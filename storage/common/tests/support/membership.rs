@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core::{
+    error::MutationError,
     property::backend::{LWWBackend, PropertyBackend},
     schema::CatalogResolver,
     storage::{GetStateResult, StorageCommitOutcome, StorageEngine, StorageTransaction},
@@ -100,15 +101,28 @@ pub async fn check(engine: &impl StorageEngine) -> anyhow::Result<()> {
     // Successive states for one entity belong to one transaction, not separate core write batches.
     let original = engine.get_state(id(5)).await?;
     let mut first = original.clone();
-    first.payload.state.head = EventId::from_bytes([40; 32]).into();
+    first.payload.state.head = Clock::new(vec![(2, EventId::from_bytes([40; 32]))]).unwrap();
     first.payload.state.memberships.insert(a);
     let mut last = first.clone();
-    last.payload.state.head = EventId::from_bytes([41; 32]).into();
+    last.payload.state.head = Clock::new(vec![(3, EventId::from_bytes([41; 32]))]).unwrap();
     last.payload.state.memberships.insert(b);
     let mut transaction = engine.transaction();
     transaction.set_state(&original.payload.state.head, &first).await?;
+    // Same event IDs with different generation annotations are not the state this write extends.
+    let incorrect_head = Clock::new(vec![(99, EventId::from_bytes([40; 32]))])?;
+    assert!(matches!(transaction.set_state(&incorrect_head, &last).await, Err(MutationError::InvalidUpdate(_))));
     transaction.set_state(&first.payload.state.head, &last).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+    assert_eq!(engine.get_state(id(5)).await?.payload.state, last.payload.state);
+    let incorrect_head = Clock::new(vec![(99, EventId::from_bytes([41; 32]))])?;
+    let mut stale = engine.transaction();
+    stale.set_state(&incorrect_head, &original).await?;
+    match stale.commit().await? {
+        StorageCommitOutcome::Conflict { observed } => {
+            assert_eq!(observed[&id(5)].as_ref().unwrap().payload.state, last.payload.state);
+        }
+        StorageCommitOutcome::Committed(_) => panic!("a mismatched generation must conflict"),
+    }
     assert_eq!(engine.get_state(id(5)).await?.payload.state, last.payload.state);
     let both = engine.fetch_states(&and(member(a), member(b)).into()).await?;
     assert!(both.iter().any(|state| state.payload.entity_id == id(5)), "the last state's memberships are materialized");
@@ -192,7 +206,7 @@ async fn write(engine: &impl StorageEngine, byte: u8, models: &[ModelId], values
             state: State {
                 state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
                 memberships: models.iter().copied().collect(),
-                head: Clock::from(vec![event]),
+                head: Clock::genesis(event),
             },
         },
         None,

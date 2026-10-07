@@ -252,7 +252,7 @@ impl Postgres {
                         r#"CREATE TABLE IF NOT EXISTS "{ENTITY_TABLE}" (
                             "id" character(43) PRIMARY KEY,
                             "state_buffer" bytea NOT NULL,
-                            "head" character(43)[] NOT NULL,
+                            "head" bytea NOT NULL,
                             "attestations" bytea[] NOT NULL
                         )"#
                     ),
@@ -267,7 +267,7 @@ impl Postgres {
                             "id" character(43) PRIMARY KEY,
                             "entity_id" character(43) NOT NULL,
                             "body" bytea NOT NULL,
-                            "parent" character(43)[] NOT NULL,
+                            "parent" bytea NOT NULL,
                             "attestations" bytea NOT NULL
                         )"#
                     ),
@@ -732,7 +732,7 @@ mod tests {
                 state: State {
                     state_buffers: StateBuffers::default(),
                     memberships: [ModelId::System(SystemModel::Model)].into(),
-                    head: Clock::from(vec![EventId::from_bytes([1; 32])]),
+                    head: Clock::genesis(EventId::from_bytes([1; 32])),
                 },
             },
             None,
@@ -746,7 +746,7 @@ mod tests {
         let snapshot = read_snapshot(&mut reader).await?;
         let selected = snapshot.query_one("SELECT id FROM _ankurah_model", &[]).await?.get(0);
         let mut after = before.clone();
-        after.payload.state.head = Clock::from(vec![EventId::from_bytes([2; 32])]);
+        after.payload.state.head = Clock::new(vec![(2, EventId::from_bytes([2; 32]))]).unwrap();
         after.payload.state.memberships.insert(ModelId::System(SystemModel::Property));
         let mut transaction = engine.transaction();
         transaction.set_state(&before.payload.state.head, &after).await?;
@@ -756,6 +756,27 @@ mod tests {
         assert_eq!(load_states(&snapshot, &[selected]).await?, vec![before]);
         drop(snapshot);
         assert_eq!(engine.get_state(id).await?, after);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result<()> {
+        let container = postgres::Postgres::default().with_init_sql(include_bytes!("../tests/pg_init.sql").to_vec()).start().await?;
+        let uri = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            container.get_host().await?,
+            container.get_host_port_ipv4(5432).await?,
+        );
+        let engine = Postgres::open(&uri).await?;
+        let id = EntityId::from_bytes([0xd3; EntityId::BYTE_LEN]);
+        // Synthetic tips with distinct generations: the engine must retain each association.
+        let head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
+        let state = Attested::opt(EntityState { entity_id: id, state: State { head, ..State::default() } }, None);
+        let mut transaction = engine.transaction();
+        transaction.set_state(&Clock::default(), &state).await?;
+        assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+        let stored = engine.get_state(id).await?.payload.state;
+        assert_eq!(stored.head, state.payload.state.head);
         Ok(())
     }
 }

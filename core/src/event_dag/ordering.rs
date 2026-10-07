@@ -31,7 +31,7 @@ pub fn topo_sort_events(events: Vec<Attested<Event>>) -> Result<Vec<Attested<Eve
         indegree.entry(id.clone()).or_insert(0);
         // Deduplicate parent ids: a malformed parent clock must not skew the
         // in-degree accounting.
-        let parents: BTreeSet<&EventId> = event.payload.parent.as_slice().iter().filter(|p| by_id.contains_key(*p)).collect();
+        let parents: BTreeSet<&EventId> = event.payload.parent.ids().filter(|p| by_id.contains_key(*p)).collect();
         for parent in parents {
             *indegree.entry(id.clone()).or_insert(0) += 1;
             children.entry(parent.clone()).or_default().push(id.clone());

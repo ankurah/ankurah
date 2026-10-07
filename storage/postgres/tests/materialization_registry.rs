@@ -40,7 +40,8 @@ fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId
             state: State {
                 state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                 memberships: BTreeSet::new(),
-                head: Clock::from(vec![event_id]),
+                // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
+                head: Clock::genesis(event_id),
             },
         },
         None,
@@ -334,7 +335,7 @@ async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Resul
             Default::default(),
         );
         let mut state = state_with_strings(old.payload.entity_id, 3, &[(property, "after")]);
-        state.payload.state.head = event.id().into();
+        state.payload.state.head = Clock::singleton(&event);
         events.push(Attested::opt(event, None));
         writes.push((old.payload.state.head.clone(), state));
     }
@@ -374,7 +375,10 @@ async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Resul
         transaction.set_state(expected_head, state).await?;
     }
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
-    assert_eq!(engine.get_events(events.iter().map(|event| event.payload.id()).collect()).await?.len(), 2);
+    let mut stored = engine.get_events(events.iter().map(|event| event.payload.id()).collect()).await?;
+    stored.sort_by_key(|event| event.payload.id());
+    events.sort_by_key(|event| event.payload.id());
+    assert_eq!(stored, events, "the stored events read back unchanged, generation included");
     for (_, state) in writes {
         assert_eq!(engine.get_state(state.payload.entity_id).await?.payload.state, state.payload.state);
     }

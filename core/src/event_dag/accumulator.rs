@@ -14,7 +14,7 @@ use crate::error::RetrievalError;
 use crate::event_dag::layers::EventLayers;
 use crate::event_dag::relation::AbstractCausalRelation;
 use crate::retrieval::GetEvents;
-use ankurah_proto::{Event, EventId};
+use ankurah_proto::{Clock, Event, EventId, EventStructureError};
 
 /// Accumulates event DAG structure during comparison and provides
 /// read-through caching for event retrieval during layer iteration.
@@ -24,8 +24,8 @@ use ankurah_proto::{Event, EventId};
 /// DAG structure (parent pointers) discovered during BFS and caches
 /// hot events to reduce storage round-trips.
 pub(crate) struct EventAccumulator<E: GetEvents> {
-    /// DAG structure: event id -> parent ids (always in memory, cheap)
-    dag: BTreeMap<EventId, Vec<EventId>>,
+    /// Parent links and generations discovered during comparison; never evicted.
+    dag: BTreeMap<EventId, Clock>,
 
     /// LRU cache of Event objects fetched from storage (bounded, eviction-safe)
     cache: LruCache<EventId, Event>,
@@ -44,9 +44,8 @@ impl<E: GetEvents> EventAccumulator<E> {
     /// Called during BFS traversal -- records DAG structure and caches the event.
     pub(crate) fn accumulate(&mut self, event: &Event) {
         let id = event.id();
-        let parents: Vec<EventId> = event.parent.as_slice().to_vec();
-        self.dag.insert(id, parents);
-        self.cache.put(event.id(), event.clone());
+        self.dag.insert(id.clone(), event.parent.clone());
+        self.cache.put(id, event.clone());
     }
 
     /// Get event by id: cache -> retriever (storage).
@@ -61,7 +60,26 @@ impl<E: GetEvents> EventAccumulator<E> {
     }
 
     /// Get a reference to the DAG structure.
-    pub(crate) fn dag(&self) -> &BTreeMap<EventId, Vec<EventId>> { &self.dag }
+    pub(crate) fn dag(&self) -> &BTreeMap<EventId, Clock> { &self.dag }
+
+    /// The event's generation, calculated from its retained parent clock even
+    /// after the event itself has been evicted from the cache.
+    pub(crate) fn generation_of_event(&self, id: &EventId) -> Option<u32> { self.dag.get(id).map(Clock::child_generation) }
+
+    /// Check subject tips and parent clocks read during comparison against event generations or the comparison head.
+    /// Unknown generations are left unverified; this makes no additional reads.
+    pub(crate) fn validate_generation_claims(&self, subject: &Clock, comparison: &Clock) -> Result<(), EventStructureError> {
+        let clocks = std::iter::once(subject).chain(self.dag.values());
+        for clock in clocks {
+            for &(claimed, ref event) in clock {
+                let Some(known) = self.generation_of_event(event).or_else(|| comparison.generation_of(event)) else { continue };
+                if claimed != known {
+                    return Err(EventStructureError::GenerationMismatch { event: event.clone(), claimed, known });
+                }
+            }
+        }
+        Ok(())
+    }
 
     /// Produce layer iterator for merge (consumes self).
     /// Only valid for DivergedSince results -- the DAG must be complete.
@@ -74,7 +92,7 @@ impl<E: GetEvents> EventAccumulator<E> {
 pub struct ComparisonResult<E: GetEvents> {
     /// The causal relation between the compared clocks.
     pub(crate) relation: AbstractCausalRelation<EventId>,
-    /// The event accumulator with DAG structure (private -- access via into_layers).
+    /// Event history collected during comparison.
     accumulator: EventAccumulator<E>,
 }
 
@@ -93,7 +111,8 @@ impl<E: GetEvents> ComparisonResult<E> {
         }
     }
 
-    /// Get a reference to the accumulator (for inspection/testing).
+    /// Borrow the event history collected during comparison.
+    #[cfg(test)]
     pub(crate) fn accumulator(&self) -> &EventAccumulator<E> { &self.accumulator }
 
     /// Decompose into relation and accumulator.
@@ -104,7 +123,7 @@ impl<E: GetEvents> ComparisonResult<E> {
 
 /// Compute ancestry set by walking backward through DAG parent pointers.
 /// Returns all event IDs reachable from `head` (inclusive).
-pub(crate) fn compute_ancestry_from_dag(dag: &BTreeMap<EventId, Vec<EventId>>, head: &[EventId]) -> BTreeSet<EventId> {
+pub(crate) fn compute_ancestry_from_dag(dag: &BTreeMap<EventId, Clock>, head: &[EventId]) -> BTreeSet<EventId> {
     let mut ancestry = BTreeSet::new();
     let mut frontier: Vec<EventId> = head.to_vec();
     while let Some(id) = frontier.pop() {
@@ -112,7 +131,7 @@ pub(crate) fn compute_ancestry_from_dag(dag: &BTreeMap<EventId, Vec<EventId>>, h
             continue;
         }
         if let Some(parents) = dag.get(&id) {
-            for parent in parents {
+            for parent in parents.ids() {
                 if !ancestry.contains(parent) {
                     frontier.push(parent.clone());
                 }
@@ -124,7 +143,7 @@ pub(crate) fn compute_ancestry_from_dag(dag: &BTreeMap<EventId, Vec<EventId>>, h
 
 /// Walk backward from `descendant` through parent pointers looking for `ancestor`.
 /// Missing entries are treated as dead ends (below the meet), not errors.
-pub(crate) fn is_descendant_dag(dag: &BTreeMap<EventId, Vec<EventId>>, descendant: &EventId, ancestor: &EventId) -> bool {
+pub(crate) fn is_descendant_dag(dag: &BTreeMap<EventId, Clock>, descendant: &EventId, ancestor: &EventId) -> bool {
     let mut visited = BTreeSet::new();
     let mut frontier = vec![descendant.clone()];
     while let Some(id) = frontier.pop() {
@@ -137,7 +156,7 @@ pub(crate) fn is_descendant_dag(dag: &BTreeMap<EventId, Vec<EventId>>, descendan
         let Some(parents) = dag.get(&id) else {
             continue;
         };
-        for parent in parents {
+        for parent in parents.ids() {
             if !visited.contains(parent) {
                 frontier.push(parent.clone());
             }
@@ -150,8 +169,28 @@ pub(crate) fn is_descendant_dag(dag: &BTreeMap<EventId, Vec<EventId>>, descendan
 mod tests {
     use super::*;
 
-    // We can't easily test EventAccumulator with a real GetEvents impl in unit tests,
-    // but we can test the helper functions. EventLayer::compare is tested in `layers`.
+    struct NoReads;
+
+    #[async_trait::async_trait]
+    impl GetEvents for NoReads {
+        async fn get_event(&self, _: &EventId) -> Result<Event, RetrievalError> { panic!("unexpected event read") }
+        async fn event_stored(&self, _: &EventId) -> Result<bool, RetrievalError> { panic!("unexpected event read") }
+    }
+
+    #[test]
+    fn dag_metadata_survives_payload_eviction() {
+        use ankurah_proto::AuthorId;
+        let genesis = Event::genesis(None, AuthorId::Unknown, Default::default());
+        let child = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, Default::default());
+        let mut accumulator = EventAccumulator::new(NoReads);
+        accumulator.cache.resize(NonZeroUsize::new(1).unwrap());
+        accumulator.accumulate(&child);
+        accumulator.accumulate(&genesis);
+
+        assert!(!accumulator.cache.contains(&child.id()), "the payload must actually be evicted");
+        assert_eq!(accumulator.generation_of_event(&child.id()), Some(2));
+        assert_eq!(accumulator.dag()[&child.id()], Clock::singleton(&genesis));
+    }
 
     #[test]
     fn test_compute_ancestry_from_dag() {
@@ -162,10 +201,10 @@ mod tests {
         let c = EventId::from_bytes([3; 32]);
         let d = EventId::from_bytes([4; 32]);
 
-        dag.insert(a.clone(), vec![]); // genesis
-        dag.insert(b.clone(), vec![a.clone()]);
-        dag.insert(c.clone(), vec![a.clone()]);
-        dag.insert(d.clone(), vec![b.clone()]);
+        dag.insert(a.clone(), Clock::default()); // genesis
+        dag.insert(b.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
+        dag.insert(c.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
+        dag.insert(d.clone(), Clock::new(vec![(2, b.clone())]).unwrap());
 
         // Ancestry of D should be {A, B, D}
         let ancestry = compute_ancestry_from_dag(&dag, &[d.clone()]);
@@ -190,9 +229,9 @@ mod tests {
         let b = EventId::from_bytes([2; 32]);
         let c = EventId::from_bytes([3; 32]);
 
-        dag.insert(a.clone(), vec![]);
-        dag.insert(b.clone(), vec![a.clone()]);
-        dag.insert(c.clone(), vec![b.clone()]);
+        dag.insert(a.clone(), Clock::default());
+        dag.insert(b.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
+        dag.insert(c.clone(), Clock::new(vec![(2, b.clone())]).unwrap());
 
         assert!(is_descendant_dag(&dag, &c, &a)); // C descends from A
         assert!(is_descendant_dag(&dag, &c, &b)); // C descends from B

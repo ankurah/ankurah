@@ -83,7 +83,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
             proto::OperationSet::from_backends(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };
-    let ev_child = forge_title_event(title_prop, rec_id, proto::Clock::from(vec![ev_parent.id()]), "t-child");
+    let ev_child = forge_title_event(title_prop, rec_id, proto::Clock::singleton(&ev_parent), "t-child");
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
 
     let item = proto::SubscriptionUpdateItem {
@@ -153,7 +153,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     let ev_a = forge_title_event(title_prop, a_id, view_a.entity().head().clone(), "a1");
     let ev_b = forge_title_event(title_prop, b_id, view_b.entity().head().clone(), "b1");
     let unknown_id = proto::EntityId::random();
-    let ev_unknown = forge_title_event(title_prop, unknown_id, proto::Clock::from(vec![proto::EventId::from_bytes([7u8; 32])]), "ghost");
+    let ev_unknown = forge_title_event(title_prop, unknown_id, proto::Clock::genesis(proto::EventId::from_bytes([7u8; 32])), "ghost");
     let (id_ev_a, id_ev_b) = (ev_a.id(), ev_b.id());
 
     let update = proto::NodeUpdate {

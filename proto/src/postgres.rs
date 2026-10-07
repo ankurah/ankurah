@@ -1,7 +1,6 @@
 use base64::engine::general_purpose;
 use base64::write::EncoderWriter;
-use postgres_protocol::types;
-use postgres_types::{to_sql_checked, FromSql, IsNull, Kind, ToSql, Type};
+use postgres_types::{to_sql_checked, FromSql, IsNull, ToSql, Type};
 
 use crate::{Clock, DecodeError, EventBody, EventId};
 use bytes::{BufMut, BytesMut};
@@ -43,82 +42,19 @@ impl<'a> FromSql<'a> for EventId {
     }
 }
 
-// Clock implementation
 impl ToSql for Clock {
-    fn to_sql(&self, ty: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-        let member_type = match *ty.kind() {
-            Kind::Array(ref member) => member,
-            _ => panic!("expected array type"),
-        };
-
-        let dimension =
-            postgres_protocol::types::ArrayDimension { len: self.len().try_into().map_err(|_| "array too large")?, lower_bound: 1 };
-
-        postgres_protocol::types::array_to_sql(
-            Some(dimension),
-            member_type.oid(),
-            self.iter(),
-            |e, w| match e.to_sql(member_type, w)? {
-                IsNull::No => Ok(postgres_protocol::IsNull::No),
-                IsNull::Yes => Ok(postgres_protocol::IsNull::Yes),
-            },
-            out,
-        )?;
+    fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(&bincode::serialize(self)?);
         Ok(IsNull::No)
     }
 
-    fn accepts(ty: &Type) -> bool {
-        match ty.kind() {
-            Kind::Array(inner) => match inner.name() {
-                "character" => true,
-                "bpchar" => true,
-                _ => false,
-            },
-            _ => false,
-        }
-    }
-
+    fn accepts(ty: &Type) -> bool { *ty == Type::BYTEA }
     to_sql_checked!();
 }
 
 impl<'a> FromSql<'a> for Clock {
-    fn from_sql(ty: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> {
-        let member_type = match *ty.kind() {
-            Kind::Array(ref member) => member,
-            _ => panic!("expected array type"),
-        };
-        use fallible_iterator::FallibleIterator; // 0.2.0
-
-        let array = types::array_from_sql(raw)?;
-        if array.dimensions().count()? > 1 {
-            return Err("array contains too many dimensions".into());
-        }
-
-        let mut event_ids = Vec::new();
-        let mut values = array.values();
-        while let Some(v) = values.next()? {
-            if let Some(v) = v {
-                // binary search for the insertion point, and don't insert if it's already present
-                let index = event_ids.binary_search(&EventId::from_sql(member_type, v)?).unwrap_or_else(|i| i);
-                if index == event_ids.len() || event_ids[index] != EventId::from_sql(member_type, v)? {
-                    event_ids.insert(index, EventId::from_sql(member_type, v)?);
-                }
-            }
-        }
-
-        Ok(Clock(event_ids))
-    }
-
-    fn accepts(ty: &Type) -> bool {
-        match ty.kind() {
-            Kind::Array(inner) => match inner.name() {
-                "character" => true,
-                "bpchar" => true,
-                _ => false,
-            },
-            _ => false,
-        }
-    }
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> { Ok(bincode::deserialize(raw)?) }
+    fn accepts(ty: &Type) -> bool { *ty == Type::BYTEA }
 }
 
 // use bytea and bincode to serialize and deserialize the event body - do not base64 encode the bytea

@@ -38,9 +38,10 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     client.system.wait_system_ready().await?;
     let album_model = server.context(DEFAULT_CONTEXT)?.resolve_model_id::<Album>().await?;
 
+    // A synthetic genesis parent keeps the update structurally valid; its entity is unknown.
     let fake_update = proto::Event::update(
         EntityId::random(),
-        proto::Clock::new([proto::EventId::from_bytes([1u8; 32])]),
+        proto::Clock::genesis(proto::EventId::from_bytes([1u8; 32])),
         proto::AuthorId::Unknown,
         proto::OperationSet::default(),
     );

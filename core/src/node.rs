@@ -671,9 +671,9 @@ where
             AbstractCausalRelation::StrictDescends { chain: _ } => {
                 // Current descends from known - collect events by walking backward
                 // TODO: Optimize with forward chain from relation (GitHub #200)
-                let known_set: HashSet<_> = known_head.as_slice().iter().collect();
+                let known_set: HashSet<_> = known_head.ids().collect();
                 let mut events = Vec::new();
-                let mut frontier: Vec<proto::EventId> = current_head.as_slice().to_vec();
+                let mut frontier: Vec<proto::EventId> = current_head.ids().cloned().collect();
                 let mut visited: HashSet<proto::EventId> = HashSet::new();
 
                 while !frontier.is_empty() {
@@ -684,7 +684,7 @@ where
                         let id = event.payload.id();
                         if visited.insert(id.clone()) && !known_set.contains(&id) {
                             // Add parents to frontier (walking backward)
-                            for parent in event.payload.parent.as_slice() {
+                            for parent in event.payload.parent.ids() {
                                 if !visited.contains(parent) && !known_set.contains(parent) {
                                     frontier.push(parent.clone());
                                 }

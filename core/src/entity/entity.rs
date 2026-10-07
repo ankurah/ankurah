@@ -21,6 +21,8 @@ enum Handle {
 }
 
 impl Entity {
+    /// Wrap an existing resident entity, sharing its state and change notifications.
+    /// Reads through this handle observe subsequent updates to the resident.
     pub(crate) fn from_resident(entity: Arc<EntityInner>) -> Self { Self(Handle::Resident(entity)) }
 
     pub(super) fn from_proxy(proxy: Arc<EntityProxy>) -> Self { Self(Handle::Proxy(proxy)) }

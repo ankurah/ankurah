@@ -67,7 +67,7 @@ impl<'a> Workload<'a> {
         let id = event.entity_id;
         self.next_entity += 1;
 
-        let head = proto::Clock::from(vec![event.id()]);
+        let head = proto::Clock::singleton(&event);
         let attested = model::attest(event);
 
         self.commit_and_propagate(origin, id, vec![attested], &head).await;
@@ -91,7 +91,7 @@ impl<'a> Workload<'a> {
     /// head, then edit again from the captured (now stale) head.
     pub async fn edit_from(&mut self, origin: usize, entity: proto::EntityId, parent: proto::Clock, field: Field, value: &str) {
         let event = model::edit_event(entity, parent, field, value, self.next_mint_seq());
-        let new_head = proto::Clock::from(vec![event.id()]);
+        let new_head = proto::Clock::singleton(&event);
         let attested = model::attest(event);
         self.commit_and_propagate(origin, entity, vec![attested], &new_head).await;
         self.heads.insert(entity, new_head);
@@ -178,10 +178,10 @@ impl<'a> Workload<'a> {
     /// sees). Events are applied in the order given, which must be causal for the
     /// commit path; the tracked head advances to the last event.
     pub async fn apply_events_at(&mut self, node: usize, entity: proto::EntityId, events: Vec<Attested<proto::Event>>) {
-        let last = events.last().map(|e| e.payload.id());
+        let last = events.last().map(|e| proto::Clock::singleton(&e.payload));
         self.nodes[node].origin_commit(events).await.expect("forged events apply at source node");
-        if let Some(id) = last {
-            self.heads.insert(entity, proto::Clock::from(vec![id]));
+        if let Some(head) = last {
+            self.heads.insert(entity, head);
         }
     }
 

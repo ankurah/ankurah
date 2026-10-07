@@ -111,7 +111,7 @@ fn row(
     let state = proto::State {
         state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), buffer)])),
         memberships: std::collections::BTreeSet::from([membership]),
-        head: event_id.into(),
+        head: proto::Clock::singleton(&event),
     };
     let entity_state = proto::EntityState { entity_id, state };
     (entity_id, (entity_state.into(), Attested::opt(event, None)))

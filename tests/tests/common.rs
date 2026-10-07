@@ -526,7 +526,7 @@ impl TestDag {
 
     /// Convert a Clock to sorted labels for assertion.
     pub fn clock_labels(&self, clock: &proto::Clock) -> Vec<char> {
-        let mut labels: Vec<char> = clock.as_slice().iter().filter_map(|id| self.id_to_label.get(id).copied()).collect();
+        let mut labels: Vec<char> = clock.ids().filter_map(|id| self.id_to_label.get(id).copied()).collect();
         labels.sort();
         labels
     }
@@ -540,8 +540,7 @@ impl TestDag {
         for event in events {
             let id = event.payload.id();
             if let Some(&label) = self.id_to_label.get(&id) {
-                let parents: Vec<char> =
-                    event.payload.parent.as_slice().iter().filter_map(|pid| self.id_to_label.get(pid).copied()).collect();
+                let parents: Vec<char> = event.payload.parent.ids().filter_map(|pid| self.id_to_label.get(pid).copied()).collect();
                 actual_parents.insert(label, parents);
             }
         }

@@ -54,6 +54,9 @@ impl TrxEntityData {
         }
     }
 
+    /// Redirect this transaction entity's existing and future reads to the committed resident.
+    /// Call after persistence and publication; existing proxies switch their signal subscriptions
+    /// and notify their listeners.
     fn committed(&self, resident: Arc<EntityInner>) { self.finish(TrxView::Resident(resident.clone()), ProxyTarget::Resident(resident)); }
 
     fn rollback(&self, upstream: Option<&Arc<EntityInner>>, creation: RolledBackCreation) {

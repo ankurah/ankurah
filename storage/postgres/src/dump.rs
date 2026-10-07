@@ -207,15 +207,10 @@ mod tests {
         for _ in 0..RECORDS {
             let event = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
             let entity_id = event.entity_id;
-            let event_id = event.id();
             let state = Attested::opt(
                 EntityState {
                     entity_id,
-                    state: State {
-                        state_buffers: StateBuffers::default(),
-                        memberships: BTreeSet::new(),
-                        head: Clock::from(vec![event_id]),
-                    },
+                    state: State { state_buffers: StateBuffers::default(), memberships: BTreeSet::new(), head: Clock::singleton(&event) },
                 },
                 None,
             );

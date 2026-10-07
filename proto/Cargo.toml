@@ -9,15 +9,10 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-default = []
-postgres = [
-    "dep:postgres-types",
-    "dep:postgres-protocol",
-    "dep:fallible-iterator",
-    "ankurah-core-types/postgres",
-]
-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen", "ankurah-core-types/wasm"]
-uniffi = ["dep:uniffi", "ankurah-core-types/uniffi"]
+default  = []
+postgres = ["dep:postgres-types", "ankurah-core-types/postgres"]
+wasm     = ["dep:wasm-bindgen", "dep:js-sys", "dep:serde-wasm-bindgen", "ankurah-core-types/wasm"]
+uniffi   = ["dep:uniffi", "ankurah-core-types/uniffi"]
 
 [dependencies]
 anyhow             = "1.0.86"
@@ -34,8 +29,6 @@ ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
 sha2               = "0.10.8"
 rand               = "0.9"
 postgres-types     = { version = "0.2", optional = true }
-postgres-protocol  = { version = "0.6", optional = true }
-fallible-iterator  = { version = "0.2", optional = true }                                   # has to be 0.2 to match postgres-protocol
 
 wasm-bindgen = { version = "0.2.92", features = ["serde"], optional = true }
 js-sys       = { version = "0.3.69", optional = true }

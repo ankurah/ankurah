@@ -306,7 +306,8 @@ mod tests {
                 state: State {
                     state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                     memberships: BTreeSet::new(),
-                    head: Clock::from(vec![event_id]),
+                    // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
+                    head: Clock::genesis(event_id),
                 },
             },
             None,
@@ -468,5 +469,17 @@ mod tests {
             engine.fetch_states(&all.clone().and_member_of(model_b)).await.unwrap().is_empty(),
             "a rejected batch must not publish associations or projections"
         );
+    }
+
+    #[tokio::test]
+    async fn distinct_tip_generations_survive_a_write_and_a_read() {
+        let engine = crate::SledStorageEngine::new_test().unwrap();
+        let entity = entity_id(0x51);
+        let mut state = state_with_strings(entity, 1, &[(PropertyId::EntityId(entity_id(0x52)), "value")]);
+        // Synthetic tips with distinct generations: the engine must retain each association.
+        state.payload.state.head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
+        commit_canonical_state(&engine, Clock::default(), state.clone()).await;
+        let stored = engine.get_state(entity).await.unwrap().payload.state;
+        assert_eq!(stored.head, state.payload.state.head);
     }
 }

@@ -64,7 +64,7 @@ async fn insert(engine: &SledStorageEngine, model: ModelId, property: PropertyId
             state: State {
                 state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
                 memberships: BTreeSet::from([model]),
-                head: Clock::from(vec![event]),
+                head: Clock::genesis(event),
             },
         },
         None,

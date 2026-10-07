@@ -104,7 +104,7 @@ async fn test_rapid_concurrent_transactions() -> Result<()> {
         let parents = &event.payload.parent;
         if !parents.is_empty() {
             // Verify each parent exists in the event list
-            for parent_id in parents.iter() {
+            for parent_id in parents.ids() {
                 assert!(events.iter().any(|e| e.payload.id() == *parent_id), "Parent {:?} should exist in events", parent_id);
             }
         }

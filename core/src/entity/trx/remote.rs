@@ -23,7 +23,7 @@ pub struct RemoteTrxEntity(Arc<RemoteTrxEntityInner>);
 #[derive(Debug)]
 pub(in crate::entity) enum RemoteTrxEntityInner {
     New { id: EntityId, data: TrxEntityData },
-    Mut { upstream: Arc<EntityInner>, data: TrxEntityData },
+    Mut { upstream: Arc<EntityInner>, base_head: Clock, data: TrxEntityData },
 }
 
 impl RemoteTrxEntity {
@@ -60,7 +60,8 @@ impl RemoteTrxEntity {
     pub(crate) fn edit(entity: &Entity) -> Result<Self, PropertyError> {
         let upstream = entity.resident()?;
         let data = TrxEntityData::new(upstream.state.fork(), upstream.system_epoch());
-        Ok(Self(Arc::new(RemoteTrxEntityInner::Mut { upstream, data })))
+        let base_head = data.state.head();
+        Ok(Self(Arc::new(RemoteTrxEntityInner::Mut { upstream, base_head, data })))
     }
 
     pub fn id(&self) -> EntityId { self.0.id() }
@@ -111,7 +112,9 @@ impl RemoteTrxEntity {
 
         let inner = match &*self.0 {
             RemoteTrxEntityInner::New { id, .. } => RemoteTrxEntityInner::New { id: *id, data: snapshot },
-            RemoteTrxEntityInner::Mut { upstream, .. } => RemoteTrxEntityInner::Mut { upstream: upstream.clone(), data: snapshot },
+            RemoteTrxEntityInner::Mut { upstream, base_head, .. } => {
+                RemoteTrxEntityInner::Mut { upstream: upstream.clone(), base_head: base_head.clone(), data: snapshot }
+            }
         };
         Self(Arc::new(inner)).read()
     }
@@ -123,27 +126,34 @@ impl RemoteTrxEntity {
         let events = std::mem::take(&mut *data.events.lock().unwrap());
 
         let resident = match &*self.0 {
-            RemoteTrxEntityInner::Mut { upstream, .. } => upstream.clone(),
+            RemoteTrxEntityInner::Mut { upstream, base_head, .. } => {
+                if !events.is_empty() && upstream.state.replace_if_head_matches(base_head, &data.state) {
+                    data.committed(upstream.clone());
+                    return Ok(EntityChange::new(Entity::from_resident(upstream.clone()), events));
+                }
+                upstream.clone()
+            }
             RemoteTrxEntityInner::New { id, .. } => {
                 let (existed, resident) = entities.publish_new(*id, &data.state)?;
                 if !existed {
                     data.committed(resident.clone());
-                    return EntityChange::new(Entity::from_resident(resident), events);
+                    return Ok(EntityChange::new(Entity::from_resident(resident), events));
                 }
                 resident
             }
         };
 
-        let mut change = EntityChange::new(Entity::from_resident(resident.clone()), Vec::new())?;
+        let mut applied_events = Vec::new();
         for event in events {
-            // Storage now contains the complete transaction's causal history.
+            // A reader may have loaded committed state while this transaction was publishing.
+            // Reconcile against that head rather than overwriting it with the older fork.
             if resident.state.apply_event(getter, &event.payload).await? {
-                change.push_event(event)?;
+                applied_events.push(event);
             }
         }
 
-        data.committed(resident);
-        Ok(change)
+        data.committed(resident.clone());
+        Ok(EntityChange::new(Entity::from_resident(resident), applied_events))
     }
 
     pub(crate) fn rollback(&self) {

@@ -57,14 +57,14 @@ async fn test_concurrent_transactions_same_entity() -> Result<()> {
     // Persisted state must include both concurrent commits in its head
     let stored_state = node.storage.get_state(album_id).await?;
     let persisted_head = stored_state.payload.state.head;
-    let persisted_head_ids: Vec<_> = persisted_head.iter().map(|id| id.to_base64_short()).collect();
+    let persisted_head_ids: Vec<_> = persisted_head.ids().map(|id| id.to_base64_short()).collect();
     println!("Persisted head ids: {:?}", persisted_head_ids);
     assert_eq!(persisted_head.len(), 2, "Persisted head should include both concurrent commits");
 
     // All head entries must correspond to stored events
     let persisted_events = node.storage.dump_entity_events(album_id).await?;
     let persisted_event_ids: Vec<_> = persisted_events.iter().map(|e| e.payload.id()).collect();
-    for head_id in persisted_head.iter() {
+    for head_id in persisted_head.ids() {
         assert!(
             persisted_event_ids.iter().any(|event_id| event_id == head_id),
             "Head event {:?} must exist in persisted events",
@@ -186,7 +186,7 @@ async fn test_concurrent_commits_preserve_every_branch() -> Result<()> {
     assert_eq!(stored.payload.state.head.len(), WRITERS);
     for event_id in committed_ids {
         assert!(
-            stored.payload.state.head.iter().any(|head| head == &event_id),
+            stored.payload.state.head.ids().any(|head| head == &event_id),
             "every successful concurrent commit must remain in the canonical head"
         );
     }
