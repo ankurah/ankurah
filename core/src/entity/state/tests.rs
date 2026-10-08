@@ -112,3 +112,90 @@ fn publication_checks_the_complete_head_and_keeps_backend_copies_independent() -
     assert_eq!(resident.value(&property), Some(Value::String("prepared".into())));
     Ok(())
 }
+
+/// Serves a fixed set of events and records every id asked for.
+struct ServedGetter {
+    events: Vec<Event>,
+    asked: Mutex<Vec<EventId>>,
+}
+
+impl ServedGetter {
+    fn of(events: &[&Event]) -> Self { Self { events: events.iter().map(|event| (*event).clone()).collect(), asked: Mutex::default() } }
+}
+
+#[async_trait::async_trait]
+impl GetEvents for ServedGetter {
+    async fn get_event(&self, event_id: &EventId) -> Result<Event, RetrievalError> {
+        self.asked.lock().unwrap().push(event_id.clone());
+        self.events.iter().find(|event| event.id() == *event_id).cloned().ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))
+    }
+
+    async fn event_stored(&self, event_id: &EventId) -> Result<bool, RetrievalError> {
+        Ok(self.events.iter().any(|event| event.id() == *event_id))
+    }
+}
+
+/// An update may claim at most one above the head's greatest tip generation, and is refused before any read when it
+/// claims more. The forged update names the tip honestly and the tip's own ancestor at a false generation, which the
+/// comparison alone would never read: it settles a direct extension from the tip's parent links. An honest
+/// concurrent update within the bound still applies.
+#[tokio::test]
+async fn an_update_claiming_more_than_one_above_the_head_is_refused_before_any_read() -> anyhow::Result<()> {
+    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+    let tip = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
+    let forged = Event::update(
+        genesis.entity_id,
+        Clock::new(vec![(tip.generation(), tip.id()), (1000, genesis.id())])?,
+        AuthorId::Unknown,
+        OperationSet::default(),
+    );
+    let concurrent = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
+    assert_eq!((tip.generation(), forged.generation(), concurrent.generation()), (2, 1001, 2));
+
+    let served = ServedGetter::of(&[&genesis, &tip, &forged, &concurrent]);
+    let state = EntityState::empty();
+    assert!(state.apply_event(&served, &genesis).await?);
+    assert!(state.apply_event(&served, &tip).await?);
+    assert_eq!(state.head(), Clock::singleton(&tip));
+
+    served.asked.lock().unwrap().clear();
+    let error = state.apply_event(&served, &forged).await.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            MutationError::LineageError(LineageError::BeyondHead { event, claimed: 1001, head: 2 })
+                if *event == forged.id()
+        ),
+        "{error}"
+    );
+    assert!(served.asked.lock().unwrap().is_empty(), "the bound reads nothing");
+    assert_eq!(state.head(), Clock::singleton(&tip));
+
+    assert!(state.apply_event(&served, &concurrent).await?);
+    assert_eq!(state.head(), Clock::from_events([&tip, &concurrent]));
+    Ok(())
+}
+
+/// An update above a head that lags its chain has a missing link, even when the link is held: it is refused until
+/// the chain is applied link by link, which then brings the head to it.
+#[tokio::test]
+async fn an_update_above_a_lagging_head_is_refused_until_its_chain_is_applied() -> anyhow::Result<()> {
+    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+    let first = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
+    let second = Event::update(genesis.entity_id, Clock::singleton(&first), AuthorId::Unknown, OperationSet::default());
+    let third = Event::update(genesis.entity_id, Clock::singleton(&second), AuthorId::Unknown, OperationSet::default());
+    assert_eq!(third.generation(), 4);
+
+    let served = ServedGetter::of(&[&genesis, &first, &second, &third]);
+    let state = EntityState::empty();
+    assert!(state.apply_event(&served, &genesis).await?);
+    let error = state.apply_event(&served, &third).await.unwrap_err();
+    assert!(matches!(&error, MutationError::LineageError(LineageError::BeyondHead { claimed: 4, head: 1, .. })), "{error}");
+    assert_eq!(state.head(), Clock::singleton(&genesis));
+
+    for event in [&first, &second, &third] {
+        assert!(state.apply_event(&served, event).await?);
+    }
+    assert_eq!(state.head(), Clock::singleton(&third));
+    Ok(())
+}

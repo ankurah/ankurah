@@ -312,6 +312,9 @@ impl From<anyhow::Error> for MutationError {
 pub enum LineageError {
     /// Proven different genesis events (single-root invariant violated)
     Disjoint,
+    /// The event claims a generation more than one above the head's greatest tip: a link between is missing from
+    /// this state, or the claim is forged. Not a proof of different roots.
+    BeyondHead { event: EventId, claimed: u32, head: u32 },
     /// Recursion budget exceeded before determination could be made
     BudgetExceeded { original_budget: usize, subject_frontier: BTreeSet<EventId>, other_frontier: BTreeSet<EventId> },
 }
@@ -320,6 +323,10 @@ impl std::fmt::Display for LineageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LineageError::Disjoint => write!(f, "disjoint (different genesis events)"),
+            LineageError::BeyondHead { event, claimed, head } => write!(
+                f,
+                "event {event} claims generation {claimed}, more than one above the head's greatest tip at {head}: a link between is missing from this state, or the claim is forged"
+            ),
             LineageError::BudgetExceeded { original_budget, subject_frontier, other_frontier } => {
                 let subject: Vec<_> = subject_frontier.iter().map(|id| id.to_base64_short()).collect();
                 let other: Vec<_> = other_frontier.iter().map(|id| id.to_base64_short()).collect();
