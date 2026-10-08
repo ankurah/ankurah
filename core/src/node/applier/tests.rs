@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
     entity::Entity,
+    error::LineageError,
     policy::PermissiveAgent,
     property::backend::{lww::LWWBackend, PropertyBackend},
     retrieval::LocalEventGetter,
@@ -482,7 +483,8 @@ async fn event_only_commits_accepted_prefix_without_partial_failed_operations() 
     Ok(())
 }
 
-/// Each event ingress rejects false parent annotations before storage. EventOnly preserves the accepted prefix.
+/// Each event ingress rejects a false parent annotation before storage: a claim above the head is refused by the
+/// bound before any read. EventOnly preserves the accepted prefix.
 #[tokio::test]
 async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::Result<()> {
     for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
@@ -497,7 +499,7 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
             let events = if parent_in_batch { vec![honest.clone(), forged] } else { vec![forged] };
             let error = fixture.deliver(ingress, events.clone()).await.unwrap_err();
             assert!(
-                matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: c, known: k, .. }) if (c, k) == (claimed, known)),
+                matches!(error, MutationError::LineageError(LineageError::BeyondHead { claimed: c, head: h, .. }) if (c, h) == (claimed + 1, known)),
                 "{ingress:?}, claimed {claimed}, known {known}: {error}"
             );
             let commits_prefix = parent_in_batch && matches!(ingress, EventIngress::EventOnly);
@@ -523,10 +525,10 @@ async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_
         let genesis = fixture.entity.head();
         let honest = Event::update(fixture.entity.id(), genesis.clone(), AuthorId::Unknown, OperationSet::default());
         let unreadable = EventId::from_bytes([9; 32]);
-        // The known parent is generation 2, but the update claims 3.
+        // The known parent is generation 2, but the update claims 1: a false annotation within the bound.
         let over_both = Event::update(
             fixture.entity.id(),
-            Clock::new(vec![(3, honest.id()), (1, unreadable.clone())])?,
+            Clock::new(vec![(1, honest.id()), (1, unreadable.clone())])?,
             AuthorId::Unknown,
             OperationSet::default(),
         );
@@ -626,8 +628,7 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
         AuthorId::Unknown,
         OperationSet(vec![value_operation("last")?]),
     );
-    cache(&fixture.storage, &[&intermediate]).await?;
-    let mut applied = vec![Attested::from(first), Attested::from(last)];
+    let mut applied = vec![Attested::from(first), Attested::from(intermediate), Attested::from(last)];
     for event in &mut applied {
         assert!(candidate.apply_event(&fixture.events, event, |_| Ok(None)).await?);
     }
@@ -643,7 +644,7 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
     let (notifications, received) = mpsc::channel();
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
     let change = candidate.commit(&fixture.node.entities, &NoEventReads).await?;
-    // The earlier event is an ancestor via an event outside this batch; neither notification may be lost.
+    // Every applied event is published; no notification may be lost.
     assert_eq!(change.events(), applied);
     assert_eq!(change.entity(), &fixture.entity);
     assert_eq!(fixture.entity.to_state()?, prepared);
@@ -719,8 +720,8 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     };
     let parent = over(&genesis, genesis.generation());
     let tip = over(&parent, parent.generation());
-    // Falsify P's generation: its payload derives 2.
-    let update = over(&parent, 99);
+    // Falsify P's generation below its own, within the bound: its payload derives 2.
+    let update = over(&parent, 1);
 
     let peer = EntityId::from_bytes([5; 32]);
     let events = LocalEventGetter::new(storage.clone(), false);
@@ -745,7 +746,7 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     let before = entity.to_state()?;
     let error = NodeApplier::save_events(&node, genesis.entity_id, &[admitted], &events).await.unwrap_err();
     assert!(
-        matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: 99, known: 2, .. })),
+        matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: 1, known: 2, .. })),
         "{error}"
     );
     assert_eq!(storage.get_state(genesis.entity_id).await?.payload.state, before);
@@ -776,8 +777,8 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
         };
         let parent = over(&genesis, genesis.generation());
         let tip = over(&parent, parent.generation());
-        // Falsify P's generation: its payload derives 2.
-        let update = over(&parent, 99);
+        // Falsify P's generation below its own, within the bound: its payload derives 2.
+        let update = over(&parent, 1);
 
         let peer = EntityId::from_bytes([5; 32]);
         let events = LocalEventGetter::new(storage.clone(), false);

@@ -1,7 +1,7 @@
 use crate::node::handler::commit_transaction;
 use crate::{
     entity::{Entity, LocalTrxEntity, RemoteTrxEntity},
-    error::{MutationError, RetrievalError, ValidationError},
+    error::{LineageError, MutationError, ValidationError},
     node::Node,
     policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     property::backend::{LWWBackend, PropertyBackend},
@@ -15,8 +15,7 @@ use crate::{
 };
 use ankql::ast::{Predicate, Resolved};
 use ankurah_proto::{
-    self as proto, Attested, AuthorId, EntityId, EntityState, Event, EventStructureError, Membership, ModelId, Operation, OperationSet,
-    PropertyId,
+    self as proto, Attested, AuthorId, EntityId, EntityState, Event, Membership, ModelId, Operation, OperationSet, PropertyId,
 };
 use std::sync::{Arc, Mutex};
 
@@ -286,7 +285,8 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
 }
 
 /// A remote commit admits an update only at one more than the greatest generation among its parents, counting a
-/// parent earlier in the same transaction, and a refused transaction stores none of its events.
+/// parent earlier in the same transaction: a claim above that is refused by the bound, and a refused transaction
+/// stores none of its events.
 #[tokio::test]
 async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_require() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
@@ -307,15 +307,15 @@ async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_requi
     };
     let honest = update(&genesis, 1);
 
-    for (events, claimed, required) in [(vec![update(&genesis, 2)], 2, 1), (vec![honest.clone(), update(&honest, 3)], 3, 2)] {
+    for (events, claimed, head) in [(vec![update(&genesis, 2)], 3, 1), (vec![honest.clone(), update(&honest, 3)], 4, 2)] {
         let attested = events.iter().cloned().map(Attested::from).collect();
         let error = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), attested).await.unwrap_err();
         assert!(
             matches!(
                 error.downcast_ref::<MutationError>(),
-                Some(MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: c, known: r, .. })) if (*c, *r) == (claimed, required)
+                Some(MutationError::LineageError(LineageError::BeyondHead { claimed: c, head: h, .. })) if (*c, *h) == (claimed, head)
             ),
-            "claimed {claimed}, required {required}: {error}"
+            "claimed {claimed}, head {head}: {error}"
         );
         assert!(storage.get_events(events.iter().map(Event::id).collect()).await?.is_empty());
         let stored = storage.get_state(genesis.entity_id).await?.payload.state;
@@ -328,8 +328,8 @@ async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_requi
     Ok(())
 }
 
-/// A durable node holds the parents of everything it admits, so it refuses an update naming a parent it does not
-/// hold before storing anything, rather than fetch that parent.
+/// A durable node holds the parents of everything it admits. An update naming a parent it does not hold claims more
+/// than one above its head, so the bound refuses it before storing anything, rather than fetch that parent.
 #[tokio::test]
 async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
@@ -347,7 +347,7 @@ async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> any
     assert!(
         matches!(
             error.downcast_ref::<MutationError>(),
-            Some(MutationError::RetrievalError(RetrievalError::EventNotFound(id))) if *id == unheld.id()
+            Some(MutationError::LineageError(LineageError::BeyondHead { event, claimed: 3, head: 1 })) if *event == child.id()
         ),
         "{error}"
     );

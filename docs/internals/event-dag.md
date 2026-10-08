@@ -92,6 +92,16 @@ This also checks an update naming only a subset of the head, without treating
 unrelated tips as parents. A durable node refuses a parent its comparison walk
 cannot read rather than fetching it.
 
+An update more than one above the head's greatest tip has a missing link: an
+event between it and the head that this state has not applied. Whether that
+event is stored, fetchable or forged, the update cannot apply until its chain
+does, so each apply attempt refuses it before the comparison and without
+reading anything, which also denies a forged claim the power to make the node
+read or fetch. This also closes a gap in the
+evidence check above: the comparison can settle a direct extension without
+reading a parent that is an ancestor of a tip, and an annotation inflating
+that ancestor puts the update above the bound.
+
 Every pre-commit application checks the evidence available then, including when
 rebuilding a candidate for persistence. After storage commits, publication
 copies the prepared state if the resident still has the fork's original head,

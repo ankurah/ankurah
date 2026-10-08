@@ -260,6 +260,15 @@ impl EntityState {
         const MAX_RETRIES: usize = 5;
 
         for attempt in 0..MAX_RETRIES {
+            // An event more than one above the head has a missing link: an event between it and the head that this
+            // state has not applied. Whether that event is stored, fetchable or forged, this event cannot apply until
+            // its chain does, so it is refused before the comparison and without reading anything, which also denies
+            // a forged claim the power to make this node read or fetch.
+            if event.generation() > head.child_generation() {
+                let head = head.max_generation().unwrap_or(0);
+                return Err(LineageError::BeyondHead { event: event.id(), claimed: event.generation(), head }.into());
+            }
+
             // Stage the event so BFS can discover it, then compare event's clock vs head
             let subject_clock = Clock::singleton(event);
             let comparison_result = crate::event_dag::compare(getter, &subject_clock, &head, DEFAULT_BUDGET).await?;

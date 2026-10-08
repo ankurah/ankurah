@@ -214,7 +214,8 @@ events and empty heads:
 ### The Retry Loop
 
 After guards pass, `apply_event` enters a bounded retry loop (up to 5
-attempts). Each attempt reads the current head, runs
+attempts). Each attempt reads the current head, refuses an event claiming more
+than one above the head's greatest tip generation, runs
 [`compare()`](event-dag.md#comparing-two-clocks) against the event DAG,
 checks its parent [generation annotations](event-dag.md#generations) against
 parent payloads read by comparison or resident tip annotations, unless the event
