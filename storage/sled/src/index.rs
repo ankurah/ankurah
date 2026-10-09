@@ -16,6 +16,12 @@ pub enum BuildStatus {
     Ready,
 }
 
+/// The layout of the keys in an index tree, bumped whenever the canonical
+/// encoding of key parts (`ankurah_core::indexing::encoding`) changes. Keys
+/// of one layout misorder among keys of another, so an index recorded under
+/// a different layout is started over when the database opens.
+pub const KEY_LAYOUT_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IndexRecord {
     pub id: u32,
@@ -23,7 +29,35 @@ pub struct IndexRecord {
     pub spec: ankurah_core::indexing::KeySpec<String>,
     pub created_at_unix_ms: i64,
     pub build_status: BuildStatus,
+    /// The `KEY_LAYOUT_VERSION` the tree's keys were written under.
+    pub key_layout_version: u32,
 }
+
+/// The record shape written before index keys carried a layout version
+/// (layout 0, whose ascending variable-length parts ended with a single
+/// 0x00). Decoded only so that such an index is started over.
+#[derive(Deserialize)]
+struct UnversionedIndexRecord {
+    id: u32,
+    name: String,
+    spec: ankurah_core::indexing::KeySpec<String>,
+    created_at_unix_ms: i64,
+    build_status: BuildStatus,
+}
+
+impl IndexRecord {
+    /// Decode a persisted record of either shape; `None` for bytes that are neither.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if let Ok(record) = bincode::deserialize::<IndexRecord>(bytes) {
+            return Some(record);
+        }
+        let UnversionedIndexRecord { id, name, spec, created_at_unix_ms, build_status } = bincode::deserialize(bytes).ok()?;
+        Some(IndexRecord { id, name, spec, created_at_unix_ms, build_status, key_layout_version: 0 })
+    }
+}
+
+/// The sled tree holding an index's keys.
+fn tree_name(id: u32) -> String { format!("index_{id}") }
 
 #[derive(Clone)]
 pub struct Index(Arc<IndexInner>);
@@ -55,11 +89,15 @@ impl IndexManager {
         for item in index_config_tree.iter() {
             let (key, bytes) = item?;
             let key = u32::from_be_bytes(key.as_ref().try_into().map_err(|_| IndexError::InvalidKeyLength)?);
-            if let Ok(mut rec) = bincode::deserialize::<IndexRecord>(&bytes) {
-                // Trust key as source of truth for id
-                rec.id = key;
-                indexes.insert(key, Index::from_record(rec, db, index_config_tree.clone())?);
-            }
+            let Some(rec) = IndexRecord::decode(&bytes) else { continue };
+            // Trust key as source of truth for id
+            let rec = IndexRecord { id: key, ..rec };
+            let index = if rec.key_layout_version == KEY_LAYOUT_VERSION {
+                Index::from_record(rec, db, index_config_tree.clone())?
+            } else {
+                Index::started_over_under_current_layout(rec, db, index_config_tree.clone())?
+            };
+            indexes.insert(key, index);
         }
         Ok(Self { index_config_tree, indexes: RwLock::new(indexes), mutation_lock: Mutex::new(()) })
     }
@@ -186,9 +224,22 @@ impl Index {
             created_at_unix_ms: rec.created_at_unix_ms,
             build_status: Mutex::new(rec.build_status),
             build_lock: Mutex::new(()),
-            tree: db.open_tree(format!("index_{}", rec.id))?,
+            tree: db.open_tree(tree_name(rec.id))?,
             index_config_tree,
         })))
+    }
+
+    /// Start over an index whose tree holds keys of another layout: drop the
+    /// tree, record the index as not built under the current layout, and
+    /// leave the refill to `build_if_needed` on first use. The tree goes
+    /// before the record so that a crash between the two leaves the old
+    /// layout recorded and the drop repeated on the next open.
+    fn started_over_under_current_layout(rec: IndexRecord, db: &Db, index_config_tree: Tree) -> Result<Self, IndexError> {
+        db.drop_tree(tree_name(rec.id))?;
+        let rec = IndexRecord { build_status: BuildStatus::NotBuilt, key_layout_version: KEY_LAYOUT_VERSION, ..rec };
+        let index = Self::from_record(rec, db, index_config_tree)?;
+        index.persist_snapshot()?;
+        Ok(index)
     }
 
     pub fn new_from_spec(
@@ -204,7 +255,7 @@ impl Index {
             created_at_unix_ms: chrono::Utc::now().timestamp_millis(),
             build_status: Mutex::new(BuildStatus::NotBuilt),
             build_lock: Mutex::new(()),
-            tree: db.open_tree(format!("index_{}", id))?,
+            tree: db.open_tree(tree_name(id))?,
             index_config_tree,
         })))
     }
@@ -238,6 +289,7 @@ impl Index {
             spec: self.0.spec.clone(),
             created_at_unix_ms: self.0.created_at_unix_ms,
             build_status: self.status(),
+            key_layout_version: KEY_LAYOUT_VERSION,
         })?;
         self.0.index_config_tree.insert(self.0.id.to_be_bytes(), bytes)?;
         Ok(())
