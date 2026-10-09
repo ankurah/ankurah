@@ -3,16 +3,15 @@ use ankurah_core::{
     error::{MutationError, RetrievalError},
     property::backend::backend_from_string,
     schema::CatalogResolver,
-    value::ValueType,
 };
 use ankurah_proto::{Attested, EntityState, ModelId, PropertyId};
 use ankurah_storage_common::{
-    materialization_index::{index_name, serving_index, ExistingIndex},
+    materialization_index::{index_name, serving_index, ExistingIndex, IndexOutcome, TableIndexes, DDL_RETRY_BACKOFF},
     naming,
 };
-use rusqlite::{params_from_iter, Connection};
+use rusqlite::{params_from_iter, Connection, TransactionBehavior};
 use std::{collections::BTreeMap, sync::Arc};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::{index, SqliteStorageEngine, COLUMN_MAP_TABLE};
 use crate::{
@@ -88,10 +87,10 @@ pub(super) struct Materialization {
     /// were deduped at assignment. Always carries the `PropertyId::Id -> "id"`
     /// pin so a read of the primary key is a uniform map hit.
     property_columns: Arc<std::sync::RwLock<BTreeMap<PropertyId, String>>>,
-    /// This table's indexes as the catalog last listed them: read when a
+    /// This table's indexes as the catalog last listed them, read when a
     /// query first needs an index and again after each one this handle
-    /// creates, so that a query whose index exists runs no DDL.
-    indexes: std::sync::RwLock<Option<Vec<ExistingIndex>>>,
+    /// creates, and the specs this handle runs no DDL for.
+    indexes: std::sync::RwLock<TableIndexes>,
     /// The engine's lock on index DDL, see [`SqliteStorageEngine`].
     index_ddl_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -143,7 +142,7 @@ impl Materialization {
             ddl_lock: Arc::new(tokio::sync::Mutex::new(())),
             resolver: engine.resolver.clone(),
             property_columns: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
-            indexes: std::sync::RwLock::new(None),
+            indexes: std::sync::RwLock::new(TableIndexes::default()),
             index_ddl_lock: engine.index_ddl_lock.clone(),
         };
         let id_pin_key = property_key_text(&PropertyId::Id);
@@ -400,46 +399,87 @@ impl Materialization {
     /// Make sure an index serving `spec` exists on this table, creating it on
     /// first use: the shared planner chose the key, as it does for sled and
     /// IndexedDB, and this is where the engine runs the DDL in place of
-    /// opening a sled tree. The catalog is read again under the engine's
-    /// index DDL lock before anything is created, so two first uses create
-    /// one index and an index another process created is found rather than
-    /// made again. SQLite builds the index within the CREATE INDEX statement:
-    /// the first query waits for that build, as sled's first query waits for
-    /// its backfill, and there is no backfill code. Every index this engine
+    /// opening a sled tree. The decision is taken under the engine's index
+    /// DDL lock and, on the file, inside one immediate write transaction that
+    /// reads the catalog, creates when nothing listed serves, and reads it
+    /// again: two first uses in this engine create one index, and another
+    /// engine on the file sees the catalog before or after, never between,
+    /// so two engines cannot create two indexes that would serve each other.
+    /// SQLite builds the index within the CREATE INDEX statement: the first
+    /// query waits for that build, as sled's first query waits for its
+    /// backfill, and there is no backfill code. Every index this engine
     /// creates goes through here, so a later hook on index creation has one
-    /// place to attach. The query's SQL answers it with or without the index,
-    /// so an index SQLite declines to use costs only its upkeep, and an index
-    /// dropped behind this handle's back is simply not used until the engine
-    /// reopens. A JSON sub-path part declared as any type but JSON gets no
-    /// index at all: its `json_extract` expression would run on every write
-    /// and refuse a value that is not JSON, so the plan is served without one.
-    pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> Result<(), SqliteError> {
-        if spec.keyparts.iter().any(|part| part.sub_path.is_some() && part.value_type != ValueType::Json) {
-            return Ok(());
+    /// place to attach, and the outcome says what was decided. No result
+    /// depends on the index, the query's SQL answering with or without it,
+    /// so a build that fails is logged and the spec waits out a backoff; an
+    /// index dropped behind this handle's back is simply not used until the
+    /// engine reopens. No sub-path part gets an expression index on SQLite:
+    /// its record of a column's type, the declared type, is BLOB for JSON and
+    /// binary values alike and binds nothing, so it cannot establish that the
+    /// column holds only JSON, and `json_extract` in an index would refuse a
+    /// later write of any other value.
+    pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> IndexOutcome {
+        let now = tokio::time::Instant::now().into_std();
+        {
+            let known = self.indexes.read().expect("RwLock poisoned");
+            if let Some(index) = known.serving(spec) {
+                return IndexOutcome::Reused(index.clone());
+            }
+            if known.refuses(spec, now) {
+                return IndexOutcome::Unservable(spec.clone());
+            }
         }
-        if self.indexes.read().expect("RwLock poisoned").as_deref().is_some_and(|known| serving_index(known, spec).is_some()) {
-            return Ok(());
+        if spec.keyparts.iter().any(|part| part.sub_path.is_some()) {
+            self.indexes.write().expect("RwLock poisoned").refuse(spec.clone());
+            return IndexOutcome::Unservable(spec.clone());
         }
         let _ddl = self.index_ddl_lock.lock().await;
-        let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
-        let mut existing = self.list_indexes(&conn).await?;
-        if serving_index(&existing, spec).is_none() {
-            let statement = index::create_index_sql(self.table(), &index_name(self.table(), spec), spec);
-            debug!("Materialization({}).assure_index_exists: {}", self.materialization_table_name, statement);
-            conn.with_connection(move |c| {
-                c.execute(&statement, [])?;
-                Ok(())
-            })
-            .await?;
-            existing = self.list_indexes(&conn).await?;
+        let decided = self.reuse_or_create(spec).await;
+        let mut known = self.indexes.write().expect("RwLock poisoned");
+        match decided {
+            Ok((listed, outcome)) => {
+                known.list(listed);
+                if matches!(outcome, IndexOutcome::Unservable(_)) {
+                    known.refuse(spec.clone());
+                }
+                outcome
+            }
+            Err(error) => {
+                warn!("Materialization({}): no index for {:?}, as making one failed: {}", self.materialization_table_name, spec, error);
+                known.fail(spec.clone(), now + DDL_RETRY_BACKOFF);
+                IndexOutcome::Unservable(spec.clone())
+            }
         }
-        *self.indexes.write().expect("RwLock poisoned") = Some(existing);
-        Ok(())
     }
 
-    async fn list_indexes(&self, conn: &PooledConnection) -> Result<Vec<ExistingIndex>, SqliteError> {
+    /// Reuse the listed index serving `spec` or create one, in one immediate
+    /// write transaction, and list the catalog as it is after. A name already
+    /// taken by an index that does not serve the spec makes the creation a
+    /// no-op and the spec unservable.
+    async fn reuse_or_create(&self, spec: &KeySpec<String>) -> Result<(Vec<ExistingIndex>, IndexOutcome), SqliteError> {
+        let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         let table = self.table().to_owned();
-        conn.with_connection(move |c| index::list_indexes(c, &table)).await
+        let spec = spec.clone();
+        conn.with_connection_mut(move |c| {
+            let transaction = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let listed = index::list_indexes(&transaction, &table)?;
+            if let Some(index) = serving_index(&listed, &spec) {
+                let outcome = IndexOutcome::Reused(index.clone());
+                transaction.commit()?;
+                return Ok((listed, outcome));
+            }
+            let statement = index::create_index_sql(&table, &index_name(&table, &spec), &spec);
+            debug!("Materialization({table}).assure_index_exists: {statement}");
+            transaction.execute(&statement, [])?;
+            let listed = index::list_indexes(&transaction, &table)?;
+            let outcome = match serving_index(&listed, &spec) {
+                Some(index) => IndexOutcome::Created(index.clone()),
+                None => IndexOutcome::Unservable(spec),
+            };
+            transaction.commit()?;
+            Ok((listed, outcome))
+        })
+        .await
     }
 
     async fn add_missing_columns(&self, conn: &PooledConnection, missing: Vec<(String, &'static str)>) -> Result<(), SqliteError> {

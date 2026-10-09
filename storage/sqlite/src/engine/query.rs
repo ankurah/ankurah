@@ -16,8 +16,8 @@ use crate::{
 
 /// A selection over joined materializations, with any unsupported predicate retained for Rust.
 pub(super) struct Query {
-    sql: String,
-    params: Vec<rusqlite::types::Value>,
+    pub(super) sql: String,
+    pub(super) params: Vec<rusqlite::types::Value>,
     remaining: Selection<Resolved>,
 }
 
@@ -39,13 +39,14 @@ impl Query {
         }
         // The materialization that serves the selection gets the index its
         // plan reads, before the query's read snapshot opens. A SQLite index
-        // takes a direction per column, so the engine serves every plan.
+        // takes a direction per column, so the engine serves every plan. The
+        // outcome is not consumed yet; see `IndexOutcome`.
         if let Some((model, served)) = plan.indexed_materialization() {
             if let Some(table) = tables.iter().find(|table| table.model == model) {
                 if let Some(Plan::Index { index_spec, .. }) =
                     plan_on_materialization(&served, &table.columns, PlannerConfig::full_support())
                 {
-                    engine.materialization(&model).await?.assure_index_exists(&index_spec).await?;
+                    engine.materialization(&model).await?.assure_index_exists(&index_spec).await;
                 }
             }
         }

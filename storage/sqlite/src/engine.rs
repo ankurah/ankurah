@@ -712,6 +712,27 @@ mod tests {
         assert_eq!(engine.fetch_states(&all.clone().and_member_of(model)).await.unwrap().len(), 2);
     }
 
+    fn state_with_values(entity_id: EntityId, event_byte: u8, values: &[(PropertyId, Value)]) -> Attested<EntityState> {
+        let backend = LWWBackend::new();
+        for (property, value) in values {
+            backend.set(*property, Some(value.clone()));
+        }
+        let operations = backend.to_operations().unwrap().expect("state has values");
+        let event_id = EventId::from_bytes([event_byte; 32]);
+        backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
+        Attested::opt(
+            EntityState {
+                entity_id,
+                state: State {
+                    state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
+                    memberships: BTreeSet::new(),
+                    head: Clock::genesis(event_id),
+                },
+            },
+            None,
+        )
+    }
+
     /// The names of the indexes created on `table`, from SQLite's catalog.
     async fn created_index_names(engine: &SqliteStorageEngine, table: &str) -> Vec<String> {
         let conn = engine.pool.get().await.unwrap();
@@ -725,33 +746,189 @@ mod tests {
         .unwrap()
     }
 
-    /// A JSON sub-path part declared as any type but JSON gets no expression
-    /// index, since `json_extract` in an index would refuse later writes of
-    /// values that are not JSON; the query runs without one. Only a selection
-    /// built without the catalog resolver carries such a part, and the stored
-    /// text here is a JSON number so that `json_extract`, which the query runs
-    /// with or without an index, answers.
+    /// `property = literal` within `model`, with an optional sub-path below the property.
+    fn equals(model: ModelId, property: PropertyId, sub_path: &[&str], literal: Value) -> ankql::ast::Selection<Resolved> {
+        let mut path = ankql::ast::PropertyPath::from(property);
+        path.subpath = sub_path.iter().map(|step| (*step).to_owned()).collect();
+        ankql::ast::Selection::from(ankql::ast::Predicate::Comparison {
+            left: Box::new(ankql::ast::Expr::Path(path)),
+            operator: ankql::ast::ComparisonOperator::Equal,
+            right: Box::new(ankql::ast::Expr::Literal(literal)),
+        })
+        .and_member_of(model)
+    }
+
+    /// Every statement the in-memory engine's one connection runs, once
+    /// `trace_statements` was called on it. Tests that trace hold `TRACING`
+    /// for their whole run, so that one test's statements never land in
+    /// another's.
+    static STATEMENTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    static TRACING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn record_statement(statement: &str) { STATEMENTS.lock().unwrap().push(statement.to_owned()); }
+
+    async fn trace_statements(engine: &SqliteStorageEngine) {
+        let conn = engine.pool.get().await.unwrap();
+        conn.with_connection_mut(|c| {
+            c.trace(Some(record_statement));
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The statements creating one of the engine's own indexes traced since
+    /// the last call; the shared tables' index, which every query makes sure
+    /// of, is not one.
+    fn traced_index_ddl() -> Vec<String> {
+        use ankurah_storage_common::materialization_index::INDEX_NAME_PREFIX;
+        STATEMENTS
+            .lock()
+            .unwrap()
+            .drain(..)
+            .filter(|statement| statement.starts_with("CREATE INDEX") && statement.contains(INDEX_NAME_PREFIX))
+            .collect()
+    }
+
+    /// A query on a JSON sub-path creates no index on SQLite: the declared
+    /// type of a column is BLOB for JSON and binary values alike and binds
+    /// nothing, so the engine cannot know the column holds only JSON, and an
+    /// index on `json_extract` would refuse a later write of any other
+    /// value. The query answers, and a string written to the property after
+    /// the query is accepted.
     #[tokio::test]
-    async fn a_sub_path_part_declared_non_json_gets_no_index() {
+    async fn a_sub_path_query_creates_no_index_and_a_later_non_json_write_succeeds() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let model = ModelId::EntityId(entity_id(0xa1));
         let property = PropertyId::EntityId(entity_id(0xa2));
-        commit_state(&engine, Clock::default(), model, state_with_strings(entity_id(0xa3), 1, &[(property, "7")])).await;
+        let entity = entity_id(0xa3);
+        let json = state_with_values(entity, 1, &[(property, Value::Json(serde_json::json!({ "kind": "mention" })))]);
+        commit_state(&engine, Clock::default(), model, json.clone()).await;
         let table = engine.materialization(&model).await.unwrap().table().to_owned();
-        let kind_equals = |literal: Value| {
-            let mut path = ankql::ast::PropertyPath::from(property);
-            path.subpath = vec!["kind".to_owned()];
-            ankql::ast::Selection::from(ankql::ast::Predicate::Comparison {
-                left: Box::new(ankql::ast::Expr::Path(path)),
-                operator: ankql::ast::ComparisonOperator::Equal,
-                right: Box::new(ankql::ast::Expr::Literal(literal)),
+
+        let found = engine.fetch_states(&equals(model, property, &["kind"], Value::Json(serde_json::json!("mention")))).await.unwrap();
+        assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), [entity]);
+        assert!(created_index_names(&engine, &table).await.is_empty());
+
+        let text = state_for_model(state_with_strings(entity, 2, &[(property, "hello")]), model);
+        commit_canonical_state(&engine, json.payload.state.head, text.clone()).await;
+        assert_eq!(engine.get_state(entity).await.unwrap().payload.state, text.payload.state);
+    }
+
+    /// Allow or forbid writes on the in-memory engine's one connection.
+    async fn set_query_only(engine: &SqliteStorageEngine, on: bool) {
+        let conn = engine.pool.get().await.unwrap();
+        conn.with_connection(move |c| {
+            c.execute_batch(&format!("PRAGMA query_only = {}", if on { "ON" } else { "OFF" }))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+
+    /// A build that fails, here because the write transaction it needs cannot
+    /// open on a connection that may not write, leaves the query answering
+    /// from its SQL without the index, and the next query for the same key
+    /// runs no DDL at all: the spec waits out a backoff.
+    #[tokio::test]
+    async fn a_failed_build_leaves_the_query_answering_and_runs_no_ddl_until_the_backoff_is_over() {
+        let _tracing = TRACING.lock().await;
+        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let model = ModelId::EntityId(entity_id(0xb1));
+        let [status, kind] = [0xb2, 0xb3].map(|byte| PropertyId::EntityId(entity_id(byte)));
+        commit_state(&engine, Clock::default(), model, state_with_strings(entity_id(0xb4), 1, &[(status, "unread"), (kind, "mention")]))
+            .await;
+        let table = engine.materialization(&model).await.unwrap().table().to_owned();
+        trace_statements(&engine).await;
+        let by_kind = equals(model, kind, &[], Value::String("mention".into()));
+        assert_eq!(engine.fetch_states(&by_kind).await.unwrap().len(), 1);
+        assert_eq!(traced_index_ddl().len(), 1, "while writes are allowed, a first use creates its index");
+
+        set_query_only(&engine, true).await;
+        let unread = equals(model, status, &[], Value::String("unread".into()));
+        assert_eq!(engine.fetch_states(&unread).await.unwrap().len(), 1, "the query answers without the index");
+        assert!(traced_index_ddl().is_empty(), "the build failed before its statement");
+        set_query_only(&engine, false).await;
+        assert_eq!(engine.fetch_states(&unread).await.unwrap().len(), 1);
+        assert!(traced_index_ddl().is_empty(), "within the backoff no DDL runs");
+        assert_eq!(created_index_names(&engine, &table).await.len(), 1, "only the first key's index exists");
+    }
+
+    /// The index the engine creates is one SQLite reads for the engine's own
+    /// query: its WHERE clause searches the materialization by the index, and
+    /// its ORDER BY needs no sort.
+    #[tokio::test]
+    async fn the_created_index_serves_the_engine_s_own_where_and_order_by() {
+        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let model = ModelId::EntityId(entity_id(0xc1));
+        let [status, kind] = [0xc2, 0xc3].map(|byte| PropertyId::EntityId(entity_id(byte)));
+        for (byte, kind_value) in [(0xc4, "mention"), (0xc5, "reply")] {
+            commit_state(
+                &engine,
+                Clock::default(),
+                model,
+                state_with_strings(entity_id(byte), byte, &[(status, "unread"), (kind, kind_value)]),
+            )
+            .await;
+        }
+        let mut selection = equals(model, status, &[], Value::String("unread".into()));
+        selection.order_by = Some(vec![ankql::ast::OrderByItem { path: kind.into(), direction: ankql::ast::OrderDirection::Desc }]);
+        let found = engine.fetch_states(&selection).await.unwrap();
+        assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), [entity_id(0xc5), entity_id(0xc4)]);
+
+        let query = query::Query::prepare(&engine, &selection).await.unwrap();
+        let conn = engine.pool.get().await.unwrap();
+        let plan: Vec<String> = conn
+            .with_connection(move |c| {
+                let mut statement = c.prepare(&format!("EXPLAIN QUERY PLAN {}", query.sql))?;
+                let steps = statement
+                    .query_map(rusqlite::params_from_iter(&query.params), |row| row.get::<_, String>(3))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(steps)
             })
-            .and_member_of(model)
-        };
-        assert!(engine.fetch_states(&kind_equals(Value::String("x".into()))).await.unwrap().is_empty());
-        assert!(created_index_names(&engine, &table).await.is_empty(), "a part declared a string gets no expression index");
-        assert!(engine.fetch_states(&kind_equals(Value::Json(serde_json::json!("x")))).await.unwrap().is_empty());
-        assert_eq!(created_index_names(&engine, &table).await.len(), 1, "a part declared JSON gets one");
+            .await
+            .unwrap();
+        assert!(plan.iter().any(|step| step.contains("USING INDEX _ankurah_index__")), "{plan:?}");
+        assert!(!plan.iter().any(|step| step.contains("TEMP B-TREE")), "{plan:?}");
+    }
+
+    /// Another index on the name the engine would use, which does not serve
+    /// the plan, makes the plan unservable: the query answers, and no DDL
+    /// runs for that key again.
+    #[tokio::test]
+    async fn a_stranger_s_index_on_the_engine_s_name_makes_the_plan_unservable() {
+        let _tracing = TRACING.lock().await;
+        use ankurah_core::indexing::{IndexKeyPart, KeySpec};
+        use ankurah_storage_common::materialization_index::{index_name, IndexOutcome};
+
+        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let model = ModelId::EntityId(entity_id(0xd1));
+        let [status, kind] = [0xd2, 0xd3].map(|byte| PropertyId::EntityId(entity_id(byte)));
+        commit_state(&engine, Clock::default(), model, state_with_strings(entity_id(0xd4), 1, &[(status, "unread"), (kind, "mention")]))
+            .await;
+        let materialization = engine.materialization(&model).await.unwrap();
+        let status_column = materialization.column_for_property(&status).await.unwrap();
+        let kind_column = materialization.column_for_property(&kind).await.unwrap();
+        let spec = KeySpec::new(vec![IndexKeyPart::asc(status_column, ankurah_core::value::ValueType::String)]);
+        let stranger =
+            format!(r#"CREATE INDEX "{}" ON "{}" ("{kind_column}")"#, index_name(materialization.table(), &spec), materialization.table());
+        let conn = engine.pool.get().await.unwrap();
+        conn.with_connection(move |c| {
+            c.execute(&stranger, [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        drop(conn);
+        trace_statements(&engine).await;
+
+        assert!(matches!(materialization.assure_index_exists(&spec).await, IndexOutcome::Unservable(_)));
+        assert_eq!(traced_index_ddl().len(), 1, "the name was tried once");
+        assert!(matches!(materialization.assure_index_exists(&spec).await, IndexOutcome::Unservable(_)));
+        assert!(traced_index_ddl().is_empty(), "the key is not tried again");
+        let found = engine.fetch_states(&equals(model, status, &[], Value::String("unread".into()))).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(created_index_names(&engine, materialization.table()).await.len(), 1, "only the stranger's index exists");
     }
 
     #[tokio::test]
