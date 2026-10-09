@@ -1,4 +1,3 @@
-#[cfg(debug_assertions)]
 use ankql::ast::Predicate;
 use ankql::ast::Resolved;
 use ankql::selection::map_references;
