@@ -3,11 +3,10 @@ use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     property::backend::backend_from_string,
     schema::CatalogResolver,
-    value::ValueType,
 };
 use ankurah_proto::{Attested, EntityId, EntityState, ModelId, PropertyId};
 use ankurah_storage_common::{
-    materialization_index::{serving_index, ExistingIndex},
+    materialization_index::{serving_index, ExistingIndex, IndexOutcome, TableIndexes, DDL_RETRY_BACKOFF},
     naming,
 };
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
@@ -44,10 +43,10 @@ pub(crate) struct Materialization {
     /// `PropertyId::Id -> "id"` pin so a read of the primary key is a uniform
     /// map hit.
     property_columns: Arc<RwLock<BTreeMap<PropertyId, String>>>,
-    /// This table's indexes as the catalog last listed them: read when a
+    /// This table's indexes as the catalog last listed them, read when a
     /// query first needs an index and again after each one this handle
-    /// creates, so that a query whose index exists runs no DDL.
-    indexes: RwLock<Option<Vec<ExistingIndex>>>,
+    /// creates, and the specs this handle runs no DDL for.
+    indexes: RwLock<TableIndexes>,
     /// The engine's lock on index DDL, see [`Postgres`].
     index_ddl_lock: Arc<tokio::sync::Mutex<()>>,
 }
@@ -126,7 +125,7 @@ impl Materialization {
             resolver: resolver.clone(),
             columns: Arc::new(RwLock::new(Vec::new())),
             property_columns: Arc::new(RwLock::new(BTreeMap::new())),
-            indexes: RwLock::new(None),
+            indexes: RwLock::new(TableIndexes::default()),
             index_ddl_lock: engine.index_ddl_lock.clone(),
         };
 
@@ -443,46 +442,90 @@ impl Materialization {
     /// Make sure an index serving `spec` exists on this table, creating it on
     /// first use: the shared planner chose the key, as it does for sled and
     /// IndexedDB, and this is where the engine runs the DDL in place of
-    /// opening a sled tree. The catalog is read again under the engine's
-    /// index DDL lock before anything is created, so two first uses in this
-    /// engine create one index; the creation itself runs under an advisory
-    /// lock on the index's name, because another node on the same database
-    /// can reach it at the same time, and two sessions creating one name at
-    /// once fail on the catalog's uniqueness where the second, made to wait,
-    /// finds the index instead. PostgreSQL builds the index within the plain
-    /// CREATE INDEX statement, run outside any transaction: the first query
-    /// waits for that build, as sled's first query waits for its backfill,
-    /// and there is no backfill code. Every index this engine creates goes
-    /// through here, so a later hook on index creation has one place to
-    /// attach. The query's SQL answers it with or without the index, so an
-    /// index PostgreSQL declines to use costs only its upkeep, and an index
-    /// dropped behind this handle's back is simply not used until the engine
-    /// reopens. A JSON sub-path part declared as any type but JSON gets no
-    /// index at all: its `->` expression would run on every write and is
-    /// refused on a column that is not jsonb, so the plan is served without
-    /// one.
-    pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> Result<(), RetrievalError> {
-        if spec.keyparts.iter().any(|part| part.sub_path.is_some() && part.value_type != ValueType::Json) {
-            return Ok(());
+    /// opening a sled tree. The decision is taken under the engine's index
+    /// DDL lock and, on the database, inside one transaction holding the
+    /// transaction-scoped advisory lock of this table, which reads the
+    /// catalog, creates when nothing listed serves, and reads it again: two
+    /// first uses in this engine create one index, and another node on the
+    /// same database decides after this one, so two nodes cannot create two
+    /// indexes that would serve each other; a cancelled or dropped session
+    /// rolls its transaction back and so releases the lock. The plain CREATE
+    /// INDEX, never CONCURRENTLY, builds the index within that transaction:
+    /// the first query waits for the build, as sled's first query waits for
+    /// its backfill, and there is no backfill code. Every index this engine
+    /// creates goes through here, so a later hook on index creation has one
+    /// place to attach, and the outcome says what was decided. No result
+    /// depends on the index, the query's SQL answering with or without it,
+    /// so a build that fails is logged and the spec waits out a backoff; an
+    /// index dropped behind this handle's back is simply not used until the
+    /// engine reopens. A sub-path part gets an expression index only on a
+    /// column this handle's schema records as jsonb, which holds nothing but
+    /// JSON, so the `->` expression in the index can refuse no write the
+    /// column would take; any other column leaves the plan without an index.
+    pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> IndexOutcome {
+        let now = tokio::time::Instant::now().into_std();
+        {
+            let known = self.indexes.read().unwrap();
+            if let Some(index) = known.serving(spec) {
+                return IndexOutcome::Reused(index.clone());
+            }
+            if known.refuses(spec, now) {
+                return IndexOutcome::Unservable(spec.clone());
+            }
         }
-        if self.indexes.read().unwrap().as_deref().is_some_and(|known| serving_index(known, spec).is_some()) {
-            return Ok(());
+        if spec.keyparts.iter().any(|part| part.sub_path.is_some() && !self.holds_json(&part.key)) {
+            self.indexes.write().unwrap().refuse(spec.clone());
+            return IndexOutcome::Unservable(spec.clone());
         }
         let _ddl = self.index_ddl_lock.lock().await;
-        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
-        let mut existing = index::list_indexes(&client, self.table()).await.map_err(RetrievalError::storage)?;
-        if serving_index(&existing, spec).is_none() {
-            let name = index::index_name(self.table(), spec);
-            let statement = index::create_index_sql(self.table(), &name, spec);
-            debug!("Materialization({}).assure_index_exists: {}", self.materialization_table_name, statement);
-            let lock_key = acquire_ddl_lock(&client, &name).await.map_err(RetrievalError::storage)?;
-            let created = client.execute(&statement, &[]).await;
-            release_ddl_lock(&client, lock_key).await.map_err(RetrievalError::storage)?;
-            created.map_err(RetrievalError::storage)?;
-            existing = index::list_indexes(&client, self.table()).await.map_err(RetrievalError::storage)?;
+        let decided = self.reuse_or_create(spec).await;
+        let mut known = self.indexes.write().unwrap();
+        match decided {
+            Ok((listed, outcome)) => {
+                known.list(listed);
+                if matches!(outcome, IndexOutcome::Unservable(_)) {
+                    known.refuse(spec.clone());
+                }
+                outcome
+            }
+            Err(error) => {
+                warn!("Materialization({}): no index for {:?}, as making one failed: {}", self.materialization_table_name, spec, error);
+                known.fail(spec.clone(), now + DDL_RETRY_BACKOFF);
+                IndexOutcome::Unservable(spec.clone())
+            }
         }
-        *self.indexes.write().unwrap() = Some(existing);
-        Ok(())
+    }
+
+    /// Whether this handle's schema records `column` as jsonb.
+    fn holds_json(&self, column: &str) -> bool { self.column(&column.to_owned()).is_some_and(|column| column.data_type == "jsonb") }
+
+    /// Reuse the listed index serving `spec` or create one, in one
+    /// transaction under the table's advisory lock, and list the catalog as
+    /// it is after. A name already taken by an index that does not serve the
+    /// spec makes the creation a no-op and the spec unservable.
+    async fn reuse_or_create(&self, spec: &KeySpec<String>) -> Result<(Vec<ExistingIndex>, IndexOutcome), RetrievalError> {
+        let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        let transaction = client.transaction().await.map_err(RetrievalError::storage)?;
+        transaction
+            .execute("SELECT pg_advisory_xact_lock($1)", &[&index::ddl_lock_key(self.table())])
+            .await
+            .map_err(RetrievalError::storage)?;
+        let listed = index::list_indexes(&transaction, self.table()).await.map_err(RetrievalError::storage)?;
+        if let Some(index) = serving_index(&listed, spec) {
+            let outcome = IndexOutcome::Reused(index.clone());
+            transaction.commit().await.map_err(RetrievalError::storage)?;
+            return Ok((listed, outcome));
+        }
+        let statement = index::create_index_sql(self.table(), &index::index_name(self.table(), spec), spec);
+        debug!("Materialization({}).assure_index_exists: {}", self.materialization_table_name, statement);
+        transaction.execute(&statement, &[]).await.map_err(RetrievalError::storage)?;
+        let listed = index::list_indexes(&transaction, self.table()).await.map_err(RetrievalError::storage)?;
+        let outcome = match serving_index(&listed, spec) {
+            Some(index) => IndexOutcome::Created(index.clone()),
+            None => IndexOutcome::Unservable(spec.clone()),
+        };
+        transaction.commit().await.map_err(RetrievalError::storage)?;
+        Ok((listed, outcome))
     }
 
     pub async fn add_missing_columns(

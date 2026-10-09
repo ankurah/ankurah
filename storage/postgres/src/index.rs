@@ -9,9 +9,14 @@ use ankurah_core::indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder};
 use ankurah_core::value::ValueType;
 use ankurah_storage_common::materialization_index::{self, ExistingIndex};
 use sha2::{Digest, Sha256};
-use tokio_postgres::Client;
+use tokio_postgres::GenericClient;
 
-use crate::{quote_identifier, IDENTIFIER_MAX_BYTES};
+use crate::{advisory_lock_key, quote_identifier, IDENTIFIER_MAX_BYTES};
+
+/// The advisory lock key under which index DDL on `table` runs: one key per
+/// table, so that two sessions deciding on indexes for one table decide one
+/// after the other and never create two indexes that would serve each other.
+pub(super) fn ddl_lock_key(table: &str) -> i64 { advisory_lock_key(&format!("ankurah_index_ddl:{table}")) }
 
 /// The name of the index for `spec` on `table`, within PostgreSQL's
 /// identifier limit: the shared name when it fits, else its head followed by
@@ -69,47 +74,81 @@ fn jsonb_path_sql(column: &str, steps: &[String]) -> String {
 }
 
 /// The indexes the catalog lists on `table`, each as the key spec it serves.
-/// A partial or invalid index serves nothing. Each key column and its
-/// direction come from `pg_index`; an expression column is read back from
+/// Only a valid, whole (not partial) btree index with the default operator
+/// class on every key column is listed: any other cannot supply the ordered,
+/// collated scan a plan expects, and serves nothing. Each key column and its
+/// direction come from `pg_index`, with its nulls order when that is not the
+/// default for its direction; an expression column is read back from
 /// `pg_get_indexdef`'s rendering of it, where only this engine's `->` chain
 /// is recognized: an index with any other expression serves nothing. The
 /// catalog records no value type and `KeySpec::matches` reads none, so each
 /// part carries `ValueType::String`, as the planner's own ORDER BY parts do;
-/// a part's nulls order is likewise not read back, as matching ignores it.
-pub(super) async fn list_indexes(client: &Client, table: &str) -> Result<Vec<ExistingIndex>, tokio_postgres::Error> {
+/// collation is not read back, as the planner never asks for one.
+pub(super) async fn list_indexes<C: GenericClient>(client: &C, table: &str) -> Result<Vec<ExistingIndex>, tokio_postgres::Error> {
     let rows = client
         .query(
-            "SELECT ic.relname AS name, i.indkey[k - 1] = 0 AS expression, (i.indoption[k - 1] & 1) = 1 AS descending, \
-                    pg_get_indexdef(i.indexrelid, k, true) AS definition \
-             FROM pg_index AS i JOIN pg_class AS ic ON ic.oid = i.indexrelid, generate_series(1, i.indnkeyatts) AS k \
-             WHERE i.indrelid = to_regclass($1) AND i.indisvalid AND i.indpred IS NULL \
+            "SELECT ic.relname AS name, i.indkey[k - 1] = 0 AS expression, \
+                    (i.indoption[k - 1] & 1) = 1 AS descending, (i.indoption[k - 1] & 2) = 2 AS nulls_first, \
+                    opc.opcdefault AS default_opclass, pg_get_indexdef(i.indexrelid, k, true) AS definition \
+             FROM pg_index AS i \
+               JOIN pg_class AS ic ON ic.oid = i.indexrelid \
+               JOIN pg_am AS am ON am.oid = ic.relam \
+               CROSS JOIN LATERAL generate_series(1, i.indnkeyatts) AS k \
+               JOIN pg_opclass AS opc ON opc.oid = i.indclass[k - 1] \
+             WHERE i.indrelid = to_regclass($1) AND i.indisvalid AND i.indpred IS NULL AND am.amname = 'btree' \
              ORDER BY ic.relname, k",
             &[&quote_identifier(table)],
         )
         .await?;
-    let mut columns: BTreeMap<String, Vec<(bool, bool, String)>> = BTreeMap::new();
+    let mut columns: BTreeMap<String, Vec<CatalogColumn>> = BTreeMap::new();
     for row in rows {
-        columns.entry(row.get("name")).or_default().push((row.get("expression"), row.get("descending"), row.get("definition")));
+        columns.entry(row.get("name")).or_default().push(CatalogColumn {
+            expression: row.get("expression"),
+            descending: row.get("descending"),
+            nulls_first: row.get("nulls_first"),
+            default_opclass: row.get("default_opclass"),
+            definition: row.get("definition"),
+        });
     }
 
     let mut existing = Vec::new();
     'index: for (name, columns) in columns {
         let mut keyparts = Vec::with_capacity(columns.len());
-        for (expression, descending, definition) in columns {
-            let (key, sub_path) = if expression {
-                match jsonb_path(&definition) {
+        for column in columns {
+            if !column.default_opclass {
+                continue 'index;
+            }
+            let (key, sub_path) = if column.expression {
+                match jsonb_path(&column.definition) {
                     Some((column, steps)) => (column, Some(steps)),
                     None => continue 'index,
                 }
             } else {
-                (unquote_identifier(&definition), None)
+                (unquote_identifier(&column.definition), None)
             };
-            let direction = if descending { IndexDirection::Desc } else { IndexDirection::Asc };
-            keyparts.push(IndexKeyPart { key, sub_path, direction, value_type: ValueType::String, nulls: None, collation: None });
+            let direction = if column.descending { IndexDirection::Desc } else { IndexDirection::Asc };
+            // PostgreSQL puts NULLs first in a descending column and last in an ascending one unless told otherwise.
+            let nulls = if column.nulls_first == column.descending {
+                None
+            } else if column.nulls_first {
+                Some(NullsOrder::First)
+            } else {
+                Some(NullsOrder::Last)
+            };
+            keyparts.push(IndexKeyPart { key, sub_path, direction, value_type: ValueType::String, nulls, collation: None });
         }
         existing.push(ExistingIndex { name, spec: KeySpec::new(keyparts) });
     }
     Ok(existing)
+}
+
+/// One key column of an index as `pg_index` and `pg_get_indexdef` describe it.
+struct CatalogColumn {
+    expression: bool,
+    descending: bool,
+    nulls_first: bool,
+    default_opclass: bool,
+    definition: String,
 }
 
 /// The column and steps of a `->` chain as `pg_get_indexdef` renders one this
@@ -148,9 +187,10 @@ mod tests {
         let mut nulls_first = part("status", IndexDirection::Desc);
         nulls_first.nulls = Some(NullsOrder::First);
         let spec = KeySpec::new(vec![nulls_first, part("detail.kind.name", IndexDirection::Asc)]);
+        let name = index_name("notification", &spec);
         assert_eq!(
-            create_index_sql("notification", &index_name("notification", &spec), &spec),
-            r#"CREATE INDEX IF NOT EXISTS "notification__status desc(nulls=first)__detail.kind.name asc" ON "notification" ("status" DESC NULLS FIRST, ("detail"->'kind'->'name') ASC)"#
+            create_index_sql("notification", &name, &spec),
+            format!(r#"CREATE INDEX IF NOT EXISTS "{name}" ON "notification" ("status" DESC NULLS FIRST, ("detail"->'kind'->'name') ASC)"#)
         );
     }
 
@@ -159,10 +199,10 @@ mod tests {
         let long = |column: &str| KeySpec::new(vec![part(&format!("{column}_{}", "x".repeat(60)), IndexDirection::Asc)]);
         let [a, b] = [index_name("notification", &long("a")), index_name("notification", &long("b"))];
         assert_eq!(a.len(), IDENTIFIER_MAX_BYTES);
-        assert!(a.starts_with("notification__a_xxx"), "{a}");
+        assert!(a.starts_with("_ankurah_index__notification__a_xxx"), "{a}");
         assert_ne!(a, b, "two long specs with one head get two names");
         assert_eq!(a, index_name("notification", &long("a")));
-        assert_eq!(index_name("notification", &part_spec("status")), "notification__status asc");
+        assert_eq!(index_name("notification", &part_spec("status")), "_ankurah_index__notification__status asc");
     }
 
     #[test]

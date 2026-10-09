@@ -766,21 +766,17 @@ mod tests {
         Ok(())
     }
 
-    /// A JSON sub-path part declared as any type but JSON gets no expression
-    /// index: its `->` expression would run on every write and PostgreSQL
-    /// refuses it on a column that is not jsonb, so the plan is served
-    /// without one. PostgreSQL's `->` rejects a query on such a column before
-    /// any index question, so the check is exercised at the creation
-    /// function, on the column of a stored JSON value.
-    #[tokio::test]
-    async fn a_sub_path_part_declared_non_json_gets_no_index() -> anyhow::Result<()> {
-        use ankurah_core::{
-            indexing::{IndexDirection, IndexKeyPart, KeySpec},
-            property::backend::{lww::LWWBackend, PropertyBackend},
-            value::{Value, ValueType},
-        };
-        use ankurah_proto::PropertyId;
+    use ankurah_core::{
+        indexing::{IndexDirection, IndexKeyPart, KeySpec},
+        property::backend::{lww::LWWBackend, PropertyBackend},
+        value::{Value, ValueType},
+    };
+    use ankurah_proto::PropertyId;
+    use ankurah_storage_common::materialization_index::{index_name, serving_index, ExistingIndex, IndexOutcome};
+    use testcontainers_modules::testcontainers::ContainerAsync;
 
+    /// A test server and an engine on it, with the server's connection string for a second engine.
+    async fn test_engine() -> anyhow::Result<(ContainerAsync<postgres::Postgres>, Postgres, String)> {
         let container = postgres::Postgres::default().with_init_sql(include_bytes!("../tests/pg_init.sql").to_vec()).start().await?;
         let uri = format!(
             "host={} port={} user=postgres password=postgres dbname=postgres",
@@ -788,55 +784,278 @@ mod tests {
             container.get_host_port_ipv4(5432).await?,
         );
         let engine = Postgres::open(&uri).await?;
-        let model = ModelId::EntityId(EntityId::from_bytes([0xa1; EntityId::BYTE_LEN]));
-        let property = PropertyId::EntityId(EntityId::from_bytes([0xa2; EntityId::BYTE_LEN]));
+        Ok((container, engine, uri))
+    }
+
+    fn entity_id(byte: u8) -> EntityId { EntityId::from_bytes([byte; EntityId::BYTE_LEN]) }
+
+    fn state_with_values(entity_id: EntityId, event_byte: u8, model: ModelId, values: &[(PropertyId, Value)]) -> Attested<EntityState> {
         let backend = LWWBackend::new();
-        backend.set(property, Some(Value::Json(serde_json::json!({ "kind": "mention" }))));
-        let operations = backend.to_operations()?.expect("the state has a value");
-        let event_id = EventId::from_bytes([1; 32]);
-        backend.apply_operations_with_event(&operations, event_id.clone())?;
-        let state = Attested::opt(
+        for (property, value) in values {
+            backend.set(*property, Some(value.clone()));
+        }
+        let operations = backend.to_operations().unwrap().expect("state has values");
+        let event_id = EventId::from_bytes([event_byte; 32]);
+        backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
+        Attested::opt(
             EntityState {
-                entity_id: EntityId::from_bytes([0xa3; EntityId::BYTE_LEN]),
+                entity_id,
                 state: State {
-                    state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer()?)])),
+                    state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                     memberships: [model].into(),
                     head: Clock::genesis(event_id),
                 },
             },
             None,
-        );
-        let mut transaction = engine.transaction();
-        transaction.set_state(&Clock::default(), &state).await?;
-        assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+        )
+    }
 
-        let materialization = engine.materialization(&model).await?;
-        let client = engine.pool.get().await?;
-        let column: String = client
-            .query_one(
-                "SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name <> 'id'",
-                &[&materialization.table()],
-            )
+    async fn commit_state(engine: &Postgres, expected_head: &Clock, state: &Attested<EntityState>) -> anyhow::Result<()> {
+        let mut transaction = engine.transaction();
+        transaction.set_state(expected_head, state).await?;
+        assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+        Ok(())
+    }
+
+    /// `property = literal` within `model`, with an optional sub-path below the property.
+    fn equals(model: ModelId, property: PropertyId, sub_path: &[&str], literal: Value) -> ankql::ast::Selection<Resolved> {
+        let mut path = ankql::ast::PropertyPath::from(property);
+        path.subpath = sub_path.iter().map(|step| (*step).to_owned()).collect();
+        ankql::ast::Selection::from(ankql::ast::Predicate::Comparison {
+            left: Box::new(ankql::ast::Expr::Path(path)),
+            operator: ankql::ast::ComparisonOperator::Equal,
+            right: Box::new(ankql::ast::Expr::Literal(literal)),
+        })
+        .and_member_of(model)
+    }
+
+    /// The one column of `table` the schema records with `data_type`.
+    async fn column_of_type(client: &tokio_postgres::Client, table: &str, data_type: &str) -> anyhow::Result<String> {
+        let rows = client
+            .query("SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND data_type = $2", &[&table, &data_type])
+            .await?;
+        assert_eq!(rows.len(), 1, "one {data_type} column on {table}");
+        Ok(rows[0].get(0))
+    }
+
+    /// The names of the indexes on `table` besides its primary key, from PostgreSQL's catalog.
+    async fn created_index_names(client: &tokio_postgres::Client, table: &str) -> anyhow::Result<Vec<String>> {
+        Ok(client
+            .query("SELECT indexname FROM pg_indexes WHERE tablename = $1 AND indexname NOT LIKE '%_pkey' ORDER BY indexname", &[&table])
             .await?
-            .get(0);
-        let index_names = || async {
-            client
-                .query("SELECT indexname FROM pg_indexes WHERE tablename = $1 AND indexname NOT LIKE '%_pkey'", &[&materialization.table()])
-                .await
-                .map(|rows| rows.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())
-        };
-        let kind_part = |value_type| IndexKeyPart {
-            key: column.clone(),
+            .into_iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect())
+    }
+
+    fn sub_path_part(column: String, direction: IndexDirection) -> IndexKeyPart<String> {
+        IndexKeyPart {
+            key: column,
             sub_path: Some(vec!["kind".to_owned()]),
-            direction: IndexDirection::Asc,
-            value_type,
+            direction,
+            value_type: ValueType::Json,
             nulls: None,
             collation: None,
+        }
+    }
+
+    /// A sub-path part gets an expression index only on a column the schema
+    /// records as jsonb, decided by that record, not by the plan part: a
+    /// jsonb column holds nothing but JSON, so the index can refuse no write
+    /// the column would take, and later writes of JSON and of a string to
+    /// their columns both succeed.
+    #[tokio::test]
+    async fn an_expression_index_is_created_only_on_a_jsonb_column_and_fails_no_write() -> anyhow::Result<()> {
+        let (_container, engine, _) = test_engine().await?;
+        let model = ModelId::EntityId(entity_id(0xa1));
+        let [json, text] = [0xa2, 0xa3].map(|byte| PropertyId::EntityId(entity_id(byte)));
+        let entity = entity_id(0xa4);
+        let first = state_with_values(
+            entity,
+            1,
+            model,
+            &[(json, Value::Json(serde_json::json!({ "kind": "mention" }))), (text, Value::String("unread".into()))],
+        );
+        commit_state(&engine, &Clock::default(), &first).await?;
+        let materialization = engine.materialization(&model).await?;
+        let client = engine.pool.get().await?;
+        let json_column = column_of_type(&client, materialization.table(), "jsonb").await?;
+        let text_column = column_of_type(&client, materialization.table(), "character varying").await?;
+
+        let on_json = KeySpec::new(vec![sub_path_part(json_column, IndexDirection::Asc)]);
+        let on_text = KeySpec::new(vec![sub_path_part(text_column, IndexDirection::Asc)]);
+        assert!(matches!(materialization.assure_index_exists(&on_json).await, IndexOutcome::Created(_)));
+        assert!(matches!(materialization.assure_index_exists(&on_text).await, IndexOutcome::Unservable(_)));
+        assert_eq!(created_index_names(&client, materialization.table()).await?, [index_name(materialization.table(), &on_json)]);
+        let found = engine.fetch_states(&equals(model, json, &["kind"], Value::Json(serde_json::json!("mention")))).await?;
+        assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), [entity]);
+
+        let second = state_with_values(
+            entity,
+            2,
+            model,
+            &[(json, Value::Json(serde_json::json!({ "kind": "reply" }))), (text, Value::String("hello".into()))],
+        );
+        commit_state(&engine, &first.payload.state.head, &second).await?;
+        assert_eq!(engine.get_state(entity).await?.payload.state, second.payload.state);
+        Ok(())
+    }
+
+    /// Only a valid btree index with the default operator class, sorting as
+    /// the plan asks, serves it: a hash index, a pattern-ops index and an
+    /// index putting NULLs first do not.
+    #[tokio::test]
+    async fn only_a_default_btree_index_sorting_as_the_plan_asks_serves_it() -> anyhow::Result<()> {
+        let (_container, engine, _) = test_engine().await?;
+        let client = engine.pool.get().await?;
+        client
+            .batch_execute(
+                r#"CREATE TABLE "scratch" ("id" character(43) PRIMARY KEY, "status" varchar);
+                   CREATE INDEX "plain" ON "scratch" ("status");
+                   CREATE INDEX "descending" ON "scratch" ("status" DESC);
+                   CREATE INDEX "hashed" ON "scratch" USING hash ("status");
+                   CREATE INDEX "pattern" ON "scratch" ("status" varchar_pattern_ops);
+                   CREATE INDEX "nulls_first" ON "scratch" ("status" NULLS FIRST);
+                   CREATE INDEX "nulls_last" ON "scratch" ("status" DESC NULLS LAST);"#,
+            )
+            .await?;
+        let listed = index::list_indexes(&*client, "scratch").await?;
+        let names: Vec<_> = listed.iter().map(|index| index.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["descending", "nulls_first", "nulls_last", "plain", "scratch_pkey"],
+            "a hash or pattern-ops index is not listed"
+        );
+
+        let status = KeySpec::new(vec![IndexKeyPart::asc("status", ValueType::String)]);
+        let serving: Vec<_> = listed
+            .iter()
+            .filter(|index| serving_index(std::slice::from_ref(index), &status).is_some())
+            .map(|index| index.name.as_str())
+            .collect();
+        assert_eq!(serving, ["descending", "plain"], "an index ordering NULLs otherwise than its direction's default does not serve");
+        Ok(())
+    }
+
+    /// A creation cancelled while it waits for the table's lock holds nothing:
+    /// its transaction rolls back when its session is dropped, and a later
+    /// creation from another engine goes through.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_creation_releases_the_table_lock() -> anyhow::Result<()> {
+        let (_container, engine, uri) = test_engine().await?;
+        let engine = Arc::new(engine);
+        let model = ModelId::EntityId(entity_id(0xb1));
+        let property = PropertyId::EntityId(entity_id(0xb2));
+        commit_state(
+            &engine,
+            &Clock::default(),
+            &state_with_values(entity_id(0xb3), 1, model, &[(property, Value::String("unread".into()))]),
+        )
+        .await?;
+        let table = engine.materialization(&model).await?.table().to_owned();
+        let mut holder = engine.pool.get().await?;
+        let held = holder.transaction().await?;
+        held.execute("SELECT pg_advisory_xact_lock($1)", &[&index::ddl_lock_key(&table)]).await?;
+        let column = column_of_type(held.client(), &table, "character varying").await?;
+        let spec = KeySpec::new(vec![IndexKeyPart::asc(column, ValueType::String)]);
+
+        let waiting = tokio::spawn({
+            let (engine, spec) = (engine.clone(), spec.clone());
+            async move { engine.materialization(&model).await.unwrap().assure_index_exists(&spec).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the creation waits for the lock");
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        held.commit().await?;
+
+        let other = Postgres::open(&uri).await?;
+        let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+            other.materialization(&model).await.unwrap().assure_index_exists(&spec).await
+        })
+        .await
+        .expect("the cancelled creation holds no lock");
+        assert!(matches!(outcome, IndexOutcome::Created(_)), "{outcome:?}");
+        let client = other.pool.get().await?;
+        assert_eq!(created_index_names(&client, &table).await?, [index_name(&table, &spec)]);
+        Ok(())
+    }
+
+    /// The index the engine creates is one PostgreSQL reads for the engine's
+    /// own query: with sequential scans ruled out, its WHERE clause is served
+    /// by an index scan on the index, its ORDER BY without a sort, and a JSON
+    /// sub-path by the expression index.
+    #[tokio::test]
+    async fn the_created_index_serves_the_engine_s_own_where_and_order_by() -> anyhow::Result<()> {
+        let (_container, engine, _) = test_engine().await?;
+        let model = ModelId::EntityId(entity_id(0xc1));
+        let [status, kind, detail] = [0xc2, 0xc3, 0xc4].map(|byte| PropertyId::EntityId(entity_id(byte)));
+        for (byte, kind_value) in [(0xc5, "mention"), (0xc6, "reply")] {
+            let state = state_with_values(
+                entity_id(byte),
+                byte,
+                model,
+                &[
+                    (status, Value::String("unread".into())),
+                    (kind, Value::String(kind_value.into())),
+                    (detail, Value::Json(serde_json::json!({ "kind": kind_value }))),
+                ],
+            );
+            commit_state(&engine, &Clock::default(), &state).await?;
+        }
+        let mut ordered = equals(model, status, &[], Value::String("unread".into()));
+        ordered.order_by = Some(vec![ankql::ast::OrderByItem { path: kind.into(), direction: ankql::ast::OrderDirection::Desc }]);
+        let found = engine.fetch_states(&ordered).await?;
+        assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), [entity_id(0xc6), entity_id(0xc5)]);
+        let by_kind = equals(model, detail, &["kind"], Value::Json(serde_json::json!("reply")));
+        assert_eq!(engine.fetch_states(&by_kind).await?.len(), 1);
+
+        let client = engine.pool.get().await?;
+        client
+            .batch_execute("SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_hashjoin = off; SET enable_mergejoin = off")
+            .await?;
+        let explain = |selection: ankql::ast::Selection<Resolved>| {
+            let client = &client;
+            let engine = &engine;
+            async move {
+                let query = query::Query::prepare(engine, &selection).await?;
+                let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                    query.params.iter().map(|value| value.as_ref() as _).collect();
+                let rows = client.query(&format!("EXPLAIN {}", query.sql), &params).await?;
+                Ok::<Vec<String>, anyhow::Error>(rows.into_iter().map(|row| row.get::<_, String>(0)).collect())
+            }
         };
-        materialization.assure_index_exists(&KeySpec::new(vec![kind_part(ValueType::String)])).await?;
-        assert!(index_names().await?.is_empty(), "a part declared a string gets no expression index");
-        materialization.assure_index_exists(&KeySpec::new(vec![kind_part(ValueType::Json)])).await?;
-        assert_eq!(index_names().await?.len(), 1, "a part declared JSON gets one");
+        let plan = explain(ordered).await?;
+        assert!(plan.iter().any(|line| line.contains("Index Scan using \"_ankurah_index__")), "{plan:?}");
+        assert!(!plan.iter().any(|line| line.trim_start().starts_with("Sort")), "{plan:?}");
+        let plan = explain(by_kind).await?;
+        assert!(plan.iter().any(|line| line.contains("Index Scan using \"_ankurah_index__") && line.contains(".kind asc")), "{plan:?}");
+        Ok(())
+    }
+
+    /// A second engine on the database finds the index the first created in
+    /// the catalog: its first use reuses it, running no DDL.
+    #[tokio::test]
+    async fn a_second_engine_s_first_use_reuses_the_index_without_ddl() -> anyhow::Result<()> {
+        let (_container, engine, uri) = test_engine().await?;
+        let model = ModelId::EntityId(entity_id(0xd1));
+        let property = PropertyId::EntityId(entity_id(0xd2));
+        commit_state(
+            &engine,
+            &Clock::default(),
+            &state_with_values(entity_id(0xd3), 1, model, &[(property, Value::String("unread".into()))]),
+        )
+        .await?;
+        assert_eq!(engine.fetch_states(&equals(model, property, &[], Value::String("unread".into()))).await?.len(), 1);
+        let table = engine.materialization(&model).await?.table().to_owned();
+        let client = engine.pool.get().await?;
+        let column = column_of_type(&client, &table, "character varying").await?;
+        let spec = KeySpec::new(vec![IndexKeyPart::asc(column, ValueType::String)]);
+
+        let other = Postgres::open(&uri).await?;
+        let outcome = other.materialization(&model).await?.assure_index_exists(&spec).await;
+        assert_eq!(outcome, IndexOutcome::Reused(ExistingIndex { name: index_name(&table, &spec), spec: spec.clone() }));
+        assert_eq!(created_index_names(&client, &table).await?, [index_name(&table, &spec)]);
         Ok(())
     }
 
