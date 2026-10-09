@@ -18,11 +18,12 @@ use std::{
     },
 };
 
-/// Efficient storage for sort keys - uses fixed array for small keys, Vec for larger ones
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+/// Efficient storage for sort keys - uses fixed array for small keys, Vec for larger ones.
+/// Keys compare by their bytes whichever variant holds them.
+#[derive(Debug, Clone)]
 enum IVec {
-    /// Keys <= 16 bytes stored in zero-padded fixed array
-    Small([u8; 16]),
+    /// Keys <= 16 bytes: the first `len` bytes of a fixed array
+    Small { data: [u8; 16], len: u8 },
     /// Keys > 16 bytes stored in Vec
     Large(Vec<u8>),
 }
@@ -33,11 +34,32 @@ impl IVec {
         if bytes.len() <= 16 {
             let mut data = [0u8; 16];
             data[..bytes.len()].copy_from_slice(bytes);
-            Self::Small(data)
+            Self::Small { data, len: bytes.len() as u8 }
         } else {
             Self::Large(bytes.to_vec())
         }
     }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Small { data, len } => &data[..usize::from(*len)],
+            Self::Large(bytes) => bytes,
+        }
+    }
+}
+
+impl PartialEq for IVec {
+    fn eq(&self, other: &Self) -> bool { self.as_bytes() == other.as_bytes() }
+}
+
+impl Eq for IVec {}
+
+impl PartialOrd for IVec {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
+impl Ord for IVec {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.as_bytes().cmp(other.as_bytes()) }
 }
 
 impl From<Vec<u8>> for IVec {
@@ -794,13 +816,56 @@ mod tests {
 
         // Verify 16-byte keys use Small variant (this is implicit in the implementation)
         match exactly_16 {
-            IVec::Small(_) => (), // Expected
+            IVec::Small { .. } => (), // Expected
             IVec::Large(_) => panic!("16-byte key should use Small variant"),
         }
 
         match exactly_17 {
             IVec::Large(_) => (), // Expected
-            IVec::Small(_) => panic!("17-byte key should use Large variant"),
+            IVec::Small { .. } => panic!("17-byte key should use Large variant"),
+        }
+    }
+
+    /// Encoded as sort keys, "a" fifteen times is 17 bytes (Large) and "z"
+    /// fourteen times is 16 bytes (Small); the variant must not decide.
+    fn keys_across_the_variant_boundary(direction: IndexDirection) -> (Vec<u8>, Vec<u8>) {
+        let encode = |name: &str| {
+            crate::indexing::encode_component_typed(&Value::String(name.into()), ValueType::String, direction.is_desc()).unwrap()
+        };
+        let (long_a, short_z) = (encode(&"a".repeat(15)), encode(&"z".repeat(14)));
+        assert_eq!((long_a.len(), short_z.len()), (17, 16));
+        (long_a, short_z)
+    }
+
+    #[test]
+    fn keys_compare_by_bytes_across_the_small_and_large_variants() {
+        let (long_a, short_z) = keys_across_the_variant_boundary(IndexDirection::Asc);
+        assert!(IVec::from_slice(&long_a) < IVec::from_slice(&short_z), "ascending: a... sorts before z...");
+        let (long_a, short_z) = keys_across_the_variant_boundary(IndexDirection::Desc);
+        assert!(IVec::from_slice(&long_a) > IVec::from_slice(&short_z), "descending: a... sorts after z...");
+    }
+
+    #[test]
+    fn limit_one_keeps_the_first_entity_across_the_variant_boundary() {
+        for (direction, expected_first) in [(IndexDirection::Asc, 1), (IndexDirection::Desc, 2)] {
+            let resultset = EntityResultSet::empty();
+            resultset.order_by(Some(KeySpec {
+                keyparts: vec![IndexKeyPart {
+                    key: prop("name"),
+                    sub_path: None,
+                    direction,
+                    nulls: None,
+                    collation: None,
+                    value_type: ValueType::String,
+                }],
+            }));
+            let mut write = resultset.write();
+            write.add(TestEntity::new(2, HashMap::from([(prop("name"), Value::String("z".repeat(14)))])));
+            write.add(TestEntity::new(1, HashMap::from([(prop("name"), Value::String("a".repeat(15)))])));
+            drop(write);
+            resultset.limit(Some(1));
+            let kept: Vec<_> = resultset.read().iter_entities().map(|(id, _)| id).collect();
+            assert_eq!(kept, vec![TestEntity::new(expected_first, HashMap::new()).id], "{direction:?}");
         }
     }
 }
