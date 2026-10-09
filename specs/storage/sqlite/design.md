@@ -68,13 +68,28 @@ DDL mutex, with the durable column map rechecked while holding the lock.
 
 1. resolves durable property ids to the model materialization's physical
    columns;
-2. splits pushdown-capable predicates from Rust post-filtering;
-3. executes filtering, ordering, and eligible limits against the
+2. makes sure the index the shared planner's plan reads exists on the
+   serving model's table, creating it on first use under the engine's index
+   DDL lock, before the read snapshot opens;
+3. splits pushdown-capable predicates from Rust post-filtering;
+4. executes filtering, ordering, and eligible limits against the
    materialization table;
-4. hydrates matching canonical records from `_ankurah_entity`.
+5. hydrates matching canonical records from `_ankurah_entity`.
 
 The AST remains logical and identity-addressed. Physical names never leak back
 into AnkQL.
+
+The indexes are the ones sled and IndexedDB build for the same query: the
+shared planner's `Plan::Index` for the selection lowered to the table's
+columns, created with `CREATE INDEX IF NOT EXISTS` on the key parts' columns
+in their directions, a JSON sub-path as its `json_extract` expression, and
+named sled's way behind the table name. An existing index serves a shorter key
+only past trailing `id` parts, which is sled's rule. The catalog
+(`pragma_index_list` and `pragma_index_xinfo`) is the only record of what
+exists; it is cached per materialization and read again under the lock before
+anything is created. SQLite builds the index inside the statement, so the
+first query waits for it, and the query's SQL answers with or without the
+index.
 
 ## Connections
 
