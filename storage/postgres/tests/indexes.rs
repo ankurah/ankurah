@@ -56,10 +56,13 @@ async fn recipients(ctx: &Context, query: &str) -> Result<Vec<String>> {
     Ok(found)
 }
 
+/// One index as the catalog lists it: its name, then each key column's name
+/// (None for an expression) with whether that column sorts descending.
+type CatalogIndex = (String, Vec<(Option<String>, bool)>);
+
 /// The indexes on the notification table as the catalog lists them, besides
-/// its primary key: each name with its key columns (None for an expression)
-/// and whether each column sorts descending.
-async fn catalog(pool: &TestPool) -> Result<Vec<(String, Vec<(Option<String>, bool)>)>> {
+/// its primary key.
+async fn catalog(pool: &TestPool) -> Result<Vec<CatalogIndex>> {
     let client = pool.get().await?;
     let rows = client
         .query(
@@ -70,7 +73,7 @@ async fn catalog(pool: &TestPool) -> Result<Vec<(String, Vec<(Option<String>, bo
             &[],
         )
         .await?;
-    let mut indexes: Vec<(String, Vec<(Option<String>, bool)>)> = Vec::new();
+    let mut indexes: Vec<CatalogIndex> = Vec::new();
     for row in rows {
         let (name, column, descending): (String, Option<String>, bool) = (row.get("name"), row.get("column"), row.get("descending"));
         match indexes.last_mut() {
@@ -207,9 +210,9 @@ async fn concurrent_first_uses_from_two_engines_create_one_index() -> Result<()>
     let first = notified(storage, &["alice", "bob"]).await?;
     let second = reopened(&pool).await?;
     let query = "recipient = 'alice' AND status = 'unread'";
-    let (a, b, c2, d) =
+    let results =
         tokio::join!(recipients(&first, query), recipients(&second, query), recipients(&first, query), recipients(&second, query));
-    for found in [a?, b?, c2?, d?] {
+    for found in [results.0?, results.1?, results.2?, results.3?] {
         assert_eq!(found, ["alice"]);
     }
     assert_eq!(index_names(&pool).await?, [RECIPIENT_STATUS]);

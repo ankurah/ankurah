@@ -47,10 +47,12 @@ async fn recipients(ctx: &Context, query: &str) -> Result<Vec<String>> {
     Ok(found)
 }
 
-/// The indexes on the notification table as the catalog lists them: each
-/// name with its key columns (None for an expression) and whether each
-/// column sorts descending.
-async fn catalog(storage: &SqliteStorageEngine) -> Result<Vec<(String, Vec<(Option<String>, bool)>)>> {
+/// One index as the catalog lists it: its name, then each key column's name
+/// (None for an expression) with whether that column sorts descending.
+type CatalogIndex = (String, Vec<(Option<String>, bool)>);
+
+/// The indexes on the notification table as the catalog lists them.
+async fn catalog(storage: &SqliteStorageEngine) -> Result<Vec<CatalogIndex>> {
     let conn = storage.pool().get().await?;
     let rows = conn
         .with_connection(|connection| {
@@ -64,7 +66,7 @@ async fn catalog(storage: &SqliteStorageEngine) -> Result<Vec<(String, Vec<(Opti
             Ok(rows)
         })
         .await?;
-    let mut indexes: Vec<(String, Vec<(Option<String>, bool)>)> = Vec::new();
+    let mut indexes: Vec<CatalogIndex> = Vec::new();
     for (name, column, descending) in rows {
         match indexes.last_mut() {
             Some((last, columns)) if *last == name => columns.push((column, descending)),

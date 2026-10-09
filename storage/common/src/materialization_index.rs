@@ -37,16 +37,20 @@ pub fn serving_index<'a>(existing: &'a [ExistingIndex], spec: &KeySpec<String>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_core::{indexing::IndexKeyPart, value::ValueType};
+    use ankurah_core::{
+        indexing::{IndexDirection, IndexKeyPart},
+        value::ValueType,
+    };
 
+    /// A spec from parts written as `+column` or `-column.step`.
     fn spec(parts: &[&str]) -> KeySpec<String> {
         KeySpec::new(parts.iter().map(|part| IndexKeyPart::from_flat_path(&part[1..], direction(part), ValueType::String)).collect())
     }
 
-    fn direction(part: &str) -> ankurah_core::indexing::IndexDirection {
+    fn direction(part: &str) -> IndexDirection {
         match part.as_bytes()[0] {
-            b'+' => ankurah_core::indexing::IndexDirection::Asc,
-            b'-' => ankurah_core::indexing::IndexDirection::Desc,
+            b'+' => IndexDirection::Asc,
+            b'-' => IndexDirection::Desc,
             _ => panic!("a part starts with its direction"),
         }
     }

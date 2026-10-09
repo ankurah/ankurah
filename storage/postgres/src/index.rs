@@ -141,6 +141,8 @@ mod tests {
         IndexKeyPart::from_flat_path(path, direction, ValueType::String)
     }
 
+    fn part_spec(column: &str) -> KeySpec<String> { KeySpec::new(vec![part(column, IndexDirection::Asc)]) }
+
     #[test]
     fn the_statement_renders_each_part_s_column_or_expression_with_its_direction() {
         let mut nulls_first = part("status", IndexDirection::Desc);
@@ -162,8 +164,6 @@ mod tests {
         assert_eq!(a, index_name("notification", &long("a")));
         assert_eq!(index_name("notification", &part_spec("status")), "notification__status asc");
     }
-
-    fn part_spec(column: &str) -> KeySpec<String> { KeySpec::new(vec![part(column, IndexDirection::Asc)]) }
 
     #[test]
     fn an_expression_reads_back_only_in_the_engine_s_own_form() {

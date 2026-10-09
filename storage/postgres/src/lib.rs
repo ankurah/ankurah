@@ -59,7 +59,7 @@ const IDENTIFIER_MAX_BYTES: usize = 63;
 const FIXED_STORAGE_TABLES: &[&str] =
     &[META_TABLE, MODEL_REGISTRATION_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE];
 
-pub(crate) fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
+fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
 
 fn system_label(model: SystemModel) -> &'static str {
     match model {
