@@ -3,6 +3,7 @@ use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     property::backend::backend_from_string,
     schema::CatalogResolver,
+    value::ValueType,
 };
 use ankurah_proto::{Attested, EntityId, EntityState, ModelId, PropertyId};
 use ankurah_storage_common::{
@@ -456,8 +457,14 @@ impl Materialization {
     /// attach. The query's SQL answers it with or without the index, so an
     /// index PostgreSQL declines to use costs only its upkeep, and an index
     /// dropped behind this handle's back is simply not used until the engine
-    /// reopens.
+    /// reopens. A JSON sub-path part declared as any type but JSON gets no
+    /// index at all: its `->` expression would run on every write and is
+    /// refused on a column that is not jsonb, so the plan is served without
+    /// one.
     pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> Result<(), RetrievalError> {
+        if spec.keyparts.iter().any(|part| part.sub_path.is_some() && part.value_type != ValueType::Json) {
+            return Ok(());
+        }
         if self.indexes.read().unwrap().as_deref().is_some_and(|known| serving_index(known, spec).is_some()) {
             return Ok(());
         }

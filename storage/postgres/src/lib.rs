@@ -766,6 +766,80 @@ mod tests {
         Ok(())
     }
 
+    /// A JSON sub-path part declared as any type but JSON gets no expression
+    /// index: its `->` expression would run on every write and PostgreSQL
+    /// refuses it on a column that is not jsonb, so the plan is served
+    /// without one. PostgreSQL's `->` rejects a query on such a column before
+    /// any index question, so the check is exercised at the creation
+    /// function, on the column of a stored JSON value.
+    #[tokio::test]
+    async fn a_sub_path_part_declared_non_json_gets_no_index() -> anyhow::Result<()> {
+        use ankurah_core::{
+            indexing::{IndexDirection, IndexKeyPart, KeySpec},
+            property::backend::{lww::LWWBackend, PropertyBackend},
+            value::{Value, ValueType},
+        };
+        use ankurah_proto::PropertyId;
+
+        let container = postgres::Postgres::default().with_init_sql(include_bytes!("../tests/pg_init.sql").to_vec()).start().await?;
+        let uri = format!(
+            "host={} port={} user=postgres password=postgres dbname=postgres",
+            container.get_host().await?,
+            container.get_host_port_ipv4(5432).await?,
+        );
+        let engine = Postgres::open(&uri).await?;
+        let model = ModelId::EntityId(EntityId::from_bytes([0xa1; EntityId::BYTE_LEN]));
+        let property = PropertyId::EntityId(EntityId::from_bytes([0xa2; EntityId::BYTE_LEN]));
+        let backend = LWWBackend::new();
+        backend.set(property, Some(Value::Json(serde_json::json!({ "kind": "mention" }))));
+        let operations = backend.to_operations()?.expect("the state has a value");
+        let event_id = EventId::from_bytes([1; 32]);
+        backend.apply_operations_with_event(&operations, event_id.clone())?;
+        let state = Attested::opt(
+            EntityState {
+                entity_id: EntityId::from_bytes([0xa3; EntityId::BYTE_LEN]),
+                state: State {
+                    state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer()?)])),
+                    memberships: [model].into(),
+                    head: Clock::genesis(event_id),
+                },
+            },
+            None,
+        );
+        let mut transaction = engine.transaction();
+        transaction.set_state(&Clock::default(), &state).await?;
+        assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+
+        let materialization = engine.materialization(&model).await?;
+        let client = engine.pool.get().await?;
+        let column: String = client
+            .query_one(
+                "SELECT column_name FROM information_schema.columns WHERE table_name = $1 AND column_name <> 'id'",
+                &[&materialization.table()],
+            )
+            .await?
+            .get(0);
+        let index_names = || async {
+            client
+                .query("SELECT indexname FROM pg_indexes WHERE tablename = $1 AND indexname NOT LIKE '%_pkey'", &[&materialization.table()])
+                .await
+                .map(|rows| rows.into_iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>())
+        };
+        let kind_part = |value_type| IndexKeyPart {
+            key: column.clone(),
+            sub_path: Some(vec!["kind".to_owned()]),
+            direction: IndexDirection::Asc,
+            value_type,
+            nulls: None,
+            collation: None,
+        };
+        materialization.assure_index_exists(&KeySpec::new(vec![kind_part(ValueType::String)])).await?;
+        assert!(index_names().await?.is_empty(), "a part declared a string gets no expression index");
+        materialization.assure_index_exists(&KeySpec::new(vec![kind_part(ValueType::Json)])).await?;
+        assert_eq!(index_names().await?.len(), 1, "a part declared JSON gets one");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result<()> {
         let container = postgres::Postgres::default().with_init_sql(include_bytes!("../tests/pg_init.sql").to_vec()).start().await?;

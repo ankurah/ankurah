@@ -82,8 +82,10 @@ into AnkQL.
 The indexes are the ones sled and IndexedDB build for the same query: the
 shared planner's `Plan::Index` for the selection lowered to the table's
 columns, created with `CREATE INDEX IF NOT EXISTS` on the key parts' columns
-in their directions, a JSON sub-path as its `json_extract` expression, and
-named sled's way behind the table name. An existing index serves a shorter key
+in their directions, a JSON sub-path as its `json_extract` expression (only
+for a part declared JSON: the expression runs on every write and refuses a
+value that is not JSON, so any other sub-path part leaves the plan without an
+index), and named sled's way behind the table name. An existing index serves a shorter key
 only past trailing `id` parts, which is sled's rule. The catalog
 (`pragma_index_list` and `pragma_index_xinfo`) is the only record of what
 exists; it is cached per materialization and read again under the lock before

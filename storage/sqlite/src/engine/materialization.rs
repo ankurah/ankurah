@@ -3,6 +3,7 @@ use ankurah_core::{
     error::{MutationError, RetrievalError},
     property::backend::backend_from_string,
     schema::CatalogResolver,
+    value::ValueType,
 };
 use ankurah_proto::{Attested, EntityState, ModelId, PropertyId};
 use ankurah_storage_common::{
@@ -409,8 +410,13 @@ impl Materialization {
     /// place to attach. The query's SQL answers it with or without the index,
     /// so an index SQLite declines to use costs only its upkeep, and an index
     /// dropped behind this handle's back is simply not used until the engine
-    /// reopens.
+    /// reopens. A JSON sub-path part declared as any type but JSON gets no
+    /// index at all: its `json_extract` expression would run on every write
+    /// and refuse a value that is not JSON, so the plan is served without one.
     pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> Result<(), SqliteError> {
+        if spec.keyparts.iter().any(|part| part.sub_path.is_some() && part.value_type != ValueType::Json) {
+            return Ok(());
+        }
         if self.indexes.read().expect("RwLock poisoned").as_deref().is_some_and(|known| serving_index(known, spec).is_some()) {
             return Ok(());
         }

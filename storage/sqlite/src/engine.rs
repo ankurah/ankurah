@@ -712,6 +712,48 @@ mod tests {
         assert_eq!(engine.fetch_states(&all.clone().and_member_of(model)).await.unwrap().len(), 2);
     }
 
+    /// The names of the indexes created on `table`, from SQLite's catalog.
+    async fn created_index_names(engine: &SqliteStorageEngine, table: &str) -> Vec<String> {
+        let conn = engine.pool.get().await.unwrap();
+        let table = table.to_owned();
+        conn.with_connection(move |c| {
+            let mut statement = c.prepare("SELECT name FROM pragma_index_list(?1) WHERE origin = 'c' ORDER BY name")?;
+            let names = statement.query_map([table], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            Ok(names)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A JSON sub-path part declared as any type but JSON gets no expression
+    /// index, since `json_extract` in an index would refuse later writes of
+    /// values that are not JSON; the query runs without one. Only a selection
+    /// built without the catalog resolver carries such a part, and the stored
+    /// text here is a JSON number so that `json_extract`, which the query runs
+    /// with or without an index, answers.
+    #[tokio::test]
+    async fn a_sub_path_part_declared_non_json_gets_no_index() {
+        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let model = ModelId::EntityId(entity_id(0xa1));
+        let property = PropertyId::EntityId(entity_id(0xa2));
+        commit_state(&engine, Clock::default(), model, state_with_strings(entity_id(0xa3), 1, &[(property, "7")])).await;
+        let table = engine.materialization(&model).await.unwrap().table().to_owned();
+        let kind_equals = |literal: Value| {
+            let mut path = ankql::ast::PropertyPath::from(property);
+            path.subpath = vec!["kind".to_owned()];
+            ankql::ast::Selection::from(ankql::ast::Predicate::Comparison {
+                left: Box::new(ankql::ast::Expr::Path(path)),
+                operator: ankql::ast::ComparisonOperator::Equal,
+                right: Box::new(ankql::ast::Expr::Literal(literal)),
+            })
+            .and_member_of(model)
+        };
+        assert!(engine.fetch_states(&kind_equals(Value::String("x".into()))).await.unwrap().is_empty());
+        assert!(created_index_names(&engine, &table).await.is_empty(), "a part declared a string gets no expression index");
+        assert!(engine.fetch_states(&kind_equals(Value::Json(serde_json::json!("x")))).await.unwrap().is_empty());
+        assert_eq!(created_index_names(&engine, &table).await.len(), 1, "a part declared JSON gets one");
+    }
+
     #[tokio::test]
     async fn test_open_in_memory() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
