@@ -372,3 +372,46 @@ fn desc_range_inequality_with_asc_prefix() -> Result<(), IndexError> {
 
     Ok(())
 }
+
+/// Without an equality prefix the range runs from the empty prefix, the
+/// first key of the tree, or from the bound's own range end; a real fetch
+/// never produces this shape, since it always leads with the membership.
+#[test]
+fn ranges_without_an_equality_prefix_start_at_the_tree_or_the_bound() -> Result<(), IndexError> {
+    use ankurah::core::indexing::{encode_component_typed, prefix_range_end};
+    let key_spec = KeySpec::new(vec![IndexKeyPart::asc("name", ValueType::String)]);
+    let encoded_a = encode_component_typed(&Value::String("a".into()), ValueType::String, false).unwrap();
+    let bound = |low, high| KeyBounds::new(vec![KeyBoundComponent { column: "name".into(), low, high }]);
+
+    let above =
+        key_bounds_to_sled_range(&bound(Endpoint::excl(Value::String("a".into())), Endpoint::UnboundedHigh(ValueType::String)), &key_spec)?;
+    assert_eq!((above.start, above.end), (prefix_range_end(&encoded_a).unwrap(), None));
+
+    let below =
+        key_bounds_to_sled_range(&bound(Endpoint::UnboundedLow(ValueType::String), Endpoint::excl(Value::String("a".into()))), &key_spec)?;
+    assert_eq!((below.start, below.end), (Vec::new(), Some(encoded_a)));
+    Ok(())
+}
+
+/// An all-0xFF key has no key above it: `x > max` ascending and `x < min`
+/// descending are empty ranges (start and end coincide), and `x >= min`
+/// descending runs unbounded above.
+#[test]
+fn all_ff_keys_overflow_into_empty_or_unbounded_ranges() -> Result<(), IndexError> {
+    let bound = |low, high| KeyBounds::new(vec![KeyBoundComponent { column: "x".into(), low, high }]);
+    let ascending = KeySpec::new(vec![IndexKeyPart::asc("x", ValueType::I64)]);
+    let descending = KeySpec::new(vec![IndexKeyPart::desc("x", ValueType::I64)]);
+
+    let above_max =
+        key_bounds_to_sled_range(&bound(Endpoint::excl(Value::I64(i64::MAX)), Endpoint::UnboundedHigh(ValueType::I64)), &ascending)?;
+    assert_eq!(above_max.end, Some(above_max.start), "x > i64::MAX ascending is empty");
+
+    let below_min =
+        key_bounds_to_sled_range(&bound(Endpoint::UnboundedLow(ValueType::I64), Endpoint::excl(Value::I64(i64::MIN))), &descending)?;
+    assert_eq!(below_min.end, Some(below_min.start), "x < i64::MIN descending is empty");
+
+    let from_min =
+        key_bounds_to_sled_range(&bound(Endpoint::incl(Value::I64(i64::MIN)), Endpoint::UnboundedHigh(ValueType::I64)), &descending)?;
+    assert_eq!((from_min.start, from_min.end), (Vec::new(), None), "x >= i64::MIN descending is the whole tree");
+    Ok(())
+}
