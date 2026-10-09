@@ -10,9 +10,8 @@ use ankurah_core::value::ValueType;
 use ankurah_storage_common::materialization_index::ExistingIndex;
 use rusqlite::Connection;
 
+use super::quote_identifier;
 use crate::error::SqliteError;
-
-fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
 
 /// The statement that creates the index named `name` for `spec` on `table`.
 /// Each key part is its materialization column, or for a JSON sub-path the
@@ -43,6 +42,10 @@ fn json_extract_sql(column: &str, steps: &[String]) -> String {
     format!("json_extract({}, '$.{}')", quote_identifier(column), path)
 }
 
+/// The catalog's key columns of one index: each column's name, None for an
+/// expression, and whether it sorts descending.
+type KeyColumns = Vec<(Option<String>, bool)>;
+
 /// The indexes the catalog lists on `table`, each as the key spec it serves.
 /// A partial index holds only some rows and serves nothing. A key part's
 /// column and direction come from `pragma_index_xinfo`; an expression column,
@@ -59,20 +62,23 @@ pub(super) fn list_indexes(conn: &Connection, table: &str) -> Result<Vec<Existin
         "SELECT il.name, il.partial, ix.name, ix.desc FROM pragma_index_list(?1) AS il JOIN pragma_index_xinfo(il.name) AS ix \
          WHERE ix.key ORDER BY il.name, ix.seqno",
     )?;
-    let mut indexes: BTreeMap<String, (bool, Vec<(Option<String>, bool)>)> = BTreeMap::new();
+    let mut indexes: BTreeMap<String, (bool, KeyColumns)> = BTreeMap::new();
     for row in columns.query_map([table], |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?, row.get(2)?, row.get(3)?)))? {
         let (name, partial, column, descending) = row?;
         indexes.entry(name).or_insert((partial, Vec::new())).1.push((column, descending));
     }
 
     let mut existing = Vec::new();
-    for (name, (partial, columns)) in indexes {
+    'index: for (name, (partial, columns)) in indexes {
         if partial {
             continue;
         }
-        let Some(expressions) = statements.get(&name).and_then(|sql| sql.as_deref()).map_or(Some(Vec::new()), json_extract_calls) else {
-            continue;
+        // An index without a statement is one SQLite made for a constraint; it has no expressions.
+        let expressions = match statements.get(&name).and_then(|statement| statement.as_deref()) {
+            Some(statement) => json_extract_calls(statement),
+            None => Some(Vec::new()),
         };
+        let Some(expressions) = expressions else { continue };
         let mut expressions = expressions.into_iter();
         let mut keyparts = Vec::with_capacity(columns.len());
         for (column, descending) in columns {
@@ -80,15 +86,13 @@ pub(super) fn list_indexes(conn: &Connection, table: &str) -> Result<Vec<Existin
                 Some(column) => (column, None),
                 None => match expressions.next() {
                     Some((column, steps)) => (column, Some(steps)),
-                    None => break,
+                    None => continue 'index,
                 },
             };
             let direction = if descending { IndexDirection::Desc } else { IndexDirection::Asc };
             keyparts.push(IndexKeyPart { key, sub_path, direction, value_type: ValueType::String, nulls: None, collation: None });
         }
-        if keyparts.len() == keyparts.capacity() {
-            existing.push(ExistingIndex { name, spec: KeySpec::new(keyparts) });
-        }
+        existing.push(ExistingIndex { name, spec: KeySpec::new(keyparts) });
     }
     Ok(existing)
 }
