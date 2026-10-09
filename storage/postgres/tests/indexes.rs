@@ -180,16 +180,17 @@ async fn composite_and_json_sub_path_keys_are_rendered_and_read_back() -> Result
     assert_eq!(recipients_in_order(&ctx, descending).await?, ["bob", "alice"]);
     assert_eq!(recipients(&ctx, "detail.kind = 'mention' AND status = 'unread'").await?, ["alice"]);
     let column = |name: &str, descending| (Some(name.to_owned()), descending);
+    let listed = catalog(&pool).await?;
+    assert_eq!(listed.len(), 2, "{listed:?}");
     assert_eq!(
-        catalog(&pool).await?,
-        [
-            ("_ankurah_index__notification__detail.kind asc__status asc".to_owned(), vec![(None, false), column("status", false)]),
-            (
-                "_ankurah_index__notification__status asc__kind desc__recipient asc".to_owned(),
-                vec![column("status", false), column("kind", true), column("recipient", false)]
-            ),
-        ]
+        listed[0],
+        ("_ankurah_index__notification__detail.kind asc__status asc".to_owned(), vec![(None, false), column("status", false)])
     );
+    // The three-part name exceeds PostgreSQL's identifier limit, so a hash ends its retained head.
+    assert!(listed[1].0.starts_with("_ankurah_index__notification__status asc__kind"), "{listed:?}");
+    assert_eq!(listed[1].0.len(), 63);
+    assert_eq!(listed[1].1, [column("status", false), column("kind", true), column("recipient", false)]);
+    let composite = listed[1].0.clone();
     assert!(definition(&pool, "_ankurah_index__notification__detail.kind asc__status asc").await?.contains("(detail -> 'kind'::text)"));
     assert_eq!(recipients_in_order(&ctx, descending).await?, ["bob", "alice"], "the same order read through the index");
 
@@ -197,11 +198,7 @@ async fn composite_and_json_sub_path_keys_are_rendered_and_read_back() -> Result
     assert_eq!(recipients(&ctx, "detail.kind = 'mention' AND status = 'unread'").await?, ["alice"]);
     drop_index(&pool, "_ankurah_index__notification__detail.kind asc__status asc").await?;
     assert_eq!(recipients(&ctx, "detail.kind = 'mention' AND status = 'unread'").await?, ["alice"]);
-    assert_eq!(
-        index_names(&pool).await?,
-        ["_ankurah_index__notification__status asc__kind desc__recipient asc"],
-        "the expression index was read back"
-    );
+    assert_eq!(index_names(&pool).await?, [composite], "the expression index was read back");
     Ok(())
 }
 
