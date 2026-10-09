@@ -1,7 +1,4 @@
 use super::common::*;
-use ankurah::{policy::DEFAULT_CONTEXT, Node, PermissiveAgent};
-use ankurah_storage_sled::SledStorageEngine;
-use std::sync::Arc;
 
 #[tokio::test]
 async fn test_collection_boundary_excludes_other_collections() -> Result<(), anyhow::Error> {
@@ -27,14 +24,13 @@ async fn test_collection_boundary_excludes_other_collections() -> Result<(), any
     Ok(())
 }
 
+/// An equality on a leading part of the index scans exactly that prefix's
+/// key range: the keys of the next year follow it in the tree and must not
+/// be reached, with no guard to stop the scan.
 #[tokio::test]
-async fn test_prefix_guard_toggle_effect() -> Result<(), anyhow::Error> {
-    let engine = Arc::new(SledStorageEngine::new_test()?);
-    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-    node.system.create().await?;
-    let ctx = node.context_async(DEFAULT_CONTEXT).await.unwrap();
+async fn test_equality_scan_ends_at_the_prefix_range_end() -> Result<(), anyhow::Error> {
+    let ctx = setup_context().await?;
 
-    // Insert albums across multiple years and a couple of books (different collection)
     create_albums(
         &ctx,
         vec![("Album1", "1965"), ("Album2", "1966"), ("Album3", "1967"), ("Album4", "1968"), ("Album5", "1969"), ("Album6", "1970")],
@@ -42,17 +38,6 @@ async fn test_prefix_guard_toggle_effect() -> Result<(), anyhow::Error> {
     .await?;
     create_books(&ctx, vec![("Book1", "2001"), ("Book2", "2002")]).await?;
 
-    // 1) Guard enabled (default): equality prefix should constrain results to year=1969 only
-    assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5"]);
-
-    // 2) Disable guard: expect overshoot beyond equality prefix (includes following names)
-    #[cfg(debug_assertions)]
-    engine.set_prefix_guard_disabled(true);
-    assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5", "Album6"]);
-
-    // 3) Re-enable guard: back to constrained results
-    #[cfg(debug_assertions)]
-    engine.set_prefix_guard_disabled(false);
     assert_eq!(names(&fetch(&ctx, "year = '1969' ORDER BY name LIMIT 100").await?), vec!["Album5"]);
 
     Ok(())

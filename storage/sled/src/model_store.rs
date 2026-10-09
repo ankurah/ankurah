@@ -1,15 +1,13 @@
+#[cfg(debug_assertions)]
+use ankql::ast::Predicate;
 use ankql::ast::Resolved;
 use ankql::selection::map_references;
-use ankurah_storage_common::{ColumnPath, EngineColumns};
-#[cfg(debug_assertions)]
-use std::sync::atomic::AtomicBool;
-
-use ankql::ast::Predicate;
 use ankurah_core::indexing::KeySpec;
 use ankurah_core::{error::RetrievalError, ModelId};
 use ankurah_proto::PropertyId;
 use ankurah_proto::{Attested, EntityState};
 use ankurah_storage_common::{filtering::ValueSetStream, KeyBounds, OrderByComponents, Plan, Planner, PlannerConfig, ScanDirection};
+use ankurah_storage_common::{ColumnPath, EngineColumns};
 use futures::Stream;
 use std::sync::Arc;
 
@@ -31,9 +29,6 @@ pub struct SledModelStoreInner {
     pub database: Arc<Database>,
     /// Projected rows for `model_id`.
     pub tree: sled::Tree,
-    #[cfg(debug_assertions)]
-    /// Runtime test switch for disabling open-ended scan prefix guards.
-    pub prefix_guard_disabled: Arc<AtomicBool>,
 }
 
 /// Private Sled helper for one model's projected query surface.
@@ -41,19 +36,8 @@ pub struct SledModelStore(SledModelStoreInner);
 
 impl SledModelStore {
     /// Construct a model materialization handle from engine-owned resources.
-    pub fn new(
-        model_id: ModelId,
-        database: Arc<Database>,
-        tree: sled::Tree,
-        #[cfg(debug_assertions)] prefix_guard_disabled: Arc<AtomicBool>,
-    ) -> Self {
-        Self(SledModelStoreInner {
-            model_id,
-            database,
-            tree,
-            #[cfg(debug_assertions)]
-            prefix_guard_disabled,
-        })
+    pub fn new(model_id: ModelId, database: Arc<Database>, tree: sled::Tree) -> Self {
+        Self(SledModelStoreInner { model_id, database, tree })
     }
 }
 
@@ -148,20 +132,9 @@ impl SledModelStoreInner {
         index_spec.keyparts.insert(0, IndexKeyPart::asc(column.clone(), ValueType::String));
         bounds.keyparts.insert(0, KeyBoundComponent { column, low: membership.clone(), high: membership });
 
-        // Debug flag for disabling equality-prefix guard (testing only)
-        let prefix_guard_disabled = {
-            #[cfg(debug_assertions)]
-            {
-                use std::sync::atomic::Ordering;
-                self.prefix_guard_disabled.load(Ordering::Relaxed)
-            }
-            #[cfg(not(debug_assertions))]
-            false
-        };
-
         let (index, match_type) = self.database.index_manager.assure_index_exists(&index_spec, &self.database.db)?;
 
-        let ids = SledIndexScanner::new(&index, &bounds, scan_direction, match_type, prefix_guard_disabled)?;
+        let ids = SledIndexScanner::new(&index, &bounds, scan_direction, match_type)?;
         if !selection.predicate.referenced_models().is_empty() {
             return self.filter_candidate_states(ids, selection, order_by_spill.is_satisfied());
         }

@@ -17,11 +17,8 @@ pub struct SledIndexScanner<'a> {
     pub bounds: &'a KeyBounds,
     pub direction: ScanDirection,
     pub match_type: IndexSpecMatch,
-    pub prefix_guard_disabled: bool,
     // Iterator state
     iter: SledIndexIter,
-    eq_prefix_bytes: Vec<u8>,
-    use_prefix_guard: bool,
 }
 
 enum SledIndexIter {
@@ -41,18 +38,10 @@ impl Iterator for SledIndexIter {
 }
 
 impl<'a> SledIndexScanner<'a> {
-    pub fn new(
-        index: &'a Index,
-        bounds: &'a KeyBounds,
-        direction: ScanDirection,
-        match_type: IndexSpecMatch,
-        prefix_guard_disabled: bool,
-    ) -> Result<Self, IndexError> {
-        // Setup iterator immediately in constructor
-        let SledRangeBounds { start: start_full, end: end_full_opt, upper_open_ended, eq_prefix_guard: eq_prefix_bytes } =
-            key_bounds_to_sled_range(bounds, index.spec())?;
-
-        let use_prefix_guard = upper_open_ended && !eq_prefix_bytes.is_empty() && !prefix_guard_disabled;
+    pub fn new(index: &'a Index, bounds: &'a KeyBounds, direction: ScanDirection, match_type: IndexSpecMatch) -> Result<Self, IndexError> {
+        // The range covers exactly the matching tuples' keys (see
+        // `key_bounds_to_sled_range`), so the scan needs no guard of its own.
+        let SledRangeBounds { start, end } = key_bounds_to_sled_range(bounds, index.spec())?;
 
         let effective_direction = match match_type {
             IndexSpecMatch::Match => direction,
@@ -63,17 +52,17 @@ impl<'a> SledIndexScanner<'a> {
         };
 
         let iter = match effective_direction {
-            ScanDirection::Forward => match &end_full_opt {
-                Some(end_full) => SledIndexIter::Forward(index.tree().range(start_full.clone()..end_full.clone())),
-                None => SledIndexIter::Forward(index.tree().range(start_full.clone()..)),
+            ScanDirection::Forward => match &end {
+                Some(end) => SledIndexIter::Forward(index.tree().range(start.clone()..end.clone())),
+                None => SledIndexIter::Forward(index.tree().range(start.clone()..)),
             },
-            ScanDirection::Reverse => match &end_full_opt {
-                Some(end_full) => SledIndexIter::Reverse(index.tree().range(start_full.clone()..end_full.clone()).rev()),
-                None => SledIndexIter::Reverse(index.tree().range(start_full.clone()..).rev()),
+            ScanDirection::Reverse => match &end {
+                Some(end) => SledIndexIter::Reverse(index.tree().range(start.clone()..end.clone()).rev()),
+                None => SledIndexIter::Reverse(index.tree().range(start.clone()..).rev()),
             },
         };
 
-        Ok(Self { index, bounds, direction, match_type, prefix_guard_disabled, iter, eq_prefix_bytes, use_prefix_guard })
+        Ok(Self { index, bounds, direction, match_type, iter })
     }
 
     /// Get the effective scan direction, accounting for index match type
@@ -95,24 +84,14 @@ impl Stream for SledIndexScanner<'_> {
 
     fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Synchronous implementation - always returns Ready
-        loop {
-            let (key_bytes, _value_bytes) = match self.iter.next() {
-                Some(Ok(kv)) => kv,
-                Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::storage(e.to_string())))),
-                None => return Poll::Ready(None),
-            };
+        let (key_bytes, _value_bytes) = match self.iter.next() {
+            Some(Ok(kv)) => kv,
+            Some(Err(e)) => return Poll::Ready(Some(Err(RetrievalError::storage(e.to_string())))),
+            None => return Poll::Ready(None),
+        };
 
-            // Apply prefix guard if needed
-            if self.use_prefix_guard && !self.eq_prefix_bytes.is_empty() && !key_bytes.starts_with(&self.eq_prefix_bytes) {
-                return Poll::Ready(None); // End of prefix range
-            }
-
-            // Decode EntityId from key suffix
-            match decode_entity_id_from_index_key(&key_bytes) {
-                Ok(entity_id) => return Poll::Ready(Some(Ok(entity_id))),
-                Err(e) => return Poll::Ready(Some(Err(e))),
-            }
-        }
+        // Decode EntityId from key suffix
+        Poll::Ready(Some(decode_entity_id_from_index_key(&key_bytes)))
     }
 }
 

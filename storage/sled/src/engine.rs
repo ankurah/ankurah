@@ -1,8 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-#[cfg(debug_assertions)]
-use std::sync::{atomic::AtomicBool, Arc, Mutex};
-#[cfg(not(debug_assertions))]
 use std::sync::{Arc, Mutex};
 
 use ankurah_core::{
@@ -28,18 +25,6 @@ pub use transaction::SledTransaction;
 pub struct SledStorageEngine {
     /// Shared canonical stores, materializations, and engine metadata.
     pub database: Mutex<Arc<Database>>,
-    #[cfg(debug_assertions)]
-    /// Runtime test switch for disabling open-ended scan prefix guards.
-    pub prefix_guard_disabled: Arc<AtomicBool>,
-}
-
-impl SledStorageEngine {
-    #[cfg(debug_assertions)]
-    /// Enable or disable open-ended scan prefix guards in debug builds.
-    pub fn set_prefix_guard_disabled(&self, disabled: bool) {
-        use std::sync::atomic::Ordering;
-        self.prefix_guard_disabled.store(disabled, Ordering::Relaxed);
-    }
 }
 
 impl SledStorageEngine {
@@ -55,11 +40,7 @@ impl SledStorageEngine {
         std::fs::create_dir_all(&path)?;
         let dbpath = path.join("sled");
         let db = sled::open(&dbpath)?;
-        Ok(Self {
-            database: Mutex::new(Arc::new(Database::open(db)?)),
-            #[cfg(debug_assertions)]
-            prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self { database: Mutex::new(Arc::new(Database::open(db)?)) })
     }
 
     /// Open the default `.ankurah` database in the current user's home
@@ -70,11 +51,7 @@ impl SledStorageEngine {
     pub fn new_test() -> anyhow::Result<Self> {
         let db = Config::new().temporary(true).flush_every_ms(None).open().unwrap();
 
-        Ok(Self {
-            database: Mutex::new(Arc::new(Database::open(db)?)),
-            #[cfg(debug_assertions)]
-            prefix_guard_disabled: Arc::new(AtomicBool::new(false)),
-        })
+        Ok(Self { database: Mutex::new(Arc::new(Database::open(db)?)) })
     }
 
     /// List model identities which already have durable materialization trees.
@@ -87,13 +64,7 @@ impl SledStorageEngine {
         let Some(tree) = database.materialization(model_id)? else {
             return Ok(None);
         };
-        Ok(Some(SledModelStore::new(
-            *model_id,
-            database,
-            tree,
-            #[cfg(debug_assertions)]
-            self.prefix_guard_disabled.clone(),
-        )))
+        Ok(Some(SledModelStore::new(*model_id, database, tree)))
     }
 }
 

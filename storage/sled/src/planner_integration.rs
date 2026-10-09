@@ -17,9 +17,8 @@ use crate::error::IndexError;
 #[derive(Debug)]
 pub struct SledRangeBounds {
     pub start: Vec<u8>,
+    /// Exclusive; `None` when every key from `start` on qualifies.
     pub end: Option<Vec<u8>>,
-    pub upper_open_ended: bool,
-    pub eq_prefix_guard: Vec<u8>,
 }
 
 /// Convert IndexBounds directly to Sled byte ranges for a specific index
@@ -49,14 +48,9 @@ pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec<String>) 
     // The inequality is on the part after the equalities, not on the first
     // part (PR #212). A bound the index has no part for cannot narrow the scan.
     let (Some(bound), Some(part)) = (inequality, key_spec.keyparts.get(equal.len())) else {
-        // Equalities on leading parts only: scan the prefix's range open-ended
-        // behind a prefix guard. Equalities on the whole key: the tight range.
-        return Ok(if key_spec.keyparts.len() > equal.len() {
-            SledRangeBounds { start: prefix.clone(), end: None, upper_open_ended: true, eq_prefix_guard: prefix }
-        } else {
-            let end = prefix_range_end(&prefix);
-            SledRangeBounds { start: prefix, upper_open_ended: end.is_none(), end, eq_prefix_guard: Vec::new() }
-        });
+        // Equalities only, on leading parts or the whole key: the prefix's range.
+        let end = prefix_range_end(&prefix);
+        return Ok(SledRangeBounds { start: prefix, end });
     };
 
     // A descending part reverses byte order, so its logical ends swap sides.
@@ -75,14 +69,7 @@ pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec<String>) 
         Some((value, false)) => match prefix_range_end(&encode(value)?) {
             Some(after) => after,
             // Nothing sorts above an all-0xFF key: no key qualifies.
-            None => {
-                return Ok(SledRangeBounds {
-                    start: prefix.clone(),
-                    end: Some(prefix),
-                    upper_open_ended: false,
-                    eq_prefix_guard: Vec::new(),
-                })
-            }
+            None => return Ok(SledRangeBounds { start: prefix.clone(), end: Some(prefix) }),
         },
     };
     let end = match byte_high {
@@ -90,8 +77,7 @@ pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec<String>) 
         Some((value, false)) => Some(encode(value)?),
         Some((value, true)) => prefix_range_end(&encode(value)?),
     };
-    let upper_open_ended = end.is_none();
-    Ok(SledRangeBounds { start, end, upper_open_ended, eq_prefix_guard: prefix })
+    Ok(SledRangeBounds { start, end })
 }
 
 /// The value a bound pins its part to: both ends inclusive on the same value.

@@ -4,8 +4,9 @@ use ankurah_storage_common::{Endpoint, KeyBoundComponent, KeyBounds};
 use ankurah_storage_sled::{error::IndexError, planner_integration::key_bounds_to_sled_range};
 
 #[test]
-fn equality_bounds_use_prefix_guard_for_multi_key() -> Result<(), IndexError> {
-    // name = "Alice" on a (name, age) index should use prefix guard
+fn equality_bounds_use_tight_range_for_multi_key() -> Result<(), IndexError> {
+    // name = "Alice" on a (name, age) index: prefix-free parts give the equality prefix a tight end,
+    // so the scan is bounded like a single-key equality instead of open-ended behind a guard.
     let bounds = KeyBounds::new(vec![KeyBoundComponent {
         column: "name".to_string(),
         low: Endpoint::incl(Value::String("Alice".to_string())),
@@ -35,10 +36,8 @@ fn equality_bounds_use_prefix_guard_for_multi_key() -> Result<(), IndexError> {
 
     let result = key_bounds_to_sled_range(&bounds, &key_spec)?;
 
-    // Should use unbounded upper with prefix guard for multi-key partial equality
-    assert!(result.end.is_none(), "Multi-key equality should have unbounded upper");
-    assert!(result.upper_open_ended, "Should be open-ended");
-    assert!(!result.eq_prefix_guard.is_empty(), "Should have prefix guard");
+    assert!(result.end.is_some(), "Multi-key equality should have bounded upper");
+    assert!(result.end.as_ref().unwrap() > &result.start, "end must lie above the prefix");
     Ok(())
 }
 
@@ -66,8 +65,6 @@ fn equality_bounds_use_tight_range_for_single_key() -> Result<(), IndexError> {
 
     // Should use tight range for single-key equality
     assert!(result.end.is_some(), "Single-key equality should have bounded upper");
-    assert!(!result.upper_open_ended, "Should not be open-ended");
-    assert!(result.eq_prefix_guard.is_empty(), "Should not need prefix guard");
     Ok(())
 }
 
@@ -171,14 +168,12 @@ fn desc_inequality_with_asc_equality_prefix() -> Result<(), IndexError> {
     // and invoke handle_desc_inequality, which should:
     // 1. Set start = enc(room, deleted, timestamp) - the upper bound becomes start
     // 2. Set end = succ(enc(room, deleted)) - scan to end of equality prefix
-    // 3. Have a non-empty eq_prefix_guard
 
     // For DESC with upper bound only (timestamp <= Y):
     // - start should be enc(room123, false, 1700000000000)
     // - end should be succ(enc(room123, false))
     assert!(result.start.len() > 10, "Start should be encoded key with all three components, got {} bytes", result.start.len());
     assert!(result.end.is_some(), "Should have bounded end");
-    assert!(!result.eq_prefix_guard.is_empty(), "Should have equality prefix guard");
 
     // The start should NOT be 0x00 - that would indicate the fix didn't apply
     assert_ne!(
@@ -238,7 +233,6 @@ fn desc_inequality_with_single_asc_prefix() -> Result<(), IndexError> {
     // Should apply DESC handling for the score column
     assert!(result.start.len() > 5, "Start should include encoded category + score");
     assert!(result.end.is_some(), "Should have bounded end");
-    assert!(!result.eq_prefix_guard.is_empty(), "Should have equality prefix guard");
     assert_ne!(result.start, vec![0x00], "Should not start at 0x00 for upper-bound-only DESC");
 
     Ok(())
@@ -311,7 +305,6 @@ fn desc_lower_bound_inequality_with_asc_prefix() -> Result<(), IndexError> {
     // the successor of the inequality value, capturing all timestamps >= Y.
     assert!(result.start.len() > 5, "Start should include encoded equality prefix");
     assert!(result.end.is_some(), "Should have bounded end");
-    assert!(!result.eq_prefix_guard.is_empty(), "Should have equality prefix guard");
 
     Ok(())
 }
@@ -376,7 +369,6 @@ fn desc_range_inequality_with_asc_prefix() -> Result<(), IndexError> {
     // - end should be succ(enc(room, deleted, A)) - lower logical becomes upper physical
     assert!(result.start.len() > 10, "Start should include all three components");
     assert!(result.end.is_some(), "Should have bounded end");
-    assert!(!result.eq_prefix_guard.is_empty(), "Should have equality prefix guard");
 
     Ok(())
 }

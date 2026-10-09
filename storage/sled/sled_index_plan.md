@@ -118,8 +118,8 @@ Range end of a prefix (`prefix_range_end` in core):
 - Split the bounds into the equality parts (both endpoints inclusive on one value) and the one
   inequality on the part after them; the planner bounds no later part.
 - `prefix = encode_tuple(equality values)`.
-- Equalities only: on a leading part of the key, iterate `tree.range(prefix ..)` with the
-  equality-prefix guard; on the whole key, `tree.range(prefix .. prefix_range_end(prefix))`.
+- Equalities only, on leading parts of the key or on all of it:
+  `tree.range(prefix .. prefix_range_end(prefix))`.
 - With the inequality, `bound = encode_tuple(equality values + the bound's value)`:
   - `start`: `prefix` when the low side is unbounded; `bound` for an inclusive low bound;
     `prefix_range_end(bound)` for an exclusive one (no key qualifies when that is `None`)
@@ -129,11 +129,12 @@ Range end of a prefix (`prefix_range_end` in core):
 - No `entity_id` suffix is appended to either bound: `start` is at or below every key that
   begins with it, and `end` is the first key above every key that begins with the bounded value,
   so `tree.range(start .. end)` (end exclusive) covers exactly the matching tuples.
-- Prefix guard for open-ended scans: stop when the tuple portion no longer matches the equality-prefix tuple
+- No equality-prefix guard: every key in `[prefix, prefix_range_end(prefix))` begins with the
+  prefix by construction, so the range itself is the guard.
 
 Reverse scans:
 
-- To satisfy DESC without separate DESC indexes, iterate `rev()` over the constructed ranges and apply the same equality-prefix guard logic.
+- To satisfy DESC without separate DESC indexes, iterate `rev()` over the constructed ranges.
 
 ## Query execution (planner integration)
 
@@ -142,7 +143,7 @@ Reverse scans:
 3. `assure_index_exists(collection, index_spec)`
    - If missing/not built → allocate `u32 id`, persist `IndexRecord` as Building, backfill `index_{id}` synchronously, mark Ready
 4. Convert `bounds` → sled key-range over composite tuple
-5. Open `index_{id}` and iterate `range(start_full..end_full)` or `range(start_full..)` + equality-prefix guard (debug flag allows disabling guard in tests)
+5. Open `index_{id}` and iterate `range(start .. end)`, or `range(start ..)` when the end is unbounded
 6. Decode `EntityId` from key suffix. If spilled predicates or ORDER BY spill exist, fetch materialized values from `collection_{collection}` first and evaluate there to skip non-matching rows early
 7. For rows that pass filters, hydrate canonical state from `entities`
 8. ORDER BY and LIMIT are applied via the streaming pipeline rules (see below): use in-memory sort or top-K as appropriate; do not combine full sort with limit – prefer `top_k` when both are present
@@ -183,7 +184,7 @@ Notes:
 
 ## Scanning and execution efficiency (streaming pipeline)
 
-- Use canonical range normalization, `prefix_range_end` for inclusive upper and exclusive lower bounds, and prefix guards for open-ended scans.
+- Use canonical range normalization and `prefix_range_end` for inclusive upper and exclusive lower bounds.
 - Pipeline is composed from engine-specific scanners and generic combinators:
   - EntityIdStream: iterates `EntityId`s
   - GetPropertyValueStream: iterates materialized rows (`MatRow = { id, mat }`), where `mat` implements `Filterable` (later renamed `GetPropertyValue`)
@@ -203,10 +204,6 @@ Notes:
 - Maintain a small top-K heap when `order_by_spill` with `limit` is present, to avoid full materialization.
 - Batch writes with `sled::Batch` for index maintenance; keep read path streaming and low-allocation.
 
-Prefix guard toggle for testing:
-
-- Provide a debug-only flag to disable the equality-prefix guard to validate correctness via tests that compare guarded vs unguarded scans.
-
 ## Deletion
 
 - On delete (future API): remove entity from `entities` and delete its entries from all indexes
@@ -221,7 +218,7 @@ Prefix guard toggle for testing:
 ## Testing plan
 
 - Unit tests for tuple encoding (round-trip, ordering across types)
-- Range mapping tests: inclusive/exclusive bounds, open upper with prefix guard; values that extend another through 0x00 fetched through sled (`tests/string_bounds.rs`)
+- Range mapping tests: inclusive/exclusive bounds, equality prefixes with a tight end; values that extend another through 0x00 fetched through sled (`tests/string_bounds.rs`)
 - Reopen: an index recorded under an older key layout is rebuilt and serves fetches (`tests/index_layout.rs`)
 - Backfill: create index on existing dataset; verify entries and scans
 - Maintenance: set_state replacing values updates index entries; delete path
