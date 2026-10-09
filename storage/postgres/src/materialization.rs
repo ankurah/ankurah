@@ -1,10 +1,14 @@
+use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     property::backend::backend_from_string,
     schema::CatalogResolver,
 };
 use ankurah_proto::{Attested, EntityId, EntityState, ModelId, PropertyId};
-use ankurah_storage_common::naming;
+use ankurah_storage_common::{
+    materialization_index::{serving_index, ExistingIndex},
+    naming,
+};
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use std::{
     collections::BTreeMap,
@@ -13,7 +17,7 @@ use std::{
 use tokio_postgres::{types::ToSql, GenericClient};
 use tracing::{debug, error, info, warn};
 
-use super::{acquire_ddl_lock, error_kind, release_ddl_lock, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES};
+use super::{acquire_ddl_lock, error_kind, index, release_ddl_lock, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES};
 use crate::value::PGValue;
 
 #[derive(Clone, Debug)]
@@ -39,6 +43,12 @@ pub(crate) struct Materialization {
     /// `PropertyId::Id -> "id"` pin so a read of the primary key is a uniform
     /// map hit.
     property_columns: Arc<RwLock<BTreeMap<PropertyId, String>>>,
+    /// This table's indexes as the catalog last listed them: read when a
+    /// query first needs an index and again after each one this handle
+    /// creates, so that a query whose index exists runs no DDL.
+    indexes: RwLock<Option<Vec<ExistingIndex>>>,
+    /// The engine's lock on index DDL, see [`Postgres`].
+    index_ddl_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A projection whose physical table and columns have already been prepared.
@@ -115,6 +125,8 @@ impl Materialization {
             resolver: resolver.clone(),
             columns: Arc::new(RwLock::new(Vec::new())),
             property_columns: Arc::new(RwLock::new(BTreeMap::new())),
+            indexes: RwLock::new(None),
+            index_ddl_lock: engine.index_ddl_lock.clone(),
         };
 
         let lock_key = acquire_ddl_lock(&client, bucket.table()).await?;
@@ -425,6 +437,45 @@ impl Materialization {
                 Err(StateError::DDLError(Box::new(err)))
             }
         }
+    }
+
+    /// Make sure an index serving `spec` exists on this table, creating it on
+    /// first use: the shared planner chose the key, as it does for sled and
+    /// IndexedDB, and this is where the engine runs the DDL in place of
+    /// opening a sled tree. The catalog is read again under the engine's
+    /// index DDL lock before anything is created, so two first uses in this
+    /// engine create one index; the creation itself runs under an advisory
+    /// lock on the index's name, because another node on the same database
+    /// can reach it at the same time, and two sessions creating one name at
+    /// once fail on the catalog's uniqueness where the second, made to wait,
+    /// finds the index instead. PostgreSQL builds the index within the plain
+    /// CREATE INDEX statement, run outside any transaction: the first query
+    /// waits for that build, as sled's first query waits for its backfill,
+    /// and there is no backfill code. Every index this engine creates goes
+    /// through here, so a later hook on index creation has one place to
+    /// attach. The query's SQL answers it with or without the index, so an
+    /// index PostgreSQL declines to use costs only its upkeep, and an index
+    /// dropped behind this handle's back is simply not used until the engine
+    /// reopens.
+    pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> Result<(), RetrievalError> {
+        if self.indexes.read().unwrap().as_deref().is_some_and(|known| serving_index(known, spec).is_some()) {
+            return Ok(());
+        }
+        let _ddl = self.index_ddl_lock.lock().await;
+        let client = self.pool.get().await.map_err(RetrievalError::storage)?;
+        let mut existing = index::list_indexes(&client, self.table()).await.map_err(RetrievalError::storage)?;
+        if serving_index(&existing, spec).is_none() {
+            let name = index::index_name(self.table(), spec);
+            let statement = index::create_index_sql(self.table(), &name, spec);
+            debug!("Materialization({}).assure_index_exists: {}", self.materialization_table_name, statement);
+            let lock_key = acquire_ddl_lock(&client, &name).await.map_err(RetrievalError::storage)?;
+            let created = client.execute(&statement, &[]).await;
+            release_ddl_lock(&client, lock_key).await.map_err(RetrievalError::storage)?;
+            created.map_err(RetrievalError::storage)?;
+            existing = index::list_indexes(&client, self.table()).await.map_err(RetrievalError::storage)?;
+        }
+        *self.indexes.write().unwrap() = Some(existing);
+        Ok(())
     }
 
     pub async fn add_missing_columns(

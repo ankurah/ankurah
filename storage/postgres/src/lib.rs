@@ -31,6 +31,7 @@ use tokio_postgres::{error::SqlState, GenericClient};
 use tracing::{debug, error};
 
 mod dump;
+mod index;
 mod materialization;
 mod query;
 mod transaction;
@@ -58,7 +59,7 @@ const IDENTIFIER_MAX_BYTES: usize = 63;
 const FIXED_STORAGE_TABLES: &[&str] =
     &[META_TABLE, MODEL_REGISTRATION_TABLE, COLUMN_MAP_TABLE, ENTITY_TABLE, EVENT_TABLE, ENTITY_MODEL_TABLE];
 
-fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
+pub(crate) fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.replace('"', "\"\"")) }
 
 fn system_label(model: SystemModel) -> &'static str {
     match model {
@@ -87,6 +88,11 @@ pub struct Postgres {
     resolver: Arc<RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
     /// Whether this instance created the shared tables since opening or since its last `delete_all`.
     shared_tables_ready: AtomicBool,
+    /// Serializes index DDL across this engine's materializations: two CREATE
+    /// INDEX statements never interleave, and a second first use of an index
+    /// waits to find the first's. Another node on the same database is held
+    /// off by an advisory lock on the index's name instead.
+    index_ddl_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Postgres {
@@ -101,6 +107,7 @@ impl Postgres {
             materializations: SafeMap::new(),
             resolver: Arc::new(RwLock::new(None)),
             shared_tables_ready: AtomicBool::new(false),
+            index_ddl_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         engine.check_protocol_version().await?;
         Ok(engine)
