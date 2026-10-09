@@ -3,8 +3,9 @@ use ankurah_core::{error::RetrievalError, storage::StorageEngine};
 use ankurah_proto::{Attested, EntityId, EntityState, PropertyId};
 use ankurah_storage_common::{
     materialization_join::{MaterializationJoin, MaterializationTable},
-    materialization_plan::MaterializationPlan,
+    materialization_plan::{plan_on_materialization, MaterializationPlan},
     selection::select_states,
+    Plan, PlannerConfig,
 };
 
 use super::{load_states, SqliteStorageEngine, ENTITY_TABLE};
@@ -35,6 +36,18 @@ impl Query {
         for model in models.into_iter().filter(|model| existing.contains(model)) {
             let table = engine.materialization(&model).await?;
             tables.push(MaterializationTable { model, table: table.table().to_owned(), columns: table.query_columns(&properties).await? });
+        }
+        // The materialization that serves the selection gets the index its
+        // plan reads, before the query's read snapshot opens. A SQLite index
+        // takes a direction per column, so the engine serves every plan.
+        if let Some((model, served)) = plan.indexed_materialization() {
+            if let Some(table) = tables.iter().find(|table| table.model == model) {
+                if let Some(Plan::Index { index_spec, .. }) =
+                    plan_on_materialization(&served, &table.columns, PlannerConfig::full_support())
+                {
+                    engine.materialization(&model).await?.assure_index_exists(&index_spec).await?;
+                }
+            }
         }
         let join = MaterializationJoin::new(tables);
         let mut split = split_predicate_for_sqlite(&selection.predicate);

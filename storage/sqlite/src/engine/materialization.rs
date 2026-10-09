@@ -1,15 +1,19 @@
+use ankurah_core::indexing::KeySpec;
 use ankurah_core::{
     error::{MutationError, RetrievalError},
     property::backend::backend_from_string,
     schema::CatalogResolver,
 };
 use ankurah_proto::{Attested, EntityState, ModelId, PropertyId};
-use ankurah_storage_common::naming;
+use ankurah_storage_common::{
+    materialization_index::{index_name, serving_index, ExistingIndex},
+    naming,
+};
 use rusqlite::{params_from_iter, Connection};
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::debug;
 
-use super::{SqliteStorageEngine, COLUMN_MAP_TABLE};
+use super::{index, SqliteStorageEngine, COLUMN_MAP_TABLE};
 use crate::{
     connection::{PooledConnection, SqliteConnectionManager},
     error::SqliteError,
@@ -83,6 +87,12 @@ pub(super) struct Materialization {
     /// were deduped at assignment. Always carries the `PropertyId::Id -> "id"`
     /// pin so a read of the primary key is a uniform map hit.
     property_columns: Arc<std::sync::RwLock<BTreeMap<PropertyId, String>>>,
+    /// This table's indexes as the catalog last listed them: read when a
+    /// query first needs an index and again after each one this handle
+    /// creates, so that a query whose index exists runs no DDL.
+    indexes: std::sync::RwLock<Option<Vec<ExistingIndex>>>,
+    /// The engine's lock on index DDL, see [`SqliteStorageEngine`].
+    index_ddl_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 /// A projection whose table and columns already exist.
@@ -132,6 +142,8 @@ impl Materialization {
             ddl_lock: Arc::new(tokio::sync::Mutex::new(())),
             resolver: engine.resolver.clone(),
             property_columns: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
+            indexes: std::sync::RwLock::new(None),
+            index_ddl_lock: engine.index_ddl_lock.clone(),
         };
         let id_pin_key = property_key_text(&PropertyId::Id);
         conn.with_connection(move |c| {
@@ -382,6 +394,46 @@ impl Materialization {
         let mut columns = self.columns.write().expect("RwLock poisoned");
         *columns = new_columns;
         Ok(())
+    }
+
+    /// Make sure an index serving `spec` exists on this table, creating it on
+    /// first use: the shared planner chose the key, as it does for sled and
+    /// IndexedDB, and this is where the engine runs the DDL in place of
+    /// opening a sled tree. The catalog is read again under the engine's
+    /// index DDL lock before anything is created, so two first uses create
+    /// one index and an index another process created is found rather than
+    /// made again. SQLite builds the index within the CREATE INDEX statement:
+    /// the first query waits for that build, as sled's first query waits for
+    /// its backfill, and there is no backfill code. Every index this engine
+    /// creates goes through here, so a later hook on index creation has one
+    /// place to attach. The query's SQL answers it with or without the index,
+    /// so an index SQLite declines to use costs only its upkeep, and an index
+    /// dropped behind this handle's back is simply not used until the engine
+    /// reopens.
+    pub(super) async fn assure_index_exists(&self, spec: &KeySpec<String>) -> Result<(), SqliteError> {
+        if self.indexes.read().expect("RwLock poisoned").as_deref().is_some_and(|known| serving_index(known, spec).is_some()) {
+            return Ok(());
+        }
+        let _ddl = self.index_ddl_lock.lock().await;
+        let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
+        let mut existing = self.list_indexes(&conn).await?;
+        if serving_index(&existing, spec).is_none() {
+            let statement = index::create_index_sql(self.table(), &index_name(self.table(), spec), spec);
+            debug!("Materialization({}).assure_index_exists: {}", self.materialization_table_name, statement);
+            conn.with_connection(move |c| {
+                c.execute(&statement, [])?;
+                Ok(())
+            })
+            .await?;
+            existing = self.list_indexes(&conn).await?;
+        }
+        *self.indexes.write().expect("RwLock poisoned") = Some(existing);
+        Ok(())
+    }
+
+    async fn list_indexes(&self, conn: &PooledConnection) -> Result<Vec<ExistingIndex>, SqliteError> {
+        let table = self.table().to_owned();
+        conn.with_connection(move |c| index::list_indexes(c, &table)).await
     }
 
     async fn add_missing_columns(&self, conn: &PooledConnection, missing: Vec<(String, &'static str)>) -> Result<(), SqliteError> {

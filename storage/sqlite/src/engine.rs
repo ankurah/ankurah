@@ -21,6 +21,7 @@ use crate::connection::{PooledConnection, SqliteConnectionManager};
 use crate::error::SqliteError;
 use crate::value::SqliteValue;
 
+mod index;
 mod materialization;
 mod query;
 mod transaction;
@@ -71,6 +72,10 @@ pub struct SqliteStorageEngine {
     pool: bb8::Pool<SqliteConnectionManager>,
     /// Optional labels for first-use physical name assignment.
     resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
+    /// Serializes index DDL across this engine's materializations: two CREATE
+    /// INDEX statements never interleave, and a second first use of an index
+    /// waits to find the first's.
+    index_ddl_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SqliteStorageEngine {
@@ -185,7 +190,12 @@ impl SqliteStorageEngine {
     /// `check_protocol_version`) so every construction path verifies
     /// the store it is about to serve.
     pub async fn new(pool: bb8::Pool<SqliteConnectionManager>) -> anyhow::Result<Self> {
-        let engine = Self { pool, materializations: SafeMap::new(), resolver: Arc::new(std::sync::RwLock::new(None)) };
+        let engine = Self {
+            pool,
+            materializations: SafeMap::new(),
+            resolver: Arc::new(std::sync::RwLock::new(None)),
+            index_ddl_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
         engine.check_protocol_version().await?;
         Ok(engine)
     }
