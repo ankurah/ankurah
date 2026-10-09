@@ -42,7 +42,7 @@
   - Sled exposes `ProjectedEntity { id, collection, map }` per-row for filtering/sorting; implements `Filterable` and `HasEntityId`
 - `index_{index_id}` (per-index tree; bound to one collection via metadata)
 
-  - key: composite tuple bytes (per `IndexSpec`) `|| 0x00 || entity_id_bytes`
+  - key: composite tuple bytes (per `IndexSpec`) `|| entity_id_bytes`
   - val: empty
 
 - `events` (append-only; no secondary index in V1)
@@ -58,10 +58,12 @@ Notes:
 
 We use Option A: make the key unique by appending `entity_id` to the composite key.
 
-- key: `composite_tuple_bytes || 0x00 || entity_id_bytes`
+- key: `composite_tuple_bytes || entity_id_bytes`
 - val: empty
 
 This keeps maintenance simple, enables natural range scans, and provides a deterministic tie-breaker.
+No separator stands between the tuple and the id: every part's encoding is prefix-free (see below),
+and the id is a fixed-width suffix, so a scanner takes the last `EntityId::BYTE_LEN` bytes.
 
 ## Index metadata
 
@@ -73,10 +75,16 @@ struct IndexRecord {
   spec: IndexSpec,           // full spec (serde/bincode)
   created_at: SystemTime,
   build_status: BuildStatus, // NotBuilt | Building | Ready
+  key_layout_version: u32,   // layout of the tree's keys; KEY_LAYOUT_VERSION in index.rs
 }
 ```
 
 - `index_config` maps `id` → `IndexRecord`.
+- `key_layout_version` is bumped whenever the canonical key encoding changes. A record written
+  before the field existed decodes as layout 0. On open, an index recorded under another layout is
+  started over: its tree is dropped first, then its record is rewritten as `NotBuilt` under the
+  current layout, so a crash between the two leaves the old layout recorded and the drop is
+  repeated on the next open; the next use rebuilds the tree through the ordinary build path.
 - `index_{id}` exists iff `build_status == Ready`.
 - V1 backfill is synchronous (create meta as Building → build → Ready).
 
@@ -85,32 +93,42 @@ struct IndexRecord {
 - Use `Collatable` to produce order-preserving bytes per component.
 - Target type for planning and storage is `PropertyValue` (from core/property).
 - Plan: implement `Collatable for PropertyValue` (follow-up), but for V1 we can adapt via a conversion to the existing `core::value::Value` encoding to avoid blocking.
-- Tuple encoding (component-wise, preserves lex order and unambiguously delimits parts):
-  - component header: 1-byte type tag (String=0x10, I64=0x20, F64=0x30, Bool=0x40, Bytes=0x50)
-  - component length: u32 big-endian (bytes length)
-  - component body: `Collatable::to_bytes()` for the value
+- Tuple encoding (component-wise, preserves lex order, no separators; `core/src/indexing/encoding.rs`):
+  - fixed-width parts (integers, floats, booleans, entity ids): `Collatable::to_bytes()`
+  - variable-length parts (strings, binary, objects, JSON strings): the payload with every 0x00
+    escaped as 0x00 0xFF, then the terminator 0x00 0x00
+  - a descending part is the bitwise complement of its ascending encoding
 - Composite key bytes = concat of encoded components for all keyparts (in order).
 
-Rationale: length-prefix + type-tag ensures lexicographic order over tuples and disambiguates boundaries without escaping. Big-endian length preserves prefix ordering.
+Rationale: each part's encoding is prefix-free, so concatenation keeps tuple order and part
+boundaries without length prefixes or type tags, and the keys of every tuple beginning with a
+given prefix are exactly the keys that begin with the prefix's bytes. The module doc carries the
+argument.
 
-Lexicographic successor for inclusive upper bounds:
+Range end of a prefix (`prefix_range_end` in core):
 
-- Use a true bytewise successor (increment-with-carry) over the composite tuple bytes. If all bytes are 0xFF, the successor does not exist and the bound is effectively unbounded-high for end-exclusive ranges.
+- The least key above every key that begins with `prefix`: the prefix without its trailing 0xFF
+  bytes, its last byte incremented. `None` for an empty or all-0xFF prefix, when every key from
+  `prefix` on begins with it (unbounded-high). The bytewise increment-with-carry successor
+  (`lex_successor`) is gone: it could land inside the key of a longer value.
 
 ## Mapping planner bounds → sled ranges
 
 - Input: `IndexBounds` (multi-column), per-keypart `Endpoint::{Value{datum, inclusive}, UnboundedLow, UnboundedHigh}`
-- Normalize to a canonical lexicographic interval (recommend sharing the normalizer across backends):
-  - Output: `lower: Option<(Vec<PropertyValue>, lower_open)>`, `upper: Option<(Vec<PropertyValue>, upper_open)>`, and `eq_prefix_len/values`
-- Build sled byte keys over the composite tuple (index key portion):
-  - `encode_tuple(values: &[PropertyValue]) -> Vec<u8>` → `tuple_key`
-  - `start_tuple = encode_tuple(lower_tuple)`; if `lower_open`, set `start_tuple = lex_successor(start_tuple)` (if successor is None → empty scan)
-  - If `upper == None` (open-ended): use equality-prefix guard
-  - Else: `end_tuple = encode_tuple(upper_tuple)`; if `upper_open == false`, set `end_tuple = lex_successor(end_tuple)` (if successor is None, treat as unbounded-high)
-- Form full-range bounds for the actual sled keys that include `entity_id` suffix:
-  - `start_full = start_tuple || 0x00` (smallest possible suffix)
-  - If bounded upper: `end_full = end_tuple || 0x00` and use `tree.range(start_full .. end_full)` (end exclusive)
-  - If unbounded upper: iterate `tree.range(start_full ..)` with a prefix guard on the equality prefix
+- Split the bounds into the equality parts (both endpoints inclusive on one value) and the one
+  inequality on the part after them; the planner bounds no later part.
+- `prefix = encode_tuple(equality values)`.
+- Equalities only: on a leading part of the key, iterate `tree.range(prefix ..)` with the
+  equality-prefix guard; on the whole key, `tree.range(prefix .. prefix_range_end(prefix))`.
+- With the inequality, `bound = encode_tuple(equality values + the bound's value)`:
+  - `start`: `prefix` when the low side is unbounded; `bound` for an inclusive low bound;
+    `prefix_range_end(bound)` for an exclusive one (no key qualifies when that is `None`)
+  - `end`: `prefix_range_end(prefix)` when the high side is unbounded; `bound` for an exclusive
+    high bound; `prefix_range_end(bound)` for an inclusive one (`None` → unbounded-high)
+  - A descending part reverses byte order, so its logical low and high swap sides first.
+- No `entity_id` suffix is appended to either bound: `start` is at or below every key that
+  begins with it, and `end` is the first key above every key that begins with the bounded value,
+  so `tree.range(start .. end)` (end exclusive) covers exactly the matching tuples.
 - Prefix guard for open-ended scans: stop when the tuple portion no longer matches the equality-prefix tuple
 
 Reverse scans:
@@ -134,7 +152,7 @@ Reverse scans:
 - Build from `collection_{collection}` (materialized values), not from `entities`:
   - For each `entity_id` → `Vec<(SledPropertyId, PropertyValue)>`, extract keypart values
   - Compute composite tuple bytes
-  - Insert key `composite_tuple_bytes || 0x00 || entity_id` → empty
+  - Insert key `composite_tuple_bytes || entity_id` → empty
 - Backfill in batches to limit memory; flush periodically
 - After success, mark meta Ready and persist snapshot to `index_config`
 - For V1, synchronous. Follow-up: batched/incremental with progress saved in meta
@@ -146,8 +164,8 @@ On `set_state` for a collection:
 - Upsert `entities`: write canonical `StateFragment`
 - Upsert `collection_{collection}`: recompute materialized `Vec<(SledPropertyId, PropertyValue)>`
 - For each index in `indexes` for this collection:
-  - If old materialization exists: compute old composite key; if changed, delete old key `old_tuple || 0x00 || entity_id`
-  - Compute new composite key and insert key `new_tuple || 0x00 || entity_id` with empty value
+  - If old materialization exists: compute old composite key; if changed, delete old key `old_tuple || entity_id`
+  - Compute new composite key and insert key `new_tuple || entity_id` with empty value
 
 Notes:
 
@@ -165,7 +183,7 @@ Notes:
 
 ## Scanning and execution efficiency (streaming pipeline)
 
-- Use canonical range normalization, lexicographic successor for inclusive upper bounds, and prefix guards for open-ended scans.
+- Use canonical range normalization, `prefix_range_end` for inclusive upper and exclusive lower bounds, and prefix guards for open-ended scans.
 - Pipeline is composed from engine-specific scanners and generic combinators:
   - EntityIdStream: iterates `EntityId`s
   - GetPropertyValueStream: iterates materialized rows (`MatRow = { id, mat }`), where `mat` implements `Filterable` (later renamed `GetPropertyValue`)
@@ -197,12 +215,14 @@ Prefix guard toggle for testing:
 
 - Current Sled backend uses unified `entities`, `index_config`, and per-index `index_{id}` trees
 - Non-breaking option: detect old layout and offer a migrator that reads old trees and writes to the new layout
+- A change of the index key encoding needs no migrator: `key_layout_version` in each `IndexRecord` has the index started over on open (see Index metadata)
 - For tests/dev: new test engine `SledStorageEngine::new_test()` will initialize the new layout directly
 
 ## Testing plan
 
 - Unit tests for tuple encoding (round-trip, ordering across types)
-- Range mapping tests: inclusive/exclusive bounds, open upper with prefix guard
+- Range mapping tests: inclusive/exclusive bounds, open upper with prefix guard; values that extend another through 0x00 fetched through sled (`tests/string_bounds.rs`)
+- Reopen: an index recorded under an older key layout is rebuilt and serves fetches (`tests/index_layout.rs`)
 - Backfill: create index on existing dataset; verify entries and scans
 - Maintenance: set_state replacing values updates index entries; delete path
 - Planner integration: end-to-end queries with equality-only, inequality, ORDER BY, LIMIT
