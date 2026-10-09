@@ -7,6 +7,7 @@ mod index_creation;
 mod json_property;
 mod multi_column_order_by;
 mod normalization_tests;
+mod null_endpoints;
 mod pagination;
 mod ref_traversal;
 mod repeated_column;
