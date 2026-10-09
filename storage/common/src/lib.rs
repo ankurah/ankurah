@@ -1,6 +1,7 @@
 pub mod bounds;
 pub mod engine_columns;
 pub mod filtering;
+pub mod materialization_index;
 pub mod materialization_join;
 pub mod materialization_plan;
 pub mod naming;
