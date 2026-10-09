@@ -94,7 +94,8 @@ fn inequality_bounds_handle_desc_correctly() -> Result<(), IndexError> {
     let result = key_bounds_to_sled_range(&bounds, &key_spec)?;
 
     // For DESC, age > 25 should map to a bounded upper range (scan from start to enc(25))
-    assert_eq!(result.start, vec![0x00], "DESC inequality should start from beginning");
+    // With no equality prefix the range starts at the empty prefix, the first key of the tree.
+    assert!(result.start.is_empty(), "DESC inequality should start from beginning");
     assert!(result.end.is_some(), "DESC inequality should have bounded upper");
     Ok(())
 }

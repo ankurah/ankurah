@@ -68,6 +68,7 @@ pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec<String>) 
         encode_tuple_values_with_key_spec(&values, key_spec)
     };
 
+    // Without a bound on a side, the scan runs to that end of the prefix's range.
     let start = match byte_low {
         None => prefix.clone(),
         Some((value, true)) => encode(value)?,
@@ -84,14 +85,12 @@ pub fn key_bounds_to_sled_range(bounds: &KeyBounds, key_spec: &KeySpec<String>) 
             }
         },
     };
-    let (end, upper_open_ended) = match byte_high {
-        None => (None, true),
-        Some((value, false)) => (Some(encode(value)?), false),
-        Some((value, true)) => match prefix_range_end(&encode(value)?) {
-            Some(after) => (Some(after), false),
-            None => (None, true),
-        },
+    let end = match byte_high {
+        None => prefix_range_end(&prefix),
+        Some((value, false)) => Some(encode(value)?),
+        Some((value, true)) => prefix_range_end(&encode(value)?),
     };
+    let upper_open_ended = end.is_none();
     Ok(SledRangeBounds { start, end, upper_open_ended, eq_prefix_guard: prefix })
 }
 
