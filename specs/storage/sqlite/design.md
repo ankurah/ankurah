@@ -82,16 +82,23 @@ into AnkQL.
 The indexes are the ones sled and IndexedDB build for the same query: the
 shared planner's `Plan::Index` for the selection lowered to the table's
 columns, created with `CREATE INDEX IF NOT EXISTS` on the key parts' columns
-in their directions, a JSON sub-path as its `json_extract` expression (only
-for a part declared JSON: the expression runs on every write and refuses a
-value that is not JSON, so any other sub-path part leaves the plan without an
-index), and named sled's way behind the table name. An existing index serves a shorter key
-only past trailing `id` parts, which is sled's rule. The catalog
-(`pragma_index_list` and `pragma_index_xinfo`) is the only record of what
-exists; it is cached per materialization and read again under the lock before
-anything is created. SQLite builds the index inside the statement, so the
-first query waits for it, and the query's SQL answers with or without the
-index.
+in their directions and named sled's way behind the engines' `_ankurah_index`
+prefix and the table name. A key with a JSON sub-path part gets no index on
+SQLite: the declared type of a column is `BLOB` for JSON and binary values
+alike and binds nothing, so the engine cannot know the column holds only
+JSON, and a `json_extract` expression in an index would refuse a later write
+of any other value. An existing index serves a shorter key only past trailing
+`id` parts, which is sled's rule, and only when it sorts as the plan asks
+(collation included). The catalog (`pragma_index_list`, `pragma_index_xinfo`
+and the index's statement in `sqlite_master`) is the only record of what
+exists; it is cached per materialization, and the decision to reuse or create
+is taken under the engine's index DDL lock inside one immediate write
+transaction, so that another engine on the file sees the catalog before or
+after, never between. The outcome (created, reused, or unservable: a name
+taken by another index, or a sub-path part) is returned for the index creation
+hook to consume later. SQLite builds the index inside the statement, so the
+first query waits for it; the query's SQL answers with or without the index,
+so a build that fails is logged and the key waits out a backoff.
 
 ## Connections
 
