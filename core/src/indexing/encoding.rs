@@ -59,9 +59,13 @@
 //! null, the fixed-width boolean, integer or float, or the escaped and
 //! terminated string. The tags order the kinds null < bool < int < float <
 //! string, and within a kind the value encodes as above, so the whole is
-//! prefix-free and ordered. A number encodes as an i64 when it fits and as an
-//! f64 otherwise. Arrays, objects and numbers beyond both are not sortable
-//! and all encode as null: the one deliberate exception to injectivity.
+//! prefix-free and ordered. Injectivity has two deliberate exceptions, each
+//! a known equivalence of distinct values rather than a flaw of the framing:
+//! null and every array and object share the null key, being unsortable;
+//! and a number encodes as an i64 when it fits and otherwise as the f64 it
+//! rounds to, so integers beyond i64 that round to one f64 share a key
+//! (2^63 and 2^63 + 1 both encode as the float 2^63). A number that
+//! serde_json can give as neither encodes as null.
 
 use super::key_spec::KeySpec;
 use crate::collation::Collatable;
@@ -315,11 +319,32 @@ mod tests {
         })
     }
 
-    /// Sort `values` by their value order and drop those comparing equal.
+    /// Distinct values the encoding deliberately gives one key (module doc,
+    /// "JSON parts"): the unsortable kinds, and integers beyond i64 that round
+    /// to one f64. Every other pair the value order calls equal is a failure.
+    fn known_equivalences() -> Vec<Vec<Value>> {
+        use serde_json::json;
+        let class = |values: Vec<serde_json::Value>| values.into_iter().map(Value::Json).collect();
+        vec![
+            class(vec![json!(null), json!([]), json!({}), json!([1, 2]), json!({"a": 1})]),
+            class(vec![json!(9223372036854775808u64), json!(9223372036854775809u64)]),
+        ]
+    }
+
+    fn known_equivalent(a: &Value, b: &Value) -> bool { known_equivalences().iter().any(|class| class.contains(a) && class.contains(b)) }
+
+    /// Sort `values` by their value order and drop exact duplicates (`==`),
+    /// keeping distinct values that the order calls equal.
     fn distinct_sorted(mut values: Vec<Value>) -> Vec<Value> {
         values.sort_by(value_cmp);
-        values.dedup_by(|a, b| value_cmp(a, b) == Ordering::Equal);
-        values
+        let mut distinct: Vec<Value> = Vec::with_capacity(values.len());
+        for value in values {
+            let same_rank = distinct.iter().rev().take_while(|kept| value_cmp(kept, &value) == Ordering::Equal);
+            if !same_rank.into_iter().any(|kept| *kept == value) {
+                distinct.push(value);
+            }
+        }
+        distinct
     }
 
     /// Every sequence over `alphabet` up to `max_len` symbols, plus `random`
@@ -387,10 +412,14 @@ mod tests {
 
     fn json_samples() -> Vec<Value> {
         use serde_json::Value as J;
-        let mut out = vec![J::Null, J::Bool(false), J::Bool(true)];
+        let mut out = vec![J::Bool(false), J::Bool(true)];
         out.extend(integer_samples(i64::MIN, i64::MAX).into_iter().map(J::from));
         out.extend(float_samples().into_iter().filter_map(serde_json::Number::from_f64).map(J::Number));
         out.push(J::from(u64::MAX));
+        out.extend(known_equivalences().into_iter().flatten().map(|value| match value {
+            Value::Json(json) => json,
+            _ => unreachable!(),
+        }));
         out.extend(string_samples().into_iter().map(|s| match s {
             Value::String(s) => J::String(s),
             _ => unreachable!(),
@@ -422,25 +451,33 @@ mod tests {
         ]
     }
 
-    /// `keys` are the encodings of distinct values in value order: they must
-    /// be strictly monotone in the direction's byte order (which gives
-    /// injectivity and order preservation) and no key may be a proper prefix
-    /// of another. In byte order a key's extensions follow it directly, so
-    /// checking each key against its byte-order neighbour covers every pair.
-    fn assert_injective_ordered_prefix_free(keys: &[Vec<u8>], descending: bool, what: &str) {
+    /// `items` are distinct and in their value order (`cmp`), `keys` their
+    /// encodings. Keys must be strictly monotone in the direction's byte order,
+    /// which gives injectivity and order preservation, except that a pair the
+    /// order calls equal must be a known equivalence (`equivalent`) sharing one
+    /// key; and no key may be a proper prefix of another. In byte order a
+    /// key's extensions follow it directly, so byte-order neighbours cover
+    /// every pair.
+    fn assert_injective_ordered_prefix_free<T: std::fmt::Debug>(
+        items: &[T],
+        keys: &[Vec<u8>],
+        cmp: impl Fn(&T, &T) -> Ordering,
+        equivalent: impl Fn(&T, &T) -> bool,
+        descending: bool,
+        what: &str,
+    ) {
         let expected = if descending { Ordering::Greater } else { Ordering::Less };
-        for (i, pair) in keys.windows(2).enumerate() {
-            assert_eq!(
-                pair[0].cmp(&pair[1]),
-                expected,
-                "{what}: keys {i} and {} out of order: {:02x?} vs {:02x?}",
-                i + 1,
-                pair[0],
-                pair[1]
-            );
+        for (pair, (a, b)) in keys.windows(2).zip(items.iter().zip(&items[1..])) {
+            if cmp(a, b) == Ordering::Equal {
+                assert!(equivalent(a, b), "{what}: {a:?} and {b:?} compare equal but are not a known equivalence");
+                assert_eq!(pair[0], pair[1], "{what}: known equivalence {a:?} and {b:?} must share one key");
+            } else {
+                assert_eq!(pair[0].cmp(&pair[1]), expected, "{what}: {a:?} and {b:?} out of order: {:02x?} vs {:02x?}", pair[0], pair[1]);
+            }
         }
         let mut by_bytes = keys.to_vec();
         by_bytes.sort();
+        by_bytes.dedup();
         for pair in by_bytes.windows(2) {
             assert!(!pair[1].starts_with(&pair[0]), "{what}: {:02x?} is a prefix of {:02x?}", pair[0], pair[1]);
         }
@@ -452,8 +489,22 @@ mod tests {
             assert!(values.len() > 1, "{value_type:?} needs samples");
             for descending in [false, true] {
                 let keys: Vec<_> = values.iter().map(|v| encode(v, value_type, descending)).collect();
-                assert_injective_ordered_prefix_free(&keys, descending, &format!("{value_type:?} descending={descending}"));
+                let what = format!("{value_type:?} descending={descending}");
+                assert_injective_ordered_prefix_free(&values, &keys, value_cmp, known_equivalent, descending, &what);
             }
+        }
+    }
+
+    /// Integers beyond i64 encode as the f64 they round to, so neighbours that
+    /// round alike share a key: the known equivalence of the module doc, kept
+    /// here as the expected collision until the number representation changes.
+    #[test]
+    fn json_integers_beyond_i64_that_round_to_one_float_share_a_key() {
+        let json = |n: u64| Value::Json(serde_json::json!(n));
+        let (first, second, far) = (json(1 << 63), json((1 << 63) + 1), json(u64::MAX));
+        for descending in [false, true] {
+            assert_eq!(encode(&first, ValueType::Json, descending), encode(&second, ValueType::Json, descending));
+            assert_ne!(encode(&first, ValueType::Json, descending), encode(&far, ValueType::Json, descending));
         }
     }
 
@@ -495,7 +546,15 @@ mod tests {
             }
             tuples.sort_by(|a, b| tuple_cmp(a, b, &spec));
             let keys: Vec<_> = tuples.iter().map(|t| encode_tuple(t, &spec)).collect();
-            assert_injective_ordered_prefix_free(&keys, false, &spec.name_with("", ", "));
+            let parts_equivalent = |a: &Vec<Value>, b: &Vec<Value>| a.iter().zip(b).all(|(x, y)| x == y || known_equivalent(x, y));
+            assert_injective_ordered_prefix_free(
+                &tuples,
+                &keys,
+                |a, b| tuple_cmp(a, b, &spec),
+                parts_equivalent,
+                false,
+                &spec.name_with("", ", "),
+            );
         }
     }
 
