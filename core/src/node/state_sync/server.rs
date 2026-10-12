@@ -9,7 +9,7 @@ use ankurah_proto::{self as proto, AddressRange, ComparisonId, ComparisonProgres
 use anyhow::{bail, ensure};
 use web_time::Instant;
 
-use super::{Snapshot, LEAF_PAGE, PAGE_BYTES, PAGE_WORK};
+use super::{Snapshot, LEAF_PAGE, PAGE_BYTES, PAGE_STEPS, PAGE_WORK};
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
@@ -79,6 +79,7 @@ enum Work {
     Offer(proto::TreeHead),
     Expand(proto::TreeHead),
     AskLeaves(AddressRange),
+    SendLeaves(AddressRange),
     Item(StateItem),
     Repair(proto::EntityId, Option<proto::Clock>),
     Chunks { entity_id: proto::EntityId, target: proto::Clock, bytes: Vec<u8>, offset: usize },
@@ -347,8 +348,22 @@ impl Comparison {
     {
         let mut items = Vec::new();
         let mut bytes = 0;
-        for _ in 0..PAGE_WORK {
+        let mut tree_or_history_work = 0;
+        for _ in 0..PAGE_STEPS {
             let Some(work) = self.work.pop_front() else { break };
+            // Keep this in step with tree/storage/history access in the arms below.
+            let expensive = match &work {
+                Work::Compare { .. } | Work::Expand(_) | Work::SendLeaves(_) => true,
+                Work::Repair(id, known) => known.is_some() || !self.snapshot.states.contains_key(id),
+                _ => false,
+            };
+            if expensive {
+                if tree_or_history_work == PAGE_WORK {
+                    self.work.push_front(work);
+                    break;
+                }
+                tree_or_history_work += 1;
+            }
             let item = match work {
                 Work::Compare { head: known, prefix } => {
                     let mut local = self.snapshot.head(known.bounds.clone()).await?;
@@ -357,6 +372,11 @@ impl Comparison {
                     local.prefix = prefix;
                     if local.digest == known.digest {
                         Some(StateItem::Equal(known.bounds))
+                    } else if known.digest == ankurah_digest_tree::Digest::empty() {
+                        // No membership left to compare in this region. The peer
+                        // may still hold these entities under a different query.
+                        self.work.push_front(Work::SendLeaves(known.bounds));
+                        None
                     } else if local.digest.count() <= LEAF_PAGE as i64 {
                         self.work.push_front(Work::AskLeaves(known.bounds));
                         None
@@ -392,6 +412,23 @@ impl Comparison {
                 Work::AskLeaves(bounds) => {
                     self.leaves.push(bounds.clone());
                     Some(StateItem::NeedLeaves(bounds))
+                }
+                Work::SendLeaves(bounds) => {
+                    let page = self.snapshot.page(bounds.clone()).await?;
+                    if page.bounds.end != bounds.end {
+                        let std::ops::Bound::Included(last) = &page.bounds.end else { unreachable!("partial leaf page") };
+                        self.work.push_back(Work::SendLeaves(bounds.after(last)));
+                    }
+                    let needed = page
+                        .leaves
+                        .iter()
+                        .map(|leaf| leaf.entity.entity_id)
+                        .filter(|id| !self.repaired.contains(id) && self.heads.insert(*id))
+                        .collect::<Vec<_>>();
+                    if !needed.is_empty() {
+                        self.work.push_front(Work::Item(StateItem::NeedHeads(needed)));
+                    }
+                    Some(StateItem::Leaves(page))
                 }
                 Work::Item(item) => Some(item),
                 Work::Repair(id, known) => {

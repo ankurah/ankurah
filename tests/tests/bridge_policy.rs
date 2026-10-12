@@ -329,17 +329,19 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                                     answers.push(proto::StateAnswer::Summary(head));
                                 }
                                 proto::StateItem::NeedLeaves(bounds) => {
-                                    let leaves = if bounds.contains(&entity_id.to_bytes()) {
-                                        vec![proto::KnownLeaf {
-                                            key: vec![],
-                                            entity: proto::KnownEntity { entity_id, head: known_head.clone() },
-                                        }]
-                                    } else {
-                                        vec![]
-                                    };
-                                    answers.push(proto::StateAnswer::Leaves(proto::LeafPage { bounds, leaves }));
+                                    answers.push(proto::StateAnswer::Leaves(proto::LeafPage { bounds, leaves: vec![] }));
                                 }
-                                proto::StateItem::NeedHeads(unknown) => answers.push(proto::StateAnswer::Heads { known: vec![], unknown }),
+                                proto::StateItem::NeedHeads(ids) => {
+                                    // Empty query membership does not mean this
+                                    // catalog row's earlier clock is unknown.
+                                    let known = ids
+                                        .contains(&entity_id)
+                                        .then(|| proto::KnownEntity { entity_id, head: known_head.clone() })
+                                        .into_iter()
+                                        .collect();
+                                    let unknown = ids.into_iter().filter(|id| *id != entity_id).collect();
+                                    answers.push(proto::StateAnswer::Heads { known, unknown });
+                                }
                                 proto::StateItem::Repair { delta, .. } if delta.entity_id == entity_id => {
                                     assert!(
                                         matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1),

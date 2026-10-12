@@ -48,3 +48,47 @@ async fn expiry_while_close_waits_cannot_acknowledge_a_removed_comparison() -> a
     assert!(!connection.comparisons.was_closed(&comparison));
     Ok(())
 }
+
+#[tokio::test]
+async fn cached_transfers_fill_replies_without_increasing_history_work_per_reply() -> anyhow::Result<()> {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
+    let states = (0..200)
+        .map(|_| proto::Attested {
+            payload: proto::EntityState { entity_id: proto::EntityId::random(), state: Default::default() },
+            attestations: Default::default(),
+        })
+        .collect::<Vec<_>>();
+    for state in &states {
+        node.storage.set_state(state.clone());
+    }
+    let earlier = proto::Clock::genesis(proto::EventId::from_bytes([1; 32]));
+    for (outside_query, known, cap) in [(false, None, 128), (false, Some(earlier), 32), (true, None, 32)] {
+        let snapshot =
+            super::super::QueryTree::default().refresh(spec.clone(), if outside_query { vec![] } else { states.clone() }).await?;
+        let work = states.iter().map(|state| Work::Repair(state.payload.entity_id, known.clone())).collect();
+        let mut comparison = Comparison {
+            snapshot,
+            work,
+            summaries: HashMap::new(),
+            leaves: Vec::new(),
+            heads: HashSet::new(),
+            repaired: HashSet::new(),
+            hints: HashMap::new(),
+            complete: false,
+            replay: None,
+            seen: HashSet::new(),
+        };
+        let mut received = HashSet::new();
+        while !comparison.complete {
+            let reply = comparison.reply(&node, ComparisonId::new(), &vec![], false).await?;
+            assert_eq!(reply.items.len(), cap.min(200 - received.len()));
+            for item in reply.items {
+                let StateItem::Repair { delta, .. } = item else { panic!("expected a repair") };
+                assert!(received.insert(delta.entity_id), "repair repeated across pages");
+            }
+        }
+        assert_eq!(received.len(), 200);
+    }
+    Ok(())
+}

@@ -1,4 +1,4 @@
-//! Repeatable payload/row measurements, not a wall-clock benchmark.
+//! Payload/row measurements, optionally with simulated per-message network latency.
 use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah::{
     core::{
@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[derive(Model, Debug, Serialize, Deserialize)]
@@ -79,6 +80,12 @@ struct Traffic {
     repairs: usize,
     equal: usize,
     completed: usize,
+    summaries: usize,
+    leaf_questions: usize,
+    clock_questions: usize,
+    max_reply_items: usize,
+    max_reply_item_bytes: usize,
+    elapsed_ms: u128,
 }
 #[derive(Default)]
 struct Meter {
@@ -87,6 +94,10 @@ struct Meter {
     closes: HashMap<proto::RequestId, proto::ComparisonId>,
     comparisons: HashSet<proto::ComparisonId>,
     traffic: Traffic,
+    started: Option<Instant>,
+    one_way_ms: u64,
+    generation: usize,
+    errors: Vec<String>,
 }
 impl Meter {
     fn observe(&mut self, message: &proto::NodeMessage) {
@@ -126,11 +137,17 @@ impl Meter {
                     _ => None,
                 };
                 if let Some(page) = page {
+                    self.traffic.max_reply_items = self.traffic.max_reply_items.max(page.items.len());
+                    let bytes = page.items.iter().map(|item| bincode::serialized_size(item).unwrap() as usize).sum();
+                    self.traffic.max_reply_item_bytes = self.traffic.max_reply_item_bytes.max(bytes);
                     for item in &page.items {
                         match item {
                             proto::StateItem::Leaves(page) => self.traffic.leaves += page.leaves.len(),
                             proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
                             proto::StateItem::Equal(_) => self.traffic.equal += 1,
+                            proto::StateItem::Summary(_) => self.traffic.summaries += 1,
+                            proto::StateItem::NeedLeaves(_) => self.traffic.leaf_questions += 1,
+                            proto::StateItem::NeedHeads(ids) => self.traffic.clock_questions += ids.len(),
                             _ => {}
                         }
                     }
@@ -139,7 +156,10 @@ impl Meter {
             _ => {}
         }
     }
-    fn take(&mut self) -> Traffic { std::mem::take(&mut self.traffic) }
+    fn take(&mut self) -> Traffic {
+        self.traffic.elapsed_ms = self.started.replace(Instant::now()).map_or(0, |start| start.elapsed().as_millis());
+        std::mem::take(&mut self.traffic)
+    }
 }
 
 type TestNode = Node<Counted, PermissiveAgent>;
@@ -148,14 +168,34 @@ struct Sender {
     target: ankurah::core::node::WeakNode<Counted, PermissiveAgent>,
     id: proto::EntityId,
     meter: Arc<Mutex<Meter>>,
+    generation: usize,
 }
 #[async_trait]
 impl PeerSender for Sender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         let node = self.target.upgrade().ok_or(SendError::ConnectionClosed)?;
-        self.meter.lock().unwrap().observe(&message);
+        let one_way_ms = {
+            let mut meter = self.meter.lock().unwrap();
+            meter.observe(&message);
+            meter.one_way_ms
+        };
+        let meter = self.meter.clone();
+        let generation = self.generation;
         tokio::spawn(async move {
-            node.handle_message(message).await.expect("cost peer handles message");
+            if one_way_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(one_way_ms)).await;
+            }
+            // Disconnect discards packets still in flight, including a final
+            // unsubscribe. A later connection must not receive those packets.
+            if meter.lock().unwrap().generation != generation {
+                return;
+            }
+            if let Err(error) = node.handle_message(message).await {
+                let mut meter = meter.lock().unwrap();
+                if meter.generation == generation {
+                    meter.errors.push(error.to_string());
+                }
+            }
         });
         Ok(())
     }
@@ -163,10 +203,30 @@ impl PeerSender for Sender {
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 async fn connect(server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) -> anyhow::Result<()> {
-    client.register_peer(server.presence().await?, Box::new(Sender { target: server.weak(), id: server.id, meter: meter.clone() })).await?;
-    server.register_peer(client.presence().await?, Box::new(Sender { target: client.weak(), id: client.id, meter: meter.clone() })).await?;
+    let generation = {
+        let mut meter = meter.lock().unwrap();
+        meter.generation += 1;
+        meter.generation
+    };
+    client
+        .register_peer(
+            server.presence().await?,
+            Box::new(Sender { target: server.weak(), id: server.id, meter: meter.clone(), generation }),
+        )
+        .await?;
+    server
+        .register_peer(
+            client.presence().await?,
+            Box::new(Sender { target: client.weak(), id: client.id, meter: meter.clone(), generation }),
+        )
+        .await?;
     client.wait_ready().await?;
     Ok(())
+}
+fn disconnect(server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) {
+    meter.lock().unwrap().generation += 1;
+    server.deregister_peer(client.id);
+    client.deregister_peer(server.id);
 }
 fn reset(server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) {
     server.storage.take();
@@ -174,16 +234,23 @@ fn reset(server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) {
     meter.lock().unwrap().take();
 }
 fn record(label: &str, n: usize, server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) -> Traffic {
-    let traffic = meter.lock().unwrap().take();
+    let traffic = {
+        let mut meter = meter.lock().unwrap();
+        assert!(meter.errors.is_empty(), "peer errors: {:?}", meter.errors);
+        meter.take()
+    };
+    assert!(traffic.max_reply_items <= 128);
+    assert!(traffic.max_reply_item_bytes <= 64 * 1024);
     println!(
         "DIGEST_COST {}",
-        serde_json::json!({"case":label,"entities":n,"wire":traffic,"server_materialization":server.storage.take(),"client_materialization":client.storage.take()})
+        serde_json::json!({"case":label,"entities":n,"one_way_ms":meter.lock().unwrap().one_way_ms,"wire":traffic,"server_materialization":server.storage.take(),"client_materialization":client.storage.take()})
     );
     traffic
 }
 
 #[tokio::test]
 async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<()> {
+    let one_way_ms = std::env::var("DIGEST_COST_ONE_WAY_MS").ok().map(|value| value.parse()).transpose()?.unwrap_or(0);
     for n in [256, 4096] {
         let server = Node::new_durable(Arc::new(Counted::new()?), PermissiveAgent::new());
         server.system.create().await?;
@@ -198,7 +265,7 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         *server.storage.model.lock().unwrap() = Some(model);
         let client = Node::new(Arc::new(Counted::new()?), PermissiveAgent::new());
         *client.storage.model.lock().unwrap() = Some(model);
-        let meter = Arc::new(Mutex::new(Meter { model: Some(model), ..Default::default() }));
+        let meter = Arc::new(Mutex::new(Meter { model: Some(model), one_way_ms, ..Default::default() }));
         connect(&server, &client, &meter).await?;
         let reader = client.context_async(DEFAULT_CONTEXT).await?;
         reader.resolve_model_id::<CostRow>().await?;
@@ -206,6 +273,10 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let cold = record("fetch_cold", n, &server, &client, &meter);
         assert_eq!(cold.repairs, n);
+        assert_eq!((cold.summaries, cold.leaf_questions, cold.clock_questions), (0, 0, n));
+        // Require roughly 96 small rows per exchange, with six exchanges of
+        // startup/tail slack. This is a regression target, not a protocol limit.
+        assert!(cold.requests <= n.div_ceil(96) + 6, "cold transfer takes too many exchanges: {cold:?}");
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let equal = record("fetch_equal", n, &server, &client, &meter);
         assert_eq!((equal.equal, equal.leaves, equal.repairs), (1, 0, 0));
@@ -224,8 +295,7 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         let query = reader.query_wait::<CostRowView>("true").await?;
         query.wait_durable_answered().await?;
         record("subscribe_cached", n, &server, &client, &meter);
-        server.deregister_peer(client.id);
-        client.deregister_peer(server.id);
+        disconnect(&server, &client, &meter);
         reset(&server, &client, &meter);
         connect(&server, &client, &meter).await?;
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -236,8 +306,7 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         .await?;
         let equal = record("reconnect_equal", n, &server, &client, &meter);
         assert_eq!((equal.equal, equal.leaves, equal.repairs), (1, 0, 0));
-        server.deregister_peer(client.id);
-        client.deregister_peer(server.id);
+        disconnect(&server, &client, &meter);
         let trx = writer.begin();
         rows[n / 2].edit(&trx)?.value()?.set(&"offline-edit".into())?;
         trx.commit().await?;
@@ -255,8 +324,7 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         assert!(sparse.request_bytes + sparse.response_bytes < 32_768);
         assert_eq!(query.ids().len(), n);
         drop(query);
-        server.deregister_peer(client.id);
-        client.deregister_peer(server.id);
+        disconnect(&server, &client, &meter);
     }
     Ok(())
 }

@@ -144,6 +144,51 @@ async fn fetch_repairs_former_matches_and_uses_heads_held_outside_the_query() ->
 }
 
 #[tokio::test]
+async fn empty_query_pages_mix_new_snapshots_and_bridges_from_other_queries() -> Result<()> {
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let mut known = Vec::new();
+    for i in 0..96 {
+        known.push(trx.create(&Pet { name: format!("known-{i}"), age: "1".into() }).await?.read()?);
+    }
+    trx.commit().await?;
+    let trace = Trace::default();
+    let (_connection, _) = GatedConnection::new(&server, &client, {
+        let trace = trace.clone();
+        move |message| {
+            trace.record(message);
+            false
+        }
+    })
+    .await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    assert_eq!(reader.fetch::<PetView>("age = '1'").await?.len(), 96);
+    let trx = writer.begin();
+    for pet in &known {
+        pet.edit(&trx)?.age()?.replace("2")?;
+    }
+    for i in 0..96 {
+        trx.create(&Pet { name: format!("new-{i}"), age: "2".into() }).await?;
+    }
+    trx.commit().await?;
+    trace.clear();
+    assert_eq!(reader.fetch::<PetView>("age = '2'").await?.len(), 192);
+    let items = trace.items(None);
+    assert!(items.iter().all(|item| !matches!(item, StateItem::Summary(_) | StateItem::NeedLeaves(_))));
+    assert!(known.iter().all(|pet| bridge_for(&items, pet.id())));
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| matches!(item, StateItem::Repair { delta, .. }
+        if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })))
+            .count(),
+        96
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_falls_back_to_snapshot_when_event_bridge_exceeds_work_budget() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
@@ -524,15 +569,19 @@ async fn retry_replays_the_same_snapshot_and_followup_without_advancing_twice() 
     };
     wait_for(|| pages().len() == 2).await;
     assert_eq!(bincode::serialize(&pages()[0])?, bincode::serialize(&pages()[1])?);
-    let StateItem::NeedLeaves(bounds) = pages()[0].items[0].clone() else { panic!("expected leaf request") };
+    let unknown = pages()[0]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            StateItem::NeedHeads(ids) => Some(ids.clone()),
+            _ => None,
+        })
+        .expect("empty membership still needs actual entity clocks");
     let advanced = client
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CompareTree {
-                comparison,
-                answers: vec![proto::StateAnswer::Leaves(proto::LeafPage { bounds, leaves: vec![] })],
-            },
+            proto::NodeRequestBody::CompareTree { comparison, answers: vec![proto::StateAnswer::Heads { known: vec![], unknown }] },
         )
         .await?;
     assert!(matches!(advanced, NodeResponseBody::TreeCompared(_)));

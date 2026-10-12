@@ -10,6 +10,9 @@ pub(crate) use tree::{QueryTree, Snapshot};
 
 // Local responder limits, deliberately absent from the wire request.
 const PAGE_BYTES: usize = 64 * 1024;
+// Cached snapshots/items are cheap enough to fill a reply. Tree reads and
+// repairs that may load storage or walk history have a separate, lower cap.
+const PAGE_STEPS: usize = 128;
 const PAGE_WORK: usize = 32;
 const LEAF_PAGE: usize = 32;
 const MAX_REPAIR_BYTES: usize = 64 * 1024 * 1024;
