@@ -83,3 +83,7 @@ postgres-crash = [
 [[bench]]
 name    = "lane_perf"
 harness = false
+
+[[bench]]
+name    = "live_query_startup"
+harness = false
