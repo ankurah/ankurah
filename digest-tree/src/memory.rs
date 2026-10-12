@@ -21,9 +21,9 @@ use crate::map::{ByteBounds, MapName, MapTransaction};
 /// applies every write, or none when one fails. Appends take a counter as their
 /// suffix.
 ///
-/// An open transaction keeps the maps it began with, so a commit made while an
-/// earlier transaction is still open copies the maps rather than change them
-/// under it; one made while none is open changes them in place.
+/// An open transaction retains its original snapshot. A commit copies the maps
+/// only when another transaction still holds the current snapshot; readers of
+/// older snapshots do not require another copy.
 #[derive(Debug, Default)]
 pub struct MemoryMaps {
     shared: Arc<Mutex<Shared>>,
@@ -35,6 +35,8 @@ struct Shared {
     committed: Arc<Maps>,
     /// How many values have been appended: the next one's suffix.
     appended: u64,
+    revision: u64,
+    structure: u64,
 }
 
 /// The entries of the three maps, indexed by [`MapName`].
@@ -45,12 +47,15 @@ impl MemoryMaps {
     /// Three empty maps.
     pub fn new() -> Self { Self::default() }
 
-    /// Begin a transaction over the maps as they stand now. While it is open,
-    /// every commit of another transaction copies all three maps, at a cost
-    /// that grows with the tree.
+    /// Begin a transaction over the maps as they stand now. A commit copies
+    /// all three maps if another transaction still holds the current version;
+    /// transactions holding older versions do not require another copy.
     pub fn begin(&self) -> MemoryTransaction {
-        let began_with = self.shared.lock().unwrap().committed.clone();
-        MemoryTransaction { shared: self.shared.clone(), began_with, writes: Default::default(), failed: false }
+        let shared = self.shared.lock().unwrap();
+        MemoryTransaction {
+            shared: self.shared.clone(), began_with: shared.committed.clone(), writes: Default::default(), failed: false,
+            revision: shared.revision, structure: shared.structure, watches_structure: false, changes_structure: false,
+        }
     }
 }
 
@@ -64,6 +69,10 @@ pub struct MemoryTransaction {
     writes: [BTreeMap<Vec<u8>, Write>; 3],
     /// Whether a write's condition failed, which fails the commit.
     failed: bool,
+    revision: u64,
+    structure: u64,
+    watches_structure: bool,
+    changes_structure: bool,
 }
 
 /// A buffered write: the value to store, `None` to remove the key, and the
@@ -108,6 +117,10 @@ impl MemoryTransaction {
 
 #[async_trait]
 impl MapTransaction for MemoryTransaction {
+    fn watch_structure(&mut self) { self.watches_structure = true; }
+
+    fn change_structure(&mut self) { self.changes_structure = true; }
+
     async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> { Ok(self.seen(map, key).map(<[u8]>::to_vec)) }
 
     async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
@@ -122,7 +135,15 @@ impl MapTransaction for MemoryTransaction {
         }
         let began_with = self.began_with.0[map as usize].range::<[u8], _>(bounds);
         let written = self.writes[map as usize].range::<[u8], _>(bounds);
-        Ok(overlay(began_with, written).take(limit).map(|(key, value)| (key.clone(), value.clone())).collect())
+        Ok(overlay(began_with, written, false).take(limit).map(|(key, value)| (key.clone(), value.clone())).collect())
+    }
+
+    async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
+        let owned = crate::AddressRange::new(bounds.0.map(<[u8]>::to_vec), bounds.1.map(<[u8]>::to_vec));
+        if crate::bounds::empty(&owned) { return Ok(Vec::new()); }
+        let began_with = self.began_with.0[map as usize].range::<[u8], _>(bounds).rev();
+        let written = self.writes[map as usize].range::<[u8], _>(bounds).rev();
+        Ok(overlay(began_with, written, true).take(limit).map(|(key, value)| (key.clone(), value.clone())).collect())
     }
 
     async fn insert(&mut self, map: MapName, key: &[u8], value: &[u8]) -> Result<(), TreeError> { self.write(map, key, None, Some(value)) }
@@ -145,7 +166,7 @@ impl MapTransaction for MemoryTransaction {
     }
 
     async fn commit(self) -> Result<(), TreeError> {
-        let MemoryTransaction { shared, began_with, writes, failed } = self;
+        let MemoryTransaction { shared, began_with, writes, failed, revision, structure, watches_structure, changes_structure } = self;
         if failed {
             return Err(TreeError::Conflict);
         }
@@ -153,11 +174,21 @@ impl MapTransaction for MemoryTransaction {
         // place when no other transaction holds them.
         drop(began_with);
         let mut shared = shared.lock().unwrap();
+        if (watches_structure && structure != shared.structure) || (changes_structure && revision != shared.revision) {
+            return Err(TreeError::Conflict);
+        }
         let expectations_hold = shared.committed.0.iter().zip(&writes).all(|(committed, writes)| {
             writes.iter().all(|(key, write)| committed.get(key).map(Vec::as_slice) == write.expected.as_deref())
         });
         if !expectations_hold {
             return Err(TreeError::Conflict);
+        }
+        if writes.iter().all(BTreeMap::is_empty) {
+            return Ok(());
+        }
+        shared.revision = shared.revision.checked_add(1).expect("transaction revision exhausted");
+        if changes_structure {
+            shared.structure = shared.structure.checked_add(1).expect("topology revision exhausted");
         }
         let committed = Arc::make_mut(&mut shared.committed);
         for (map, writes) in committed.0.iter_mut().zip(writes) {
@@ -177,6 +208,7 @@ impl MapTransaction for MemoryTransaction {
 fn overlay<'a>(
     began_with: impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)>,
     written: impl Iterator<Item = (&'a Vec<u8>, &'a Write)>,
+    reverse: bool,
 ) -> impl Iterator<Item = (&'a Vec<u8>, &'a Vec<u8>)> {
     let (mut began_with, mut written) = (began_with.peekable(), written.peekable());
     std::iter::from_fn(move || loop {
@@ -184,7 +216,7 @@ fn overlay<'a>(
         let written_key = written.peek().map(|(key, _)| *key);
         match (began_with_key, written_key) {
             (None, None) => return None,
-            (Some(old), new) if new.is_none_or(|new| old < new) => return began_with.next(),
+            (Some(old), new) if new.is_none_or(|new| if reverse { old > new } else { old < new }) => return began_with.next(),
             (old, _) => {
                 if old == written_key {
                     began_with.next();

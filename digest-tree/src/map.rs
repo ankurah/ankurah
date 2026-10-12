@@ -49,7 +49,7 @@ pub enum MapName {
     Leaves,
     /// The keys each entity is filed under, by entity id, so that a change,
     /// which names only the entity, finds the leaves it must subtract or
-    /// move.
+    /// move. Its reserved empty key counts entities with multiple keys.
     Lookup,
     /// The tree node rows, by prefix: a base row per tree node and the delta
     /// rows appended since its base was last compacted.
@@ -59,6 +59,14 @@ pub enum MapName {
 /// One transaction over a tree's three maps.
 #[async_trait]
 pub trait MapTransaction: Send {
+    /// Keep the tree topology this transaction read valid until commit.
+    /// Ordinary leaf changes may still commit concurrently.
+    fn watch_structure(&mut self);
+
+    /// Publish a topology change only if no writes have committed since this
+    /// transaction began. Transactions watching the old topology must retry.
+    fn change_structure(&mut self);
+
     /// The value stored under `key` in `map`.
     async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError>;
 
@@ -66,6 +74,9 @@ pub trait MapTransaction: Send {
     /// key order. Reading on from the last key returned, a page at a time,
     /// reads them all.
     async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError>;
+
+    /// The last `limit` entries within `bounds`, in descending key order.
+    async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError>;
 
     /// Store `value` under `key` in `map`, where the transaction sees nothing:
     /// [`TreeError::Conflict`] when it sees a value.

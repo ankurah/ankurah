@@ -30,6 +30,10 @@
 
 use std::collections::BTreeSet;
 
+/// The empty lookup key holds a big-endian u64 count of entities with more
+/// than one leaf. All other lookup keys are 32-byte entity identities.
+pub(crate) const MULTIPLE_KEYS: &[u8] = b"";
+
 use ankurah_core_types::EntityId;
 
 use crate::digest::{DecodeError, Digest, DigestGroup, HeadHash, LeafElement};

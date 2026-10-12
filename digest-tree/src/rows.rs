@@ -55,16 +55,10 @@ pub struct NodeRow<G: DigestGroup = Ristretto255> {
 /// Leaf rows are ordered by it, and a tree node's prefix is a run of its
 /// leading bits.
 ///
-/// Addresses keep each key's rows together and in key order only where no
-/// key's encoding is a proper prefix of another's. The canonical encoding is
-/// prefix-free for fixed-width key parts but not for every variable-length
-/// one: an ascending string ends in a zero byte that a longer string may
-/// continue (the empty string encodes as 00, "\0" as 00 FF 00), so one key's
-/// rows can interleave with another's. A range of addresses is exactly the
-/// rows of a key range only over prefix-free key parts. A Selection compares
-/// a scope over its tree, a head array of tree node prefixes with key bounds
-/// where the span cuts a tree node, and the scope refuses key bounds over the
-/// other parts until the canonical encoding is made prefix-free.
+/// [`CanonicalCodec`](crate::CanonicalCodec) makes complete keys prefix-free
+/// for a given spec, including strings containing NUL. Thus each key's leaves
+/// occupy a contiguous interval and tuple bounds extend to address bounds
+/// without admitting rows of a neighboring key.
 pub fn leaf_address(key: &[u8], entity_id: EntityId) -> Vec<u8> {
     let mut address = Vec::with_capacity(key.len() + EntityId::BYTE_LEN);
     address.extend_from_slice(key);

@@ -22,15 +22,20 @@
 //! land together when it commits, or not at all, with [`TreeError::Conflict`],
 //! after which the writer retries from fresh reads.
 //!
-//! A tree node's base row is written when the tree is built; every later
-//! change to the tree node is a delta row appended beside it under a key of
+//! A tree node's base row is written when the tree is built or restructured;
+//! ordinary changes append a delta row beside it under a key of
 //! its own, which readers sum and compaction folds into the base from time to
 //! time, so no change rewrites a hot tree node's row and no two changes
-//! conflict on one. Every stored element and digest carries its group's codec
+//! conflict on one. A structural change retries after any intervening write,
+//! and writers using the previous topology retry after it changes.
+//! Every stored element and digest carries its group's codec
 //! version byte, so a row written in another group does not decode.
+//! Deltas without a base cannot establish a subtree's total: reads and
+//! compaction report [`TreeError::IncompleteNode`] instead of assuming zero.
 //!
-//! The tree reads no entity state, evaluates no predicate and encodes no key:
-//! it receives addresses and head hashes and keeps the rows they go into. A
+//! Callers evaluate admission against their entity state and supply canonical
+//! keys and head hashes. [`CanonicalCodec`] encodes those keys; [`TreeRequest`]
+//! and [`TreeSpec::serves`] prove supported predicate implications. A
 //! Selection compares a scope over its tree: a head array of tree node
 //! prefixes, with key bounds where the span cuts a tree node.
 //!
@@ -52,28 +57,39 @@
 //!   [`MemoryTransaction`].
 //! - [`error`]: the [`TreeError`].
 //!
-//! Later tasks add applying a leaf change (`change`), the build from a set of
-//! leaves and the audit that recomputes a tree from its rows (`build`,
-//! `audit`), the scope a Selection compares, a head array over byte bounds
-//! (`scope`), and the service that holds trees by spec (`service`).
+//! [`TreeTransaction::apply_change`] maintains leaves, entity lookups and
+//! ancestor summaries together, including bucket splits and merges. Build and
+//! audit operate on admitted leaves. Selection scopes resolve exact bounds and
+//! limits within one snapshot, and expose counts, digests, clipped heads and
+//! paginated leaves. Direct address scopes also support multi-key leaf sets.
+//! This crate has no Ankurah node or storage-engine dependency.
 
 #![deny(missing_docs)]
 
+mod bounds;
 pub mod digest;
 pub mod error;
+pub mod key;
 pub mod layout;
+pub mod maintain;
 pub mod map;
 pub mod memory;
 pub mod prefix;
+pub mod request;
 pub mod rows;
+pub mod scope;
 pub mod spec;
 pub mod tree;
 
 pub use digest::{Digest, DigestGroup, HeadHash, Leaf, LeafElement, LtHash16, Ristretto255};
 pub use error::TreeError;
+pub use key::{CanonicalCodec, KeyCodec, PropertyTypes};
+pub use maintain::{Audit, LeafChange, LeafData, BUCKET_CAPACITY};
 pub use map::{ByteBounds, MapName, MapTransaction};
 pub use memory::{MemoryMaps, MemoryTransaction};
 pub use prefix::{NodePrefix, NodePrefixError};
+pub use request::{TreeMatch, TreeRequest};
 pub use rows::{leaf_address, AddressRange, LeafRow, NodeRow};
+pub use scope::{LeafCursor, LeafPage, TreeHead, TreeScope};
 pub use spec::TreeSpec;
 pub use tree::{DigestTree, TreeTransaction};

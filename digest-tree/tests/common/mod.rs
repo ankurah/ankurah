@@ -40,7 +40,7 @@ pub fn types() -> impl PropertyTypes {
 }
 
 /// The canonical encoding, as the crate is handed it.
-pub fn codec() -> impl KeyCodec { ankurah_digest_tree::testing::canonical_codec() }
+pub fn codec() -> impl KeyCodec { ankurah_digest_tree::CanonicalCodec }
 
 /// Four acme entities with foo 9, 10, 12, 15, each at its own head.
 /// All satisfy the example's admission predicate, project = 'acme' AND foo > 7.

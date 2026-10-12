@@ -2,15 +2,16 @@
 
 use std::hash::{Hash, Hasher};
 
-use ankql::ast::{Predicate, Resolved};
-use ankurah_core_types::{KeySpec, PropertyId};
+use ankql::ast::{Predicate, Resolved, Selection};
+use ankurah_core_types::{KeySpec, PropertyId, PropertyPath};
 use serde::Serialize;
 
 /// What defines a tree: the leaves it admits and the order it keeps them in.
 ///
 /// A tree spec is the resolved, canonical description of a tree, so that two
-/// trees can be checked to hold the same leaf set before their digests are
-/// compared, and so that the tree a Selection needs can be found by its spec.
+/// trees can be checked to use the same admission and addressing rules before
+/// their digests are compared. Spec equality does not establish equal content,
+/// and a compatible scope can reuse a tree with a different admission predicate.
 /// One spec stands behind every use of a tree: an index's tree, a partial
 /// replica's scope, a live query's result (where the tree is the matched set,
 /// each entity with its head), a durable subscription, a fetch. What a use
@@ -37,8 +38,11 @@ use serde::Serialize;
 /// spans of the one tree: the tiers before the cut whole, then within the
 /// cut's tier the leaves past the cut value in the walk's direction, then
 /// within the cut's own value the entity ids up to it. The default key for a
-/// new Selection tree uses the parts the predicate pins by equality, then
-/// the ORDER BY parts under a limit, or the single range part without one.
+/// new Selection tree uses equality-pinned parts in canonical order, followed
+/// by nonconstant ORDER BY parts under a limit (entity-id order when omitted).
+/// Without a limit, it adds one constrained range part if available, using a
+/// matching ORDER BY part to choose among several, then a canonical tie-break.
+/// This is a creation policy; reuse considers the existing tree's layout.
 /// Thus `project = 'acme' AND foo > 7` uses (project, foo), with or without
 /// `ORDER BY foo`. The range predicate supplies foo; ordering is not needed
 /// to make narrower foo ranges addressable. The entity-id tree has the
@@ -46,9 +50,10 @@ use serde::Serialize;
 ///
 /// The predicate is the admission. It chooses which entities file a leaf,
 /// never where they file: the Selection's whole predicate, resolved to
-/// property ids, membership in a component included as a term of it;
-/// [`Predicate::True`] admits every entity that has all the key's parts, which
-/// is what an index tree holds. A filtered tree can also serve a narrower
+/// property ids, membership in a component included as a term of it.
+/// Missing key parts require an explicit encoding or admission policy: a key
+/// choice must not silently exclude entities the predicate admits.
+/// A filtered tree can also serve a narrower
 /// Selection when it admits every entity the Selection requires and the
 /// remaining restriction is exactly expressed by bounds in that tree's key
 /// order. Stored bucket boundaries need not coincide with those bounds: a
@@ -59,10 +64,10 @@ use serde::Serialize;
 /// need not equal the tree's admission predicate. Both uses read the same
 /// leaves at the same addresses; reuse creates no second tree.
 ///
-/// The tree reads the spec only to compare and hash it: it evaluates no
-/// predicate and encodes no key; whoever feeds the tree derives the keys and
-/// decides admission. Whether a tree is an index tree is a fact about its
-/// owner, not a property of the spec.
+/// Whoever feeds the tree decides admission against entity state and derives
+/// keys with the canonical codec. The reuse planner analyzes predicates to
+/// prove coverage and exact bounds, but does not load or evaluate entity state.
+/// Whether a tree is an index tree is a fact about its owner, not its spec.
 #[derive(Debug, Clone, Serialize)]
 pub struct TreeSpec {
     key_spec: KeySpec<PropertyId>,
@@ -72,11 +77,9 @@ pub struct TreeSpec {
 impl TreeSpec {
     /// The spec of the tree that serves `key_spec` and `predicate`: the key
     /// spec with its directions and nulls placements dropped, every part
-    /// ascending, and the whole predicate. This is the only way to build a
-    /// spec, so a spec never carries a direction.
-    pub fn new(key_spec: KeySpec<PropertyId>, predicate: Predicate<Resolved>) -> Self {
-        Self { key_spec: key_spec.ascending(), predicate }
-    }
+    /// ascending, and the whole predicate. `for_selection` uses this same
+    /// constructor, so a spec never carries a direction.
+    pub fn new(key_spec: KeySpec<PropertyId>, predicate: Predicate<Resolved>) -> Self { Self { key_spec: key_spec.ascending(), predicate } }
 
     /// The ordering: the parts that address the leaves, every one ascending.
     /// Empty for the entity-id tree. A predicate's range part can be present
@@ -84,23 +87,34 @@ impl TreeSpec {
     pub fn key_spec(&self) -> &KeySpec<PropertyId> { &self.key_spec }
 
     /// The admission: the Selection's whole predicate, resolved.
-    /// [`Predicate::True`] admits every entity that has all the key's parts,
-    /// which is what an index tree and the entity-id tree hold.
+    /// Key availability must not silently add another membership restriction.
     pub fn predicate(&self) -> &Predicate<Resolved> { &self.predicate }
 
-    /// The bytes specs are compared and hashed by: the bincode serialization,
-    /// the workspace's canonical binary form, which writes a float literal as
-    /// its bits.
-    fn canonical_bytes(&self) -> Vec<u8> { bincode::serialize(self).expect("a tree spec serializes") }
+    /// Identity ignores display labels but preserves predicate structure and
+    /// literal bits. The stored predicate retains its labels for diagnostics.
+    fn identity_bytes(&self) -> Vec<u8> {
+        let predicate = ankql::selection::map_references::<Resolved, Resolved>(
+            &Selection::from(self.predicate.clone()),
+            &|path| {
+                let mut reference = PropertyPath::from(path.property_id());
+                reference.subpath = path.subpath.clone();
+                reference
+            },
+            &|model| *model,
+        )
+        .predicate;
+        bincode::serialize(&(&self.key_spec, predicate)).expect("a tree spec serializes")
+    }
 }
 
-/// Two specs are equal when they serialize alike. A float literal compares by
+/// Two specs are equal when their identity bytes agree. Display labels do not
+/// participate. A float literal compares by
 /// its bits, so 0.0 and -0.0, or two NaNs with different payloads, make
 /// different specs, and a NaN equals itself: canonicalizing literals, so that
 /// equal Selections share a tree, is the caller's job, done before it builds
 /// the spec. So is the order of a conjunction's terms, which the bytes keep.
 impl PartialEq for TreeSpec {
-    fn eq(&self, other: &Self) -> bool { self.canonical_bytes() == other.canonical_bytes() }
+    fn eq(&self, other: &Self) -> bool { self.identity_bytes() == other.identity_bytes() }
 }
 
 /// Equality compares bytes, which compare totally, float literals included.
@@ -108,7 +122,7 @@ impl Eq for TreeSpec {}
 
 /// Hashes the bytes equality compares, so equal specs hash alike.
 impl Hash for TreeSpec {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.canonical_bytes().hash(state) }
+    fn hash<H: Hasher>(&self, state: &mut H) { self.identity_bytes().hash(state) }
 }
 
 #[cfg(test)]
@@ -142,6 +156,24 @@ mod tests {
     fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
 
     #[test]
+    fn display_labels_do_not_change_identity_or_replace_diagnostic_names() {
+        let spec = |label: &str, id: u8, subpath: Vec<String>| {
+            let path = PropertyPath::registered(EntityId::from_bytes([id; 32]), label, subpath);
+            let predicate = Predicate::Not(Box::new(Predicate::IsNull(Box::new(Expr::Path(path)))));
+            TreeSpec::new(by_name(), predicate)
+        };
+        let original = spec("written_name", 3, vec!["city".into()]);
+        let renamed = spec("renamed", 3, vec!["city".into()]);
+        assert_eq!(original, renamed);
+        assert_eq!(hash_of(&original), hash_of(&renamed));
+        let trees = HashMap::from([(original.clone(), "one tree")]);
+        assert_eq!(trees.get(&renamed), Some(&"one tree"));
+        assert_ne!(bincode::serialize(&original).unwrap(), bincode::serialize(&renamed).unwrap(), "labels survive for diagnostics");
+        assert_ne!(original, spec("written_name", 4, vec!["city".into()]), "property identity matters");
+        assert_ne!(original, spec("written_name", 3, vec!["zip".into()]), "the subpath matters");
+    }
+
+    #[test]
     fn specs_that_differ_in_any_field_differ() {
         let part = |n: u8, value_type| IndexKeyPart::asc(property(n), value_type);
         let specs = [
@@ -149,8 +181,14 @@ mod tests {
             TreeSpec::new(by_name(), Predicate::True),
             TreeSpec::new(KeySpec::new(vec![part(1, ValueType::I64)]), Predicate::True),
             TreeSpec::new(KeySpec::new(vec![part(2, ValueType::String)]), Predicate::True),
-            TreeSpec::new(KeySpec::new(vec![IndexKeyPart { sub_path: Some(vec!["city".into()]), ..part(1, ValueType::String) }]), Predicate::True),
-            TreeSpec::new(KeySpec::new(vec![IndexKeyPart { collation: Some("en-US".into()), ..part(1, ValueType::String) }]), Predicate::True),
+            TreeSpec::new(
+                KeySpec::new(vec![IndexKeyPart { sub_path: Some(vec!["city".into()]), ..part(1, ValueType::String) }]),
+                Predicate::True,
+            ),
+            TreeSpec::new(
+                KeySpec::new(vec![IndexKeyPart { collation: Some("en-US".into()), ..part(1, ValueType::String) }]),
+                Predicate::True,
+            ),
             TreeSpec::new(by_name(), rating_above(Value::I64(3))),
             TreeSpec::new(by_name(), rating_above(Value::I64(4))),
         ];
@@ -201,17 +239,17 @@ mod tests {
         assert_ne!(TreeSpec::new(typed, rating_above(Value::I64(3))), expected, "a part of another type");
     }
 
-    /// The entity-id tree's canonical bytes, pinned: the empty key spec
+    /// The entity-id tree's identity bytes, pinned: the empty key spec
     /// serializes as its eight-byte length and the predicate `true` as its
     /// variant's index in four little-endian bytes. A change to the layout,
     /// serde's or bincode's included, shows up here.
     #[test]
     fn the_entity_id_tree_serializes_canonically() {
         let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
-        assert_eq!(hex(&spec.canonical_bytes()), "000000000000000005000000");
+        assert_eq!(hex(&spec.identity_bytes()), "000000000000000005000000");
     }
 
-    /// Specs with a key and a float in the predicate, pinned at their canonical
+    /// Specs with a key and a float in the predicate, pinned at their identity
     /// bytes, so that any build, native or wasm32, that serializes a spec
     /// differently shows up here. A literal enters by its bits, its last eight
     /// bytes here: 0.0 and -0.0 make two specs, and a NaN makes the spec of
@@ -221,13 +259,14 @@ mod tests {
     fn specs_with_float_literals_compare_by_their_bits() {
         let nan = f64::from_bits(0x7ff8_0000_0000_0001);
         let other_nan = f64::from_bits(0x7ff8_0000_0000_0002);
-        let two_parts = KeySpec::new(vec![IndexKeyPart::asc(property(1), ValueType::String), IndexKeyPart::desc(property(2), ValueType::F64)]);
+        let two_parts =
+            KeySpec::new(vec![IndexKeyPart::asc(property(1), ValueType::String), IndexKeyPart::desc(property(2), ValueType::F64)]);
         let vectors = [(by_name(), 0.0, ZERO), (by_name(), -0.0, NEGATIVE_ZERO), (by_name(), nan, NAN), (two_parts, 2.5, TWO_PARTS)];
         let specs: Vec<TreeSpec> = vectors
             .into_iter()
             .map(|(key_spec, bound, bytes)| {
                 let spec = TreeSpec::new(key_spec, rating_above(Value::F64(bound)));
-                assert_eq!(hex(&spec.canonical_bytes()), bytes, "{bound:?}");
+                assert_eq!(hex(&spec.identity_bytes()), bytes, "{bound:?}");
                 spec
             })
             .collect();
@@ -237,18 +276,23 @@ mod tests {
         assert_ne!(specs[2], TreeSpec::new(by_name(), rating_above(Value::F64(other_nan))), "a NaN of another payload");
     }
 
-    const ZERO: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
-                          00000003030303030303030303030303030303030303030303030303030303030303030600000000000000726174696e67000000000000000002000000000000\
-                          00030000000000000000000000";
-    const NEGATIVE_ZERO: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
-                          00000003030303030303030303030303030303030303030303030303030303030303030600000000000000726174696e67000000000000000002000000000000\
-                          00030000000000000000000080";
-    const NAN: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
-                          00000003030303030303030303030303030303030303030303030303030303030303030600000000000000726174696e67000000000000000002000000000000\
-                          0003000000010000000000f87f";
-    const TWO_PARTS: &str = "02000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000010000000202020202\
-                          02020202020202020202020202020202020202020202020202020200000000000300000000000000000001000000010000000303030303030303030303030303\
-                          0303030303030303030303030303030303030600000000000000726174696e6700000000000000000200000000000000030000000000000000000440";
+    const ZERO: &str =
+        "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
+        00000003030303030303030303030303030303030303030303030303030303030303032b0000000000000041774d4441774d4441774d4441774d4441774d4441\
+        774d4441774d4441774d4441774d4441774d4441774d00000000000000000200000000000000030000000000000000000000";
+    const NEGATIVE_ZERO: &str =
+        "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
+        00000003030303030303030303030303030303030303030303030303030303030303032b0000000000000041774d4441774d4441774d4441774d4441774d4441\
+        774d4441774d4441774d4441774d4441774d4441774d00000000000000000200000000000000030000000000000000000080";
+    const NAN: &str =
+        "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
+        00000003030303030303030303030303030303030303030303030303030303030303032b0000000000000041774d4441774d4441774d4441774d4441774d4441\
+        774d4441774d4441774d4441774d4441774d4441774d0000000000000000020000000000000003000000010000000000f87f";
+    const TWO_PARTS: &str =
+        "02000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000010000000202020202\
+        02020202020202020202020202020202020202020202020202020200000000000300000000000000000001000000010000000303030303030303030303030303\
+        0303030303030303030303030303030303032b0000000000000041774d4441774d4441774d4441774d4441774d4441774d4441774d4441774d4441774d444177\
+        4d4441774d00000000000000000200000000000000030000000000000000000440";
 
     /// Equal specs find one tree in a map keyed by spec; a spec that differs
     /// in its predicate finds none.

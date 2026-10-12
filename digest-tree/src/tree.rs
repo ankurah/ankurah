@@ -48,7 +48,11 @@ impl<G: DigestGroup> DigestTree<G> {
 
     /// Begin a transaction over the tree's maps as they stand now, with the
     /// tree's operations.
-    pub fn begin(&self) -> TreeTransaction<G> { TreeTransaction::new(self.maps.begin()) }
+    pub fn begin(&self) -> TreeTransaction<G> {
+        let mut transaction = TreeTransaction::new(self.maps.begin());
+        transaction.spec = Some(self.spec.clone());
+        transaction
+    }
 }
 
 /// One transaction over a tree's maps, with the tree's operations, its leaves
@@ -63,8 +67,12 @@ impl<G: DigestGroup> DigestTree<G> {
 /// the layouts of the keys and values are in [`layout`].
 #[derive(Debug)]
 pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction> {
-    transaction: T,
+    pub(crate) transaction: T,
     group: PhantomData<G>,
+    pub(crate) spec: Option<TreeSpec>,
+    pub(crate) failed: bool,
+    pub(crate) generation: u64,
+    pub(crate) snapshot: std::sync::Arc<()>,
 }
 
 /// How many entries a read of a whole range takes at a time.
@@ -106,7 +114,6 @@ impl DeltaPages {
 /// A digest row as read: its key, its bytes, which a conditional write
 /// expects to find unchanged, and the digest they hold.
 struct DigestRow<G: DigestGroup> {
-    key: Vec<u8>,
     value: Vec<u8>,
     digest: Digest<G>,
 }
@@ -115,12 +122,17 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// The tree's operations within `transaction`, a transaction over maps
     /// that hold a tree's rows: [`DigestTree::begin`] makes one over the
     /// tree's memory-resident maps.
-    pub fn new(transaction: T) -> Self { Self { transaction, group: PhantomData } }
+    pub(crate) fn new(transaction: T) -> Self {
+        Self { transaction, group: PhantomData, spec: None, failed: false, generation: 0, snapshot: std::sync::Arc::new(()) }
+    }
 
     /// Apply the transaction's writes together, if every condition they were
     /// made on still holds: [`TreeError::Conflict`] otherwise, with nothing
     /// applied.
-    pub async fn commit(self) -> Result<(), TreeError> { self.transaction.commit().await }
+    pub async fn commit(self) -> Result<(), TreeError> {
+        if self.failed { return Err(TreeError::Conflict); }
+        self.transaction.commit().await
+    }
 
     /// The leaf row of the entity `entity_id` filed under `key`.
     pub async fn leaf(&mut self, key: &[u8], entity_id: EntityId) -> Result<Option<LeafRow<G>>, TreeError> {
@@ -130,16 +142,15 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
 
     /// Every leaf row of an entity, one per key it is filed under, in address
     /// order: how a change to the entity finds the leaves it must subtract or
-    /// move, since the change names only the entity. A key the lookup lists
-    /// with no leaf row filed under it is left out; the two are written
-    /// together, so only damage parts them, which the audit catches.
+    /// move, since the change names only the entity. A missing leaf named by
+    /// the lookup is an error: omitting it would lose the old contribution
+    /// that a change must subtract.
     pub async fn entity_leaves(&mut self, entity_id: EntityId) -> Result<Vec<LeafRow<G>>, TreeError> {
         let (_, keys) = self.keys_of(entity_id).await?;
         let mut rows = Vec::new();
         for key in keys {
-            if let Some(row) = self.leaf(&key, entity_id).await? {
-                rows.push(row);
-            }
+            let row = self.leaf(&key, entity_id).await?.ok_or(TreeError::MissingLeaf { entity_id, key })?;
+            rows.push(row);
         }
         // Key order is not address order where one key is a prefix of another.
         rows.sort_by_cached_key(LeafRow::address);
@@ -158,12 +169,13 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// the one the writer read at that address (`None`: no row), and list its
     /// key under its entity. [`TreeError::Conflict`] when another change got
     /// there first.
-    pub async fn put_leaf(&mut self, row: LeafRow<G>, expected: Option<&LeafRow<G>>) -> Result<(), TreeError> {
+    pub(crate) async fn put_leaf(&mut self, row: LeafRow<G>, expected: Option<&LeafRow<G>>) -> Result<(), TreeError> {
         debug_assert!(expected.is_none_or(|expected| expected.address() == row.address()), "the expectation is for the row's own address");
         let expected = expected.map(layout::leaf_value);
         self.transaction.put_if(MapName::Leaves, &row.address(), expected.as_deref(), &layout::leaf_value(&row)).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if keys.insert(row.key.clone()) {
+            if keys.len() == 2 { self.adjust_multiple_keys(true).await?; }
             self.transaction.put_if(MapName::Lookup, &row.entity_id.to_bytes(), listed.as_deref(), &layout::lookup_value(&keys)).await?;
         }
         Ok(())
@@ -172,10 +184,11 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// Remove the leaf row `row`, as the writer read it, and its key from
     /// under its entity. [`TreeError::Conflict`] when the row there now is
     /// another, or none.
-    pub async fn delete_leaf(&mut self, row: &LeafRow<G>) -> Result<(), TreeError> {
+    pub(crate) async fn delete_leaf(&mut self, row: &LeafRow<G>) -> Result<(), TreeError> {
         self.transaction.delete_if(MapName::Leaves, &row.address(), &layout::leaf_value(row)).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if keys.remove(&row.key) {
+            if keys.len() == 1 { self.adjust_multiple_keys(false).await?; }
             let listed = listed.as_deref().expect("the key was listed, so its entity has a lookup value");
             let id = row.entity_id.to_bytes();
             match keys.is_empty() {
@@ -190,17 +203,14 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// since, summed a page at a time as they are read; `None` where it has
     /// neither.
     ///
-    /// A tree node exists when it has a base row or any delta row. One with
-    /// deltas and no base arises when an append races
-    /// [`TreeTransaction::delete_node`]: the deletion reads the tree node's
-    /// rows, a delta lands after that read, and the deletion removes only what
-    /// it read. Such a tree node is zero plus its deltas, until a compaction,
-    /// which gives it a base, or a later cleanup resolves it. A tree with no
-    /// leaves may store no root row, as a new tree does, and a reader takes an
-    /// absent root for the empty tree node: no leaves and the empty digest.
+    /// Deltas without a base report [`TreeError::IncompleteNode`]. This can
+    /// happen in damaged or incompletely maintained rows: the remaining
+    /// changes do not summarize the leaves still beneath the prefix.
+    /// An empty baseline must be stored explicitly before appending
+    /// changes to it. `None` means no stored summary, not an empty subtree.
     pub async fn node(&mut self, prefix: &NodePrefix) -> Result<Option<NodeRow<G>>, TreeError> {
         let base = self.base(prefix).await?;
-        let mut exists = base.is_some();
+        let exists = base.is_some();
         let mut digest = base.map_or(Digest::empty(), |base| base.digest);
         let mut deltas = DeltaPages::of(prefix);
         loop {
@@ -208,16 +218,17 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
             if page.is_empty() {
                 return Ok(exists.then_some(NodeRow { digest }));
             }
-            exists = true;
+            if !exists {
+                return Err(TreeError::IncompleteNode(prefix.clone()));
+            }
             for (_, value) in page {
                 digest = digest.checked_add(layout::digest("delta value", &value)?)?;
             }
         }
     }
 
-    /// The tree node's base row alone, without the deltas appended since:
-    /// what [`TreeTransaction::put_node_base`] expects to replace. `None`
-    /// where the tree node has no base row.
+    /// The stored baseline without subsequent deltas; `None` where absent.
+    /// Use [`TreeTransaction::node`] for the complete current summary.
     pub async fn node_base(&mut self, prefix: &NodePrefix) -> Result<Option<NodeRow<G>>, TreeError> {
         Ok(self.base(prefix).await?.map(|base| NodeRow { digest: base.digest }))
     }
@@ -225,21 +236,29 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// The nearest existing tree nodes beneath `prefix`, in prefix order:
     /// every tree node `prefix` properly contains with no existing tree node
     /// between them, so that no two overlap. Where path compression skipped
-    /// levels, a child lies several levels down. A tree node exists when it
-    /// has a base row or any delta row: see [`TreeTransaction::node`].
+    /// levels, a child lies several levels down. Deltas without a base report
+    /// [`TreeError::IncompleteNode`], as in [`TreeTransaction::node`].
     ///
     /// The scan over the subtree's keys meets delta rows too: the tree node's
     /// own, which are stepped over, and those of a tree node whose prefix ends
     /// on a whole byte of its encoding, which follow everything beneath that
     /// tree node. After each child the scan resumes past the child's own keys,
-    /// not at the next prefix, so it meets such deltas; when their tree node
-    /// has no base, the tree nodes beneath it were met first, and they give
-    /// way to it.
+    /// not at the next prefix, so it also detects deltas whose base is missing.
     pub async fn children(&mut self, prefix: &NodePrefix) -> Result<Vec<(NodePrefix, NodeRow<G>)>, TreeError> {
+        let mut children = Vec::new();
+        for prefix in self.child_prefixes(prefix).await? {
+            let node = self.node(&prefix).await?.ok_or_else(|| TreeError::IncompleteNode(prefix.clone()))?;
+            children.push((prefix, node));
+        }
+        Ok(children)
+    }
+
+    /// Read topology without decoding summary values or their deltas.
+    pub(crate) async fn child_prefixes(&mut self, prefix: &NodePrefix) -> Result<Vec<NodePrefix>, TreeError> {
         let (own_deltas_first, own_deltas_past) = layout::delta_key_bounds(prefix);
         let end = prefix.subtree_key_end();
         let mut start = Bound::Excluded(prefix.to_bytes());
-        let mut children: Vec<(NodePrefix, NodeRow<G>)> = Vec::new();
+        let mut children = Vec::new();
         loop {
             let bounds = (start.as_ref().map(Vec::as_slice), end.as_ref().map_or(Bound::Unbounded, |end| Bound::Excluded(end.as_slice())));
             let Some((key, _)) = self.transaction.scan(MapName::Nodes, bounds, 1).await?.pop() else { break };
@@ -251,12 +270,8 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
                 continue;
             }
             let child = layout::node_key_prefix(&key)?;
-            while children.last().is_some_and(|(beneath, _)| child.contains(beneath)) {
-                children.pop();
-            }
-            if let Some(node) = self.node(&child).await? {
-                children.push((child.clone(), node));
-            }
+            if key != child.to_bytes() { return Err(TreeError::IncompleteNode(child)); }
+            children.push(child.clone());
             match child.subtree_key_end() {
                 Some(end) => start = Bound::Included(end),
                 None => break,
@@ -270,7 +285,7 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// [`TreeTransaction::node_base`]. Deltas appended to the tree node stay;
     /// a rebuild of the tree node alone deletes it first.
     /// [`TreeError::Conflict`] when the base there now is another.
-    pub async fn put_node_base(&mut self, prefix: &NodePrefix, expected: Option<&NodeRow<G>>, node: NodeRow<G>) -> Result<(), TreeError> {
+    pub(crate) async fn put_node_base(&mut self, prefix: &NodePrefix, expected: Option<&NodeRow<G>>, node: NodeRow<G>) -> Result<(), TreeError> {
         let (key, value) = (prefix.to_bytes(), layout::digest_value(&node.digest));
         match expected {
             None => self.transaction.insert(MapName::Nodes, &key, &value).await,
@@ -282,14 +297,15 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// by `delta`: a delta row is appended under a key of its own and the
     /// base row is left alone, so changes neither contend on it nor conflict
     /// with each other.
-    pub async fn append_node_delta(&mut self, prefix: &NodePrefix, delta: Digest<G>) -> Result<(), TreeError> {
+    pub(crate) async fn append_node_delta(&mut self, prefix: &NodePrefix, delta: Digest<G>) -> Result<(), TreeError> {
         let (key_prefix, _) = layout::delta_key_bounds(prefix);
         self.transaction.append(MapName::Nodes, &key_prefix, &layout::digest_value(&delta)).await
     }
 
     /// Fold up to [`COMPACTION_BATCH`] of the tree node's deltas, the first in
     /// key order, into its base row and remove them, so that reads sum fewer
-    /// rows; a tree node with no base row gets one. Returns whether deltas
+    /// rows. Deltas without a base report [`TreeError::IncompleteNode`]
+    /// without changing any rows. Returns whether deltas
     /// remain beyond the batch, which a later compaction, in a transaction of
     /// its own, folds. The base is written only if it is still the one read,
     /// and each delta removed only if it is still there:
@@ -309,13 +325,12 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         if batch.is_empty() {
             return Ok(false);
         }
-        let base = self.base(prefix).await?;
-        let mut digest = base.as_ref().map_or(Digest::empty(), |base| base.digest);
+        let base = self.base(prefix).await?.ok_or_else(|| TreeError::IncompleteNode(prefix.clone()))?;
+        let mut digest = base.digest;
         for (_, value) in &batch {
             digest = digest.checked_add(layout::digest("delta value", value)?)?;
         }
-        let expected = base.as_ref().map(|base| base.value.as_slice());
-        self.transaction.put_if(MapName::Nodes, &prefix.to_bytes(), expected, &layout::digest_value(&digest)).await?;
+        self.transaction.put_if(MapName::Nodes, &prefix.to_bytes(), Some(&base.value), &layout::digest_value(&digest)).await?;
         for (key, value) in batch {
             self.transaction.delete_if(MapName::Nodes, &key, &value).await?;
         }
@@ -326,9 +341,10 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// as read, [`TreeError::Conflict`] otherwise. Its descendants stay. A
     /// delta appended after the deletion read stays too: see
     /// [`TreeTransaction::node`].
-    pub async fn delete_node(&mut self, prefix: &NodePrefix) -> Result<(), TreeError> {
+    #[cfg(test)]
+    pub(crate) async fn delete_node(&mut self, prefix: &NodePrefix) -> Result<(), TreeError> {
         if let Some(base) = self.base(prefix).await? {
-            self.transaction.delete_if(MapName::Nodes, &base.key, &base.value).await?;
+            self.transaction.delete_if(MapName::Nodes, &prefix.to_bytes(), &base.value).await?;
         }
         let mut deltas = DeltaPages::of(prefix);
         loop {
@@ -353,11 +369,34 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         Ok((listed, keys))
     }
 
+    /// Lookup's empty key is a count of entities filed under multiple keys.
+    /// Entity lookup keys are always 32 bytes, so the metadata cannot collide.
+    pub(crate) async fn multiple_key_entities(&mut self) -> Result<u64, TreeError> {
+        match self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await? {
+            Some(value) => Ok(u64::from_be_bytes(value.as_slice().try_into()
+                .map_err(|_| TreeError::Audit("invalid multi-key entity count"))?)),
+            None => Ok(0),
+        }
+    }
+
+    async fn adjust_multiple_keys(&mut self, add: bool) -> Result<(), TreeError> {
+        let stored = self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await?;
+        let count = self.multiple_key_entities().await?;
+        let count = if add { count.checked_add(1) } else { count.checked_sub(1) }
+            .ok_or(TreeError::Audit("invalid multi-key entity count"))?;
+        if count == 0 {
+            self.transaction.delete_if(MapName::Lookup, layout::MULTIPLE_KEYS,
+                stored.as_deref().ok_or(TreeError::Audit("missing multi-key entity count"))?).await
+        } else {
+            self.transaction.put_if(MapName::Lookup, layout::MULTIPLE_KEYS, stored.as_deref(), &count.to_be_bytes()).await
+        }
+    }
+
     /// The tree node's base row.
     async fn base(&mut self, prefix: &NodePrefix) -> Result<Option<DigestRow<G>>, TreeError> {
         let key = prefix.to_bytes();
         let Some(value) = self.transaction.get(MapName::Nodes, &key).await? else { return Ok(None) };
-        Ok(Some(DigestRow { digest: layout::digest("node value", &value)?, key, value }))
+        Ok(Some(DigestRow { digest: layout::digest("node value", &value)?, value }))
     }
 }
 
@@ -398,9 +437,7 @@ mod tests {
 
     /// An empty tree. The tree files whatever addresses it is given, so its
     /// spec plays no part in these tests.
-    fn empty_tree<G: DigestGroup>() -> DigestTree<G> {
-        DigestTree::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True))
-    }
+    fn empty_tree<G: DigestGroup>() -> DigestTree<G> { DigestTree::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True)) }
 
     async fn node_keys<G: DigestGroup, T: MapTransaction>(maps: &mut TreeTransaction<G, T>) -> usize {
         maps.transaction.scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap().len()
@@ -427,6 +464,11 @@ mod tests {
 
     #[async_trait]
     impl<T: MapTransaction> MapTransaction for Interleaved<T> {
+        fn watch_structure(&mut self) { self.inner.watch_structure(); }
+        fn change_structure(&mut self) { self.inner.change_structure(); }
+        async fn scan_reverse(&mut self, map: MapName, bounds: crate::map::ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
+            self.inner.scan_reverse(map, bounds, limit).await
+        }
         async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> { self.inner.get(map, key).await }
 
         async fn scan(
@@ -481,16 +523,17 @@ mod tests {
         a_new_tree_is_empty,
         a_leaf_is_written_against_the_row_the_writer_read,
         the_leaves_of_one_entity_follow_its_keys,
+        a_missing_leaf_in_the_lookup_is_an_error,
         leaves_are_read_by_address_range_a_page_at_a_time,
         the_range_under_a_prefix_reads_its_leaves,
         a_node_is_its_base_plus_its_deltas,
         compaction_folds_the_deltas_it_read_into_the_base,
         compaction_leaves_a_late_delta_and_fails_whole_on_a_removed_one,
         deleting_a_node_removes_its_base_and_its_deltas_and_leaves_its_descendants,
-        an_append_racing_a_deletion_leaves_a_node_of_deltas,
+        a_delta_without_its_base_is_not_a_subtree_summary,
         children_skip_compressed_levels_and_delta_rows,
-        children_give_way_to_a_node_of_deltas_at_seven_bits,
-        children_give_way_to_nodes_of_deltas_at_fourteen_bits,
+        children_reject_a_missing_base_at_seven_bits,
+        children_reject_missing_bases_at_fourteen_bits,
         more_deltas_than_a_page_in_any_suffix_order_read_and_compact_whole,
         competing_lookup_updates_for_one_entity_leave_no_orphaned_row,
         competing_compactors_fold_each_delta_once,
@@ -590,6 +633,19 @@ mod tests {
         assert!(maps.transaction.get(MapName::Lookup, &entity(2).to_bytes()).await.unwrap().is_some());
     }
 
+    async fn a_missing_leaf_in_the_lookup_is_an_error<G: DigestGroup>() {
+        let tree = empty_tree::<G>();
+        let leaf = row::<G>(b"blue", entity(1));
+        let mut maps = tree.begin();
+        maps.put_leaf(leaf.clone(), None).await.unwrap();
+        maps.commit().await.unwrap();
+        let mut damaged = tree.begin();
+        damaged.transaction.delete_if(MapName::Leaves, &leaf.address(), &layout::leaf_value(&leaf)).await.unwrap();
+        damaged.commit().await.unwrap();
+        assert!(matches!(tree.begin().entity_leaves(leaf.entity_id).await,
+            Err(TreeError::MissingLeaf { entity_id, key }) if entity_id == leaf.entity_id && key == leaf.key));
+    }
+
     async fn leaves_are_read_by_address_range_a_page_at_a_time<G: DigestGroup>() {
         let tree = empty_tree::<G>();
         let rows: Vec<LeafRow<G>> = (1..=6).map(|n| row(&[n], entity(n))).collect();
@@ -649,11 +705,12 @@ mod tests {
         assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(node(2)), "the base alone");
         assert_eq!(node_keys(&mut maps).await, 3, "the base and two deltas");
 
-        // A tree node with deltas and no base row is the sum of its deltas.
+        // An empty baseline is explicit.
         let fresh = prefix("1");
+        maps.put_node_base(&fresh, None, node(0)).await.unwrap();
         maps.append_node_delta(&fresh, leaf(5)).await.unwrap();
         assert_eq!(maps.node(&fresh).await.unwrap(), Some(NodeRow { digest: leaf(5) }));
-        assert_eq!(maps.node_base(&fresh).await.unwrap(), None);
+        assert_eq!(maps.node_base(&fresh).await.unwrap(), Some(node(0)));
         maps.commit().await.unwrap();
 
         // A base is replaced against the base the writer read, not against
@@ -667,7 +724,7 @@ mod tests {
         maps.commit().await.unwrap();
         let mut maps = tree.begin();
         assert_eq!(maps.node(&bucket).await.unwrap().unwrap().digest, leaf(1) - leaf(1) + leaf(3));
-        assert_eq!(node_keys(&mut maps).await, 4);
+        assert_eq!(node_keys(&mut maps).await, 5);
     }
 
     async fn compaction_folds_the_deltas_it_read_into_the_base<G: DigestGroup>() {
@@ -692,8 +749,9 @@ mod tests {
         assert!(!maps.compact_node(&bucket).await.unwrap());
         assert_eq!(node_keys(&mut maps).await, 1, "nothing to fold");
 
-        // A tree node with no base row gets one.
+        // An explicit empty base can be compacted like any other.
         let fresh = prefix("1");
+        maps.put_node_base(&fresh, None, node(0)).await.unwrap();
         maps.append_node_delta(&fresh, leaf(6)).await.unwrap();
         maps.compact_node(&fresh).await.unwrap();
         maps.commit().await.unwrap();
@@ -760,30 +818,45 @@ mod tests {
         maps.delete_node(&parent).await.unwrap();
     }
 
-    /// A delta appended after a deletion read stays, and leaves a tree node with
-    /// deltas and no base, which reads as the sum of its deltas until a
-    /// compaction gives it a base.
-    async fn an_append_racing_a_deletion_leaves_a_node_of_deltas<G: DigestGroup>() {
+    /// Removing a parent's summary leaves its leaves and children intact. A
+    /// concurrent insertion can leave a delta behind, but that delta alone
+    /// must never stand for the parent or be compacted into a base.
+    async fn a_delta_without_its_base_is_not_a_subtree_summary<G: DigestGroup>() {
         let tree = empty_tree::<G>();
-        let bucket = prefix("0110");
-        let mut maps = tree.begin();
-        maps.put_node_base(&bucket, None, node(2)).await.unwrap();
-        maps.append_node_delta(&bucket, leaf(3)).await.unwrap();
-        maps.commit().await.unwrap();
+        let (root, parent, left, right) = (prefix(""), prefix("0"), prefix("00"), prefix("01"));
+        let (a, b, c) = (row::<G>(b"", entity(0x01)), row::<G>(b"", entity(0x41)), row::<G>(b"", entity(0x02)));
+        let (da, db, dc) = (Digest::from(a.element), Digest::from(b.element), Digest::from(c.element));
+        let mut build = tree.begin();
+        build.put_leaf(a, None).await.unwrap();
+        build.put_leaf(b, None).await.unwrap();
+        for (p, digest) in [(&root, da + db), (&parent, da + db), (&left, da), (&right, db)] {
+            build.put_node_base(p, None, NodeRow { digest }).await.unwrap();
+        }
+        build.commit().await.unwrap();
 
-        let mut deletion = tree.begin();
-        deletion.delete_node(&bucket).await.unwrap();
-        let mut append = tree.begin();
-        append.append_node_delta(&bucket, leaf(4)).await.unwrap();
+        let (mut deletion, mut append) = (tree.begin(), tree.begin());
+        deletion.delete_node(&parent).await.unwrap();
+        append.put_leaf(c, None).await.unwrap();
+        for p in [&root, &parent, &left] {
+            append.append_node_delta(p, dc).await.unwrap();
+        }
         append.commit().await.unwrap();
         deletion.commit().await.unwrap();
 
         let mut maps = tree.begin();
-        assert_eq!(maps.node_base(&bucket).await.unwrap(), None);
-        assert_eq!(maps.node(&bucket).await.unwrap(), Some(NodeRow { digest: leaf(4) }), "zero plus its deltas");
-        maps.compact_node(&bucket).await.unwrap();
+        let leaves: Digest<G> =
+            maps.leaves(&AddressRange::under(&parent), 10).await.unwrap().iter().map(|row| Digest::from(row.element)).sum();
+        assert_eq!(leaves.count(), 3);
+        let children: Digest<G> = maps.children(&parent).await.unwrap().iter().map(|(_, row)| row.digest).sum();
+        assert_eq!(children, leaves);
+        assert_eq!(maps.node(&root).await.unwrap().unwrap().digest, leaves);
+        assert!(matches!(maps.node(&parent).await, Err(TreeError::IncompleteNode(p)) if p == parent));
+        assert!(matches!(maps.children(&root).await, Err(TreeError::IncompleteNode(p)) if p == parent));
+        assert!(matches!(maps.compact_node(&parent).await, Err(TreeError::IncompleteNode(p)) if p == parent));
         maps.commit().await.unwrap();
-        assert_eq!(tree.begin().node_base(&bucket).await.unwrap(), Some(NodeRow { digest: leaf(4) }));
+        let mut maps = tree.begin();
+        assert_eq!(maps.node_base(&parent).await.unwrap(), None, "compaction wrote no base");
+        assert_eq!(delta_count(&mut maps, &parent).await, 1, "compaction consumed no delta");
     }
 
     /// Children are the nearest existing tree nodes beneath a prefix, with deltas
@@ -795,8 +868,8 @@ mod tests {
         let tree = empty_tree::<G>();
         let mut maps = tree.begin();
         // The root, its children 0 and 1; beneath 0 the seven-bit 0000000 and
-        // 01; beneath 0000000 its child 00000000; 01 has deltas and no base.
-        for (text, leaves) in [("", 6), ("0", 3), ("0000000", 2), ("00000000", 2), ("1", 3)] {
+        // 01; beneath 0000000 its child 00000000; 01 starts with an empty base.
+        for (text, leaves) in [("", 6), ("0", 3), ("0000000", 2), ("00000000", 2), ("01", 0), ("1", 3)] {
             maps.put_node_base(&prefix(text), None, node(leaves)).await.unwrap();
         }
         for text in ["", "0", "0000000", "1", "01"] {
@@ -814,16 +887,14 @@ mod tests {
         assert_eq!(prefixes(maps.children(&prefix("1")).await.unwrap()), [], "the last prefix, with nothing after it");
 
         let (child, summary) = &maps.children(&prefix("0")).await.unwrap()[1];
-        assert_eq!((child, summary), (&prefix("01"), &NodeRow { digest: leaf(7) }), "a delta-only child");
+        assert_eq!((child, summary), (&prefix("01"), &NodeRow { digest: leaf(7) }), "a child with an explicit empty baseline");
         assert_eq!(maps.node(&prefix("0")).await.unwrap(), Some(NodeRow { digest: node(3).digest + leaf(7) }));
     }
 
     /// A tree node whose prefix ends on a whole byte of its encoding, as one of
-    /// seven bits does, keeps its deltas after everything beneath it. With
-    /// deltas and no base it is still the child, and the tree nodes beneath it, at
-    /// the left and the right edge of its subtree, are its children rather
-    /// than its parent's.
-    async fn children_give_way_to_a_node_of_deltas_at_seven_bits<G: DigestGroup>() {
+    /// seven bits does, keeps its deltas after everything beneath it. A
+    /// missing base must still be detected after scanning its descendants.
+    async fn children_reject_a_missing_base_at_seven_bits<G: DigestGroup>() {
         let tree = empty_tree::<G>();
         let deltas_only = prefix("0110100");
         let (leftmost, rightmost) = (prefix("01101000000000"), prefix("01101001111111"));
@@ -835,15 +906,15 @@ mod tests {
         maps.commit().await.unwrap();
 
         let mut maps = tree.begin();
-        assert_eq!(prefixes(maps.children(&NodePrefix::root()).await.unwrap()), [prefix("00"), deltas_only.clone(), prefix("1")]);
-        assert_eq!(prefixes(maps.children(&prefix("0")).await.unwrap()), [prefix("00"), deltas_only.clone()]);
+        assert!(matches!(maps.children(&NodePrefix::root()).await, Err(TreeError::IncompleteNode(p)) if p == deltas_only));
+        assert!(matches!(maps.children(&prefix("0")).await, Err(TreeError::IncompleteNode(p)) if p == deltas_only));
         assert_eq!(prefixes(maps.children(&deltas_only).await.unwrap()), [leftmost, rightmost]);
-        assert_eq!(maps.node(&deltas_only).await.unwrap(), Some(NodeRow { digest: leaf(5) }), "zero plus its deltas");
+        assert!(matches!(maps.node(&deltas_only).await, Err(TreeError::IncompleteNode(p)) if p == deltas_only));
     }
 
     /// The same at fourteen bits, the second whole byte, beneath a tree node
     /// with a base, and for one tree node of deltas beneath another.
-    async fn children_give_way_to_nodes_of_deltas_at_fourteen_bits<G: DigestGroup>() {
+    async fn children_reject_missing_bases_at_fourteen_bits<G: DigestGroup>() {
         let tree = empty_tree::<G>();
         let (parent, deltas_only) = (prefix("1010101"), prefix("10101010011001"));
         let (leftmost, rightmost) = (prefix("101010100110010"), prefix("101010100110011111111"));
@@ -859,13 +930,13 @@ mod tests {
         maps.commit().await.unwrap();
 
         let mut maps = tree.begin();
-        assert_eq!(prefixes(maps.children(&NodePrefix::root()).await.unwrap()), [outer.clone(), parent.clone()]);
-        assert_eq!(prefixes(maps.children(&parent).await.unwrap()), std::slice::from_ref(&deltas_only));
+        assert!(matches!(maps.children(&NodePrefix::root()).await, Err(TreeError::IncompleteNode(p)) if p == inner));
+        assert!(matches!(maps.children(&parent).await, Err(TreeError::IncompleteNode(p)) if p == deltas_only));
         assert_eq!(prefixes(maps.children(&deltas_only).await.unwrap()), [leftmost, rightmost]);
-        assert_eq!(prefixes(maps.children(&outer).await.unwrap()), std::slice::from_ref(&inner));
+        assert!(matches!(maps.children(&outer).await, Err(TreeError::IncompleteNode(p)) if p == inner));
         assert_eq!(prefixes(maps.children(&inner).await.unwrap()), [inner_leftmost, inner_rightmost]);
-        assert_eq!(maps.node(&outer).await.unwrap(), Some(NodeRow { digest: leaf(6) }));
-        assert_eq!(maps.node(&inner).await.unwrap(), Some(NodeRow { digest: leaf(7) }));
+        assert!(matches!(maps.node(&outer).await, Err(TreeError::IncompleteNode(p)) if p == outer));
+        assert!(matches!(maps.node(&inner).await, Err(TreeError::IncompleteNode(p)) if p == inner));
     }
 
     /// More deltas than a page and a compaction batch, filed under suffixes in

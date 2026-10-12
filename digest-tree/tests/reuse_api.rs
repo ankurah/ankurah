@@ -1,7 +1,6 @@
-//! The reuse API by example, written before the API exists.
-//! Reuse means exact digest membership; sorting unlimited results is the caller's job.
+//! Reuse examples checked against independently specified membership.
 mod common;
-use ankurah_digest_tree::TreeRequest;
+use ankurah_digest_tree::{Digest, Leaf, TreeMatch, TreeRequest};
 use common::{codec, populated_tree, types};
 
 #[tokio::test]
@@ -9,58 +8,68 @@ async fn one_tree_serves_its_own_selection_whole_and_a_narrower_one_as_a_span() 
     let above_7 = selection!("project = 'acme' AND foo > 7 ORDER BY foo");
     let tree = populated_tree(&above_7).await;
     let mut tx = tree.begin();
-
-    for selection in [
-        above_7,                                                                 // Whole, count 4
-        selection!("project = 'acme' AND foo > 7"),                                // Whole, count 4
-        selection!("project = 'acme' AND foo > 7 ORDER BY bar"),                   // Whole, count 4
-        selection!("project = 'acme' AND foo > 10 ORDER BY foo"),                  // Span, count 2
-        selection!("project = 'acme' AND foo > 10"),                               // Span, count 2
-        selection!("project = 'acme' AND foo > 7 AND foo <= 12"),                  // Span, count 3
-        selection!("project = 'acme' AND foo = 10"),                               // Span, count 1
+    for (selection, kind, ids) in [
+        (above_7, TreeMatch::Whole, vec![0, 1, 2, 3]),
+        (selection!("project = 'acme' AND foo > 7"), TreeMatch::Whole, vec![0, 1, 2, 3]),
+        (selection!("project = 'acme' AND foo > 7 ORDER BY bar"), TreeMatch::Whole, vec![0, 1, 2, 3]),
+        (selection!("project = 'acme' AND foo > 10 ORDER BY foo"), TreeMatch::Span, vec![2, 3]),
+        (selection!("project = 'acme' AND foo > 10"), TreeMatch::Span, vec![2, 3]),
+        (selection!("project = 'acme' AND foo > 7 AND foo <= 12"), TreeMatch::Span, vec![0, 1, 2]),
+        (selection!("project = 'acme' AND foo = 10"), TreeMatch::Span, vec![1]),
     ] {
         let request = TreeRequest::for_selection(&selection, &types()).unwrap();
-        let _match = tree.spec().serves(&request);
+        assert_eq!(tree.spec().serves(&request), Some(kind));
         let scope = tx.scope(&request, &codec()).await.unwrap();
-        let _heads = tx.heads(&scope).await.unwrap(); // [root] for Whole; bounded heads for Span
-        let _count = tx.count(&scope).await.unwrap();
+        assert_eq!(tx.count(&scope).await.unwrap(), ids.len() as u64);
+        let page = tx.page(&scope, &codec(), None, 20).await.unwrap();
+        assert_eq!(page.leaves.iter().map(|row| row.entity_id).collect::<Vec<_>>(), ids.iter().copied().map(common::entity).collect::<Vec<_>>());
+        let expected: Digest = page.leaves.iter().map(|row| Digest::from(Leaf::new(&row.key, row.entity_id, row.head).element())).sum();
+        assert_eq!(tx.digest(&scope).await.unwrap(), expected);
+        for head in tx.heads(&scope).await.unwrap() {
+            assert_eq!(ankurah_digest_tree::TreeHead::from_bytes(&head.to_bytes()).unwrap(), head);
+        }
     }
 }
 
 #[tokio::test]
 async fn limits_and_reverse_order_use_scopes_of_the_same_tree() {
-    let above_7 = selection!("project = 'acme' AND foo > 7");
-    let tree = populated_tree(&above_7).await;
+    let tree = populated_tree(&selection!("project = 'acme' AND foo > 7")).await;
     let mut tx = tree.begin();
-
-    for selection in [
-        selection!("project = 'acme' AND foo > 7 ORDER BY foo DESC"),              // Whole, count 4
-        selection!("project = 'acme' AND foo > 7 ORDER BY foo LIMIT 2"),           // Span, foo 9 and 10
-        selection!("project = 'acme' AND foo > 7 ORDER BY foo DESC LIMIT 2"),      // Span, foo 15 and 12
-        selection!("project = 'acme' AND foo > 10 ORDER BY foo DESC LIMIT 1"),     // Span, foo 15
+    for (selection, ids) in [
+        (selection!("project = 'acme' AND foo > 7 ORDER BY foo DESC"), vec![0, 1, 2, 3]),
+        (selection!("project = 'acme' AND foo > 7 ORDER BY foo LIMIT 2"), vec![0, 1]),
+        (selection!("project = 'acme' AND foo > 7 ORDER BY foo DESC LIMIT 2"), vec![3, 2]),
+        (selection!("project = 'acme' AND foo > 10 ORDER BY foo DESC LIMIT 1"), vec![3]),
+        (selection!("project = 'acme' AND foo > 7 ORDER BY foo LIMIT 0"), vec![]),
     ] {
         let request = TreeRequest::for_selection(&selection, &types()).unwrap();
-        let _match = tree.spec().serves(&request);
         let scope = tx.scope(&request, &codec()).await.unwrap();
-        let _heads = tx.heads(&scope).await.unwrap();
-        let _count = tx.count(&scope).await.unwrap();
+        assert_eq!(tx.count(&scope).await.unwrap(), ids.len() as u64);
+        let mut found = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = tx.page(&scope, &codec(), cursor.as_ref(), 1).await.unwrap();
+            found.extend(page.leaves.iter().map(|row| row.entity_id));
+            cursor = page.next;
+            if cursor.is_none() { break; }
+        }
+        assert_eq!(found, ids.into_iter().map(common::entity).collect::<Vec<_>>());
     }
 }
 
 #[tokio::test]
 async fn missing_members_and_conditions_outside_the_key_prevent_reuse() {
-    let above_7 = selection!("project = 'acme' AND foo > 7");
-    let tree = populated_tree(&above_7).await;
-
+    let tree = populated_tree(&selection!("project = 'acme' AND foo > 7")).await;
     for selection in [
-        selection!("project = 'acme' AND foo > 3 ORDER BY foo"),                   // Admission excludes 3 < foo <= 7
-        selection!("project = 'acme'"),                                           // Admission excludes foo <= 7
-        selection!("project = 'zed' AND foo > 10"),                                // Admission excludes zed
-        selection!("foo > 10"),                                                    // Admission excludes other projects
-        selection!("project = 'acme' AND foo > 7 AND bar > 0"),                    // Cannot bound bar with this key
-        selection!("project = 'acme' AND foo > 7 ORDER BY bar LIMIT 2"),           // Cannot find the cut without bar
+        selection!("project = 'acme' AND foo > 3 ORDER BY foo"),
+        selection!("project = 'acme'"),
+        selection!("project = 'zed' AND foo > 10"),
+        selection!("foo > 10"),
+        selection!("project = 'acme' AND foo > 7 AND bar > 0"),
+        selection!("project = 'acme' AND foo > 7 ORDER BY bar LIMIT 2"),
     ] {
         let request = TreeRequest::for_selection(&selection, &types()).unwrap();
-        let _match = tree.spec().serves(&request); // None: no scope from this tree
+        assert_eq!(tree.spec().serves(&request), None, "{selection}");
+        assert!(tree.begin().scope(&request, &codec()).await.is_err());
     }
 }

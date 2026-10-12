@@ -1,0 +1,212 @@
+//! Canonical, ascending key encoding. Every part is self-delimiting, including
+//! strings containing NUL, so a tuple prefix names one contiguous address range.
+
+use crate::TreeError;
+use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
+use std::collections::HashMap;
+
+/// Resolve the type of an exact property path without a node or a catalog.
+pub trait PropertyTypes {
+    /// The type at this path, or `None` when it is unknown.
+    fn value_type(&self, path: &PropertyPath) -> Option<ValueType>;
+}
+impl PropertyTypes for HashMap<PropertyId, ValueType> {
+    fn value_type(&self, path: &PropertyPath) -> Option<ValueType> {
+        if !path.subpath.is_empty() {
+            return None;
+        }
+        if path.property_id() == PropertyId::Id {
+            return Some(ValueType::EntityId);
+        }
+        self.get(&path.property_id()).copied()
+    }
+}
+
+/// The codec used to derive exact bounds and to identify tuple parts during
+/// traversal. Implementations must produce the exact bytes specified by
+/// [`CanonicalCodec`], which the membership planner also uses for literals.
+pub trait KeyCodec {
+    /// Encode the first `values.len()` parts of a key spec.
+    fn encode_prefix(&self, spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError>;
+    /// Split a complete key into its self-delimiting encoded parts, rejecting
+    /// malformed, noncanonical or trailing bytes.
+    fn split<'a>(&self, spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError>;
+}
+
+/// The standalone crate's canonical codec. Missing values sort before present
+/// ones and do not change admission. NaNs and JSON ordering are unsupported;
+/// floating zero has one encoding, and strings use UTF-8 byte order.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CanonicalCodec;
+
+impl CanonicalCodec {
+    /// Encoding version, to negotiate before comparing keys across versions.
+    pub const VERSION: u8 = 1;
+
+    /// Encode a tuple prefix, explicitly representing missing/null values.
+    pub fn encode_nullable(&self, spec: &KeySpec<PropertyId>, values: &[Option<Value>]) -> Result<Vec<u8>, TreeError> {
+        if values.len() > spec.keyparts.len() {
+            return Err(TreeError::InvalidKey("too many tuple parts"));
+        }
+        let mut bytes = Vec::new();
+        for (part, value) in spec.keyparts.iter().zip(values) {
+            bytes.extend(encode_part(part, value.as_ref())?);
+        }
+        Ok(bytes)
+    }
+}
+impl KeyCodec for CanonicalCodec {
+    fn encode_prefix(&self, spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
+        if values.len() > spec.keyparts.len() {
+            return Err(TreeError::InvalidKey("too many tuple parts"));
+        }
+        let mut bytes = Vec::new();
+        for (part, value) in spec.keyparts.iter().zip(values) {
+            bytes.extend(encode_part(part, Some(value))?);
+        }
+        Ok(bytes)
+    }
+    fn split<'a>(&self, spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
+        let mut parts = Vec::new();
+        let mut rest = key;
+        for part in &spec.keyparts {
+            validate_part(part)?;
+            let len = match rest.first() {
+                Some(0) => 1,
+                Some(1) => match part.value_type {
+                    ValueType::I16 => 3,
+                    ValueType::I32 => 5,
+                    ValueType::I64 | ValueType::F64 => 9,
+                    ValueType::Bool => 2,
+                    ValueType::EntityId => 33,
+                    ValueType::String | ValueType::Binary | ValueType::Object => variable_len(&rest[1..])? + 1,
+                    ValueType::Json => return Err(TreeError::InvalidKey("JSON has no canonical key order")),
+                },
+                _ => return Err(TreeError::InvalidKey("missing or invalid part marker")),
+            };
+            let (encoded, tail) = rest.split_at_checked(len).ok_or(TreeError::InvalidKey("truncated part"))?;
+            if encoded[0] == 1 {
+                if part.value_type == ValueType::Bool && encoded[1] > 1 {
+                    return Err(TreeError::InvalidKey("invalid boolean"));
+                }
+                if part.value_type == ValueType::F64 {
+                    let bits = u64::from_be_bytes(encoded[1..].try_into().unwrap());
+                    let bits = if bits >> 63 == 1 { bits ^ (1 << 63) } else { !bits };
+                    let value = f64::from_bits(bits);
+                    if value.is_nan() || (value == 0.0 && bits != 0) {
+                        return Err(TreeError::InvalidKey("noncanonical float"));
+                    }
+                }
+                if part.value_type == ValueType::String {
+                    let mut raw = Vec::new();
+                    let mut i = 1;
+                    while i < encoded.len() - 2 {
+                        raw.push(encoded[i]);
+                        i += if encoded[i] == 0 { 2 } else { 1 };
+                    }
+                    std::str::from_utf8(&raw).map_err(|_| TreeError::InvalidKey("invalid UTF-8"))?;
+                }
+            }
+            parts.push(encoded);
+            rest = tail;
+        }
+        if !rest.is_empty() {
+            return Err(TreeError::InvalidKey("trailing key bytes"));
+        }
+        Ok(parts)
+    }
+}
+
+pub(crate) fn validate_part(part: &IndexKeyPart<PropertyId>) -> Result<(), TreeError> {
+    if part.collation.is_some() {
+        return Err(TreeError::InvalidKey("custom collations are unsupported"));
+    }
+    if part.value_type == ValueType::Json {
+        return Err(TreeError::InvalidKey("JSON has no canonical key order"));
+    }
+    Ok(())
+}
+
+pub(crate) fn encode_part(part: &IndexKeyPart<PropertyId>, value: Option<&Value>) -> Result<Vec<u8>, TreeError> {
+    validate_part(part)?;
+    let Some(value) = value else { return Ok(vec![0]) };
+    let mut bytes = vec![1];
+    let integer = match value {
+        Value::I16(v) => Some(i64::from(*v)),
+        Value::I32(v) => Some(i64::from(*v)),
+        Value::I64(v) => Some(*v),
+        _ => None,
+    };
+    match (part.value_type, value) {
+        (ValueType::I16, _) if integer.is_some() => {
+            let n = i16::try_from(integer.unwrap()).map_err(|_| TreeError::InvalidKey("integer overflow"))?;
+            bytes.extend(((n as u16) ^ (1 << 15)).to_be_bytes());
+        }
+        (ValueType::I32, _) if integer.is_some() => {
+            let n = i32::try_from(integer.unwrap()).map_err(|_| TreeError::InvalidKey("integer overflow"))?;
+            bytes.extend(((n as u32) ^ (1 << 31)).to_be_bytes());
+        }
+        (ValueType::I64, _) if integer.is_some() => bytes.extend(((integer.unwrap() as u64) ^ (1 << 63)).to_be_bytes()),
+        (ValueType::F64, Value::F64(n)) => {
+            if n.is_nan() {
+                return Err(TreeError::InvalidKey("NaN has no query ordering"));
+            }
+            let bits = if *n == 0.0 { 0 } else { n.to_bits() };
+            bytes.extend((if bits >> 63 == 1 { !bits } else { bits ^ (1 << 63) }).to_be_bytes());
+        }
+        (ValueType::F64, _) if integer.is_some() => {
+            let n = integer.unwrap();
+            let float = n as f64;
+            if float as i128 != i128::from(n) {
+                return Err(TreeError::InvalidKey("integer is not exactly representable as a float"));
+            }
+            return encode_part(part, Some(&Value::F64(float)));
+        }
+        (ValueType::Bool, Value::Bool(v)) => bytes.push(u8::from(*v)),
+        (ValueType::EntityId, Value::EntityId(id)) => bytes.extend(id.to_bytes()),
+        (ValueType::EntityId, Value::String(text)) => {
+            let id = text.parse::<EntityId>().map_err(|_| TreeError::InvalidKey("invalid entity id"))?;
+            bytes.extend(id.to_bytes());
+        }
+        (ValueType::String, Value::String(text)) => escaped(&mut bytes, text.as_bytes()),
+        (ValueType::Binary, Value::Binary(raw)) | (ValueType::Object, Value::Object(raw)) => escaped(&mut bytes, raw),
+        _ => return Err(TreeError::InvalidKey("value does not have the declared type")),
+    }
+    Ok(bytes)
+}
+
+fn escaped(out: &mut Vec<u8>, raw: &[u8]) {
+    for &byte in raw {
+        out.push(byte);
+        if byte == 0 {
+            out.push(255);
+        }
+    }
+    out.extend([0, 0]);
+}
+fn variable_len(bytes: &[u8]) -> Result<usize, TreeError> {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0 {
+            match bytes.get(i + 1) {
+                Some(0) => return Ok(i + 2),
+                Some(255) => i += 1,
+                _ => return Err(TreeError::InvalidKey("invalid variable-length escape")),
+            }
+        }
+        i += 1;
+    }
+    Err(TreeError::InvalidKey("unterminated variable-length part"))
+}
+
+/// First byte string after every string starting with `prefix`.
+pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(byte) = end.pop() {
+        if byte != 255 {
+            end.push(byte + 1);
+            return Some(end);
+        }
+    }
+    None
+}
