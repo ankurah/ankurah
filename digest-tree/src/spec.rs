@@ -1,10 +1,9 @@
-//! The tree spec: what defines a tree, and the key spec a tree files its
-//! leaves by.
+//! The tree spec: what defines a tree.
 
 use std::hash::{Hash, Hasher};
 
 use ankql::ast::{Predicate, Resolved};
-use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, ValueType};
+use ankurah_core_types::{KeySpec, PropertyId};
 use serde::Serialize;
 
 /// What defines a tree: the leaves it admits and the order it keeps them in.
@@ -25,103 +24,70 @@ use serde::Serialize;
 /// The key spec is the ordering. It fixes the address of every leaf, the
 /// canonical key bytes followed by the entity id, and with it the order the
 /// leaves are kept in, the prefixes the tree nodes are named by, and the spans
-/// a scope can name. It has no directions: every part is encoded ascending,
-/// with nulls at one fixed end, so the tree is the same whatever order a
-/// Selection asks for. Which way a use walks each part, and where nulls fall
-/// for it, is the use's order, a [`KeySpec`] over the same parts that the use
-/// keeps with its scope. A digest is a sum, so the order changes no digest,
-/// only which leaves fall under a limit's cut, and that cut is a few spans of
-/// the one tree: the tiers before the one the cut falls in, then within that
-/// tier the leaves past the cut value in the walk's direction, then within the
-/// cut's own value the entity ids up to it. Which parts make the key is
-/// derived from the Selection alone, by one rule applied wherever the tree is
-/// built, never from the indexes at hand: the parts the predicate pins by
-/// equality, then the ORDER BY parts when the Selection has a limit, or the
-/// single range part when it has none; a limit-less ORDER BY never enters a
-/// spec, since it changes no membership. The entity-id tree has the empty key
-/// spec, so its address is the entity id alone. An index tree's key spec is
-/// the index's [`KeySpec`] with its directions dropped.
+/// a scope can name. Every part of it ascends and none places nulls:
+/// [`TreeSpec::new`] drops the directions and nulls placements of the key spec
+/// it is handed, since the tree encodes every part ascending, with nulls at
+/// one fixed end, and leaves the direction to whoever walks it. So every order
+/// over the same parts names one tree: the index on (a, b) in any directions,
+/// `ORDER BY a ASC, b DESC` and its reverse all read the one tree keyed
+/// (a, b). Which way a use walks each part, and where nulls fall for it, is
+/// the use's order, a [`KeySpec`] with directions over the same parts that the
+/// use keeps with its scope. A digest is a sum, so the order changes no
+/// digest, only which leaves fall under a limit's cut, and that cut is a few
+/// spans of the one tree: the tiers before the cut whole, then within the
+/// cut's tier the leaves past the cut value in the walk's direction, then
+/// within the cut's own value the entity ids up to it. The default key for a
+/// new Selection tree uses the parts the predicate pins by equality, then
+/// the ORDER BY parts under a limit, or the single range part without one.
+/// Thus `project = 'acme' AND foo > 7` uses (project, foo), with or without
+/// `ORDER BY foo`. The range predicate supplies foo; ordering is not needed
+/// to make narrower foo ranges addressable. The entity-id tree has the
+/// empty key spec, so its address is the entity id alone.
 ///
 /// The predicate is the admission. It chooses which entities file a leaf,
 /// never where they file: the Selection's whole predicate, resolved to
 /// property ids, membership in a component included as a term of it;
 /// [`Predicate::True`] admits every entity that has all the key's parts, which
-/// is what an index tree holds. A tree with another predicate has the prefix
-/// structure of the index tree over the same key spec with fewer leaves, and
-/// its leaves are a filtered copy of that index tree's. A Selection whose
-/// predicate is nothing but equalities and a range on a key needs no tree of
-/// its own: it is a scope over the index tree.
+/// is what an index tree holds. A filtered tree can also serve a narrower
+/// Selection when it admits every entity the Selection requires and the
+/// remaining restriction is exactly expressed by bounds in that tree's key
+/// order. Stored bucket boundaries need not coincide with those bounds: a
+/// partial tree node must be descended or its qualifying leaves read, never
+/// included with its whole digest. For example,
+/// the tree admitting `project = 'acme' AND foo > 7`, keyed by (project, foo),
+/// serves `project = 'acme' AND foo > 10` as a span. The requesting predicate
+/// need not equal the tree's admission predicate. Both uses read the same
+/// leaves at the same addresses; reuse creates no second tree.
 ///
 /// The tree reads the spec only to compare and hash it: it evaluates no
 /// predicate and encodes no key; whoever feeds the tree derives the keys and
 /// decides admission. Whether a tree is an index tree is a fact about its
-/// owner, not a property of the spec. Every field is public, so a spec is
-/// built with struct literal syntax.
+/// owner, not a property of the spec.
 #[derive(Debug, Clone, Serialize)]
 pub struct TreeSpec {
-    /// The ordering: the parts that address the leaves, each encoded
-    /// ascending. The parts the predicate pins by equality, then the ORDER BY
-    /// parts under a limit or the range part without one; empty for the
-    /// entity-id tree.
-    pub key_spec: TreeKeySpec,
-    /// The admission: the Selection's whole predicate, resolved.
-    /// [`Predicate::True`] admits every entity that has all the key's parts,
-    /// which is what an index tree and the entity-id tree hold.
-    pub predicate: Predicate<Resolved>,
-}
-
-/// The key spec a tree files its leaves by: its parts in order, without
-/// directions. A [`KeySpec`] says which way each part sorts and where its
-/// nulls fall; a tree needs neither, since it encodes every part ascending
-/// with nulls at one fixed end and leaves the direction to whoever walks it.
-/// So every order over the same parts names one tree, and an index's key spec
-/// becomes its tree's by dropping its directions: [`TreeKeySpec::from`].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub struct TreeKeySpec {
-    /// The parts, most significant first.
-    pub parts: Vec<TreeKeyPart>,
-}
-
-impl TreeKeySpec {
-    /// The key spec of these parts, most significant first; empty for the
-    /// entity-id tree.
-    pub fn new(parts: Vec<TreeKeyPart>) -> Self { Self { parts } }
-}
-
-/// One part of a tree's key spec: the property it files by and how its value
-/// is encoded, with no direction.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-pub struct TreeKeyPart {
-    /// The property, by its durable id.
-    pub property: PropertyId,
-    /// The path below the property, for a value inside a document.
-    pub sub_path: Option<Vec<String>>,
-    /// The type the value is encoded as.
-    pub value_type: ValueType,
-    /// The collation that orders a string, when it is not the plain byte
-    /// order.
-    pub collation: Option<String>,
-}
-
-impl TreeKeyPart {
-    /// A part on `property` with no sub-path or collation.
-    pub fn new(property: PropertyId, value_type: ValueType) -> Self { Self { property, sub_path: None, value_type, collation: None } }
-}
-
-/// The part without its direction and nulls placement.
-impl From<&IndexKeyPart<PropertyId>> for TreeKeyPart {
-    fn from(part: &IndexKeyPart<PropertyId>) -> Self {
-        Self { property: part.key, sub_path: part.sub_path.clone(), value_type: part.value_type, collation: part.collation.clone() }
-    }
-}
-
-/// The key spec without its directions and nulls placements: the key spec of
-/// the tree that serves every order over these parts.
-impl From<&KeySpec<PropertyId>> for TreeKeySpec {
-    fn from(key_spec: &KeySpec<PropertyId>) -> Self { Self { parts: key_spec.keyparts.iter().map(TreeKeyPart::from).collect() } }
+    key_spec: KeySpec<PropertyId>,
+    predicate: Predicate<Resolved>,
 }
 
 impl TreeSpec {
+    /// The spec of the tree that serves `key_spec` and `predicate`: the key
+    /// spec with its directions and nulls placements dropped, every part
+    /// ascending, and the whole predicate. This is the only way to build a
+    /// spec, so a spec never carries a direction.
+    pub fn new(key_spec: KeySpec<PropertyId>, predicate: Predicate<Resolved>) -> Self {
+        Self { key_spec: key_spec.ascending(), predicate }
+    }
+
+    /// The ordering: the parts that address the leaves, every one ascending.
+    /// Empty for the entity-id tree. A predicate's range part can be present
+    /// without an ORDER BY, allowing narrower selections to use key bounds.
+    pub fn key_spec(&self) -> &KeySpec<PropertyId> { &self.key_spec }
+
+    /// The admission: the Selection's whole predicate, resolved.
+    /// [`Predicate::True`] admits every entity that has all the key's parts,
+    /// which is what an index tree and the entity-id tree hold.
+    pub fn predicate(&self) -> &Predicate<Resolved> { &self.predicate }
+
     /// The bytes specs are compared and hashed by: the bincode serialization,
     /// the workspace's canonical binary form, which writes a float literal as
     /// its bits.
@@ -149,14 +115,14 @@ impl Hash for TreeSpec {
 mod tests {
     use super::*;
     use ankql::ast::{ComparisonOperator, Expr};
-    use ankurah_core_types::{EntityId, IndexDirection, NullsOrder, PropertyPath, Value};
+    use ankurah_core_types::{EntityId, IndexDirection, IndexKeyPart, NullsOrder, PropertyPath, Value, ValueType};
     use std::collections::hash_map::DefaultHasher;
     use std::collections::{HashMap, HashSet};
 
     fn property(n: u8) -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([n; 32])) }
 
-    /// The key spec on property 1 alone, a string.
-    fn by_name() -> TreeKeySpec { TreeKeySpec::new(vec![TreeKeyPart::new(property(1), ValueType::String)]) }
+    /// The key spec ascending on property 1 alone, a string.
+    fn by_name() -> KeySpec<PropertyId> { KeySpec::new(vec![IndexKeyPart::asc(property(1), ValueType::String)]) }
 
     /// The predicate `rating > bound`, with `rating` the property 3.
     fn rating_above(bound: Value) -> Predicate<Resolved> {
@@ -177,17 +143,16 @@ mod tests {
 
     #[test]
     fn specs_that_differ_in_any_field_differ() {
+        let part = |n: u8, value_type| IndexKeyPart::asc(property(n), value_type);
         let specs = [
-            TreeSpec { key_spec: TreeKeySpec::new(vec![]), predicate: Predicate::True },
-            TreeSpec { key_spec: by_name(), predicate: Predicate::True },
-            TreeSpec { key_spec: TreeKeySpec::new(vec![TreeKeyPart::new(property(1), ValueType::I64)]), predicate: Predicate::True },
-            TreeSpec { key_spec: TreeKeySpec::new(vec![TreeKeyPart::new(property(2), ValueType::String)]), predicate: Predicate::True },
-            TreeSpec {
-                key_spec: TreeKeySpec::new(vec![TreeKeyPart { sub_path: Some(vec!["city".into()]), ..TreeKeyPart::new(property(1), ValueType::String) }]),
-                predicate: Predicate::True,
-            },
-            TreeSpec { key_spec: by_name(), predicate: rating_above(Value::I64(3)) },
-            TreeSpec { key_spec: by_name(), predicate: rating_above(Value::I64(4)) },
+            TreeSpec::new(KeySpec::new(vec![]), Predicate::True),
+            TreeSpec::new(by_name(), Predicate::True),
+            TreeSpec::new(KeySpec::new(vec![part(1, ValueType::I64)]), Predicate::True),
+            TreeSpec::new(KeySpec::new(vec![part(2, ValueType::String)]), Predicate::True),
+            TreeSpec::new(KeySpec::new(vec![IndexKeyPart { sub_path: Some(vec!["city".into()]), ..part(1, ValueType::String) }]), Predicate::True),
+            TreeSpec::new(KeySpec::new(vec![IndexKeyPart { collation: Some("en-US".into()), ..part(1, ValueType::String) }]), Predicate::True),
+            TreeSpec::new(by_name(), rating_above(Value::I64(3))),
+            TreeSpec::new(by_name(), rating_above(Value::I64(4))),
         ];
         let distinct: HashSet<TreeSpec> = specs.iter().cloned().collect();
         assert_eq!(distinct.len(), specs.len());
@@ -197,51 +162,43 @@ mod tests {
         }
     }
 
-    /// Every order over the same parts names one tree: a key spec's
-    /// directions and nulls placements drop away, so the key specs of
+    /// Every order over the same parts names one tree: the key specs of
     /// `ORDER BY a ASC, b DESC`, its reverse, and the index on (a, b) in any
-    /// directions are one tree key spec. Another part order, or another type
-    /// for a part, is another tree.
+    /// directions and nulls placements give equal specs with equal hashes, and
+    /// the spec reports the parts ascending with no nulls placement, their
+    /// sub-paths, types and collations kept. Another part order, or another
+    /// type for a part, is another tree.
     #[test]
-    fn every_order_over_the_same_parts_is_one_key_spec() {
+    fn every_order_over_the_same_parts_is_one_tree() {
         use IndexDirection::{Asc, Desc};
         use NullsOrder::{First, Last};
-        let part = |n: u8, direction, nulls| IndexKeyPart { direction, nulls, ..IndexKeyPart::asc(property(n), ValueType::String) };
+        let part = |n: u8, direction, nulls| IndexKeyPart {
+            direction,
+            nulls,
+            sub_path: Some(vec!["address".into()]),
+            collation: Some("en-US".into()),
+            ..IndexKeyPart::asc(property(n), ValueType::String)
+        };
         let orders = [
             KeySpec::new(vec![part(1, Asc, None), part(2, Desc, None)]),
             KeySpec::new(vec![part(1, Desc, None), part(2, Asc, None)]),
             KeySpec::new(vec![part(1, Asc, Some(First)), part(2, Asc, Some(Last))]),
             KeySpec::new(vec![part(1, Desc, Some(Last)), part(2, Desc, Some(First))]),
         ];
-        let expected = TreeKeySpec::new(vec![TreeKeyPart::new(property(1), ValueType::String), TreeKeyPart::new(property(2), ValueType::String)]);
+        let expected = TreeSpec::new(KeySpec::new(vec![part(1, Asc, None), part(2, Asc, None)]), rating_above(Value::I64(3)));
         for order in &orders {
-            assert_eq!(TreeKeySpec::from(order), expected, "{order:?}");
-        }
-        assert_ne!(TreeKeySpec::from(&KeySpec::new(vec![part(2, Asc, None), part(1, Asc, None)])), expected, "the parts in another order");
-        let typed = KeySpec::new(vec![part(1, Asc, None), IndexKeyPart::asc(property(2), ValueType::I64)]);
-        assert_ne!(TreeKeySpec::from(&typed), expected, "a part of another type");
-        assert_eq!(TreeKeySpec::from(&KeySpec::new(vec![])), TreeKeySpec::new(vec![]), "the entity-id tree");
-
-        // A part's sub-path, type and collation come through the conversion;
-        // only its direction and nulls placement are dropped.
-        let full = IndexKeyPart {
-            sub_path: Some(vec!["address".into(), "city".into()]),
-            direction: Desc,
-            nulls: Some(First),
-            collation: Some("en-US".into()),
-            ..IndexKeyPart::asc(property(4), ValueType::I64)
-        };
-        assert_eq!(
-            TreeKeyPart::from(&full),
-            TreeKeyPart {
-                property: property(4),
-                sub_path: Some(vec!["address".into(), "city".into()]),
-                value_type: ValueType::I64,
-                collation: Some("en-US".into()),
+            let spec = TreeSpec::new(order.clone(), rating_above(Value::I64(3)));
+            assert_eq!(spec, expected, "{order:?}");
+            assert_eq!(hash_of(&spec), hash_of(&expected));
+            for kept in &spec.key_spec().keyparts {
+                assert!(!kept.direction.is_desc() && kept.nulls.is_none(), "ascending, no nulls placement");
+                assert_eq!((kept.sub_path.as_deref(), kept.collation.as_deref()), (Some(&["address".to_string()][..]), Some("en-US")));
             }
-        );
-        let bare = TreeKeyPart::new(property(4), ValueType::I64);
-        assert_ne!(TreeKeyPart::from(&full), bare, "the sub-path and the collation are part of the key");
+        }
+        let swapped = TreeSpec::new(KeySpec::new(vec![part(2, Asc, None), part(1, Asc, None)]), rating_above(Value::I64(3)));
+        assert_ne!(swapped, expected, "the parts in another order");
+        let typed = KeySpec::new(vec![part(1, Asc, None), IndexKeyPart { value_type: ValueType::I64, ..part(2, Asc, None) }]);
+        assert_ne!(TreeSpec::new(typed, rating_above(Value::I64(3))), expected, "a part of another type");
     }
 
     /// The entity-id tree's canonical bytes, pinned: the empty key spec
@@ -250,7 +207,7 @@ mod tests {
     /// serde's or bincode's included, shows up here.
     #[test]
     fn the_entity_id_tree_serializes_canonically() {
-        let spec = TreeSpec { key_spec: TreeKeySpec::new(vec![]), predicate: Predicate::True };
+        let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
         assert_eq!(hex(&spec.canonical_bytes()), "000000000000000005000000");
     }
 
@@ -264,12 +221,12 @@ mod tests {
     fn specs_with_float_literals_compare_by_their_bits() {
         let nan = f64::from_bits(0x7ff8_0000_0000_0001);
         let other_nan = f64::from_bits(0x7ff8_0000_0000_0002);
-        let two_parts = TreeKeySpec::new(vec![TreeKeyPart::new(property(1), ValueType::String), TreeKeyPart::new(property(2), ValueType::F64)]);
+        let two_parts = KeySpec::new(vec![IndexKeyPart::asc(property(1), ValueType::String), IndexKeyPart::desc(property(2), ValueType::F64)]);
         let vectors = [(by_name(), 0.0, ZERO), (by_name(), -0.0, NEGATIVE_ZERO), (by_name(), nan, NAN), (two_parts, 2.5, TWO_PARTS)];
         let specs: Vec<TreeSpec> = vectors
             .into_iter()
             .map(|(key_spec, bound, bytes)| {
-                let spec = TreeSpec { key_spec, predicate: rating_above(Value::F64(bound)) };
+                let spec = TreeSpec::new(key_spec, rating_above(Value::F64(bound)));
                 assert_eq!(hex(&spec.canonical_bytes()), bytes, "{bound:?}");
                 spec
             })
@@ -277,33 +234,33 @@ mod tests {
         assert_ne!(specs[0], specs[1], "0.0 and -0.0");
         assert_eq!(specs[2], specs[2].clone(), "a NaN equals itself");
         assert_eq!(hash_of(&specs[2]), hash_of(&specs[2].clone()), "and hashes alike");
-        assert_ne!(specs[2], TreeSpec { key_spec: by_name(), predicate: rating_above(Value::F64(other_nan)) }, "a NaN of another payload");
+        assert_ne!(specs[2], TreeSpec::new(by_name(), rating_above(Value::F64(other_nan))), "a NaN of another payload");
     }
 
-    const ZERO: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010005000000000000000001000000010000000303\
-                          0303030303030303030303030303030303030303030303030303030303030600000000000000726174696e670000000000000000020000000000000003000000\
-                          0000000000000000";
-    const NEGATIVE_ZERO: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010005000000000000000001000000010000000303\
-                          0303030303030303030303030303030303030303030303030303030303030600000000000000726174696e670000000000000000020000000000000003000000\
-                          0000000000000080";
-    const NAN: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010005000000000000000001000000010000000303\
-                          0303030303030303030303030303030303030303030303030303030303030600000000000000726174696e670000000000000000020000000000000003000000\
-                          010000000000f87f";
-    const TWO_PARTS: &str = "02000000000000000100000001010101010101010101010101010101010101010101010101010101010101010005000000000100000002020202020202020202\
-                          02020202020202020202020202020202020202020202000300000000000000000100000001000000030303030303030303030303030303030303030303030303\
-                          03030303030303030600000000000000726174696e6700000000000000000200000000000000030000000000000000000440";
+    const ZERO: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
+                          00000003030303030303030303030303030303030303030303030303030303030303030600000000000000726174696e67000000000000000002000000000000\
+                          00030000000000000000000000";
+    const NEGATIVE_ZERO: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
+                          00000003030303030303030303030303030303030303030303030303030303030303030600000000000000726174696e67000000000000000002000000000000\
+                          00030000000000000000000080";
+    const NAN: &str = "01000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000000000000100000001\
+                          00000003030303030303030303030303030303030303030303030303030303030303030600000000000000726174696e67000000000000000002000000000000\
+                          0003000000010000000000f87f";
+    const TWO_PARTS: &str = "02000000000000000100000001010101010101010101010101010101010101010101010101010101010101010000000000050000000000010000000202020202\
+                          02020202020202020202020202020202020202020202020202020200000000000300000000000000000001000000010000000303030303030303030303030303\
+                          0303030303030303030303030303030303030600000000000000726174696e6700000000000000000200000000000000030000000000000000000440";
 
     /// Equal specs find one tree in a map keyed by spec; a spec that differs
     /// in its predicate finds none.
     #[test]
     fn equal_specs_find_one_tree_in_a_map() {
-        let index_tree = || TreeSpec { key_spec: by_name(), predicate: Predicate::True };
-        let tree_of_its_own = || TreeSpec { key_spec: by_name(), predicate: rating_above(Value::I64(3)) };
+        let index_tree = || TreeSpec::new(by_name(), Predicate::True);
+        let tree_of_its_own = || TreeSpec::new(by_name(), rating_above(Value::I64(3)));
         let trees: HashMap<TreeSpec, &str> =
             [(index_tree(), "the index tree"), (tree_of_its_own(), "a tree of its own")].into_iter().collect();
         assert_eq!(trees.get(&index_tree()), Some(&"the index tree"));
         assert_eq!(trees.get(&tree_of_its_own()), Some(&"a tree of its own"));
-        let another = TreeSpec { key_spec: by_name(), predicate: rating_above(Value::I64(4)) };
+        let another = TreeSpec::new(by_name(), rating_above(Value::I64(4)));
         assert_eq!(trees.get(&another), None, "the predicate is part of the spec");
     }
 }
