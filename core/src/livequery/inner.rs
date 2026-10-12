@@ -13,6 +13,8 @@ use tracing::{debug, warn};
 
 /// Shared query state; versions identify selection attempts, not system epochs.
 pub(super) struct LiveQueryInner {
+    pub(super) tree: Arc<crate::node::state_sync::QueryTree>,
+    pub(super) remote_activated_version: AtomicU32,
     pub(super) query_id: proto::QueryId,
     // Must drop before context, which may hold the node's last strong reference.
     pub(super) subscription: ReactorSubscription,
@@ -47,6 +49,8 @@ impl LiveQueryInner {
         let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(Context(context.clone())));
 
         Self {
+            tree: Arc::new(crate::node::state_sync::QueryTree::default()),
+            remote_activated_version: AtomicU32::new(0),
             query_id,
             context,
             subscription,
@@ -178,11 +182,37 @@ impl LiveQueryInner {
                 self.resultset.clone(),
                 self.gap_fetcher.clone(),
                 version,
-                self,
+                LocalActivation(self),
             )
             .await?;
 
         Ok(())
+    }
+
+    pub(super) async fn activate_remote(&self, version: u32, entities: Vec<Entity>) -> Result<bool, RetrievalError> {
+        let Some((selection, stored_version)) = self.selection.value() else { return Ok(false) };
+        if version != stored_version || !self.is_current(version) {
+            return Ok(false);
+        }
+        self.context
+            .node()?
+            .reactor()
+            .upsert_query_from_peer(
+                self.subscription.id(),
+                self.query_id,
+                selection,
+                self.context.clone(),
+                self.resultset.clone(),
+                self.gap_fetcher.clone(),
+                version,
+                self,
+                entities,
+            )
+            .await?;
+        if !self.is_current(version) {
+            return Ok(false);
+        }
+        Ok(true)
     }
 
     /// Mark the current version initialized before the reactor notifies result observers.
@@ -207,7 +237,20 @@ impl LiveQueryInner {
 impl crate::reactor::PreNotifyHook for &LiveQueryInner {
     fn is_current(&self, version: u32) -> bool { self.current_version.load(Ordering::Acquire) == version }
 
-    fn pre_notify(&self, version: u32) { self.mark_initialized(version); }
+    fn pre_notify(&self, version: u32) {
+        self.remote_activated_version.store(version, Ordering::Release);
+        self.mark_initialized(version);
+    }
+}
+
+// A cached initialization may be in flight when the peer answers. It must
+// not replace the peer's authoritative membership after that installation.
+struct LocalActivation<'a>(&'a LiveQueryInner);
+impl PreNotifyHook for LocalActivation<'_> {
+    fn is_current(&self, version: u32) -> bool {
+        self.0.is_current(version) && self.0.remote_activated_version.load(Ordering::Acquire) != version
+    }
+    fn pre_notify(&self, version: u32) { self.0.mark_initialized(version); }
 }
 
 impl Drop for LiveQueryInner {

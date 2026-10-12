@@ -42,14 +42,24 @@ impl NodeApplier {
         // are collected per item, the remaining items still apply, and the
         // reactor is notified for the successfully applied subset.
         let mut changes = Vec::new();
+        let mut memberships = Vec::new();
         let mut errors: Vec<ApplyErrorItem> = Vec::new();
         for update in items {
             let entity_id = update.entity_id;
+            let relevance = update.predicate_relevance.clone();
             let event_getter = CachedEventGetter::new(node, &cdata);
             let state_getter = LocalStateGetter::new(node.storage.clone());
             match Self::apply_update(node, from_peer_id, update, &event_getter, &state_getter).await {
-                Ok(Some(change)) => changes.push(change),
-                Ok(None) => {}
+                Ok(change) => {
+                    if let Some(change) = change {
+                        changes.push(change);
+                    }
+                    if let Some(entity) = node.entities.get(&entity_id) {
+                        for (query, _) in relevance {
+                            memberships.push((query, entity.clone()));
+                        }
+                    }
+                }
                 Err(cause) => {
                     tracing::warn!("failed to apply update for {}: {}", entity_id, cause);
                     errors.push(ApplyErrorItem { entity_id, cause });
@@ -58,6 +68,13 @@ impl NodeApplier {
         }
 
         node.reactor.notify_change(changes).await;
+        for (query, entity) in memberships {
+            if let Some(query) = node.live_queries.get(query) {
+                if let Err(error) = query.refresh_membership(entity).await {
+                    tracing::debug!(%error, "query disappeared during membership delivery");
+                }
+            }
+        }
 
         if !errors.is_empty() {
             return Err(ApplyError::Items(errors));

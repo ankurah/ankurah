@@ -281,7 +281,42 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
-        let included_entities = node.fetch_entities_from_local(&selection).await?;
+        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None).await
+    }
+
+    pub(crate) async fn upsert_query_from_peer<H: PreNotifyHook>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection<Resolved>,
+        node: Arc<dyn LocalEntitySource<E>>,
+        resultset: EntityResultSet<E>,
+        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+        version: u32,
+        pre_notify_hook: H,
+        entities: Vec<E>,
+    ) -> anyhow::Result<()> {
+        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, Some(entities))
+            .await
+    }
+
+    async fn install_query<H: PreNotifyHook>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query_id: proto::QueryId,
+        selection: ankql::ast::Selection<Resolved>,
+        node: Arc<dyn LocalEntitySource<E>>,
+        resultset: EntityResultSet<E>,
+        gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
+        version: u32,
+        pre_notify_hook: H,
+        entities: Option<Vec<E>>,
+    ) -> anyhow::Result<()> {
+        let authoritative = entities.is_some();
+        let included_entities = match entities {
+            Some(entities) => entities,
+            None => node.fetch_entities_from_local(&selection).await?,
+        };
         if !pre_notify_hook.is_current(version) {
             return Ok(());
         }
@@ -299,11 +334,16 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node);
 
         let mut reactor_update_items = Vec::new();
-        subscription.update_query(query_id, selection.clone(), included_entities, version, &mut reactor_update_items)?;
+        subscription.update_query(query_id, selection.clone(), included_entities, version, &mut reactor_update_items, authoritative)?;
 
-        drop(notify);
-        subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
-        let _notify = self.0.notify_lock.lock().await;
+        let _notify = if authoritative {
+            resultset.clear_gap_dirty();
+            notify
+        } else {
+            drop(notify);
+            subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
+            self.0.notify_lock.lock().await
+        };
         if !pre_notify_hook.is_current(version) {
             return Ok(());
         }
@@ -349,6 +389,27 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
         for change in all_watcher_changes {
             watcher_set.apply_watcher_change(change);
+        }
+    }
+
+    /// A catch-up repair can apply a live Add's state before its membership
+    /// notification arrives. Re-evaluate only that query, without publishing a
+    /// duplicate entity update to every other query holding the same state.
+    pub(crate) async fn refresh_membership<C: ChangeNotification<Entity = E, Event = Ev>>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query: proto::QueryId,
+        change: C,
+    ) {
+        let _notify = self.0.notify_lock.lock().await;
+        let subscription = self.0.subscriptions.lock().unwrap().get(&subscription_id).cloned();
+        let Some(subscription) = subscription else { return };
+        let mut candidates = CandidateChanges::new(Arc::new(vec![change]));
+        candidates.add_query(query, 0);
+        let changes = subscription.evaluate_membership(candidates);
+        let mut watchers = self.0.watcher_set.lock().unwrap();
+        for change in changes {
+            watchers.apply_watcher_change(change);
         }
     }
 

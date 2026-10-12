@@ -158,6 +158,7 @@ dependencies = [
  "ankql",
  "ankurah-core-types",
  "ankurah-derive",
+ "ankurah-digest-tree",
  "ankurah-proto",
  "ankurah-signals",
  "anyhow",
@@ -189,6 +190,7 @@ dependencies = [
  "uniffi",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-time",
  "yrs",
 ]
 

@@ -163,7 +163,7 @@ async fn standing_query_membership_can_change_but_version_cannot_regress() -> an
         query_id,
         selection: selection.clone().and_member_of(proto::ModelId::System(model)),
         version,
-        known_matches: Vec::new(),
+        known_state: None,
     };
 
     assert!(matches!(

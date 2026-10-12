@@ -210,6 +210,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         included_entities: Vec<E>,
         version: u32,
         reactor_updates: &mut A,
+        authoritative: bool,
     ) -> anyhow::Result<Vec<E>> {
         let mut state_guard = self.state.lock().unwrap();
         let state = &mut *state_guard;
@@ -233,36 +234,62 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let mut rw_resultset = query_state.resultset.write();
         let mut newly_added: Vec<E> = Vec::new();
 
-        rw_resultset.mark_all_dirty();
-
-        for entity in included_entities {
-            if evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) && query_state.source.can_read(&entity) {
-                let entity_id = AbstractEntity::id(&entity);
-
-                if !rw_resultset.contains(&entity_id) {
-                    rw_resultset.add(entity.clone());
-                    state.entities.insert(entity_id, entity.clone());
-                    reactor_updates.push_initial(&entity, query_id);
-                    newly_added.push(entity);
+        let mut removed_entities = Vec::new();
+        if authoritative {
+            let before: IndexMap<_, _> = rw_resultset.iter_entities().map(|(id, entity)| (id, entity.clone())).collect();
+            let included = included_entities
+                .into_iter()
+                .filter(|entity| query_state.source.can_read(entity) && evaluate_predicate(entity, &selection.predicate).unwrap_or(false))
+                .collect();
+            // Replace as a set before applying its order/limit. Adding to the
+            // old limited set first could evict an authoritative new member.
+            rw_resultset.replace_all(included);
+            for (id, entity) in rw_resultset.iter_entities() {
+                if !before.contains_key(&id) {
+                    state.entities.insert(id, entity.clone());
+                    reactor_updates.push_initial(entity, query_id);
+                    newly_added.push(entity.clone());
                 }
             }
-        }
-
-        let mut removed_entities = Vec::new();
-        rw_resultset.retain_dirty(|entity| {
-            let can_read = query_state.source.can_read(entity);
-            if can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false) {
-                return true;
-            };
-            let entity_id = entity.id();
-            tracing::debug!("Entity {:?} no longer matches predicate", entity_id);
-
-            removed_entities.push(entity_id);
-            if can_read {
-                reactor_updates.push_remove(entity, query_id);
+            for (id, entity) in before {
+                if !rw_resultset.contains(&id) {
+                    removed_entities.push(id);
+                    if query_state.source.can_read(&entity) {
+                        reactor_updates.push_remove(&entity, query_id);
+                    }
+                }
             }
-            false
-        });
+        } else {
+            rw_resultset.mark_all_dirty();
+
+            for entity in included_entities {
+                if evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) && query_state.source.can_read(&entity) {
+                    let entity_id = AbstractEntity::id(&entity);
+
+                    if !rw_resultset.contains(&entity_id) {
+                        rw_resultset.add(entity.clone());
+                        state.entities.insert(entity_id, entity.clone());
+                        reactor_updates.push_initial(&entity, query_id);
+                        newly_added.push(entity);
+                    }
+                }
+            }
+
+            rw_resultset.retain_dirty(|entity| {
+                let can_read = query_state.source.can_read(entity);
+                if can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false) {
+                    return true;
+                };
+                let entity_id = entity.id();
+                tracing::debug!("Entity {:?} no longer matches predicate", entity_id);
+
+                removed_entities.push(entity_id);
+                if can_read {
+                    reactor_updates.push_remove(entity, query_id);
+                }
+                false
+            });
+        }
 
         query_state.paused = false;
         query_state.version = version;
@@ -311,6 +338,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Evaluate candidate changes for this subscription and spawn gap filling/notification task
     /// Returns watcher changes that need to be applied to the global WatcherSet
     pub fn evaluate_changes<C: ChangeNotification<Entity = E, Event = Ev>>(self, candidates: CandidateChanges<C>) -> Vec<WatcherChange> {
+        self.evaluate_candidates(candidates, false)
+    }
+
+    pub fn evaluate_membership<C: ChangeNotification<Entity = E, Event = Ev>>(self, candidates: CandidateChanges<C>) -> Vec<WatcherChange> {
+        self.evaluate_candidates(candidates, true)
+    }
+
+    fn evaluate_candidates<C: ChangeNotification<Entity = E, Event = Ev>>(
+        self,
+        candidates: CandidateChanges<C>,
+        membership_only: bool,
+    ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
         let mut items: IndexMap<proto::EntityId, ReactorUpdateItem<E, Ev>> = IndexMap::new();
 
@@ -341,6 +380,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 let can_read = query_state.source.can_read(entity);
                 let matches = can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
                 let did_match = query_state.resultset.contains_key(&entity_id);
+                if membership_only && matches == did_match {
+                    continue;
+                }
 
                 // Process membership change in one match
                 let membership_change = match (did_match, matches) {

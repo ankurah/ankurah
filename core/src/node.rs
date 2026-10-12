@@ -43,6 +43,7 @@ mod match_args;
 mod peer_state;
 mod schema_registration;
 mod state;
+pub(crate) mod state_sync;
 #[cfg(test)]
 mod tests;
 
@@ -103,7 +104,7 @@ where PA: PolicyAgent
     /// or update one already registered there. Otherwise a competing writer could retry
     /// from stale in-memory state after storage advances. Reactor notification follows later.
     pub(crate) commit_publication_lock: tokio::sync::Mutex<()>,
-    peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
+    pub(crate) peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,
 
     /// Per-node source of randomness for peer selection. Seeded from entropy in production;
@@ -344,7 +345,7 @@ where
 
         // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
         // follow-on uses #426's node session union for catalog queries.
-        let auth = if crate::schema::request_bypasses_policy(&request.body) {
+        let auth = if self.comparison_bypasses_policy(node_id, &request.body, true) {
             Vec::new()
         } else {
             self.policy_agent.sign_request(self, cdata, &request)?
@@ -447,7 +448,7 @@ where
 
                     // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
                     // follow-on uses #426's node session union for catalog queries.
-                    let cdata = if crate::schema::request_bypasses_policy(&request.body) {
+                    let cdata = if self.comparison_bypasses_policy(request.from, &request.body, false) {
                         Ok(Vec::new())
                     } else {
                         self.policy_agent.check_request(self, &auth, &request).await
@@ -477,7 +478,8 @@ where
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
                 // Remove predicate from the peer's subscription
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(query_id).await?;
+                    peer_state.comparisons.invalidate_query(query_id);
+                    peer_state.subscription_handler.remove_predicate(self, query_id).await?;
                 }
             }
         }
@@ -487,6 +489,21 @@ where
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
     async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
     where C: Iterable<PA::ContextData> {
+        let peer = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("peer disconnected"))?;
+        let initial = matches!(&request.body, proto::NodeRequestBody::Fetch { .. } | proto::NodeRequestBody::SubscribeQuery { .. });
+        // Retried initial requests must observe the first comparison, even if
+        // both requests arrive before its snapshot has finished building.
+        let _initial = if initial { Some(peer.initial_comparison.lock().await) } else { None };
+        let fingerprint = if initial { bincode::serialize(&request.body)? } else { Vec::new() };
+        let credentials: Vec<_> = cdata.iterable().cloned().collect();
+        if initial {
+            if let Some(state) = peer.comparisons.replay_initial(&request.id, &fingerprint, &credentials)? {
+                return Ok(match request.body {
+                    proto::NodeRequestBody::SubscribeQuery { query_id, .. } => proto::NodeResponseBody::QuerySubscribed { query_id, state },
+                    _ => proto::NodeResponseBody::Fetch(state),
+                });
+            }
+        }
         match request.body {
             proto::NodeRequestBody::CommitTransaction { id, events } => handler::commit_transaction(self, cdata, id, events).await,
             proto::NodeRequestBody::RegisterSchema { model } => {
@@ -502,30 +519,22 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::Fetch { mut selection, known_matches } => {
+            proto::NodeRequestBody::Fetch { mut selection, known_state } => {
+                let spec = state_sync::QueryTree::offered_spec(&selection, &self.catalog, &known_state)?;
+                let catalog = crate::schema::is_catalog_read(&selection.predicate);
                 let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
                 selection.predicate = policy.filter_predicate(selection.predicate)?;
-
-                let expanded_states = crate::util::expand_states::expand_states(
-                    self.storage.fetch_states(&selection).await?,
-                    known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-                    self.storage.as_ref(),
-                )
-                .await?;
-
-                let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
-
-                let mut deltas = Vec::new();
-                for state in expanded_states {
-                    if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
-                        continue;
-                    }
-
-                    if let Some(delta) = self.generate_entity_delta(&known_map, state, cdata).await? {
-                        deltas.push(delta);
-                    }
-                }
-                Ok(proto::NodeResponseBody::Fetch(deltas))
+                let states = self
+                    .storage
+                    .fetch_states(&selection)
+                    .await?
+                    .into_iter()
+                    .filter(|state| policy.check_read(&state.payload.entity_id, &state.payload.state).is_ok())
+                    .collect();
+                let snapshot = state_sync::QueryTree::default().refresh(spec, states).await?;
+                let state =
+                    self.start_comparison(request.from, request.id, fingerprint, credentials, None, catalog, snapshot, known_state).await?;
+                Ok(proto::NodeResponseBody::Fetch(state))
             }
             proto::NodeRequestBody::Get { ids } => {
                 let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
@@ -535,7 +544,7 @@ where
                 Ok(proto::NodeResponseBody::Get(results))
             }
             proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
-            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
+            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_state } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // Catalog subscriptions carry no credential; others carry exactly one.
                 let cdata = match cdata.iterable().at_most_one() {
@@ -546,7 +555,29 @@ where
                         ));
                     }
                 };
-                peer_state.subscription_handler.subscribe_query(self, query_id, selection, cdata, version, known_matches).await
+                peer_state
+                    .subscription_handler
+                    .subscribe_query(self, request.id, fingerprint, query_id, selection, cdata, version, known_state)
+                    .await
+            }
+            proto::NodeRequestBody::CompareTree { comparison, answers } => {
+                self.compare_tree(request.from, request.id, comparison, answers, credentials).await
+            }
+            proto::NodeRequestBody::CloseComparison { comparison, outcome } => {
+                let peer = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("peer disconnected"))?;
+                if let Some(session) = peer.comparisons.get(&comparison) {
+                    anyhow::ensure!(session.permits(&credentials), "comparison credentials changed");
+                    if outcome == proto::ComparisonOutcome::Applied {
+                        anyhow::ensure!(session.complete().await, "comparison has unanswered work");
+                    }
+                    if let Some((query, version)) = session.query {
+                        peer.subscription_handler.finish_comparison(self, query, version, comparison, outcome).await?;
+                    }
+                    peer.comparisons.finish(comparison);
+                } else if outcome == proto::ComparisonOutcome::Applied && !peer.comparisons.was_closed(&comparison) {
+                    return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison });
+                }
+                Ok(proto::NodeResponseBody::Success)
             }
         }
     }
@@ -593,8 +624,8 @@ where
         Ok(())
     }
 
-    /// Generate EntityDelta for an entity state, using known_matches to decide between StateSnapshot and EventBridge
-    /// Returns None if the entity is in known_matches with equal heads (client already has current state)
+    /// Build a repair from a selectively requested clock, or a snapshot if no bridge is available.
+    /// Equal clocks need no repair.
     pub(crate) async fn generate_entity_delta<C>(
         &self,
         known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
@@ -610,7 +641,7 @@ where
         let proto::Attested { payload: proto::EntityState { entity_id, state }, attestations } = entity_state;
         let current_head = &state.head;
 
-        // Entity is in known_matches - try to optimize the response
+        // The requester supplied this entity's clock; try an event bridge.
         if let Some(known_head) = known_map.get(&entity_id) {
             // Case 1: Heads equal → return None (omit entity, client already has current state) ✓
             if known_head == current_head {
@@ -635,7 +666,7 @@ where
             }
         }
 
-        // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
+        // Unknown state or unavailable history requires a snapshot.
         let state_fragment = proto::StateFragment { state, attestations };
         Ok(Some(proto::EntityDelta { entity_id, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
@@ -661,7 +692,7 @@ where
         let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);
 
         // First check the causal relationship
-        let comparison_result = compare(&event_getter, current_head, known_head, 100000).await?;
+        let comparison_result = compare(&event_getter, current_head, known_head, 256).await?;
 
         match comparison_result.relation {
             AbstractCausalRelation::Equal => {
@@ -678,6 +709,9 @@ where
 
                 while !frontier.is_empty() {
                     let batch = std::mem::take(&mut frontier);
+                    if visited.len() + batch.len() > 256 {
+                        return Ok(vec![]);
+                    }
                     let fetched = self.storage.get_events(batch).await?;
 
                     for event in fetched {
@@ -777,8 +811,7 @@ where
         }
     }
 
-    /// Fetch matching entities from a durable peer using local heads as known matches.
-    /// Apply its deltas locally before returning.
+    /// Compare a temporary result tree with a durable peer and apply its repairs before returning.
     pub(crate) async fn fetch_from_peer(
         &self,
         selection: ankql::ast::Selection<Resolved>,
@@ -787,33 +820,43 @@ where
         self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-        let known_matched_entities = self.fetch_entities_from_local(&selection).await?;
-
-        let known_matches = known_matched_entities
-            .iter()
-            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
-            .collect();
-
-        let selection_clone = selection.clone();
-        match self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches }).await? {
-            proto::NodeResponseBody::Fetch(deltas) => {
-                let event_getter = CachedEventGetter::new(self, cdata);
-                let state_getter = LocalStateGetter::new(self.storage.clone());
-
-                applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, &state_getter).await?;
-                // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
-
-                self.fetch_entities_from_local(&selection_clone).await
+        let tree = state_sync::QueryTree::default();
+        for attempt in 0..2 {
+            let states = self
+                .fetch_entities_from_local(&selection)
+                .await?
+                .into_iter()
+                .map(|entity| entity.to_entity_state().map(|state| Attested::opt(state, None)))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut snapshot = tree.snapshot(&selection, &self.catalog, states).await?;
+            let known_state = Some(snapshot.offer().await?);
+            let response =
+                self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection: selection.clone(), known_state }).await?;
+            let state = match response {
+                proto::NodeResponseBody::Fetch(state) => state,
+                proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
+                other => return Err(RequestError::UnexpectedResponse(other).into()),
+            };
+            let remote =
+                match self.receive_state(peer_id, cdata, snapshot, state, crate::schema::is_catalog_read(&selection.predicate), None).await
+                {
+                    Err(RetrievalError::RequestError(RequestError::ConnectionLost)) if attempt == 0 => continue,
+                    result => result?,
+                };
+            self.close_comparison(peer_id, remote.comparison, cdata, proto::ComparisonOutcome::Applied).await?;
+            let ids: std::collections::HashSet<_> = remote.ids.into_iter().collect();
+            // Filter before applying LIMIT: an unreadable or former result in the
+            // local cache must not displace an authoritative peer result.
+            let mut local_selection = selection.clone();
+            local_selection.limit = None;
+            let mut entities = self.fetch_entities_from_local(&local_selection).await?;
+            entities.retain(|entity| ids.contains(&entity.id()));
+            if let Some(limit) = selection.limit {
+                entities.truncate(limit as usize);
             }
-            proto::NodeResponseBody::Error(e) => {
-                debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
-            }
-            _ => {
-                debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
-            }
+            return Ok(entities);
         }
+        Err(RequestError::ConnectionLost.into())
     }
 
     /// Get a random durable peer node ID.

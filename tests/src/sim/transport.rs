@@ -131,6 +131,8 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
         proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
+        proto::NodeRequestBody::CompareTree { answers, .. } => format!("compare {}", payload_digest(answers)),
+        proto::NodeRequestBody::CloseComparison { outcome, .. } => format!("close {outcome:?}"),
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
         }
@@ -143,7 +145,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         proto::NodeResponseBody::SchemaRegistered { model } => {
             format!("schemaregistered {} {}p", model.label, model.properties.len())
         }
-        proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
+        proto::NodeResponseBody::Fetch(state) => format!("fetch {}", state_descriptor(state)),
         proto::NodeResponseBody::Get(results) => {
             let mut ss: Vec<String> = results
                 .iter()
@@ -157,12 +159,26 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
             format!("get [{}]", ss.join("+"))
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
-        proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
+        proto::NodeResponseBody::QuerySubscribed { state, .. } => format!("subscribed {}", state_descriptor(state)),
+        proto::NodeResponseBody::TreeCompared(page) => format!("compared {}", payload_digest(&(&page.items, page.progress))),
+        proto::NodeResponseBody::ComparisonUnavailable { .. } => "comparison unavailable".into(),
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).
         proto::NodeResponseBody::Error(e) => format!("error:{e}"),
     }
+}
+
+fn state_descriptor(state: &proto::StateReply) -> String {
+    payload_digest(&(&state.spec, &state.scope, &state.page.items, state.page.progress))
+}
+
+/// Compare actual comparison payloads, excluding their random session id.
+/// Counts alone would hide different repairs with the same number of items.
+fn payload_digest(payload: &impl serde::Serialize) -> String {
+    use base64::{engine::general_purpose, Engine as _};
+    use sha2::{Digest, Sha256};
+    general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bincode::serialize(payload).expect("comparison payload serializes")))
 }
 
 fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {

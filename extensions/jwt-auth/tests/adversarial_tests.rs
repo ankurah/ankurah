@@ -99,7 +99,7 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
         from: ankurah_proto::EntityId::random(),
         body: ankurah_proto::NodeRequestBody::Fetch {
             selection: ankql::ast::Predicate::MemberOf(ankurah::ModelId::EntityId(ankurah::EntityId::random())).into(),
-            known_matches: vec![],
+            known_state: None,
         },
     };
 

@@ -87,6 +87,9 @@ impl EntityLiveQuery {
             if cached || !has_relay {
                 let inner = self.0.clone();
                 crate::task::spawn(async move {
+                    if inner.remote_activated_version.load(Ordering::Acquire) == version {
+                        return;
+                    }
                     match inner.activate(version).await {
                         Ok(()) if !has_relay => inner.mark_durable_answered(version),
                         Ok(()) => {}
@@ -119,6 +122,20 @@ impl EntityLiveQuery {
 
     /// The current version's initialization error, cleared when a new version starts.
     pub fn error(&self) -> Read<Option<Arc<RetrievalError>>> { self.0.error.read() }
+    pub(crate) fn is_current(&self, version: u32) -> bool { self.0.current_version.load(Ordering::Acquire) == version }
+    pub(crate) async fn refresh_membership(&self, entity: Entity) -> Result<(), RetrievalError> {
+        self.0
+            .context
+            .node()?
+            .reactor()
+            .refresh_membership(self.0.subscription.id(), self.query_id(), EntityChange::new(entity, vec![]))
+            .await;
+        Ok(())
+    }
+    pub(crate) fn digest_tree(&self) -> Arc<crate::node::state_sync::QueryTree> { self.0.tree.clone() }
+    pub(crate) async fn activate_remote(&self, version: u32, entities: Vec<Entity>) -> Result<bool, RetrievalError> {
+        self.0.activate_remote(version, entities).await
+    }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
     /// The latest installed selection and version; `None` until initial resolution.
     pub fn selection(&self) -> Read<Option<(ankql::ast::Selection<Resolved>, u32)>> { self.0.selection.read() }
@@ -141,6 +158,10 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
     async fn subscription_established(&self, version: u32) {
         if let Some(inner) = self.0.upgrade() {
             tracing::debug!("Subscription established for query {}: {}", inner.query_id, version);
+            if inner.remote_activated_version.load(Ordering::Acquire) == version {
+                inner.mark_durable_answered(version);
+                return;
+            }
             match inner.activate(version).await {
                 Ok(()) => inner.mark_durable_answered(version),
                 Err(e) => {

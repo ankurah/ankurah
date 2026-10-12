@@ -15,12 +15,19 @@ use crate::{
     storage::StorageEngine,
 };
 use ankurah_signals::{Subscribe, SubscriptionGuard};
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
+
+mod delivery;
+use delivery::Delivery;
 
 /// Owns one peer's reactor subscription and per-query credential sources.
 pub struct SubscriptionHandler<CD: ContextData> {
-    _peer_id: proto::EntityId,
+    peer_id: proto::EntityId,
     subscription: ReactorSubscription,
+    delivery: Arc<Mutex<Delivery>>,
     _guard: SubscriptionGuard,
     /// Tracks each standing query's version and the credential source shared with its gap fetcher.
     /// Held through async installation and failure cleanup so removal cannot race an
@@ -32,6 +39,7 @@ struct StandingQuery<CD: ContextData> {
     /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
     sessions: SessionSet<CD>,
     version: u32,
+    tree: Arc<crate::node::state_sync::QueryTree>,
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
@@ -42,22 +50,23 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     {
         let subscription = node.reactor.subscribe();
         let weak_node = node.weak();
+        let delivery = Arc::new(Mutex::new(Delivery::default()));
+        let updates = delivery.clone();
 
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
 
             if let Some(node) = weak_node.upgrade() {
-                tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
-                node.send_update(
-                    peer_id,
-                    proto::NodeUpdateBody::SubscriptionUpdate {
-                        items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
-                    },
-                );
+                let items = update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect();
+                let result = updates.lock().unwrap().send(&node, peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items });
+                if let Err(error) = result {
+                    warn!(%peer_id, %error, "failed to serialize a subscription update; disconnecting peer");
+                    node.deregister_peer(peer_id);
+                }
             }
         });
 
-        Self { _peer_id: peer_id, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
+        Self { peer_id, subscription, delivery, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
     }
 
     /// Get the subscription ID for this peer.
@@ -67,12 +76,17 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     pub fn subscription(&self) -> &ReactorSubscription { &self.subscription }
 
     /// Remove a query and its credential source even if reactor cleanup fails.
-    pub async fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
+    pub async fn remove_predicate<SE, PA>(&self, node: &Node<SE, PA>, query_id: proto::QueryId) -> Result<(), SubscriptionError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
         // A selection update must not reinstall the query between reactor and credential removal.
         // Reactor removal is synchronous and does not call back into this handler.
         let mut queries = self.queries.lock().await;
         let removed = self.subscription.remove_predicate(query_id);
         queries.remove(&query_id);
+        self.delivery.lock().unwrap().release(node, self.peer_id, query_id);
         removed
     }
 
@@ -80,11 +94,13 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     pub async fn subscribe_query<SE, PA>(
         &self,
         node: &Node<SE, PA>,
+        request: proto::RequestId,
+        fingerprint: Vec<u8>,
         query_id: proto::QueryId,
         mut selection: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
-        known_matches: Vec<proto::KnownEntity>,
+        known_state: Option<proto::KnownState>,
     ) -> anyhow::Result<proto::NodeResponseBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -94,97 +110,101 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if version == 0 {
             return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
         }
+        let spec = crate::node::state_sync::QueryTree::offered_spec(&selection, &node.catalog, &known_state)?;
+        let catalog = crate::schema::is_catalog_read(&selection.predicate);
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
         // Re-subscribes revalidate; #426 owns denied-update claw-back.
         selection.predicate = policy.filter_predicate(selection.predicate)?;
 
         use std::collections::hash_map::Entry;
-        let (sessions, query_created) = match queries.entry(query_id) {
+        let (sessions, tree) = match queries.entry(query_id) {
             Entry::Occupied(mut o) => {
                 let standing = o.get_mut();
                 if version < standing.version {
                     anyhow::bail!("stale subscription version {version} for query {query_id}; current version is {}", standing.version);
                 }
                 standing.version = version;
-                (standing.sessions.clone(), false)
+                (standing.sessions.clone(), standing.tree.clone())
             }
             Entry::Vacant(v) => {
                 let sessions = match cdata {
                     Some(cdata) => cdata.clone().into(),
                     None => SessionSet::new(),
                 };
-                v.insert(StandingQuery { sessions: sessions.clone(), version });
-                (sessions, true)
+                let tree = Arc::new(crate::node::state_sync::QueryTree::default());
+                v.insert(StandingQuery { sessions: sessions.clone(), version, tree: tree.clone() });
+                (sessions, tree)
             }
         };
 
-        let response = self.subscribe_query_inner(node, query_id, selection, &sessions, &credentials, version, known_matches).await;
-
-        if response.is_err() && query_created {
+        let peer = node.peer_connections.get(&self.peer_id).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+        peer.comparisons.invalidate_query(query_id);
+        self.delivery.lock().unwrap().begin(query_id, version);
+        let response = async {
+            let context = crate::context::Context::new_weak(node, sessions);
+            let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(context.clone()));
+            let matching = self.subscription.upsert_query(query_id, selection, gap_fetcher, context.0, version).await?;
+            let mut states = Vec::new();
+            for entity in matching {
+                let state = entity.to_entity_state()?;
+                if policy.check_read(&state.entity_id, &state.state).is_err() {
+                    continue;
+                }
+                let attestation = node.policy_agent.attest_state(node, &state);
+                states.push(Attested::opt(state, attestation));
+            }
+            let snapshot = tree.refresh(spec, states).await?;
+            let state = node
+                .start_comparison(
+                    self.peer_id,
+                    request,
+                    fingerprint,
+                    credentials.clone(),
+                    Some((query_id, version)),
+                    catalog,
+                    snapshot,
+                    known_state,
+                )
+                .await?;
+            if !self.delivery.lock().unwrap().bind(query_id, version, state.page.comparison) {
+                peer.comparisons.remove(&state.page.comparison);
+                return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: state.page.comparison });
+            }
+            Ok(proto::NodeResponseBody::QuerySubscribed { query_id, state })
+        }
+        .await;
+        if response.is_err() {
             queries.remove(&query_id);
             let _ = self.subscription.remove_predicate(query_id);
+            self.delivery.lock().unwrap().release(node, self.peer_id, query_id);
         }
         response
     }
 
-    /// Install the query and build its versioned initial delta response.
-    async fn subscribe_query_inner<SE, PA>(
+    pub(crate) async fn finish_comparison<SE, PA>(
         &self,
         node: &Node<SE, PA>,
-        query_id: proto::QueryId,
-        selection: ankql::ast::Selection<Resolved>,
-        sessions: &SessionSet<CD>,
-        credentials: &Vec<CD>,
+        query: proto::QueryId,
         version: u32,
-        known_matches: Vec<proto::KnownEntity>,
-    ) -> anyhow::Result<proto::NodeResponseBody>
+        comparison: proto::ComparisonId,
+        outcome: proto::ComparisonOutcome,
+    ) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let context = crate::context::Context::new_weak(node, sessions.clone());
-        let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(context.clone()));
-
-        let included_entities = context.0.fetch_entities_from_local(&selection).await?;
-        let matching_entities =
-            self.subscription.upsert_query(query_id, selection.clone(), included_entities, gap_fetcher, context.0, version).await?;
-
-        // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
-
-        // TASK: Optimize to avoid re-attesting entities fetched from storage https://github.com/ankurah/ankurah/issues/148
-        let initial_states: Vec<_> = matching_entities
-            .into_iter()
-            .filter_map(|e| {
-                let entity_state = e.to_entity_state().ok()?;
-                let attestation = node.policy_agent.attest_state(node, &entity_state);
-                Some(Attested::opt(entity_state, attestation))
-            })
-            .collect();
-
-        let expanded_states = crate::util::expand_states::expand_states(
-            initial_states,
-            known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-            node.storage.as_ref(),
-        )
-        .await?;
-
-        let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
-
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-        let mut deltas = Vec::with_capacity(expanded_states.len());
-        for state in expanded_states {
-            // `known_matches` may resurface rows outside the current policy.
-            if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
-                continue;
-            }
-
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, credentials).await? {
-                deltas.push(delta);
-            }
+        let mut queries = self.queries.lock().await;
+        let mut delivery = self.delivery.lock().unwrap();
+        if !delivery.matches(query, version, comparison) {
+            return Ok(());
         }
-
-        Ok(proto::NodeResponseBody::QuerySubscribed { query_id, deltas })
+        if outcome == proto::ComparisonOutcome::Abandoned {
+            queries.remove(&query);
+            let _ = self.subscription.remove_predicate(query);
+        }
+        delivery.release(node, self.peer_id, query);
+        Ok(())
     }
 }
 

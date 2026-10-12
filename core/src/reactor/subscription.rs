@@ -84,7 +84,6 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         &self,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
-        included_entities: Vec<crate::entity::Entity>,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
         source: Arc<dyn crate::reactor::LocalEntitySource>,
         version: u32,
@@ -95,15 +94,21 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
             .subscription(self.0.subscription_id)
             .ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", self.0.subscription_id))?;
 
+        // Register watchers before allowing a writer's notification to pass the
+        // initial fetch/install boundary.
+        let notify = self.0.reactor.0.notify_lock.lock().await;
+        let included_entities = source.fetch_entities_from_local(&selection).await?;
         let resultset = subscription.register_or_get_query(query_id, gap_fetcher, source);
 
-        let mut all_entities = subscription.update_query(query_id, selection.clone(), included_entities, version, &mut ())?;
+        let mut all_entities = subscription.update_query(query_id, selection.clone(), included_entities, version, &mut (), true)?;
 
+        drop(notify);
         subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
 
         resultset.set_loaded(true);
 
-        Ok(all_entities)
+        let entities = resultset.read().iter_entities().map(|(_, entity)| entity.clone()).collect();
+        Ok(entities)
     }
 }
 

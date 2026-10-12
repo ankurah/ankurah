@@ -63,6 +63,29 @@ async fn peer_get_preserves_denial_and_absence_even_with_a_cached_entity() -> Re
 }
 
 #[tokio::test]
+async fn comparison_membership_removes_denied_cached_rows_from_fetch_and_livequery() -> Result<()> {
+    let agent = BridgePolicyAgent::new();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    server.system.create().await?;
+    let writer = server.context_async(DEFAULT_CONTEXT).await?;
+    let trx = writer.begin();
+    let hidden = trx.create(&Pet { name: "hidden".into(), age: "1".into() }).await?.id();
+    let visible = trx.create(&Pet { name: "visible".into(), age: "1".into() }).await?.id();
+    trx.commit().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let _connection = LocalProcessConnection::new(&client, &server).await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    assert_eq!(reader.fetch::<PetView>("true").await?.len(), 2);
+    agent.deny_read_states.lock().unwrap().insert(hidden);
+    let rows = reader.fetch::<PetView>("true").await?;
+    assert_eq!(rows.iter().map(|row| row.id()).collect::<Vec<_>>(), [visible]);
+    let query = reader.query_wait::<PetView>(ankurah::core::node::nocache("true")?).await?;
+    query.wait_durable_answered().await?;
+    assert_eq!(query.ids(), [visible]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn state_read_hook_filters_fetch_cache_and_live_updates() -> Result<()> {
     use ankurah::{core::error::RetrievalError, model::View};
     use ankurah_signals::Peek;
@@ -281,24 +304,74 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let requests = [
             proto::NodeRequestBody::Get { ids: vec![entity_id] },
             proto::NodeRequestBody::GetEvents { event_ids: events.iter().map(|event| event.payload.id()).collect() },
-            proto::NodeRequestBody::Fetch {
-                selection: Predicate::MemberOf(model).into(),
-                known_matches: vec![proto::KnownEntity { entity_id, head: known_head.clone() }],
-            },
+            proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: None },
             proto::NodeRequestBody::SubscribeQuery {
                 query_id: proto::QueryId::new(),
                 selection: Predicate::MemberOf(model).into(),
                 version: 1,
-                known_matches: vec![proto::KnownEntity { entity_id, head: known_head }],
+                known_state: None,
             },
         ];
         for request in requests {
             match client.request(server.id, &credentials, request).await? {
                 proto::NodeResponseBody::Get(results) => assert!(matches!(results.as_slice(), [proto::GetResult::Found(_)])),
                 proto::NodeResponseBody::GetEvents(received) => assert_eq!(received.len(), events.len()),
-                proto::NodeResponseBody::Fetch(deltas) | proto::NodeResponseBody::QuerySubscribed { deltas, .. } => {
-                    let delta = deltas.iter().find(|delta| delta.entity_id == entity_id).expect("catalog row must be readable");
-                    assert!(matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1), "{delta:?}");
+                proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
+                    let mut page = state.page;
+                    let comparison = page.comparison;
+                    let mut found = false;
+                    loop {
+                        let mut answers = Vec::new();
+                        for item in page.items {
+                            match item {
+                                proto::StateItem::Summary(mut head) => {
+                                    head.digest = Default::default();
+                                    answers.push(proto::StateAnswer::Summary(head));
+                                }
+                                proto::StateItem::NeedLeaves(bounds) => {
+                                    let leaves = if bounds.contains(&entity_id.to_bytes()) {
+                                        vec![proto::KnownLeaf {
+                                            key: vec![],
+                                            entity: proto::KnownEntity { entity_id, head: known_head.clone() },
+                                        }]
+                                    } else {
+                                        vec![]
+                                    };
+                                    answers.push(proto::StateAnswer::Leaves(proto::LeafPage { bounds, leaves }));
+                                }
+                                proto::StateItem::NeedHeads(unknown) => answers.push(proto::StateAnswer::Heads { known: vec![], unknown }),
+                                proto::StateItem::Repair { delta, .. } if delta.entity_id == entity_id => {
+                                    assert!(
+                                        matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1),
+                                        "{delta:?}"
+                                    );
+                                    found = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if page.progress == proto::ComparisonProgress::Complete {
+                            break;
+                        }
+                        page = match client
+                            .request(server.id, &credentials, proto::NodeRequestBody::CompareTree { comparison, answers })
+                            .await?
+                        {
+                            proto::NodeResponseBody::TreeCompared(page) => page,
+                            other => panic!("catalog comparison failed: {other:?}"),
+                        };
+                    }
+                    assert!(found, "catalog row must be readable through comparison follow-ups");
+                    assert!(matches!(
+                        client
+                            .request(
+                                server.id,
+                                &credentials,
+                                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned }
+                            )
+                            .await?,
+                        proto::NodeResponseBody::Success
+                    ));
                 }
                 response => panic!("catalog read failed for {label}: {response:?}"),
             }
@@ -314,7 +387,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_matches: vec![] },
+                proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: None },
             )
             .await?;
         assert!(matches!(response, proto::NodeResponseBody::Error(message) if message.contains("all reads denied")));

@@ -90,6 +90,8 @@ pub struct Scheduler {
     max_rounds: usize,
     /// Load-bearing request ids whose responses carry no collection.
     catalog_requests: std::collections::BTreeSet<proto::RequestId>,
+    /// Comparisons continuing a protected catalog or subscription handshake.
+    catalog_comparisons: std::collections::HashSet<proto::ComparisonId>,
 }
 
 impl Scheduler {
@@ -102,6 +104,7 @@ impl Scheduler {
             node_ids,
             max_rounds: 100_000,
             catalog_requests: std::collections::BTreeSet::new(),
+            catalog_comparisons: std::collections::HashSet::new(),
         }
     }
 
@@ -157,6 +160,9 @@ impl Scheduler {
                         selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy)
                     }
                     proto::NodeRequestBody::SubscribeQuery { .. } => true,
+                    proto::NodeRequestBody::CompareTree { comparison, .. } | proto::NodeRequestBody::CloseComparison { comparison, .. } => {
+                        self.catalog_comparisons.contains(comparison)
+                    }
                     _ => return false,
                 };
                 if !protected {
@@ -165,7 +171,18 @@ impl Scheduler {
                 self.catalog_requests.insert(request.id.clone());
                 true
             }
-            proto::NodeMessage::Response(response) => self.catalog_requests.contains(&response.request_id),
+            proto::NodeMessage::Response(response) => {
+                let protected = self.catalog_requests.contains(&response.request_id);
+                if protected {
+                    match &response.body {
+                        proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
+                            self.catalog_comparisons.insert(state.page.comparison);
+                        }
+                        _ => {}
+                    }
+                }
+                protected
+            }
             _ => false,
         }
     }

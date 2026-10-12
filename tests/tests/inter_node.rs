@@ -185,7 +185,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let gate_query_id: Arc<std::sync::Mutex<Option<proto::QueryId>>> = Arc::new(std::sync::Mutex::new(None));
 
     // Hold QuerySubscribed responses whose query_id matches B, so B's initial
-    // delta is not applied on the client until we explicitly release it.
+    // comparison cannot finish until we explicitly release it.
     let (_conn, gate) = {
         let gate_query_id = gate_query_id.clone();
         GatedConnection::new(&server, &client, move |msg: &proto::NodeMessage| match msg {
@@ -213,13 +213,13 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
 
     let pred = "name = 'Rex'";
 
-    // Query B: start (do NOT wait). Its known_matches are empty (Rex not local
-    // yet) so the server returns a StateSnapshot for Rex - which the gate parks.
+    // Query B: start (do NOT wait). Its offered tree is empty (Rex not local
+    // yet); the gate parks the first comparison reply.
     client_ctx.resolve_model_id::<Pet>().await?;
     let query_b = client_ctx.query::<PetView>(nocache(pred)?)?;
     *gate_query_id.lock().unwrap() = Some(query_b.query_id());
 
-    // Query A: fully establish. Rex is still not local (B's delta is held), so A
+    // Query A: fully establish. Rex is still not local (B's reply is held), so A
     // gets and applies its own StateSnapshot, making Rex resident at head0 and
     // registering A's watchers.
     let query_a = client_ctx.query_wait::<PetView>(nocache(pred)?).await?;
@@ -229,9 +229,9 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let _handle_a = query_a.subscribe(&watcher_a);
     assert_eq!(watcher_a.count(), 0); // no notification on subscribe
 
-    // Release B's held delta: a StateSnapshot for Rex at the SAME head A already
-    // holds - a no-op apply (with_state -> Some(false)). This must NOT surface a
-    // spurious empty-events Update on query A's watcher.
+    // Release B's reply. Its comparison now finds Rex at the head A already
+    // holds, so installing B must not surface a spurious empty-events Update
+    // on query A's watcher.
     gate.release_held(&client).await;
     assert_eq!(
         watcher_a.quiesce().await,

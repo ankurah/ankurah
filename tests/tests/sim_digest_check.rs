@@ -46,3 +46,30 @@ fn digest_is_stable_for_identical_content() {
     let d2 = message_digest(&event_only_message(same.entity_id, model::attest(same)));
     assert_eq!(d1, d2, "identical content must produce identical digests");
 }
+
+#[test]
+fn comparison_digest_tracks_repair_content_but_not_session_ids() {
+    let reply = |event: proto::Event| {
+        proto::NodeMessage::Response(proto::NodeResponse {
+            request_id: proto::RequestId::new(),
+            from: event.entity_id,
+            to: event.entity_id,
+            body: proto::NodeResponseBody::TreeCompared(proto::ComparisonReply {
+                comparison: proto::ComparisonId::new(),
+                items: vec![proto::StateItem::Repair {
+                    target: proto::Clock::singleton(&event),
+                    delta: proto::EntityDelta {
+                        entity_id: event.entity_id,
+                        content: proto::DeltaContent::EventBridge { events: vec![model::attest(event).into()] },
+                    },
+                }],
+                progress: proto::ComparisonProgress::Complete,
+            }),
+        })
+    };
+    let one = model::genesis_event(1, model::Field::Title, "one");
+    let two = model::genesis_event(1, model::Field::Title, "two");
+    let first = message_digest(&reply(one.clone()));
+    assert_eq!(first, message_digest(&reply(one)), "fresh correlation ids must not change the trace");
+    assert_ne!(first, message_digest(&reply(two)), "same-size replies with different repairs must differ");
+}

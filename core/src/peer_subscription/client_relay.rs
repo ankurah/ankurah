@@ -568,33 +568,56 @@ where
         let node = self.upgrade().ok_or(NodeDropped)?;
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
-        // 1. Pre-fetch known_matches from local storage
-        let known_matches: Vec<ankurah_proto::KnownEntity> = node
+        let tree = node.live_queries.get(query_id).ok_or(NodeDropped)?.digest_tree();
+        let states = node
             .fetch_entities_from_local(&selection)
             .await?
             .into_iter()
-            .map(|entity| ankurah_proto::KnownEntity { entity_id: entity.id(), head: entity.head() })
-            .collect();
-
-        // 2. Send subscribe request with known_matches
+            .map(|entity| entity.to_entity_state().map(|state| proto::Attested::opt(state, None)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut snapshot = tree.snapshot(&selection, &node.catalog, states).await?;
+        let known_state = Some(snapshot.offer().await?);
         let response = node
             .request(
                 peer_id,
                 &context_data,
-                ankurah_proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_matches },
+                proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_state },
             )
             .await?;
-        let deltas = match response {
-            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, deltas } => deltas,
-            ankurah_proto::NodeResponseBody::Error(e) => return Err(RetrievalError::RequestError(RequestError::ServerError(e))),
-            other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
+        let state = match response {
+            proto::NodeResponseBody::QuerySubscribed { query_id: response_query, state } if response_query == query_id => state,
+            proto::NodeResponseBody::ComparisonUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
+            proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
+            other => return Err(RequestError::UnexpectedResponse(other).into()),
         };
-
-        tracing::debug!("Node.remote_subscribe: query_id: {}, received deltas: {}", query_id, deltas.len());
-        // 3. Apply deltas to local node using NodeApplier
-        let event_getter = crate::retrieval::CachedEventGetter::new(&node, &context_data);
-        let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-        crate::node::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
+        let remote = node
+            .receive_state(
+                peer_id,
+                &context_data,
+                snapshot,
+                state,
+                crate::schema::is_catalog_read(&selection.predicate),
+                Some((query_id, version)),
+            )
+            .await?;
+        let activated: Result<bool, RetrievalError> = async {
+            let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
+            let event_getter = crate::retrieval::LocalEventGetter::new(node.storage.clone(), node.durable);
+            let mut entities = Vec::with_capacity(remote.ids.len());
+            for id in remote.ids {
+                entities.push(
+                    node.entities.get_or_retrieve(&state_getter, &event_getter, &id).await?.ok_or(RetrievalError::EntityNotFound(id))?,
+                );
+            }
+            match node.live_queries.get(query_id) {
+                Some(query) => query.activate_remote(version, entities).await,
+                None => Ok(false),
+            }
+        }
+        .await;
+        let outcome = if matches!(activated, Ok(true)) { proto::ComparisonOutcome::Applied } else { proto::ComparisonOutcome::Abandoned };
+        node.close_comparison(peer_id, remote.comparison, &context_data, outcome).await?;
+        activated?;
 
         Ok(())
     }

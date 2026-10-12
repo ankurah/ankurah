@@ -12,6 +12,11 @@ pub(crate) struct LiveQueryRegistry {
 impl LiveQueryRegistry {
     pub(crate) fn new() -> Self { Self { entries: std::sync::Mutex::new(HashMap::new()) } }
 
+    pub(crate) fn get(&self, id: ankurah_proto::QueryId) -> Option<EntityLiveQuery> {
+        let entries: Vec<_> = self.entries.lock().unwrap_or_else(|error| error.into_inner()).values().cloned().collect();
+        entries.iter().filter_map(WeakEntityLiveQuery::upgrade).find(|query| query.query_id() == id)
+    }
+
     pub(super) fn insert(&self, query: &EntityLiveQuery) {
         let address = Arc::as_ptr(&query.0) as usize;
         self.entries.lock().unwrap_or_else(|error| error.into_inner()).insert(address, query.weak());
