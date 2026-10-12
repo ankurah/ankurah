@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use ankurah_digest_tree::{leaf_address, CanonicalCodec, KeyCodec};
+use ankurah_digest_tree::{leaf_address, CanonicalCodec, KeyCodec, NodePrefix};
 use ankurah_proto::{self as proto, AddressRange, ComparisonId, ComparisonProgress, StateAnswer, StateItem};
 use anyhow::{bail, ensure};
 use web_time::Instant;
@@ -19,6 +19,9 @@ use crate::{
 
 const COMPARISON_TTL: Duration = Duration::from_secs(120);
 const MAX_COMPARISONS: usize = 128;
+
+#[cfg(test)]
+mod tests;
 
 pub(crate) struct Comparisons<CD: ContextData> {
     sessions: Mutex<HashMap<ComparisonId, Arc<Session<CD>>>>,
@@ -38,6 +41,7 @@ pub(crate) struct Session<CD: ContextData> {
     initial: proto::StateReply,
     fingerprint: Vec<u8>,
     state: tokio::sync::Mutex<Comparison>,
+    _cancel_expiry: futures::channel::oneshot::Sender<()>,
 }
 
 impl<CD: ContextData> Comparisons<CD> {
@@ -71,7 +75,7 @@ impl<CD: ContextData> Comparisons<CD> {
 }
 
 enum Work {
-    Compare(proto::TreeHead),
+    Compare { head: proto::TreeHead, prefix: NodePrefix },
     Offer(proto::TreeHead),
     Expand(proto::TreeHead),
     AskLeaves(AddressRange),
@@ -83,7 +87,7 @@ enum Work {
 struct Comparison {
     snapshot: Snapshot,
     work: VecDeque<Work>,
-    summaries: HashMap<Vec<u8>, AddressRange>,
+    summaries: HashMap<Vec<u8>, NodePrefix>,
     leaves: Vec<AddressRange>,
     heads: HashSet<proto::EntityId>,
     repaired: HashSet<proto::EntityId>,
@@ -148,7 +152,7 @@ where
             }
         }
         let first = match hints.remove(&range_id(&super::whole())) {
-            Some(head) => Work::Compare(head),
+            Some(head) => Work::Compare { head, prefix: NodePrefix::root() },
             None => Work::Offer(snapshot.head(super::whole()).await?),
         };
         let mut state = Comparison {
@@ -166,6 +170,7 @@ where
         let id = ComparisonId::new();
         let page = state.reply(self, id, &credentials, catalog).await?;
         let initial = proto::StateReply { spec: state.snapshot.spec.clone(), scope: vec![super::whole()], page };
+        let (cancel_expiry, cancelled) = futures::channel::oneshot::channel();
         let session = Arc::new(Session {
             catalog,
             credentials,
@@ -175,14 +180,36 @@ where
             initial_request: request,
             initial: initial.clone(),
             state: tokio::sync::Mutex::new(state),
+            _cancel_expiry: cancel_expiry,
         });
         let mut sessions = connection.comparisons.sessions.lock().unwrap();
-        // Query sessions retain their handoff metadata until cancellation or
-        // the next follow-up can release the delivery gate.
+        // Only the expiry path can remove query sessions: it also releases
+        // their delivery gates. Fetch sessions need no handoff cleanup.
         sessions.retain(|_, session| session.query.is_some() || !session.expired());
         ensure!(sessions.len() < MAX_COMPARISONS, "too many open comparisons; close existing comparisons first");
         sessions.insert(id, session);
+        drop(sessions);
+        let node = self.weak();
+        crate::task::spawn(async move {
+            let expiry = futures_timer::Delay::new(COMPARISON_TTL);
+            if matches!(futures::future::select(expiry, cancelled).await, futures::future::Either::Left(_)) {
+                if let Some(node) = node.upgrade() {
+                    if let Err(error) = node.expire_comparison(peer, id).await {
+                        tracing::warn!(%error, "failed to release expired state comparison");
+                    }
+                }
+            }
+        });
         Ok(initial)
+    }
+
+    pub(crate) async fn expire_comparison(&self, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()> {
+        let Some(connection) = self.peer_connections.get(&peer) else { return Ok(()) };
+        let Some(session) = connection.comparisons.remove(&id) else { return Ok(()) };
+        if let Some((query, version)) = session.query {
+            connection.subscription_handler.finish_comparison(self, query, version, id, proto::ComparisonOutcome::Abandoned).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn compare_tree(
@@ -199,10 +226,7 @@ where
         };
         ensure!(session.permits(&credentials), "comparison credentials changed");
         if session.expired() {
-            if let Some((query, version)) = session.query {
-                connection.subscription_handler.finish_comparison(self, query, version, id, proto::ComparisonOutcome::Abandoned).await?;
-            }
-            connection.comparisons.remove(&id);
+            self.expire_comparison(peer, id).await?;
             return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
         }
         let mut state = session.state.lock().await;
@@ -242,8 +266,9 @@ impl Comparison {
             match answer {
                 StateAnswer::Summary(head) => {
                     let _: proto::TreeHead = proto::TreeHead::from_bytes(&head.to_bytes())?;
-                    ensure!(self.summaries.remove(&range_id(&head.bounds)).is_some(), "unsolicited summary bounds");
-                    self.work.push_back(Work::Compare(head));
+                    let prefix =
+                        self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
+                    self.work.push_back(Work::Compare { head, prefix });
                 }
                 StateAnswer::Heads { known, unknown } => {
                     ensure!(known.len() + unknown.len() <= 128, "too many clock answers");
@@ -325,8 +350,11 @@ impl Comparison {
         for _ in 0..PAGE_WORK {
             let Some(work) = self.work.pop_front() else { break };
             let item = match work {
-                Work::Compare(known) => {
-                    let local = self.snapshot.head(known.bounds.clone()).await?;
+                Work::Compare { head: known, prefix } => {
+                    let mut local = self.snapshot.head(known.bounds.clone()).await?;
+                    // The answering peer's topology may differ. Continue from
+                    // the responder prefix retained with this question.
+                    local.prefix = prefix;
                     if local.digest == known.digest {
                         Some(StateItem::Equal(known.bounds))
                     } else if local.digest.count() <= LEAF_PAGE as i64 {
@@ -338,13 +366,8 @@ impl Comparison {
                     }
                 }
                 Work::Offer(head) => {
-                    if head.digest.count() > LEAF_PAGE as i64 {
-                        self.work.push_front(Work::Expand(head));
-                        None
-                    } else {
-                        self.summaries.insert(range_id(&head.bounds), head.bounds.clone());
-                        Some(StateItem::Summary(head))
-                    }
+                    self.summaries.insert(range_id(&head.bounds), head.prefix.clone());
+                    Some(StateItem::Summary(head))
                 }
                 Work::Expand(head) => {
                     // Descend locally within the work budget, preserving cached
@@ -359,7 +382,7 @@ impl Comparison {
                     } else {
                         for head in refined {
                             self.work.push_back(match self.hints.remove(&range_id(&head.bounds)) {
-                                Some(hint) => Work::Compare(hint),
+                                Some(hint) => Work::Compare { head: hint, prefix: head.prefix },
                                 None => Work::Offer(head),
                             });
                         }

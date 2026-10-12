@@ -690,3 +690,61 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
     assert!(trace.items(Some(query.query_id())).len() >= 2, "the query must obtain a fresh comparison");
     Ok(())
 }
+
+#[tokio::test]
+async fn expiring_an_unfinished_query_releases_other_queries_and_its_snapshot() -> Result<()> {
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let pet = trx.create(&Pet { name: "Rex".into(), age: "1".into() }).await?.read()?;
+    trx.commit().await?;
+    let _connection = LocalProcessConnection::new(&server, &client).await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let established = reader.query_wait::<PetView>("true").await?;
+    established.wait_durable_answered().await?;
+    let model = writer.resolve_model_id::<Pet>().await?;
+    let response = client
+        .request(
+            server.id,
+            &DEFAULT_CONTEXT,
+            proto::NodeRequestBody::SubscribeQuery {
+                query_id: proto::QueryId::new(),
+                version: 1,
+                selection: ankql::ast::Predicate::MemberOf(model).into(),
+                known_state: None,
+            },
+        )
+        .await?;
+    let NodeResponseBody::QuerySubscribed { state, .. } = response else { panic!("{response:?}") };
+    let comparison = state.page.comparison;
+    let trx = writer.begin();
+    pet.edit(&trx)?.age()?.replace("2")?;
+    trx.commit().await?;
+    assert_eq!(established.peek()[0].age()?, "1", "another comparison holds live delivery");
+    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
+    wait_for(|| established.peek()[0].age().unwrap() == "2").await;
+    assert!(matches!(
+        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::CompareTree { comparison, answers: vec![] }).await?,
+        NodeResponseBody::ComparisonUnavailable { .. }
+    ));
+    let response = client
+        .request(
+            server.id,
+            &DEFAULT_CONTEXT,
+            proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::MemberOf(model).into(), known_state: None },
+        )
+        .await?;
+    let NodeResponseBody::Fetch(state) = response else { panic!("{response:?}") };
+    ankurah::core::test_helpers::expire_comparison(&server, client.id, state.page.comparison).await?;
+    assert!(matches!(
+        client
+            .request(
+                server.id,
+                &DEFAULT_CONTEXT,
+                proto::NodeRequestBody::CompareTree { comparison: state.page.comparison, answers: vec![] }
+            )
+            .await?,
+        NodeResponseBody::ComparisonUnavailable { .. }
+    ));
+    Ok(())
+}

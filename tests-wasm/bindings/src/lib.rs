@@ -10,6 +10,8 @@ use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
+mod digest_state;
+
 // Re-export signal types for testing
 pub use ankurah_signals::{JsValueCalculated, JsValueMut, JsValueRead};
 

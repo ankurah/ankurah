@@ -84,6 +84,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // A selection update must not reinstall the query between reactor and credential removal.
         // Reactor removal is synchronous and does not call back into this handler.
         let mut queries = self.queries.lock().await;
+        if let Some(peer) = node.peer_connections.get(&self.peer_id) {
+            peer.comparisons.invalidate_query(query_id);
+        }
         let removed = self.subscription.remove_predicate(query_id);
         queries.remove(&query_id);
         self.delivery.lock().unwrap().release(node, self.peer_id, query_id);

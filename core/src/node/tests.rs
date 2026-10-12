@@ -7,6 +7,55 @@ use ankurah_signals::Subscribe;
 
 mod commit;
 
+#[tokio::test]
+async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> anyhow::Result<()> {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let peer = proto::EntityId::random();
+    let (sent, _messages) = std::sync::mpsc::channel();
+    node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await?;
+    let model = ModelId::System(proto::SystemModel::Model);
+    let query_id = proto::QueryId::new();
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    storage.hold_fetch.lock().unwrap().insert(model, (entered, release_rx));
+    let subscribe = node.handle_request(
+        &DEFAULT_CONTEXT,
+        proto::NodeRequest {
+            id: proto::RequestId::new(),
+            from: peer,
+            to: node.id,
+            body: proto::NodeRequestBody::SubscribeQuery {
+                query_id,
+                version: 1,
+                selection: ankql::ast::Predicate::MemberOf(model).into(),
+                known_state: None,
+            },
+        },
+    );
+    tokio::pin!(subscribe);
+    assert!(futures::poll!(&mut subscribe).is_pending());
+    entered_rx.await?;
+    let unsubscribe = node.handle_message(proto::NodeMessage::UnsubscribeQuery { from: peer, query_id });
+    tokio::pin!(unsubscribe);
+    assert!(futures::poll!(&mut unsubscribe).is_pending());
+
+    release.send(()).unwrap();
+    let proto::NodeResponseBody::QuerySubscribed { state, .. } = subscribe.await? else { panic!("expected comparison") };
+    let comparison = state.page.comparison;
+    let connection = node.peer_connections.get(&peer).unwrap();
+    let session = Arc::downgrade(&connection.comparisons.get(&comparison).unwrap());
+    unsubscribe.await?;
+    assert!(session.upgrade().is_none(), "unsubscribe must release the frozen snapshot and its timer");
+    assert!(matches!(
+        node.compare_tree(peer, proto::RequestId::new(), comparison, vec![], vec![]).await?,
+        proto::NodeResponseBody::ComparisonUnavailable { .. }
+    ));
+    Ok(())
+}
+
 #[derive(Clone)]
 struct ClosedSender(proto::EntityId);
 

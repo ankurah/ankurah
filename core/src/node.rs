@@ -478,7 +478,6 @@ where
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
                 // Remove predicate from the peer's subscription
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.comparisons.invalidate_query(query_id);
                     peer_state.subscription_handler.remove_predicate(self, query_id).await?;
                 }
             }
@@ -569,6 +568,12 @@ where
                     anyhow::ensure!(session.permits(&credentials), "comparison credentials changed");
                     if outcome == proto::ComparisonOutcome::Applied {
                         anyhow::ensure!(session.complete().await, "comparison has unanswered work");
+                    }
+                    // Expiry or unsubscribe may have removed the session while
+                    // we waited. Only the owner of the live session can finish
+                    // its handoff; a stale Arc cannot acknowledge activation.
+                    if peer.comparisons.remove(&comparison).is_none() {
+                        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison });
                     }
                     if let Some((query, version)) = session.query {
                         peer.subscription_handler.finish_comparison(self, query, version, comparison, outcome).await?;

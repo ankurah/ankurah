@@ -6,6 +6,15 @@ use crate::schema::registration::RegistrationError;
 
 pub use crate::node::handler::commit_transaction;
 
+/// Drive the same cleanup as the comparison expiry timer, without a real-time wait.
+pub async fn expire_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, comparison: proto::ComparisonId) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    node.expire_comparison(peer, comparison).await
+}
+
 /// Bind `schema`'s cells from a hand-built definition under the node's
 /// current epoch, bypassing registration and the catalog: deterministic
 /// harnesses seed identical ids on every node this way.
