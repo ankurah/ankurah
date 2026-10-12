@@ -7,6 +7,7 @@ use crate::map::{MapAccess, MapName};
 use crate::request::{prefix_range, ReusePlan};
 use crate::{AddressRange, Digest, DigestGroup, KeyCodec, LeafRow, NodePrefix, Ristretto255, TreeError, TreeRequest, TreeTransaction};
 use ankurah_core_types::{IndexDirection, KeySpec, PropertyId};
+use serde::{Deserialize, Serialize};
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 
@@ -41,6 +42,17 @@ pub struct TreeHead<G: DigestGroup = Ristretto255> {
     pub bounds: AddressRange,
     /// Digest of precisely the leaves within these bounds.
     pub digest: Digest<G>,
+}
+
+impl<G: DigestGroup> Serialize for TreeHead<G> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> { self.to_bytes().serialize(serializer) }
+}
+
+impl<'de, G: DigestGroup> Deserialize<'de> for TreeHead<G> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let bytes = Vec::<u8>::deserialize(deserializer)?;
+        Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
+    }
 }
 impl<G: DigestGroup> TreeHead<G> {
     /// Encode a versioned head for a peer, independent of a local snapshot.

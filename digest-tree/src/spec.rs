@@ -4,7 +4,7 @@ use std::hash::{Hash, Hasher};
 
 use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_core_types::{KeySpec, PropertyId, PropertyPath};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// What defines a tree: the leaves it admits and the order it keeps them in.
 ///
@@ -72,6 +72,18 @@ use serde::Serialize;
 pub struct TreeSpec {
     key_spec: KeySpec<PropertyId>,
     predicate: Predicate<Resolved>,
+}
+
+impl<'de> Deserialize<'de> for TreeSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Fields {
+            key_spec: KeySpec<PropertyId>,
+            predicate: Predicate<Resolved>,
+        }
+        let fields = Fields::deserialize(deserializer)?;
+        Ok(Self::new(fields.key_spec, fields.predicate))
+    }
 }
 
 impl TreeSpec {

@@ -10,6 +10,7 @@
 use std::ops::Bound;
 
 use ankurah_core_types::EntityId;
+use serde::{Deserialize, Serialize};
 
 use crate::digest::{Digest, DigestGroup, HeadHash, LeafElement, Ristretto255};
 
@@ -67,7 +68,7 @@ pub fn leaf_address(key: &[u8], entity_id: EntityId) -> Vec<u8> {
 }
 
 /// A range of leaf addresses: the rows a read asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AddressRange {
     /// The lower bound.
     pub start: Bound<Vec<u8>>,

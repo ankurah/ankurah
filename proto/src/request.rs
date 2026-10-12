@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventFragment,
-    EventId, RegisterModel, RegisteredModel, StateFragment,
+    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, ComparisonId,
+    ComparisonOutcome, ComparisonReply, EntityState, EventFragment, EventId, KnownState, RegisterModel, RegisteredModel, StateAnswer,
+    StateFragment, StateReply,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -30,8 +31,8 @@ pub struct NodeRequest {
     pub body: NodeRequestBody,
 }
 
-/// Entity with known head for lineage attestation
-#[derive(Serialize, Deserialize, Clone, Debug)]
+/// Entity with an actual known clock, supplied selectively during state comparison.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct KnownEntity {
     pub entity_id: EntityId,
     pub head: Clock,
@@ -99,15 +100,15 @@ pub struct CausalAssertionFragment {
 /// Content for entity initialization - either bridge, state, or attested state
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DeltaContent {
-    /// Entity not in known_matches; send full state snapshot
+    /// Full entity state when a suitable event bridge is unavailable.
     StateSnapshot { state: StateFragment },
-    /// Entity present in known matches with a small event gap
+    /// Events connecting a supplied entity clock to the repair target.
     EventBridge { events: Vec<EventFragment> },
-    /// Entity present in known matches with a large event gap; send state + causal assertion
+    /// State with a causal assertion relative to the supplied entity clock.
     StateAndRelation { state: StateFragment, relation: CausalAssertionFragment },
 }
 
-/// Entity initialization data returned in QuerySubscribed and Fetch
+/// Entity repair data carried by a state comparison.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
@@ -131,13 +132,14 @@ pub enum NodeRequestBody {
     },
     Fetch {
         selection: ast::Selection<ast::Resolved>,
-        known_matches: Vec<KnownEntity>,
+        /// None means no summary was supplied, not that the node holds no entities.
+        known_state: Option<KnownState>,
     },
     SubscribeQuery {
         query_id: QueryId,
         selection: ast::Selection<ast::Resolved>,
         version: u32,
-        known_matches: Vec<KnownEntity>,
+        known_state: Option<KnownState>,
     },
     /// Register one model's schema: an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
@@ -150,6 +152,19 @@ pub enum NodeRequestBody {
     /// collections are not writable any other way.
     RegisterSchema {
         model: RegisterModel,
+    },
+    /// Continue one comparison with a batch of answers at any requested depths.
+    /// Follow-ups are sequential; empty answers resume deferred responder work.
+    /// The responder chooses its own byte/work limits and retains pending work.
+    CompareTree {
+        comparison: ComparisonId,
+        answers: Vec<StateAnswer>,
+    },
+    /// Acknowledge application or abandon a comparison, releasing its snapshots.
+    /// The responder acknowledges with Success; closing is idempotent for this peer.
+    CloseComparison {
+        comparison: ComparisonId,
+        outcome: ComparisonOutcome,
     },
 }
 
@@ -168,13 +183,15 @@ pub enum NodeResponseBody {
     CommitComplete {
         id: TransactionId,
     },
-    Fetch(Vec<EntityDelta>),
+    Fetch(StateReply),
     /// One outcome per requested identity, in request order.
     Get(Vec<GetResult>),
     GetEvents(Vec<Attested<Event>>),
     QuerySubscribed {
         query_id: QueryId,
-        deltas: Vec<EntityDelta>,
+        /// Subscription establishment and initial transfer completion are distinct.
+        /// Live delivery must preserve the handoff from this captured snapshot.
+        state: StateReply,
     },
     /// The resolved schema, with build ids echoed for descriptor binding.
     SchemaRegistered {
@@ -182,6 +199,12 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
+    TreeCompared(ComparisonReply),
+    /// The snapshot expired or was invalidated. Restart the original Fetch or
+    /// SubscribeQuery; previously received pages cannot complete a new comparison.
+    ComparisonUnavailable {
+        comparison: ComparisonId,
+    },
 }
 
 /// A known-ID read reports denial separately from absence, without returning denied state.
@@ -256,15 +279,17 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::GetEvents { event_ids } => {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
-            NodeRequestBody::Fetch { selection: query, known_matches } => {
-                write!(f, "Fetch {query} known:{}", known_matches.len())
+            NodeRequestBody::Fetch { selection: query, known_state } => {
+                write!(f, "Fetch {query} summaries:{}", known_state.as_ref().map_or(0, |state| state.heads.len()))
             }
-            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_matches } => {
-                write!(f, "Subscribe {query_id} {query} v{version} known:{}", known_matches.len())
+            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_state } => {
+                write!(f, "Subscribe {query_id} {query} v{version} summaries:{}", known_state.as_ref().map_or(0, |state| state.heads.len()))
             }
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
+            NodeRequestBody::CompareTree { comparison, answers } => write!(f, "CompareTree {comparison} answers:{}", answers.len()),
+            NodeRequestBody::CloseComparison { comparison, outcome } => write!(f, "CloseComparison {comparison} {outcome:?}"),
         }
     }
 }
@@ -272,8 +297,8 @@ impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
-            NodeResponseBody::Fetch(deltas) => {
-                write!(f, "Fetch [{}]", deltas.len()) // TODO display deltas
+            NodeResponseBody::Fetch(state) => {
+                write!(f, "Fetch {} items:{} {:?}", state.page.comparison, state.page.items.len(), state.page.progress)
             }
             NodeResponseBody::Get(states) => {
                 write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
@@ -281,12 +306,18 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
+            NodeResponseBody::QuerySubscribed { query_id, state } => {
+                write!(f, "Subscribed {query_id} {} items:{} {:?}", state.page.comparison, state.page.items.len(), state.page.progress)
+            }
             NodeResponseBody::SchemaRegistered { model } => {
                 write!(f, "SchemaRegistered {} properties:{}", model.label, model.properties.len())
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
+            NodeResponseBody::TreeCompared(page) => {
+                write!(f, "TreeCompared {} items:{} {:?}", page.comparison, page.items.len(), page.progress)
+            }
+            NodeResponseBody::ComparisonUnavailable { comparison } => write!(f, "ComparisonUnavailable {comparison}"),
         }
     }
 }
