@@ -1,0 +1,41 @@
+[package]
+name          = "ankurah-digest-tree"
+description   = "Digest trees for Ankurah: additive digests over leaves, the tree spec, prefix addressing, and the memory-resident tree"
+version       = "0.10.0"
+edition       = "2021"
+license       = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-digest-tree"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
+
+[dependencies]
+ankql              = { path = "../ankql", version = "=0.10.0" }
+ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
+async-trait        = "0.1"
+bincode            = "1.3.3"
+# std, the one default feature, builds for wasm32 and lets x86 builds choose
+# their SIMD implementation at run time.
+blake3 = "1.8.2"
+# No default features: the digests need neither basepoint tables nor zeroizing.
+curve25519-dalek = { version = "4.1.3", default-features = false }
+serde            = { version = "1.0", features = ["derive"] }
+sha2             = "0.10.8"
+thiserror        = "2"
+
+[dev-dependencies]
+# The API tests write their Selections with `selection!`.
+ankurah-derive = { path = "../derive", version = "=0.10.0" }
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+# The tests draw random prefixes, addresses and orders from seeded generators.
+rand = { version = "0.8", features = ["small_rng"] }
+# The tree's tests await its transactions' operations.
+tokio = { version = "1.40", default-features = false, features = ["rt", "macros"] }
+
+# criterion's default rayon feature refuses wasm32, and the benchmarks run natively.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = "0.5"
+
+# harness = false because criterion provides its own harness.
+[[bench]]
+name    = "digest"
+harness = false
