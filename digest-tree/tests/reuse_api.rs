@@ -22,7 +22,10 @@ async fn one_tree_serves_its_own_selection_whole_and_a_narrower_one_as_a_span() 
         let scope = tx.scope(&request, &codec()).await.unwrap();
         assert_eq!(tx.count(&scope).await.unwrap(), ids.len() as u64);
         let page = tx.page(&scope, &codec(), None, 20).await.unwrap();
-        assert_eq!(page.leaves.iter().map(|row| row.entity_id).collect::<Vec<_>>(), ids.iter().copied().map(common::entity).collect::<Vec<_>>());
+        assert_eq!(
+            page.leaves.iter().map(|row| row.entity_id).collect::<Vec<_>>(),
+            ids.iter().copied().map(common::entity).collect::<Vec<_>>()
+        );
         let expected: Digest = page.leaves.iter().map(|row| Digest::from(Leaf::new(&row.key, row.entity_id, row.head).element())).sum();
         assert_eq!(tx.digest(&scope).await.unwrap(), expected);
         for head in tx.heads(&scope).await.unwrap() {
@@ -51,7 +54,9 @@ async fn limits_and_reverse_order_use_scopes_of_the_same_tree() {
             let page = tx.page(&scope, &codec(), cursor.as_ref(), 1).await.unwrap();
             found.extend(page.leaves.iter().map(|row| row.entity_id));
             cursor = page.next;
-            if cursor.is_none() { break; }
+            if cursor.is_none() {
+                break;
+            }
         }
         assert_eq!(found, ids.into_iter().map(common::entity).collect::<Vec<_>>());
     }

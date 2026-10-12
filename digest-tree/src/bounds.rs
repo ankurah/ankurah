@@ -36,6 +36,42 @@ pub(crate) fn intersect(a: &AddressRange, b: &AddressRange) -> Option<AddressRan
     let range = AddressRange::new(start.clone(), end.clone());
     (!empty(&range)).then_some(range)
 }
+
+/// The portions of `range` outside a sorted, disjoint set of covered ranges.
+/// Keeping these gaps matters when the other peer has leaves absent locally.
+pub(crate) fn gaps(range: &AddressRange, covered: &[AddressRange]) -> Vec<AddressRange> {
+    let mut start = range.start.clone();
+    let mut gaps = Vec::new();
+    for covered in covered {
+        let Some(covered) = intersect(range, covered) else { continue };
+        let end = match covered.start {
+            Bound::Included(value) => Bound::Excluded(value),
+            Bound::Excluded(value) => Bound::Included(value),
+            Bound::Unbounded => {
+                start = match covered.end {
+                    Bound::Included(value) => Bound::Excluded(value),
+                    Bound::Excluded(value) => Bound::Included(value),
+                    Bound::Unbounded => return gaps,
+                };
+                continue;
+            }
+        };
+        let gap = AddressRange::new(start, end);
+        if !empty(&gap) {
+            gaps.push(gap);
+        }
+        start = match covered.end {
+            Bound::Included(value) => Bound::Excluded(value),
+            Bound::Excluded(value) => Bound::Included(value),
+            Bound::Unbounded => return gaps,
+        };
+    }
+    let tail = AddressRange::new(start, range.end.clone());
+    if !empty(&tail) {
+        gaps.push(tail);
+    }
+    gaps
+}
 pub(crate) fn subset(a: &AddressRange, b: &AddressRange) -> bool {
     empty(a) || (lower_cmp(&a.start, &b.start).is_ge() && upper_cmp(&a.end, &b.end).is_le())
 }
@@ -66,4 +102,40 @@ pub(crate) fn normalize(mut ranges: Vec<AddressRange>) -> Vec<AddressRange> {
         out.push(range);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gaps_partition_each_kind_of_boundary() {
+        let mut endpoints = vec![Bound::Unbounded];
+        for value in [vec![], vec![1], vec![1, 0], vec![2]] {
+            endpoints.push(Bound::Included(value.clone()));
+            endpoints.push(Bound::Excluded(value));
+        }
+        let ranges: Vec<_> = endpoints
+            .iter()
+            .flat_map(|start| endpoints.iter().map(move |end| AddressRange::new(start.clone(), end.clone())))
+            .filter(|range| !empty(range))
+            .collect();
+        let samples = [vec![], vec![0], vec![1], vec![1, 0], vec![1, 0, 0], vec![1, 1], vec![2], vec![2, 0], vec![255]];
+        for range in &ranges {
+            for a in &ranges {
+                for b in &ranges {
+                    let covered = normalize(vec![a.clone(), b.clone()]);
+                    let missing = gaps(range, &covered);
+                    for address in &samples {
+                        let uncovered = range.contains(address) && !covered.iter().any(|part| part.contains(address));
+                        assert_eq!(
+                            missing.iter().filter(|part| part.contains(address)).count(),
+                            usize::from(uncovered),
+                            "range={range:?}, covered={covered:?}, address={address:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

@@ -50,8 +50,8 @@
 //! - [`rows`]: the rows a tree keeps, the [`LeafRow`] per leaf and the
 //!   [`NodeRow`] per tree node, with the [leaf address](leaf_address) they are
 //!   filed under.
-//! - [`map`]: the [`MapTransaction`], a transaction over the three maps a
-//!   [`MapName`] names, with its consistent reads and conditional writes.
+//! - [`map`]: [`MapAccess`] to the three maps a [`MapName`] names, with
+//!   consistent reads and conditional writes; [`MapTransaction`] owns commit.
 //! - [`layout`]: the byte layout of every key and value in the maps.
 //! - [`memory`]: the [`MemoryMaps`] that hold a tree in memory, and their
 //!   [`MemoryTransaction`].
@@ -67,6 +67,8 @@
 #![deny(missing_docs)]
 
 mod bounds;
+#[cfg(test)]
+mod cost_tests;
 pub mod digest;
 pub mod error;
 pub mod key;
@@ -85,7 +87,7 @@ pub use digest::{Digest, DigestGroup, HeadHash, Leaf, LeafElement, LtHash16, Ris
 pub use error::TreeError;
 pub use key::{CanonicalCodec, KeyCodec, PropertyTypes};
 pub use maintain::{Audit, LeafChange, LeafData, BUCKET_CAPACITY};
-pub use map::{ByteBounds, MapName, MapTransaction};
+pub use map::{ByteBounds, MapAccess, MapName, MapTransaction};
 pub use memory::{MemoryMaps, MemoryTransaction};
 pub use prefix::{NodePrefix, NodePrefixError};
 pub use request::{TreeMatch, TreeRequest};

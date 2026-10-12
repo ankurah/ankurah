@@ -15,7 +15,7 @@
 //!   ([`NodePrefix::to_bytes`]) and holds the digest in the row codec
 //!   ([`Digest::ROW_LEN`] bytes); each of its delta rows is keyed by the
 //!   prefix's encoding, the byte [`DELTA_SEPARATOR`] and a suffix unique to the
-//!   append ([`MapTransaction::append`](crate::MapTransaction::append)), and
+//!   append ([`MapAccess::append`](crate::MapAccess::append)), and
 //!   holds a digest delta in the row codec. The encoding is prefix-ordered, so
 //!   a subtree is one range scan, but a descendant's encoding may extend an
 //!   ancestor's bytes, so a suffix alone after the prefix could make a deeper

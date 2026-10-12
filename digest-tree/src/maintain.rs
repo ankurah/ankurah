@@ -7,7 +7,7 @@ use ankurah_core_types::EntityId;
 
 use crate::digest::{Digest, DigestGroup, HeadHash, Leaf};
 use crate::layout;
-use crate::map::{MapName, MapTransaction};
+use crate::map::{MapAccess, MapName};
 use crate::{AddressRange, CanonicalCodec, KeyCodec, LeafRow, NodePrefix, NodeRow, TreeError, TreeTransaction};
 
 /// The target maximum number of leaves in a terminal bucket.
@@ -57,15 +57,15 @@ pub struct Audit {
     pub nodes: usize,
 }
 
-impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
+impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Apply a leaf change and maintain its lookup and every affected summary.
-    /// A failed operation poisons the transaction, so earlier buffered writes
-    /// cannot accidentally be committed after an error.
+    /// A failed or cancelled operation poisons the transaction, so partial
+    /// buffered writes cannot accidentally be committed.
     pub async fn apply_change(&mut self, change: LeafChange) -> Result<(), TreeError> {
-        let result = self.change_leaf(change).await;
-        self.failed |= result.is_err();
         self.generation += 1;
-        result
+        let mut mutation = self.mutation();
+        let result = mutation.change_leaf(change).await;
+        mutation.finish(result)
     }
 
     async fn change_leaf(&mut self, change: LeafChange) -> Result<(), TreeError> {
@@ -75,12 +75,16 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
                 CanonicalCodec.split(spec.key_spec(), &leaf.key)?;
             }
         }
+        let mut before_value = None;
         let before = match &change.before {
             Some(expected) => {
-                let row = self.leaf(&expected.key, expected.entity_id).await?.ok_or(TreeError::Conflict)?;
+                let address = crate::leaf_address(&expected.key, expected.entity_id);
+                let value = self.transaction.get(MapName::Leaves, &address).await?.ok_or(TreeError::Conflict)?;
+                let row = layout::leaf_row::<G>(&address, &value)?;
                 if row.head != expected.head {
                     return Err(TreeError::Conflict);
                 }
+                before_value = Some(value);
                 Some(row)
             }
             None => None,
@@ -88,7 +92,7 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         let after = change.after.as_ref().map(LeafData::row::<G>);
         if let Some(row) = &after {
             let expected = before.as_ref().filter(|old| old.address() == row.address());
-            if self.leaf(&row.key, row.entity_id).await?.as_ref() != expected {
+            if expected.is_none() && self.leaf(&row.key, row.entity_id).await?.is_some() {
                 return Err(TreeError::Conflict);
             }
         }
@@ -104,6 +108,19 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
                 return Err(TreeError::Audit("tree rows exist without a root summary"));
             }
             self.put_node_base(&root, None, NodeRow { digest: Digest::empty() }).await?;
+        }
+        if let Some((old, new)) = before.as_ref().zip(after.as_ref()).filter(|(a, b)| a.address() == b.address()) {
+            // Changing only the head preserves both the lookup and topology.
+            // Encode the common difference once for all ancestors.
+            let address = new.address();
+            let path = self.path(&address).await?;
+            self.transaction.put_if(MapName::Leaves, &address, before_value.as_deref(), &layout::leaf_value(new)).await?;
+            let delta = layout::digest_value(&(Digest::from(new.element) - Digest::from(old.element)));
+            for prefix in path {
+                let (key_prefix, _) = layout::delta_key_bounds(&prefix);
+                self.transaction.append(MapName::Nodes, &key_prefix, &delta).await?;
+            }
+            return Ok(());
         }
         // A move may share some ancestors. Combine contributions before
         // writing so each affected node receives one delta.
@@ -130,9 +147,6 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
                 self.append_node_delta(&prefix, delta).await?;
             }
         }
-        if before.as_ref().zip(after.as_ref()).is_some_and(|(a, b)| a.address() == b.address()) {
-            return Ok(());
-        }
         // Ancestors precede descendants. A rebuilt ancestor may have removed
         // old descendants; skip those when reaching them.
         for prefix in affected {
@@ -140,19 +154,56 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
                 continue;
             }
             let children = self.child_prefixes(&prefix).await?;
-            let sample = self.leaves(&AddressRange::under(&prefix), BUCKET_CAPACITY + 1).await?;
+            let removed = before.as_ref().is_some_and(|row| prefix.contains_address(&row.address()));
+            let added = after.as_ref().is_some_and(|row| prefix.contains_address(&row.address()));
             let uncovered = after.as_ref().is_some_and(|row| {
                 prefix.contains_address(&row.address())
                     && !children.is_empty()
                     && !children.iter().any(|p| p.contains_address(&row.address()))
             });
-            let split = children.is_empty() && sample.len() > BUCKET_CAPACITY;
-            let merge = !children.is_empty() && sample.len() <= BUCKET_CAPACITY / 2;
-            if split || merge || uncovered {
-                self.rebuild_subtree(&prefix).await?;
+            if uncovered {
+                self.insert_branch(&prefix, &children, after.as_ref().expect("the insertion is uncovered")).await?;
+            } else if children.is_empty() && added && !removed {
+                let sample = self.leaves(&AddressRange::under(&prefix), BUCKET_CAPACITY + 1).await?;
+                if sample.len() > BUCKET_CAPACITY {
+                    self.rebuild_subtree(&prefix).await?;
+                }
+            } else if !children.is_empty() && removed && !added {
+                let sample = self.leaves(&AddressRange::under(&prefix), BUCKET_CAPACITY / 2 + 1).await?;
+                if sample.len() <= BUCKET_CAPACITY / 2 {
+                    self.rebuild_subtree(&prefix).await?;
+                }
             }
         }
         Ok(())
+    }
+
+    /// Splice two branches above the existing children. Prefix addresses
+    /// already give the old descendants their new parent; their rows stay put.
+    async fn insert_branch(&mut self, parent: &NodePrefix, children: &[NodePrefix], leaf: &LeafRow<G>) -> Result<(), TreeError> {
+        self.transaction.change_structure();
+        let address = leaf.address();
+        let child = &children[0];
+        let depth = (parent.bit_len()..child.bit_len())
+            .find(|&bit| {
+                let value = address.get((bit / 8) as usize).map(|byte| byte & (0x80 >> (bit % 8)) != 0);
+                value != Some(child.bit(bit))
+            })
+            .ok_or(TreeError::Audit("new branch overlaps an existing child"))?;
+        if depth as usize >= address.len() * 8 {
+            return Err(TreeError::InvalidKey("leaf addresses must be prefix-free"));
+        }
+        let added = NodePrefix::of(&address, depth + 1);
+        let retained = NodePrefix::of(&address, depth).child(child.bit(depth));
+        if !children.iter().all(|child| retained.contains(child)) {
+            return Err(TreeError::Audit("compressed children do not share one branch"));
+        }
+        let contribution = Digest::from(leaf.element);
+        // The parent's pending delta already includes the new leaf. Its
+        // other contribution is exactly the retained branch's summary.
+        let digest = self.node(parent).await?.ok_or_else(|| TreeError::IncompleteNode(parent.clone()))?.digest;
+        self.put_node_base(&retained, None, NodeRow { digest: digest.checked_sub(contribution)? }).await?;
+        self.put_node_base(&added, None, NodeRow { digest: contribution }).await
     }
 
     async fn path(&mut self, address: &[u8]) -> Result<Vec<NodePrefix>, TreeError> {
@@ -174,34 +225,47 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         loop {
             let page = self.leaves(&remaining, 1024).await?;
             let done = page.len() < 1024;
-            if let Some(last) = page.last() { remaining = remaining.after(&last.address()); }
+            if let Some(last) = page.last() {
+                remaining = remaining.after(&last.address());
+            }
             rows.extend(page);
-            if done { return Ok(rows); }
+            if done {
+                return Ok(rows);
+            }
         }
     }
 
     /// Replace the entire tree with these already-admitted leaves. Duplicate
-    /// addresses are rejected. The replacement is atomic at commit.
+    /// addresses are rejected. The replacement is atomic at commit; failure
+    /// or cancellation prevents this transaction from committing.
     pub async fn build(&mut self, leaves: impl IntoIterator<Item = LeafData>) -> Result<(), TreeError> {
-        let result = self.build_inner(leaves).await;
-        self.failed |= result.is_err();
         self.generation += 1;
-        result
+        let mut mutation = self.mutation();
+        let result = mutation.build_inner(leaves).await;
+        mutation.finish(result)
     }
 
     async fn build_inner(&mut self, leaves: impl IntoIterator<Item = LeafData>) -> Result<(), TreeError> {
         self.transaction.change_structure();
         let mut rows = BTreeMap::new();
         for leaf in leaves {
-            if let Some(spec) = &self.spec { CanonicalCodec.split(spec.key_spec(), &leaf.key)?; }
+            if let Some(spec) = &self.spec {
+                CanonicalCodec.split(spec.key_spec(), &leaf.key)?;
+            }
             let row = leaf.row::<G>();
-            if rows.insert(row.address(), row).is_some() { return Err(TreeError::DuplicateLeaf); }
+            if rows.insert(row.address(), row).is_some() {
+                return Err(TreeError::DuplicateLeaf);
+            }
         }
         for map in [MapName::Leaves, MapName::Lookup, MapName::Nodes] {
             let entries = self.transaction.scan(map, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await?;
-            for (key, value) in entries { self.transaction.delete_if(map, &key, &value).await?; }
+            for (key, value) in entries {
+                self.transaction.delete_if(map, &key, &value).await?;
+            }
         }
-        for row in rows.into_values() { self.put_leaf(row, None).await?; }
+        for row in rows.into_values() {
+            self.put_leaf(row, None).await?;
+        }
         self.rebuild_subtree(&NodePrefix::root()).await
     }
 
@@ -213,15 +277,21 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         let leaves = self.all_leaves(&AddressRange::under(prefix)).await?;
         let start = prefix.to_bytes();
         let end = prefix.subtree_key_end();
-        let entries = self.transaction.scan(MapName::Nodes,
-            (Bound::Included(&start), end.as_deref().map_or(Bound::Unbounded, Bound::Excluded)), usize::MAX).await?;
-        for (key, value) in entries { self.transaction.delete_if(MapName::Nodes, &key, &value).await?; }
+        let entries = self
+            .transaction
+            .scan(MapName::Nodes, (Bound::Included(&start), end.as_deref().map_or(Bound::Unbounded, Bound::Excluded)), usize::MAX)
+            .await?;
+        for (key, value) in entries {
+            self.transaction.delete_if(MapName::Nodes, &key, &value).await?;
+        }
         let mut pending = vec![(prefix.clone(), 0, leaves.len())];
         while let Some((prefix, from, to)) = pending.pop() {
             let rows = &leaves[from..to];
             let digest = rows.iter().map(|row| row.element).map(Digest::from).sum();
             self.put_node_base(&prefix, None, NodeRow { digest }).await?;
-            if rows.len() <= BUCKET_CAPACITY { continue; }
+            if rows.len() <= BUCKET_CAPACITY {
+                continue;
+            }
             let first = rows.first().unwrap().address();
             let last = rows.last().unwrap().address();
             let common = first.iter().zip(&last).take_while(|(a, b)| a == b).count();
@@ -245,7 +315,9 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         let leaves = self.all_leaves(&AddressRange::all()).await?;
         let mut lookup: BTreeMap<EntityId, BTreeSet<Vec<u8>>> = BTreeMap::new();
         for row in &leaves {
-            if let Some(spec) = &self.spec { CanonicalCodec.split(spec.key_spec(), &row.key)?; }
+            if let Some(spec) = &self.spec {
+                CanonicalCodec.split(spec.key_spec(), &row.key)?;
+            }
             if row.element != Leaf::new(&row.key, row.entity_id, row.head).element() {
                 return Err(TreeError::Audit("leaf element differs from its inputs"));
             }
@@ -273,7 +345,9 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
             let node = self.node(prefix).await?.ok_or(TreeError::Audit("missing node"))?;
             let beneath: Vec<_> = leaves.iter().filter(|row| prefix.contains_address(&row.address())).collect();
             let expected: Digest<G> = beneath.iter().map(|row| Digest::from(row.element)).sum();
-            if node.digest != expected { return Err(TreeError::Audit("summary differs from leaves")); }
+            if node.digest != expected {
+                return Err(TreeError::Audit("summary differs from leaves"));
+            }
             let children = self.children(prefix).await?;
             if !children.is_empty() && beneath.iter().any(|row| !children.iter().any(|(p, _)| p.contains_address(&row.address()))) {
                 return Err(TreeError::Audit("children do not cover their parent's leaves"));
@@ -286,9 +360,9 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{DigestTree, Ristretto255, TreeSpec};
     use ankql::ast::Predicate;
     use ankurah_core_types::KeySpec;
-    use crate::{DigestTree, Ristretto255, TreeSpec};
 
     #[tokio::test]
     async fn audit_detects_each_kind_of_derived_data_corruption() {

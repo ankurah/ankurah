@@ -10,8 +10,10 @@ fn creation_policy_does_not_dictate_existing_tree_reuse() {
     assert_eq!(default.key_spec().keyparts.iter().map(|p| p.key).collect::<Vec<_>>(), [property("project")]);
     let request = TreeRequest::for_selection(&selection!("project = 'acme' AND foo > 7"), &types()).unwrap();
     assert_eq!(default.serves(&request), None);
-    let hinted = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property("project"), ValueType::String),
-        IndexKeyPart::asc(property("foo"), ValueType::I64)]), default.predicate().clone());
+    let hinted = TreeSpec::new(
+        KeySpec::new(vec![IndexKeyPart::asc(property("project"), ValueType::String), IndexKeyPart::asc(property("foo"), ValueType::I64)]),
+        default.predicate().clone(),
+    );
     assert_eq!(hinted.serves(&request), Some(TreeMatch::Span));
     for source in [selection!("project = 'acme' AND foo > 7"), selection!("project = 'acme' AND foo > 7 ORDER BY foo")] {
         let tree = TreeSpec::for_selection(&source, &types()).unwrap();
@@ -35,17 +37,22 @@ fn a_residual_must_hold_across_every_admission_branch() {
     let constant = TreeSpec::new(spec.key_spec().clone(), selection!("foo > 7 AND bar = 1").predicate);
     assert_eq!(constant.serves(&TreeRequest::for_selection(&selection!("foo > 10 AND bar = 1"), &types()).unwrap()), Some(TreeMatch::Span));
     // Empty requests require neither an admission proof nor a compatible order.
-    assert!(spec.serves(&TreeRequest::for_selection(&selection!("project = 'elsewhere' ORDER BY project LIMIT 0"), &types()).unwrap()).is_some());
+    assert!(spec
+        .serves(&TreeRequest::for_selection(&selection!("project = 'elsewhere' ORDER BY project LIMIT 0"), &types()).unwrap())
+        .is_some());
 }
 
 #[tokio::test]
 async fn id_bounds_extremes_and_default_order_are_exact() {
     let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
     let tree: DigestTree = DigestTree::new(spec);
-    let model: Vec<_> = [0, 1, 128, 255].into_iter().map(|n| LeafData {
-        key: vec![], entity_id: common::entity(n), head: HeadHash::of([[n; 32]]),
-    }).collect();
-    let mut build = tree.begin(); build.build(model.clone()).await.unwrap(); build.commit().await.unwrap();
+    let model: Vec<_> = [0, 1, 128, 255]
+        .into_iter()
+        .map(|n| LeafData { key: vec![], entity_id: common::entity(n), head: HeadHash::of([[n; 32]]) })
+        .collect();
+    let mut build = tree.begin();
+    build.build(model.clone()).await.unwrap();
+    build.commit().await.unwrap();
     for (operator, value, expected) in [
         (ComparisonOperator::GreaterThan, 255, vec![]),
         (ComparisonOperator::GreaterThanOrEqual, 255, vec![255]),
@@ -53,17 +60,26 @@ async fn id_bounds_extremes_and_default_order_are_exact() {
         (ComparisonOperator::LessThanOrEqual, 0, vec![0]),
         (ComparisonOperator::NotEqual, 255, vec![0, 1, 128]),
     ] {
-        let predicate = Predicate::Comparison { left: Box::new(Expr::Path(PropertyPath::id())), operator,
-            right: Box::new(Expr::Literal(Value::EntityId(common::entity(value)))) };
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::Path(PropertyPath::id())),
+            operator,
+            right: Box::new(Expr::Literal(Value::EntityId(common::entity(value)))),
+        };
         let request = TreeRequest::for_selection(&Selection::from(predicate), &types()).unwrap();
-        let mut tx = tree.begin(); let scope = tx.scope(&request, &CanonicalCodec).await.unwrap();
+        let mut tx = tree.begin();
+        let scope = tx.scope(&request, &CanonicalCodec).await.unwrap();
         let page = tx.page(&scope, &CanonicalCodec, None, 10).await.unwrap();
-        assert_eq!(page.leaves.iter().map(|v| v.entity_id).collect::<Vec<_>>(), expected.into_iter().map(common::entity).collect::<Vec<_>>());
+        assert_eq!(
+            page.leaves.iter().map(|v| v.entity_id).collect::<Vec<_>>(),
+            expected.into_iter().map(common::entity).collect::<Vec<_>>()
+        );
     }
     for desc in [false, true] {
-        let selection = Selection { predicate: Predicate::True, order_by: desc.then(|| vec![OrderByItem {
-            path: PropertyPath::from(PropertyId::Id), direction: OrderDirection::Desc,
-        }]), limit: Some(2) };
+        let selection = Selection {
+            predicate: Predicate::True,
+            order_by: desc.then(|| vec![OrderByItem { path: PropertyPath::from(PropertyId::Id), direction: OrderDirection::Desc }]),
+            limit: Some(2),
+        };
         let mut tx = tree.begin();
         let scope = tx.scope(&TreeRequest::for_selection(&selection, &types()).unwrap(), &CanonicalCodec).await.unwrap();
         let first = tx.page(&scope, &CanonicalCodec, None, 1).await.unwrap();

@@ -84,12 +84,8 @@ impl TreeSpec {
     /// ORDER BY breaking ties. Entity identity is always the final address part.
     pub fn for_selection(selection: &Selection<Resolved>, types: &impl PropertyTypes) -> Result<Self, TreeError> {
         let request = TreeRequest::for_selection(selection, types)?;
-        let mut paths: Vec<_> = request
-            .types
-            .keys()
-            .filter(|p| p.property_id() != PropertyId::Id && request.pinned(p).is_some())
-            .cloned()
-            .collect();
+        let mut paths: Vec<_> =
+            request.types.keys().filter(|p| p.property_id() != PropertyId::Id && request.pinned(p).is_some()).cloned().collect();
         if request.limit.is_some() {
             for key in &request.order.keyparts {
                 let path = path(key);
@@ -175,7 +171,12 @@ impl TreeSpec {
                 // Once entity id is compared, later terms cannot break a tie.
             }
         }
-        Some(ReusePlan { kind: if whole { TreeMatch::Whole } else { TreeMatch::Span }, ranges: normalize(ranges), directions, id_direction })
+        Some(ReusePlan {
+            kind: if whole { TreeMatch::Whole } else { TreeMatch::Span },
+            ranges: normalize(ranges),
+            directions,
+            id_direction,
+        })
     }
 }
 
@@ -264,52 +265,91 @@ fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<PropertyPath, Value
         Predicate::False => Ok(vec![]),
         Predicate::And(a, b) => {
             let (a, b) = (clauses(a, types)?, clauses(b, types)?);
-            if a.len().saturating_mul(b.len()) > 256 { return Err(TreeError::UnsupportedSelection); }
+            if a.len().saturating_mul(b.len()) > 256 {
+                return Err(TreeError::UnsupportedSelection);
+            }
             let mut out = Vec::new();
-            for a in a { for b in &b {
-                let mut merged = a.clone();
-                merged.opaque.extend(b.opaque.iter().cloned());
-                let mut possible = true;
-                for (path, domain) in &b.fields {
-                    let domain = match merged.fields.get(path) { Some(previous) => intersect(previous, domain), None => Some(domain.clone()) };
-                    match domain { Some(domain) => { merged.fields.insert(path.clone(), domain); }, None => { possible = false; break; } }
+            for a in a {
+                for b in &b {
+                    let mut merged = a.clone();
+                    merged.opaque.extend(b.opaque.iter().cloned());
+                    let mut possible = true;
+                    for (path, domain) in &b.fields {
+                        let domain = match merged.fields.get(path) {
+                            Some(previous) => intersect(previous, domain),
+                            None => Some(domain.clone()),
+                        };
+                        match domain {
+                            Some(domain) => {
+                                merged.fields.insert(path.clone(), domain);
+                            }
+                            None => {
+                                possible = false;
+                                break;
+                            }
+                        }
+                    }
+                    if possible {
+                        out.push(merged);
+                    }
                 }
-                if possible { out.push(merged); }
-            } }
+            }
             Ok(out)
         }
         Predicate::Or(a, b) => {
             let mut out = clauses(a, types)?;
             out.extend(clauses(b, types)?);
-            if out.len() > 256 { return Err(TreeError::UnsupportedSelection); }
+            if out.len() > 256 {
+                return Err(TreeError::UnsupportedSelection);
+            }
             Ok(out)
         }
         Predicate::Comparison { left, operator, right } => {
             let (path, value, op) = match (left.as_ref(), right.as_ref()) {
                 (Expr::Path(path), value) => (path, value, operator.clone()),
-                (value, Expr::Path(path)) => (path, value, match operator {
-                    Op::GreaterThan => Op::LessThan, Op::GreaterThanOrEqual => Op::LessThanOrEqual,
-                    Op::LessThan => Op::GreaterThan, Op::LessThanOrEqual => Op::GreaterThanOrEqual,
-                    Op::Equal => Op::Equal, Op::NotEqual => Op::NotEqual, _ => return Ok(opaque(predicate)),
-                }),
+                (value, Expr::Path(path)) => (
+                    path,
+                    value,
+                    match operator {
+                        Op::GreaterThan => Op::LessThan,
+                        Op::GreaterThanOrEqual => Op::LessThanOrEqual,
+                        Op::LessThan => Op::GreaterThan,
+                        Op::LessThanOrEqual => Op::GreaterThanOrEqual,
+                        Op::Equal => Op::Equal,
+                        Op::NotEqual => Op::NotEqual,
+                        _ => return Ok(opaque(predicate)),
+                    },
+                ),
                 _ => return Ok(opaque(predicate)),
             };
             let part = part(path, *types.get(path).ok_or(TreeError::InvalidKey("unknown predicate type"))?);
-            let encode = |expr: &Expr<Resolved>| match expr { Expr::Literal(v) => encode_part(&part, Some(v)), _ => Err(TreeError::UnsupportedSelection) };
+            let encode = |expr: &Expr<Resolved>| match expr {
+                Expr::Literal(v) => encode_part(&part, Some(v)),
+                _ => Err(TreeError::UnsupportedSelection),
+            };
             let nonnull = Included(vec![1]);
             let domain = match (&op, value) {
                 (Op::In, Expr::ExprList(values)) => {
                     let mut out = Vec::new();
-                    for value in values { let bytes = encode(value)?; out.push(field(path, Included(bytes.clone()), Included(bytes))); }
-                    if out.len() > 256 { return Err(TreeError::UnsupportedSelection); }
+                    for value in values {
+                        let bytes = encode(value)?;
+                        out.push(field(path, Included(bytes.clone()), Included(bytes)));
+                    }
+                    if out.len() > 256 {
+                        return Err(TreeError::UnsupportedSelection);
+                    }
                     return Ok(out);
                 }
-                (Op::Between, Expr::ExprList(values)) if values.len() == 2 => AddressRange::new(Included(encode(&values[0])?), Included(encode(&values[1])?)),
+                (Op::Between, Expr::ExprList(values)) if values.len() == 2 => {
+                    AddressRange::new(Included(encode(&values[0])?), Included(encode(&values[1])?))
+                }
                 (_, Expr::Literal(_)) => {
                     let bytes = encode(value)?;
                     match op {
                         Op::Equal => AddressRange::new(Included(bytes.clone()), Included(bytes)),
-                        Op::NotEqual => return Ok(vec![field(path, nonnull, Excluded(bytes.clone())), field(path, Excluded(bytes), Unbounded)]),
+                        Op::NotEqual => {
+                            return Ok(vec![field(path, nonnull, Excluded(bytes.clone())), field(path, Excluded(bytes), Unbounded)])
+                        }
                         Op::GreaterThan => AddressRange::new(Excluded(bytes), Unbounded),
                         Op::GreaterThanOrEqual => AddressRange::new(Included(bytes), Unbounded),
                         Op::LessThan => AddressRange::new(nonnull, Excluded(bytes)),
@@ -319,7 +359,11 @@ fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<PropertyPath, Value
                 }
                 _ => return Ok(opaque(predicate)),
             };
-            if crate::bounds::empty(&domain) { Ok(vec![]) } else { Ok(vec![field(path, domain.start, domain.end)]) }
+            if crate::bounds::empty(&domain) {
+                Ok(vec![])
+            } else {
+                Ok(vec![field(path, domain.start, domain.end)])
+            }
         }
         Predicate::IsNull(expr) => match expr.as_ref() {
             Expr::Path(path) if *path == PropertyPath::id() => Ok(vec![]),
@@ -333,9 +377,15 @@ fn field(path: &PropertyPath, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Cla
     Clause { fields: BTreeMap::from([(path.clone(), AddressRange::new(start, end))]), opaque: BTreeSet::new() }
 }
 fn opaque(predicate: &Predicate<Resolved>) -> Vec<Clause> {
-    let normalized = ankql::selection::map_references::<Resolved, Resolved>(&Selection::from(predicate.clone()), &|p| {
-        let mut path = PropertyPath::from(p.property_id()); path.subpath = p.subpath.clone(); path
-    }, &|id| *id);
+    let normalized = ankql::selection::map_references::<Resolved, Resolved>(
+        &Selection::from(predicate.clone()),
+        &|p| {
+            let mut path = PropertyPath::from(p.property_id());
+            path.subpath = p.subpath.clone();
+            path
+        },
+        &|id| *id,
+    );
     vec![Clause { fields: BTreeMap::new(), opaque: BTreeSet::from([bincode::serialize(&normalized.predicate).unwrap()]) }]
 }
 fn collect_paths(predicate: &Predicate<Resolved>, out: &mut BTreeSet<PropertyPath>) {
@@ -356,14 +406,18 @@ fn collect_paths(predicate: &Predicate<Resolved>, out: &mut BTreeSet<PropertyPat
 
 fn collect_expr(expr: &Expr<Resolved>, out: &mut BTreeSet<PropertyPath>) {
     match expr {
-        Expr::Path(path) => { out.insert(path.clone()); }
+        Expr::Path(path) => {
+            out.insert(path.clone());
+        }
         Expr::Predicate(predicate) => collect_paths(predicate, out),
         Expr::InfixExpr { left, right, .. } => {
             collect_expr(left, out);
             collect_expr(right, out);
         }
         Expr::ExprList(values) => {
-            for value in values { collect_expr(value, out); }
+            for value in values {
+                collect_expr(value, out);
+            }
         }
         _ => {}
     }

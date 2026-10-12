@@ -76,10 +76,12 @@
 //! are an element, so only the audit catches a damaged LtHash16 row. Its digest
 //! rows are 2,057 bytes against ristretto255's 41.
 //!
-//! A change to a tree never decodes a tree node row. It decodes only the old
-//! leaf's stored element, and encodes two: the new leaf's element, for its leaf
-//! row, and the one difference it appends under each ancestor prefix of the
-//! changed leaf's path. Readers and compaction decode tree node rows, a tree
+//! A head-only change decodes the old leaf's stored element and encodes two:
+//! the new leaf's element for its leaf row, and one difference reused under
+//! each ancestor prefix. It reads topology keys without decoding tree node
+//! digests. An insertion, removal or key move may also split or merge buckets;
+//! that work reads bounded leaf sets or a parent summary to establish the new
+//! summaries. Readers and compaction decode tree node rows, a tree
 //! node's base row and each delta appended since: reading a tree node with
 //! eight deltas costs about 20 µs in ristretto255 in this module's benchmark,
 //! and about 1 µs in LtHash16. If measurements call for a faster layout, it

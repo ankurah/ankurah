@@ -94,37 +94,45 @@ async fn concurrent_updates_commute_but_rebuilds_and_stale_changes_retry() {
 
 #[tokio::test]
 async fn split_and_merge_conflict_with_updates_in_both_commit_orders() {
-    for split in [true, false] { for structural_first in [true, false] {
-        let tree = empty_tree::<ankurah_digest_tree::Ristretto255>();
-        let initial = if split { 64 } else { 65 };
-        let mut setup = tree.begin(); setup.build((0..initial).map(|n| leaf(n, 1))).await.unwrap(); setup.commit().await.unwrap();
-        let (mut structure, mut update) = (tree.begin(), tree.begin());
-        if split {
-            structure.apply_change(LeafChange { before: None, after: Some(leaf(64, 1)) }).await.unwrap();
-        } else {
-            for n in 32..65 { structure.apply_change(LeafChange { before: Some(leaf(n, 1)), after: None }).await.unwrap(); }
+    for split in [true, false] {
+        for structural_first in [true, false] {
+            let tree = empty_tree::<ankurah_digest_tree::Ristretto255>();
+            let initial = if split { 64 } else { 65 };
+            let mut setup = tree.begin();
+            setup.build((0..initial).map(|n| leaf(n, 1))).await.unwrap();
+            setup.commit().await.unwrap();
+            let (mut structure, mut update) = (tree.begin(), tree.begin());
+            if split {
+                structure.apply_change(LeafChange { before: None, after: Some(leaf(64, 1)) }).await.unwrap();
+            } else {
+                for n in 32..65 {
+                    structure.apply_change(LeafChange { before: Some(leaf(n, 1)), after: None }).await.unwrap();
+                }
+            }
+            update.apply_change(LeafChange { before: Some(leaf(1, 1)), after: Some(leaf(1, 2)) }).await.unwrap();
+            if structural_first {
+                structure.commit().await.unwrap();
+                assert!(matches!(update.commit().await, Err(TreeError::Conflict)));
+            } else {
+                update.commit().await.unwrap();
+                assert!(matches!(structure.commit().await, Err(TreeError::Conflict)));
+            }
+            tree.begin().audit().await.unwrap();
         }
-        update.apply_change(LeafChange { before: Some(leaf(1, 1)), after: Some(leaf(1, 2)) }).await.unwrap();
-        if structural_first {
-            structure.commit().await.unwrap();
-            assert!(matches!(update.commit().await, Err(TreeError::Conflict)));
-        } else {
-            update.commit().await.unwrap();
-            assert!(matches!(structure.commit().await, Err(TreeError::Conflict)));
-        }
-        tree.begin().audit().await.unwrap();
-    } }
+    }
 }
 
 #[tokio::test]
 async fn seeded_updates_moves_and_deletes_match_an_independent_model() {
-    use rand::{rngs::SmallRng, Rng, SeedableRng};
     use ankurah_core_types::{IndexKeyPart, PropertyId, Value, ValueType};
     use ankurah_digest_tree::{CanonicalCodec, KeyCodec};
+    use rand::{rngs::SmallRng, Rng, SeedableRng};
     let key = KeySpec::new(vec![IndexKeyPart::asc(PropertyId::EntityId(EntityId::from_bytes([8; 32])), ValueType::I64)]);
     let tree = DigestTree::<ankurah_digest_tree::Ristretto255>::new(TreeSpec::new(key, Predicate::True));
     let mut model = BTreeMap::new();
-    let mut setup = tree.begin(); setup.build([]).await.unwrap(); setup.commit().await.unwrap();
+    let mut setup = tree.begin();
+    setup.build([]).await.unwrap();
+    setup.commit().await.unwrap();
     let mut rng = SmallRng::seed_from_u64(314159);
     for step in 0..400 {
         let n = rng.gen_range(0..180u16);
@@ -137,8 +145,17 @@ async fn seeded_updates_moves_and_deletes_match_an_independent_model() {
         let mut tx = tree.begin();
         tx.apply_change(LeafChange { before, after: after.clone() }).await.unwrap();
         tx.commit().await.unwrap();
-        match after { Some(leaf) => { model.insert(n, leaf); }, None => { model.remove(&n); } }
-        if step % 31 == 0 { check(&tree, &model).await; }
+        match after {
+            Some(leaf) => {
+                model.insert(n, leaf);
+            }
+            None => {
+                model.remove(&n);
+            }
+        }
+        if step % 31 == 0 {
+            check(&tree, &model).await;
+        }
     }
     check(&tree, &model).await;
 }

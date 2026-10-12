@@ -15,7 +15,14 @@ macro_rules! selection {
 }
 
 pub fn property(name: &str) -> PropertyId {
-    PropertyId::EntityId(EntityId::from_bytes([match name { "project" => 1, "foo" => 2, "bar" => 3, other => panic!("no property {other}") }; 32]))
+    PropertyId::EntityId(EntityId::from_bytes(
+        [match name {
+            "project" => 1,
+            "foo" => 2,
+            "bar" => 3,
+            other => panic!("no property {other}"),
+        }; 32],
+    ))
 }
 
 pub fn resolve(selection: Selection<Parsed>) -> Selection<Resolved> {

@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::error::TreeError;
-use crate::map::{ByteBounds, MapName, MapTransaction};
+use crate::map::{ByteBounds, MapAccess, MapName, MapTransaction};
 
 /// A tree's three maps in memory, behind one lock, and the transactions over
 /// them.
@@ -53,8 +53,14 @@ impl MemoryMaps {
     pub fn begin(&self) -> MemoryTransaction {
         let shared = self.shared.lock().unwrap();
         MemoryTransaction {
-            shared: self.shared.clone(), began_with: shared.committed.clone(), writes: Default::default(), failed: false,
-            revision: shared.revision, structure: shared.structure, watches_structure: false, changes_structure: false,
+            shared: self.shared.clone(),
+            began_with: shared.committed.clone(),
+            writes: Default::default(),
+            failed: false,
+            revision: shared.revision,
+            structure: shared.structure,
+            watches_structure: false,
+            changes_structure: false,
         }
     }
 }
@@ -67,7 +73,7 @@ pub struct MemoryTransaction {
     began_with: Arc<Maps>,
     /// The transaction's writes, by map and key, for its commit to apply.
     writes: [BTreeMap<Vec<u8>, Write>; 3],
-    /// Whether a write's condition failed, which fails the commit.
+    /// A failed condition or poisoned tree operation prevents commit.
     failed: bool,
     revision: u64,
     structure: u64,
@@ -116,7 +122,9 @@ impl MemoryTransaction {
 }
 
 #[async_trait]
-impl MapTransaction for MemoryTransaction {
+impl MapAccess for MemoryTransaction {
+    fn poison(&mut self) { self.failed = true; }
+
     fn watch_structure(&mut self) { self.watches_structure = true; }
 
     fn change_structure(&mut self) { self.changes_structure = true; }
@@ -140,7 +148,9 @@ impl MapTransaction for MemoryTransaction {
 
     async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
         let owned = crate::AddressRange::new(bounds.0.map(<[u8]>::to_vec), bounds.1.map(<[u8]>::to_vec));
-        if crate::bounds::empty(&owned) { return Ok(Vec::new()); }
+        if crate::bounds::empty(&owned) {
+            return Ok(Vec::new());
+        }
         let began_with = self.began_with.0[map as usize].range::<[u8], _>(bounds).rev();
         let written = self.writes[map as usize].range::<[u8], _>(bounds).rev();
         Ok(overlay(began_with, written, true).take(limit).map(|(key, value)| (key.clone(), value.clone())).collect())
@@ -164,7 +174,10 @@ impl MapTransaction for MemoryTransaction {
         };
         self.write(map, &[key_prefix, &suffix.to_be_bytes()].concat(), None, Some(value))
     }
+}
 
+#[async_trait]
+impl MapTransaction for MemoryTransaction {
     async fn commit(self) -> Result<(), TreeError> {
         let MemoryTransaction { shared, began_with, writes, failed, revision, structure, watches_structure, changes_structure } = self;
         if failed {

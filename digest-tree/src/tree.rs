@@ -21,7 +21,7 @@ use ankurah_core_types::EntityId;
 use crate::digest::{Digest, DigestGroup, Ristretto255};
 use crate::error::TreeError;
 use crate::layout;
-use crate::map::{MapName, MapTransaction};
+use crate::map::{MapAccess, MapName, MapTransaction};
 use crate::memory::{MemoryMaps, MemoryTransaction};
 use crate::prefix::NodePrefix;
 use crate::rows::{leaf_address, AddressRange, LeafRow, NodeRow};
@@ -48,11 +48,7 @@ impl<G: DigestGroup> DigestTree<G> {
 
     /// Begin a transaction over the tree's maps as they stand now, with the
     /// tree's operations.
-    pub fn begin(&self) -> TreeTransaction<G> {
-        let mut transaction = TreeTransaction::new(self.maps.begin());
-        transaction.spec = Some(self.spec.clone());
-        transaction
-    }
+    pub fn begin(&self) -> TreeTransaction<G> { TreeTransaction::bind(&self.spec, self.maps.begin()) }
 }
 
 /// One transaction over a tree's maps, with the tree's operations, its leaves
@@ -60,8 +56,10 @@ impl<G: DigestGroup> DigestTree<G> {
 ///
 /// Every operation runs within the transaction: its reads observe the state
 /// the transaction began with and the transaction's own earlier writes, and
-/// its writes land, all together, only when [`TreeTransaction::commit`]
-/// succeeds. A [`TreeError::Conflict`] from any operation or from the commit
+/// its writes land, all together, only when the owning transaction commits.
+/// [`TreeTransaction::commit`] is available when this view owns its maps.
+/// A borrowed view leaves commit to its outer owner.
+/// A [`TreeError::Conflict`] from any operation or from the commit
 /// fails the transaction whole, and the caller retries from fresh reads in a
 /// new one. The operations below are the only writers of the maps' contents;
 /// the layouts of the keys and values are in [`layout`].
@@ -73,6 +71,49 @@ pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction>
     pub(crate) failed: bool,
     pub(crate) generation: u64,
     pub(crate) snapshot: std::sync::Arc<()>,
+}
+
+impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
+    /// Commit the owned maps together, if every condition still holds.
+    /// Failure publishes nothing. Borrowed map views have no commit method.
+    pub async fn commit(self) -> Result<(), TreeError> {
+        if self.failed {
+            return Err(TreeError::Conflict);
+        }
+        self.transaction.commit().await
+    }
+}
+
+/// Keeps partial work from escaping through an outer transaction's commit,
+/// including when a mutation future is dropped before returning a result.
+pub(crate) struct Mutation<'a, G: DigestGroup, T: MapAccess> {
+    tree: &'a mut TreeTransaction<G, T>,
+    completed: bool,
+}
+
+impl<G: DigestGroup, T: MapAccess> Mutation<'_, G, T> {
+    pub(crate) fn finish<R>(mut self, result: Result<R, TreeError>) -> Result<R, TreeError> {
+        self.completed = result.is_ok();
+        result
+    }
+}
+
+impl<G: DigestGroup, T: MapAccess> std::ops::Deref for Mutation<'_, G, T> {
+    type Target = TreeTransaction<G, T>;
+    fn deref(&self) -> &Self::Target { self.tree }
+}
+
+impl<G: DigestGroup, T: MapAccess> std::ops::DerefMut for Mutation<'_, G, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target { self.tree }
+}
+
+impl<G: DigestGroup, T: MapAccess> Drop for Mutation<'_, G, T> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.tree.failed = true;
+            self.tree.transaction.poison();
+        }
+    }
 }
 
 /// How many entries a read of a whole range takes at a time.
@@ -97,7 +138,7 @@ impl DeltaPages {
     }
 
     /// The next page, empty once every delta has been read.
-    async fn next<T: MapTransaction>(&mut self, transaction: &mut T) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
+    async fn next<T: MapAccess>(&mut self, transaction: &mut T) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
         if self.exhausted {
             return Ok(Vec::new());
         }
@@ -118,7 +159,47 @@ struct DigestRow<G: DigestGroup> {
     digest: Digest<G>,
 }
 
-impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
+impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
+    /// Use these transaction-bound maps as the tree described by `spec`.
+    /// The caller supplies this tree's maps and matching spec. Admission is
+    /// still the caller's responsibility; the tree validates canonical keys.
+    /// Passing a borrowed adapter leaves commit with the outer transaction.
+    /// Scopes and cursors belong to this view and must be resolved again when
+    /// a new view is opened, even within the same outer transaction.
+    ///
+    /// ```
+    /// # async fn example() -> Result<(), ankurah_digest_tree::TreeError> {
+    /// use ankurah_digest_tree::{MapTransaction, MemoryMaps, Ristretto255, TreeSpec, TreeTransaction};
+    /// use ankurah_core_types::KeySpec;
+    /// let spec = TreeSpec::new(KeySpec::new(vec![]), ankql::ast::Predicate::True);
+    /// let maps = MemoryMaps::new();
+    /// let mut owner = maps.begin();
+    /// {
+    ///     let mut tree = TreeTransaction::<Ristretto255, _>::bind(&spec, &mut owner);
+    ///     tree.build([]).await?;
+    /// }
+    /// owner.commit().await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Borrowing maps does not grant permission to commit them:
+    ///
+    /// ```compile_fail
+    /// # async fn example(spec: &ankurah_digest_tree::TreeSpec) {
+    /// use ankurah_digest_tree::{MemoryMaps, Ristretto255, TreeTransaction};
+    /// let maps = MemoryMaps::new();
+    /// let mut owner = maps.begin();
+    /// let tree = TreeTransaction::<Ristretto255, _>::bind(spec, &mut owner);
+    /// tree.commit().await.unwrap();
+    /// # }
+    /// ```
+    pub fn bind(spec: &TreeSpec, maps: T) -> Self {
+        let mut tree = Self::new(maps);
+        tree.spec = Some(spec.clone());
+        tree
+    }
+
     /// The tree's operations within `transaction`, a transaction over maps
     /// that hold a tree's rows: [`DigestTree::begin`] makes one over the
     /// tree's memory-resident maps.
@@ -126,13 +207,7 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         Self { transaction, group: PhantomData, spec: None, failed: false, generation: 0, snapshot: std::sync::Arc::new(()) }
     }
 
-    /// Apply the transaction's writes together, if every condition they were
-    /// made on still holds: [`TreeError::Conflict`] otherwise, with nothing
-    /// applied.
-    pub async fn commit(self) -> Result<(), TreeError> {
-        if self.failed { return Err(TreeError::Conflict); }
-        self.transaction.commit().await
-    }
+    pub(crate) fn mutation(&mut self) -> Mutation<'_, G, T> { Mutation { tree: self, completed: false } }
 
     /// The leaf row of the entity `entity_id` filed under `key`.
     pub async fn leaf(&mut self, key: &[u8], entity_id: EntityId) -> Result<Option<LeafRow<G>>, TreeError> {
@@ -175,7 +250,9 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         self.transaction.put_if(MapName::Leaves, &row.address(), expected.as_deref(), &layout::leaf_value(&row)).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if keys.insert(row.key.clone()) {
-            if keys.len() == 2 { self.adjust_multiple_keys(true).await?; }
+            if keys.len() == 2 {
+                self.adjust_multiple_keys(true).await?;
+            }
             self.transaction.put_if(MapName::Lookup, &row.entity_id.to_bytes(), listed.as_deref(), &layout::lookup_value(&keys)).await?;
         }
         Ok(())
@@ -188,7 +265,9 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
         self.transaction.delete_if(MapName::Leaves, &row.address(), &layout::leaf_value(row)).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if keys.remove(&row.key) {
-            if keys.len() == 1 { self.adjust_multiple_keys(false).await?; }
+            if keys.len() == 1 {
+                self.adjust_multiple_keys(false).await?;
+            }
             let listed = listed.as_deref().expect("the key was listed, so its entity has a lookup value");
             let id = row.entity_id.to_bytes();
             match keys.is_empty() {
@@ -270,7 +349,9 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
                 continue;
             }
             let child = layout::node_key_prefix(&key)?;
-            if key != child.to_bytes() { return Err(TreeError::IncompleteNode(child)); }
+            if key != child.to_bytes() {
+                return Err(TreeError::IncompleteNode(child));
+            }
             children.push(child.clone());
             match child.subtree_key_end() {
                 Some(end) => start = Bound::Included(end),
@@ -285,7 +366,12 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// [`TreeTransaction::node_base`]. Deltas appended to the tree node stay;
     /// a rebuild of the tree node alone deletes it first.
     /// [`TreeError::Conflict`] when the base there now is another.
-    pub(crate) async fn put_node_base(&mut self, prefix: &NodePrefix, expected: Option<&NodeRow<G>>, node: NodeRow<G>) -> Result<(), TreeError> {
+    pub(crate) async fn put_node_base(
+        &mut self,
+        prefix: &NodePrefix,
+        expected: Option<&NodeRow<G>>,
+        node: NodeRow<G>,
+    ) -> Result<(), TreeError> {
         let (key, value) = (prefix.to_bytes(), layout::digest_value(&node.digest));
         match expected {
             None => self.transaction.insert(MapName::Nodes, &key, &value).await,
@@ -316,7 +402,14 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// deltas have been folded: a delta appended after compaction read is
     /// not among those it removes, stays in its row, and a later round folds
     /// it.
+    /// Failure or cancellation prevents this transaction from committing.
     pub async fn compact_node(&mut self, prefix: &NodePrefix) -> Result<bool, TreeError> {
+        let mut mutation = self.mutation();
+        let result = mutation.compact_node_inner(prefix).await;
+        mutation.finish(result)
+    }
+
+    async fn compact_node_inner(&mut self, prefix: &NodePrefix) -> Result<bool, TreeError> {
         let (first, past) = layout::delta_key_bounds(prefix);
         let bounds = (Bound::Included(first.as_slice()), past.as_deref().map_or(Bound::Unbounded, Bound::Excluded));
         let mut batch = self.transaction.scan(MapName::Nodes, bounds, COMPACTION_BATCH + 1).await?;
@@ -373,8 +466,9 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     /// Entity lookup keys are always 32 bytes, so the metadata cannot collide.
     pub(crate) async fn multiple_key_entities(&mut self) -> Result<u64, TreeError> {
         match self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await? {
-            Some(value) => Ok(u64::from_be_bytes(value.as_slice().try_into()
-                .map_err(|_| TreeError::Audit("invalid multi-key entity count"))?)),
+            Some(value) => {
+                Ok(u64::from_be_bytes(value.as_slice().try_into().map_err(|_| TreeError::Audit("invalid multi-key entity count"))?))
+            }
             None => Ok(0),
         }
     }
@@ -382,11 +476,16 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
     async fn adjust_multiple_keys(&mut self, add: bool) -> Result<(), TreeError> {
         let stored = self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await?;
         let count = self.multiple_key_entities().await?;
-        let count = if add { count.checked_add(1) } else { count.checked_sub(1) }
-            .ok_or(TreeError::Audit("invalid multi-key entity count"))?;
+        let count =
+            if add { count.checked_add(1) } else { count.checked_sub(1) }.ok_or(TreeError::Audit("invalid multi-key entity count"))?;
         if count == 0 {
-            self.transaction.delete_if(MapName::Lookup, layout::MULTIPLE_KEYS,
-                stored.as_deref().ok_or(TreeError::Audit("missing multi-key entity count"))?).await
+            self.transaction
+                .delete_if(
+                    MapName::Lookup,
+                    layout::MULTIPLE_KEYS,
+                    stored.as_deref().ok_or(TreeError::Audit("missing multi-key entity count"))?,
+                )
+                .await
         } else {
             self.transaction.put_if(MapName::Lookup, layout::MULTIPLE_KEYS, stored.as_deref(), &count.to_be_bytes()).await
         }
@@ -439,11 +538,11 @@ mod tests {
     /// spec plays no part in these tests.
     fn empty_tree<G: DigestGroup>() -> DigestTree<G> { DigestTree::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True)) }
 
-    async fn node_keys<G: DigestGroup, T: MapTransaction>(maps: &mut TreeTransaction<G, T>) -> usize {
+    async fn node_keys<G: DigestGroup, T: MapAccess>(maps: &mut TreeTransaction<G, T>) -> usize {
         maps.transaction.scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap().len()
     }
 
-    async fn delta_count<G: DigestGroup, T: MapTransaction>(maps: &mut TreeTransaction<G, T>, prefix: &NodePrefix) -> usize {
+    async fn delta_count<G: DigestGroup, T: MapAccess>(maps: &mut TreeTransaction<G, T>, prefix: &NodePrefix) -> usize {
         let (first, past) = layout::delta_key_bounds(prefix);
         let bounds = (Bound::Included(first.as_slice()), past.as_deref().map_or(Bound::Unbounded, Bound::Excluded));
         maps.transaction.scan(MapName::Nodes, bounds, usize::MAX).await.unwrap().len()
@@ -463,10 +562,16 @@ mod tests {
     }
 
     #[async_trait]
-    impl<T: MapTransaction> MapTransaction for Interleaved<T> {
+    impl<T: MapAccess> MapAccess for Interleaved<T> {
+        fn poison(&mut self) { self.inner.poison(); }
         fn watch_structure(&mut self) { self.inner.watch_structure(); }
         fn change_structure(&mut self) { self.inner.change_structure(); }
-        async fn scan_reverse(&mut self, map: MapName, bounds: crate::map::ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
+        async fn scan_reverse(
+            &mut self,
+            map: MapName,
+            bounds: crate::map::ByteBounds<'_>,
+            limit: usize,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
             self.inner.scan_reverse(map, bounds, limit).await
         }
         async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> { self.inner.get(map, key).await }
@@ -500,7 +605,10 @@ mod tests {
         async fn append(&mut self, map: MapName, key_prefix: &[u8], value: &[u8]) -> Result<(), TreeError> {
             self.inner.append(map, key_prefix, value).await
         }
+    }
 
+    #[async_trait]
+    impl<T: MapTransaction> MapTransaction for Interleaved<T> {
         async fn commit(self) -> Result<(), TreeError> { self.inner.commit().await }
     }
 
@@ -853,7 +961,7 @@ mod tests {
         assert!(matches!(maps.node(&parent).await, Err(TreeError::IncompleteNode(p)) if p == parent));
         assert!(matches!(maps.children(&root).await, Err(TreeError::IncompleteNode(p)) if p == parent));
         assert!(matches!(maps.compact_node(&parent).await, Err(TreeError::IncompleteNode(p)) if p == parent));
-        maps.commit().await.unwrap();
+        assert!(matches!(maps.commit().await, Err(TreeError::Conflict)));
         let mut maps = tree.begin();
         assert_eq!(maps.node_base(&parent).await.unwrap(), None, "compaction wrote no base");
         assert_eq!(delta_count(&mut maps, &parent).await, 1, "compaction consumed no delta");
