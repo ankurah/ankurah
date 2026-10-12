@@ -1,4 +1,5 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, EventFragment, StateFragment};
+use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, DeltaContent, EntityDelta};
+use crate::{RequestId, StateFrame};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -9,25 +10,10 @@ pub struct UpdateId(Ulid);
 pub enum NodeUpdateBody {
     /// New events for a subscription
     SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
-}
-
-/// Content of an update - either events or state with events
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub enum UpdateContent {
-    /// Only events, no state (peer already has the state)
-    EventOnly(Vec<EventFragment>),
-    /// Both state and events (peer needs both)
-    StateAndEvent(StateFragment, Vec<EventFragment>),
-}
-
-impl UpdateContent {
-    /// Decompose into optional state and event fragments
-    pub fn into_parts(self) -> (Option<StateFragment>, Option<Vec<EventFragment>>) {
-        match self {
-            UpdateContent::EventOnly(events) => (None, Some(events)),
-            UpdateContent::StateAndEvent(state, events) => (Some(state), Some(events)),
-        }
-    }
+    /// Continuation of Fetch or SubscribeQuery; route by the original request
+    /// even if this frame outruns its metadata response. Apply only after frame 0
+    /// validates. UpdateAck is routing receipt here; ContinueState returns credit.
+    StateFrame { request_id: RequestId, frame: StateFrame },
 }
 
 /// How an entity's membership changed for a specific predicate
@@ -44,8 +30,7 @@ pub enum MembershipChange {
 /// A single entity update with all subscription relevance information
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SubscriptionUpdateItem {
-    pub entity_id: EntityId,
-    pub content: UpdateContent,
+    pub delta: EntityDelta,
     /// Which predicates this update is relevant to and how
     /// Uses PredicateId for remote subscriptions
     pub predicate_relevance: Vec<(QueryId, MembershipChange)>,
@@ -54,9 +39,10 @@ pub struct SubscriptionUpdateItem {
 impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
     type Error = anyhow::Error;
     fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {
-        match value.content {
-            UpdateContent::StateAndEvent(state, _) => Ok((value.entity_id, state).into()),
-            UpdateContent::EventOnly(_) => Err(anyhow::anyhow!("Cannot convert event-only update to entity state")),
+        match value.delta.content {
+            DeltaContent::StateSnapshot { state } | DeltaContent::StateAndEvents { state, .. } => Ok((value.delta.entity_id, state).into()),
+            DeltaContent::EventBridge { .. } => Err(anyhow::anyhow!("Cannot convert event-only update to entity state")),
+            DeltaContent::StateAndRelation { .. } => Err(anyhow::anyhow!("StateAndRelation is not supported for live updates")),
         }
     }
 }
@@ -112,6 +98,9 @@ impl std::fmt::Display for NodeUpdate {
 impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NodeUpdateBody::StateFrame { request_id, frame } => {
+                write!(f, "StateFrame {request_id} {} sequence:{}", frame.comparison, frame.sequence)
+            }
             NodeUpdateBody::SubscriptionUpdate { items } => {
                 write!(f, "SubscriptionUpdate [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
             }
@@ -121,12 +110,7 @@ impl std::fmt::Display for NodeUpdateBody {
 
 impl std::fmt::Display for SubscriptionUpdateItem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: ", self.entity_id)?;
-
-        match &self.content {
-            UpdateContent::EventOnly(events) => write!(f, "Events({})", events.len())?,
-            UpdateContent::StateAndEvent(state, events) => write!(f, "State+Events({}, {})", state, events.len())?,
-        }
+        write!(f, "{}", self.delta)?;
 
         if !self.predicate_relevance.is_empty() {
             write!(f, " predicates:{}", self.predicate_relevance.len())?;

@@ -4,8 +4,8 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, ComparisonId,
-    ComparisonOutcome, ComparisonReply, EntityState, EventFragment, EventId, KnownState, RegisterModel, RegisteredModel, StateAnswer,
-    StateFragment, StateReply,
+    ComparisonOutcome, EntityState, EventFragment, EventId, KnownState, RegisterModel, RegisteredModel, StateAnswer, StateFragment,
+    StateReply,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -97,7 +97,7 @@ pub struct CausalAssertionFragment {
     pub attestations: crate::auth::AttestationSet,
 }
 
-/// Content for entity initialization - either bridge, state, or attested state
+/// Entity data shared by initial repair and ongoing updates.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DeltaContent {
     /// Full entity state when a suitable event bridge is unavailable.
@@ -106,13 +106,28 @@ pub enum DeltaContent {
     EventBridge { events: Vec<EventFragment> },
     /// State with a causal assertion relative to the supplied entity clock.
     StateAndRelation { state: StateFragment, relation: CausalAssertionFragment },
+    /// Snapshot plus connecting events; retain the events if the snapshot cannot apply.
+    StateAndEvents { state: StateFragment, events: Vec<EventFragment> },
 }
 
-/// Entity repair data carried by a state comparison.
+/// One entity payload, independent of initial/live delivery and query relevance.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
     pub content: DeltaContent,
+}
+
+/// A fragment of one bincode-encoded DeltaContent, shared by repair and live delivery.
+/// Reassemble under the stream and its typed wrapper, then validate and apply once.
+/// Offsets start at zero, are contiguous, and stop at `last`; total assembly is capped.
+/// The entity and wrapper metadata stay fixed. An entity cannot have two concurrent
+/// assemblies on a stream. Copying bytes returns wire credit, not an application claim.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct EntityDeltaChunk {
+    pub entity_id: EntityId,
+    pub offset: u64,
+    pub bytes: bytes::Bytes,
+    pub last: bool,
 }
 
 /// The body of a request from one node to another
@@ -132,7 +147,7 @@ pub enum NodeRequestBody {
     },
     Fetch {
         selection: ast::Selection<ast::Resolved>,
-        /// None means no summary was supplied, not that the node holds no entities.
+        /// None means no result knowledge was supplied, not an empty entity store.
         known_state: Option<KnownState>,
     },
     SubscribeQuery {
@@ -153,15 +168,18 @@ pub enum NodeRequestBody {
     RegisterSchema {
         model: RegisterModel,
     },
-    /// Continue one comparison with a batch of answers at any requested depths.
-    /// Follow-ups are sequential; empty answers resume deferred responder work.
-    /// The responder chooses its own byte/work limits and retains pending work.
-    CompareTree {
+    /// Return flow credit and answer questions without waiting for another page.
+    /// Responses are Success; further numbered frames arrive as NodeUpdate.
+    /// Retrying the same request id is idempotent. A processed prefix may contain
+    /// explicit pending NeedRepair; it is not the global Applied acknowledgment.
+    ContinueState {
         comparison: ComparisonId,
+        processed_through: u64,
         answers: Vec<StateAnswer>,
     },
-    /// Acknowledge application or abandon a comparison, releasing its snapshots.
-    /// The responder acknowledges with Success; closing is idempotent for this peer.
+    /// Applied releases snapshot resources and starts the standing Live stream;
+    /// Abandoned cancels only this bound generation. Both are idempotent.
+    /// The response is Success; readiness does not wait for the Applied reply.
     CloseComparison {
         comparison: ComparisonId,
         outcome: ComparisonOutcome,
@@ -199,7 +217,6 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
-    TreeCompared(ComparisonReply),
     /// The snapshot expired or was invalidated. Restart the original Fetch or
     /// SubscribeQuery; previously received pages cannot complete a new comparison.
     ComparisonUnavailable {
@@ -280,15 +297,17 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
             NodeRequestBody::Fetch { selection: query, known_state } => {
-                write!(f, "Fetch {query} summaries:{}", known_state.as_ref().map_or(0, |state| state.heads.len()))
+                write!(f, "Fetch {query} regions:{}", known_state.as_ref().map_or(0, |state| state.regions.len()))
             }
             NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_state } => {
-                write!(f, "Subscribe {query_id} {query} v{version} summaries:{}", known_state.as_ref().map_or(0, |state| state.heads.len()))
+                write!(f, "Subscribe {query_id} {query} v{version} regions:{}", known_state.as_ref().map_or(0, |state| state.regions.len()))
             }
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
-            NodeRequestBody::CompareTree { comparison, answers } => write!(f, "CompareTree {comparison} answers:{}", answers.len()),
+            NodeRequestBody::ContinueState { comparison, processed_through, answers } => {
+                write!(f, "ContinueState {comparison} through:{processed_through} answers:{}", answers.len())
+            }
             NodeRequestBody::CloseComparison { comparison, outcome } => write!(f, "CloseComparison {comparison} {outcome:?}"),
         }
     }
@@ -298,7 +317,7 @@ impl std::fmt::Display for NodeResponseBody {
         match self {
             NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
             NodeResponseBody::Fetch(state) => {
-                write!(f, "Fetch {} items:{} {:?}", state.page.comparison, state.page.items.len(), state.page.progress)
+                write!(f, "Fetch {} frame:{}", state.frame.comparison, state.frame.sequence)
             }
             NodeResponseBody::Get(states) => {
                 write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
@@ -307,16 +326,13 @@ impl std::fmt::Display for NodeResponseBody {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::QuerySubscribed { query_id, state } => {
-                write!(f, "Subscribed {query_id} {} items:{} {:?}", state.page.comparison, state.page.items.len(), state.page.progress)
+                write!(f, "Subscribed {query_id} {} frame:{}", state.frame.comparison, state.frame.sequence)
             }
             NodeResponseBody::SchemaRegistered { model } => {
                 write!(f, "SchemaRegistered {} properties:{}", model.label, model.properties.len())
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
-            NodeResponseBody::TreeCompared(page) => {
-                write!(f, "TreeCompared {} items:{} {:?}", page.comparison, page.items.len(), page.progress)
-            }
             NodeResponseBody::ComparisonUnavailable { comparison } => write!(f, "ComparisonUnavailable {comparison}"),
         }
     }
@@ -333,6 +349,9 @@ impl std::fmt::Display for EntityDelta {
                     event_strs.push(event.payload.to_string());
                 }
                 write!(f, "EntityDelta {}: EventBridge({})", self.entity_id, event_strs.join(", "))
+            }
+            DeltaContent::StateAndEvents { state, events } => {
+                write!(f, "EntityDelta {}: StateAndEvents({}, {})", self.entity_id, state, events.len())
             }
             DeltaContent::StateAndRelation { state, relation: _ } => {
                 write!(f, "EntityDelta {}: StateAndRelation({})", self.entity_id, state)

@@ -1,26 +1,28 @@
-//! Snapshot-bound state comparison shared by Fetch and SubscribeQuery.
+//! Snapshot-bound state transfer shared by Fetch and SubscribeQuery.
 //!
-//! An initial request offers a spec and summaries of the requester's state.
-//! The responder establishes the authorized result scope and a comparison,
-//! then supplies summaries, leaf details and repairs within its own byte and
-//! work limits. Follow-ups may compare many regions at different depths.
+//! The initial response carries metadata and frame zero. Later frames are pushed
+//! through NodeUpdate, correlated with the originating request and comparison.
+//! ContinueState acknowledges a processed prefix and supplies bounded answers;
+//! it returns Success rather than carrying another frame. Responders choose
+//! byte/work/window limits beneath the protocol's hard resource caps.
 //!
-//! A comparison binds both peers' snapshots, the spec, the authorized Selection,
-//! the peer and (for subscriptions) query ID and version. Implementations must
-//! retain those snapshots or invalidate the comparison; they must not silently
-//! mix revisions. Neither a spec nor a comparison ID grants read permission.
+//! Complete commits the captured result and a standing subscription delivery
+//! route. The requester becomes ready after causal repair and local activation,
+//! then sends Applied without waiting for its reply. Live frames remain queued
+//! until Applied arrives and then continue on the same numbered stream.
+//! Snapshot cleanup never silently revokes that standing route: subsequent
+//! failure requires RestartRequired or disconnect. Abandoned cancels the exact
+//! generation; Applied releases snapshot resources and permits live delivery.
 //!
-//! Requests within a comparison are sequential. A transport retry reuses the
-//! same NodeRequest ID and body; the responder replays that reply rather than
-//! advancing twice. If it can no longer replay consistently, it returns
-//! ComparisonUnavailable. A fresh follow-up acknowledges receipt of the prior
-//! page; only CloseComparison with Applied acknowledges successful application.
+//! Frame acknowledgments are flow control, not global application claims.
+//! Peers, connection generations, credentials, snapshots, spec and query version
+//! stay bound throughout. Unknown or superseded streams cannot be adopted.
 
 pub use ankurah_digest_tree::{AddressRange, TreeHead, TreeSpec};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::{Clock, EntityDelta, EntityId, KnownEntity};
+use crate::{Clock, EntityDelta, EntityDeltaChunk, EntityId, KnownEntity, MembershipChange, QueryId, SubscriptionUpdateItem};
 
 /// A responder-issued handle for one comparison, scoped to the requesting peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -38,48 +40,69 @@ impl std::fmt::Display for ComparisonId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "C-{}", self.0) }
 }
 
-/// State the requester can summarize, possibly using a scope of a broader tree.
-///
-/// Heads use Ristretto255 and may include several depths. Uncovered regions
-/// are unknown, not empty. Even a zero-count head says nothing about entities
-/// this node holds outside the summarized result. The serving peer validates
-/// key types, admission compatibility and authorized bounds before comparison.
+/// Bounded knowledge of the requester's materialized query result.
+/// Regions are disjoint and exact. Omitted regions are unknown, not empty.
+/// No region asserts absence of entity state held outside this query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownState {
     pub spec: TreeSpec,
-    pub heads: Vec<TreeHead>,
+    pub regions: Vec<KnownRegion>,
 }
 
-/// Initial Fetch or SubscribeQuery reply. Later pages reuse this descriptor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum KnownRegion {
+    Summary(TreeHead),
+    /// Exhaustive for its bounds; an empty page explicitly describes an empty range.
+    Leaves(LeafPage),
+}
+
+/// Initial Fetch or SubscribeQuery response; frame.sequence must be zero.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReply {
-    /// The spec used to interpret all heads, leaf keys and bounds in this comparison.
-    /// An offered spec must be compatible before its summaries can be used.
     pub spec: TreeSpec,
-    /// The responder's entire result scope at the captured snapshot, including
-    /// its ordered limit. Empty means an empty result; it does not delete entities.
-    /// These bounds are interpreted with `spec` and the original Selection.
+    /// Exact authorized result scope, including the Selection's ordered limit.
     pub scope: Vec<AddressRange>,
-    pub page: ComparisonReply,
+    pub frame: StateFrame,
 }
 
-/// One bounded reply, potentially spanning many branches and recursion depths.
+/// Immutable within one connection generation and comparison.
+/// Frame zero is in StateReply; subsequent frames arrive only as NodeUpdate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ComparisonReply {
+pub struct StateFrame {
     pub comparison: ComparisonId,
-    pub items: Vec<StateItem>,
-    pub progress: ComparisonProgress,
+    pub sequence: u64,
+    pub body: StateFrameBody,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StateFrameBody {
+    State {
+        items: Vec<StateItem>,
+        progress: ComparisonProgress,
+    },
+    /// Subscription only, after Applied. Query id/version are bound by the stream.
+    /// All live updates for this generation use this same sequence and byte window.
+    /// ContinueState credits Live after application; a stalled stream may require restart.
+    Live(Vec<SubscriptionUpdateItem>),
+    /// Same entity encoding/assembly as RepairChunk. Relevance stays fixed for all
+    /// fragments and is applied only with the complete validated delta. No other
+    /// Live item interleaves; the relevance list is independently bounded.
+    LiveChunk {
+        chunk: EntityDeltaChunk,
+        predicate_relevance: Vec<(QueryId, MembershipChange)>,
+    },
+    /// Mark this generation unavailable and restart; never claim completion.
+    RestartRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ComparisonProgress {
-    /// Answer the outstanding questions and continue. An empty answer list
-    /// resumes work the responder deferred under its own budget. Outstanding
-    /// questions and omitted regions remain pending across replies.
+    /// Further work or questions remain; the responder pushes while credit permits.
+    /// On late repair frames this does not revoke a prior Complete handoff.
     Continue,
-    /// All result membership and repair data has been supplied. This is not
-    /// an acknowledgment that the requester has applied it; CloseComparison
-    /// with Applied provides that acknowledgment after successful application.
+    /// Initial offers have been sent and the subscription route is established.
+    /// This does not claim application: late NeedRepair is allowed. Readiness
+    /// requires actual target coverage, no pending repair, and local activation.
     Complete,
 }
 
@@ -102,25 +125,13 @@ pub enum StateItem {
     /// `target` is the captured sender head covered by this delta. Application
     /// may retain newer or concurrent local state; sending is not acknowledgment.
     Repair { target: Clock, delta: EntityDelta },
-    /// A fragment of a repair too large for one reply. Reassemble and validate
-    /// the complete DeltaContent before applying it, using the same path as Repair.
-    RepairChunk(RepairChunk),
-}
-
-/// Fragments of one bincode-encoded DeltaContent under the current wire version.
-///
-/// Within a comparison, an entity has one repair target. Chunks start at offset
-/// zero and are contiguous; the entity and target stay fixed until `last`.
-/// Different entities may interleave. A Complete reply cannot leave a partial
-/// repair. Receivers must bound assembly and reject gaps, overlaps and changes
-/// of target, rather than applying an incomplete event bridge or snapshot.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepairChunk {
-    pub entity_id: EntityId,
-    pub target: Clock,
-    pub offset: u64,
-    pub bytes: bytes::Bytes,
-    pub last: bool,
+    /// A fragment of a repair too large for one reply. Target stays fixed for its
+    /// assembly. Complete cannot leave a partial repair; late requested repairs
+    /// may span Continue frames, but every required assembly must finish before Applied.
+    RepairChunk { target: Clock, chunk: EntityDeltaChunk },
+    /// Required causal repair cannot be supplied within policy/history/work limits.
+    /// Fail this Fetch or initialization; do not report ready with a known gap.
+    RepairUnavailable { entity_id: EntityId, target: Clock },
 }
 
 /// Answers for any subset of the outstanding regions/entities in a comparison.
@@ -134,6 +145,14 @@ pub enum StateAnswer {
     Heads {
         known: Vec<KnownEntity>,
         unknown: Vec<EntityId>,
+    },
+    /// An already offered snapshot did not incorporate target into local state.
+    /// Only the exact offered entity/target is admissible, including after Complete.
+    /// Answer with bounded connecting events or RepairUnavailable, never the same snapshot.
+    NeedRepair {
+        entity_id: EntityId,
+        target: Clock,
+        actual: Clock,
     },
 }
 
@@ -158,8 +177,13 @@ pub struct KnownLeaf {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ComparisonOutcome {
-    /// Sent only after Complete and successful application of all supplied data.
-    Applied,
-    /// Release the comparison without claiming any successful application.
+    /// After Complete, all offered targets are covered and local result activation
+    /// succeeded. Release the snapshot and drain the standing Live stream.
+    /// processed_through covers every initial/repair frame, including late repairs
+    /// after Complete. It returns frame credit (including frame 0) as well.
+    /// The requester need not await the reply before reporting readiness.
+    Applied { processed_through: u64 },
+    /// Cancel this exact stream/query generation, including after Complete.
+    /// Never remove a replacement query generation.
     Abandoned,
 }
