@@ -10,7 +10,7 @@
 //! STARTUP_MODES=cold,warm_equal,warm_edit,warm_membership STARTUP_BPS=0,1250000. Bytes exclude transport framing. No wall-clock CI threshold.
 
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -154,7 +154,10 @@ struct Meter {
     subscriptions_applied: usize,
     query_subscriptions_applied: HashMap<proto::QueryId, usize>,
     local_result_installed_at: Option<Instant>,
+    local_result_states: Option<BTreeMap<proto::EntityId, proto::State>>,
+    local_result_capture_us: Option<u128>,
     local_result_installed_cpu: Option<ProcessCpu>,
+    local_result_capture_cpu: Option<ProcessCpu>,
     last_activity: Option<Instant>,
     uplink_free: Option<Instant>,
     downlink_free: Option<Instant>,
@@ -407,6 +410,23 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
                         Ok(cpu) => meter.local_result_installed_cpu = cpu,
                         Err(error) => meter.errors.push(format!("installation CPU snapshot: {error}")),
                     }
+                    // Capture before any transport drain or asynchronous verifier can
+                    // allow a later repair to rescue an early installation landmark.
+                    let capture_start = Instant::now();
+                    let states = observed
+                        .read()
+                        .iter_entities()
+                        .map(|(id, entity)| Ok((id, entity.to_state()?)))
+                        .collect::<anyhow::Result<BTreeMap<_, _>>>();
+                    meter.local_result_capture_us = Some(capture_start.elapsed().as_micros());
+                    match states {
+                        Ok(states) => meter.local_result_states = Some(states),
+                        Err(error) => meter.errors.push(format!("installation state capture: {error}")),
+                    }
+                    match ProcessCpu::now() {
+                        Ok(cpu) => meter.local_result_capture_cpu = cpu_delta(meter.local_result_installed_cpu, cpu),
+                        Err(error) => meter.errors.push(format!("installation capture CPU snapshot: {error}")),
+                    }
                 }
             }
         })))
@@ -442,10 +462,6 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
         let ready_us = start.elapsed().as_micros();
         (query, Some(ready_us), ProcessCpu::now()?)
     };
-    let settled = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
-    let initial_drained_us = settled.duration_since(start).as_micros();
-    let initial_drain_cpu = ProcessCpu::now()?;
-    let settled_traffic = meter.lock().unwrap().traffic.clone();
     let mut server_reads = server.storage.take();
     let mut client_reads = client.storage.take();
     let local_result_installed_us = if ready_us.is_none() {
@@ -472,23 +488,46 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     let verification_start = Instant::now();
     let verification_attempts = expected.len();
     let verification_client_point_reads = expected.len();
-    // Both landmarks precede verification: versioned durable-ready for primary
-    // cases and a fresh loaded=true local installation notification for reconnect.
-    // A mismatched set or state at that landmark fails; verification never waits
-    // for a later repair that would make the recorded installation too early.
-    anyhow::ensure!(query.ids().into_iter().collect::<BTreeSet<_>>() == expected, "installed query has incorrect authoritative membership");
+    // Reconnect captures synchronously in the first loaded=true callback after
+    // recording its timestamp. Primary cases capture immediately after the
+    // versioned wait, without awaiting response bookkeeping or a transport drain.
+    // Each entity's full state is atomic; the collection is not one global
+    // snapshot. This fixture performs no writes after measurement begins.
+    let captured_states = if ready_us.is_none() {
+        meter.lock().unwrap().local_result_states.take().expect("installation callback captured states")
+    } else {
+        query
+            .resultset()
+            .read()
+            .iter_entities()
+            .map(|(id, entity)| Ok((id, entity.to_state()?)))
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?
+    };
+    anyhow::ensure!(
+        captured_states.keys().copied().collect::<BTreeSet<_>>() == expected,
+        "installed query has incorrect authoritative membership"
+    );
     for id in &expected {
         let remote = server.storage.get_state(*id).await?;
+        anyhow::ensure!(captured_states[id] == remote.payload.state, "installation capture has incorrect applied state for {id}");
+        // Persistence is a post-landmark check; these async reads do not claim
+        // to observe a globally atomic state at the recorded timestamp.
         let local = client.storage.get_state(*id).await?;
-        anyhow::ensure!(local.payload.state == remote.payload.state, "installed query has incorrect applied state for {id}");
+        anyhow::ensure!(local.payload.state == remote.payload.state, "installed query has incorrect persisted state for {id}");
     }
     let verification_us = verification_start.elapsed().as_micros();
     let verified_us = start.elapsed().as_micros();
     let verified_cpu = ProcessCpu::now()?;
     let elapsed_us = ready_us.or(local_result_installed_us).expect("ready or installed landmark");
-    let final_settled = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
-    let transport_settled_us = final_settled.duration_since(start).as_micros();
-    let final_drain_cpu = ProcessCpu::now()?;
+    // Own QuerySubscribed and transport quiescence validate this activation
+    // after its captured membership/state have already been checked.
+    let settled = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
+    let initial_drained_us = settled.duration_since(start).as_micros();
+    let initial_drain_cpu = ProcessCpu::now()?;
+    let settled_traffic = meter.lock().unwrap().traffic.clone();
+    // Legacy drain fields describe the same post-verification drain.
+    let transport_settled_us = initial_drained_us;
+    let final_drain_cpu = initial_drain_cpu;
     let settled_us = transport_settled_us.max(ready_us.unwrap_or(verified_us));
     let mut server_tail_reads = server.storage.take();
     let mut client_tail_reads = client.storage.take();
@@ -499,11 +538,16 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     server_reads.add(server_tail_reads);
     client_reads.add(client_tail_reads);
 
-    let traffic = {
+    let (traffic, local_result_capture_us, local_result_capture_cpu, local_result_installed_cpu) = {
         let mut meter = meter.lock().unwrap();
         meter.measuring = false;
         anyhow::ensure!(meter.errors.is_empty(), "measured peer errors: {:?}", meter.errors);
-        std::mem::take(&mut meter.traffic)
+        (
+            std::mem::take(&mut meter.traffic),
+            meter.local_result_capture_us,
+            meter.local_result_capture_cpu,
+            meter.local_result_installed_cpu,
+        )
     };
     println!(
         "STARTUP {}",
@@ -511,16 +555,18 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
             "label":label, "entities":n, "cache":cache, "cached_entities":cached,
             "mode":mode, "bandwidth_bytes_per_second":bytes_per_second,
             "rtt_ms":rtt_ms, "repeat":repeat, "elapsed_us":elapsed_us,
-            "ready_us":ready_us, "local_result_installed_us":local_result_installed_us, "initial_drained_us":initial_drained_us,
+            "ready_us":ready_us, "local_result_installed_us":local_result_installed_us,
+            "local_result_capture_us":local_result_capture_us, "initial_drained_us":initial_drained_us,
             "settled_us":settled_us, "transport_settled_us":transport_settled_us,
             "verified_us":verified_us, "verification_us":verification_us, "verification_attempts":verification_attempts, "verified":true,
             "traffic":traffic, "settled_traffic":settled_traffic, "server_reads":server_reads, "client_reads":client_reads,
             "phase_process_cpu": {
-                "scope":"process CPU during each interval: server/client combined, all background threads included; phases can overlap; excludes teardown",
+                "scope":"process CPU during each interval: server/client combined, all background threads included; phases can overlap; initial/final drain follow verification and include it; local_result_capture is separate reconnect capture work; excludes teardown",
                 "setup":cpu_delta(sample_cpu_start, measurement_cpu_start),
                 "through_ready":cpu_delta(measurement_cpu_start, ready_cpu),
                 "through_initial_drain":cpu_delta(measurement_cpu_start, initial_drain_cpu),
-                "through_local_result_installed":cpu_delta(measurement_cpu_start, meter.lock().unwrap().local_result_installed_cpu),
+                "through_local_result_installed":cpu_delta(measurement_cpu_start, local_result_installed_cpu),
+                "local_result_capture":local_result_capture_cpu,
                 "verification":cpu_delta(verification_cpu_start, verified_cpu),
                 "through_verified":cpu_delta(measurement_cpu_start, verified_cpu),
                 "after_verification_drain":cpu_delta(verified_cpu, final_drain_cpu),
