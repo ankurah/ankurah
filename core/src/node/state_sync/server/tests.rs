@@ -101,7 +101,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let mut leaf_pages = 0;
     let mut finished = false;
     for _ in 0..64 {
-        let body = comparison.reply(&node, &vec![], false).await?;
+        let body = comparison.reply(&node, &vec![], false, false).await?;
         assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
         let StateFrameBody::State { items, progress } = body else { panic!("state frame") };
         let mut answers = Vec::new();
@@ -189,7 +189,7 @@ async fn snapshot_pages_tile_gaps_split_by_bytes_and_resume_after_an_oversized_r
     let mut chunks = Vec::new();
     let mut inline_after_chunks = false;
     while !comparison.complete {
-        let body = comparison.reply(&node, &vec![], false).await?;
+        let body = comparison.reply(&node, &vec![], false, false).await?;
         assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
         let StateFrameBody::State { items, .. } = body else { panic!("state frame") };
         for item in items {
@@ -250,12 +250,12 @@ async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_anoth
     let id = source[0].payload.entity_id;
     let mut comparison = Comparison::new(snapshot(source.clone()).await?, None)?;
     comparison.known_clocks.insert(id, source[0].payload.state.head.clone());
-    let StateFrameBody::State { items, progress } = comparison.reply(&node, &vec![], false).await? else { panic!("state frame") };
+    let StateFrameBody::State { items, progress } = comparison.reply(&node, &vec![], false, false).await? else { panic!("state frame") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items.as_slice(), [StateItem::Leaves(page)] if page.leaves[0].entity.entity_id == id));
     assert!(comparison.offered.is_empty(), "equal supplied state must not be sent again");
     let mut comparison = Comparison::new(snapshot(source).await?, None)?;
-    assert!(comparison.reply(&node, &vec![], true).await.is_err(), "an exhaustive catalog page cannot skip an inadmissible row");
+    assert!(comparison.reply(&node, &vec![], true, false).await.is_err(), "an exhaustive catalog page cannot skip an inadmissible row");
     Ok(())
 }
 

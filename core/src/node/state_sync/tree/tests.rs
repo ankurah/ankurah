@@ -13,6 +13,116 @@ fn state(id: u8, head: u8) -> Attested<EntityState> {
     }
 }
 
+fn numbered_state(id: u32, head: u8) -> Attested<EntityState> {
+    let mut state = state(0, head);
+    let mut bytes = [0; EntityId::BYTE_LEN];
+    bytes[..4].copy_from_slice(&id.to_be_bytes());
+    state.payload.entity_id = EntityId::from_bytes(bytes);
+    state
+}
+
+#[tokio::test]
+async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> anyhow::Result<()> {
+    let query = QueryTree::default();
+    let initial = (0..256).map(|id| numbered_state(id, 1)).collect::<Vec<_>>();
+    let mut old = query.refresh(spec(), initial).await?;
+    assert!(old.offer().await?.regions.len() > 1, "a fresh tree offers its bounded frontier");
+    let original = old.head(super::super::whole()).await?;
+
+    // Addition, replacement, and removal each cross the measured dense threshold.
+    for states in [
+        (0..512).map(|id| numbered_state(id, 1)).collect::<Vec<_>>(),
+        (0..512).map(|id| numbered_state(id, 2)).collect(),
+        (0..256).map(|id| numbered_state(id, 2)).collect(),
+    ] {
+        let mut refreshed = query.refresh(spec(), states.clone()).await?;
+        assert!(refreshed.tree.is_none(), "dense refresh must defer digest construction");
+        assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
+        let recomputed_query = QueryTree::default();
+        let mut recomputed = recomputed_query.refresh(spec(), states).await?;
+        assert_eq!(refreshed.members(), recomputed.members());
+        let offer = refreshed.offer().await?;
+        let [proto::KnownRegion::Summary(root)] = offer.regions.as_slice() else {
+            panic!("a retained query must offer its root even after a bulk rebuild")
+        };
+        assert_eq!(*root, recomputed.head(super::super::whole()).await?);
+        assert_eq!(old.head(super::super::whole()).await?, original);
+    }
+
+    let sparse = (0..256).map(|id| numbered_state(id, if id == 17 { 3 } else { 2 })).collect::<Vec<_>>();
+    let mut refreshed = query.refresh(spec(), sparse.clone()).await?;
+    assert!(refreshed.tree.is_some(), "a sparse refresh must retain incremental construction");
+    let recomputed_query = QueryTree::default();
+    let mut recomputed = recomputed_query.refresh(spec(), sparse).await?;
+    assert_eq!(refreshed.head(super::super::whole()).await?, recomputed.head(super::super::whole()).await?);
+    assert_eq!(old.head(super::super::whole()).await?, original);
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_unbuilt_cache_offers_a_root_after_initial_membership_fill() -> anyhow::Result<()> {
+    let query = QueryTree::default();
+    let mut initial = query.refresh(spec(), vec![]).await?;
+    assert!(matches!(initial.offer().await?.regions.as_slice(), [proto::KnownRegion::Leaves(_)]));
+    let mut refreshed = query.refresh(spec(), (0..256).map(|id| numbered_state(id, 1)).collect()).await?;
+    assert!(refreshed.tree.is_none());
+    let offer = refreshed.offer().await?;
+    let [proto::KnownRegion::Summary(root)] = offer.regions.as_slice() else {
+        panic!("same-query lineage must use a root even when no previous digest was built")
+    };
+    assert_eq!(root.digest.count(), 256);
+    Ok(())
+}
+
+#[tokio::test]
+async fn initial_complete_retains_only_large_standing_query_digests() -> anyhow::Result<()> {
+    use crate::{
+        connector::{PeerSender, SendError},
+        node::Node,
+        policy::PermissiveAgent,
+        test_utils::TestStorage,
+    };
+    #[derive(Clone)]
+    struct Sender(EntityId);
+    impl PeerSender for Sender {
+        fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
+        fn recipient_node_id(&self) -> EntityId { self.0 }
+        fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+    }
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let peer = EntityId::random();
+    node.register_peer(
+        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+        Box::new(Sender(peer)),
+    )
+    .await?;
+    for (standing, count) in [(false, 64), (true, super::super::LEAF_PAGE), (true, 64)] {
+        let query = QueryTree::default();
+        let snapshot = query.refresh(spec(), (0..count).map(|id| numbered_state(id as u32, 1)).collect()).await?;
+        assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
+        let reply = node
+            .start_comparison(
+                peer,
+                proto::RequestId::new(),
+                vec![],
+                vec![],
+                standing.then(|| (proto::QueryId::new(), 1)),
+                false,
+                snapshot,
+                None,
+            )
+            .await?;
+        assert!(matches!(reply.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
+        assert_eq!(
+            query.0.lock().await.as_ref().unwrap().tree.is_some(),
+            standing && count > super::super::LEAF_PAGE,
+            "only a large standing query must build its retained digest before Complete"
+        );
+    }
+    node.deregister_peer(peer);
+    Ok(())
+}
+
 #[tokio::test]
 async fn small_and_empty_inventories_offer_exact_leaves_without_building_a_tree() -> anyhow::Result<()> {
     for count in [0, super::super::LEAF_PAGE] {

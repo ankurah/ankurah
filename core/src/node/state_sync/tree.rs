@@ -19,9 +19,10 @@ type Cache = tokio::sync::Mutex<Option<Cached>>;
 const OFFER_BYTES: u64 = 16 * 1024;
 const OFFER_REGIONS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
+const BULK_REFRESH_CHANGES: usize = 128;
 
-/// Retained by an active query; Fetch uses a temporary instance. Refresh changes
-/// only leaves whose entity head or membership changed, preserving the tree layout.
+/// Retained by an active query; Fetch uses a temporary instance. Sparse refreshes
+/// update changed leaves in place; dense refreshes reconstruct the digest on demand.
 #[derive(Default)]
 pub(crate) struct QueryTree(Arc<Cache>);
 
@@ -37,6 +38,7 @@ pub(crate) struct Snapshot {
     pub spec: TreeSpec,
     pub states: States,
     tree: Option<TreeTransaction>,
+    retained: bool,
     members: Arc<Members>,
     cache: Weak<Cache>,
     generation: Arc<()>,
@@ -101,12 +103,22 @@ impl QueryTree {
     pub async fn refresh(&self, spec: TreeSpec, states: Vec<Attested<EntityState>>) -> anyhow::Result<Snapshot> {
         let states: States = states.into_iter().map(|state| (state.payload.entity_id, Arc::new(state))).collect();
         let mut cache = self.0.lock().await;
+        let retained = cache.as_ref().is_some_and(|cached| cached.spec == spec);
         if cache.as_ref().is_none_or(|cached| cached.spec != spec) {
             let members = states.values().map(|state| member(&spec, state)).collect::<anyhow::Result<Members>>()?;
             *cache = Some(Cached { spec: spec.clone(), tree: None, states, members: Arc::new(members), generation: Arc::new(()) });
         } else {
             let cached = cache.as_mut().unwrap();
-            let mut tx = cached.tree.as_ref().map(DigestTree::begin);
+            let changes = cached
+                .states
+                .iter()
+                .filter(|(id, before)| states.get(id).is_none_or(|after| after.payload.state.head != before.payload.state.head))
+                .count()
+                + states.keys().filter(|id| !cached.states.contains_key(id)).count();
+            // Individual topology maintenance wins for sparse changes. A
+            // dense inventory fill is cheaper to construct once on demand.
+            let bulk = changes >= BULK_REFRESH_CHANGES && changes >= cached.states.len().div_ceil(4);
+            let mut tx = if bulk { None } else { cached.tree.as_ref().map(DigestTree::begin) };
             let mut members = cached.members.clone();
             let mut changed = false;
             for (id, before) in &cached.states {
@@ -141,6 +153,9 @@ impl QueryTree {
             if let Some(tx) = tx {
                 tx.commit().await?;
             }
+            if bulk {
+                cached.tree = None;
+            }
             cached.states = states;
             cached.members = members;
             if changed {
@@ -151,6 +166,7 @@ impl QueryTree {
         Ok(Snapshot {
             spec,
             tree: cached.tree.as_ref().map(DigestTree::begin),
+            retained,
             states: cached.states.clone(),
             members: cached.members.clone(),
             cache: Arc::downgrade(&self.0),
@@ -236,13 +252,12 @@ impl Snapshot {
                 return Ok(inventory);
             }
         }
-        // A retained tree cheaply answers equality with its root. A newly
-        // built tree offers bounded descendants too, so initial comparison
-        // can recognize cached regions without another refinement exchange.
-        let retained = self.tree.is_some();
+        // Existing query caches answer equality with their root, even when
+        // its lazy digest needs construction. A first snapshot also offers
+        // bounded descendants to avoid another refinement exchange.
         let root = self.head(super::whole()).await?;
         let mut frontier = vec![(root, true)];
-        if !retained {
+        if !self.retained {
             for _ in 0..OFFER_REFINEMENTS {
                 let Some(index) = frontier
                     .iter()

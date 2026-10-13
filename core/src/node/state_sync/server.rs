@@ -347,7 +347,7 @@ where
         let connection = self.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
         let mut comparison = Comparison::new(snapshot, known)?;
         let id = ComparisonId::new();
-        let body = comparison.reply(self, &credentials, catalog).await?;
+        let body = comparison.reply(self, &credentials, catalog, query.is_some()).await?;
         let frame = StateFrame { comparison: id, sequence: 0, body };
         let initial = proto::StateReply { spec: comparison.snapshot.spec.clone(), scope: vec![super::whole()], frame: frame.clone() };
         let mut state = Stream {
@@ -621,7 +621,7 @@ where
                 if comparison.work.is_empty() || comparison.waiting_for_capacity() {
                     break;
                 }
-                comparison.reply(self, &session.credentials, session.catalog).await?
+                comparison.reply(self, &session.credentials, session.catalog, session.query.is_some()).await?
             } else if state.applied {
                 let Some(body) = state.next_live(&session.live)? else { break };
                 body
@@ -1069,6 +1069,7 @@ impl Comparison {
         node: &Node<SE, PA>,
         credentials: &Vec<PA::ContextData>,
         catalog: bool,
+        standing_query: bool,
     ) -> anyhow::Result<StateFrameBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -1284,6 +1285,11 @@ impl Comparison {
         }
         let finished = self.work.is_empty() && self.summaries.is_empty() && self.leaves.is_empty() && self.heads.is_empty();
         let first_complete = finished && !self.complete;
+        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > LEAF_PAGE {
+            // Charge retained-query construction to its initial handoff. Small
+            // inventories and temporary Fetch snapshots remain lazy.
+            self.snapshot.head(super::whole()).await?;
+        }
         self.complete |= finished;
         Ok(StateFrameBody::State {
             items,
