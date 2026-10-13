@@ -106,7 +106,7 @@ fn row(
     };
 
     let stored = LWWBackend::new();
-    stored.apply_operations_with_event(&lww, event_id.clone()).expect("forged catalog ops apply");
+    ankurah::core::test_helpers::apply_backend_event(&stored, &event).expect("forged catalog ops apply");
     let buffer = stored.to_state_buffer().expect("forged catalog state serializes");
     let state = proto::State {
         state_buffers: proto::StateBuffers(BTreeMap::from([("lww".to_owned(), buffer)])),

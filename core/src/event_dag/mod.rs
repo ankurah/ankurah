@@ -19,7 +19,7 @@ pub mod relation;
 mod tests;
 
 pub(crate) use comparison::compare;
-pub(crate) use layers::{CausalRelation, EventLayer};
+pub(crate) use layers::{CausalRelation, EventLayer, EventLayers};
 pub(crate) use relation::AbstractCausalRelation;
 
 /// Default budget for DAG traversal: large enough for typical histories but

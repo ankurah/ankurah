@@ -1,8 +1,8 @@
 //! Core comparison logic for determining causal relationships in event DAGs.
 //!
-//! ## Algorithm: Backward Breadth-First Search
+//! ## Algorithm: Backward Search in Generation Order
 //!
-//! This module implements a **backward breadth-first search** from two clock heads
+//! This module searches backward from two clock heads
 //! simultaneously, walking toward their common ancestors (if any) to classify their
 //! causal relationship.
 //!
@@ -17,20 +17,20 @@
 //!
 //! ## Process
 //!
-//! Before any traversal, `compare` runs a quick check for the common case of
-//! a new event sitting exactly one step above the current head (every subject
-//! event's parents nonempty and within the comparison clock, every comparison
-//! head covered). That shape returns `StrictDescends` without fetching the
-//! comparison events at all; the BFS below is the general path.
+//! Before the two-sided traversal, `compare` tries to trace the subject's
+//! parents down to the current head. A complete extension returns
+//! `StrictDescends` without fetching the comparison events themselves.
 //!
 //! 1. **Initialize**: Start with two frontiers = {subject_head} and {other_head}
-//! 2. **Expand**: Fetch events at current frontier positions via `EventAccumulator`
+//! 2. **Expand**: Read the original heads together, then prefer the greatest queued generation
 //! 3. **Process**: For each returned event:
 //!    - Remove it from its frontier
 //!    - Add its parents to the frontier (moving backward)
 //!    - Track which frontier(s) have seen it (subject, other, or both)
 //! 4. **Detect**: Check if we've determined the relationship (Descends, NotDescends, etc.)
-//! 5. **Repeat** until: relationship determined, frontiers empty, or budget exhausted
+//! 5. **Repeat** until the relation is known, all remaining paths lie below one
+//!    common node, or the budget is exhausted. Unresolved multiple meet nodes
+//!    keep walking; saturation and a failed budget attempt use breadth-first search.
 
 use super::{
     accumulator::{compute_ancestry_from_dag, ComparisonResult, EventAccumulator},
@@ -44,8 +44,8 @@ use std::collections::{BTreeSet, HashMap};
 
 /// Compare two clocks to determine their causal relationship.
 ///
-/// Performs a simultaneous backward breadth-first search from both heads,
-/// looking for common ancestors or divergence.
+/// Walks backward from both heads, preferring greater generations after the
+/// original heads are read, looking for common ancestors or divergence.
 ///
 /// Takes ownership of the retriever, wrapping it in an `EventAccumulator`.
 /// Returns a `ComparisonResult` containing both the relation and the accumulated DAG.
@@ -62,7 +62,7 @@ pub async fn compare<E: GetEvents>(
     let mut accumulator = EventAccumulator::new(event_getter);
     let relation = compare_ancestry(&mut accumulator, subject, comparison, budget).await?;
     accumulator.validate_generation_claims(subject, comparison)?;
-    Ok(ComparisonResult::new(relation, accumulator))
+    Ok(ComparisonResult { relation, accumulator })
 }
 
 async fn compare_ancestry<E: GetEvents>(
@@ -87,54 +87,19 @@ async fn compare_ancestry<E: GetEvents>(
         });
     }
 
-    // Quick check: if every subject event sits exactly one step above the
-    // comparison heads (nonempty parent set, all parents within the comparison
-    // set) and every comparison head is covered by some subject event's
-    // parents, then subject strictly descends comparison. This avoids BFS
-    // entirely for the common case of a new event whose parents ARE the
-    // current head -- and crucially avoids fetching the comparison events
-    // themselves, which may not be in local storage (ephemeral node scenario).
-    //
-    // Both directions are required for soundness (V3): without the per-event
-    // parents-within-comparison guard, a subject event contributing nothing
-    // relevant to the parent union (a disjoint genesis root, or an event on a
-    // foreign lineage) is silently vouched for by its siblings, and the BFS
-    // that would detect the disjoint lineage never runs.
-    {
-        let mut all_parents: BTreeSet<EventId> = BTreeSet::new();
-        let mut applicable = true;
-
-        for id in subject.ids() {
-            match accumulator.get_event(id).await {
-                Ok(event) => {
-                    accumulator.accumulate(&event);
-                    let parents = &event.parent;
-                    if parents.is_empty() || !parents.ids().all(|p| comparison.contains(p)) {
-                        applicable = false;
-                        break;
-                    }
-                    all_parents.extend(parents.ids().cloned());
-                }
-                Err(_) => {
-                    applicable = false;
-                    break;
-                }
-            }
-        }
-
-        if applicable && comparison.ids().all(|id| all_parents.contains(id)) {
-            // Subject's parents cover all comparison heads -> StrictDescends
-            let chain: Vec<EventId> = subject.ids().cloned().collect();
-            return Ok(AbstractCausalRelation::StrictDescends { chain });
-        }
+    // Prove complete extensions without reading the comparison head's events:
+    // an ephemeral node may have their state without retaining their payloads.
+    if let Some(chain) = descendant_chain(accumulator, subject, comparison, budget).await {
+        return Ok(AbstractCausalRelation::StrictDescends { chain });
     }
 
     let initial_budget = budget;
     let max_budget = initial_budget * 4;
     let mut current_budget = initial_budget;
+    let mut generation_order = subject.max_generation() != Some(u32::MAX) && comparison.max_generation() != Some(u32::MAX);
 
     loop {
-        let mut comp = Comparison::new(accumulator, subject, comparison, current_budget);
+        let mut comp = Comparison::new(accumulator, subject, comparison, current_budget, generation_order);
         let relation = loop {
             if let Some(relation) = comp.step().await? {
                 break relation;
@@ -142,6 +107,12 @@ async fn compare_ancestry<E: GetEvents>(
         };
 
         match &relation {
+            AbstractCausalRelation::BudgetExceeded { .. } if generation_order => {
+                // The breadth-first walk can finish a whole frontier beyond its budget.
+                // Retain that behavior when generation ordering does not settle sooner.
+                generation_order = false;
+                current_budget = initial_budget;
+            }
             AbstractCausalRelation::BudgetExceeded { .. } if current_budget < max_budget => {
                 current_budget = (current_budget * 4).min(max_budget);
                 // accumulator retains its DAG and cache - warm start for retry
@@ -152,6 +123,53 @@ async fn compare_ancestry<E: GetEvents>(
             }
         }
     }
+}
+
+/// Follow subject parents down to the comparison clock. Every path must land
+/// there, and every comparison tip must be covered; foreign branches cannot hitch a ride.
+async fn descendant_chain<E: GetEvents>(
+    accumulator: &mut EventAccumulator<E>,
+    subject: &Clock,
+    comparison: &Clock,
+    budget: usize,
+) -> Option<Vec<EventId>> {
+    let oldest_tip = comparison.entries().iter().map(|(generation, _)| *generation).min()?;
+    let mut pending: BTreeSet<_> = subject.entries().iter().cloned().collect();
+    let mut covered = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    let mut chain = Vec::new();
+    while let Some((_, id)) = pending.pop_last() {
+        if comparison.contains(&id) {
+            covered.insert(id);
+            continue;
+        }
+        if !visited.insert(id.clone()) {
+            continue;
+        }
+        if visited.len() > budget.max(subject.entries().len()) {
+            return None;
+        }
+        let event = accumulator.get_event(&id).await.ok()?;
+        accumulator.accumulate(&event);
+        // Older or saturated parents need the two-sided traversal. Generation
+        // only limits this shortcut; the links themselves must prove descent.
+        if event.parent.is_empty()
+            || event
+                .parent
+                .entries()
+                .iter()
+                .any(|(generation, parent)| !comparison.contains(parent) && (*generation <= oldest_tip || *generation == u32::MAX))
+        {
+            return None;
+        }
+        chain.push(id);
+        pending.extend(event.parent.entries().iter().cloned());
+    }
+    if covered.len() != comparison.entries().len() {
+        return None;
+    }
+    chain.reverse();
+    Some(chain)
 }
 
 /// Internal state machine for the comparison algorithm.
@@ -170,6 +188,9 @@ struct Comparison<'a, E: GetEvents> {
     any_common: bool,
 
     remaining_budget: usize,
+    generation_order: bool,
+    queue: BTreeSet<(u32, EventId)>,
+    unfetchable: BTreeSet<EventId>,
 }
 
 /// One clock's backward traversal. Both sides are instances of this type so
@@ -241,6 +262,10 @@ struct NodeState {
     common_child_count: usize,
     subject_children: Vec<EventId>, // Children from subject's traversal
     other_children: Vec<EventId>,   // Children from comparison's traversal
+    /// The generation currently placing this node in the fetch queue.
+    queued_generation: Option<u32>,
+    /// Every path currently queuing this node has crossed common history.
+    below_meet: bool,
 }
 
 impl NodeState {
@@ -251,6 +276,8 @@ impl NodeState {
             common_child_count: 0,
             subject_children: Vec::new(),
             other_children: Vec::new(),
+            queued_generation: None,
+            below_meet: false,
         }
     }
 
@@ -276,8 +303,8 @@ impl NodeState {
 }
 
 impl<'a, E: GetEvents> Comparison<'a, E> {
-    fn new(accumulator: &'a mut EventAccumulator<E>, subject: &Clock, comparison: &Clock, budget: usize) -> Self {
-        Self {
+    fn new(accumulator: &'a mut EventAccumulator<E>, subject: &Clock, comparison: &Clock, budget: usize, generation_order: bool) -> Self {
+        let mut result = Self {
             accumulator,
             subject: Side::new(subject.ids().cloned().collect()),
             comparison: Side::new(comparison.ids().cloned().collect()),
@@ -285,10 +312,23 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             meet_candidates: BTreeSet::new(),
             any_common: false,
             remaining_budget: budget,
+            generation_order,
+            queue: BTreeSet::new(),
+            unfetchable: BTreeSet::new(),
+        };
+        if generation_order {
+            for (generation, id) in subject.into_iter().chain(comparison) {
+                result.enqueue(id, *generation, false);
+            }
         }
+        result
     }
 
     async fn step(&mut self) -> Result<Option<AbstractCausalRelation<EventId>>, RetrievalError> {
+        // Resolve the original heads together before following their annotations.
+        if self.generation_order && (!self.subject.processed.is_empty() || !self.comparison.processed.is_empty()) {
+            return self.step_generation().await;
+        }
         // Collect frontier IDs from both frontiers
         let mut all_frontier_ids = Vec::new();
         all_frontier_ids.extend(self.subject.frontier.ids.iter().cloned());
@@ -322,12 +362,90 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
                 Err(e) => return Err(e),
             };
             self.accumulator.accumulate(&event);
+            if event.generation() == u32::MAX {
+                self.generation_order = false;
+            }
             self.remaining_budget = self.remaining_budget.saturating_sub(1);
             self.process_event(event.id(), &event.parent);
         }
 
         // Check if we have a result
         Ok(self.check_result())
+    }
+
+    async fn step_generation(&mut self) -> Result<Option<AbstractCausalRelation<EventId>>, RetrievalError> {
+        if let Some(id) =
+            self.unfetchable.iter().find(|id| self.subject.frontier.ids.contains(id) && self.comparison.frontier.ids.contains(id)).cloned()
+        {
+            self.unfetchable.remove(&id);
+            self.process_event(id, &Clock::default());
+            return Ok(self.check_result());
+        }
+        while let Some((queued_generation, id)) = self.queue.pop_last() {
+            let event = match self.accumulator.get_event(&id).await {
+                Ok(event) => event,
+                Err(RetrievalError::EventNotFound(_)) => {
+                    if self.subject.frontier.ids.contains(&id) && self.comparison.frontier.ids.contains(&id) {
+                        self.process_event(id, &Clock::default());
+                        return Ok(self.check_result());
+                    }
+                    self.unfetchable.insert(id);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            self.accumulator.accumulate(&event);
+            let generation = event.generation();
+            if generation < queued_generation {
+                // Every queued node has a discovery state.
+                self.states.get_mut(&id).unwrap().queued_generation = Some(generation);
+                self.queue.insert((generation, id));
+                continue;
+            }
+            // Unreliable ordering or saturation keeps the full comparison history.
+            // Known contradictory annotations are still rejected by compare's validator.
+            if generation > queued_generation || generation == u32::MAX {
+                self.generation_order = false;
+            }
+            self.remaining_budget = self.remaining_budget.saturating_sub(1);
+            self.process_event(id, &event.parent);
+            return Ok(self.check_result());
+        }
+        if let Some(id) = self.unfetchable.iter().next() {
+            return Err(RetrievalError::EventNotFound(id.clone()));
+        }
+        Ok(self.check_result())
+    }
+
+    fn enqueue(&mut self, id: &EventId, generation: u32, below_meet: bool) {
+        let state = self.states.entry(id.clone()).or_insert_with(NodeState::new);
+        let queued = state.queued_generation.is_some() || self.unfetchable.contains(id);
+        // One path bypassing common history keeps this node active.
+        state.below_meet = if queued { state.below_meet && below_meet } else { below_meet };
+        if !queued {
+            state.queued_generation = Some(generation);
+            self.queue.insert((generation, id.clone()));
+        }
+    }
+
+    fn settled(&self) -> bool {
+        if self.subject.frontier.is_empty() && self.comparison.frontier.is_empty() {
+            return true;
+        }
+        if !self.generation_order {
+            return false;
+        }
+        // Generations may contain unverified claims. Multiple common nodes could
+        // still descend one another through unread history, so only graph links
+        // proving a single maximal common node permit skipping its ancestors.
+        self.meet_candidates.iter().filter(|id| self.states[*id].common_child_count == 0).count() == 1
+            && self
+                .subject
+                .frontier
+                .ids
+                .iter()
+                .chain(&self.comparison.frontier.ids)
+                .all(|id| self.states.get(id).is_some_and(|state| state.below_meet))
     }
 
     fn process_event(&mut self, id: EventId, parents: &Clock) {
@@ -337,6 +455,9 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         // Update shared node state
         let is_common = {
             let state = self.states.entry(id.clone()).or_insert_with(NodeState::new);
+            if let Some(order) = state.queued_generation.take() {
+                self.queue.remove(&(order, id.clone()));
+            }
             state.mark_seen_from(from_subject, from_comparison);
             state.is_common()
         };
@@ -361,6 +482,14 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
         }
         if from_comparison {
             self.comparison.absorb(&id, parents, &self.subject.original);
+        }
+        if self.generation_order {
+            let below_meet = is_common || self.states[&id].below_meet;
+            for (generation, parent) in parents {
+                if self.subject.frontier.ids.contains(parent) || self.comparison.frontier.ids.contains(parent) {
+                    self.enqueue(parent, *generation, below_meet);
+                }
+            }
         }
     }
 
@@ -458,8 +587,8 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
             return Some(AbstractCausalRelation::StrictAscends);
         }
 
-        // Check if frontiers are exhausted
-        if self.subject.frontier.is_empty() && self.comparison.frontier.is_empty() {
+        // Stop once the remaining shared history cannot change the meet.
+        if self.settled() {
             // No shared history discovered: the clocks are disjoint when the
             // two traversals bottomed out at different genesis events. (Both
             // roots are always found by exhaustion; the fallthrough is
@@ -485,8 +614,8 @@ impl<'a, E: GetEvents> Comparison<'a, E> {
 
             // Shared history exists. Every comparison head must be accounted
             // for: some common node reachable backward from it over the
-            // accumulated DAG, which is complete for both traversals at
-            // exhaustion. A head sharing nothing with the subject forces the
+            // accumulated DAG, which includes every path above the settled meet.
+            // A head sharing nothing with the subject forces the
             // conservative empty meet, so the merge machinery re-layers
             // rather than pretending a partial meet covers the whole clock.
             let dag = self.accumulator.dag();

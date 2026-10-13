@@ -169,26 +169,11 @@ async fn server_edits_subscription() -> Result<()> {
     Ok(())
 }
 
-// Deterministic red repro for the subscription-notification race behind the
-// intermittent `server_edits_subscription` failure (flaky-test tracker #202).
-//
-// Mechanism: when a query initializes, its QuerySubscribed deltas are applied by
-// NodeApplier::apply_delta_inner. For a StateSnapshot delta it calls
-// entity.with_state(...), which returns Some(false) when the state does NOT
-// advance the entity (already resident at that head). apply_delta_inner discards
-// that flag and unconditionally emits an EntityChange with EMPTY events. Because
-// reactor.notify_change is global across every subscription on the node, that
-// no-op change is delivered to ANOTHER, already-established query that holds the
-// same entity as an ItemChange::Update with an empty events list. On slow
-// runners this spurious empty-events Update wins the race against the real
-// edit-driven Update, producing exactly:
-//     left:  [(id, Update, [])]        right: [(id, Update, [EventId(..)])]
-//
-// The race in production is timing (message ordering across two concurrently
-// initializing subscriptions). Here we make the window explicit and
-// deterministic with a MessageGate that holds query B's QuerySubscribed
-// response until query A is fully established and watching the same entity at
-// the same head. Releasing B's (now no-op) delta must NOT notify query A.
+// A second subscription's snapshot can arrive after another query already holds
+// the entity at that head. Applying the unchanged snapshot must not notify the
+// established query with an empty-events Update, which could race its next real
+// update (#202). Hold query B's response until query A is watching, then release
+// the unchanged snapshot and verify that A receives no notification.
 #[tokio::test]
 async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

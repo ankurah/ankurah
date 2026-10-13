@@ -27,6 +27,10 @@ impl AttestationSet {
     pub fn push(&mut self, attestation: Attestation) { self.0.push(attestation); }
 }
 
+impl<T> AsRef<T> for Attested<T> {
+    fn as_ref(&self) -> &T { &self.payload }
+}
+
 impl<T> Attested<T> {
     pub fn opt(payload: T, attestation: Option<Attestation>) -> Self {
         Self { payload, attestations: AttestationSet(attestation.into_iter().collect()) }

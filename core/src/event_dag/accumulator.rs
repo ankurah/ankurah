@@ -11,7 +11,6 @@ use std::num::NonZeroUsize;
 use lru::LruCache;
 
 use crate::error::RetrievalError;
-use crate::event_dag::layers::EventLayers;
 use crate::event_dag::relation::AbstractCausalRelation;
 use crate::retrieval::GetEvents;
 use ankurah_proto::{Clock, Event, EventId, EventStructureError};
@@ -19,18 +18,16 @@ use ankurah_proto::{Clock, Event, EventId, EventStructureError};
 /// Accumulates event DAG structure during comparison and provides
 /// read-through caching for event retrieval during layer iteration.
 ///
-/// Events are assumed to be already stored in local storage before
-/// comparison begins (eager storage model). The accumulator tracks
-/// DAG structure (parent pointers) discovered during BFS and caches
-/// hot events to reduce storage round-trips.
+/// Events may come from a staged batch, storage, or a peer. Parent links
+/// remain in memory; a bounded cache avoids repeated payload retrieval.
 pub(crate) struct EventAccumulator<E: GetEvents> {
     /// Parent links and generations discovered during comparison; never evicted.
     dag: BTreeMap<EventId, Clock>,
 
-    /// LRU cache of Event objects fetched from storage (bounded, eviction-safe)
+    /// LRU cache of retrieved event payloads (bounded, eviction-safe)
     cache: LruCache<EventId, Event>,
 
-    /// Event getter with storage access
+    /// Source of staged, stored, or remote events
     event_getter: E,
 }
 
@@ -41,15 +38,14 @@ impl<E: GetEvents> EventAccumulator<E> {
         Self { dag: BTreeMap::new(), cache: LruCache::new(NonZeroUsize::new(1000).unwrap()), event_getter }
     }
 
-    /// Called during BFS traversal -- records DAG structure and caches the event.
+    /// Record parent links and cache the event during comparison.
     pub(crate) fn accumulate(&mut self, event: &Event) {
         let id = event.id();
         self.dag.insert(id.clone(), event.parent.clone());
         self.cache.put(id, event.clone());
     }
 
-    /// Get event by id: cache -> retriever (storage).
-    /// All events are already in storage (eager storage model).
+    /// Read an event from the cache or underlying retriever.
     pub(crate) async fn get_event(&mut self, id: &EventId) -> Result<Event, RetrievalError> {
         if let Some(event) = self.cache.get(id) {
             return Ok(event.clone());
@@ -80,12 +76,6 @@ impl<E: GetEvents> EventAccumulator<E> {
         }
         Ok(())
     }
-
-    /// Produce layer iterator for merge (consumes self).
-    /// Only valid for DivergedSince results -- the DAG must be complete.
-    pub(crate) fn into_layers(self, meet: Vec<EventId>, current_head: Vec<EventId>) -> EventLayers<E> {
-        EventLayers::new(self, meet, current_head)
-    }
 }
 
 /// Result of a causal comparison, carrying the accumulated DAG.
@@ -93,30 +83,13 @@ pub struct ComparisonResult<E: GetEvents> {
     /// The causal relation between the compared clocks.
     pub(crate) relation: AbstractCausalRelation<EventId>,
     /// Event history collected during comparison.
-    accumulator: EventAccumulator<E>,
+    pub(super) accumulator: EventAccumulator<E>,
 }
 
+#[cfg(test)]
 impl<E: GetEvents> ComparisonResult<E> {
-    /// Create a new ComparisonResult.
-    pub(crate) fn new(relation: AbstractCausalRelation<EventId>, accumulator: EventAccumulator<E>) -> Self {
-        Self { relation, accumulator }
-    }
-
-    /// For DivergedSince results, consume self to get a layer iterator.
-    /// Returns None for non-divergent relations.
-    pub(crate) fn into_layers(self, current_head: Vec<EventId>) -> Option<EventLayers<E>> {
-        match &self.relation {
-            AbstractCausalRelation::DivergedSince { meet, .. } => Some(self.accumulator.into_layers(meet.clone(), current_head)),
-            _ => None,
-        }
-    }
-
     /// Borrow the event history collected during comparison.
-    #[cfg(test)]
     pub(crate) fn accumulator(&self) -> &EventAccumulator<E> { &self.accumulator }
-
-    /// Decompose into relation and accumulator.
-    pub(crate) fn into_parts(self) -> (AbstractCausalRelation<EventId>, EventAccumulator<E>) { (self.relation, self.accumulator) }
 }
 
 // ---- Helper functions ----

@@ -172,17 +172,6 @@ impl PropertyBackend for YrsBackend {
         }
     }
 
-    fn apply_operations(&self, operations: &[Operation]) -> Result<(), MutationError> {
-        let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));
-        for operation in operations {
-            self.apply_update(&operation.diff, &changed_fields)?;
-        }
-        //Only notify field subscribers for fields that actually changed
-        super::notify_changed_fields(&self.field_broadcasts, changed_fields.lock().unwrap().iter());
-
-        Ok(())
-    }
-
     fn apply_layer(&self, layer: &crate::event_dag::EventLayer) -> Result<(), MutationError> {
         // Order within layer doesn't matter for CRDTs - they're commutative.
         // Just apply all operations from to_apply events.

@@ -6,7 +6,7 @@ use ankurah_core::{
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::Value,
 };
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, EventId, ModelId, PropertyId, State, StateBuffers};
+use ankurah_proto::{Attested, Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers};
 
 /// The stored integers in numeric order, spanning zero and both ends of `i64`.
 const ASCENDING: [i64; 9] = [i64::MIN, -1_000_000_000_000, -5, -1, 0, 3, 10, 1_000_000_000_000, i64::MAX];
@@ -88,10 +88,7 @@ async fn write_values(engine: &impl StorageEngine) -> anyhow::Result<HashMap<Ent
     for (byte, value) in (1..).zip(ASCENDING) {
         let backend = LWWBackend::new();
         backend.set(property(), Some(Value::I64(value)));
-        let event = EventId::from_bytes([byte; 32]);
-        if let Some(operations) = backend.to_operations()? {
-            backend.apply_operations_with_event(&operations, event.clone())?;
-        }
+        let event = ankurah_core::test_helpers::commit_backend(&backend, byte)?;
         let entity_id = EntityId::from_bytes([byte; 32]);
         let state = Attested::opt(
             EntityState {
@@ -99,7 +96,7 @@ async fn write_values(engine: &impl StorageEngine) -> anyhow::Result<HashMap<Ent
                 state: State {
                     state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
                     memberships: BTreeSet::from([model()]),
-                    head: Clock::genesis(event),
+                    head: Clock::singleton(&event),
                 },
             },
             None,

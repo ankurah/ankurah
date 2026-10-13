@@ -757,40 +757,8 @@ async fn test_missing_event_busyloop() {
     );
 }
 
-/// Test that an unfetchable event on BOTH frontiers is handled as a common
-/// ancestor without fetching, returning StrictDescends instead of an error.
-///
-/// DAG:  A (creation, NOT in retriever) → B (in retriever)
-/// compare(subject=[B], comparison=[A])
-///
-/// Step 1 (quick-check): fetches B, sees parent=[A]. A == comparison head,
-///   so quick-check returns StrictDescends immediately.
-///
-/// But we also test the BFS path by using a two-step chain so the quick-check
-/// doesn't short-circuit:
-///   A (NOT in retriever) → B → C (both in retriever)
-///   compare(subject=[C], comparison=[A])
-///
-/// Quick-check: fetches C, parent=[B]. B != A, so quick-check doesn't fire.
-/// BFS step 1: fetches C (subject frontier), processes it, adds B to subject frontier.
-///   Fetches/processes A (comparison frontier) — but A is unfetchable!
-///   However, A is only on comparison frontier here, not subject. So we need
-///   a scenario where A ends up on BOTH frontiers.
-///
-/// Better scenario: A (NOT in retriever) → B (in retriever)
-///   compare(subject=[B], comparison=[A])
-///   Quick-check fetches B, parent=[A]. comparison_set={A}, all_parents={A}.
-///   comparison_set ⊆ all_parents → returns StrictDescends. Never reaches BFS.
-///
-/// To actually exercise BFS both-frontiers: use a diamond.
-///   A (NOT in retriever) → B, A → C (B and C in retriever)
-///   compare(subject=[B], comparison=[C])
-///   Quick-check: fetches B, parent=[A]. comparison_set={C}. A != C. No shortcut.
-///   BFS: subject_frontier={B}, comparison_frontier={C}
-///   Step 1: fetch B (ok), parents=[A], add A to subject_frontier.
-///           fetch C (ok), parents=[A], add A to comparison_frontier.
-///   Step 2: A is on BOTH frontiers. Process with empty parents. Common ancestor found.
-///   Result: DivergedSince { meet=[A] }
+/// Siblings B and C both point to unavailable A. Once both frontiers reach A,
+/// comparison can identify it as their meet without needing its payload.
 #[tokio::test]
 async fn test_both_frontiers_unfetchable_meet_point() {
     let mut retriever = MockRetriever::new();
@@ -1385,109 +1353,38 @@ mod lww_layer_tests {
         }
     }
 
-    /// H1 verification: cross-layer handling of winners drawn from already_applied events.
-    ///
-    /// DAG (M = meet, layers as EventLayers yields them for head=[A], incoming=B):
-    ///   M -- A            (local branch, sets x, in head ancestry => already_applied, layer 1)
-    ///   M -- X -- B       (remote branch, B sets x => to_apply; X layer 1, B layer 2)
-    /// A and B are concurrent; the test arranges A.id > B.id, so correct LWW
-    /// resolution says A's value must win on every replica.
-    ///
-    /// apply_layer only persists winners with from_to_apply=true (lww.rs), so a
-    /// winner drawn from already_applied is never written back to self.values.
-    /// This test pins down both halves of the question:
-    ///
-    /// 1. REACHABLE state (invariant): by the time A is in head ancestry, entity.rs
-    ///    has already applied A's operations (apply_operations_from_event on create/
-    ///    StrictDescends/commit, or as a to_apply winner in an earlier merge), so the
-    ///    stored entry for x is A (or something that beat A). Re-seeding each layer
-    ///    from stored state therefore resolves correctly without persisting
-    ///    already_applied winners. Verified for both the local replica and a remote
-    ///    replica that receives A fresh -- they converge on A's value.
-    ///
-    /// 2. UNREACHABLE-state mechanics (the H1 hazard): if the stored entry for x were
-    ///    stamped with a below-meet event Z while A sat only in already_applied, then
-    ///    layer 1 resolves A as the winner for x but does NOT persist it, layer 2
-    ///    re-seeds from stale Z (older_than_meet), and B auto-wins: wrong final value
-    ///    AND wrong stored event_id. The assertions document that mechanical hazard;
-    ///    entity.rs cannot produce this precondition because head only advances after
-    ///    the event's operations are applied to backend state.
     #[test]
     fn test_cross_layer_already_applied_winner_persistence() {
-        // Below-meet event Z: last writer of x before the meet. Deliberately NOT
-        // included in the layers' DAG context, modeling the ephemeral cut where
-        // traversal terminates at an unfetchable common ancestor. (The exhaustive
-        // durable path DOES accumulate below the meet; there Z would be in the DAG
-        // and layer 2's stale re-seed would lose to B via Descends rather than
-        // older_than_meet -- same outcome, same unreachable precondition.)
-        let event_z = make_lww_event(9, vec![("x", "value_from_Z")]);
-
-        // The layers below are built by hand; the retriever only holds the
-        // parents the fixtures read their generations from.
+        // M -> A and M -> X -> B. A has the larger ID, but B's greater
+        // generation must win even when A was already stored before the merge.
         let mut retriever = MockRetriever::new();
         let meet = make_test_event(&retriever, 50, &[]);
         retriever.add_event(meet.clone());
-        let remote_mid = make_test_event(&retriever, 51, &[meet.id()]); // X: remote event, no lww ops
+        let remote_mid = make_test_event(&retriever, 51, &[meet.id()]);
         retriever.add_event(remote_mid.clone());
         let event_b = make_lww_event_with_parent(&retriever, 2, vec![("x", "value_from_B")], &[remote_mid.id()]);
-        // Local-branch event A, concurrent with B, with A.id > B.id (search over seeds).
         let event_a = (0u8..=255)
             .map(|seed| make_lww_event_with_parent(&retriever, seed, vec![("x", "value_from_A")], &[meet.id()]))
             .find(|a| a.id() > event_b.id())
-            .expect("some seed yields A.id > B.id");
+            .unwrap();
 
-        let a_ops: Vec<_> = event_a.operations().backend_operations("lww").cloned().collect();
-        let z_ops: Vec<_> = event_z.operations().backend_operations("lww").cloned().collect();
-        let (a_ops, z_ops) = (&a_ops, &z_ops);
-
-        // All layers share the same accumulated DAG {M, A, X, B}; Z is absent from it.
-        let layer1 = || layer_from_refs_with_context(&[&event_a], &[&remote_mid], &[&meet, &event_b]);
-        let layer1_a_fresh = || layer_from_refs_with_context(&[], &[&event_a, &remote_mid], &[&meet, &event_b]);
-        let layer2 = || layer_from_refs_with_context(&[], &[&event_b], &[&meet, &event_a, &remote_mid]);
-
-        // (1a) REACHABLE local replica: stored x already reflects A, because A's
-        // operations were applied when A entered head ancestry.
         let backend_local = LWWBackend::new();
-        backend_local.apply_operations_with_event(a_ops, event_a.id()).unwrap();
-        backend_local.apply_layer(&layer1()).unwrap();
-        backend_local.apply_layer(&layer2()).unwrap();
-        assert_eq!(
-            backend_local.get(&prop("x")),
-            Some(Value::String("value_from_A".into())),
-            "reachable state: stored entry reflects already_applied A, so A must survive B"
-        );
+        backend_local.apply_layer(&layer_from_refs(&[], &[&event_a])).unwrap();
+        backend_local.apply_layer(&layer_from_refs_with_context(&[&event_a], &[&remote_mid], &[&meet, &event_b])).unwrap();
+        assert_eq!(backend_local.get(&prop("x")), Some(Value::String("value_from_A".into())));
+        assert_eq!(backend_local.get_event_id(&prop("x")), Some(event_a.id()));
 
-        // (1b) Convergence control: a replica that receives A fresh (to_apply) agrees.
+        // A replica receiving A for the first time reaches the same state.
         let backend_remote = LWWBackend::new();
-        backend_remote.apply_operations_with_event(z_ops, event_z.id()).unwrap();
-        backend_remote.apply_layer(&layer1_a_fresh()).unwrap();
-        backend_remote.apply_layer(&layer2()).unwrap();
-        assert_eq!(
-            backend_remote.get(&prop("x")),
-            Some(Value::String("value_from_A".into())),
-            "replica receiving A via to_apply must converge to A's value"
-        );
+        backend_remote.apply_layer(&layer_from_refs_with_context(&[], &[&event_a, &remote_mid], &[&meet, &event_b])).unwrap();
+        assert_eq!(backend_remote.to_state_buffer().unwrap(), backend_local.to_state_buffer().unwrap());
 
-        // (2) UNREACHABLE-state mechanics: stored x stamped with below-meet Z while A
-        // is only in already_applied. Layer 1's winner (A) is not persisted...
-        let backend_stale = LWWBackend::new();
-        backend_stale.apply_operations_with_event(z_ops, event_z.id()).unwrap();
-        backend_stale.apply_layer(&layer1()).unwrap();
-        assert_eq!(
-            backend_stale.get_event_id(&prop("x")),
-            Some(event_z.id()),
-            "already_applied winner A is not written back; stored entry still stamped with Z"
-        );
-        // ...so layer 2 re-seeds from stale Z (older_than_meet) and B auto-wins,
-        // even though A.id > B.id says A should win. This is the H1 hazard, shown
-        // here to be purely mechanical: the precondition is unreachable via entity.rs.
-        backend_stale.apply_layer(&layer2()).unwrap();
-        assert_eq!(
-            backend_stale.get(&prop("x")),
-            Some(Value::String("value_from_B".into())),
-            "stale-seed mechanics: with an (entity-unreachable) below-meet stored entry, B beats A"
-        );
-        assert_eq!(backend_stale.get_event_id(&prop("x")), Some(event_b.id()));
+        let layer2 = layer_from_refs_with_context(&[], &[&event_b], &[&meet, &event_a, &remote_mid]);
+        backend_local.apply_layer(&layer2).unwrap();
+        backend_remote.apply_layer(&layer2).unwrap();
+        assert_eq!(backend_local.get(&prop("x")), Some(Value::String("value_from_B".into())));
+        assert_eq!(backend_local.get_event_id(&prop("x")), Some(event_b.id()));
+        assert_eq!(backend_remote.to_state_buffer().unwrap(), backend_local.to_state_buffer().unwrap());
     }
 }
 
@@ -2004,9 +1901,9 @@ mod phase4_duplicate_creation {
         let creation_event_1 = make_creation_event(1);
         retriever.add_event(creation_event_1.clone());
 
-        let result = entity.apply_event(&retriever, &creation_event_1).await;
+        let result = entity.apply_events(&retriever, &[&creation_event_1]).await;
         assert!(result.is_ok(), "First creation event should succeed");
-        assert!(result.unwrap(), "First creation event should return true (applied)");
+        assert_eq!(result.unwrap(), vec![true], "First creation event should apply");
 
         // Entity head should now be non-empty
         assert!(!entity.head().is_empty(), "Entity head should be non-empty after creation");
@@ -2015,7 +1912,7 @@ mod phase4_duplicate_creation {
         // BFS detects two different roots -> Disjoint -> LineageError::Disjoint
         let creation_event_2 = make_creation_event(2);
         retriever.add_event(creation_event_2.clone());
-        let result = entity.apply_event(&retriever, &creation_event_2).await;
+        let result = entity.apply_events(&retriever, &[&creation_event_2]).await;
 
         assert!(result.is_err(), "Second creation event should fail");
         let err = result.unwrap_err();
@@ -2032,14 +1929,14 @@ mod phase4_duplicate_creation {
         let creation_event = make_creation_event(1);
         retriever.add_event(creation_event.clone());
 
-        let result = entity.apply_event(&retriever, &creation_event.clone()).await;
-        assert!(result.is_ok() && result.unwrap(), "First apply should succeed");
+        let result = entity.apply_events(&retriever, &[&creation_event.clone()]).await;
+        assert_eq!(result.unwrap(), vec![true], "First apply should succeed");
 
         // Re-deliver the SAME creation event (same content, same id)
         // Since event_stored returns false but event is at head, comparison returns Equal -> no-op
-        let result = entity.apply_event(&retriever, &creation_event).await;
+        let result = entity.apply_events(&retriever, &[&creation_event]).await;
         assert!(result.is_ok(), "Re-delivery of same creation event should not error");
-        assert!(!result.unwrap(), "Re-delivery should return false (no-op)");
+        assert_eq!(result.unwrap(), vec![false], "Re-delivery should be a no-op");
     }
 }
 
@@ -2091,7 +1988,7 @@ mod phase4_budget_escalation {
 
 /// Phase 4 Test 6: TOCTOU retry exhaustion produces clean error.
 ///
-/// This tests the retry loop in `apply_event`. A proper test would require a mock
+/// This tests the retry loop in `apply_events`. A proper test would require a mock
 /// that changes the entity head between comparison and CAS, which requires interior
 /// mutability and a custom Retrieve implementation that modifies entity state during
 /// comparison. This is too complex for a unit test.
@@ -2103,7 +2000,7 @@ mod phase4_toctou_retry {
         (1) a custom Retrieve that triggers a side-effect during get_event to modify \
         entity state, (2) precise timing control over the entity's RwLock. The expected \
         behavior is: after MAX_RETRIES (5) attempts where the head moves each time, \
-        apply_event returns Err(MutationError::TOCTOUAttemptsExhausted). This error \
+        apply_events returns Err(MutationError::TOCTOUAttemptsExhausted). This error \
         variant exists and is returned at the end of the retry loop."]
     fn test_toctou_retry_exhaustion_produces_clean_error() {
         // See ignore message above.
@@ -2167,7 +2064,7 @@ mod phase4_mixed_parent_merge {
 
         let ev_e = make_test_event(&retriever, 5, &[id_c.clone(), id_g.clone()]);
         let id_e = ev_e.id();
-        retriever.add_event(ev_e);
+        retriever.add_event(ev_e.clone());
 
         // Build accumulator manually to simulate what comparison would produce.
         // The DAG contains all events above the meet (A is the meet).
@@ -2178,20 +2075,16 @@ mod phase4_mixed_parent_merge {
         }
 
         // Meet = [A], current head = [B]
-        let mut layers = accumulator.into_layers(vec![id_a.clone()], vec![id_b.clone()]);
-
-        // Collect all layers
-        let mut all_layers = Vec::new();
-        while let Some(layer) = layers.next().await.unwrap() {
-            all_layers.push(layer);
-        }
+        let layers =
+            crate::event_dag::layers::EventLayers::load(accumulator, vec![id_a.clone()], vec![id_b.clone()], &[&ev_e]).await.unwrap();
+        let all_layers = layers.layers();
 
         // Verify we got multiple layers and all events are covered
         assert!(all_layers.len() >= 2, "Expected at least 2 layers for mixed-parent merge, got {}", all_layers.len());
 
         // Collect all event ids from all layers
         let mut all_event_ids: Vec<EventId> = Vec::new();
-        for layer in &all_layers {
+        for layer in all_layers {
             for e in &layer.already_applied {
                 all_event_ids.push(e.id());
             }
@@ -2274,7 +2167,7 @@ mod phase4_eager_storage_bfs {
 
         let ev_d = make_test_event(&retriever, 4, &[id_b.clone()]);
         let id_d = ev_d.id();
-        retriever.add_event(ev_d);
+        retriever.add_event(ev_d.clone());
 
         let ev_e = make_test_event(&retriever, 5, &[id_c.clone()]);
         let id_e = ev_e.id();
@@ -2304,15 +2197,12 @@ mod phase4_eager_storage_bfs {
         assert!(dag.contains_key(&id_d), "BFS should have accumulated event D");
         assert!(dag.contains_key(&id_e), "BFS should have accumulated event E");
 
-        // Now verify the result can produce valid layers
-        let mut layers = result.into_layers(vec![id_d.clone()]).unwrap();
-        let mut layer_count = 0;
-        while let Some(layer) = layers.next().await.unwrap() {
-            layer_count += 1;
-            // Each layer should have events
+        // Preparation must also load layers from the eagerly stored history.
+        let layers = crate::event_dag::EventLayers::prepare(&retriever, &[&ev_d], &clock_e).await.unwrap();
+        assert!(!layers.layers().is_empty(), "Should produce at least one layer from eagerly stored events");
+        for layer in layers.layers() {
             assert!(!layer.to_apply.is_empty() || !layer.already_applied.is_empty(), "Layer should not be empty");
         }
-        assert!(layer_count > 0, "Should produce at least one layer from eagerly stored events");
     }
 }
 
@@ -2824,7 +2714,7 @@ mod strict_descends_gap_jump {
         retriever.add_event(ev_b.clone());
 
         // Establish local head = {A}.
-        assert!(entity.apply_event(&retriever, &ev_a).await.unwrap(), "A should apply");
+        assert_eq!(entity.apply_events(&retriever, &[&ev_a]).await.unwrap(), vec![true], "A should apply");
         assert_eq!(entity.head(), retriever.clock(&[id_a.clone()]));
         assert_eq!(read_lww(&entity, "p0"), Some(Value::String("genesis".into())));
 
@@ -2835,7 +2725,7 @@ mod strict_descends_gap_jump {
         assert_eq!(sorted_ids, vec![id_x.clone(), id_b.clone()], "sort must place parent X before child B");
 
         for event in &sorted {
-            assert!(entity.apply_event(&retriever, &event.payload).await.unwrap(), "each event applies in causal order");
+            assert_eq!(entity.apply_events(&retriever, &[&event.payload]).await.unwrap(), vec![true], "each event applies in causal order");
         }
 
         assert_eq!(entity.head(), retriever.clock(&[id_b.clone()]), "head advanced to B");
@@ -3090,5 +2980,377 @@ mod comparison_property {
             "artifact line must carry a copy-pasteable single-seed repro command: {line}"
         );
         assert!(!line.contains('\n'), "artifact line must be a single line: {line}");
+    }
+}
+
+mod lww_delivery_order {
+    use super::*;
+    use crate::entity::state::EntityState;
+
+    fn write(seed: u8, value: &str, parents: &[&Event]) -> Event {
+        let backend = LWWBackend::new();
+        backend.set(prop("p"), Some(Value::String(value.into())));
+        let operations = OperationSet::from_backends(BTreeMap::from([("lww".into(), backend.to_operations().unwrap().unwrap())]));
+        let parent = Clock::from_events(parents.iter().copied());
+        Event { entity_id: EntityId::from_bytes([seed; 32]), body: fixture_body(&[seed], &parent, operations), parent }
+    }
+
+    #[tokio::test]
+    async fn triangle_converges_in_every_causal_delivery_order() {
+        // G -> X1 -> X2 and G -> Y, with X1.id > Y.id > X2.id.
+        // Pairwise causal-order/ID comparison loses a different candidate in
+        // each delivery order; generation ranking must retain X2 in all three.
+        let (g, x1, x2, y) = (0..=255)
+            .map(|seed| {
+                let g = write(seed, "G", &[]);
+                let x1 = write(seed, "X1", &[&g]);
+                let x2 = write(seed, "X2", &[&x1]);
+                let y = write(seed, "Y", &[&g]);
+                (g, x1, x2, y)
+            })
+            .find(|(_, x1, x2, y)| x1.id() > y.id() && y.id() > x2.id())
+            .unwrap();
+        let mut retriever = MockRetriever::new();
+        for event in [&g, &x1, &x2, &y] {
+            retriever.add_event(event.clone());
+        }
+
+        let mut states = Vec::new();
+        for order in [[&g, &x1, &x2, &y], [&g, &x1, &y, &x2], [&g, &y, &x1, &x2]] {
+            let entity = EntityState::empty();
+            for event in order {
+                assert_eq!(entity.apply_events(&retriever, &[event]).await.unwrap(), vec![true]);
+            }
+            assert_eq!(entity.head(), Clock::from_events([&x2, &y]));
+            states.push(entity.to_state().unwrap().state_buffers);
+        }
+        assert_eq!(states[0], states[1]);
+        assert_eq!(states[0], states[2]);
+        let backend = LWWBackend::from_state_buffer(&states[0]["lww"]).unwrap();
+        assert_eq!(backend.get(&prop("p")), Some(Value::String("X2".into())));
+        assert_eq!(backend.get_event_id(&prop("p")), Some(x2.id()));
+    }
+
+    #[tokio::test]
+    async fn unequal_branches_keep_deepest_write_in_every_interleaving() {
+        // Four positions for Y among the three ordered X writes, with sixteen
+        // different ID orderings. This exercises repeated direct and layer merges.
+        for seed in 0..16 {
+            let g = write(seed, "G", &[]);
+            let x1 = write(seed, "X1", &[&g]);
+            let x2 = write(seed, "X2", &[&x1]);
+            let x3 = write(seed, "X3", &[&x2]);
+            let y = write(seed, "Y", &[&g]);
+            let mut retriever = MockRetriever::new();
+            for event in [&g, &x1, &x2, &x3, &y] {
+                retriever.add_event(event.clone());
+            }
+            for position in 1..=4 {
+                let mut order = vec![&g, &x1, &x2, &x3];
+                order.insert(position, &y);
+                let entity = EntityState::empty();
+                for event in &order {
+                    assert_eq!(entity.apply_events(&retriever, &[event]).await.unwrap(), vec![true]);
+                }
+                // Every batch boundary must yield the same head and backend state as single-event delivery.
+                for split in 0..=order.len() {
+                    let batched = EntityState::empty();
+                    batched.apply_events(&retriever, &order[..split]).await.unwrap();
+                    batched.apply_events(&retriever, &order[split..]).await.unwrap();
+                    assert_eq!(
+                        batched.to_state().unwrap(),
+                        entity.to_state().unwrap(),
+                        "seed {seed}, Y position {position}, split {split}"
+                    );
+                }
+                assert_eq!(entity.head(), Clock::from_events([&x3, &y]));
+                assert_eq!(entity.value(&prop("p")), Some(Value::String("X3".into())), "seed {seed}, Y position {position}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod generation_comparison {
+    use super::*;
+    use crate::error::{LineageError, MutationError};
+    use crate::event_dag::{accumulator::EventAccumulator, CausalRelation, EventLayers};
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone)]
+    struct CountingRetriever {
+        inner: MockRetriever,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl CountingRetriever {
+        fn new(inner: MockRetriever) -> Self { Self { inner, reads: Arc::new(AtomicUsize::new(0)) } }
+        fn reads(&self) -> usize { self.reads.load(Ordering::Relaxed) }
+    }
+
+    #[async_trait]
+    impl GetEvents for CountingRetriever {
+        async fn get_event(&self, id: &EventId) -> Result<Event, RetrievalError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.inner.get_event(id).await
+        }
+        async fn event_stored(&self, id: &EventId) -> Result<bool, RetrievalError> { self.inner.event_stored(id).await }
+    }
+
+    fn linear_history(length: u16) -> (MockRetriever, Vec<Event>) {
+        let mut retriever = MockRetriever::new();
+        let mut events: Vec<Event> = Vec::new();
+        for seed in 1..=length {
+            let parents = events.last().map(|event| vec![event.id()]).unwrap_or_default();
+            let event = make_test_event_u16(&retriever, seed, &parents);
+            retriever.add_event(event.clone());
+            events.push(event);
+        }
+        (retriever, events)
+    }
+
+    #[tokio::test]
+    async fn divergent_branches_do_not_read_the_long_shared_tail() {
+        for depth in [1, 5, 20] {
+            let (mut retriever, events) = linear_history(300);
+            let meet = events.last().unwrap();
+            let mut left = meet.clone();
+            let mut right = meet.clone();
+            let mut left_chain = Vec::new();
+            let mut right_chain = Vec::new();
+            for step in 0..depth {
+                left = make_test_event_u16(&retriever, 400 + 2 * step, &[left.id()]);
+                retriever.add_event(left.clone());
+                left_chain.push(left.id());
+                right = make_test_event_u16(&retriever, 401 + 2 * step, &[right.id()]);
+                retriever.add_event(right.clone());
+                right_chain.push(right.id());
+            }
+            let retriever = CountingRetriever::new(retriever);
+            let result = compare(retriever.clone(), &Clock::singleton(&left), &Clock::singleton(&right), 1000).await.unwrap();
+            assert_eq!(
+                result.relation,
+                AbstractCausalRelation::DivergedSince {
+                    meet: vec![meet.id()],
+                    subject: vec![left_chain[0].clone()],
+                    other: vec![right_chain[0].clone()],
+                    subject_chain: left_chain,
+                    other_chain: right_chain,
+                }
+            );
+            assert_eq!(retriever.reads(), usize::from(2 * depth + 1), "depth {depth}");
+        }
+    }
+
+    #[tokio::test]
+    async fn uneven_ancestor_comparisons_do_not_read_below_the_older_head() {
+        let (events, history) = linear_history(320);
+        let ancestor = Clock::singleton(&history[299]);
+        let descendant = Clock::singleton(&history[319]);
+        let retriever = CountingRetriever::new(events.clone());
+        let result = compare(retriever.clone(), &descendant, &ancestor, 1000).await.unwrap();
+        assert_eq!(result.relation, AbstractCausalRelation::StrictDescends { chain: history[300..].iter().map(Event::id).collect() });
+        assert!(retriever.reads() <= 21, "read {} events", retriever.reads());
+
+        let retriever = CountingRetriever::new(events);
+        let result = compare(retriever.clone(), &ancestor, &descendant, 1000).await.unwrap();
+        assert_eq!(result.relation, AbstractCausalRelation::StrictAscends);
+        assert!(retriever.reads() <= 21, "read {} events", retriever.reads());
+    }
+
+    #[tokio::test]
+    async fn unresolved_meet_nodes_cannot_be_ordered_by_unverified_parent_claims() {
+        let (mut retriever, chain) = linear_history(4);
+        let c2 = &chain[2];
+        let parent = &chain[3];
+        let mut c1 = make_test_event(&retriever, 10, &[parent.id()]);
+        // A second parent keeps c1's own generation honest-looking while its
+        // annotation hides that the first parent descends the other meet node.
+        let mut sibling = chain[0].clone();
+        for seed in 11..=13 {
+            sibling = make_test_event(&retriever, seed, &[sibling.id()]);
+            retriever.add_event(sibling.clone());
+        }
+        c1.parent = Clock::new(vec![(1, parent.id()), (sibling.generation(), sibling.id())]).unwrap();
+        retriever.add_event(c1.clone());
+        let left = make_test_event(&retriever, 14, &[c1.id(), c2.id()]);
+        retriever.add_event(left.clone());
+        let right = make_test_event(&retriever, 15, &[c1.id(), c2.id()]);
+        retriever.add_event(right.clone());
+
+        let result = compare(retriever, &Clock::singleton(&left), &Clock::singleton(&right), 100).await;
+        assert!(
+            matches!(result, Err(RetrievalError::EventStructure(EventStructureError::GenerationMismatch { event, claimed: 1, known: 4 })) if event == parent.id())
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_generations_keep_the_exhaustive_walk() {
+        // The opaque ancestor represents a snapshot whose earlier history is unavailable.
+        let opaque = EventId::from_bytes([42; 32]);
+        let mut meet = make_test_event_over(1, &[]);
+        meet.parent = Clock::new(vec![(u32::MAX - 2, opaque)]).unwrap();
+        meet.body = fixture_body(&[1], &meet.parent, OperationSet::default());
+        let left = make_test_event_over(2, &[&meet]);
+        let right = make_test_event_over(3, &[&meet]);
+        let mut events = MockRetriever::new();
+        for event in [&meet, &left, &right] {
+            events.add_event(event.clone());
+        }
+        let retriever = CountingRetriever::new(events);
+        let result = compare(retriever.clone(), &Clock::singleton(&left), &Clock::singleton(&right), 100).await.unwrap();
+        let AbstractCausalRelation::DivergedSince { meet: found, .. } = result.relation else { panic!("expected divergence") };
+        assert_eq!(found, vec![meet.id()]);
+        assert_eq!(retriever.reads(), 4, "the walk includes the unavailable common ancestor below the meet");
+    }
+
+    #[tokio::test]
+    async fn merge_preserves_writer_below_one_of_multiple_meet_points() {
+        // R -> P -> V -> M1 -> C; R -> M2 -> C; M2 -> S; (M1, S) -> J.
+        // V and S write x concurrently at the same generation. V has the greater
+        // ID and must survive, although it is below only M1 in the shared meet.
+        let mut retriever = MockRetriever::new();
+        let root = make_test_event(&retriever, 1, &[]);
+        retriever.add_event(root.clone());
+        let prior = make_test_event(&retriever, 2, &[root.id()]);
+        retriever.add_event(prior.clone());
+        let stored = make_lww_event_with_parent(&retriever, 3, vec![("x", "stored")], &[prior.id()]);
+        retriever.add_event(stored.clone());
+        let m1 = make_test_event(&retriever, 4, &[stored.id()]);
+        retriever.add_event(m1.clone());
+        let m2 = make_test_event(&retriever, 5, &[root.id()]);
+        retriever.add_event(m2.clone());
+        let incoming = (6..=255)
+            .map(|seed| make_lww_event_with_parent(&retriever, seed, vec![("x", "incoming")], &[m2.id()]))
+            .find(|event| event.id() < stored.id())
+            .unwrap();
+        retriever.add_event(incoming.clone());
+        assert_eq!(incoming.generation(), stored.generation());
+        let current = make_test_event(&retriever, 7, &[m1.id(), m2.id()]);
+        retriever.add_event(current.clone());
+        let joined = make_test_event(&retriever, 8, &[m1.id(), incoming.id()]);
+        retriever.add_event(joined.clone());
+
+        let result = compare(&retriever, &Clock::singleton(&joined), &Clock::singleton(&current), 100).await.unwrap();
+        let AbstractCausalRelation::DivergedSince { meet, .. } = &result.relation else { panic!("expected divergence") };
+        assert_eq!(meet.iter().cloned().collect::<std::collections::BTreeSet<_>>(), [m1.id(), m2.id()].into_iter().collect());
+        let backend = LWWBackend::new();
+        backend.apply_layer(&layer_from_refs(&[], &[&stored])).unwrap();
+        let layers = EventLayers::prepare(&retriever, &[&joined], &Clock::singleton(&current)).await.unwrap();
+        for layer in layers.layers() {
+            backend.apply_layer(layer).unwrap();
+        }
+        assert_eq!(backend.get(&prop("x")), Some(Value::String("stored".into())));
+    }
+    #[tokio::test]
+    async fn skips_applied_frontiers_without_losing_later_events_or_policy_boundaries() {
+        // R -> H (resident), R -> first -> last. The incoming clock keeps H too.
+        // Exhaustive history includes R below the compared head; traverse it
+        // without an application step before reaching the new branch.
+        let root = make_test_event_over(1, &[]);
+        let head = make_test_event_over(2, &[&root]);
+        let first = make_test_event_over(3, &[&root]);
+        let last = make_test_event_over(4, &[&first]);
+        let mut accumulator = EventAccumulator::new(MockRetriever::new());
+        for event in [&root, &head, &first, &last] {
+            accumulator.accumulate(event);
+        }
+        let layers = EventLayers::load(accumulator, vec![head.id()], vec![head.id()], &[&head, &first, &last]).await.unwrap();
+        assert_eq!(layers.per_event().map(|layers| layers.len()).collect::<Vec<_>>(), vec![0, 1, 1]);
+        let [first_layer, last_layer] = layers.layers() else { panic!("expected the two new writes") };
+        assert_eq!(first_layer.to_apply, vec![first.clone()]);
+        assert_eq!(last_layer.to_apply, vec![last.clone()]);
+        assert!(first_layer.already_applied.is_empty());
+        assert!(last_layer.already_applied.is_empty());
+        assert_eq!(last_layer.compare(&last.id(), &root.id()), CausalRelation::Descends);
+    }
+
+    #[tokio::test]
+    async fn already_applied_comparisons_have_no_layers() {
+        let (retriever, history) = linear_history(2);
+        let current = Clock::singleton(&history[1]);
+        let layers = EventLayers::prepare(&retriever, &[&history[1], &history[1]], &current).await.unwrap();
+        assert!(layers.layers().is_empty());
+        assert_eq!(layers.per_event().map(|layers| layers.len()).collect::<Vec<_>>(), vec![0, 0]);
+
+        let layers = EventLayers::prepare(&retriever, &[&history[0]], &current).await.unwrap();
+        assert!(layers.layers().is_empty());
+        assert_eq!(layers.per_event().map(|layers| layers.len()).collect::<Vec<_>>(), vec![0]);
+    }
+
+    #[tokio::test]
+    async fn disjoint_comparison_cannot_produce_layers() {
+        let left = make_test_event_over(1, &[]);
+        let right = make_test_event_over(2, &[]);
+        let mut retriever = MockRetriever::new();
+        retriever.add_event(left.clone());
+        retriever.add_event(right.clone());
+        assert!(matches!(
+            EventLayers::prepare(&retriever, &[&left], &Clock::singleton(&right)).await,
+            Err(MutationError::LineageError(LineageError::Disjoint))
+        ));
+    }
+
+    #[tokio::test]
+    async fn exhausted_preparation_returns_its_budget_and_frontiers() {
+        // Equally deep branches pass the generation bound but cannot meet within the history budget.
+        let (mut retriever, history) = linear_history(5000);
+        let mut other = history[0].clone();
+        for seed in 5001..10000 {
+            other = make_test_event_u16(&retriever, seed, &[other.id()]);
+            retriever.add_event(other.clone());
+        }
+        assert!(matches!(
+            EventLayers::prepare(&retriever, &[history.last().unwrap()], &Clock::singleton(&other)).await,
+            Err(MutationError::LineageError(LineageError::BudgetExceeded {
+                original_budget, subject_frontier, other_frontier,
+            })) if original_budget == crate::event_dag::DEFAULT_BUDGET + 1
+                && !subject_frontier.is_empty() && !other_frontier.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn direct_extension_builds_one_layer_without_reading_either_head_tip() {
+        let root = make_test_event_over(1, &[]);
+        let left = make_test_event_over(2, &[&root]);
+        let right = make_test_event_over(3, &[&root]);
+        let incoming = make_test_event_over(4, &[&left, &right]);
+        let mut events = MockRetriever::new();
+        events.add_event(incoming.clone());
+        let retriever = CountingRetriever::new(events);
+        let layers = EventLayers::prepare(&retriever, &[&incoming], &Clock::from_events([&left, &right])).await.unwrap();
+        let [layer] = layers.layers() else { panic!("expected one layer") };
+        assert!(layer.already_applied.is_empty());
+        assert_eq!(layer.to_apply, vec![incoming.clone()]);
+        assert_eq!(layer.compare(&incoming.id(), &left.id()), CausalRelation::Descends);
+        assert_eq!(layer.compare(&incoming.id(), &right.id()), CausalRelation::Descends);
+        assert_eq!(retriever.reads(), 1, "only the staged incoming event was read");
+    }
+
+    #[tokio::test]
+    async fn empty_head_builds_a_genesis_layer_only_when_application_is_requested() {
+        let genesis = make_test_event_over(1, &[]);
+        let mut events = MockRetriever::new();
+        events.add_event(genesis.clone());
+        let retriever = CountingRetriever::new(events);
+        compare(retriever.clone(), &Clock::singleton(&genesis), &Clock::default(), 100).await.unwrap();
+        assert_eq!(retriever.reads(), 0, "empty-head comparison needs no history");
+        let layers = EventLayers::prepare(&retriever, &[&genesis], &Clock::default()).await.unwrap();
+        let [layer] = layers.layers() else { panic!("expected one layer") };
+        assert!(layer.already_applied.is_empty());
+        assert_eq!(layer.to_apply, vec![genesis]);
+        assert_eq!(retriever.reads(), 1);
+    }
+
+    #[tokio::test]
+    async fn empty_head_rejects_an_update_without_its_creation_batch() {
+        let genesis = make_test_event_over(1, &[]);
+        let update = make_test_event_over(2, &[&genesis]);
+        let mut events = MockRetriever::new();
+        events.add_event(update.clone());
+        let retriever = CountingRetriever::new(events);
+        assert!(matches!(EventLayers::prepare(&retriever, &[&update], &Clock::default()).await, Err(MutationError::InvalidEvent)));
+        assert_eq!(retriever.reads(), 0);
     }
 }

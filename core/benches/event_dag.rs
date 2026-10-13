@@ -17,13 +17,13 @@
 //! Groups:
 //! - `compare`: the causal comparison across DAG shapes (linear deep, uneven
 //!   diamond chains, wide antichains, disjoint graphs).
-//! - `layers`: draining a `DivergedSince` comparison into topological layers.
+//! - `layers`: preparing application layers, including comparison and batch validation.
 //! - `clock`: membership, normalizing construction, and insert on `Clock`.
 //! - `toposort`: parents-first ordering of a shuffled event batch.
 
 use std::collections::{BTreeMap, HashMap};
 
-use ankurah_core::bench_support::{compare, topo_sort_events, AbstractCausalRelation, DEFAULT_BUDGET};
+use ankurah_core::bench_support::{compare, prepare_layers, topo_sort_events, AbstractCausalRelation, DEFAULT_BUDGET};
 use ankurah_core::error::RetrievalError;
 use ankurah_core::retrieval::GetEvents;
 use ankurah_proto::{Attested, AuthorId, Clock, EntityId, Event, EventBody, EventId, OperationSet};
@@ -252,28 +252,23 @@ fn bench_compare(c: &mut Criterion) {
 }
 
 // ============================================================================
-// Layer iteration: DivergedSince -> EventLayers -> drain
+// Batch preparation: validation, comparison, and layer loading
 // ============================================================================
 
 fn bench_layers(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     let mut group = c.benchmark_group("layers");
 
-    // A diamond chain diverges into two long concurrent tips; draining walks
-    // every layer from the meet to both tips. current_head is the comparison
-    // tip so the partition into to_apply / already_applied is non-trivial.
+    // The final diamond's tips are concurrent. Preparation validates the incoming
+    // tip, compares it against the other tip, and loads their application layer.
     for n in [4usize, 16, 64] {
         let s = diamond_chain(n);
-        let current_head: Vec<EventId> = s.comparison.ids().cloned().collect();
         group.throughput(Throughput::Elements(s.events));
-        group.bench_with_input(BenchmarkId::new("diamond_chain_drain", n), &s, |b, s| {
+        group.bench_with_input(BenchmarkId::new("diamond_chain_prepare", n), &s, |b, s| {
+            let events: Vec<_> = s.subject.ids().map(|id| &s.retriever.events[id]).collect();
             b.to_async(&rt).iter(|| async {
-                let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
-                let mut layers = r.into_layers(current_head.clone()).expect("DivergedSince yields layers");
-                let mut count = 0usize;
-                while let Some(layer) = layers.next().await.unwrap() {
-                    count += layer.to_apply + layer.already_applied;
-                }
+                let layers = prepare_layers(&s.retriever.clone(), &events, &s.comparison).await.unwrap();
+                let count: usize = layers.iter().map(|layer| layer.to_apply + layer.already_applied).sum();
                 std::hint::black_box(count);
             });
         });

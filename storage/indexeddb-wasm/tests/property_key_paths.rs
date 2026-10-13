@@ -5,7 +5,7 @@ use ankurah_core::{
     storage::{CatalogResolver, StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::{Value, ValueType},
 };
-use ankurah_proto::{Clock, EntityId, EntityState, EventId, ModelId, PropertyId, State, StateBuffers};
+use ankurah_proto::{Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers};
 use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use std::sync::Arc;
 use wasm_bindgen_test::*;
@@ -86,14 +86,12 @@ fn state(model: &ModelId, marker: u8, value_id: EntityId, value: Option<Value>, 
         backend.set(PropertyId::EntityId(value_id), Some(value));
     }
     backend.set(rank_id(), Some(Value::I32(rank)));
-    let event_id = EventId::from_bytes([marker; 32]);
-    let operations = backend.to_operations()?.expect("fixture has writes");
-    backend.apply_operations_with_event(&operations, event_id.clone())?;
+    let event = ankurah_core::test_helpers::commit_backend(&backend, marker)?;
     Ok(EntityState {
         entity_id: EntityId::from_bytes([marker; 32]),
         state: State {
             state_buffers: StateBuffers([(String::from("lww"), backend.to_state_buffer()?)].into()),
-            head: Clock::genesis(event_id),
+            head: Clock::singleton(&event),
             memberships: [*model].into(),
             ..State::default()
         },

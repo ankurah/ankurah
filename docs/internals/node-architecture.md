@@ -27,7 +27,7 @@ caches it locally.
 This distinction surfaces in one critical API:
 `storage_is_definitive()`. On a durable node this returns `true` -- a
 negative lookup is conclusive. On an ephemeral node it returns `false`,
-which forces the system to do a deeper [DAG traversal](event-dag.md#bfs-traversal)
+which forces the system to do a deeper [DAG traversal](event-dag.md#generation-guided-traversal)
 instead of taking the shortcut. See the
 [creation-event guard](entity-lifecycle.md#guard-ordering) for the main place
 this matters.
@@ -51,9 +51,9 @@ have the state) or the new entity state plus the events that produced it
 (`StateAndEvent`). `EventOnly` is a valid wire format handled by the
 receiver, though current senders always include state. On the receiving side
 the node validates the state, integrates the events via
-[`apply_event`](entity-lifecycle.md#how-events-are-applied), and persists the
+[`apply_events`](entity-lifecycle.md#how-events-are-applied), and persists the
 result. If the incoming state diverges from what the receiver already has,
-the receiver falls back to event-by-event `apply_event` with
+the receiver falls back to batch `apply_events` with
 [BFS comparison](event-dag.md#comparing-two-clocks).
 
 ### Request/response deltas (`DeltaContent`)

@@ -28,7 +28,7 @@
 //!   relationship, so their arrival order must not change the outcome);
 //! - the same event DAG delivered under different layer-arrival schedules
 //!   converges to byte-identical state (cross-order determinism);
-//! - the `_with_event` provenance hook is honored (LWW records the writing event
+//! - the layer provenance contract is honored (LWW records the writing event
 //!   id and uses it for conflict resolution; a CRDT is free to ignore it).
 //!
 //! They deliberately do NOT certify *merge usefulness* or *interleaving intent*.
@@ -61,17 +61,10 @@
 //!
 //! # Constructible-state scope (`ValueEntry::Pending`)
 //!
-//! LWW carries a `ValueEntry::Pending` variant for wire-applied-but-uncommitted
-//! values. Its disposition is an open question bound to issue #272 and the
-//! ankurah#267 remainder, so the kit does not decide it and does not exercise it.
-//! Every law here drives backends only through their committed, event-tracked
-//! paths (`apply_operations_with_event`, `apply_layer`, `to_state_buffer`), which
-//! is the set of states a backend actually reaches during normal DAG integration.
-//! A `Pending` value is read-visible but neither merges nor persists (it is
-//! rejected by `to_state_buffer` and ignored by `apply_layer`), so it is outside
-//! the state space these laws range over. When ankurah#272 decides whether a
-//! wire-applied uncommitted value is a Bayou-style tentative participant or a
-//! non-authoritative staging marker, the corresponding law belongs in that PR.
+//! LWW carries a `ValueEntry::Pending` variant for locally extracted but uncommitted
+//! values. These remain read-visible, but cannot be serialized until their
+//! event applies. The laws below cover committed state after `apply_layer`;
+//! local transaction staging is outside their scope.
 //!
 //! # Adopting the kit
 //!
@@ -142,7 +135,7 @@ pub(crate) trait ConformanceBackend {
     fn linear_writes() -> Vec<Self::Write>;
 
     /// Assert the backend's provenance obligation after a single write was applied
-    /// via `apply_operations_with_event` under `event_id`. LWW asserts the event
+    /// via `apply_layer` under `event_id`. LWW asserts the event
     /// id was recorded and is exposed for later resolution; a CRDT that ignores
     /// provenance leaves this a no-op. Called by [`law_provenance`].
     fn check_provenance(_backend: &Arc<dyn PropertyBackend>, _event_id: &EventId) {}
@@ -214,17 +207,19 @@ fn layer_from_events(already_applied: &[&Event], to_apply: &[&Event], context: &
 /// backend whose own re-serialized state buffer is byte-identical, and whose
 /// read-visible properties match. This certifies the state buffer carries
 /// everything the backend needs to reconstruct itself, including the provenance
-/// (LWW event ids) required for future conflict resolution.
+/// (LWW write ranks) required for future conflict resolution.
 pub(crate) fn law_state_buffer_round_trip<B: ConformanceBackend>() {
     let backend = B::new_backend();
 
     // Apply a linear sequence of writes, each committed under a distinct event id
     // so the backend records provenance where it needs to.
     let scratch = B::new_backend();
+    let mut previous: Option<Event> = None;
     for (i, write) in B::linear_writes().iter().enumerate() {
         let ops = B::stage_write(&scratch, write);
-        let event = make_event(i as u16, B::backend_name(), ops.clone(), &[]);
-        backend.apply_operations_with_event(&ops, event.id()).expect("apply_operations_with_event");
+        let event = make_event(i as u16, B::backend_name(), ops.clone(), &previous.iter().collect::<Vec<_>>());
+        crate::test_helpers::apply_backend_event(&*backend, &event).expect("apply_layer");
+        previous = Some(event);
     }
 
     let buffer = backend.to_state_buffer().expect("to_state_buffer must succeed for a committed backend");
@@ -242,24 +237,26 @@ pub(crate) fn law_state_buffer_round_trip<B: ConformanceBackend>() {
 }
 
 /// Operation round-trip across two nodes: node A applies a linear sequence of
-/// writes via `apply_operations_with_event`; the operations from each event are
+/// writes via `apply_layer`; the operations from each event are
 /// carried to node B (a second, independent backend instance) and applied the
 /// same way. Both nodes must expose identical property values and produce
 /// byte-identical state buffers. This is the wire path (`to_operations` on the
-/// writer, `apply_operations` on the reader) between two nodes that never share
+/// writer, `apply_layer` on the reader) between two nodes that never share
 /// in-memory state.
 pub(crate) fn law_operation_round_trip_across_nodes<B: ConformanceBackend>() {
     let node_a = B::new_backend();
     let node_b = B::new_backend();
 
     let scratch = B::new_backend();
+    let mut previous: Option<Event> = None;
     for (i, write) in B::linear_writes().iter().enumerate() {
         let ops = B::stage_write(&scratch, write);
-        let event = make_event(i as u16, B::backend_name(), ops.clone(), &[]);
+        let event = make_event(i as u16, B::backend_name(), ops.clone(), &previous.iter().collect::<Vec<_>>());
         // Node A records the write under its event id.
-        node_a.apply_operations_with_event(&ops, event.id()).expect("node A apply_operations_with_event");
+        crate::test_helpers::apply_backend_event(&*node_a, &event).expect("node A apply_layer");
         // The same operations cross to node B under the same event id.
-        node_b.apply_operations_with_event(&ops, event.id()).expect("node B apply_operations_with_event");
+        crate::test_helpers::apply_backend_event(&*node_b, &event).expect("node B apply_layer");
+        previous = Some(event);
     }
 
     assert_eq!(
@@ -276,43 +273,16 @@ pub(crate) fn law_operation_round_trip_across_nodes<B: ConformanceBackend>() {
     );
 }
 
-/// Provenance handling for the `_with_event` variant. This law is asserted at two
-/// levels:
-///
-/// - Universal (all backends): applying an event's operations via
-///   `apply_operations_with_event` and via `apply_operations` produces the same
-///   read-visible values. Provenance may change internal bookkeeping, but it must
-///   not change what a reader sees for a single non-conflicting write.
-/// - Backend-specific (via `check_provenance`): the adopter asserts whatever the
-///   backend promises about the writing event id. LWW asserts the event id was
-///   recorded and is exposed for later conflict resolution; a CRDT asserts
-///   nothing (it is free to ignore the id, so its check is a no-op).
-///
-/// The split exists because provenance is where backends legitimately differ: the
-/// contract requires LWW to track the writing event (so `apply_layer` can resolve
-/// concurrent writes by causal dominance) but explicitly permits a CRDT to ignore
-/// it.
+/// Applying an event records its identity where the backend uses host provenance
+/// (LWW; native CRDTs may ignore it).
 pub(crate) fn law_provenance<B: ConformanceBackend>() {
     let write = B::linear_writes().into_iter().next().expect("linear_writes must be non-empty");
     let scratch = B::new_backend();
     let ops = B::stage_write(&scratch, &write);
-    let event = make_event(0, B::backend_name(), ops.clone(), &[]);
-
-    let tracked = B::new_backend();
-    tracked.apply_operations_with_event(&ops, event.id()).expect("apply_operations_with_event");
-
-    let untracked = B::new_backend();
-    untracked.apply_operations(&ops).expect("apply_operations");
-
-    assert_eq!(
-        tracked.property_values(),
-        untracked.property_values(),
-        "[{}] a single non-conflicting write must read the same with or without event tracking",
-        B::backend_name()
-    );
-
-    // Backend-specific provenance obligations.
-    B::check_provenance(&tracked, &event.id());
+    let event = make_event(0, B::backend_name(), ops, &[]);
+    let committed = B::new_backend();
+    crate::test_helpers::apply_backend_event(&*committed, &event).unwrap();
+    B::check_provenance(&committed, &event.id());
 }
 
 /// `apply_layer` invariance under permutation of the events WITHIN a layer.
@@ -352,9 +322,8 @@ pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
     for perm in &permutations {
         let backend = B::new_backend();
         // Seed the root as committed state (the meet the layer branches from).
-        let ops: Vec<_> = root.operations().backend_operations(B::backend_name()).cloned().collect();
-        if !ops.is_empty() {
-            backend.apply_operations_with_event(&ops, root.id()).expect("apply root");
+        if root.operations().backend_operations(B::backend_name()).next().is_some() {
+            crate::test_helpers::apply_backend_event(&*backend, &root).expect("apply root");
         }
 
         let to_apply: Vec<&Event> = perm.iter().collect();
@@ -440,9 +409,8 @@ pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
 /// Apply the backend-relevant operations of `root` as committed state, so the
 /// root is the meet the subsequent layers branch from.
 fn apply_committed_root<B: ConformanceBackend>(backend: &Arc<dyn PropertyBackend>, root: &Event) {
-    let ops: Vec<_> = root.operations().backend_operations(B::backend_name()).cloned().collect();
-    if !ops.is_empty() {
-        backend.apply_operations_with_event(&ops, root.id()).expect("apply committed root");
+    if root.operations().backend_operations(B::backend_name()).next().is_some() {
+        crate::test_helpers::apply_backend_event(&**backend, root).expect("apply committed root");
     }
 }
 
@@ -501,7 +469,7 @@ mod lww_conformance {
 
         fn check_provenance(backend: &Arc<dyn PropertyBackend>, event_id: &EventId) {
             // LWW must record the writing event id so apply_layer can later resolve
-            // concurrent writes by causal dominance.
+            // concurrent writes by generation and event ID.
             let lww = backend.clone().as_arc_dyn_any().downcast::<LWWBackend>().expect("backend is LWW");
             let recorded = lww.get_event_id(&prop("title"));
             assert_eq!(recorded.as_ref(), Some(event_id), "LWW must record the writing event id for provenance");
@@ -529,6 +497,50 @@ mod lww_conformance {
         scratch.set(prop(field), Some(Value::String(value.to_string())));
         let ops = scratch.to_operations().unwrap().unwrap();
         make_event(seed, LwwAdopter::backend_name(), ops, parents)
+    }
+
+    #[test]
+    fn restored_rank_resolves_a_concurrent_write_without_stored_event_history() {
+        let root = lww_write_event(0, "field", "root", &[]);
+        let a = lww_write_event(1, "field", "a", &[&root]);
+        let b = lww_write_event(2, "field", "b", &[&root]);
+        let (winner, loser) = if a.id() > b.id() { (&a, &b) } else { (&b, &a) };
+        let backend = LWWBackend::new();
+        backend.apply_layer(&layer_from_events(&[], &[winner], &[&root])).unwrap();
+        let buffer = backend.to_state_buffer().unwrap();
+        let restored = LWWBackend::from_state_buffer(&buffer).unwrap();
+
+        // Comparison may stop before the stored writer. Its absence from the
+        // layer's DAG does not imply it is an ancestor of the incoming write.
+        restored.apply_layer(&layer_from_events(&[], &[loser], &[])).unwrap();
+        assert_eq!(restored.to_state_buffer().unwrap(), buffer);
+        assert_eq!(restored.get_event_id(&prop("field")), Some(winner.id()));
+    }
+
+    #[test]
+    fn saturated_descendant_overwrites_larger_id_in_direct_and_layer_paths() {
+        let root = lww_write_event(0, "field", "root", &[]);
+        let (earlier, later) = (1..200)
+            .map(|seed| {
+                let mut earlier = lww_write_event(seed, "field", "earlier", &[&root]);
+                // Stand in for the admitted head of a very deep history.
+                earlier.parent = Clock::new(vec![(u32::MAX - 1, root.id())]).unwrap();
+                let later = lww_write_event(seed + 200, "field", "later", &[&earlier]);
+                (earlier, later)
+            })
+            .find(|(earlier, later)| earlier.id() > later.id())
+            .unwrap();
+        assert_eq!((earlier.generation(), later.generation()), (u32::MAX, u32::MAX));
+
+        let backend = LWWBackend::new();
+        backend.apply_layer(&layer_from_events(&[], &[&earlier], &[])).unwrap();
+        let buffer = backend.to_state_buffer().unwrap();
+        let direct = LWWBackend::from_state_buffer(&buffer).unwrap();
+        let layered = LWWBackend::from_state_buffer(&buffer).unwrap();
+        crate::test_helpers::apply_backend_event(&direct, &later).unwrap();
+        layered.apply_layer(&layer_from_events(&[], &[&later], &[&earlier])).unwrap();
+        assert_eq!(direct.get(&prop("field")), Some(Value::String("later".into())));
+        assert_eq!(layered.to_state_buffer().unwrap(), direct.to_state_buffer().unwrap());
     }
 
     /// Intent law for LWW (verdict 267-C): a causally-LATER write must always beat
@@ -572,7 +584,7 @@ mod lww_conformance {
         let backend: Arc<dyn PropertyBackend> = Arc::new(LWWBackend::new());
         let ops: Vec<_> = earlier.operations().backend_operations(LwwAdopter::backend_name()).cloned().collect();
         if !ops.is_empty() {
-            backend.apply_operations_with_event(&ops, earlier.id()).unwrap();
+            crate::test_helpers::apply_backend_event(&*backend, &earlier).unwrap();
         }
         backend.apply_layer(&layer).unwrap();
 

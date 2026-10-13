@@ -160,6 +160,10 @@ pub struct Event {
     pub body: EventBody,
 }
 
+impl AsRef<Event> for Event {
+    fn as_ref(&self) -> &Event { self }
+}
+
 /// The two event shapes. A genesis is an entity's single creation event and
 /// carries its initial operations, frozen when `create()` returns; every
 /// later event is an update.

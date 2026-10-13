@@ -27,7 +27,7 @@ The event DAG subsystem answers two questions:
    [property backends](property-backends.md) use to merge concurrent operations.
 
 The implementation lives in `core/src/event_dag/` and is consumed primarily by
-[`Entity::apply_event`](entity-lifecycle.md#how-events-are-applied).
+[`EntityState::apply_events`](entity-lifecycle.md#how-events-are-applied).
 
 
 ## Key Concepts
@@ -116,8 +116,7 @@ belong to the same entity and connect to the snapshot's head through the ordered
 carried batch. Their parent annotations are checked against resident tips, carried
 parents, and locally stored parents. This check never fetches peer history.
 Unknown annotations remain trusted; known contradictions are rejected.
-Comparison still follows parent links; generation-directed traversal is a
-separate optimization.
+Comparison follows parent links; generations guide which event to read next.
 
 
 ## Comparing Two Clocks
@@ -143,33 +142,42 @@ order. Batch application paths sort independently (see
 
 ### Quick-check: the linear-extension fast path
 
-The overwhelmingly common case is that an incoming event extends the current
-head by exactly one step. Before launching a full traversal, the algorithm
-checks whether every member of the comparison clock appears directly in the
-subject event's parent set. If so, it returns `StrictDescends` immediately
-**without fetching the comparison events at all**.
+Before launching a two-sided traversal, comparison follows the subject's
+parent links toward the current head. If every path reaches that head and
+every head tip is covered, it returns `StrictDescends` **without fetching the
+comparison events themselves**. This covers both a direct child and a complete
+chain supplied in one batch. Older or saturated parents and an exhausted
+budget fall back to the general traversal.
 
 This matters for [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes),
 where the comparison head events may not exist in local storage -- the
 quick-check never needs them.
 
-### BFS traversal
+### Generation-guided traversal
 
-When the quick-check does not apply, the algorithm walks backward through the
-DAG from both clocks simultaneously:
+When the quick-check does not apply, the walk reads the original heads together,
+then fetches the queued event with the greatest generation (ties by event ID).
+Each event extends its side's frontier backward through parent links. Reaching
+an event from both sides makes it a common-node candidate.
 
-1. Initialize two **frontiers**, one from the subject clock and one from the
-   comparison clock.
-2. At each step, fetch every event on both frontiers, record its DAG structure,
-   and extend the frontiers backward through parent pointers.
-3. When an event is reached from both directions, it becomes a **meet
-   candidate**.
-4. After each step, check whether a conclusion can be drawn:
-   - The subject traversal has seen every comparison head **and** its boundary
-     is clean (see below): `StrictDescends`.
-   - All subject heads seen by the comparison traversal: `StrictAscends`.
-   - Both frontiers empty: compute the minimal meet (candidates with no common
-     descendants in the traversal), return `DivergedSince` or `Disjoint`.
+Generations guide fetch order, not ancestry conclusions. The walk stops before
+shared history only when recorded parent links establish one maximal common
+node and every remaining frontier path has crossed common history. One path
+that bypasses it keeps a queued node active. For example, one divergent event
+on each side of a 300-event shared history needs three reads: the two new events
+and their common parent.
+
+Unresolved multiple meet nodes keep walking: unverified generation annotations
+cannot prove that those nodes are unrelated through unread history. Saturated
+heads (`u32::MAX`) retain the breadth-first walk and its full history for LWW's
+saturation fallback. Discovering that a queued annotation understated an event's
+generation also disables early stopping. Known contradictory claims are still
+rejected after comparison without additional reads.
+
+After each step, coverage and the boundary check below can establish
+`StrictDescends`; reverse coverage can establish `StrictAscends`. Otherwise,
+a settled meet yields `DivergedSince`, while unrelated genesis events yield
+`Disjoint` after exhaustion.
 
 ### Why coverage alone is not enough
 
@@ -201,15 +209,30 @@ correctly terminating traversal at that point. An unfetchable event on only
 
 ### Budget escalation
 
-The initial budget (default 1000 events) caps each BFS attempt. If exhausted,
-the algorithm internally retries with 4x budget (up to `initial * 4`). The
-traversal itself restarts from the original clocks -- only the accumulator
+The initial budget (default 1000 events) caps each attempt. If generation order
+exhausts it, comparison retries with the previous breadth-first traversal, which
+can finish a whole frontier before checking its budget. That traversal retains
+its existing escalation up to `initial * 4`. The traversal itself restarts from
+the original clocks -- only the accumulator
 (recorded DAG structure and LRU event cache) survives the retry, so re-walked
 steps avoid storage round-trips but still spend budget. The internal retry
 keeps the public API simple -- callers do not need to manage retry logic.
 
 
 ## Event Layers
+
+`EventLayers::prepare` validates the input batch, compares it against the entity
+head, and loads the layers needed to apply it. `StrictDescends` uses that head
+as its meet; `DivergedSince` uses the discovered meet. The loaded collection
+groups layers by input event so each policy check sees its event's resulting
+state before later inputs apply.
+Traversal is internal to construction; using the loaded layers requires no
+history reads. An immediate extension needs only the incoming event's parent
+links, and fetches no events from the old head.
+
+`dag_from_meet` is shared by all layers from that comparison. Its links cover
+the compared histories from the meet to their tips; it may also contain older
+history from exhaustive traversal. Arbitrary older IDs are outside that coverage.
 
 When comparison returns `DivergedSince`, the merge machinery walks the
 accumulated DAG *forward* and hands [property backends](property-backends.md)
@@ -245,10 +268,10 @@ guarantees make per-layer merging sound:
 
 2. **Divergent-region layers are antichains.** Above the meet, no event in a
    layer is an ancestor of another event in the same layer, even transitively.
-   This holds because `DivergedSince` is only produced by an exhaustive
-   traversal (see [Invariants](#invariants)): every event between the meet and
-   the tips is in the accumulated DAG, so a causal path cannot hide behind an
-   unfetched event. Within a layer, concurrency is genuine.
+   Comparison records the parent links between the meet and the tips before
+   returning `DivergedSince`. It may stop at a proved common boundary without
+   fetching older history; no causal path above that boundary is omitted.
+   Within a layer, concurrency is genuine.
 
 Orthogonal to layering, each layer partitions its events by whether the local
 replica has already incorporated them: events in the current head's ancestry
@@ -265,14 +288,13 @@ round whose incumbent is re-seeded from stored state.
 
 Two scope notes. First, the layer sweep covers the *entire* accumulated DAG,
 and an exhaustive traversal accumulates the common history **below** the meet
-as well -- so when the meet sits above genesis, early layers also carry
-below-meet events (genesis itself surfaces in layer 1). These are always
-already-applied (they are ancestors of the current head by definition), so
-they never mutate state; they are inert electoral context. Second, the
+as well. Frontiers containing only already-applied events are traversed but
+produce no application layer; their parent links remain available for causal
+lookup. Mixed layers retain already-applied events as context. Second, the
 antichain guarantee is scoped to the divergent region: a below-meet straggler
 can share a layer with an event that descends it through the meet. This is
-harmless for the same reason -- causal comparisons consult the full
-accumulated DAG, never layer membership.
+harmless because LWW compares persisted write ranks, never layer membership.
+For saturated generations, its causal fallback still needs the full accumulated DAG.
 
 
 ## The Staging Pattern
@@ -307,7 +329,7 @@ The first half ensures BFS reachability. The second half ensures crash safety:
 ### Trait separation enforces the protocol
 
 The [retrieval layer](retrieval.md) splits event access into distinct traits so
-that `apply_event` (which takes [`GetEvents`](retrieval.md#why-three-traits-instead-of-one)) cannot
+that `apply_events` (which takes [`GetEvents`](retrieval.md#why-three-traits-instead-of-one)) cannot
 accidentally stage or commit events. Only the outer caller holds
 [`SuspenseEvents`](retrieval.md#why-three-traits-instead-of-one), which adds
 `stage_event`. Permanent append remains a separate `StorageEngine` operation,
@@ -334,9 +356,9 @@ never been seen, enabling a cheap rejection without BFS.
    `continue` behavior left unfetchable IDs permanently on the frontier, causing
    infinite loops.
 
-3. **Never compute layers from an incomplete traversal.** `BudgetExceeded` means
-   the accumulated DAG is partial; layer computation would produce incorrect
-   merge results.
+3. **Build layers only after comparison succeeds.** `BudgetExceeded` leaves
+   unresolved paths; layer construction must reject it. Stopping at a proved
+   common boundary is sufficient: layers need the history above that boundary.
 
 4. **Meet filter: `common_child_count == 0`.** This ensures head tips always
    appear in the meet set (they have no descendants in the comparison, so they
@@ -345,15 +367,16 @@ never been seen, enabling a cheap rejection without BFS.
 
 ### Staging protocol
 
-5. **Stage before head update; commit before state persist.** Violating the
-   first causes BFS failures; violating the second breaks crash recovery.
+5. **Stage before candidate head update; persist events and state together.**
+   The first makes incoming history readable during comparison; the second
+   keeps a failed commit from exposing only part of a batch.
 
 6. **`get_event` is the union view; `event_stored` is permanent-only.** Mixing
    these up breaks creation-uniqueness semantics.
 
-7. **Creation guards execute before the retry loop** in `apply_event`. They are
-   properties of the event, not of the current head, and must not be
-   re-evaluated on retry.
+7. **Each preparation attempt checks admission against its current head.**
+   A resident retry repeats these checks before rebuilding the layers. The
+   write lock checks that same head again before applying them.
 
 
 ## Design Decisions
@@ -399,7 +422,7 @@ event is rejected as a different genesis. Ephemeral nodes fall through to
 
 The original monolithic `Retrieve` trait combined event access, state access,
 and staging. This made it impossible to express "read-only event access" at the
-type level. Since `apply_event` must not stage or commit events (the caller
+type level. Since `apply_events` must not stage or commit events (the caller
 manages that), the split into [`GetEvents`](retrieval.md#why-three-traits-instead-of-one),
 [`GetState`](retrieval.md#why-three-traits-instead-of-one), and
 [`SuspenseEvents`](retrieval.md#why-three-traits-instead-of-one) turns the staging protocol into

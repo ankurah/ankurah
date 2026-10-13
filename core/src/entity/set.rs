@@ -1,6 +1,6 @@
 use super::{
     entity::{Entity, EntityInner},
-    state::{EntityInnerState, EntityState, StateApplyResult},
+    state::{EntityInnerState, EntityState},
 };
 use crate::{
     error::{MutationError, RetrievalError},
@@ -119,8 +119,8 @@ impl WeakEntitySet {
                 }
             }
         };
-        let result = entity.state.apply_state(event_getter, &state).await?;
-        Ok((Some(matches!(result, StateApplyResult::Applied)), Entity::from_resident(entity)))
+        let adopted = entity.state.apply_state(event_getter, &state).await?;
+        Ok((Some(adopted), Entity::from_resident(entity)))
     }
 }
 
@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::{
         entity::{LocalTrxEntity, TemporaryEntity},
-        property::backend::{LWWBackend, PropertyBackend},
+        property::backend::LWWBackend,
         value::Value,
     };
     use ankurah_proto::{AuthorId, Clock, EventId, PropertyId};
@@ -147,9 +147,8 @@ mod tests {
         for (property, value) in &expected {
             backend.set(*property, value.clone());
         }
-        let event_id = EventId::from_bytes([3; 32]);
-        backend.apply_operations_with_event(&backend.to_operations()?.unwrap(), event_id.clone())?;
-        state.set_head(Clock::genesis(event_id));
+        let event = crate::test_helpers::commit_backend(&*backend, 3)?;
+        state.set_head(Clock::singleton(&event));
         let entity = Entity::from_resident(entities.get_or_insert_state(EntityId::from_bytes([1; 32]), &state.to_state()?)?.1);
         assert_eq!(entity.values()?, expected.into_iter().collect::<Vec<_>>());
         let temporary = TemporaryEntity::new(entity.id(), &entity.to_state()?)?;

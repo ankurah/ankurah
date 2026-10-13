@@ -7,7 +7,7 @@
 //! cannot reach `pub(crate)` items directly. Rather than restructure the
 //! engine or scatter `pub` across it, this module offers narrow wrappers over
 //! exactly the primitives the benches exercise: `compare`, the resulting
-//! relation and accumulator, layer draining, and batch topological sort.
+//! relation and accumulator, layer loading, and batch topological sort.
 
 use crate::error::{MutationError, RetrievalError};
 use crate::event_dag::accumulator::ComparisonResult;
@@ -20,8 +20,8 @@ use ankurah_proto::{Attested, Clock, Event, EventId};
 pub use crate::event_dag::relation::AbstractCausalRelation;
 pub use crate::event_dag::DEFAULT_BUDGET;
 
-/// Sizes of a drained layer. The internal `EventLayer` keeps its event vecs
-/// `pub(crate)`; the benches only need the counts (to drive draining and to
+/// Sizes of a loaded layer. The internal `EventLayer` keeps its event vecs
+/// `pub(crate)`; the benches only need the counts (to inspect the loaded layers and to
 /// keep the work from being optimized away), so we surface those rather than
 /// widen `EventLayer`'s public API.
 #[derive(Debug, Clone, Copy)]
@@ -45,28 +45,30 @@ pub async fn compare<E: GetEvents>(
 }
 
 /// Opaque wrapper over the crate-internal `ComparisonResult`. Exposes only the
-/// relation and the layer-draining path the benches need.
+/// relation the benches need.
 pub struct BenchComparisonResult<E: GetEvents>(ComparisonResult<E>);
 
 impl<E: GetEvents> BenchComparisonResult<E> {
     /// The causal relation verdict.
     pub fn relation(&self) -> &AbstractCausalRelation<EventId> { &self.0.relation }
-
-    /// For a `DivergedSince` verdict, consume self to get a layer iterator
-    /// seeded at the meet and partitioned against `current_head`. Returns
-    /// `None` for non-divergent verdicts, matching the internal contract.
-    pub fn into_layers(self, current_head: Vec<EventId>) -> Option<BenchEventLayers<E>> {
-        self.0.into_layers(current_head).map(BenchEventLayers)
-    }
 }
 
-/// Opaque wrapper over the crate-internal `EventLayers` async iterator.
-pub struct BenchEventLayers<E: GetEvents>(EventLayers<E>);
+/// Compare a batch against the head and load its application layers.
+pub async fn prepare_layers<E: GetEvents + Send + Sync>(
+    getter: &E,
+    events: &[&Event],
+    head: &Clock,
+) -> Result<BenchEventLayers, MutationError> {
+    Ok(BenchEventLayers(EventLayers::prepare(getter, events, head).await?))
+}
 
-impl<E: GetEvents> BenchEventLayers<E> {
-    /// Yield the next topological layer's sizes, or `None` when drained.
-    pub async fn next(&mut self) -> Result<Option<BenchLayer>, RetrievalError> {
-        Ok(self.0.next().await?.map(|layer| BenchLayer { to_apply: layer.to_apply.len(), already_applied: layer.already_applied.len() }))
+/// Opaque wrapper over the crate-internal, fully loaded `EventLayers`.
+pub struct BenchEventLayers(EventLayers);
+
+impl BenchEventLayers {
+    /// The sizes of the loaded layers.
+    pub fn iter(&self) -> impl Iterator<Item = BenchLayer> + '_ {
+        self.0.layers().iter().map(|layer| BenchLayer { to_apply: layer.to_apply.len(), already_applied: layer.already_applied.len() })
     }
 }
 

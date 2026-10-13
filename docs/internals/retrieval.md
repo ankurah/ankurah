@@ -14,26 +14,26 @@ predicate fetch path -- are documented separately in the
 
 The system originally had a monolithic `Retrieve` trait that bundled event
 reading, state reading, and staging/committing into a single interface. The
-problem was that [`apply_event`](entity-lifecycle.md#how-events-are-applied)
+problem was that [`apply_events`](entity-lifecycle.md#how-events-are-applied)
 -- the core integration function -- only needs read access to events, but
 receiving a `Retrieve` reference gave it the *ability* to stage or commit
-events. That is the caller's responsibility, not `apply_event`'s.
+events. That is the caller's responsibility, not `apply_events`'s.
 
 The split enforces staging discipline at the type level:
 
 - **`GetEvents`** -- Read-only event access. This is what the
-  [BFS comparison algorithm](event-dag.md#bfs-traversal) and `apply_event`
+  [comparison algorithm](event-dag.md#generation-guided-traversal) and `apply_events`
   accept. It exposes `get_event` (the union of staging and permanent
   storage), `event_stored` (permanent storage only), and
   `storage_is_definitive` (whether a negative `event_stored` result is
   authoritative).
 
 - **`GetState`** -- Entity state snapshot retrieval. Separated because state
-  has different caching characteristics and is not needed by BFS.
+  has different caching characteristics and is not needed by comparison.
 
 - **`SuspenseEvents`** -- Extends `GetEvents` with `stage_event`. Only the
   outermost caller (e.g., `NodeApplier`) holds this; it is deliberately *not*
-  passed into `apply_event`. Durable event writes go through `StorageTransaction`.
+  passed into `apply_events`. Durable event writes go through `StorageTransaction`.
 
 
 ## Staging vs Permanent Storage
@@ -41,11 +41,11 @@ The split enforces staging discipline at the type level:
 The retrieval layer maintains two tiers of event storage:
 
 **The staging map** is an in-memory `HashMap` behind an `Arc<RwLock>`. When
-an event is staged, it becomes visible to `get_event` and therefore to BFS
+an event is staged, it becomes visible to `get_event` and therefore to comparison
 traversal, but `event_stored` will still return `false`. Staging is what
 makes the [comparison algorithm](event-dag.md#comparing-two-clocks) work
 on incoming events: the event is staged first, then `compare` uses the
-event's own ID as the subject clock, and BFS discovers the event body
+event's own ID as the subject clock, and comparison discovers the event body
 through the staging map.
 
 **Permanent storage** is the durable backend. After validating and attesting
@@ -60,7 +60,7 @@ The distinction between `get_event` (union view) and `event_stored`
 [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) where
 `storage_is_definitive()` is `true`, a `false` from `event_stored` for a
 creation event proves it has never been seen, enabling a cheap rejection
-without BFS. On [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes),
+without comparison. On [ephemeral nodes](node-architecture.md#durable-vs-ephemeral-nodes),
 this shortcut is unsafe because entities can arrive via `StateSnapshot`
 without their individual events being stored.
 
@@ -79,7 +79,7 @@ locally, that is a hard error. Sets `storage_is_definitive` based on the
 Adds a third lookup tier: if the event is not in staging or local storage,
 it requests the event from a random durable peer, caches the response
 locally, and returns it. This transparent remote fallback is what allows
-[BFS](event-dag.md#bfs-traversal) to succeed on ephemeral nodes that lack
+[comparison](event-dag.md#generation-guided-traversal) to succeed on ephemeral nodes that lack
 historical events. `storage_is_definitive` is always `false`.
 
 **`LocalStateGetter`** -- Shared by both paths. Wraps storage to retrieve
@@ -99,8 +99,7 @@ for each event:
 events = topological_sort(events)
 entity = get_or_create(...)
 
-for each attested_event:
-    entity.apply_event(event_getter, &event)   // (2) compare + apply
+entity.apply_events(event_getter, &mut events) // (2) compare once, then apply and check each event
 
 storage_trx = storage.transaction()
 storage_trx.add_events(events)
@@ -109,20 +108,20 @@ storage_trx.commit()                           // (3) atomic history and state
 publish(entity)
 ```
 
-For `StateAndEvent` content, the flow first tries
-[`apply_state`](entity-lifecycle.md#how-state-snapshots-are-applied). If the state is
-strictly newer, the appended events and state seed enter the common canonical
-commit coordinator. If the state diverges, it falls back to per-event
-[`apply_event`](entity-lifecycle.md#how-events-are-applied), then uses that same
-coordinator.
+For an existing entity, `StateAndEvent` delegates to `apply_and_commit_state`.
+On each attempt, that coordinator forks the resident and either adopts an
+extending snapshot or applies the accompanying events. It then persists the
+resulting state and every supplied event before publication. A storage conflict
+repeats the decision from a fresh fork. A bare snapshot that is not adopted
+requires no write.
 
 The same parent-first rule applies to every multi-event wire shape --
 `EventOnly`, `StateAndEvent`, and `EventBridge` (in `apply_delta`) alike: the
 receiver stages the whole batch upfront, topologically sorts it by in-batch
 parent edges (`event_dag/ordering.rs`), and only then applies and submits
 canonical state. The producer also sorts what it sends, but wire
-order is untrusted: applying a child before its staged parent would jump the
-head past the parent and silently drop the parent's operations.
+order is untrusted. Preparation independently rejects any batch in which a
+supplied parent follows its child, before applying operations.
 
 
 ## Crash Safety
@@ -136,7 +135,7 @@ Transaction events and state share one persistence boundary:
 - **Crash after commit, before acknowledgement:** The complete batch is durable;
   re-delivery is idempotent.
 
-- **Concurrent `apply_event` on the same entity:** The
+- **Concurrent `apply_events` on the same entity:** The
   [`try_mutate`](entity-lifecycle.md#toctou-protection) helper
   checks that the head has not changed since comparison. If it has, the
   caller retries (up to 5 attempts), preventing TOCTOU races.

@@ -210,19 +210,16 @@ impl Transaction {
                 let entity_after = RemoteTrxEntity::for_event(&node.entities, &state_getter, &event_getter, &events[0].payload).await?;
                 let entity_before = entity_after.snapshot();
                 let after = entity_after.read();
-                for event in events {
-                    let expected_head = entity_after.head();
-                    let mut attested = event.clone();
-                    entity_after
-                        .apply_event(&event_getter, &mut attested, |event| policy.check_write_event(node, &entity_before, &after, event))
-                        .await?;
-                    storage_trx.add_events(std::slice::from_ref(&attested)).await?;
-                    let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
-                    let attestation = policy.attest_state(node, &state);
-                    storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
-
-                    attested_events.push(attested);
-                }
+                let expected_head = entity_after.head();
+                let mut events = events.clone();
+                entity_after
+                    .apply_events(&event_getter, &mut events, |event| policy.check_write_event(node, &entity_before, &after, event))
+                    .await?;
+                storage_trx.add_events(&events).await?;
+                let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
+                let attestation = policy.attest_state(node, &state);
+                storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+                attested_events.extend(events);
                 forks.push((entity, entity_after));
             }
 

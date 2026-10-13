@@ -33,7 +33,7 @@ Several topologies are tested at both levels:
 - **Deep diamond** -- Symmetric and asymmetric branches (up to 8 events) asserting `DivergedSince` with correct meet point and chain lengths.
 - **Three-way concurrency** -- Three branches from the same head, verifying the lexicographic winner and `assert_dag!` structure.
 - **Multiple merge cycles** -- Repeated fork-merge sequences (e.g., A -> B||C -> D -> E||F -> G) verifying the full DAG with final single head.
-- **Missing events / BFS meet** -- Diamonds where the common ancestor is absent from the retriever. [BFS](event-dag.md#bfs-traversal) discovers it on [both frontiers](event-dag.md#unfetchable-events-on-both-frontiers) and returns `DivergedSince` without erroring. A missing event on only one frontier correctly returns `EventNotFound`.
+- **Missing common ancestor** -- Diamonds where the common ancestor is absent from the retriever. [Comparison](event-dag.md#generation-guided-traversal) discovers it on [both frontiers](event-dag.md#unfetchable-events-on-both-frontiers) and returns `DivergedSince` without erroring. A missing event on only one frontier correctly returns `EventNotFound`.
 
 ### Durable/ephemeral interaction
 
@@ -73,7 +73,7 @@ clock_eq!(dag, state.payload.state.head, [D]);
 
 ## Known Gaps
 
-**TOCTOU retry exhaustion** (`#[ignore]`) -- Testing retry exhaustion requires a mock that modifies the entity head between comparison and the CAS attempt inside [`try_mutate`](entity-lifecycle.md#toctou-protection), which needs interior mutability and precise timing over the entity's `RwLock`. Expected behavior: after `MAX_RETRIES` (5) attempts, `apply_event` returns `Err(MutationError::TOCTOUAttemptsExhausted)`.
+**TOCTOU retry exhaustion** (`#[ignore]`) -- Testing retry exhaustion requires a mock that modifies the entity head between comparison and the CAS attempt inside [`try_mutate`](entity-lifecycle.md#toctou-protection), which needs interior mutability and precise timing over the entity's `RwLock`. Expected behavior: after `MAX_RETRIES` (5) attempts, `apply_events` returns `Err(MutationError::TOCTOUAttemptsExhausted)`.
 
 **Yrs empty-string as null** (`#[ignore]`) -- Blocked on issue #236 ([empty-string treated as null](property-backends.md#known-limitation-empty-stringnull-ambiguity)). Creating an entity with empty-string content produces no CRDT operations and no creation event.
 
