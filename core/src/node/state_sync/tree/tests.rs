@@ -184,8 +184,8 @@ async fn retained_unbuilt_cache_offers_a_complete_inventory_after_initial_member
     Ok(())
 }
 
-#[tokio::test]
-async fn initial_complete_retains_only_large_standing_query_digests() -> anyhow::Result<()> {
+async fn comparison_node() -> anyhow::Result<(crate::node::Node<crate::test_utils::TestStorage, crate::policy::PermissiveAgent>, EntityId)>
+{
     use crate::{
         connector::{PeerSender, SendError},
         node::Node,
@@ -206,10 +206,22 @@ async fn initial_complete_retains_only_large_standing_query_digests() -> anyhow:
         Box::new(Sender(peer)),
     )
     .await?;
-    for (standing, count) in [(false, 64), (true, super::super::INLINE_LEAVES), (true, 64)] {
+    Ok((node, peer))
+}
+
+#[tokio::test]
+async fn initial_complete_keeps_complete_inventory_digests_lazy() -> anyhow::Result<()> {
+    let (node, peer) = comparison_node().await?;
+    for (standing, count) in [(false, 64), (true, 32), (true, 33), (true, 64), (true, 256), (true, 2048)] {
         let query = QueryTree::default();
         let snapshot = query.refresh(spec(), (0..count).map(|id| numbered_state(id as u32, 1)).collect()).await?;
         assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
+        let known = if count > 64 {
+            let mut requester = QueryTree::default().refresh(spec(), (0..count).map(|id| numbered_state(id as u32, 1)).collect()).await?;
+            Some(requester.offer().await?)
+        } else {
+            None
+        };
         let reply = node
             .start_comparison(
                 peer,
@@ -219,23 +231,124 @@ async fn initial_complete_retains_only_large_standing_query_digests() -> anyhow:
                 standing.then(|| (proto::QueryId::new(), 1)),
                 false,
                 snapshot,
-                None,
+                known,
             )
             .await?;
         assert!(matches!(reply.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
-        assert_eq!(
-            query.0.lock().await.as_ref().unwrap().tree.is_some(),
-            standing && count > super::super::INLINE_LEAVES,
-            "only a large standing query must build its retained digest before Complete"
-        );
+        assert!(query.0.lock().await.as_ref().unwrap().tree.is_none(), "a complete initial inventory needs no retained digest");
     }
     node.deregister_peer(peer);
     Ok(())
 }
 
 #[tokio::test]
+async fn a_moderate_first_refresh_repairs_changed_heads_without_building_a_digest() -> anyhow::Result<()> {
+    let (node, peer) = comparison_node().await?;
+    let query = QueryTree::default();
+    let rows = (0..64).map(|id| numbered_state(id, 1)).collect::<Vec<_>>();
+    let mut old = query.refresh(spec(), rows.clone()).await?;
+    let known = old.offer().await?;
+    let original = bincode::serialize(&known)?;
+    let subscription = proto::QueryId::new();
+    let reply = node
+        .start_comparison(
+            peer,
+            proto::RequestId::new(),
+            vec![],
+            vec![],
+            Some((subscription, 1)),
+            false,
+            query.refresh(spec(), rows.clone()).await?,
+            None,
+        )
+        .await?;
+    assert!(matches!(reply.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
+    assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
+
+    let mut changed = rows;
+    changed[17] = numbered_state(17, 2);
+    changed.push(numbered_state(64, 2));
+    let captured = query.refresh(spec(), changed.clone()).await?;
+    let expected = QueryTree::default().refresh(spec(), changed.clone()).await?;
+    assert_eq!(captured.members(), expected.members());
+    let reply =
+        node.start_comparison(peer, proto::RequestId::new(), vec![], vec![], Some((subscription, 2)), false, captured, Some(known)).await?;
+    let proto::StateFrameBody::State { items, progress } = reply.frame.body else { panic!("state") };
+    assert_eq!(progress, proto::ComparisonProgress::Complete);
+    assert!(items.iter().any(|item| matches!(item, proto::StateItem::Repair { target, delta }
+        if delta.entity_id == changed[17].payload.entity_id && *target == changed[17].payload.state.head)));
+    assert!(items.iter().any(|item| matches!(item, proto::StateItem::Snapshots(page)
+        if page.states.iter().any(|state| state.payload.entity_id == changed[64].payload.entity_id))));
+    assert!(!items
+        .iter()
+        .any(|item| matches!(item, proto::StateItem::Summary(_) | proto::StateItem::NeedLeaves(_) | proto::StateItem::NeedHeads(_))));
+    assert!(query.0.lock().await.as_ref().unwrap().tree.is_none(), "the first refresh stays on the inventory diff path");
+    assert_eq!(bincode::serialize(&old.offer().await?)?, original);
+    node.deregister_peer(peer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_tree() -> anyhow::Result<()> {
+    let (node, peer) = comparison_node().await?;
+    let query = QueryTree::default();
+    let rows = (0..super::super::INITIAL_INVENTORY_LEAVES as u32).map(|id| numbered_state(id, 1)).collect::<Vec<_>>();
+    let mut old = query.refresh(spec(), rows.clone()).await?;
+    let known = old.offer().await?;
+    let saved = bincode::serialize(&known)?;
+    let subscription = proto::QueryId::new();
+    let initial = node
+        .start_comparison(
+            peer,
+            proto::RequestId::new(),
+            vec![],
+            vec![],
+            Some((subscription, 1)),
+            false,
+            query.refresh(spec(), rows.clone()).await?,
+            Some(known.clone()),
+        )
+        .await?;
+    assert!(matches!(initial.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
+    assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
+
+    let mut larger = rows.clone();
+    larger.push(numbered_state(super::super::INITIAL_INVENTORY_LEAVES as u32, 1));
+    let crossing = node
+        .start_comparison(
+            peer,
+            proto::RequestId::new(),
+            vec![],
+            vec![],
+            Some((subscription, 2)),
+            false,
+            query.refresh(spec(), larger.clone()).await?,
+            Some(known.clone()),
+        )
+        .await?;
+    assert!(matches!(crossing.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
+    assert!(query.0.lock().await.as_ref().unwrap().tree.is_some(), "build the 2,049-row digest before Complete");
+    let mut current = query.refresh(spec(), larger.clone()).await?;
+    let mut oracle = QueryTree::default().refresh(spec(), larger).await?;
+    assert_eq!(current.head(super::super::whole()).await?, oracle.head(super::super::whole()).await?);
+
+    let shrunk = query.refresh(spec(), rows.clone()).await?;
+    assert!(shrunk.tree.is_some(), "sparse removal must retain the existing tree below the threshold");
+    let final_reply =
+        node.start_comparison(peer, proto::RequestId::new(), vec![], vec![], Some((subscription, 3)), false, shrunk, Some(known)).await?;
+    assert!(matches!(final_reply.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
+    let mut current = query.refresh(spec(), rows.clone()).await?;
+    let mut oracle = QueryTree::default().refresh(spec(), rows).await?;
+    assert!(current.tree.is_some());
+    assert_eq!(current.head(super::super::whole()).await?, oracle.head(super::super::whole()).await?);
+    assert_eq!(bincode::serialize(&old.offer().await?)?, saved, "the pre-crossing snapshot remains immutable");
+    node.deregister_peer(peer);
+    Ok(())
+}
+
+#[tokio::test]
 async fn small_and_empty_inventories_offer_exact_leaves_without_building_a_tree() -> anyhow::Result<()> {
-    for count in [0, super::super::INLINE_LEAVES] {
+    for count in [0, 32] {
         let query = QueryTree::default();
         let states = (0..count).rev().map(|id| state(id as u8, 1)).collect();
         let mut snapshot = query.refresh(spec(), states).await?;
@@ -267,7 +380,7 @@ async fn small_inventory_exceeding_the_byte_budget_falls_back_to_a_summary() -> 
             .collect::<Vec<_>>(),
     )?;
     let query = QueryTree::default();
-    let mut snapshot = query.refresh(spec(), vec![state]).await?;
+    let mut snapshot = query.refresh(spec(), vec![state.clone()]).await?;
     assert!(snapshot.page(super::super::whole()).await.is_err(), "an oversized single leaf must fail explicitly");
     assert!(snapshot.tree.is_none(), "preparing the candidate inventory must not build a tree");
     let inventory = snapshot.offer().await?;
@@ -276,6 +389,22 @@ async fn small_inventory_exceeding_the_byte_budget_falls_back_to_a_summary() -> 
     assert_eq!(head.bounds, super::super::whole());
     assert!(bincode::serialized_size(&inventory)? <= super::super::FRAME_BYTES as u64);
     assert!(snapshot.tree.is_some());
+
+    // A small result that cannot fit the inventory byte policy still builds
+    // on demand when a later requester offers its Summary. The count guard
+    // avoids eager construction, not the work needed by this comparison.
+    let (node, peer) = comparison_node().await?;
+    let responder = QueryTree::default();
+    let captured = responder.refresh(spec(), vec![state]).await?;
+    assert!(responder.0.lock().await.as_ref().unwrap().tree.is_none());
+    let reply = node
+        .start_comparison(peer, proto::RequestId::new(), vec![], vec![], Some((proto::QueryId::new(), 1)), false, captured, Some(inventory))
+        .await?;
+    let proto::StateFrameBody::State { items, progress } = reply.frame.body else { panic!("state") };
+    assert_eq!(progress, proto::ComparisonProgress::Complete);
+    assert!(matches!(items.as_slice(), [proto::StateItem::Equal(bounds)] if *bounds == super::super::whole()));
+    assert!(responder.0.lock().await.as_ref().unwrap().tree.is_some());
+    node.deregister_peer(peer);
     Ok(())
 }
 
@@ -288,7 +417,7 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
         )]),
         ankql::ast::Predicate::True,
     );
-    let rows = (0..super::super::INLINE_LEAVES)
+    let rows = (0..32)
         .map(|id| {
             let mut row = keyed_state(id as u32, 1, Some(Value::String("key".repeat(160))))?;
             row.0.payload.state.head = proto::Clock::new(
@@ -332,9 +461,7 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
         "multiple bounded pages may form one complete initial inventory"
     );
 
-    let changed = (0..super::super::INLINE_LEAVES)
-        .map(|id| keyed_state(id as u32, 2, Some(Value::String("changed".into()))))
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let changed = (0..32).map(|id| keyed_state(id as u32, 2, Some(Value::String("changed".into())))).collect::<anyhow::Result<Vec<_>>>()?;
     query.refresh_captured(wide_spec, changed).await?;
     assert_eq!(bincode::serialize(&old.page(super::super::whole()).await?)?, bincode::serialize(&pages[0])?);
     Ok(())

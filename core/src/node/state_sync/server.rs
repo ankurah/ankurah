@@ -1,5 +1,5 @@
 use super::{
-    Snapshot, CONTROL_BYTES, FRAME_BYTES, INITIAL_INVENTORY_BYTES, INITIAL_INVENTORY_LEAVES, INLINE_LEAVES, LEAF_PAGE, MAX_INFLIGHT_FRAMES,
+    Snapshot, CONTROL_BYTES, FRAME_BYTES, INITIAL_INVENTORY_BYTES, INITIAL_INVENTORY_LEAVES, LEAF_PAGE, MAX_INFLIGHT_FRAMES,
     MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS, PAGE_WORK, WINDOW_BYTES,
 };
 use crate::{
@@ -1416,9 +1416,9 @@ impl Comparison {
         }
         let finished = self.work.is_empty() && self.summaries.is_empty() && self.leaves.is_empty() && self.heads.is_empty();
         let first_complete = finished && !self.complete;
-        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INLINE_LEAVES {
-            // Charge retained-query construction to its initial handoff. Small
-            // inventories and temporary Fetch snapshots remain lazy.
+        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INITIAL_INVENTORY_LEAVES {
+            // Build before handoff above the initial inventory count limit.
+            // Smaller inventories and Fetch keep construction on demand.
             self.snapshot.head(super::whole()).await?;
         }
         self.complete |= finished;
