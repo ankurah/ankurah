@@ -263,18 +263,25 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 self.transaction.delete_if(map, &key, &value).await?;
             }
         }
-        for row in rows.into_values() {
-            self.put_leaf(row, None).await?;
+        let rows = rows.into_values().collect::<Vec<_>>();
+        for row in &rows {
+            self.put_leaf(row.clone(), None).await?;
         }
-        self.rebuild_subtree(&NodePrefix::root()).await
+        // These rows already contain the admitted leaf elements. Building the
+        // summaries from them avoids reading and decoding our own writes.
+        self.write_subtree(&NodePrefix::root(), &rows).await
     }
 
     async fn rebuild_subtree(&mut self, prefix: &NodePrefix) -> Result<(), TreeError> {
+        let leaves = self.all_leaves(&AddressRange::under(prefix)).await?;
+        self.write_subtree(prefix, &leaves).await
+    }
+
+    async fn write_subtree(&mut self, prefix: &NodePrefix, leaves: &[LeafRow<G>]) -> Result<(), TreeError> {
         // This fence is deliberately conservative: structural maintenance
         // retries after any intervening commit; ordinary leaf changes only
         // watch the topology and can append their deltas concurrently.
         self.transaction.change_structure();
-        let leaves = self.all_leaves(&AddressRange::under(prefix)).await?;
         let start = prefix.to_bytes();
         let end = prefix.subtree_key_end();
         let entries = self
