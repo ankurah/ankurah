@@ -12,7 +12,7 @@ for (const n of numbers("SIZES", "8")) {
         for (const bps of numbers("BPS", "0")) {
             for (const mode of setting("MODES", "cold,warm_refresh,warm_equal,warm_edit,warm_membership").split(",")) {
                 for (const cache of setting("CACHE", "empty,half,all").split(",")) {
-                    if ((n === 0 && cache !== "empty") || (mode !== "cold" && (n === 0 || cache !== "all"))) continue;
+                    if ((n === 0 && cache !== "empty") || (mode !== "cold" && n === 0) || (mode !== "cold" && mode !== "warm_refresh" && cache !== "all")) continue;
                     for (let repeat = 0; repeat < Number(setting("REPEATS", "1")); repeat++) {
                         fixtures.push({ n, rtt, bps, mode, cache, repeat });
                     }

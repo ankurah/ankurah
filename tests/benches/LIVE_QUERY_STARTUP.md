@@ -13,7 +13,7 @@ STARTUP_LABEL=candidate cargo bench -p ankurah-tests --bench live_query_startup
 | `STARTUP_SIZES` | `0,8,32,256,4096` | Server result sizes |
 | `STARTUP_RTT_MS` | `0,50` | Propagation round trip in milliseconds |
 | `STARTUP_BPS` | `0` | Full-duplex bytes/second per direction; zero is unlimited |
-| `STARTUP_CACHE` | `empty,half,all` | Entity coverage before cold subscription |
+| `STARTUP_CACHE` | `empty,half,all` | Entity coverage before initial subscription; optional `half_blocks,half_interleaved` diagnostics |
 | `STARTUP_MODES` | `cold` | `cold,warm_refresh,warm_equal,warm_edit,warm_membership` |
 | `STARTUP_REPEATS` | `3` | Fresh-fixture repetitions |
 | `STARTUP_LABEL` | `candidate` | Revision label in every JSON record |
@@ -28,7 +28,17 @@ acknowledgments. `initial_drained_us` and `settled_traffic` preserve the provisi
 pre-verification drain; asynchronous application can send further control traffic.
 Cold `elapsed_us` is `ready_us`.
 
-Warm cases use `cache=all` and retain the same live query. `warm_refresh` keeps
+Warm cases retain the same live query. Reconnect cases use `cache=all`.
+`warm_refresh` reports each initial cache case separately: `empty` first transfers
+the result during the initial subscription, `half` prefetches half, and `all`
+prefetches every entity. Optional `half_blocks` prefetches alternating blocks of
+256 positions; `half_interleaved` prefetches even positions. Both use bounded OR
+batches outside timing (at most 16 intervals or 32 scalar comparisons per request),
+identically on baseline/candidate. Their actual `cached_entities` coverage is
+reported; small results under 256 rows fit entirely in the first block, so use
+4096-row block diagnostics for partial coverage. This preserves first digest construction after lazy cold
+transfer inside the measured refresh rather than warming it up with an earlier
+refresh. `warm_refresh` keeps
 the connection and calls `update_selection_wait` with the same selection, then
 `wait_durable_answered`; the new version gives a portable applied `ready_us`.
 Query identity is retained; actual internal tree reuse must also be checked
@@ -88,7 +98,18 @@ The runner uses a fresh process per fixture, alternates AB/BA order, refuses to
 overwrite evidence, and saves every failure with its last phase and raw output.
 The default external deadline is 240 seconds. Whole-process child CPU, peak RSS
 and page faults cover setup, prefetch, warmup, transfer, verification and teardown;
-they are resource context, **not transfer-only CPU or memory**. Source/binary/runner
+they are resource context, **not transfer-only CPU or memory**. On Unix,
+`phase_process_cpu` separately samples process user/system CPU with `getrusage`:
+setup ends at measurement start; `through_ready` ends at the public durable-ready
+landmark (null for reconnect); initial drain, verification, verified completion,
+and final drain have their own intervals. These counters combine client/server
+and every background thread active during the interval; they are not attributed
+CPU for one query task. Cumulative intervals overlap and must not be summed. Drain CPU snapshots are
+taken after the 2 ms quiet confirmation, while the recorded wire-drain wall
+landmark excludes that confirmation; `through_ready` is captured immediately
+after the durable-ready wall landmark.
+Setup includes population, catalog, prefetch and initial subscription for warm
+cases; final-drain CPU excludes teardown. Source/binary/runner
 hashes, compiler, machine, settings and execution order are retained.
 
 Compare each mode/size/cache/RTT/bandwidth case independently. Report medians,

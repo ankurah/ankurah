@@ -35,6 +35,38 @@ pub struct StartupRow {
     pub body: String,
 }
 
+// Process CPU includes both nodes and every background thread during the phase.
+// Non-Unix hosts report null; external runner resources still cover the process.
+#[derive(Clone, Copy, Serialize)]
+struct ProcessCpu {
+    user_us: u64,
+    system_us: u64,
+}
+
+impl ProcessCpu {
+    fn now() -> anyhow::Result<Option<Self>> {
+        #[cfg(unix)]
+        {
+            let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+            // getrusage initializes the output structure only on success.
+            if unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) } != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            let usage = unsafe { usage.assume_init() };
+            let micros = |time: libc::timeval| time.tv_sec as u64 * 1_000_000 + time.tv_usec as u64;
+            Ok(Some(Self { user_us: micros(usage.ru_utime), system_us: micros(usage.ru_stime) }))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(None)
+        }
+    }
+}
+
+fn cpu_delta(start: Option<ProcessCpu>, end: Option<ProcessCpu>) -> Option<ProcessCpu> {
+    start.zip(end).map(|(start, end)| ProcessCpu { user_us: end.user_us - start.user_us, system_us: end.system_us - start.system_us })
+}
+
 #[derive(Default, Serialize)]
 struct Reads {
     selections: usize,
@@ -256,6 +288,7 @@ async fn connect(
 
 async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second: u64, repeat: usize, label: &str) -> anyhow::Result<()> {
     anyhow::ensure!(["cold", "warm_equal", "warm_edit", "warm_membership", "warm_refresh"].contains(&mode), "unknown mode: {mode}");
+    let sample_cpu_start = ProcessCpu::now()?;
     phase("server-create");
     let server = Node::new_durable(Arc::new(Counted::new()?), PermissiveAgent::new());
     server.system.create().await?;
@@ -282,6 +315,30 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     let cached = match cache {
         "empty" => 0,
         "half" => reader.fetch::<StartupRowView>(format!("position < {}", n / 2)).await?.len(),
+        "half_blocks" => {
+            let intervals = (0..n)
+                .step_by(512)
+                .map(|start| format!("(position >= {start} AND position < {})", (start + 256).min(n)))
+                .collect::<Vec<_>>();
+            let wanted: BTreeSet<_> =
+                rows.iter().enumerate().filter(|(position, _)| position / 256 % 2 == 0).map(|(_, row)| row.id()).collect();
+            let mut cached_ids = BTreeSet::new();
+            for batch in intervals.chunks(16) {
+                cached_ids.extend(reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
+            }
+            assert_eq!(cached_ids, wanted, "gapped prefetch membership");
+            cached_ids.len()
+        }
+        "half_interleaved" => {
+            let positions = (0..n).step_by(2).map(|position| format!("position = {position}")).collect::<Vec<_>>();
+            let wanted: BTreeSet<_> = rows.iter().enumerate().filter(|(position, _)| position % 2 == 0).map(|(_, row)| row.id()).collect();
+            let mut cached_ids = BTreeSet::new();
+            for batch in positions.chunks(32) {
+                cached_ids.extend(reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
+            }
+            assert_eq!(cached_ids, wanted, "gapped prefetch membership");
+            cached_ids.len()
+        }
         "all" => reader.fetch::<StartupRowView>("position >= 0").await?.len(),
         _ => anyhow::bail!("unknown cache mode: {cache}"),
     };
@@ -290,6 +347,8 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
         match cache {
             "empty" => 0,
             "half" => n / 2,
+            "half_blocks" => (0..n).filter(|position| position / 256 % 2 == 0).count(),
+            "half_interleaved" => n.div_ceil(2),
             _ => n,
         },
         "prefetch coverage"
@@ -329,29 +388,32 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
         meter.subscriptions_applied
     };
     phase("measure");
+    let measurement_cpu_start = ProcessCpu::now()?;
     let start = Instant::now();
-    let (query, ready_us) = if let Some(query) = retained_query {
+    let (query, ready_us, ready_cpu) = if let Some(query) = retained_query {
         if mode == "warm_refresh" {
             query.update_selection_wait("position >= 0").await?;
             query.wait_durable_answered().await?;
             let ready_us = start.elapsed().as_micros();
-            (query, Some(ready_us))
+            (query, Some(ready_us), ProcessCpu::now()?)
         } else {
             connect(&server, &client, rtt_ms, bytes_per_second, &meter).await?;
-            (query, None)
+            (query, None, None)
         }
     } else {
         let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
         query.wait_durable_answered().await?;
         let ready_us = start.elapsed().as_micros();
-        (query, Some(ready_us))
+        (query, Some(ready_us), ProcessCpu::now()?)
     };
     let settled = settle(&meter, subscriptions_before + 1).await?;
     let initial_drained_us = settled.duration_since(start).as_micros();
+    let initial_drain_cpu = ProcessCpu::now()?;
     let settled_traffic = meter.lock().unwrap().traffic.clone();
     let mut server_reads = server.storage.take();
     let mut client_reads = client.storage.take();
     phase("verify-applied");
+    let verification_cpu_start = ProcessCpu::now()?;
     let verification_start = Instant::now();
     let mut verification_attempts = 0;
     let mut verification_client_point_reads = 0;
@@ -379,9 +441,11 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     }
     let verification_us = verification_start.elapsed().as_micros();
     let verified_us = start.elapsed().as_micros();
+    let verified_cpu = ProcessCpu::now()?;
     let elapsed_us = ready_us.unwrap_or(verified_us);
     let final_settled = settle(&meter, subscriptions_before + 1).await?;
     let transport_settled_us = final_settled.duration_since(start).as_micros();
+    let final_drain_cpu = ProcessCpu::now()?;
     let settled_us = transport_settled_us.max(ready_us.unwrap_or(verified_us));
     let mut server_tail_reads = server.storage.take();
     let mut client_tail_reads = client.storage.take();
@@ -408,6 +472,16 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
             "settled_us":settled_us, "transport_settled_us":transport_settled_us,
             "verified_us":verified_us, "verification_us":verification_us, "verification_attempts":verification_attempts, "verified":true,
             "traffic":traffic, "settled_traffic":settled_traffic, "server_reads":server_reads, "client_reads":client_reads,
+            "phase_process_cpu": {
+                "scope":"process CPU during each interval: server/client combined, all background threads included; phases can overlap; excludes teardown",
+                "setup":cpu_delta(sample_cpu_start, measurement_cpu_start),
+                "through_ready":cpu_delta(measurement_cpu_start, ready_cpu),
+                "through_initial_drain":cpu_delta(measurement_cpu_start, initial_drain_cpu),
+                "verification":cpu_delta(verification_cpu_start, verified_cpu),
+                "through_verified":cpu_delta(measurement_cpu_start, verified_cpu),
+                "after_verification_drain":cpu_delta(verified_cpu, final_drain_cpu),
+                "through_final_drain":cpu_delta(measurement_cpu_start, final_drain_cpu),
+            },
         })
     );
     disconnect(&server, &client, &meter);
@@ -465,7 +539,10 @@ fn main() -> anyhow::Result<()> {
                     for &bps in &bandwidths {
                         for mode in modes.split(',') {
                             for cache in caches.split(',') {
-                                if (n == 0 && cache != "empty") || (mode != "cold" && (n == 0 || cache != "all")) {
+                                if (n == 0 && cache != "empty")
+                                    || (mode != "cold" && n == 0)
+                                    || (mode != "cold" && mode != "warm_refresh" && cache != "all")
+                                {
                                     continue;
                                 }
                                 tokio::time::timeout(

@@ -68,6 +68,13 @@ def summarize(data):
               "largest_message_bytes": max(x["traffic"]["max_message_bytes"] for x in data)}
     for name in ("process_user_cpu_seconds", "process_system_cpu_seconds", "process_peak_rss_bytes"):
         result[name] = distribution([x["resources"][name] for x in data])
+    if all("phase_process_cpu" in x for x in data):
+        result["phase_process_cpu_us"] = {}
+        for phase in ("setup", "through_ready", "through_initial_drain", "verification", "through_verified", "after_verification_drain", "through_final_drain"):
+            values = [x["phase_process_cpu"][phase] for x in data]
+            result["phase_process_cpu_us"][phase] = {
+                name: distribution([value[name] for value in values]) for name in ("user_us", "system_us")
+            } if all(value is not None for value in values) else None
     return result
 
 
@@ -89,12 +96,12 @@ def main():
     caches, modes = args.cache.split(","), args.modes.split(",")
     if args.repeats < 1 or args.timeout <= 0 or any(n < 0 for n in sizes + rtts + bandwidths):
         parser.error("positive repeats/timeout and nonnegative sizes/RTTs/bandwidths required")
-    if any(cache not in ("empty", "half", "all") for cache in caches):
-        parser.error("cache modes: empty,half,all")
+    if any(cache not in ("empty", "half", "all", "half_blocks", "half_interleaved") for cache in caches):
+        parser.error("cache modes: empty,half,all,half_blocks,half_interleaved")
     if any(mode not in ("cold", "warm_equal", "warm_edit", "warm_membership", "warm_refresh") for mode in modes):
         parser.error("modes: cold,warm_refresh,warm_equal,warm_edit,warm_membership")
     cases = [(n, rtt, bps, mode, cache) for n, rtt, bps, mode, cache in itertools.product(sizes, rtts, bandwidths, modes, caches)
-             if not ((n == 0 and cache != "empty") or (mode != "cold" and (n == 0 or cache != "all")))]
+             if not ((n == 0 and cache != "empty") or (mode != "cold" and n == 0) or (mode not in ("cold", "warm_refresh") and cache != "all"))]
     if not cases:
         parser.error("matrix contains no cases")
     binaries = {label: getattr(args, label).resolve(strict=True) for label in ("baseline", "candidate")}

@@ -253,6 +253,30 @@ async fn sample(
     let cached = match cache {
         "empty" => 0,
         "half" => reader.fetch::<StartupRowView>(format!("position < {}", n / 2)).await?.len(),
+        "half_blocks" => {
+            let intervals = (0..n)
+                .step_by(512)
+                .map(|start| format!("(position >= {start} AND position < {})", (start + 256).min(n)))
+                .collect::<Vec<_>>();
+            let wanted: BTreeSet<_> =
+                rows.iter().enumerate().filter(|(position, _)| position / 256 % 2 == 0).map(|(_, row)| row.id()).collect();
+            let mut cached_ids = BTreeSet::new();
+            for batch in intervals.chunks(16) {
+                cached_ids.extend(reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
+            }
+            assert_eq!(cached_ids, wanted, "gapped prefetch membership");
+            cached_ids.len()
+        }
+        "half_interleaved" => {
+            let positions = (0..n).step_by(2).map(|position| format!("position = {position}")).collect::<Vec<_>>();
+            let wanted: BTreeSet<_> = rows.iter().enumerate().filter(|(position, _)| position % 2 == 0).map(|(_, row)| row.id()).collect();
+            let mut cached_ids = BTreeSet::new();
+            for batch in positions.chunks(32) {
+                cached_ids.extend(reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
+            }
+            assert_eq!(cached_ids, wanted, "gapped prefetch membership");
+            cached_ids.len()
+        }
         "all" => reader.fetch::<StartupRowView>("position >= 0").await?.len(),
         _ => anyhow::bail!("unknown cache mode: {cache}"),
     };
@@ -261,6 +285,8 @@ async fn sample(
         match cache {
             "empty" => 0,
             "half" => n / 2,
+            "half_blocks" => (0..n).filter(|position| position / 256 % 2 == 0).count(),
+            "half_interleaved" => n.div_ceil(2),
             _ => n,
         },
         "prefetch coverage"
