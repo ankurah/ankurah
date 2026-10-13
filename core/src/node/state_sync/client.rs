@@ -206,15 +206,14 @@ where
                 for (entity_id, target) in &targets {
                     ensure!(required.get(entity_id).is_none_or(|pending| pending == target), "repair changed its pending target");
                 }
-                let divergences = NodeApplier::apply_deltas(self, &peer, deltas, &event_getter, &state_getter).await?;
+                let applied = NodeApplier::apply_deltas(self, &peer, deltas, &event_getter, &state_getter).await?;
                 for (entity_id, target) in targets {
                     ensure!(required.get(&entity_id).is_none_or(|pending| *pending == target), "repair changed its pending target");
-                    let actual = match self.entities.get(&entity_id) {
-                        Some(entity) => entity.head(),
+                    let actual = match applied.observed_head(&entity_id).or_else(|| self.entities.get(&entity_id).map(|entity| entity.head())) {
+                        Some(head) => head,
                         None => self.storage.get_state(entity_id).await?.payload.state.head,
                     };
-                    let divergent = divergences.iter().any(|gap| gap.entity_id == entity_id);
-                    let covered = !divergent && self.covers_target(&actual, &target).await?;
+                    let covered = !applied.diverged(&entity_id) && self.covers_target(&actual, &target).await?;
                     if covered {
                         required.remove(&entity_id);
                         repair_attempts.remove(&entity_id);

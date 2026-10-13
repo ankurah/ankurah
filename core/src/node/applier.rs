@@ -8,6 +8,7 @@ use crate::util::ready_chunks::ReadyChunks;
 use crate::util::Iterable;
 use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
+use std::collections::HashMap;
 
 /// Applies entity deltas received from a peer, whether they arrive as initial
 /// transfer (Fetch, QuerySubscribed, repair) or as live subscription updates.
@@ -49,6 +50,21 @@ pub(crate) struct DeltaOutcome {
     pub entity: Option<Entity>,
     pub change: Option<EntityChange>,
     pub divergence: Option<Divergence>,
+}
+
+/// Heads observed after successful application, with any divergences.
+/// These heads are coverage evidence at observation time, without retaining entities.
+#[derive(Debug, Default)]
+pub(crate) struct AppliedDeltas {
+    heads: HashMap<proto::EntityId, proto::Clock>,
+    divergences: Vec<Divergence>,
+}
+
+impl AppliedDeltas {
+    /// The committed head observed while collecting a successful outcome.
+    pub(crate) fn observed_head(&self, entity_id: &proto::EntityId) -> Option<proto::Clock> { self.heads.get(entity_id).cloned() }
+
+    pub(crate) fn diverged(&self, entity_id: &proto::EntityId) -> bool { self.divergences.iter().any(|gap| &gap.entity_id == entity_id) }
 }
 
 impl DeltaOutcome {
@@ -165,7 +181,7 @@ impl NodeApplier {
         deltas: Vec<proto::EntityDelta>,
         event_getter: &E,
         state_getter: &S,
-    ) -> Result<Vec<Divergence>, ApplyError>
+    ) -> Result<AppliedDeltas, ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -179,7 +195,7 @@ impl NodeApplier {
             (entity_id, Self::apply_delta(node, from_peer_id, delta, Delivery::Initial, event_getter, state_getter).await)
         }));
 
-        let mut divergences = Vec::new();
+        let mut applied = AppliedDeltas::default();
         let mut errors = Vec::new();
         while let Some(results) = ready_chunks.next().await {
             let mut batch = Vec::new();
@@ -187,7 +203,10 @@ impl NodeApplier {
                 match result {
                     Ok(outcome) => {
                         batch.extend(outcome.change);
-                        divergences.extend(outcome.divergence);
+                        applied.divergences.extend(outcome.divergence);
+                        if let Some(entity) = outcome.entity {
+                            applied.heads.insert(entity_id, entity.head());
+                        }
                     }
                     Err(cause) => errors.push(ApplyErrorItem { entity_id, cause }),
                 }
@@ -200,7 +219,7 @@ impl NodeApplier {
         if !errors.is_empty() {
             return Err(ApplyError::Items(errors));
         }
-        Ok(divergences)
+        Ok(applied)
     }
 
     /// Apply one delta of any content. Errors before anything is persisted are
