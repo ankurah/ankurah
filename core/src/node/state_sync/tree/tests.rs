@@ -44,8 +44,7 @@ fn keyed_state(id: u32, head: u8, value: Option<Value>) -> anyhow::Result<(Attes
     let property = proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN]));
     let backend = LWWBackend::new();
     backend.set(property, value);
-    let operations = backend.to_operations()?.unwrap();
-    backend.apply_operations_with_event(&operations, proto::EventId::from_bytes([head; 32]))?;
+    crate::test_helpers::commit_backend(&backend, head)?;
     let values = vec![backend.get(&property)];
     let mut state = numbered_state(id, head);
     state.payload.state.state_buffers = proto::StateBuffers([("lww".into(), backend.to_state_buffer()?)].into());

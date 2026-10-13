@@ -570,7 +570,11 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     release.send(()).unwrap();
 
     // An initially divergent bare snapshot is ignored too: a retry must make the same decision.
-    assert!(applying.await?.change.is_none());
+    let outcome = applying.await?;
+    assert!(outcome.change.is_none());
+    let divergence = outcome.divergence.expect("the concurrent commit leaves the snapshot uncovered");
+    assert_eq!(divergence.target, Clock::singleton(&incoming));
+    assert_eq!(divergence.actual, before.head);
     assert_eq!(fixture.entity.to_state()?, before);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());

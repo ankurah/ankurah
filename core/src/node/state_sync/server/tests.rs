@@ -845,8 +845,7 @@ fn positioned_state(id: u32, position: i64, head: u8) -> anyhow::Result<proto::A
     row.payload.entity_id = proto::EntityId::from_bytes(bytes);
     let backend = LWWBackend::new();
     backend.set(proto::PropertyId::EntityId(proto::EntityId::from_bytes([42; 32])), Some(ankurah_core_types::Value::I64(position)));
-    let operations = backend.to_operations()?.unwrap();
-    backend.apply_operations_with_event(&operations, proto::EventId::from_bytes([head; 32]))?;
+    crate::test_helpers::commit_backend(&backend, head)?;
     row.payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([head; 32]));
     row.payload.state.state_buffers = proto::StateBuffers([("lww".into(), backend.to_state_buffer()?)].into());
     Ok(row)
@@ -1050,8 +1049,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let text_state = |text: String, head: u8| -> anyhow::Result<proto::Attested<proto::EntityState>> {
         let backend = LWWBackend::new();
         backend.set(property, Some(ankurah_core_types::Value::String(text)));
-        let operations = backend.to_operations()?.unwrap();
-        backend.apply_operations_with_event(&operations, proto::EventId::from_bytes([head; 32]))?;
+        crate::test_helpers::commit_backend(&backend, head)?;
         let mut row = positioned_state(1, 0, head)?;
         row.payload.state.state_buffers = proto::StateBuffers([("lww".into(), backend.to_state_buffer()?)].into());
         Ok(row)
