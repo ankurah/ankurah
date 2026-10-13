@@ -428,12 +428,17 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let states = client.storage.fetch_states(&selection).await?;
     let tree = super::super::QueryTree::default();
     let mut snapshot = tree.refresh(super::super::QueryTree::spec(&selection, &client.catalog), states).await?;
-    // Thirty-three positive regions exceed the responder's work cap, giving
-    // a real streamed initial reply whose continuation can be held on wire.
+    // A mixed leaf/summary inventory requires per-region work. Thirty-three
+    // positive regions exceed that budget, leaving a continuation on wire.
     let mut start = super::super::whole().start;
     let mut regions = Vec::new();
     for n in 1..=32 {
-        regions.push(proto::KnownRegion::Summary(snapshot.head(proto::AddressRange::new(start, Excluded(address(n)))).await?));
+        let bounds = proto::AddressRange::new(start, Excluded(address(n)));
+        regions.push(if n == 1 {
+            proto::KnownRegion::Leaves(snapshot.page(bounds).await?)
+        } else {
+            proto::KnownRegion::Summary(snapshot.head(bounds).await?)
+        });
         start = Included(address(n));
     }
     regions.push(proto::KnownRegion::Summary(snapshot.head(proto::AddressRange::new(start, super::super::whole().end)).await?));

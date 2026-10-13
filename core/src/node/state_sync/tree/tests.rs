@@ -21,6 +21,14 @@ fn numbered_state(id: u32, head: u8) -> Attested<EntityState> {
     state
 }
 
+fn offered_digest(offer: &proto::KnownState) -> anyhow::Result<ankurah_digest_tree::Digest> {
+    ankurah_digest_tree::Digest::checked_sum(offer.regions.iter().map(|region| {
+        let proto::KnownRegion::Summary(head) = region else { panic!("expected only summaries") };
+        head.digest
+    }))
+    .map_err(Into::into)
+}
+
 fn keyed_spec() -> TreeSpec {
     TreeSpec::new(
         KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(
@@ -135,10 +143,8 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
         let mut recomputed = recomputed_query.refresh(spec(), states).await?;
         assert_eq!(refreshed.members(), recomputed.members());
         let offer = refreshed.offer().await?;
-        let [proto::KnownRegion::Summary(root)] = offer.regions.as_slice() else {
-            panic!("a retained query must offer its root even after a bulk rebuild")
-        };
-        assert_eq!(*root, recomputed.head(super::super::whole()).await?);
+        assert!(offer.regions.len() > 1, "a retained bulk rebuild must still offer bounded regions");
+        assert_eq!(offered_digest(&offer)?, recomputed.head(super::super::whole()).await?.digest);
         assert_eq!(old.head(super::super::whole()).await?, original);
     }
 
@@ -153,17 +159,15 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
 }
 
 #[tokio::test]
-async fn retained_unbuilt_cache_offers_a_root_after_initial_membership_fill() -> anyhow::Result<()> {
+async fn retained_unbuilt_cache_offers_a_frontier_after_initial_membership_fill() -> anyhow::Result<()> {
     let query = QueryTree::default();
     let mut initial = query.refresh(spec(), vec![]).await?;
     assert!(matches!(initial.offer().await?.regions.as_slice(), [proto::KnownRegion::Leaves(_)]));
     let mut refreshed = query.refresh(spec(), (0..256).map(|id| numbered_state(id, 1)).collect()).await?;
     assert!(refreshed.tree.is_none());
     let offer = refreshed.offer().await?;
-    let [proto::KnownRegion::Summary(root)] = offer.regions.as_slice() else {
-        panic!("same-query lineage must use a root even when no previous digest was built")
-    };
-    assert_eq!(root.digest.count(), 256);
+    assert!(offer.regions.len() > 1);
+    assert_eq!(offered_digest(&offer)?.count(), 256);
     Ok(())
 }
 
@@ -189,7 +193,7 @@ async fn initial_complete_retains_only_large_standing_query_digests() -> anyhow:
         Box::new(Sender(peer)),
     )
     .await?;
-    for (standing, count) in [(false, 64), (true, super::super::LEAF_PAGE), (true, 64)] {
+    for (standing, count) in [(false, 64), (true, super::super::INLINE_LEAVES), (true, 64)] {
         let query = QueryTree::default();
         let snapshot = query.refresh(spec(), (0..count).map(|id| numbered_state(id as u32, 1)).collect()).await?;
         assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
@@ -208,7 +212,7 @@ async fn initial_complete_retains_only_large_standing_query_digests() -> anyhow:
         assert!(matches!(reply.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
         assert_eq!(
             query.0.lock().await.as_ref().unwrap().tree.is_some(),
-            standing && count > super::super::LEAF_PAGE,
+            standing && count > super::super::INLINE_LEAVES,
             "only a large standing query must build its retained digest before Complete"
         );
     }
@@ -218,7 +222,7 @@ async fn initial_complete_retains_only_large_standing_query_digests() -> anyhow:
 
 #[tokio::test]
 async fn small_and_empty_inventories_offer_exact_leaves_without_building_a_tree() -> anyhow::Result<()> {
-    for count in [0, super::super::LEAF_PAGE] {
+    for count in [0, super::super::INLINE_LEAVES] {
         let query = QueryTree::default();
         let states = (0..count).rev().map(|id| state(id as u8, 1)).collect();
         let mut snapshot = query.refresh(spec(), states).await?;
@@ -251,11 +255,7 @@ async fn small_inventory_exceeding_the_byte_budget_falls_back_to_a_summary() -> 
     )?;
     let query = QueryTree::default();
     let mut snapshot = query.refresh(spec(), vec![state]).await?;
-    let candidate = proto::KnownState {
-        spec: snapshot.spec.clone(),
-        regions: vec![proto::KnownRegion::Leaves(snapshot.page(super::super::whole()).await?)],
-    };
-    assert!(bincode::serialized_size(&candidate)? > super::super::FRAME_BYTES as u64);
+    assert!(snapshot.page(super::super::whole()).await.is_err(), "an oversized single leaf must fail explicitly");
     assert!(snapshot.tree.is_none(), "preparing the candidate inventory must not build a tree");
     let inventory = snapshot.offer().await?;
     let [proto::KnownRegion::Summary(head)] = inventory.regions.as_slice() else { panic!("oversized inventory must use a summary") };
@@ -263,6 +263,67 @@ async fn small_inventory_exceeding_the_byte_budget_falls_back_to_a_summary() -> 
     assert_eq!(head.bounds, super::super::whole());
     assert!(bincode::serialized_size(&inventory)? <= super::super::FRAME_BYTES as u64);
     assert!(snapshot.tree.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots() -> anyhow::Result<()> {
+    let wide_spec = TreeSpec::new(
+        KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(
+            proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN])),
+            ValueType::String,
+        )]),
+        ankql::ast::Predicate::True,
+    );
+    let rows = (0..super::super::INLINE_LEAVES)
+        .map(|id| {
+            let mut row = keyed_state(id as u32, 1, Some(Value::String("key".repeat(160))))?;
+            row.0.payload.state.head = proto::Clock::new(
+                (0..100u32)
+                    .map(|n| {
+                        let mut bytes = [0; 32];
+                        bytes[..4].copy_from_slice(&n.to_be_bytes());
+                        (1, proto::EventId::from_bytes(bytes))
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            Ok(row)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let query = QueryTree::default();
+    let mut old = query.refresh_captured(wide_spec.clone(), rows).await?;
+    let mut remaining = super::super::whole();
+    let mut pages = Vec::new();
+    let mut ids = Vec::new();
+    loop {
+        let page = old.page(remaining.clone()).await?;
+        assert_eq!(page.bounds.start, remaining.start);
+        assert!(bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::super::PAGE_BYTES as u64);
+        ids.extend(page.leaves.iter().map(|leaf| leaf.entity.entity_id));
+        let complete = page.bounds.end == super::super::whole().end;
+        if !complete {
+            let Bound::Included(last) = &page.bounds.end else { panic!("a byte-bounded page must advance") };
+            remaining = super::super::whole().after(last);
+        }
+        pages.push(page);
+        if complete {
+            break;
+        }
+    }
+    assert!(pages.len() > 1, "clock and key bytes must split an ordinary inline-sized inventory");
+    assert_eq!(ids, old.members().values().copied().collect::<Vec<_>>());
+    assert!(old.tree.is_none());
+    let offer = old.offer().await?;
+    assert!(
+        matches!(offer.regions.as_slice(), [proto::KnownRegion::Summary(_)]),
+        "a partial inventory cannot be an exhaustive initial offer"
+    );
+
+    let changed = (0..super::super::INLINE_LEAVES)
+        .map(|id| keyed_state(id as u32, 2, Some(Value::String("changed".into()))))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    query.refresh_captured(wide_spec, changed).await?;
+    assert_eq!(bincode::serialize(&old.page(super::super::whole()).await?)?, bincode::serialize(&pages[0])?);
     Ok(())
 }
 
@@ -388,9 +449,13 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
 
     let mut warm = query.refresh(spec(), states).await?;
     let retained = warm.offer().await?;
-    let [proto::KnownRegion::Summary(retained_root)] = retained.regions.as_slice() else {
-        panic!("retained equality must use its cheap root offer")
-    };
-    assert_eq!(*retained_root, root);
+    assert!(retained.regions.len() > 1, "retained offers must also identify bounded changed regions");
+    assert!(retained.regions.len() <= OFFER_REGIONS);
+    assert!(bincode::serialized_size(&retained)? <= OFFER_BYTES);
+    assert!(retained
+        .regions
+        .iter()
+        .all(|region| matches!(region, proto::KnownRegion::Summary(head) if head.digest.count() <= super::super::LEAF_PAGE as i64)));
+    assert_eq!(offered_digest(&retained)?, root.digest);
     Ok(())
 }

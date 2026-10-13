@@ -17,7 +17,8 @@ const PAGE_BYTES: usize = 64 * 1024;
 // repairs that may load storage or walk history have a separate, lower cap.
 const PAGE_STEPS: usize = 128;
 const PAGE_WORK: usize = 32;
-const LEAF_PAGE: usize = 32;
+const INLINE_LEAVES: usize = 32;
+const LEAF_PAGE: usize = 128;
 const MAX_SNAPSHOT_ROWS: usize = 128;
 const MAX_REPAIR_BYTES: usize = 64 * 1024 * 1024;
 const FRAME_BYTES: usize = PAGE_BYTES + 4096;

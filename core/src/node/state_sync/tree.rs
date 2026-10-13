@@ -64,7 +64,6 @@ pub(crate) struct Snapshot {
     pub spec: TreeSpec,
     pub states: States,
     tree: Option<TreeTransaction>,
-    retained: bool,
     members: Arc<Members>,
     cache: Weak<Cache>,
     generation: Arc<()>,
@@ -177,7 +176,6 @@ impl QueryTree {
         let rows: BTreeMap<_, _> =
             rows.into_iter().map(|(state, key)| (state.payload.entity_id, CapturedRow { key, state: Arc::new(state) })).collect();
         let mut cache = self.0.lock().await;
-        let retained = cache.as_ref().is_some_and(|cached| cached.spec == spec);
         if cache.as_ref().is_none_or(|cached| cached.spec != spec) {
             let members = rows.values().map(CapturedRow::member).collect();
             *cache = Some(Cached { spec: spec.clone(), tree: None, rows, members: Arc::new(members), generation: Arc::new(()) });
@@ -236,7 +234,6 @@ impl QueryTree {
         Ok(Snapshot {
             spec,
             tree: cached.tree.as_ref().map(DigestTree::begin),
-            retained,
             states: cached.rows.iter().map(|(id, row)| (*id, row.state.clone())).collect(),
             members: cached.members.clone(),
             cache: Arc::downgrade(&self.0),
@@ -294,46 +291,46 @@ impl Snapshot {
     }
 
     pub async fn offer(&mut self) -> anyhow::Result<proto::KnownState> {
-        if self.members.len() <= super::LEAF_PAGE {
-            let inventory =
-                proto::KnownState { spec: self.spec.clone(), regions: vec![proto::KnownRegion::Leaves(self.page(super::whole()).await?)] };
-            if bincode::serialized_size(&inventory)? <= super::FRAME_BYTES as u64 {
-                return Ok(inventory);
+        if self.members.len() <= super::INLINE_LEAVES {
+            if let Ok(page) = self.page(super::whole()).await {
+                if page.bounds == super::whole() {
+                    let inventory = proto::KnownState { spec: self.spec.clone(), regions: vec![proto::KnownRegion::Leaves(page)] };
+                    if bincode::serialized_size(&inventory)? <= super::FRAME_BYTES as u64 {
+                        return Ok(inventory);
+                    }
+                }
             }
         }
-        // Existing query caches answer equality with their root, even when
-        // its lazy digest needs construction. A first snapshot also offers
-        // bounded descendants to avoid another refinement exchange.
+        // A bounded disjoint frontier recognizes both equal inventories and
+        // small changed regions without serial refinement exchanges.
         let root = self.head(super::whole()).await?;
         let mut frontier = vec![(root, true)];
-        if !self.retained {
-            for _ in 0..OFFER_REFINEMENTS {
-                let Some(index) = frontier
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, (head, expandable))| *expandable && head.digest.count() > super::LEAF_PAGE as i64)
-                    .max_by_key(|(_, (head, _))| head.digest.count())
-                    .map(|(index, _)| index)
-                else {
-                    break;
-                };
-                frontier[index].1 = false;
-                let children = self.refine(&frontier[index].0).await?;
-                if children.as_slice() == [frontier[index].0.clone()] {
-                    continue;
-                }
-                let mut candidate = frontier.clone();
-                candidate.splice(index..=index, children.into_iter().map(|head| (head, true)));
-                if candidate.len() > OFFER_REGIONS {
-                    continue;
-                }
-                let inventory = proto::KnownState {
-                    spec: self.spec.clone(),
-                    regions: candidate.iter().map(|(head, _)| proto::KnownRegion::Summary(head.clone())).collect(),
-                };
-                if bincode::serialized_size(&inventory)? <= OFFER_BYTES {
-                    frontier = candidate;
-                }
+        for _ in 0..OFFER_REFINEMENTS {
+            let Some(index) = frontier
+                .iter()
+                .enumerate()
+                .filter(|(_, (head, expandable))| *expandable && head.digest.count() > super::LEAF_PAGE as i64)
+                .max_by_key(|(_, (head, _))| head.digest.count())
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            frontier[index].1 = false;
+            let children = self.refine(&frontier[index].0).await?;
+            if children.as_slice() == [frontier[index].0.clone()] {
+                continue;
+            }
+            let mut candidate = frontier.clone();
+            candidate.splice(index..=index, children.into_iter().map(|head| (head, true)));
+            if candidate.len() > OFFER_REGIONS {
+                continue;
+            }
+            let inventory = proto::KnownState {
+                spec: self.spec.clone(),
+                regions: candidate.iter().map(|(head, _)| proto::KnownRegion::Summary(head.clone())).collect(),
+            };
+            if bincode::serialized_size(&inventory)? <= OFFER_BYTES {
+                frontier = candidate;
             }
         }
         Ok(proto::KnownState {
@@ -354,16 +351,37 @@ impl Snapshot {
         } else {
             self.members.range((bounds.start.clone(), bounds.end.clone())).take(super::LEAF_PAGE + 1).collect::<Vec<_>>()
         };
-        let end = if rows.len() > super::LEAF_PAGE { std::ops::Bound::Included(rows[super::LEAF_PAGE - 1].0.clone()) } else { bounds.end };
-        let leaves = rows
-            .into_iter()
-            .take(super::LEAF_PAGE)
-            .map(|(address, id)| proto::KnownLeaf {
+        let mut leaves = Vec::new();
+        let mut bytes = 0;
+        for (index, (address, id)) in rows.iter().take(super::LEAF_PAGE).enumerate() {
+            let leaf = proto::KnownLeaf {
                 key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
-                entity: proto::KnownEntity { entity_id: *id, head: self.states[id].payload.state.head.clone() },
-            })
-            .collect();
-        Ok(proto::LeafPage { bounds: proto::AddressRange::new(bounds.start, end), leaves })
+                entity: proto::KnownEntity { entity_id: **id, head: self.states[*id].payload.state.head.clone() },
+            };
+            let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
+            let overhead = bincode::serialized_size(&proto::StateAnswer::Leaves(proto::LeafPage {
+                bounds: proto::AddressRange::new(bounds.start.clone(), end),
+                leaves: Vec::new(),
+            }))?;
+            let size = bincode::serialized_size(&leaf)?;
+            if overhead + bytes + size > super::PAGE_BYTES as u64 {
+                anyhow::ensure!(!leaves.is_empty(), "single leaf inventory exceeds byte limit");
+                break;
+            }
+            bytes += size;
+            leaves.push(leaf);
+        }
+        let end = if leaves.len() == rows.len() {
+            bounds.end
+        } else {
+            Bound::Included(leaf_address(&leaves.last().unwrap().key, leaves.last().unwrap().entity.entity_id))
+        };
+        let page = proto::LeafPage { bounds: proto::AddressRange::new(bounds.start, end), leaves };
+        anyhow::ensure!(
+            bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::PAGE_BYTES as u64,
+            "leaf inventory bounds exceed byte limit"
+        );
+        Ok(page)
     }
 
     pub async fn refine(&mut self, head: &TreeHead) -> anyhow::Result<Vec<TreeHead>> { Ok(self.tree().await?.refine(head).await?) }

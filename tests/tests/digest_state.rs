@@ -130,7 +130,7 @@ async fn fetch_equal_head_and_sparse_changes_avoid_full_inventory() -> Result<()
     let items = trace.items(None);
     assert!(bridge_for(&items, pets[117].id()), "a changed leaf should use its actual clock for an event bridge");
     let leaves: usize = items.iter().map(|item| if let StateItem::Leaves(page) = item { page.leaves.len() } else { 0 }).sum();
-    assert!(leaves < 64, "one changed leaf should not resend 256 result identities: {leaves}");
+    assert!(leaves <= 128, "one changed leaf should exchange at most one bounded region, not all 256 result identities: {leaves}");
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 1);
     Ok(())
 }
@@ -1019,5 +1019,166 @@ async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_cha
         bridge_for(&trace.items(Some(query.query_id())), record.id()),
         "the uncovered snapshot target must request and apply connecting events"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branches_before_ready() -> Result<()> {
+    use futures_util::FutureExt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    // More than 128 members forces a retained Summary frontier, rather than
+    // the small exhaustive initial inventory. Unchanged payload favors a
+    // bridge for the former match's single key edit.
+    let unchanged = "unchanged-".to_owned() + &"p".repeat(1024);
+    let mut rows = Vec::new();
+    for i in 0..256 {
+        rows.push(trx.create(&Record { title: format!("a-{i:03}"), artist: unchanged.clone() }).await?.read()?);
+    }
+    let older = trx.create(&Record { title: "z-older".into(), artist: unchanged.clone() }).await?.read()?;
+    let concurrent = trx.create(&Record { title: "z-concurrent".into(), artist: unchanged.clone() }).await?.read()?;
+    let newer = trx.create(&Record { title: "z-newer".into(), artist: unchanged.clone() }).await?.read()?;
+    trx.commit().await?;
+    let former = rows[40].clone();
+    let selection = "true ORDER BY title ASC LIMIT 256";
+    let (connection, _) = GatedConnection::new(&server, &client, |_| false).await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let cached_older = reader.get::<RecordView>(older.id()).await?;
+    let cached_concurrent = reader.get::<RecordView>(concurrent.id()).await?;
+    let cached_newer = reader.get::<RecordView>(newer.id()).await?;
+    let query = reader.query::<RecordView>(nocache(selection)?)?;
+    query.wait_durable_answered().await?;
+    assert_eq!(query.ids().into_iter().collect::<HashSet<_>>(), rows.iter().map(|row| row.id()).collect());
+    let cached_former = reader.get::<RecordView>(former.id()).await?;
+
+    // Receive this sender head before going offline, then make the receiver
+    // strictly newer while moving its key outside the local ordered result.
+    let trx = writer.begin();
+    newer.edit(&trx)?.title()?.set(&"a-1925".to_owned())?;
+    trx.commit().await?;
+    let newer_target = newer.entity().head();
+    // Materialize a fresh answer here instead of making setup depend on
+    // ordinary live ORDER BY/LIMIT insertion behavior.
+    query.update_selection_wait(selection).await?;
+    query.wait_durable_answered().await?;
+    assert_eq!(cached_newer.entity().head(), newer_target);
+    assert!(query.ids().contains(&newer.id()));
+    drop(connection);
+    server.deregister_peer(client.id);
+    client.deregister_peer(server.id);
+    let trx = reader.begin();
+    cached_newer.edit(&trx)?.title()?.set(&"zz-local-newer".to_owned())?;
+    cached_newer.edit(&trx)?.artist()?.set(&"local-newer".to_owned())?;
+    cached_concurrent.edit(&trx)?.artist()?.set(&"local-concurrent".to_owned())?;
+    trx.commit().await?;
+    let newer_local = cached_newer.entity().head();
+    let concurrent_local = cached_concurrent.entity().head();
+    let older_before = cached_older.entity().head();
+    let trx = writer.begin();
+    older.edit(&trx)?.title()?.set(&"a-0645".to_owned())?;
+    concurrent.edit(&trx)?.title()?.set(&"a-1275".to_owned())?;
+    former.edit(&trx)?.title()?.set(&"zz-former".to_owned())?;
+    trx.commit().await?;
+    let older_target = older.entity().head();
+    let concurrent_target = concurrent.entity().head();
+    assert_ne!(older_before, older_target);
+    assert!(concurrent_target.entries().iter().all(|entry| !concurrent_local.entries().contains(entry)));
+    // The three inserted keys evict the two highest old keys after the
+    // explicit former match leaves. Do not use another query as the oracle.
+    let expected: HashSet<_> = rows
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 40 && *index < 254)
+        .map(|(_, row)| row.id())
+        .chain([older.id(), concurrent.id(), newer.id()])
+        .collect();
+    assert_eq!(expected.len(), 256);
+    assert_eq!(writer.fetch::<RecordView>(selection).await?.into_iter().map(|row| row.id()).collect::<HashSet<_>>(), expected);
+    assert!([older.id(), concurrent.id(), newer.id()].iter().all(|id| expected.contains(id)));
+    assert!(!expected.contains(&former.id()));
+
+    // A new version makes readiness assertions independent of the previous
+    // answer's flags while retaining the query's comparison tree.
+    query.update_selection(selection)?;
+    let history_held = Arc::new(AtomicBool::new(false));
+    let trace = Trace::default();
+    let (_connection, gate) = GatedConnection::new(&server, &client, {
+        let held = history_held.clone();
+        let trace = trace.clone();
+        let concurrent_id = concurrent.id();
+        move |message| {
+            trace.record(message);
+            let frame = match message {
+                NodeMessage::Response(response) => match &response.body {
+                    NodeResponseBody::QuerySubscribed { state, .. } => Some(&state.frame),
+                    _ => None,
+                },
+                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                _ => None,
+            };
+            let repair = frame.is_some_and(|frame| match &frame.body {
+                proto::StateFrameBody::State { items, .. } => bridge_for(items, concurrent_id),
+                _ => false,
+            });
+            if repair {
+                held.store(true, Ordering::Release);
+            }
+            repair
+        }
+    })
+    .await;
+    wait_for(|| {
+        let items = trace.items(Some(query.query_id()));
+        history_held.load(Ordering::Acquire)
+            && [older.id(), concurrent.id(), newer.id()].iter().all(|id| {
+                items.iter().any(|item| {
+                    matches!(item, StateItem::Repair { delta, .. }
+                    if delta.entity_id == *id && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))
+                })
+            })
+    })
+    .await;
+    let offered = trace.items(Some(query.query_id()));
+    for (id, target) in [(older.id(), &older_target), (concurrent.id(), &concurrent_target), (newer.id(), &newer_target)] {
+        assert!(
+            offered.iter().any(|item| matches!(item,
+                StateItem::Repair { target: actual, delta }
+                    if delta.entity_id == id && actual == target
+                        && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
+            )),
+            "an absent query member must offer its captured snapshot first: {id}"
+        );
+        assert!(
+            !offered.iter().any(|item| matches!(item, StateItem::NeedHeads(ids) if ids.contains(&id))),
+            "query absence must use snapshot-first repair without an extra clock question: {id}"
+        );
+    }
+    assert!(!query.loaded(), "Complete cannot activate membership while a snapshot target remains uncovered");
+    assert!(query.wait_durable_answered().now_or_never().is_none(), "uncovered causal repair must block readiness");
+    assert_eq!(cached_concurrent.artist()?, "local-concurrent");
+    assert_ne!(cached_concurrent.entity().head(), concurrent_target);
+    gate.release_held(&client).await;
+    tokio::time::timeout(Duration::from_secs(10), query.wait_durable_answered()).await??;
+    assert_eq!(query.ids().into_iter().collect::<HashSet<_>>(), expected, "membership comes from captured sender keys");
+    assert_eq!(cached_older.title()?, "a-0645");
+    assert_eq!(cached_older.entity().head(), older_target);
+    assert_eq!(cached_concurrent.title()?, "a-1275");
+    assert_eq!(cached_concurrent.artist()?, "local-concurrent", "connecting history must retain the independent local edit");
+    let merged = cached_concurrent.entity().head();
+    assert!(concurrent_target.entries().iter().all(|entry| merged.entries().contains(entry)));
+    assert!(concurrent_local.entries().iter().all(|entry| merged.entries().contains(entry)));
+    assert_eq!(cached_newer.title()?, "zz-local-newer", "an older sender snapshot must preserve the newer local key");
+    assert_eq!(cached_newer.artist()?, "local-newer");
+    assert_eq!(cached_newer.entity().head(), newer_local);
+    assert_eq!(cached_former.title()?, "zz-former", "a former match must still receive its current readable state");
+    assert_eq!(cached_former.entity().head(), former.entity().head());
+    let items = trace.items(Some(query.query_id()));
+    assert!(bridge_for(&items, concurrent.id()), "uncovered snapshot must trigger connecting history");
+    assert!(bridge_for(&items, former.id()), "requester-only former matches retain their supplied-clock repair");
+    for (id, head) in [(older.id(), older_target), (concurrent.id(), merged), (newer.id(), newer_local)] {
+        assert_eq!(client.storage.get_state(id).await?.payload.state.head, head, "covered heads are persisted before readiness");
+    }
     Ok(())
 }

@@ -66,13 +66,198 @@ fn live_item(bytes: usize) -> proto::SubscriptionUpdateItem {
 }
 
 #[tokio::test]
+async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> anyhow::Result<()> {
+    let (node, _, _) = node().await?;
+    let mut source = states(512, 8);
+    for (index, state) in source.iter_mut().enumerate() {
+        let mut id = [0; proto::EntityId::BYTE_LEN];
+        id[0] = 0x20;
+        id[1..5].copy_from_slice(&(index as u32).to_be_bytes());
+        state.payload.entity_id = proto::EntityId::from_bytes(id);
+    }
+    let mut requester = snapshot(source.clone()).await?;
+    let known = requester.offer().await?;
+    assert!(known.regions.len() > 1);
+    let mut equal = Comparison::new(snapshot(source.clone()).await?, Some(known.clone()))?;
+    assert!(matches!(equal.work.front(), Some(Work::CompareFrontier(_))));
+    let StateFrameBody::State { items, progress } = equal.reply(&node, &vec![], false, false).await? else { panic!("state") };
+    assert_eq!(progress, ComparisonProgress::Complete);
+    assert!(matches!(items.as_slice(), [StateItem::Equal(bounds)] if *bounds == super::super::whole()));
+
+    let empty =
+        known.regions.iter().position(|region| matches!(region, proto::KnownRegion::Summary(head) if head.digest.count() == 0)).unwrap();
+    let mut withheld = known.clone();
+    withheld.regions.remove(empty);
+    let partial = Comparison::new(snapshot(source.clone()).await?, Some(withheld))?;
+    assert!(!partial.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))), "a withheld gap cannot claim aggregate equality");
+
+    let mut mixed = known.clone();
+    let proto::KnownRegion::Summary(head) = &mixed.regions[empty] else { unreachable!() };
+    mixed.regions[empty] = proto::KnownRegion::Leaves(requester.page(head.bounds.clone()).await?);
+    let mixed = Comparison::new(snapshot(source.clone()).await?, Some(mixed))?;
+    assert!(!mixed.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))));
+
+    let mut overlap = known;
+    overlap.regions.push(overlap.regions[0].clone());
+    assert!(Comparison::new(snapshot(source).await?, Some(overlap)).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_128_leaf_mismatch_repairs_unknown_and_former_members_without_heads_questions() -> anyhow::Result<()> {
+    let (node, _, _) = node().await?;
+    let mut source = states(128, 8);
+    source.sort_by_key(|state| state.payload.entity_id);
+    let former = source[0].payload.entity_id;
+    let former_clock = source[0].payload.state.head.clone();
+    let mut requester = snapshot(source.clone()).await?;
+    let known =
+        proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Summary(requester.head(super::super::whole()).await?)] };
+    let mut current = source[1..].to_vec();
+    let added = states(1, 8).pop().unwrap();
+    let new_id = added.payload.entity_id;
+    current.push(added);
+    let mut comparison = Comparison::new(snapshot(current).await?, Some(known))?;
+    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false).await? else { panic!("state") };
+    assert!(matches!(items.as_slice(), [StateItem::NeedLeaves(bounds)] if *bounds == super::super::whole()));
+    comparison.answer(vec![StateAnswer::Leaves(requester.page(super::super::whole()).await?)]).await?;
+    let Some(Work::AnswerLeaves { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
+    comparison.expand_leaf_answer(page, rest).await?;
+    assert!(comparison.work.iter().any(|work| matches!(work, Work::Repair(id, None) if *id == new_id)));
+    assert!(comparison.work.iter().any(|work| matches!(work, Work::Repair(id, Some(clock)) if *id == former && *clock == former_clock)));
+    assert!(!comparison.work.iter().any(|work| matches!(work, Work::Item(StateItem::NeedHeads(_)))));
+    for state in &source[1..] {
+        assert!(comparison.work.iter().any(
+            |work| matches!(work, Work::Repair(id, Some(clock)) if *id == state.payload.entity_id && *clock == state.payload.state.head)
+        ));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn wider_responder_clocks_split_outbound_inventory_without_repairing_shared_ids_twice() -> anyhow::Result<()> {
+    let mut source = states(128, 8);
+    source.sort_by_key(|state| state.payload.entity_id);
+    let mut requester = snapshot(source.clone()).await?;
+    let request = requester.page(super::super::whole()).await?;
+    assert_eq!(request.leaves.len(), 128);
+    let mut current = source.clone();
+    for state in &mut current {
+        state.payload.state.head = proto::Clock::new(
+            (0..200u32)
+                .map(|n| {
+                    let mut bytes = [0; 32];
+                    bytes[..4].copy_from_slice(&n.to_be_bytes());
+                    (1, proto::EventId::from_bytes(bytes))
+                })
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    let mut comparison = Comparison::new(snapshot(current).await?, None)?;
+    comparison.work.clear();
+    comparison.leaves.push(super::super::whole());
+    comparison.answer(vec![StateAnswer::Leaves(request)]).await?;
+    let Some(Work::AnswerLeaves { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
+    comparison.expand_leaf_answer(page, rest).await?;
+    let pages = comparison
+        .work
+        .iter()
+        .filter_map(|work| match work {
+            Work::Item(StateItem::Leaves(page)) => Some(page),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(pages.len() > 1);
+    let mut start = super::super::whole().start;
+    let mut ids = Vec::new();
+    for page in pages {
+        assert_eq!(page.bounds.start, start);
+        assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
+        ids.extend(page.leaves.iter().map(|leaf| leaf.entity.entity_id));
+        start = opposite(&page.bounds.end);
+    }
+    assert_eq!(start, super::super::whole().end);
+    assert_eq!(ids, source.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>());
+    let repairs = comparison
+        .work
+        .iter()
+        .filter_map(|work| match work {
+            Work::Repair(id, clock) => Some((*id, clock)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(repairs.len(), source.len());
+    for (id, clock) in repairs {
+        assert_eq!(clock.as_ref(), Some(&source.iter().find(|state| state.payload.entity_id == id).unwrap().payload.state.head));
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit() -> anyhow::Result<()> {
+    let (node, _, _) = node().await?;
+    let mut current = states(4096, 8);
+    for (index, state) in current.iter_mut().enumerate() {
+        let mut id = [0; proto::EntityId::BYTE_LEN];
+        id[..4].copy_from_slice(&(index as u32).to_be_bytes());
+        state.payload.entity_id = proto::EntityId::from_bytes(id);
+        state.payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([2; 32]));
+    }
+    let mut before = current.clone();
+    for state in &mut before {
+        state.payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([1; 32]));
+    }
+    let mut requester = snapshot(before).await?;
+    let mut regions = Vec::new();
+    let mut start = super::super::whole().start;
+    for (index, chunk) in current.chunks(LEAF_PAGE).enumerate() {
+        let end = if (index + 1) * LEAF_PAGE == current.len() {
+            super::super::whole().end
+        } else {
+            std::ops::Bound::Included(chunk.last().unwrap().payload.entity_id.to_bytes().to_vec())
+        };
+        let bounds = AddressRange::new(start, end);
+        start = opposite(&bounds.end);
+        regions.push(proto::KnownRegion::Summary(requester.head(bounds).await?));
+    }
+    let mut comparison = Comparison::new(snapshot(current).await?, Some(proto::KnownState { spec: spec(), regions }))?;
+    let mut answers = Vec::new();
+    while !comparison.work.is_empty() {
+        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false).await? else { panic!("state") };
+        for item in items {
+            let StateItem::NeedLeaves(bounds) = item else { panic!("each changed supplied region must ask for leaves directly") };
+            answers.push(StateAnswer::Leaves(requester.page(bounds).await?));
+        }
+    }
+    assert_eq!(answers.len(), 32, "all questions are legitimate bounded mismatch regions");
+    // Several valid feedback requests can be accepted before the producer is polled.
+    for batch in answers.chunks(4) {
+        assert!(bincode::serialized_size(&(0u64, batch))? <= FRAME_BYTES as u64);
+        comparison.answer(batch.to_vec()).await?;
+    }
+    assert_eq!(comparison.work.len(), 32, "one bounded work item must represent each accepted answer");
+    let mut repaired = HashSet::new();
+    while !comparison.complete {
+        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false).await? else { panic!("state") };
+        assert!(comparison.work.len() <= 4096);
+        for item in items {
+            if let StateItem::Repair { delta, .. } = item {
+                assert!(repaired.insert(delta.entity_id));
+            }
+        }
+    }
+    assert_eq!(repaired.len(), 4096, "bounded deferral must finish every changed entity exactly once");
+    Ok(())
+}
+
+#[tokio::test]
 async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal_buckets() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
-    let mut source = states(256, 8);
+    let mut source = states(512, 8);
     for (i, state) in source.iter_mut().enumerate() {
         let mut id = [0; proto::EntityId::BYTE_LEN];
-        id[0] = if i < 128 { 0x20 } else { 0xa0 };
-        id[31] = (i % 128) as u8;
+        id[0] = if i < 256 { 0x20 } else { 0xa0 };
+        id[31] = (i % 256) as u8;
         state.payload.entity_id = proto::EntityId::from_bytes(id);
     }
     let missing = source[0].payload.entity_id;

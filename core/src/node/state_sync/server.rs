@@ -1,5 +1,6 @@
 use super::{
-    Snapshot, CONTROL_BYTES, FRAME_BYTES, LEAF_PAGE, MAX_INFLIGHT_FRAMES, MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS, PAGE_WORK, WINDOW_BYTES,
+    Snapshot, CONTROL_BYTES, FRAME_BYTES, INLINE_LEAVES, LEAF_PAGE, MAX_INFLIGHT_FRAMES, MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS,
+    PAGE_WORK, WINDOW_BYTES,
 };
 use crate::{
     node::Node,
@@ -203,10 +204,12 @@ impl<CD: ContextData> Session<CD> {
     pub fn permits(&self, credentials: &[CD]) -> bool { same_credentials(&self.credentials, credentials) }
 }
 enum Work {
+    CompareFrontier(Vec<proto::TreeHead>),
     Compare { head: proto::TreeHead, prefix: NodePrefix },
     Offer(proto::TreeHead),
     Expand { local: proto::TreeHead, known: proto::TreeHead },
     AskLeaves(AddressRange),
+    AnswerLeaves { page: proto::LeafPage, rest: Option<AddressRange> },
     SendLeaves(AddressRange),
     SendSnapshots(AddressRange),
     Item(StateItem),
@@ -852,6 +855,7 @@ impl Comparison {
             }
         });
         let mut start = super::whole().start;
+        let mut frontier = Some(Vec::new());
         for region in regions {
             ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
             let bounds = match &region {
@@ -863,6 +867,7 @@ impl Comparison {
                 "initial regions overlap or exceed scope"
             );
             if start != bounds.start {
+                frontier = None;
                 let gap = AddressRange::new(start.clone(), opposite(&bounds.start));
                 if valid_range(&gap) {
                     comparison.work.push_back(Work::SendSnapshots(gap));
@@ -872,9 +877,13 @@ impl Comparison {
             match region {
                 proto::KnownRegion::Summary(head) => {
                     let _: proto::TreeHead = proto::TreeHead::from_bytes(&head.to_bytes())?;
+                    if let Some(frontier) = &mut frontier {
+                        frontier.push(head.clone());
+                    }
                     comparison.work.push_back(Work::Compare { prefix: NodePrefix::root(), head });
                 }
                 proto::KnownRegion::Leaves(page) => {
+                    frontier = None;
                     comparison.validate_leaves(&page)?;
                     for leaf in &page.leaves {
                         ensure!(
@@ -898,6 +907,9 @@ impl Comparison {
             if valid_range(&rest) {
                 comparison.work.push_back(Work::SendSnapshots(rest));
             }
+        } else if let Some(frontier) = frontier.filter(|heads| heads.len() > 1) {
+            comparison.work.clear();
+            comparison.work.push_back(Work::CompareFrontier(frontier));
         }
         Ok(comparison)
     }
@@ -957,7 +969,7 @@ impl Comparison {
                     let requested = self.leaves[index].clone();
                     ensure!(end_le(&page.bounds.end, &requested.end), "leaf page exceeds requested bounds");
                     let mut previous = None;
-                    let mut clocks = std::collections::BTreeMap::new();
+                    let mut ids = HashSet::new();
                     for leaf in &page.leaves {
                         CanonicalCodec.split(self.snapshot.spec.key_spec(), &leaf.key)?;
                         let address = leaf_address(&leaf.key, leaf.entity.entity_id);
@@ -965,37 +977,60 @@ impl Comparison {
                             page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address),
                             "invalid leaf order or bounds"
                         );
-                        ensure!(clocks.insert(leaf.entity.entity_id, leaf.entity.head.clone()).is_none(), "duplicate entity in leaf page");
+                        ensure!(ids.insert(leaf.entity.entity_id), "duplicate entity in leaf page");
                         previous = Some(address);
                     }
-                    self.leaves.remove(index);
-                    if page.bounds.end != requested.end {
+                    let rest = if page.bounds.end != requested.end {
                         let std::ops::Bound::Included(last) = &page.bounds.end else { bail!("partial page must end at its last leaf") };
                         ensure!(previous.as_ref() == Some(last), "partial page made no progress");
-                        self.work.push_back(Work::AskLeaves(requested.after(last)));
-                    }
-                    // The small responder region can contain many requester-only leaves,
-                    // but never needs to send its entire result inventory at once.
-                    let remote = self.snapshot.page(page.bounds.clone()).await?;
-                    ensure!(remote.bounds == page.bounds, "leaf region was not fully refined");
-                    let mut needed = Vec::new();
-                    for leaf in &remote.leaves {
-                        let id = leaf.entity.entity_id;
-                        if let Some(clock) = clocks.remove(&id) {
-                            self.work.push_back(Work::Repair(id, Some(clock)));
-                        } else if !self.repaired.contains(&id) && self.heads.insert(id) {
-                            needed.push(id);
-                        }
-                    }
-                    if !needed.is_empty() {
-                        self.work.push_back(Work::Item(StateItem::NeedHeads(needed)));
-                    }
-                    for (id, clock) in clocks {
-                        self.work.push_back(Work::Repair(id, Some(clock)));
-                    }
-                    self.work.push_front(Work::Item(StateItem::Leaves(remote)));
+                        Some(requested.after(last))
+                    } else {
+                        None
+                    };
+                    self.leaves.remove(index);
+                    // Accept each validated answer once, but expand only one
+                    // region at a time while the producer drains its repairs.
+                    self.work.push_back(Work::AnswerLeaves { page, rest });
                 }
             }
+        }
+        Ok(())
+    }
+
+    async fn expand_leaf_answer(&mut self, page: proto::LeafPage, rest: Option<AddressRange>) -> anyhow::Result<()> {
+        let mut clocks =
+            page.leaves.into_iter().map(|leaf| (leaf.entity.entity_id, leaf.entity.head)).collect::<std::collections::BTreeMap<_, _>>();
+        let mut remaining = page.bounds.clone();
+        let mut pages = Vec::new();
+        let mut repairs = Vec::new();
+        let mut count = 0;
+        loop {
+            let remote = self.snapshot.page(remaining.clone()).await?;
+            count += remote.leaves.len();
+            ensure!(count <= LEAF_PAGE, "leaf region was not fully refined");
+            for leaf in &remote.leaves {
+                let id = leaf.entity.entity_id;
+                repairs.push(Work::Repair(id, clocks.remove(&id)));
+            }
+            let complete = remote.bounds.end == page.bounds.end;
+            if !complete {
+                let std::ops::Bound::Included(last) = &remote.bounds.end else { bail!("partial page must make progress") };
+                remaining = page.bounds.after(last);
+            }
+            pages.push(Work::Item(StateItem::Leaves(remote)));
+            if complete {
+                break;
+            }
+        }
+        repairs.extend(clocks.into_iter().map(|(id, clock)| Work::Repair(id, Some(clock))));
+        pages.extend(repairs);
+        if let Some(rest) = rest {
+            pages.push(Work::AskLeaves(rest));
+        }
+        // Keep this bounded region's pages and repairs ahead of later answers,
+        // rather than multiplying all pending answers into thousands of items.
+        for work in pages.into_iter().rev() {
+            self.work.push_front(work);
         }
         Ok(())
     }
@@ -1090,7 +1125,12 @@ impl Comparison {
             let Some(work) = self.work.pop_front() else { break };
             // Keep this in step with tree/storage/history access in the arms below.
             let expensive = match &work {
-                Work::Compare { .. } | Work::Expand { .. } | Work::SendLeaves(_) | Work::SendSnapshots(_) => true,
+                Work::AnswerLeaves { .. }
+                | Work::CompareFrontier(_)
+                | Work::Compare { .. }
+                | Work::Expand { .. }
+                | Work::SendLeaves(_)
+                | Work::SendSnapshots(_) => true,
                 Work::Repair(id, known) => known.is_some() || !self.snapshot.states.contains_key(id),
                 Work::History { .. } => true,
                 _ => false,
@@ -1119,6 +1159,17 @@ impl Comparison {
                             }
                         }
                         Err(_) => Some(StateItem::RepairUnavailable { entity_id, target }),
+                    }
+                }
+                Work::CompareFrontier(frontier) => {
+                    let digest = ankurah_digest_tree::Digest::checked_sum(frontier.iter().map(|head| head.digest))?;
+                    if self.snapshot.head(super::whole()).await?.digest == digest {
+                        Some(StateItem::Equal(super::whole()))
+                    } else {
+                        for head in frontier {
+                            self.work.push_back(Work::Compare { prefix: NodePrefix::root(), head });
+                        }
+                        None
                     }
                 }
                 Work::Compare { head: known, prefix } => {
@@ -1170,6 +1221,10 @@ impl Comparison {
                             });
                         }
                     }
+                    None
+                }
+                Work::AnswerLeaves { page, rest } => {
+                    self.expand_leaf_answer(page, rest).await?;
                     None
                 }
                 Work::AskLeaves(bounds) => {
@@ -1285,7 +1340,7 @@ impl Comparison {
         }
         let finished = self.work.is_empty() && self.summaries.is_empty() && self.leaves.is_empty() && self.heads.is_empty();
         let first_complete = finished && !self.complete;
-        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > LEAF_PAGE {
+        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INLINE_LEAVES {
             // Charge retained-query construction to its initial handoff. Small
             // inventories and temporary Fetch snapshots remain lazy.
             self.snapshot.head(super::whole()).await?;
