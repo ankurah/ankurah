@@ -291,12 +291,29 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         for (key, value) in entries {
             self.transaction.delete_if(MapName::Nodes, &key, &value).await?;
         }
-        let mut pending = vec![(prefix.clone(), 0, leaves.len())];
-        while let Some((prefix, from, to)) = pending.pop() {
+        enum Step {
+            Build { prefix: NodePrefix, from: usize, to: usize },
+            Join(NodePrefix),
+        }
+        let mut pending = vec![Step::Build { prefix: prefix.clone(), from: 0, to: leaves.len() }];
+        let mut completed = Vec::<Digest<G>>::new();
+        while let Some(step) = pending.pop() {
+            let (prefix, from, to) = match step {
+                Step::Build { prefix, from, to } => (prefix, from, to),
+                Step::Join(prefix) => {
+                    let right = completed.pop().expect("right subtree completed before join");
+                    let left = completed.pop().expect("left subtree completed before join");
+                    let digest = left + right;
+                    self.put_node_base(&prefix, None, NodeRow { digest }).await?;
+                    completed.push(digest);
+                    continue;
+                }
+            };
             let rows = &leaves[from..to];
-            let digest = rows.iter().map(|row| row.element).map(Digest::from).sum();
-            self.put_node_base(&prefix, None, NodeRow { digest }).await?;
             if rows.len() <= BUCKET_CAPACITY {
+                let digest = rows.iter().map(|row| row.element).map(Digest::from).sum();
+                self.put_node_base(&prefix, None, NodeRow { digest }).await?;
+                completed.push(digest);
                 continue;
             }
             let first = rows.first().unwrap().address();
@@ -309,8 +326,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             let left = NodePrefix::of(&first, depth + 1);
             let right = NodePrefix::of(&last, depth + 1);
             let middle = from + rows.partition_point(|row| left.contains_address(&row.address()));
-            pending.push((right, middle, to));
-            pending.push((left, from, middle));
+            // Sum each terminal bucket once, then combine its completed
+            // children instead of summing all leaves again at every ancestor.
+            pending.push(Step::Join(prefix));
+            pending.push(Step::Build { prefix: right, from: middle, to });
+            pending.push(Step::Build { prefix: left, from, to: middle });
         }
         Ok(())
     }
@@ -370,6 +390,57 @@ mod tests {
     use crate::{DigestTree, Ristretto255, TreeSpec};
     use ankql::ast::Predicate;
     use ankurah_core_types::KeySpec;
+    use sha2::{Digest as _, Sha256};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static GROUP_ADDS: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CountedGroup;
+    impl DigestGroup for CountedGroup {
+        type Element = <Ristretto255 as DigestGroup>::Element;
+        const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
+        const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
+        fn zero() -> Self::Element { Ristretto255::zero() }
+        fn add(sum: &mut Self::Element, other: &Self::Element) {
+            GROUP_ADDS.fetch_add(1, Ordering::Relaxed);
+            Ristretto255::add(sum, other);
+        }
+        fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
+        fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
+        fn hash_leaf(bytes: &[u8]) -> Self::Element { Ristretto255::hash_leaf(bytes) }
+        fn encode(element: &Self::Element, bytes: &mut [u8]) { Ristretto255::encode(element, bytes); }
+        fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> { Ristretto255::decode(bytes) }
+    }
+
+    #[tokio::test]
+    async fn builder_preserves_encoded_nodes_with_linear_group_additions() {
+        // These hashes freeze the original builder's canonical node rows,
+        // including its empty root, first bucket split, and deeper topology.
+        for (size, expected) in [
+            (0, "9d1fb3c08105018833a285df8382c1b95ada371c03a625f76e70d64aa37e1c89"),
+            (65, "3e9e30d9298023b788cf142a439538682f21ee3839345f640112058151c0f333"),
+            (4096, "526125e2918ee4a7500ab57a8605165f5b2a6badefe266c779481fe9770fe21e"),
+        ] {
+            let maps = crate::MemoryMaps::new();
+            let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
+            let mut tree = TreeTransaction::<CountedGroup, _>::bind(&spec, maps.begin());
+            let leaves = (0..size).map(|n| {
+                let mut id = [0; EntityId::BYTE_LEN];
+                id[..8].copy_from_slice(&(n as u64).to_be_bytes());
+                LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+            });
+            GROUP_ADDS.store(0, Ordering::Relaxed);
+            tree.build(leaves).await.unwrap();
+            let additions = GROUP_ADDS.load(Ordering::Relaxed);
+            tree.commit().await.unwrap();
+            let rows = maps.begin().scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap();
+            assert!(additions <= size + rows.len(), "aggregate each leaf once and combine completed children: {additions} additions");
+            let encoded = bincode::serialize(&rows).unwrap();
+            let hash = Sha256::digest(encoded).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+            assert_eq!(hash, expected, "node topology and every digest must retain the original encoding");
+            assert_eq!(TreeTransaction::<CountedGroup, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, size);
+        }
+    }
 
     #[tokio::test]
     async fn audit_detects_each_kind_of_derived_data_corruption() {
