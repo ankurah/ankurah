@@ -696,7 +696,7 @@ async fn catchup_batches_many_edits_with_their_connecting_events() -> Result<()>
 
 #[tokio::test]
 async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent() -> Result<()> {
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
@@ -705,54 +705,12 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
     let target = Arc::new(Mutex::new(None));
     let parked = Arc::new(AtomicBool::new(false));
     let trace = Trace::default();
-    let metadata = Arc::new(AtomicUsize::new(0));
-    let causal_reads = Arc::new(AtomicUsize::new(0));
-    let chunk_bytes = Arc::new(AtomicUsize::new(0));
-    let complete = Arc::new(AtomicUsize::new(0));
     let (_connection, gate) = GatedConnection::new(&server, &client, {
         let target = target.clone();
         let parked = parked.clone();
         let trace = trace.clone();
-        let metadata = metadata.clone();
-        let causal_reads = causal_reads.clone();
-        let chunk_bytes = chunk_bytes.clone();
-        let complete = complete.clone();
         move |message| {
             trace.record(message);
-            match message {
-                NodeMessage::Response(proto::NodeResponse { body: NodeResponseBody::GetEvents(events), .. }) => {
-                    causal_reads.fetch_add(events.len(), Ordering::Relaxed);
-                }
-                NodeMessage::Response(proto::NodeResponse { body: NodeResponseBody::QuerySubscribed { query_id, .. }, .. })
-                    if Some(*query_id) == *target.lock().unwrap() =>
-                {
-                    metadata.fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
-            }
-            let frame = match message {
-                NodeMessage::Response(proto::NodeResponse {
-                    body: NodeResponseBody::Fetch(state) | NodeResponseBody::QuerySubscribed { state, .. },
-                    ..
-                }) => Some(&state.frame),
-                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
-                _ => None,
-            };
-            if let Some(proto::StateFrame { body: proto::StateFrameBody::State { items, progress }, .. }) = frame {
-                chunk_bytes.fetch_add(
-                    items
-                        .iter()
-                        .map(|item| match item {
-                            StateItem::RepairChunk { chunk, .. } => chunk.bytes.len(),
-                            _ => 0,
-                        })
-                        .sum(),
-                    Ordering::Relaxed,
-                );
-                if *progress == proto::ComparisonProgress::Complete {
-                    complete.fetch_add(1, Ordering::Relaxed);
-                }
-            }
             matches!(message, NodeMessage::Response(response)
                 if matches!(&response.body, NodeResponseBody::QuerySubscribed { query_id, .. }
                     if Some(*query_id) == *target.lock().unwrap() && !parked.swap(true, Ordering::AcqRel)))
@@ -776,9 +734,10 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
         trx.commit().await?;
     }
     assert_eq!(retained.title()?, "old", "live output remains held until Applied");
-    let recovery_started = std::time::Instant::now();
     gate.release_held(&client).await;
-    let recovery = tokio::time::timeout(Duration::from_secs(120), async {
+    // Snapshot ancestry validation decodes eight 5 MiB updates plus genesis.
+    // Allow debug builds to finish that work before checking durable recovery.
+    tokio::time::timeout(Duration::from_secs(120), async {
         query.wait_durable_answered().await?;
         while !query.peek().first().is_some_and(|row| row.title().as_deref() == Ok(payload.as_str())) {
             tokio::task::yield_now().await;
@@ -786,10 +745,7 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
         query.wait_durable_answered().await?;
         Ok::<_, anyhow::Error>(())
     })
-    .await;
-    let phase = serde_json::json!({ "recovery_ms": recovery_started.elapsed().as_millis(), "metadata_responses": metadata.load(Ordering::Relaxed), "causal_event_reads": causal_reads.load(Ordering::Relaxed), "repair_chunk_bytes": chunk_bytes.load(Ordering::Relaxed), "complete_frames": complete.load(Ordering::Relaxed), "loaded": query.loaded(), "value_bytes": query.peek().first().and_then(|row| row.title().ok()).map(|value| value.len()) });
-    println!("OVERFLOW_RECOVERY_PHASE {phase}");
-    recovery.map_err(|error| anyhow::anyhow!("{error}; {phase}"))??;
+    .await??;
     assert_eq!(query.peek()[0].entity().head(), record.entity().head(), "recovery must incorporate the final target");
     assert!(trace.1.lock().unwrap().iter().any(|frame| matches!(frame.body, proto::StateFrameBody::RestartRequired)));
     assert!(trace.items(Some(query.query_id())).len() >= 2, "the query must obtain a fresh comparison");

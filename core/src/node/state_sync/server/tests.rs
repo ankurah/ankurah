@@ -340,3 +340,33 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
     assert!(ids.contains(&left.id()) && ids.contains(&right.id()) && ids.contains(&genesis.id()));
     Ok(())
 }
+
+#[tokio::test]
+async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_output() -> anyhow::Result<()> {
+    let (node, peer, messages) = node().await?;
+    let query = proto::QueryId::new();
+    let initial = node
+        .start_comparison(peer, proto::RequestId::new(), vec![], vec![], Some((query, 1)), false, snapshot(vec![]).await?, None)
+        .await?;
+    let id = initial.frame.comparison;
+    let mut item = live_item(1);
+    item.predicate_relevance = vec![(query, proto::MembershipChange::Add)];
+    assert!(node.queue_live(peer, id, vec![item; MAX_LIVE_ITEMS + 1]).is_err());
+    node.expire_comparison(peer, id).await?;
+    let messages = messages.lock().unwrap();
+    assert!(messages.iter().any(|message| matches!(message, proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame: StateFrame { comparison, body: StateFrameBody::RestartRequired, .. }, .. }, .. }) if *comparison == id)));
+    assert!(!messages.iter().any(|message| matches!(
+        message,
+        proto::NodeMessage::Update(proto::NodeUpdate {
+            body: proto::NodeUpdateBody::StateFrame {
+                frame: StateFrame { body: StateFrameBody::Live(_) | StateFrameBody::LiveChunk { .. }, .. },
+                ..
+            },
+            ..
+        })
+    )));
+    drop(messages);
+    assert!(matches!(node.close_state(peer, id, proto::ComparisonOutcome::Abandoned, vec![]).await?, proto::NodeResponseBody::Success));
+    assert!(node.peer_connections.get(&peer).is_some(), "successful restart control preserves other streams on this connection");
+    Ok(())
+}

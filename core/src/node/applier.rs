@@ -491,11 +491,11 @@ impl NodeApplier {
             let _publication = node.commit_publication_lock.lock().await;
             storage_trx.commit().await?.committed()?;
             if adopted {
-                let (_, entity) = node
+                let (advanced, entity) = node
                     .entities
                     .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
                     .await?;
-                Ok((Some(EntityChange::new(entity, events)), covered))
+                Ok(((advanced == Some(true)).then(|| EntityChange::new(entity, events)), covered))
             } else {
                 let change = candidate.commit(&node.entities, event_getter).await?;
                 Ok(((!change.events().is_empty()).then_some(change), covered))

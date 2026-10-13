@@ -1527,6 +1527,44 @@ async fn state_and_relation_is_refused() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Two query streams carrying the same live state can both judge it applicable before either
+/// persists it. The one that advances the resident publishes the events; the other, whose commit
+/// conflicts and retries against the installed state, has nothing to publish.
+#[tokio::test]
+async fn concurrent_identical_live_states_publish_once() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let incoming =
+        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let snapshot = fixture.remote_snapshot(&incoming).await?;
+    let content = || proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([incoming.clone()]) };
+    let (notifications, observed) = mpsc::channel();
+    let _listener = fixture.entity.broadcast().reference().listen(notifications);
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *fixture.storage.hold_commit.lock().unwrap() = Some((entered, release_rx));
+
+    // The first stream judged the snapshot applicable and is held inside its storage commit.
+    let mut first = Box::pin(fixture.apply(content(), Delivery::Live));
+    assert!(futures::poll!(&mut first).is_pending());
+    entered_rx.await?;
+    // The second stream forks the still-unchanged resident, judges the same, and waits for publication.
+    let mut second = Box::pin(fixture.apply(content(), Delivery::Live));
+    assert!(futures::poll!(&mut second).is_pending());
+    release.send(()).unwrap();
+    let first = first.await?;
+    let second = second.await?;
+
+    let published: Vec<_> = [first, second].into_iter().filter_map(|outcome| outcome.change).collect();
+    assert_eq!(published.len(), 1, "the events are published exactly once");
+    assert_eq!(published[0].events(), &[Attested::from(incoming.clone())]);
+    assert_eq!(fixture.entity.to_state()?, snapshot);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
+    assert_eq!(fixture.storage.get_events(vec![incoming.id()]).await?.len(), 1);
+    assert_eq!(observed.try_recv()?, ());
+    assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    Ok(())
+}
+
 /// A sequenced stream applies under the credentials captured for its query, so it needs no
 /// standing subscription with the peer; the unsequenced wrapper still refuses without one.
 #[tokio::test]

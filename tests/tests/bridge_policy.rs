@@ -423,7 +423,25 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
     let client_agent = BridgePolicyAgent::new();
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), client_agent.clone());
 
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    let frames = Arc::new(Mutex::new(Vec::<proto::StateFrame>::new()));
+    let (_conn, _) = common::GatedConnection::new(&server, &client, {
+        let frames = frames.clone();
+        move |message| {
+            let frame = match message {
+                proto::NodeMessage::Response(proto::NodeResponse {
+                    body: proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. },
+                    ..
+                }) => Some(&state.frame),
+                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                _ => None,
+            };
+            if let Some(frame) = frame {
+                frames.lock().unwrap().push(frame.clone());
+            }
+            false
+        }
+    })
+    .await;
     client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context_async(DEFAULT_CONTEXT).await?;
@@ -431,7 +449,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 
     let pet_id = {
         let trx = ctx_s.begin();
-        let pet = trx.create(&Pet { name: "bridge-validate".to_string(), age: "1".to_string() }).await?;
+        let pet = trx.create(&Pet { name: format!("bridge-validate-{}", "x".repeat(4096)), age: "1".to_string() }).await?;
         let id = pet.id();
         trx.commit().await?;
         id
@@ -453,6 +471,14 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].age().unwrap(), "3");
 
+    assert!(
+        frames.lock().unwrap().iter().any(|frame| match &frame.body {
+            proto::StateFrameBody::State { items, .. } => items.iter().any(|item| matches!(item, proto::StateItem::Repair { delta, .. }
+            if delta.entity_id == pet_id && matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 2))),
+            _ => false,
+        }),
+        "the fixture must exercise a smaller two-event wire bridge"
+    );
     let validated = client_agent.validate_calls.load(Ordering::SeqCst) - validate_calls_before;
     assert!(validated >= 2, "both bridge events must pass validate_received_event, saw {validated} calls");
 
