@@ -82,7 +82,7 @@ impl<G: DigestGroup> DigestTree<G> {
 pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction> {
     pub(crate) transaction: T,
     group: PhantomData<G>,
-    pub(crate) spec: Option<TreeSpec>,
+    pub(crate) spec: TreeSpec,
     pub(crate) failed: bool,
     pub(crate) generation: u64,
     pub(crate) snapshot: std::sync::Arc<()>,
@@ -210,16 +210,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// # }
     /// ```
     pub fn bind(spec: &TreeSpec, maps: T) -> Self {
-        let mut tree = Self::new(maps);
-        tree.spec = Some(spec.clone());
-        tree
-    }
-
-    /// The tree's operations within `transaction`, a transaction over maps
-    /// that hold a tree's rows: [`DigestTree::begin`] makes one over the
-    /// tree's memory-resident maps.
-    pub(crate) fn new(transaction: T) -> Self {
-        Self { transaction, group: PhantomData, spec: None, failed: false, generation: 0, snapshot: std::sync::Arc::new(()) }
+        Self { transaction: maps, group: PhantomData, spec: spec.clone(), failed: false, generation: 0, snapshot: std::sync::Arc::new(()) }
     }
 
     pub(crate) fn mutation(&mut self) -> Mutation<'_, G, T> { Mutation { tree: self, completed: false } }
@@ -1179,7 +1170,7 @@ mod tests {
             compactor.commit().await.unwrap();
         };
         let interleaved = Interleaved { inner: tree.maps.begin(), before_next_nodes_scan: Some(Box::pin(compaction)) };
-        let mut reader = TreeTransaction::<G, _>::new(interleaved);
+        let mut reader = TreeTransaction::<G, _>::bind(tree.spec(), interleaved);
         assert_eq!(reader.node(&bucket).await.unwrap(), Some(node(3)), "the base and the delta it began with");
 
         let mut maps = tree.begin();

@@ -58,7 +58,7 @@ Cold/first refresh measure public versioned durable readiness. Reconnect measure
 
 Native and browser final timing ran sequentially without our builds, tests or profilers overlapping. Source, dependency, public v8 harness and immutable artifact hashes match before/after; production-only targets and marker scans exclude private diagnostics. The shared 16-logical-CPU host had high load and unrelated applications running. Seven pairs do not establish p95/p99 or eliminate host variability.
 
-One browser attempt was mistakenly started before a failed compiler inventory check was examined. Its 42 completed samples and one sample interrupted by our cleanup are preserved separately and excluded for that known overlap, independently of their signs. The runner now stops before launch when the compiler check fails; a fresh complete 196-sample browser attempt passed. The 40 browser functional checks remained valid. Unrelated user processes were left untouched.
+One browser attempt was mistakenly started before a failed compiler inventory check was examined. Its 42 completed samples and one sample interrupted by our cleanup are preserved separately and excluded for that known overlap, independently of their signs. The qualification controller (`orchestrate.py` in the local evidence ledger) stops before launch when the compiler check fails; a fresh complete 196-sample browser attempt passed. The 40 browser functional checks remained valid. Unrelated user processes were left untouched.
 
 ## Review and follow-up
 

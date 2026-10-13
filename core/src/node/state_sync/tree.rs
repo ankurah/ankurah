@@ -89,8 +89,10 @@ impl QueryTree {
     pub fn spec(selection: &Selection<Resolved>, catalog: &CatalogManager) -> TreeSpec {
         // Materialization preserves every Selection, including expressions and
         // JSON paths the tree's scalar range planner cannot address exactly.
-        TreeSpec::for_selection(selection, &CatalogTypes(catalog))
-            .unwrap_or_else(|_| TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone()))
+        TreeSpec::for_selection(selection, &CatalogTypes(catalog)).unwrap_or_else(|error| {
+            tracing::debug!(%error, "query uses entity-id digest keys");
+            TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone())
+        })
     }
 
     pub fn offered_spec(
@@ -295,7 +297,7 @@ impl Snapshot {
             let mut inventory = proto::KnownState { spec: self.spec.clone(), regions: Vec::new() };
             let mut remaining = super::whole();
             while inventory.regions.len() < OFFER_REGIONS {
-                let Ok(page) = self.page(remaining).await else { break };
+                let Ok(page) = self.page(remaining) else { break };
                 let end = page.bounds.end.clone();
                 inventory.regions.push(proto::KnownRegion::Leaves(page));
                 if bincode::serialized_size(&inventory)? > super::INITIAL_INVENTORY_BYTES as u64 {
@@ -346,7 +348,7 @@ impl Snapshot {
         })
     }
 
-    pub async fn page(&mut self, bounds: proto::AddressRange) -> anyhow::Result<proto::LeafPage> {
+    pub fn page(&self, bounds: proto::AddressRange) -> anyhow::Result<proto::LeafPage> {
         use std::ops::Bound;
         let empty = match (&bounds.start, &bounds.end) {
             (Bound::Included(start), Bound::Included(end)) => start > end,

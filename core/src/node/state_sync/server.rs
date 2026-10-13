@@ -8,7 +8,7 @@ use crate::{
     session::ContextData,
     storage::StorageEngine,
 };
-use ankurah_digest_tree::{leaf_address, CanonicalCodec, KeyCodec, NodePrefix};
+use ankurah_digest_tree::{leaf_address, CanonicalCodec, NodePrefix};
 use ankurah_proto::{self as proto, AddressRange, ComparisonId, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem};
 use anyhow::{bail, ensure};
 use std::{
@@ -25,6 +25,8 @@ const COMPARISON_TTL: Duration = Duration::from_secs(120);
 const MAX_COMPARISONS: usize = 128;
 const MAX_FEEDBACK: usize = 256;
 const MAX_OFFERED_TARGETS: usize = 100_000;
+// Initial request identities live for the connection lifetime; reaching this
+// cap requires reconnecting rather than reusing a retired origin.
 const MAX_ORIGINS: usize = 100_000;
 const MAX_FEEDBACK_IDS: usize = 100_000;
 const MAX_HISTORY: usize = 4096;
@@ -65,7 +67,6 @@ pub(crate) struct Session<CD: ContextData> {
     initial: Mutex<Option<Arc<StateFrame>>>,
     sent: AtomicU64,
     spec: proto::TreeSpec,
-    scope: Vec<AddressRange>,
     fingerprint: Vec<u8>,
     state: tokio::sync::Mutex<Stream>,
     live: Mutex<LiveQueue>,
@@ -171,7 +172,7 @@ impl<CD: ContextData> Comparisons<CD> {
             let Some(initial) = initial.as_ref() else {
                 return Ok(Some(proto::NodeResponseBody::ComparisonUnavailable { comparison: id }));
             };
-            let reply = proto::StateReply { spec: session.spec.clone(), scope: session.scope.clone(), frame: (**initial).clone() };
+            let reply = proto::StateReply { spec: session.spec.clone(), frame: (**initial).clone() };
             return Ok(Some(match session.query {
                 Some((query_id, _)) => proto::NodeResponseBody::QuerySubscribed { query_id, state: reply },
                 None => proto::NodeResponseBody::Fetch(reply),
@@ -199,7 +200,13 @@ impl<CD: ContextData> Comparisons<CD> {
                 .any(|origin| origin.id == id && processed <= origin.last_sent && same_credentials(&origin.credentials, credentials))
     }
 }
-fn same_credentials<CD: ContextData>(a: &[CD], b: &[CD]) -> bool { a.len() == b.len() && a.iter().all(|credential| b.contains(credential)) }
+fn same_credentials<CD: ContextData>(a: &[CD], b: &[CD]) -> bool {
+    a == b
+        || (a.len() == b.len()
+            && a.iter().all(|credential| {
+                a.iter().filter(|value| *value == credential).count() == b.iter().filter(|value| *value == credential).count()
+            }))
+}
 impl<CD: ContextData> Session<CD> {
     pub fn permits(&self, credentials: &[CD]) -> bool { same_credentials(&self.credentials, credentials) }
 }
@@ -223,7 +230,6 @@ struct Comparison {
     work: VecDeque<Work>,
     summaries: HashMap<Vec<u8>, NodePrefix>,
     leaves: Vec<AddressRange>,
-    heads: HashSet<proto::EntityId>,
     repaired: HashSet<proto::EntityId>,
     known_clocks: HashMap<proto::EntityId, proto::Clock>,
     offered: HashMap<proto::EntityId, proto::Clock>,
@@ -318,475 +324,513 @@ impl Stream {
     }
 }
 
-impl<SE, PA> Node<SE, PA>
+pub(crate) fn comparison_bypasses_policy<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    body: &proto::NodeRequestBody,
+    outgoing: bool,
+) -> bool
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub(crate) fn comparison_bypasses_policy(&self, peer: proto::EntityId, body: &proto::NodeRequestBody, outgoing: bool) -> bool {
-        let id = match body {
-            proto::NodeRequestBody::ContinueState { comparison, .. } | proto::NodeRequestBody::CloseComparison { comparison, .. } => {
-                comparison
+    let id = match body {
+        proto::NodeRequestBody::ContinueState { comparison, .. } | proto::NodeRequestBody::CloseComparison { comparison, .. } => comparison,
+        _ => return crate::schema::request_bypasses_policy(body),
+    };
+    let Some(connection) = node.peer_connections.get(&peer) else { return false };
+    if outgoing {
+        connection.outgoing_comparisons.get(id).is_some_and(|catalog| catalog)
+    } else {
+        connection.comparisons.bypasses_policy(id)
+    }
+}
+
+pub(crate) async fn start_comparison<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    request: proto::RequestId,
+    fingerprint: Vec<u8>,
+    credentials: Vec<PA::ContextData>,
+    query: Option<(proto::QueryId, u32)>,
+    catalog: bool,
+    snapshot: Snapshot,
+    known: Option<proto::KnownState>,
+) -> anyhow::Result<proto::StateReply>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let mut comparison = Comparison::new(snapshot, known)?;
+    let id = ComparisonId::new();
+    let body = comparison.reply(node, &credentials, catalog, query.is_some()).await?;
+    let frame = StateFrame { comparison: id, sequence: 0, body };
+    let initial = proto::StateReply { spec: comparison.snapshot.spec.clone(), frame: frame.clone() };
+    let mut state = Stream {
+        comparison: Some(comparison),
+        retained: VecDeque::new(),
+        bytes: 0,
+        last_sent: 0,
+        processed: None,
+        required_through: 0,
+        applied: false,
+        failed: false,
+        last_activity: Instant::now(),
+        feedback: VecDeque::new(),
+        feedback_bytes: 0,
+        retired_feedback: HashSet::new(),
+        live_chunk: None,
+    };
+    state.retain(frame, false)?;
+    let (cancel_expiry, mut cancelled) = futures::channel::oneshot::channel();
+    let session = Arc::new(Session {
+        catalog,
+        credentials,
+        query,
+        initial_request: request,
+        initial: Mutex::new(Some(state.retained.front().unwrap().frame.clone())),
+        sent: AtomicU64::new(0),
+        spec: initial.spec.clone(),
+        fingerprint,
+        state: tokio::sync::Mutex::new(state),
+        live: Mutex::new(LiveQueue::default()),
+        pumping: AtomicBool::new(false),
+        wake: AtomicBool::new(false),
+        _cancel_expiry: cancel_expiry,
+    });
+    {
+        let mut sessions = connection.comparisons.sessions.lock().unwrap();
+        let mut origins = connection.comparisons.origins.lock().unwrap();
+        ensure!(sessions.len() < MAX_COMPARISONS, "too many open state streams");
+        ensure!(origins.len() < MAX_ORIGINS, "connection exhausted its bounded origin history");
+        ensure!(!origins.contains_key(&session.initial_request), "initial request origin was already used");
+        ensure!(!sessions.values().any(|s| s.initial_request == session.initial_request), "initial request already has a stream");
+        origins.insert(session.initial_request.clone(), id);
+        sessions.insert(id, session);
+    }
+    let node = node.weak();
+    crate::task::spawn(async move {
+        loop {
+            let expiry = futures_timer::Delay::new(COMPARISON_TTL);
+            if matches!(futures::future::select(expiry, &mut cancelled).await, futures::future::Either::Right(_)) {
+                break;
             }
-            _ => return crate::schema::request_bypasses_policy(body),
-        };
-        let Some(connection) = self.peer_connections.get(&peer) else { return false };
-        if outgoing {
-            connection.outgoing_comparisons.get(id).is_some_and(|catalog| catalog)
+            let Some(node) = node.upgrade() else { break };
+            let Some(connection) = node.peer_connections.get(&peer) else { break };
+            let Some(session) = connection.comparisons.get(&id) else { break };
+            let state = session.state.lock().await;
+            let idle = state.last_activity.elapsed() >= COMPARISON_TTL
+                && (!state.applied || !state.retained.is_empty() || session.live.lock().unwrap().bytes > 0);
+            drop(state);
+            if idle {
+                let _ = expire_comparison(&node, peer, id).await;
+                break;
+            }
+        }
+    });
+    Ok(initial)
+}
+
+pub(crate) async fn continue_state<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    request: proto::RequestId,
+    id: ComparisonId,
+    processed_through: u64,
+    answers: Vec<StateAnswer>,
+    credentials: Vec<PA::ContextData>,
+) -> anyhow::Result<proto::NodeResponseBody>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let Some(session) = connection.comparisons.get(&id) else {
+        return Ok(if answers.is_empty() && connection.comparisons.permits_retired_receipt(id, processed_through, &credentials) {
+            proto::NodeResponseBody::Success
         } else {
-            connection.comparisons.bypasses_policy(id)
-        }
-    }
-    pub(crate) async fn start_comparison(
-        &self,
-        peer: proto::EntityId,
-        request: proto::RequestId,
-        fingerprint: Vec<u8>,
-        credentials: Vec<PA::ContextData>,
-        query: Option<(proto::QueryId, u32)>,
-        catalog: bool,
-        snapshot: Snapshot,
-        known: Option<proto::KnownState>,
-    ) -> anyhow::Result<proto::StateReply> {
-        let connection = self.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-        let mut comparison = Comparison::new(snapshot, known)?;
-        let id = ComparisonId::new();
-        let body = comparison.reply(self, &credentials, catalog, query.is_some()).await?;
-        let frame = StateFrame { comparison: id, sequence: 0, body };
-        let initial = proto::StateReply { spec: comparison.snapshot.spec.clone(), scope: vec![super::whole()], frame: frame.clone() };
-        let mut state = Stream {
-            comparison: Some(comparison),
-            retained: VecDeque::new(),
-            bytes: 0,
-            last_sent: 0,
-            processed: None,
-            required_through: 0,
-            applied: false,
-            failed: false,
-            last_activity: Instant::now(),
-            feedback: VecDeque::new(),
-            feedback_bytes: 0,
-            retired_feedback: HashSet::new(),
-            live_chunk: None,
-        };
-        state.retain(frame, false)?;
-        let (cancel_expiry, mut cancelled) = futures::channel::oneshot::channel();
-        let session = Arc::new(Session {
-            catalog,
-            credentials,
-            query,
-            initial_request: request,
-            initial: Mutex::new(Some(state.retained.front().unwrap().frame.clone())),
-            sent: AtomicU64::new(0),
-            spec: initial.spec.clone(),
-            scope: initial.scope.clone(),
-            fingerprint,
-            state: tokio::sync::Mutex::new(state),
-            live: Mutex::new(LiveQueue::default()),
-            pumping: AtomicBool::new(false),
-            wake: AtomicBool::new(false),
-            _cancel_expiry: cancel_expiry,
+            proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
         });
-        {
-            let mut sessions = connection.comparisons.sessions.lock().unwrap();
-            let mut origins = connection.comparisons.origins.lock().unwrap();
-            ensure!(sessions.len() < MAX_COMPARISONS, "too many open state streams");
-            ensure!(origins.len() < MAX_ORIGINS, "connection exhausted its bounded origin history");
-            ensure!(!origins.contains_key(&session.initial_request), "initial request origin was already used");
-            ensure!(!sessions.values().any(|s| s.initial_request == session.initial_request), "initial request already has a stream");
-            origins.insert(session.initial_request.clone(), id);
-            sessions.insert(id, session);
-        }
-        let node = self.weak();
-        crate::task::spawn(async move {
-            loop {
-                let expiry = futures_timer::Delay::new(COMPARISON_TTL);
-                if matches!(futures::future::select(expiry, &mut cancelled).await, futures::future::Either::Right(_)) {
-                    break;
-                }
-                let Some(node) = node.upgrade() else { break };
-                let Some(connection) = node.peer_connections.get(&peer) else { break };
-                let Some(session) = connection.comparisons.get(&id) else { break };
-                let state = session.state.lock().await;
-                let idle = state.last_activity.elapsed() >= COMPARISON_TTL
-                    && (!state.applied || !state.retained.is_empty() || session.live.lock().unwrap().bytes > 0);
-                drop(state);
-                if idle {
-                    let _ = node.expire_comparison(peer, id).await;
-                    break;
-                }
-            }
-        });
-        Ok(initial)
+    };
+    ensure!(session.permits(&credentials), "comparison credentials changed");
+    ensure!(answers.len() <= 128, "too many comparison answers");
+    let encoded = bincode::serialize(&(processed_through, &answers))?;
+    ensure!(encoded.len() <= FRAME_BYTES, "comparison feedback exceeds limit");
+    let mut state = session.state.lock().await;
+    if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
     }
-    pub(crate) async fn continue_state(
-        &self,
-        peer: proto::EntityId,
-        request: proto::RequestId,
-        id: ComparisonId,
-        processed_through: u64,
-        answers: Vec<StateAnswer>,
-        credentials: Vec<PA::ContextData>,
-    ) -> anyhow::Result<proto::NodeResponseBody> {
-        let connection = self.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-        let Some(session) = connection.comparisons.get(&id) else {
-            return Ok(if answers.is_empty() && connection.comparisons.permits_retired_receipt(id, processed_through, &credentials) {
-                proto::NodeResponseBody::Success
-            } else {
-                proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
-            });
-        };
-        ensure!(session.permits(&credentials), "comparison credentials changed");
-        ensure!(answers.len() <= 128, "too many comparison answers");
-        let encoded = bincode::serialize(&(processed_through, &answers))?;
-        ensure!(encoded.len() <= FRAME_BYTES, "comparison feedback exceeds limit");
-        let mut state = session.state.lock().await;
-        if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+    if state.failed {
+        if !answers.is_empty() {
             return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
         }
-        if state.failed {
-            if !answers.is_empty() {
-                return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
-            }
-            state.acknowledge(processed_through)?;
-            if processed_through == state.last_sent {
-                connection.comparisons.finish(id);
-            }
-            return Ok(proto::NodeResponseBody::Success);
-        }
-        if let Some((_, previous)) = state.feedback.iter().find(|(previous, _)| previous == &request) {
-            ensure!(previous == &encoded, "feedback retry changed its contents");
-            return Ok(proto::NodeResponseBody::Success);
-        }
-        if state.retired_feedback.contains(&request) {
-            return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
-        }
-        ensure!(state.retired_feedback.len() < MAX_FEEDBACK_IDS, "stream exhausted control replay history");
         state.acknowledge(processed_through)?;
-        session.initial.lock().unwrap().take();
-        if let Some(comparison) = state.comparison.as_mut() {
-            comparison.answer(answers).await?;
-        } else {
-            ensure!(answers.is_empty(), "live stream cannot answer snapshot questions");
+        if processed_through == state.last_sent {
+            connection.comparisons.finish(id);
         }
-        state.feedback_bytes += encoded.len();
-        state.feedback.push_back((request, encoded));
-        while state.feedback.len() > MAX_FEEDBACK || state.feedback_bytes > CONTROL_BYTES {
-            let (retired, bytes) = state.feedback.pop_front().unwrap();
-            state.feedback_bytes -= bytes.len();
-            state.retired_feedback.insert(retired);
-        }
-        drop(state);
-        self.kick_comparison(peer, id);
-        Ok(proto::NodeResponseBody::Success)
+        return Ok(proto::NodeResponseBody::Success);
     }
-    pub(crate) async fn close_state(
-        &self,
-        peer: proto::EntityId,
-        id: ComparisonId,
-        outcome: proto::ComparisonOutcome,
-        credentials: Vec<PA::ContextData>,
-    ) -> anyhow::Result<proto::NodeResponseBody> {
-        let connection = self.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-        let Some(session) = connection.comparisons.get(&id) else {
-            return Ok(if connection.comparisons.was_closed(&id) {
-                proto::NodeResponseBody::Success
-            } else {
-                proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
-            });
-        };
-        ensure!(session.permits(&credentials), "comparison credentials changed");
-        let mut state = session.state.lock().await;
-        if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
-            return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
-        }
-        if state.failed && outcome != proto::ComparisonOutcome::Abandoned {
-            return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
-        }
-        match outcome {
-            proto::ComparisonOutcome::Applied { processed_through } => {
-                if state.applied {
-                    ensure!(
-                        processed_through >= state.required_through && processed_through <= state.last_sent,
-                        "invalid repeated Applied prefix"
-                    );
-                    return Ok(proto::NodeResponseBody::Success);
-                }
-                let comparison = state.comparison.as_ref().unwrap();
+    if let Some((_, previous)) = state.feedback.iter().find(|(previous, _)| previous == &request) {
+        ensure!(previous == &encoded, "feedback retry changed its contents");
+        return Ok(proto::NodeResponseBody::Success);
+    }
+    if state.retired_feedback.contains(&request) {
+        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+    }
+    ensure!(state.retired_feedback.len() < MAX_FEEDBACK_IDS, "stream exhausted control replay history");
+    state.acknowledge(processed_through)?;
+    session.initial.lock().unwrap().take();
+    if let Some(comparison) = state.comparison.as_mut() {
+        comparison.answer(answers)?;
+    } else {
+        ensure!(answers.is_empty(), "live stream cannot answer snapshot questions");
+    }
+    state.feedback_bytes += encoded.len();
+    state.feedback.push_back((request, encoded));
+    while state.feedback.len() > MAX_FEEDBACK || state.feedback_bytes > CONTROL_BYTES {
+        let (retired, bytes) = state.feedback.pop_front().unwrap();
+        state.feedback_bytes -= bytes.len();
+        state.retired_feedback.insert(retired);
+    }
+    drop(state);
+    kick_comparison(node, peer, id);
+    Ok(proto::NodeResponseBody::Success)
+}
+
+pub(crate) async fn close_state<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: ComparisonId,
+    outcome: proto::ComparisonOutcome,
+    credentials: Vec<PA::ContextData>,
+) -> anyhow::Result<proto::NodeResponseBody>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let Some(session) = connection.comparisons.get(&id) else {
+        return Ok(if connection.comparisons.was_closed(&id) {
+            proto::NodeResponseBody::Success
+        } else {
+            proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
+        });
+    };
+    ensure!(session.permits(&credentials), "comparison credentials changed");
+    let mut state = session.state.lock().await;
+    if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+    }
+    if state.failed && outcome != proto::ComparisonOutcome::Abandoned {
+        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+    }
+    match outcome {
+        proto::ComparisonOutcome::Applied { processed_through } => {
+            if state.applied {
                 ensure!(
-                    !comparison.unavailable
-                        && comparison.complete
-                        && comparison.work.is_empty()
-                        && comparison.summaries.is_empty()
-                        && comparison.leaves.is_empty()
-                        && comparison.heads.is_empty()
-                        && comparison.pending_repairs.is_empty(),
-                    "comparison still has outstanding or unavailable work"
+                    processed_through >= state.required_through && processed_through <= state.last_sent,
+                    "invalid repeated Applied prefix"
                 );
-                ensure!(processed_through >= state.required_through, "Applied does not cover all repair frames");
-                state.acknowledge(processed_through)?;
-                session.initial.lock().unwrap().take();
-                state.applied = true;
-                state.comparison = None;
-                if session.query.is_none() {
-                    connection.comparisons.finish(id);
-                }
+                return Ok(proto::NodeResponseBody::Success);
             }
-            proto::ComparisonOutcome::Abandoned => {
+            let comparison = state.comparison.as_ref().expect("a valid unapplied stream owns its comparison");
+            ensure!(
+                !comparison.unavailable
+                    && comparison.complete
+                    && comparison.work.is_empty()
+                    && comparison.summaries.is_empty()
+                    && comparison.leaves.is_empty()
+                    && comparison.pending_repairs.is_empty(),
+                "comparison still has outstanding or unavailable work"
+            );
+            ensure!(processed_through >= state.required_through, "Applied does not cover all repair frames");
+            state.acknowledge(processed_through)?;
+            session.initial.lock().unwrap().take();
+            state.applied = true;
+            state.comparison = None;
+            if session.query.is_none() {
                 connection.comparisons.finish(id);
             }
         }
-        drop(state);
-        if outcome == proto::ComparisonOutcome::Abandoned {
-            if let Some((query, version)) = session.query {
-                connection.subscription_handler.finish_comparison(self, query, version, id, outcome).await?;
-            }
-        } else {
-            self.kick_comparison(peer, id);
+        proto::ComparisonOutcome::Abandoned => {
+            connection.comparisons.finish(id);
         }
-        Ok(proto::NodeResponseBody::Success)
     }
-    pub(crate) fn queue_live(
-        &self,
-        peer: proto::EntityId,
-        id: ComparisonId,
-        items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> anyhow::Result<()> {
-        let connection = self.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-        let session = connection.comparisons.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
-        ensure!(session.query.is_some(), "Fetch has no live route");
-        let sizes = items.iter().map(|item| bincode::serialized_size(item).map(|size| size as usize)).collect::<Result<Vec<_>, _>>()?;
-        let bytes = sizes.iter().sum::<usize>();
-        let mut queue = session.live.lock().unwrap();
-        if queue.stopped
-            || sizes.iter().any(|size| *size > MAX_REPAIR_BYTES)
-            || queue.items.len() + items.len() > MAX_LIVE_ITEMS
-            || queue.bytes.saturating_add(bytes) > MAX_LIVE_BYTES
-        {
-            queue.stopped = true;
-            drop(queue);
-            self.kick_comparison(peer, id);
-            bail!("bounded live queue exhausted");
+    drop(state);
+    if outcome == proto::ComparisonOutcome::Abandoned {
+        if let Some((query, version)) = session.query {
+            connection.subscription_handler.abandon_comparison(query, version, id).await;
         }
-        queue.bytes += bytes;
-        queue.items.extend(items);
+    } else {
+        kick_comparison(node, peer, id);
+    }
+    Ok(proto::NodeResponseBody::Success)
+}
+
+pub(crate) fn queue_live<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: ComparisonId,
+    items: Vec<proto::SubscriptionUpdateItem>,
+) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let session = connection.comparisons.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
+    ensure!(session.query.is_some(), "Fetch has no live route");
+    let sizes = items.iter().map(|item| bincode::serialized_size(item).map(|size| size as usize)).collect::<Result<Vec<_>, _>>()?;
+    let bytes = sizes.iter().sum::<usize>();
+    let mut queue = session.live.lock().unwrap();
+    if queue.stopped
+        || sizes.iter().any(|size| *size > MAX_REPAIR_BYTES)
+        || queue.items.len() + items.len() > MAX_LIVE_ITEMS
+        || queue.bytes.saturating_add(bytes) > MAX_LIVE_BYTES
+    {
+        queue.stopped = true;
         drop(queue);
-        self.kick_comparison(peer, id);
-        Ok(())
+        kick_comparison(node, peer, id);
+        bail!("live queue stopped or exhausted");
     }
-    pub(crate) fn kick_comparison(&self, peer: proto::EntityId, id: ComparisonId) {
-        let Some(connection) = self.peer_connections.get(&peer) else { return };
-        let Some(session) = connection.comparisons.get(&id) else { return };
-        session.wake.store(true, Ordering::Release);
-        if session.pumping.swap(true, Ordering::AcqRel) {
+    queue.bytes += bytes;
+    queue.items.extend(items);
+    drop(queue);
+    kick_comparison(node, peer, id);
+    Ok(())
+}
+
+pub(crate) fn kick_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId)
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let Some(connection) = node.peer_connections.get(&peer) else { return };
+    let Some(session) = connection.comparisons.get(&id) else { return };
+    session.wake.store(true, Ordering::Release);
+    if session.pumping.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let node = node.weak();
+    crate::task::spawn(async move {
+        loop {
+            session.wake.store(false, Ordering::Release);
+            let Some(node) = node.upgrade() else { break };
+            if let Err(error) = pump_comparison(&node, peer, id).await {
+                tracing::warn!(%error, "state stream failed");
+                let _ = expire_comparison(&node, peer, id).await;
+                break;
+            }
+            if session.wake.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            // Publish idle before rechecking wake. A racing kick either starts
+            // a new pump or leaves a wake for this pump to reclaim.
+            session.pumping.store(false, Ordering::Release);
+            if session.wake.swap(false, Ordering::AcqRel) && !session.pumping.swap(true, Ordering::AcqRel) {
+                continue;
+            }
             return;
         }
-        let node = self.weak();
-        crate::task::spawn(async move {
-            loop {
-                session.wake.store(false, Ordering::Release);
-                let Some(node) = node.upgrade() else { break };
-                if let Err(error) = node.pump_comparison(peer, id).await {
-                    tracing::warn!(%error, "state stream failed");
-                    let _ = node.expire_comparison(peer, id).await;
-                    break;
-                }
-                if session.wake.swap(false, Ordering::AcqRel) {
-                    continue;
-                }
-                session.pumping.store(false, Ordering::Release);
-                if session.wake.swap(false, Ordering::AcqRel) && !session.pumping.swap(true, Ordering::AcqRel) {
-                    continue;
-                }
-                return;
-            }
-            session.pumping.store(false, Ordering::Release);
-        });
+        session.pumping.store(false, Ordering::Release);
+    });
+}
+
+pub(crate) async fn pump_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let Some(session) = connection.comparisons.get(&id) else { return Ok(()) };
+    let mut state = session.state.lock().await;
+    if state.failed || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+        return Ok(());
     }
-    pub(crate) async fn pump_comparison(&self, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()> {
-        let connection = self.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-        let Some(session) = connection.comparisons.get(&id) else { return Ok(()) };
-        let mut state = session.state.lock().await;
-        if state.failed || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
-            return Ok(());
+    ensure!(!session.live.lock().unwrap().stopped, "live queue stopped");
+    loop {
+        if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
+            || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
+        {
+            break;
         }
-        ensure!(!session.live.lock().unwrap().stopped, "live queue stopped");
-        loop {
-            if !self.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
+        let priority = state.comparison.as_ref().is_some_and(|comparison| !comparison.pending_repairs.is_empty());
+        if !state.room(priority) {
+            break;
+        }
+        let body = if let Some(comparison) = state.comparison.as_mut() {
+            if comparison.work.is_empty() || comparison.waiting_for_capacity() {
+                break;
+            }
+            comparison.reply(node, &session.credentials, session.catalog, session.query.is_some()).await?
+        } else if state.applied {
+            let Some(body) = state.next_live(&session.live)? else { break };
+            body
+        } else {
+            break;
+        };
+        let sequence = state.last_sent.checked_add(1).ok_or_else(|| anyhow::anyhow!("state sequence exhausted"))?;
+        let frame = StateFrame { comparison: id, sequence, body };
+        if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+            break;
+        }
+        if matches!(frame.body, StateFrameBody::State { .. }) {
+            state.required_through = sequence;
+        }
+        state.retain(frame.clone(), priority)?;
+        session.sent.store(sequence, Ordering::Release);
+        connection.send_message(proto::NodeMessage::Update(proto::NodeUpdate {
+            id: proto::UpdateId::new(),
+            from: node.id,
+            to: peer,
+            body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame },
+        }))?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn expire_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let Some(connection) = node.peer_connections.get(&peer) else { return Ok(()) };
+    let Some(session) = connection.comparisons.get(&id) else { return Ok(()) };
+    let mut state = session.state.lock().await;
+    if state.failed {
+        return Ok(());
+    }
+    state.failed = true;
+    state.comparison = None;
+    state.live_chunk = None;
+    session.initial.lock().unwrap().take();
+    {
+        let mut live = session.live.lock().unwrap();
+        live.stopped = true;
+        live.items.clear();
+        live.bytes = 0;
+    }
+    let frame = StateFrame { comparison: id, sequence: state.last_sent.saturating_add(1), body: StateFrameBody::RestartRequired };
+    let retained = state.room(true) && state.retain(frame.clone(), true).is_ok();
+    session.sent.store(state.last_sent, Ordering::Release);
+    drop(state);
+    if let Some((query, version)) = session.query {
+        connection.subscription_handler.abandon_comparison(query, version, id).await;
+    }
+    if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection)) {
+        return Ok(());
+    }
+    if !retained
+        || connection
+            .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
+                id: proto::UpdateId::new(),
+                from: node.id,
+                to: peer,
+                body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame: frame.clone() },
+            }))
+            .is_err()
+    {
+        node.deregister_peer(peer);
+        return Ok(());
+    }
+    let node = node.weak();
+    crate::task::spawn(async move {
+        // Retry RestartRequired three times, one second apart. If it remains
+        // unacknowledged, disconnect only this still-current peer and stream.
+        for _ in 0..3 {
+            futures_timer::Delay::new(Duration::from_secs(1)).await;
+            let Some(node) = node.upgrade() else { return };
+            if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
                 || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
             {
-                break;
+                return;
             }
-            let priority = state.comparison.as_ref().is_some_and(|comparison| !comparison.pending_repairs.is_empty());
-            if !state.room(priority) {
-                break;
-            }
-            let body = if let Some(comparison) = state.comparison.as_mut() {
-                if comparison.work.is_empty() || comparison.waiting_for_capacity() {
-                    break;
-                }
-                comparison.reply(self, &session.credentials, session.catalog, session.query.is_some()).await?
-            } else if state.applied {
-                let Some(body) = state.next_live(&session.live)? else { break };
-                body
-            } else {
-                break;
-            };
-            let sequence = state.last_sent.checked_add(1).ok_or_else(|| anyhow::anyhow!("state sequence exhausted"))?;
-            let frame = StateFrame { comparison: id, sequence, body };
-            if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
-                break;
-            }
-            if matches!(frame.body, StateFrameBody::State { .. }) {
-                state.required_through = sequence;
-            }
-            state.retain(frame.clone(), priority)?;
-            session.sent.store(sequence, Ordering::Release);
-            connection.send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                id: proto::UpdateId::new(),
-                from: self.id,
-                to: peer,
-                body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame },
-            }))?;
-        }
-        Ok(())
-    }
-    pub(crate) async fn expire_comparison(&self, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()> {
-        let Some(connection) = self.peer_connections.get(&peer) else { return Ok(()) };
-        let Some(session) = connection.comparisons.get(&id) else { return Ok(()) };
-        let mut state = session.state.lock().await;
-        if state.failed {
-            return Ok(());
-        }
-        state.failed = true;
-        state.comparison = None;
-        state.live_chunk = None;
-        session.initial.lock().unwrap().take();
-        {
-            let mut live = session.live.lock().unwrap();
-            live.stopped = true;
-            live.items.clear();
-            live.bytes = 0;
-        }
-        let frame = StateFrame { comparison: id, sequence: state.last_sent.saturating_add(1), body: StateFrameBody::RestartRequired };
-        let retained = state.room(true) && state.retain(frame.clone(), true).is_ok();
-        session.sent.store(state.last_sent, Ordering::Release);
-        drop(state);
-        if let Some((query, version)) = session.query {
-            connection.subscription_handler.finish_comparison(self, query, version, id, proto::ComparisonOutcome::Abandoned).await?;
-        }
-        if !self.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection)) {
-            return Ok(());
-        }
-        if !retained
-            || connection
+            if connection
                 .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
                     id: proto::UpdateId::new(),
-                    from: self.id,
+                    from: node.id,
                     to: peer,
                     body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame: frame.clone() },
                 }))
                 .is_err()
-        {
-            self.deregister_peer(peer);
-            return Ok(());
+            {
+                node.deregister_peer(peer);
+                return;
+            }
         }
-        let node = self.weak();
-        crate::task::spawn(async move {
-            for _ in 0..3 {
-                futures_timer::Delay::new(Duration::from_secs(1)).await;
-                let Some(node) = node.upgrade() else { return };
-                if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
-                    || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
-                {
-                    return;
-                }
-                if connection
-                    .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                        id: proto::UpdateId::new(),
-                        from: node.id,
-                        to: peer,
-                        body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame: frame.clone() },
-                    }))
-                    .is_err()
-                {
-                    node.deregister_peer(peer);
-                    return;
-                }
+        if let Some(node) = node.upgrade() {
+            if node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
+                && connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
+            {
+                node.deregister_peer(peer);
             }
-            if let Some(node) = node.upgrade() {
-                if node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
-                    && connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
-                {
-                    node.deregister_peer(peer);
-                }
-            }
-        });
-        Ok(())
-    }
+        }
+    });
+    Ok(())
+}
 
-    async fn target_history(
-        &self,
-        entity_id: proto::EntityId,
-        target: &proto::Clock,
-        snapshot: &Snapshot,
-        credentials: &Vec<PA::ContextData>,
-        catalog: bool,
-    ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>> {
-        let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
-        let state = match snapshot.states.get(&entity_id) {
-            Some(state) => (**state).clone(),
-            None => node_state(self, entity_id, &policy).await?.ok_or_else(|| anyhow::anyhow!("repair state unavailable"))?,
-        };
-        policy.check_read(&entity_id, &state.payload.state)?;
-        ensure!(
-            !catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy),
-            "repair is outside catalog scope"
-        );
-        ensure!(!target.is_empty(), "empty causal repair target");
-        let mut pending = target.entries().iter().map(|(generation, id)| (id.clone(), *generation)).collect::<HashMap<_, _>>();
-        let mut visited = HashSet::new();
-        let mut events = Vec::new();
-        let mut bytes = 0usize;
-        let mut genesis = None;
-        while !pending.is_empty() {
-            ensure!(visited.len() + pending.len() <= MAX_HISTORY, "causal repair history budget exhausted");
-            let batch = std::mem::take(&mut pending);
-            let fetched = self.storage.get_events(batch.keys().cloned().collect()).await?;
-            ensure!(fetched.len() == batch.len(), "causal repair history is incomplete");
-            for event in fetched {
-                let id = event.payload.id();
-                ensure!(batch.get(&id) == Some(&event.payload.generation()), "causal repair event or generation mismatch");
-                ensure!(event.payload.entity_id == entity_id, "causal repair entity mismatch");
-                event.payload.validate_structure()?;
-                policy.check_read_event(&event, &state.payload.state)?;
-                if !visited.insert(id.clone()) {
-                    continue;
-                }
-                bytes = bytes
-                    .checked_add(bincode::serialized_size(&event)? as usize)
-                    .ok_or_else(|| anyhow::anyhow!("history size overflow"))?;
-                ensure!(bytes <= MAX_REPAIR_BYTES, "causal repair exceeds byte limit");
-                if event.payload.parent.is_empty() {
-                    ensure!(
-                        proto::EntityId::from(id.clone()) == entity_id && genesis.as_ref().is_none_or(|root| root == &id),
-                        "causal repair has inconsistent genesis"
-                    );
-                    genesis = Some(id);
-                }
-                for (generation, parent) in &event.payload.parent {
-                    if !visited.contains(parent) {
-                        if let Some(previous) = pending.insert(parent.clone(), *generation) {
-                            ensure!(previous == *generation, "inconsistent parent generation");
-                        }
+async fn target_history<SE, PA>(
+    node: &Node<SE, PA>,
+    entity_id: proto::EntityId,
+    target: &proto::Clock,
+    snapshot: &Snapshot,
+    credentials: &Vec<PA::ContextData>,
+    catalog: bool,
+) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+    let state = match snapshot.states.get(&entity_id) {
+        Some(state) => (**state).clone(),
+        None => node_state(node, entity_id, &policy).await?.ok_or_else(|| anyhow::anyhow!("repair state unavailable"))?,
+    };
+    policy.check_read(&entity_id, &state.payload.state)?;
+    ensure!(!catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy), "repair is outside catalog scope");
+    ensure!(!target.is_empty(), "empty causal repair target");
+    let mut pending = target.entries().iter().map(|(generation, id)| (id.clone(), *generation)).collect::<HashMap<_, _>>();
+    let mut visited = HashSet::new();
+    let mut events = Vec::new();
+    let mut bytes = 0usize;
+    let mut genesis = None;
+    while !pending.is_empty() {
+        ensure!(visited.len() + pending.len() <= MAX_HISTORY, "causal repair history budget exhausted");
+        let batch = std::mem::take(&mut pending);
+        let fetched = node.storage.get_events(batch.keys().cloned().collect()).await?;
+        ensure!(fetched.len() == batch.len(), "causal repair history is incomplete");
+        for event in fetched {
+            let id = event.payload.id();
+            ensure!(batch.get(&id) == Some(&event.payload.generation()), "causal repair event or generation mismatch");
+            ensure!(event.payload.entity_id == entity_id, "causal repair entity mismatch");
+            event.payload.validate_structure()?;
+            policy.check_read_event(&event, &state.payload.state)?;
+            if !visited.insert(id.clone()) {
+                continue;
+            }
+            bytes =
+                bytes.checked_add(bincode::serialized_size(&event)? as usize).ok_or_else(|| anyhow::anyhow!("history size overflow"))?;
+            ensure!(bytes <= MAX_REPAIR_BYTES, "causal repair exceeds byte limit");
+            if event.payload.parent.is_empty() {
+                ensure!(
+                    proto::EntityId::from(id.clone()) == entity_id && genesis.as_ref().is_none_or(|root| root == &id),
+                    "causal repair has inconsistent genesis"
+                );
+                genesis = Some(id);
+            }
+            for (generation, parent) in &event.payload.parent {
+                if !visited.contains(parent) {
+                    if let Some(previous) = pending.insert(parent.clone(), *generation) {
+                        ensure!(previous == *generation, "inconsistent parent generation");
                     }
                 }
-                events.push(event);
             }
+            events.push(event);
         }
-        ensure!(genesis.is_some(), "causal repair did not prove a genesis");
-        Ok(crate::event_dag::ordering::topo_sort_events(events)?)
     }
+    ensure!(genesis.is_some(), "causal repair did not prove a genesis");
+    Ok(crate::event_dag::ordering::topo_sort_events(events)?)
 }
 
 async fn node_state<SE, PA, C>(
@@ -821,7 +865,6 @@ impl Comparison {
             work: VecDeque::new(),
             summaries: HashMap::new(),
             leaves: Vec::new(),
-            heads: HashSet::new(),
             repaired: HashSet::new(),
             known_clocks: HashMap::new(),
             offered: HashMap::new(),
@@ -924,11 +967,11 @@ impl Comparison {
         Ok(())
     }
 
-    async fn answer(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
+    fn answer(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
         ensure!(answers.len() <= 128, "too many comparison answers");
         for answer in answers {
             match answer {
-                StateAnswer::NeedRepair { entity_id, target, actual: _ } => {
+                StateAnswer::NeedRepair { entity_id, target } => {
                     ensure!(self.offered.get(&entity_id) == Some(&target), "unsolicited causal repair target");
                     if self.pending_repairs.contains(&entity_id) {
                         continue;
@@ -945,17 +988,6 @@ impl Comparison {
                     let prefix =
                         self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
                     self.work.push_back(Work::Compare { head, prefix });
-                }
-                StateAnswer::Heads { known, unknown } => {
-                    ensure!(known.len() + unknown.len() <= 128, "too many clock answers");
-                    for entity in known {
-                        ensure!(self.heads.remove(&entity.entity_id), "unsolicited entity clock");
-                        self.work.push_back(Work::Repair(entity.entity_id, Some(entity.head)));
-                    }
-                    for id in unknown {
-                        ensure!(self.heads.remove(&id), "unsolicited absent clock");
-                        self.work.push_back(Work::Repair(id, None));
-                    }
                 }
                 StateAnswer::Leaves(page) => {
                     ensure!(page.leaves.len() <= LEAF_PAGE, "too many leaves in one page");
@@ -1065,7 +1097,7 @@ impl Comparison {
         Ok(())
     }
 
-    async fn expand_leaf_answer(&mut self, page: proto::LeafPage, rest: Option<AddressRange>) -> anyhow::Result<()> {
+    fn expand_leaf_answer(&mut self, page: proto::LeafPage, rest: Option<AddressRange>) -> anyhow::Result<()> {
         let mut clocks =
             page.leaves.into_iter().map(|leaf| (leaf.entity.entity_id, leaf.entity.head)).collect::<std::collections::BTreeMap<_, _>>();
         let mut remaining = page.bounds.clone();
@@ -1073,7 +1105,7 @@ impl Comparison {
         let mut repairs = Vec::new();
         let mut count = 0;
         loop {
-            let remote = self.snapshot.page(remaining.clone()).await?;
+            let remote = self.snapshot.page(remaining.clone())?;
             count += remote.leaves.len();
             ensure!(count <= LEAF_PAGE, "leaf region was not fully refined");
             for leaf in &remote.leaves {
@@ -1213,7 +1245,7 @@ impl Comparison {
             }
             let item = match work {
                 Work::History { entity_id, target } => {
-                    match node.target_history(entity_id, &target, &self.snapshot, credentials, catalog).await {
+                    match target_history(node, entity_id, &target, &self.snapshot, credentials, catalog).await {
                         Ok(events) => {
                             let delta = proto::EntityDelta {
                                 entity_id,
@@ -1227,13 +1259,16 @@ impl Comparison {
                                 Some(StateItem::Repair { target, delta })
                             }
                         }
-                        Err(_) => Some(StateItem::RepairUnavailable { entity_id, target }),
+                        Err(error) => {
+                            tracing::debug!(%entity_id, %error, "required causal repair unavailable");
+                            Some(StateItem::RepairUnavailable { entity_id, target })
+                        }
                     }
                 }
                 Work::CompareFrontier(frontier) => {
                     let digest = ankurah_digest_tree::Digest::checked_sum(frontier.iter().map(|head| head.digest))?;
                     if self.snapshot.head(super::whole()).await?.digest == digest {
-                        Some(StateItem::Equal(super::whole()))
+                        None
                     } else {
                         for head in frontier {
                             self.work.push_back(Work::Compare { prefix: NodePrefix::root(), head });
@@ -1244,7 +1279,7 @@ impl Comparison {
                 Work::Compare { head: known, prefix } => {
                     if known.digest == ankurah_digest_tree::Digest::empty() {
                         if self.snapshot.states_in(&known.bounds, 1).next().is_none() {
-                            Some(StateItem::Equal(known.bounds))
+                            None
                         } else {
                             self.work.push_front(Work::SendSnapshots(known.bounds));
                             None
@@ -1255,7 +1290,7 @@ impl Comparison {
                         // the responder prefix retained with this question.
                         local.prefix = prefix;
                         if local.digest == known.digest {
-                            Some(StateItem::Equal(known.bounds))
+                            None
                         } else if local.digest.count() <= LEAF_PAGE as i64 {
                             self.work.push_front(Work::AskLeaves(known.bounds));
                             None
@@ -1274,7 +1309,7 @@ impl Comparison {
                     // prefixes so a reply may assist several levels at once.
                     let refined = self.snapshot.refine(&head).await?;
                     if refined.len() == 1 && refined[0].bounds == head.bounds && refined[0].prefix == head.prefix {
-                        let page = self.snapshot.page(head.bounds.clone()).await?;
+                        let page = self.snapshot.page(head.bounds.clone())?;
                         if let std::ops::Bound::Included(last) = &page.bounds.end {
                             self.work.push_back(Work::Offer(self.snapshot.head(head.bounds.after(last)).await?));
                         }
@@ -1297,7 +1332,7 @@ impl Comparison {
                     None
                 }
                 Work::AnswerLeaves { page, rest } => {
-                    self.expand_leaf_answer(page, rest).await?;
+                    self.expand_leaf_answer(page, rest)?;
                     None
                 }
                 Work::AskLeaves(bounds) => {
@@ -1305,7 +1340,7 @@ impl Comparison {
                     Some(StateItem::NeedLeaves(bounds))
                 }
                 Work::SendLeaves(bounds) => {
-                    let page = self.snapshot.page(bounds.clone()).await?;
+                    let page = self.snapshot.page(bounds.clone())?;
                     if page.bounds.end != bounds.end {
                         let std::ops::Bound::Included(last) = &page.bounds.end else { unreachable!("partial leaf page") };
                         self.work.push_back(Work::SendLeaves(bounds.after(last)));
@@ -1325,10 +1360,7 @@ impl Comparison {
                     let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
                     let state: Option<proto::Attested<proto::EntityState>> = match self.snapshot.states.get(&id) {
                         Some(state) => Some((**state).clone()),
-                        None => match node.storage.get_states(vec![id], &policy.retrieval_predicate()).await?.pop() {
-                            Some(result) => proto::GetResult::from(result).try_into().ok(),
-                            None => None,
-                        },
+                        None => node_state(node, id, &policy).await?,
                     };
                     let Some(state) = state else { continue };
                     if catalog && !state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy) {
@@ -1411,7 +1443,7 @@ impl Comparison {
                 items.push(item);
             }
         }
-        let finished = self.work.is_empty() && self.summaries.is_empty() && self.leaves.is_empty() && self.heads.is_empty();
+        let finished = self.work.is_empty() && self.summaries.is_empty() && self.leaves.is_empty();
         let first_complete = finished && !self.complete;
         if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INITIAL_INVENTORY_LEAVES {
             // Build before handoff above the initial inventory count limit.

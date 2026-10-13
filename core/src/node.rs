@@ -355,7 +355,7 @@ where
 
         // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
         // follow-on uses #426's node session union for catalog queries.
-        let auth = if self.comparison_bypasses_policy(node_id, &request.body, true) {
+        let auth = if state_sync::comparison_bypasses_policy(self, node_id, &request.body, true) {
             Vec::new()
         } else {
             self.policy_agent.sign_request(self, cdata, &request)?
@@ -458,7 +458,7 @@ where
 
                     // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
                     // follow-on uses #426's node session union for catalog queries.
-                    let cdata = if self.comparison_bypasses_policy(request.from, &request.body, false) {
+                    let cdata = if state_sync::comparison_bypasses_policy(self, request.from, &request.body, false) {
                         Ok(Vec::new())
                     } else {
                         self.policy_agent.check_request(self, &auth, &request).await
@@ -484,7 +484,7 @@ where
                     }));
                     if result.is_ok() {
                         if let Some(id) = comparison {
-                            self.kick_comparison(from, id);
+                            state_sync::kick_comparison(self, from, id);
                         }
                     }
                 }
@@ -559,8 +559,18 @@ where
                     .filter(|state| policy.check_read(&state.payload.entity_id, &state.payload.state).is_ok())
                     .collect();
                 let snapshot = state_sync::QueryTree::default().refresh(spec, states).await?;
-                let state =
-                    self.start_comparison(request.from, request.id, fingerprint, credentials, None, catalog, snapshot, known_state).await?;
+                let state = state_sync::start_comparison(
+                    self,
+                    request.from,
+                    request.id,
+                    fingerprint,
+                    credentials,
+                    None,
+                    catalog,
+                    snapshot,
+                    known_state,
+                )
+                .await?;
                 Ok(proto::NodeResponseBody::Fetch(state))
             }
             proto::NodeRequestBody::Get { ids } => {
@@ -588,10 +598,10 @@ where
                     .await
             }
             proto::NodeRequestBody::ContinueState { comparison, processed_through, answers } => {
-                self.continue_state(request.from, request.id, comparison, processed_through, answers, credentials).await
+                state_sync::continue_state(self, request.from, request.id, comparison, processed_through, answers, credentials).await
             }
             proto::NodeRequestBody::CloseComparison { comparison, outcome } => {
-                self.close_state(request.from, comparison, outcome, credentials).await
+                state_sync::close_state(self, request.from, comparison, outcome, credentials).await
             }
         }
     }
@@ -840,16 +850,29 @@ where
             let entities = self.fetch_entities_from_local(&selection).await?;
             let mut snapshot = tree.snapshot(&selection, &self.catalog, entities).await?;
             let known_state = Some(snapshot.offer().await?);
-            let (stream, response) =
-                self.request_state(peer_id, cdata, proto::NodeRequestBody::Fetch { selection: selection.clone(), known_state }).await?;
+            let (stream, response) = state_sync::request_state(
+                self,
+                peer_id,
+                cdata,
+                proto::NodeRequestBody::Fetch { selection: selection.clone(), known_state },
+            )
+            .await?;
             let state = match response {
                 proto::NodeResponseBody::Fetch(state) => state,
                 proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
                 other => return Err(RequestError::UnexpectedResponse(other).into()),
             };
-            let remote = match self
-                .receive_state(peer_id, cdata, snapshot, state, crate::schema::is_catalog_read(&selection.predicate), None, stream)
-                .await
+            let remote = match state_sync::receive_state(
+                self,
+                peer_id,
+                cdata,
+                snapshot,
+                state,
+                crate::schema::is_catalog_read(&selection.predicate),
+                None,
+                stream,
+            )
+            .await
             {
                 Err(RetrievalError::RequestError(RequestError::ConnectionLost)) if attempt == 0 => continue,
                 result => result?,
@@ -864,7 +887,7 @@ where
             if let Some(limit) = selection.limit {
                 entities.truncate(limit as usize);
             }
-            self.finish_state(peer_id, cdata.clone(), remote, None);
+            state_sync::finish_state(self, peer_id, cdata.clone(), remote, None);
             return Ok(entities);
         }
         Err(RequestError::ConnectionLost.into())

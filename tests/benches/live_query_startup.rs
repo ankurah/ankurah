@@ -37,7 +37,7 @@ pub struct StartupRow {
 }
 
 // Process CPU includes both nodes and every background thread during the phase.
-// Non-Unix hosts report null; external runner resources still cover the process.
+// Non-Unix hosts report null; the Python process-resource runner supports Unix hosts.
 #[derive(Clone, Copy, Serialize)]
 struct ProcessCpu {
     user_us: u64,
@@ -151,8 +151,8 @@ struct Meter {
     connected: bool,
     generation: usize,
     pending: usize,
-    subscriptions_applied: usize,
-    query_subscriptions_applied: HashMap<proto::QueryId, usize>,
+    subscriptions_handled: usize,
+    query_subscriptions_handled: HashMap<proto::QueryId, usize>,
     local_result_installed_at: Option<Instant>,
     local_result_states: Option<BTreeMap<proto::EntityId, proto::State>>,
     local_result_capture_us: Option<u128>,
@@ -238,8 +238,8 @@ impl PeerSender for Sender {
                     if let Err(error) = result {
                         meter.errors.push(error.to_string());
                     } else if let Some(query_id) = subscribed {
-                        meter.subscriptions_applied += 1;
-                        *meter.query_subscriptions_applied.entry(query_id).or_default() += 1;
+                        meter.subscriptions_handled += 1;
+                        *meter.query_subscriptions_handled.entry(query_id).or_default() += 1;
                     }
                 }
             }
@@ -370,7 +370,7 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     let retained_query = if mode == "cold" {
         None
     } else {
-        phase("warm-tree-initialize");
+        phase("initial-query");
         let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
         query.wait_durable_answered().await?;
         settle(&meter, 1, None).await?;
@@ -439,8 +439,8 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
         anyhow::ensure!(meter.errors.is_empty(), "setup peer errors: {:?}", meter.errors);
         meter.traffic = Traffic::default();
         meter.measuring = true;
-        let query_count = retained_query_id.map(|id| meter.query_subscriptions_applied.get(&id).copied().unwrap_or(0));
-        (meter.subscriptions_applied, query_count)
+        let query_count = retained_query_id.map(|id| meter.query_subscriptions_handled.get(&id).copied().unwrap_or(0));
+        (meter.subscriptions_handled, query_count)
     };
     let required_query_subscription = retained_query_id.zip(query_subscriptions_before).map(|(id, count)| (id, count + 1));
     phase("measure");
@@ -521,13 +521,12 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     let elapsed_us = ready_us.or(local_result_installed_us).expect("ready or installed landmark");
     // Own QuerySubscribed and transport quiescence validate this activation
     // after its captured membership/state have already been checked.
-    let settled = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
-    let initial_drained_us = settled.duration_since(start).as_micros();
-    let initial_drain_cpu = ProcessCpu::now()?;
+    let drained_at = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
+    let transport_settled_us = drained_at.duration_since(start).as_micros();
+    let drain_cpu = ProcessCpu::now()?;
+    let through_drain_cpu = cpu_delta(measurement_cpu_start, drain_cpu);
     let settled_traffic = meter.lock().unwrap().traffic.clone();
-    // Legacy drain fields describe the same post-verification drain.
-    let transport_settled_us = initial_drained_us;
-    let final_drain_cpu = initial_drain_cpu;
+    // Legacy initial/final fields refer to this single post-verification drain.
     let settled_us = transport_settled_us.max(ready_us.unwrap_or(verified_us));
     let mut server_tail_reads = server.storage.take();
     let mut client_tail_reads = client.storage.take();
@@ -556,7 +555,7 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
             "mode":mode, "bandwidth_bytes_per_second":bytes_per_second,
             "rtt_ms":rtt_ms, "repeat":repeat, "elapsed_us":elapsed_us,
             "ready_us":ready_us, "local_result_installed_us":local_result_installed_us,
-            "local_result_capture_us":local_result_capture_us, "initial_drained_us":initial_drained_us,
+            "local_result_capture_us":local_result_capture_us, "initial_drained_us":transport_settled_us,
             "settled_us":settled_us, "transport_settled_us":transport_settled_us,
             "verified_us":verified_us, "verification_us":verification_us, "verification_attempts":verification_attempts, "verified":true,
             "traffic":traffic, "settled_traffic":settled_traffic, "server_reads":server_reads, "client_reads":client_reads,
@@ -564,13 +563,13 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
                 "scope":"process CPU during each interval: server/client combined, all background threads included; phases can overlap; initial/final drain follow verification and include it; local_result_capture is separate reconnect capture work; excludes teardown",
                 "setup":cpu_delta(sample_cpu_start, measurement_cpu_start),
                 "through_ready":cpu_delta(measurement_cpu_start, ready_cpu),
-                "through_initial_drain":cpu_delta(measurement_cpu_start, initial_drain_cpu),
+                "through_initial_drain":through_drain_cpu,
                 "through_local_result_installed":cpu_delta(measurement_cpu_start, local_result_installed_cpu),
                 "local_result_capture":local_result_capture_cpu,
                 "verification":cpu_delta(verification_cpu_start, verified_cpu),
                 "through_verified":cpu_delta(measurement_cpu_start, verified_cpu),
-                "after_verification_drain":cpu_delta(verified_cpu, final_drain_cpu),
-                "through_final_drain":cpu_delta(measurement_cpu_start, final_drain_cpu),
+                "after_verification_drain":cpu_delta(verified_cpu, drain_cpu),
+                "through_final_drain":through_drain_cpu,
             },
         })
     );
@@ -604,8 +603,8 @@ async fn settle(
             let meter = meter.lock().unwrap();
             anyhow::ensure!(meter.errors.is_empty(), "peer errors: {:?}", meter.errors);
             let query_handled =
-                query_subscription.is_none_or(|(id, count)| meter.query_subscriptions_applied.get(&id).copied().unwrap_or(0) >= count);
-            if meter.pending == 0 && meter.subscriptions_applied >= subscriptions && query_handled {
+                query_subscription.is_none_or(|(id, count)| meter.query_subscriptions_handled.get(&id).copied().unwrap_or(0) >= count);
+            if meter.pending == 0 && meter.subscriptions_handled >= subscriptions && query_handled {
                 let last = meter.last_activity.unwrap_or_else(Instant::now);
                 if last.max(quiet_begin).elapsed() >= Duration::from_millis(2) {
                     return Ok(last);

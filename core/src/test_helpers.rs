@@ -12,7 +12,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    node.expire_comparison(peer, comparison).await
+    crate::node::state_sync::expire_comparison(node, peer, comparison).await
 }
 
 /// Bind `schema`'s cells from a hand-built definition under the node's

@@ -37,8 +37,8 @@ impl Bytes {
     }
 }
 
-/// Leaves of an index keyed by one 64-bit integer (an eight-byte canonical
-/// key), each entity with a one-event head.
+/// Fixed eight-byte keys, each entity with a one-event head. These benchmark
+/// the Leaf hash directly, independently of CanonicalCodec key encoding.
 struct Leaves {
     keys: Vec<[u8; 8]>,
     entity_ids: Vec<EntityId>,

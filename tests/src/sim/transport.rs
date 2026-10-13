@@ -172,9 +172,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
     }
 }
 
-fn state_descriptor(state: &proto::StateReply) -> String {
-    format!("{} {}", payload_digest(&(&state.spec, &state.scope)), frame_descriptor(&state.frame))
-}
+fn state_descriptor(state: &proto::StateReply) -> String { format!("{} {}", payload_digest(&state.spec), frame_descriptor(&state.frame)) }
 
 fn frame_descriptor(frame: &proto::StateFrame) -> String {
     let body = match &frame.body {

@@ -125,7 +125,7 @@ async fn split_and_merge_conflict_with_updates_in_both_commit_orders() {
 #[tokio::test]
 async fn seeded_updates_moves_and_deletes_match_an_independent_model() {
     use ankurah_core_types::{IndexKeyPart, PropertyId, Value, ValueType};
-    use ankurah_digest_tree::{CanonicalCodec, KeyCodec};
+    use ankurah_digest_tree::CanonicalCodec;
     use rand::{rngs::SmallRng, Rng, SeedableRng};
     let key = KeySpec::new(vec![IndexKeyPart::asc(PropertyId::EntityId(EntityId::from_bytes([8; 32])), ValueType::I64)]);
     let tree = DigestTree::<ankurah_digest_tree::Ristretto255>::new(TreeSpec::new(key, Predicate::True));

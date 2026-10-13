@@ -5,7 +5,9 @@ use crate::key::prefix_end;
 use crate::layout;
 use crate::map::{MapAccess, MapName};
 use crate::request::{prefix_range, ReusePlan};
-use crate::{AddressRange, Digest, DigestGroup, KeyCodec, LeafRow, NodePrefix, Ristretto255, TreeError, TreeRequest, TreeTransaction};
+use crate::{
+    AddressRange, CanonicalCodec, Digest, DigestGroup, LeafRow, NodePrefix, Ristretto255, TreeError, TreeRequest, TreeTransaction,
+};
 use ankurah_core_types::{IndexDirection, KeySpec, PropertyId};
 use serde::{Deserialize, Serialize};
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -104,7 +106,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     pub fn scope_ranges(&self, ranges: impl IntoIterator<Item = AddressRange>) -> TreeScope {
         TreeScope {
             ranges: normalize(ranges.into_iter().collect()),
-            directions: vec![IndexDirection::Asc; self.spec.as_ref().map_or(0, |spec| spec.key_spec().keyparts.len())],
+            directions: vec![IndexDirection::Asc; self.spec.key_spec().keyparts.len()],
             id_direction: IndexDirection::Asc,
             snapshot: self.snapshot.clone(),
             generation: self.generation,
@@ -116,8 +118,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// can supply the missing members, including when this tree is empty.
     /// Limited traversal walks each tuple tier in its requested direction; ties use
     /// ascending entity identity unless explicitly ordered otherwise.
-    pub async fn scope(&mut self, request: &TreeRequest, codec: &impl KeyCodec) -> Result<TreeScope, TreeError> {
-        let spec = self.spec.as_ref().ok_or(TreeError::UnsupportedSelection)?.clone();
+    pub async fn scope(&mut self, request: &TreeRequest) -> Result<TreeScope, TreeError> {
+        let spec = self.spec.clone();
         let ReusePlan { mut ranges, directions, id_direction, .. } = spec.plan(request).ok_or(TreeError::UnsupportedSelection)?;
         // Selection counts are entity counts. Multi-key raw trees need a
         // distinct-entity projection before they can serve this scalar API.
@@ -129,10 +131,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             if limit == 0 {
                 ranges.clear();
             } else {
-                let rows = self.walk(&ranges, &directions, id_direction, codec, limit).await?;
+                let rows = self.walk(&ranges, &directions, id_direction, limit).await?;
                 if rows.len() == limit {
                     let last = rows.last().expect("a positive limit was filled");
-                    let cut = order_cut(spec.key_spec(), &directions, id_direction, codec, last, true)?;
+                    let cut = order_cut(spec.key_spec(), &directions, id_direction, last, true)?;
                     ranges = intersections(&ranges, &cut);
                 }
             }
@@ -219,13 +221,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     /// Read a page without restarting at earlier leaves. A cursor belongs to
     /// this scope and transaction; mutations invalidate it along with the scope.
-    pub async fn page(
-        &mut self,
-        scope: &TreeScope,
-        codec: &impl KeyCodec,
-        cursor: Option<&LeafCursor>,
-        limit: usize,
-    ) -> Result<LeafPage<G>, TreeError> {
+    pub async fn page(&mut self, scope: &TreeScope, cursor: Option<&LeafCursor>, limit: usize) -> Result<LeafPage<G>, TreeError> {
         self.check_scope(scope)?;
         if limit == 0 {
             return Err(TreeError::InvalidKey("page size must be positive"));
@@ -242,12 +238,12 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         } else {
             &scope.ranges
         };
-        let mut rows = self.walk(ranges, &scope.directions, scope.id_direction, codec, limit.saturating_add(1)).await?;
+        let mut rows = self.walk(ranges, &scope.directions, scope.id_direction, limit.saturating_add(1)).await?;
         let more = rows.len() > limit;
         rows.truncate(limit);
         let next = if more {
-            let spec = self.spec.as_ref().ok_or(TreeError::UnsupportedSelection)?;
-            let cut = order_cut(spec.key_spec(), &scope.directions, scope.id_direction, codec, rows.last().unwrap(), false)?;
+            let spec = &self.spec;
+            let cut = order_cut(spec.key_spec(), &scope.directions, scope.id_direction, rows.last().unwrap(), false)?;
             Some(LeafCursor { remaining: intersections(ranges, &cut), scope: scope.clone() })
         } else {
             None
@@ -260,11 +256,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         ranges: &[AddressRange],
         directions: &[IndexDirection],
         id_direction: IndexDirection,
-        codec: &impl KeyCodec,
         limit: usize,
     ) -> Result<Vec<LeafRow<G>>, TreeError> {
-        let spec = self.spec.as_ref().ok_or(TreeError::UnsupportedSelection)?.key_spec().clone();
-        let mut walk = LeafWalk { spec, directions, id_direction, codec, limit, leaves: Vec::new() };
+        let spec = self.spec.key_spec().clone();
+        let mut walk = LeafWalk { spec, directions, id_direction, limit, leaves: Vec::new() };
         walk.read(self, ranges.to_vec(), 0).await?;
         Ok(walk.leaves)
     }
@@ -278,16 +273,15 @@ fn empty_gaps<G: DigestGroup>(prefix: &NodePrefix, bounds: &AddressRange, childr
 }
 
 /// A walk's fixed order and accumulated page, shared by all tuple tiers.
-struct LeafWalk<'a, G: DigestGroup, C: KeyCodec> {
+struct LeafWalk<'a, G: DigestGroup> {
     spec: KeySpec<PropertyId>,
     directions: &'a [IndexDirection],
     id_direction: IndexDirection,
-    codec: &'a C,
     limit: usize,
     leaves: Vec<LeafRow<G>>,
 }
 
-impl<G: DigestGroup, C: KeyCodec> LeafWalk<'_, G, C> {
+impl<G: DigestGroup> LeafWalk<'_, G> {
     async fn read<T: MapAccess>(
         &mut self,
         transaction: &mut TreeTransaction<G, T>,
@@ -323,7 +317,7 @@ impl<G: DigestGroup, C: KeyCodec> LeafWalk<'_, G, C> {
                 return Ok(());
             }
             let Some(seed) = seed else { return Ok(()) };
-            let parts = self.codec.split(&self.spec, &seed.key)?;
+            let parts = CanonicalCodec.split(&self.spec, &seed.key)?;
             let prefix = parts[..=depth].concat();
             let inside = intersections(&ranges, &[prefix_range(&prefix)]);
             Box::pin(self.read(transaction, inside, depth + 1)).await?;
@@ -350,11 +344,10 @@ fn order_cut<G: DigestGroup>(
     spec: &KeySpec<PropertyId>,
     directions: &[IndexDirection],
     id_direction: IndexDirection,
-    codec: &impl KeyCodec,
     pivot: &LeafRow<G>,
     before: bool,
 ) -> Result<Vec<AddressRange>, TreeError> {
-    let parts = codec.split(spec, &pivot.key)?;
+    let parts = CanonicalCodec.split(spec, &pivot.key)?;
     let mut prefix = Vec::new();
     let mut ranges = Vec::new();
     for (part, direction) in parts.iter().zip(directions) {

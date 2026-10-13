@@ -123,12 +123,10 @@ mod tests {
     }
 
     /// Known answers for one entity's leaves, each pinned at its encoding, its
-    /// 64 uniform bytes and its element: filed under the canonical ascending
-    /// key of the string "blue" (its UTF-8 bytes and a zero terminator); in the
-    /// entity-id tree, whose key is empty; under the composite key ("blue",
-    /// "sky"), whose bytes begin with the first key's; under the key of the
-    /// string "a\0b", whose zero byte the key encoder escapes as 00 ff; and
-    /// under "blue" with an empty head. Every value was computed independently
+    /// 64 uniform bytes and its element. The fixed byte keys are `blue\0`,
+    /// empty, `blue\0sky\0`, and `a\0\xffb\0`; the last case repeats `blue\0`
+    /// with an empty head. These exercise the Leaf hash independently of
+    /// CanonicalCodec key encoding. Every value was computed independently
     /// in Python: the head hashes, the encodings and the uniform bytes with
     /// hashlib, following the definitions above and RFC 9380 section 5.3.1,
     /// and the elements with an implementation of RFC 9496's element derivation

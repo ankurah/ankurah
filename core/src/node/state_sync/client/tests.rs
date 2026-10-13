@@ -435,7 +435,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     for n in 1..=32 {
         let bounds = proto::AddressRange::new(start, Excluded(address(n)));
         regions.push(if n == 1 {
-            proto::KnownRegion::Leaves(snapshot.page(bounds).await?)
+            proto::KnownRegion::Leaves(snapshot.page(bounds)?)
         } else {
             proto::KnownRegion::Summary(snapshot.head(bounds).await?)
         });
@@ -444,24 +444,24 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     regions.push(proto::KnownRegion::Summary(snapshot.head(proto::AddressRange::new(start, super::super::whole().end)).await?));
     gate.store(true, std::sync::atomic::Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
-    let (stream, response) = client
-        .request_state(
-            server.id,
-            &credentials,
-            proto::NodeRequestBody::SubscribeQuery {
-                query_id,
-                selection,
-                version: 1,
-                known_state: Some(proto::KnownState { spec: snapshot.spec.clone(), regions }),
-            },
-        )
-        .await?;
+    let (stream, response) = request_state(
+        &client,
+        server.id,
+        &credentials,
+        proto::NodeRequestBody::SubscribeQuery {
+            query_id,
+            selection,
+            version: 1,
+            known_state: Some(proto::KnownState { spec: snapshot.spec.clone(), regions }),
+        },
+    )
+    .await?;
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = response else { panic!("expected query metadata") };
     assert!(matches!(state.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Continue, .. }));
     let comparison = state.frame.comparison;
     let peer = server.peer_connections.get(&client.id).unwrap();
     let (_, original_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
-    let receive = client.receive_state(server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream);
+    let receive = receive_state(&client, server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream);
     tokio::pin!(receive);
     assert!(futures::poll!(&mut receive).is_pending());
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
@@ -498,17 +498,17 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
     let mut snapshot =
         super::super::QueryTree::default().refresh(super::super::QueryTree::spec(&selection, &client.catalog), states).await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
-    let (stream, response) = client
-        .request_state(
-            server.id,
-            &credentials,
-            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version: 1, known_state: Some(snapshot.offer().await?) },
-        )
-        .await?;
+    let (stream, response) = request_state(
+        &client,
+        server.id,
+        &credentials,
+        proto::NodeRequestBody::SubscribeQuery { query_id, selection, version: 1, known_state: Some(snapshot.offer().await?) },
+    )
+    .await?;
     let proto::NodeResponseBody::QuerySubscribed { mut state, .. } = response else { panic!("expected query metadata") };
     let comparison = state.frame.comparison;
-    state.scope.clear();
-    assert!(client.receive_state(server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream).await.is_err());
+    state.frame.sequence = 1;
+    assert!(receive_state(&client, server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream).await.is_err());
     assert!(messages.lock().unwrap().iter().any(|message| matches!(message,
         proto::NodeMessage::Request { request: proto::NodeRequest {
             body: proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Abandoned }, ..

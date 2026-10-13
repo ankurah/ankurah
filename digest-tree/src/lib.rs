@@ -85,7 +85,7 @@ pub mod tree;
 
 pub use digest::{Digest, DigestGroup, HeadHash, Leaf, LeafElement, LtHash16, Ristretto255};
 pub use error::TreeError;
-pub use key::{CanonicalCodec, KeyCodec, PropertyTypes};
+pub use key::{CanonicalCodec, PropertyTypes};
 pub use maintain::{Audit, LeafChange, LeafData, BUCKET_CAPACITY};
 pub use map::{ByteBounds, MapAccess, MapName, MapTransaction};
 pub use memory::{MemoryMaps, MemoryTransaction};

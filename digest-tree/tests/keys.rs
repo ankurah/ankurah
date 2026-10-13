@@ -1,5 +1,5 @@
 use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
-use ankurah_digest_tree::{CanonicalCodec, KeyCodec};
+use ankurah_digest_tree::CanonicalCodec;
 use proptest::prelude::*;
 fn spec(types: &[ValueType]) -> KeySpec<PropertyId> {
     KeySpec::new(

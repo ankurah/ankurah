@@ -87,7 +87,7 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
 }
 
 #[test]
-fn followup_batches_mixed_depths_leaf_pages_and_selective_clocks() {
+fn followup_batches_mixed_depths_and_leaf_pages() {
     let comparison = ComparisonId::new();
     let first = head(NodePrefix::root(), AddressRange::under(&NodePrefix::root()), &known(1));
     let prefix = NodePrefix::of(&[0], 3);
@@ -100,7 +100,6 @@ fn followup_batches_mixed_depths_leaf_pages_and_selective_clocks() {
             StateAnswer::Summary(first.clone()),
             StateAnswer::Summary(second.clone()),
             StateAnswer::Leaves(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![], entity: known(2) }] }),
-            StateAnswer::Heads { known: vec![known(20)], unknown: vec![known(21).entity_id] },
         ],
     });
     let NodeRequestBody::ContinueState { comparison: received, processed_through, answers } = wire(&req).body else { panic!("comparison") };
@@ -111,30 +110,24 @@ fn followup_batches_mixed_depths_leaf_pages_and_selective_clocks() {
     let StateAnswer::Leaves(page) = &answers[2] else { panic!("leaves") };
     assert_eq!(page.bounds, bounds);
     assert_eq!(page.leaves[0].entity, known(2));
-    let StateAnswer::Heads { known: clocks, unknown } = &answers[3] else { panic!("clocks") };
-    assert_eq!(clocks, &[known(20)]); // Entity need not occur in the offered tree page.
-    assert_eq!(unknown, &[known(21).entity_id]);
     let receipt = request(NodeRequestBody::ContinueState { comparison, processed_through: 18, answers: vec![] });
     assert!(matches!(wire(&receipt).body, NodeRequestBody::ContinueState { processed_through: 18, answers, .. } if answers.is_empty()));
 }
 
 #[test]
-fn initial_replies_describe_the_scope_and_continue_with_mixed_work() {
+fn initial_replies_continue_with_mixed_work() {
     let comparison = ComparisonId::new();
     let bounds = AddressRange::new(Excluded(vec![0]), Included(vec![9]));
     let state = StateReply {
         spec: spec(),
-        scope: vec![bounds.clone()],
         frame: StateFrame {
             comparison,
             sequence: 0,
             body: StateFrameBody::State {
                 items: vec![
-                    StateItem::Equal(AddressRange::new(Excluded(vec![0]), Excluded(vec![1]))),
                     StateItem::Summary(head(NodePrefix::root(), bounds.clone(), &known(2))),
                     StateItem::Leaves(LeafPage { bounds: AddressRange::new(Included(vec![3]), Included(vec![9])), leaves: vec![] }),
                     StateItem::NeedLeaves(bounds.clone()),
-                    StateItem::NeedHeads(vec![known(2).entity_id]),
                 ],
                 progress: ComparisonProgress::Continue,
             },
@@ -149,13 +142,12 @@ fn initial_replies_describe_the_scope_and_continue_with_mixed_work() {
             _ => panic!("initial state"),
         };
         assert_eq!(state.spec, spec());
-        assert_eq!(state.scope, [bounds.clone()]);
         assert_eq!(state.frame.comparison, comparison);
         assert_eq!(state.frame.sequence, 0);
         let StateFrameBody::State { items, progress } = state.frame.body else { panic!("initial state") };
         assert_eq!(progress, ComparisonProgress::Continue);
-        assert_eq!(items.len(), 5);
-        assert!(matches!(&items[2], StateItem::Leaves(page) if page.leaves.is_empty()));
+        assert_eq!(items.len(), 3);
+        assert!(matches!(&items[1], StateItem::Leaves(page) if page.leaves.is_empty()));
     }
 }
 
@@ -277,18 +269,16 @@ fn late_repair_feedback_and_failure_have_distinct_wire_fixtures() {
         "processed_through": 7,
         "answers": [{ "NeedRepair": {
             "entity_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "target": [[3, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]],
-            "actual": [[2, "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"]]
+            "target": [[3, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]]
         }}]
     }});
     let request: NodeRequestBody = serde_json::from_value(feedback.clone()).unwrap();
     assert_eq!(serde_json::to_value(wire(&request)).unwrap(), feedback);
     let NodeRequestBody::ContinueState { comparison, processed_through, answers } = request else { panic!("feedback") };
     assert_eq!(processed_through, 7);
-    let StateAnswer::NeedRepair { entity_id, target, actual } = &answers[0] else { panic!("repair request") };
+    let StateAnswer::NeedRepair { entity_id, target } = &answers[0] else { panic!("repair request") };
     assert_eq!(*entity_id, EntityId::from_bytes([0; 32]));
     assert_eq!(*target, Clock::new(vec![(3, EventId::from_bytes([0; 32]))]).unwrap());
-    assert_eq!(*actual, Clock::new(vec![(2, EventId::from_bytes([1; 32]))]).unwrap());
 
     let failure = serde_json::json!({ "StateFrame": {
         "request_id": "00000000000000000000000002",

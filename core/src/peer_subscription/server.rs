@@ -166,25 +166,19 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             }
             let snapshot = tree.refresh_captured(spec, states).await?;
             let members = snapshot.states.keys().copied().collect::<Vec<_>>();
-            let state = node
-                .start_comparison(
-                    self.peer_id,
-                    request,
-                    fingerprint,
-                    credentials.clone(),
-                    Some((query_id, version)),
-                    catalog,
-                    snapshot,
-                    known_state,
-                )
-                .await?;
-            let bound = self.delivery.lock().unwrap().bind(query_id, version, state.frame.comparison, members, node, self.peer_id);
-            let bound = match bound {
-                Ok(bound) => bound,
-                Err(error) => {
-                    return Err(error);
-                }
-            };
+            let state = crate::node::state_sync::start_comparison(
+                node,
+                self.peer_id,
+                request,
+                fingerprint,
+                credentials.clone(),
+                Some((query_id, version)),
+                catalog,
+                snapshot,
+                known_state,
+            )
+            .await?;
+            let bound = self.delivery.lock().unwrap().bind(query_id, version, state.frame.comparison, members, node, self.peer_id)?;
             if !bound {
                 peer.comparisons.remove(&state.frame.comparison);
                 return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: state.frame.comparison });
@@ -201,29 +195,15 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         response
     }
 
-    pub(crate) async fn finish_comparison<SE, PA>(
-        &self,
-        _node: &Node<SE, PA>,
-        query: proto::QueryId,
-        version: u32,
-        comparison: proto::ComparisonId,
-        outcome: proto::ComparisonOutcome,
-    ) -> anyhow::Result<()>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
-    {
+    pub(crate) async fn abandon_comparison(&self, query: proto::QueryId, version: u32, comparison: proto::ComparisonId) {
         let mut queries = self.queries.lock().await;
         let mut delivery = self.delivery.lock().unwrap();
         if !delivery.matches(query, version, comparison) {
-            return Ok(());
+            return;
         }
-        if outcome == proto::ComparisonOutcome::Abandoned {
-            queries.remove(&query);
-            let _ = self.subscription.remove_predicate(query);
-            delivery.remove(query);
-        }
-        Ok(())
+        queries.remove(&query);
+        let _ = self.subscription.remove_predicate(query);
+        delivery.remove(query);
     }
 }
 

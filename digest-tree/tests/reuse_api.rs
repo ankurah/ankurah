@@ -1,7 +1,7 @@
 //! Reuse examples checked against independently specified membership.
 mod common;
 use ankurah_digest_tree::{Digest, Leaf, TreeMatch, TreeRequest};
-use common::{codec, populated_tree, types};
+use common::{populated_tree, types};
 
 #[tokio::test]
 async fn one_tree_serves_its_own_selection_whole_and_a_narrower_one_as_a_span() {
@@ -19,9 +19,9 @@ async fn one_tree_serves_its_own_selection_whole_and_a_narrower_one_as_a_span() 
     ] {
         let request = TreeRequest::for_selection(&selection, &types()).unwrap();
         assert_eq!(tree.spec().serves(&request), Some(kind));
-        let scope = tx.scope(&request, &codec()).await.unwrap();
+        let scope = tx.scope(&request).await.unwrap();
         assert_eq!(tx.count(&scope).await.unwrap(), ids.len() as u64);
-        let page = tx.page(&scope, &codec(), None, 20).await.unwrap();
+        let page = tx.page(&scope, None, 20).await.unwrap();
         assert_eq!(
             page.leaves.iter().map(|row| row.entity_id).collect::<Vec<_>>(),
             ids.iter().copied().map(common::entity).collect::<Vec<_>>()
@@ -46,12 +46,12 @@ async fn limits_and_reverse_order_use_scopes_of_the_same_tree() {
         (selection!("project = 'acme' AND foo > 7 ORDER BY foo LIMIT 0"), vec![]),
     ] {
         let request = TreeRequest::for_selection(&selection, &types()).unwrap();
-        let scope = tx.scope(&request, &codec()).await.unwrap();
+        let scope = tx.scope(&request).await.unwrap();
         assert_eq!(tx.count(&scope).await.unwrap(), ids.len() as u64);
         let mut found = Vec::new();
         let mut cursor = None;
         loop {
-            let page = tx.page(&scope, &codec(), cursor.as_ref(), 1).await.unwrap();
+            let page = tx.page(&scope, cursor.as_ref(), 1).await.unwrap();
             found.extend(page.leaves.iter().map(|row| row.entity_id));
             cursor = page.next;
             if cursor.is_none() {
@@ -75,6 +75,6 @@ async fn missing_members_and_conditions_outside_the_key_prevent_reuse() {
     ] {
         let request = TreeRequest::for_selection(&selection, &types()).unwrap();
         assert_eq!(tree.spec().serves(&request), None, "{selection}");
-        assert!(tree.begin().scope(&request, &codec()).await.is_err());
+        assert!(tree.begin().scope(&request).await.is_err());
     }
 }

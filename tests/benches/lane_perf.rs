@@ -29,7 +29,7 @@
 //! - `fresh_fetch_snapshot`: wall time for a FRESH client's first fetch of an
 //!   entity whose server-side history is 100 / 1000 / 5000 events deep. A fresh
 //!   fetch offers an empty tree and reports the entity unknown, so the server sends a full
-//!   StateSnapshot (generate_entity_delta Case 3), never an EventBridge: depth
+//!   StateSnapshot (unknown-entity snapshot path), never an EventBridge: depth
 //!   affects only the excluded setup, and the measured region is snapshot
 //!   adoption. A lane guard asserts no events were committed locally.
 //! - `bridge_catchup`: the TRUE EventBridge lane, via the stale-client shape
@@ -38,7 +38,7 @@
 //!   server advances by GAP edits (32 / 100 / 200), then the client
 //!   reconnects and re-fetches. State comparison supplies the stale head, the
 //!   server builds the bridge from stale head to current
-//!   (generate_entity_delta Case 2), and the client applies GAP events through
+//!   (known stale-head bridge path), and the client applies GAP events through
 //!   the bridge arm. A lane guard asserts the client committed the gap events
 //!   locally (the bridge arm commits them; the snapshot arm does not).
 //! - `subscription_establishment`: wall time to establish and initialize a live
@@ -234,7 +234,7 @@ fn futures_noop_poll<F: std::future::Future>(fut: &mut std::pin::Pin<&mut F>) ->
 /// region; the measured region is the client's fetch.
 ///
 /// LANE: a fresh client reports the entity unknown during comparison, so the server sends a
-/// full StateSnapshot (generate_entity_delta Case 3), never an EventBridge. The
+/// full StateSnapshot (unknown-entity snapshot path), never an EventBridge. The
 /// history depth therefore affects only the excluded setup; the measured region
 /// is one final-state snapshot adoption and is expected to be roughly FLAT in
 /// depth. This is still a useful number (fresh-client first-fetch latency), but
@@ -307,16 +307,15 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
 /// events while the client was disconnected. This is the only shape that
 /// produces `DeltaContent::EventBridge`: the re-fetch's state comparison supplies
 /// the client's stale head, the server builds the bridge from stale head to
-/// current head (generate_entity_delta Case 2), and the client applies the gap
+/// current head (known stale-head bridge path), and the client applies the gap
 /// events through the bridge arm.
 ///
 /// Per iteration: (setup, excluded) server creates the entity; the client
 /// connects and fetches once so it persists the entity at that head, then
 /// DISCONNECTS (dropping the LocalProcessConnection deregisters the peers); the
 /// server advances by `gap` edits. (Measured) the client reconnects and fetches
-/// again; the measured region spans reconnect + re-fetch, and reconnect
-/// (two peer registrations and two task spawns) is negligible against the
-/// bridge at any gap.
+/// again; the measured region spans reconnect + re-fetch, including two peer
+/// registrations and the connector's spawned tasks.
 ///
 /// Guards: the client must reach the final state, and a lane guard asserts the
 /// client committed at least `gap` events locally, which only the bridge arm

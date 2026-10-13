@@ -22,17 +22,6 @@ impl PropertyTypes for HashMap<PropertyId, ValueType> {
     }
 }
 
-/// The codec used to derive exact bounds and to identify tuple parts during
-/// traversal. Implementations must produce the exact bytes specified by
-/// [`CanonicalCodec`], which the membership planner also uses for literals.
-pub trait KeyCodec {
-    /// Encode the first `values.len()` parts of a key spec.
-    fn encode_prefix(&self, spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError>;
-    /// Split a complete key into its self-delimiting encoded parts, rejecting
-    /// malformed, noncanonical or trailing bytes.
-    fn split<'a>(&self, spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError>;
-}
-
 /// The standalone crate's canonical codec. Missing values sort before present
 /// ones and do not change admission. NaNs and JSON ordering are unsupported;
 /// floating zero has one encoding, and strings use UTF-8 byte order.
@@ -54,9 +43,8 @@ impl CanonicalCodec {
         }
         Ok(bytes)
     }
-}
-impl KeyCodec for CanonicalCodec {
-    fn encode_prefix(&self, spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
+    /// Encode the first `values.len()` parts of a key spec.
+    pub fn encode_prefix(&self, spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
         if values.len() > spec.keyparts.len() {
             return Err(TreeError::InvalidKey("too many tuple parts"));
         }
@@ -66,7 +54,9 @@ impl KeyCodec for CanonicalCodec {
         }
         Ok(bytes)
     }
-    fn split<'a>(&self, spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
+    /// Split a complete key into its self-delimiting encoded parts, rejecting
+    /// malformed, noncanonical or trailing bytes.
+    pub fn split<'a>(&self, spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
         let mut parts = Vec::new();
         let mut rest = key;
         for part in &spec.keyparts {

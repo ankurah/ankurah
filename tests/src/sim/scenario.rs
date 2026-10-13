@@ -149,7 +149,7 @@ impl<'a> Workload<'a> {
         index
     }
 
-    /// Build and deliver a `StateAndEvent` SubscriptionUpdate carrying `origin`'s
+    /// Build and deliver a `StateAndEvents` SubscriptionUpdate carrying `origin`'s
     /// current full state and event lineage for `entity` to `dst`, through the
     /// scheduler. The groundable state snapshot always applies; used to prove
     /// the SubscriptionUpdate path works and as the valid items around an
@@ -162,7 +162,7 @@ impl<'a> Workload<'a> {
 
     /// Deliver an arbitrary set of pre-built subscription-update items as one
     /// batch from `origin` to `dst`. This is the seam scenarios use to construct
-    /// the exact V4/V6 wire shapes (adversarially ordered EventOnly fragments, a
+    /// the exact V4/V6 wire shapes (adversarially ordered EventBridge fragments, a
     /// mix of valid and unknown-entity items). Delivered once, not
     /// acceptance-retried, since the point is to exercise the applier's handling
     /// of that specific batch.
@@ -185,7 +185,7 @@ impl<'a> Workload<'a> {
         }
     }
 
-    /// Build an `EventOnly` subscription-update item carrying the given forged
+    /// Build an `EventBridge` subscription-update item carrying the given forged
     /// events (as fragments) for `entity`, in the exact order passed. Scenarios
     /// pass a deliberately adversarial (e.g. child-first) order to probe the V4
     /// bridge-ordering shape; the applier must still apply parent-first.
@@ -197,7 +197,7 @@ impl<'a> Workload<'a> {
         }
     }
 
-    /// A `StateAndEvent` item for an entity from `origin`'s current stored
+    /// A `StateAndEvents` item for an entity from `origin`'s current stored
     /// state and lineage.
     pub async fn state_and_event_item(&self, origin: usize, entity: proto::EntityId) -> proto::SubscriptionUpdateItem {
         let state = self.nodes[origin].entity_state(entity).await.expect("origin holds entity state");

@@ -1,7 +1,7 @@
 mod common;
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
-use ankurah_digest_tree::{CanonicalCodec, DigestTree, HeadHash, LeafData, TreeMatch, TreeRequest, TreeSpec};
+use ankurah_digest_tree::{DigestTree, HeadHash, LeafData, TreeMatch, TreeRequest, TreeSpec};
 use common::{property, types};
 
 #[test]
@@ -67,8 +67,8 @@ async fn id_bounds_extremes_and_default_order_are_exact() {
         };
         let request = TreeRequest::for_selection(&Selection::from(predicate), &types()).unwrap();
         let mut tx = tree.begin();
-        let scope = tx.scope(&request, &CanonicalCodec).await.unwrap();
-        let page = tx.page(&scope, &CanonicalCodec, None, 10).await.unwrap();
+        let scope = tx.scope(&request).await.unwrap();
+        let page = tx.page(&scope, None, 10).await.unwrap();
         assert_eq!(
             page.leaves.iter().map(|v| v.entity_id).collect::<Vec<_>>(),
             expected.into_iter().map(common::entity).collect::<Vec<_>>()
@@ -81,9 +81,9 @@ async fn id_bounds_extremes_and_default_order_are_exact() {
             limit: Some(2),
         };
         let mut tx = tree.begin();
-        let scope = tx.scope(&TreeRequest::for_selection(&selection, &types()).unwrap(), &CanonicalCodec).await.unwrap();
-        let first = tx.page(&scope, &CanonicalCodec, None, 1).await.unwrap();
-        let last = tx.page(&scope, &CanonicalCodec, first.next.as_ref(), 1).await.unwrap();
+        let scope = tx.scope(&TreeRequest::for_selection(&selection, &types()).unwrap()).await.unwrap();
+        let first = tx.page(&scope, None, 1).await.unwrap();
+        let last = tx.page(&scope, first.next.as_ref(), 1).await.unwrap();
         let ids = [first.leaves[0].entity_id, last.leaves[0].entity_id];
         assert_eq!(ids, if desc { [common::entity(255), common::entity(128)] } else { [common::entity(0), common::entity(1)] });
         assert!(last.next.is_none());

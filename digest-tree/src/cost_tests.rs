@@ -118,9 +118,7 @@ fn leaf(value: i64, version: u8) -> LeafData {
     }
 }
 fn begin(maps: &MemoryMaps, counts: &Counts) -> TreeTransaction<Ristretto255, Counted> {
-    let mut tx = TreeTransaction::new(Counted { inner: maps.begin(), counts: counts.clone(), suspend_after_put: false });
-    tx.spec = Some(spec());
-    tx
+    TreeTransaction::bind(&spec(), Counted { inner: maps.begin(), counts: counts.clone(), suspend_after_put: false })
 }
 async fn populated(size: i64) -> (MemoryMaps, Counts) {
     let maps = MemoryMaps::new();

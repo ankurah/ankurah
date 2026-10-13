@@ -344,10 +344,12 @@ async fn live_catchup_holds_edits_until_activation_then_reconnects_from_retained
     })
     .await;
     wait_for(|| {
-        trace.0.lock().unwrap().iter().any(|body| matches!(body,
+        trace.0.lock().unwrap().iter().any(|body| {
+            matches!(body,
             NodeResponseBody::QuerySubscribed { query_id, state }
                 if *query_id == query.query_id() && matches!(&state.frame.body,
-                    proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. })))
+                    proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))
+        })
     })
     .await;
     assert!(trace.items(Some(query.query_id())).is_empty(), "retained equal clocks need no state items on reconnect");
@@ -470,7 +472,10 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 proto::NodeRequestBody::ContinueState {
                     comparison,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Heads { known: vec![], unknown: vec![EntityId::random()] }],
+                    answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
+                        bounds: proto::AddressRange::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                        leaves: vec![]
+                    })],
                 }
             )
             .await?,
@@ -504,7 +509,10 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 proto::NodeRequestBody::ContinueState {
                     comparison,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Heads { known: vec![], unknown: vec![] }],
+                    answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
+                        bounds: proto::AddressRange::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                        leaves: vec![]
+                    })],
                 }
             )
             .await?,
@@ -756,7 +764,7 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
     *target.lock().unwrap() = Some(query.query_id());
     wait_for(|| parked.load(Ordering::Acquire)).await;
     assert!(
-        trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Equal(_) | StateItem::Leaves(_))),
+        trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Leaves(_))),
         "cached initialization supplies membership without repair"
     );
     let mut payload = String::new();
@@ -1172,10 +1180,6 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
     let offered = trace.items(Some(query.query_id()));
     for (id, target) in [(older.id(), &older_target), (concurrent.id(), &concurrent_target), (newer.id(), &newer_target)] {
         assert!(snapshot_offer(&offered, id, target), "an absent query member must offer its exact captured snapshot target first: {id}");
-        assert!(
-            !offered.iter().any(|item| matches!(item, StateItem::NeedHeads(ids) if ids.contains(&id))),
-            "query absence must use snapshot-first repair without an extra clock question: {id}"
-        );
     }
     // The gate observes inbound responses, not the outgoing KnownState. A
     // frontier necessarily asks for refinement/leaves here; the complete

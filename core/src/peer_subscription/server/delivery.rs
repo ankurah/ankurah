@@ -69,7 +69,8 @@ impl Delivery {
         // The comparison owns bounded framing and holds emission until Applied.
         // Preserve every connecting event batch instead of coalescing snapshots.
         while let Some(item) = self.next_pending(query) {
-            node.queue_live(peer, comparison, vec![item]).map_err(|error| error.context(LiveStreamFailure(comparison)))?;
+            crate::node::state_sync::queue_live(node, peer, comparison, vec![item])
+                .map_err(|error| error.context(LiveStreamFailure(comparison)))?;
         }
         Ok(true)
     }
@@ -141,11 +142,7 @@ impl Delivery {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        if self.routes.is_empty() {
-            node.send_update(peer, proto::NodeUpdateBody::SubscriptionUpdate { items });
-            return Ok(());
-        }
-        self.route_updates(items, |comparison, items| match node.queue_live(peer, comparison, items) {
+        self.route_updates(items, |comparison, items| match crate::node::state_sync::queue_live(node, peer, comparison, items) {
             Ok(()) => Ok(()),
             Err(error) => {
                 if node.peer_connections.get(&peer).is_some_and(|peer| peer.comparisons.get(&comparison).is_some()) {
@@ -406,6 +403,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removed_last_route_drops_late_notifications() -> anyhow::Result<()> {
+        let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+        let peer = proto::EntityId::random();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        node.register_peer(
+            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+            Box::new(CaptureSender { peer, messages: messages.clone() }),
+        )
+        .await?;
+        let query = proto::QueryId::new();
+        let entity = proto::EntityId::random();
+        let mut delivery = Delivery::default();
+        delivery.begin(query, 1);
+        assert!(delivery.bind_route(query, 1, proto::ComparisonId::new(), [entity]));
+        delivery.remove(query);
+        messages.lock().unwrap().clear();
+
+        delivery.send(&node, peer, vec![item(entity, vec![(query, proto::MembershipChange::Remove)])])?;
+        assert!(messages.lock().unwrap().is_empty(), "late notifications must not escape on an unsequenced stream");
+        assert_eq!(delivery.bytes, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn removed_comparison_route_is_stale_and_healthy_stream_still_receives() -> anyhow::Result<()> {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let peer = proto::EntityId::random();
@@ -424,20 +445,31 @@ mod tests {
         for (query, entity) in [(stale_query, stale_entity), (healthy_query, healthy_entity)] {
             let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
             let snapshot = crate::node::state_sync::QueryTree::default().refresh(spec, vec![]).await?;
-            let initial =
-                node.start_comparison(peer, proto::RequestId::new(), vec![], vec![], Some((query, 1)), false, snapshot, None).await?;
+            let initial = crate::node::state_sync::start_comparison(
+                &node,
+                peer,
+                proto::RequestId::new(),
+                vec![],
+                vec![],
+                Some((query, 1)),
+                false,
+                snapshot,
+                None,
+            )
+            .await?;
             delivery.begin(query, 1);
             assert!(delivery.bind_route(query, 1, initial.frame.comparison, [entity]));
             streams.push(initial.frame.comparison);
         }
         // Reproduce the cleanup window: comparison is gone, route is still bound.
-        node.close_state(peer, streams[0], proto::ComparisonOutcome::Abandoned, vec![]).await?;
-        node.close_state(peer, streams[1], proto::ComparisonOutcome::Applied { processed_through: 0 }, vec![]).await?;
+        crate::node::state_sync::close_state(&node, peer, streams[0], proto::ComparisonOutcome::Abandoned, vec![]).await?;
+        crate::node::state_sync::close_state(&node, peer, streams[1], proto::ComparisonOutcome::Applied { processed_through: 0 }, vec![])
+            .await?;
         delivery.send(&node, peer, vec![item(stale_entity, vec![]), item(healthy_entity, vec![])])?;
         assert!(node.peer_connections.get(&peer).is_some(), "retiring one stream must preserve the peer");
         assert!(delivery.matches(stale_query, 1, streams[0]), "retain the binding for its owner's standing-query cleanup");
         assert!(delivery.matches(healthy_query, 1, streams[1]));
-        node.pump_comparison(peer, streams[1]).await?;
+        crate::node::state_sync::pump_comparison(&node, peer, streams[1]).await?;
         assert!(messages.lock().unwrap().iter().any(|message| matches!(
             message,
             proto::NodeMessage::Update(proto::NodeUpdate {

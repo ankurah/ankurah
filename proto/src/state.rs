@@ -61,12 +61,10 @@ pub enum KnownRegion {
     Leaves(#[serde(with = "compact_initial_page")] LeafPage),
 }
 
-/// Initial Fetch or SubscribeQuery response; frame.sequence must be zero.
+/// Initial response for the full exact materialized selection; frame.sequence must be zero.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReply {
     pub spec: TreeSpec,
-    /// Exact authorized result scope, including the Selection's ordered limit.
-    pub scope: Vec<AddressRange>,
     pub frame: StateFrame,
 }
 
@@ -111,11 +109,9 @@ pub enum ComparisonProgress {
     Complete,
 }
 
-/// A reply may mix equality, refinement, questions and entity repairs.
+/// A reply may mix refinement, inventory questions and entity repairs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateItem {
-    /// Both captured snapshots agree on precisely these bounds.
-    Equal(AddressRange),
     /// Compare this region locally and answer with a head for the same bounds.
     /// The responder may offer several depths; overlap must not be counted twice.
     Summary(TreeHead),
@@ -123,9 +119,6 @@ pub enum StateItem {
     Leaves(LeafPage),
     /// Enumerate the requester's leaves within these bounds, in bounded pages.
     NeedLeaves(AddressRange),
-    /// Ask for actual clocks, including for entities absent from the query tree
-    /// but potentially present elsewhere on the requester.
-    NeedHeads(Vec<EntityId>),
     /// Apply through the normal attestation and causal validation path.
     /// `target` is the captured sender head covered by this delta. Application
     /// may retain newer or concurrent local state; sending is not acknowledgment.
@@ -148,19 +141,12 @@ pub enum StateAnswer {
     /// The requester's digest over the exact bounds named by the head.
     Summary(TreeHead),
     Leaves(LeafPage),
-    /// `unknown` identifies entities with no clock available to share under this comparison's read authority.
-    /// Omitted entity IDs remain unanswered, not unknown.
-    Heads {
-        known: Vec<KnownEntity>,
-        unknown: Vec<EntityId>,
-    },
     /// An already offered snapshot did not incorporate target into local state.
     /// Only the exact offered entity/target is admissible, including after Complete.
     /// Answer with bounded connecting events or RepairUnavailable, never the same snapshot.
     NeedRepair {
         entity_id: EntityId,
         target: Clock,
-        actual: Clock,
     },
 }
 

@@ -1,9 +1,7 @@
 mod common;
 use ankql::ast::{OrderByItem, OrderDirection, Selection};
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyPath, Value, ValueType};
-use ankurah_digest_tree::{
-    CanonicalCodec, Digest, DigestTree, HeadHash, KeyCodec, Leaf, LeafChange, LeafData, TreeError, TreeRequest, TreeSpec,
-};
+use ankurah_digest_tree::{CanonicalCodec, Digest, DigestTree, HeadHash, Leaf, LeafChange, LeafData, TreeError, TreeRequest, TreeSpec};
 use common::{entity, property, types};
 
 #[tokio::test]
@@ -47,7 +45,7 @@ async fn mixed_directions_limits_and_pages_match_a_sorted_model() {
                 });
                 expected.truncate(limit as usize);
                 let mut tx = tree.begin();
-                let scope = tx.scope(&TreeRequest::for_selection(&selection, &types()).unwrap(), &codec).await.unwrap();
+                let scope = tx.scope(&TreeRequest::for_selection(&selection, &types()).unwrap()).await.unwrap();
                 let expected_digest: Digest =
                     expected.iter().map(|(_, _, row)| Digest::from(Leaf::new(&row.key, row.entity_id, row.head).element())).sum();
                 assert_eq!(tx.digest(&scope).await.unwrap(), expected_digest, "{foo_desc}/{bar_desc}/{limit}");
@@ -55,7 +53,7 @@ async fn mixed_directions_limits_and_pages_match_a_sorted_model() {
                 let mut rows = Vec::new();
                 let mut cursor = None;
                 loop {
-                    let page = tx.page(&scope, &codec, cursor.as_ref(), 9).await.unwrap();
+                    let page = tx.page(&scope, cursor.as_ref(), 9).await.unwrap();
                     rows.extend(page.leaves.into_iter().map(|row| row.entity_id));
                     cursor = page.next;
                     if cursor.is_none() {
@@ -102,7 +100,7 @@ async fn disjunctions_nulls_and_embedded_nuls_have_exact_bounds() {
     ] {
         let mut tx = tree.begin();
         let request = TreeRequest::for_selection(&query, &types()).unwrap();
-        let scope = tx.scope(&request, &CanonicalCodec).await.unwrap();
+        let scope = tx.scope(&request).await.unwrap();
         let expected: Digest =
             ids.iter().map(|&n| &model[n]).map(|row| Digest::from(Leaf::new(&row.key, row.entity_id, row.head).element())).sum();
         assert_eq!(tx.digest(&scope).await.unwrap(), expected, "{query}");
@@ -114,18 +112,18 @@ async fn scope_lifetime_and_multiplicity_are_checked() {
     let tree = common::populated_tree(&selection!("project = 'acme' AND foo > 7")).await;
     let request = TreeRequest::for_selection(&selection!("project = 'acme' AND foo > 10"), &types()).unwrap();
     let mut tx = tree.begin();
-    let scope = tx.scope(&request, &CanonicalCodec).await.unwrap();
+    let scope = tx.scope(&request).await.unwrap();
     assert!(matches!(tree.begin().count(&scope).await, Err(TreeError::StaleScope)));
     let row = tx.entity_leaves(entity(2)).await.unwrap().pop().unwrap();
     tx.apply_change(LeafChange { before: Some(LeafData { key: row.key, entity_id: row.entity_id, head: row.head }), after: None })
         .await
         .unwrap();
     assert!(matches!(tx.count(&scope).await, Err(TreeError::StaleScope)));
-    let refreshed = tx.scope(&request, &CanonicalCodec).await.unwrap();
+    let refreshed = tx.scope(&request).await.unwrap();
     assert_eq!(tx.count(&refreshed).await.unwrap(), 1);
     // The committed tree is unchanged while this transaction is open.
     let mut other = tree.begin();
-    let other_scope = other.scope(&request, &CanonicalCodec).await.unwrap();
+    let other_scope = other.scope(&request).await.unwrap();
     assert_eq!(other.count(&other_scope).await.unwrap(), 2);
     let duplicate = LeafData {
         key: CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(20)]).unwrap(),
@@ -133,7 +131,7 @@ async fn scope_lifetime_and_multiplicity_are_checked() {
         head: HeadHash::of([[1; 32]]),
     };
     tx.apply_change(LeafChange { before: None, after: Some(duplicate) }).await.unwrap();
-    assert!(matches!(tx.scope(&request, &CanonicalCodec).await, Err(TreeError::MultipleKeys)));
+    assert!(matches!(tx.scope(&request).await, Err(TreeError::MultipleKeys)));
 }
 
 #[tokio::test]
@@ -170,11 +168,11 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
                 let expected: Vec<_> =
                     model.iter().filter(|(n, _)| if inclusive { *n >= lower && *n <= upper } else { *n > lower && *n < upper }).collect();
                 let mut tx = tree.begin();
-                let scope = tx.scope(&TreeRequest::for_selection(&query, &types()).unwrap(), &CanonicalCodec).await.unwrap();
+                let scope = tx.scope(&TreeRequest::for_selection(&query, &types()).unwrap()).await.unwrap();
                 let digest: Digest =
                     expected.iter().map(|(_, row)| Digest::from(Leaf::new(&row.key, row.entity_id, row.head).element())).sum();
                 assert_eq!(tx.digest(&scope).await.unwrap(), digest, "{lower}/{upper}/{inclusive}");
-                let page = tx.page(&scope, &CanonicalCodec, None, 300).await.unwrap();
+                let page = tx.page(&scope, None, 300).await.unwrap();
                 assert_eq!(
                     page.leaves.iter().map(|row| row.entity_id).collect::<Vec<_>>(),
                     expected.iter().map(|(_, row)| row.entity_id).collect::<Vec<_>>()
@@ -188,7 +186,7 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
         operator: Op::Between,
         right: Box::new(Expr::ExprList(vec![Expr::Literal(Value::I64(-7)), Expr::Literal(Value::I64(12))])),
     });
-    let scope = tx.scope(&TreeRequest::for_selection(&query, &types()).unwrap(), &CanonicalCodec).await.unwrap();
+    let scope = tx.scope(&TreeRequest::for_selection(&query, &types()).unwrap()).await.unwrap();
     assert_eq!(tx.count(&scope).await.unwrap(), 20);
     let scope = tx.scope_ranges([ankurah_digest_tree::AddressRange::all()]);
     let root = tx.heads(&scope).await.unwrap().pop().unwrap();

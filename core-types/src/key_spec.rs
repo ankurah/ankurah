@@ -114,9 +114,7 @@ impl<K> KeySpec<K> {
     /// The same parts with every direction ascending and no nulls placement:
     /// the order a digest tree files them in, whatever order a use walks them.
     pub fn ascending(&self) -> Self
-    where
-        K: Clone,
-    {
+    where K: Clone {
         Self {
             keyparts: self
                 .keyparts

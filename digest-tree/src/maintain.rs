@@ -9,7 +9,7 @@ use crate::digest::{Digest, DigestGroup, HeadHash, Leaf};
 use crate::layout;
 use crate::map::{MapAccess, MapName};
 use crate::tree::PreparedLeaf;
-use crate::{AddressRange, CanonicalCodec, KeyCodec, LeafRow, NodePrefix, NodeRow, TreeError, TreeTransaction};
+use crate::{AddressRange, CanonicalCodec, LeafRow, NodePrefix, NodeRow, TreeError, TreeTransaction};
 
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_PREPARATION_MIN_LEAVES: usize = 1024;
@@ -102,10 +102,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     async fn change_leaf(&mut self, change: LeafChange) -> Result<(), TreeError> {
         self.transaction.watch_structure();
-        if let Some(spec) = &self.spec {
-            for leaf in change.before.iter().chain(change.after.iter()) {
-                CanonicalCodec.split(spec.key_spec(), &leaf.key)?;
-            }
+        for leaf in change.before.iter().chain(change.after.iter()) {
+            CanonicalCodec.split(self.spec.key_spec(), &leaf.key)?;
         }
         let mut before_value = None;
         let before = match &change.before {
@@ -287,9 +285,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         // workers perform the independent hashing and row encoding.
         let mut admitted = BTreeMap::new();
         for leaf in leaves {
-            if let Some(spec) = &self.spec {
-                CanonicalCodec.split(spec.key_spec(), &leaf.key)?;
-            }
+            CanonicalCodec.split(self.spec.key_spec(), &leaf.key)?;
             let address = crate::leaf_address(&leaf.key, leaf.entity_id);
             if admitted.insert(address, leaf).is_some() {
                 return Err(TreeError::DuplicateLeaf);
@@ -386,9 +382,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let leaves = self.all_leaves(&AddressRange::all()).await?;
         let mut lookup: BTreeMap<EntityId, BTreeSet<Vec<u8>>> = BTreeMap::new();
         for row in &leaves {
-            if let Some(spec) = &self.spec {
-                CanonicalCodec.split(spec.key_spec(), &row.key)?;
-            }
+            CanonicalCodec.split(self.spec.key_spec(), &row.key)?;
             if row.element != Leaf::new(&row.key, row.entity_id, row.head).element() {
                 return Err(TreeError::Audit("leaf element differs from its inputs"));
             }

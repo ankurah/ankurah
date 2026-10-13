@@ -50,7 +50,7 @@ async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> a
     unsubscribe.await?;
     assert!(session.upgrade().is_none(), "unsubscribe must release the frozen snapshot and its timer");
     assert!(matches!(
-        node.continue_state(peer, proto::RequestId::new(), comparison, 0, vec![], vec![]).await?,
+        state_sync::continue_state(&node, peer, proto::RequestId::new(), comparison, 0, vec![], vec![]).await?,
         proto::NodeResponseBody::ComparisonUnavailable { .. }
     ));
     Ok(())
@@ -344,7 +344,8 @@ async fn canceled_state_requests_release_waiters_and_disconnect_wakes_remaining_
     node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await?;
     let credentials = vec![DEFAULT_CONTEXT];
     {
-        let request = node.request_state(
+        let request = crate::node::state_sync::request_state(
+            &node,
             peer,
             &credentials,
             proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::True.into(), known_state: None },

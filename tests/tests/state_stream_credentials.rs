@@ -1,4 +1,4 @@
-//! Initial clock answers and live connecting-history requests use their stream's credentials.
+//! Initial causal repair and live connecting history use their stream's credentials.
 mod common;
 
 use ankurah::{
@@ -10,12 +10,11 @@ use ankurah::{
     },
     policy::{AccessDenied, PolicyAgent},
     proto::{self, Attested},
-    Node,
+    Mutable, Node, View,
 };
 use anyhow::Result;
 use common::{GatedConnection, Peek, Record, RecordView, SledStorageEngine, StorageEngine, Subscribe, TestWatcher};
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -28,16 +27,8 @@ impl ContextData for Credential {}
 struct CredentialAgent {
     subscriptions: Arc<Mutex<Vec<(Credential, proto::QueryId, proto::RequestId)>>>,
     event_requests: Arc<Mutex<Vec<(Vec<proto::EventId>, Vec<Credential>)>>>,
-    initial_inventories: Arc<Mutex<Vec<(proto::QueryId, Option<proto::KnownState>)>>>,
     feedback: Arc<Mutex<Vec<(Vec<Credential>, proto::NodeRequest)>>>,
     feedback_arrived: Arc<tokio::sync::Notify>,
-    predicate_denied: Arc<Mutex<HashSet<proto::EntityId>>>,
-    hook_denied: Arc<Mutex<HashSet<proto::EntityId>>>,
-    read_checks: Arc<Mutex<Vec<(Vec<Credential>, proto::EntityId)>>>,
-}
-
-fn alpha_only<C: Iterable<Credential>>(credentials: &C) -> bool {
-    credentials.iterable().any(|credential| credential.0 == 1) && credentials.iterable().all(|credential| credential.0 == 1)
 }
 
 #[async_trait::async_trait]
@@ -67,17 +58,16 @@ impl PolicyAgent for CredentialAgent {
     {
         let credentials = auth.iterable().map(|auth| Credential(auth.0.first().copied().unwrap_or(0))).collect::<Vec<_>>();
         match &request.body {
-            proto::NodeRequestBody::SubscribeQuery { query_id, known_state, .. } => {
+            proto::NodeRequestBody::SubscribeQuery { query_id, .. } => {
                 self.subscriptions
                     .lock()
                     .unwrap()
                     .extend(credentials.iter().map(|credential| (credential.clone(), *query_id, request.id.clone())));
-                self.initial_inventories.lock().unwrap().push((*query_id, known_state.clone()));
             }
             proto::NodeRequestBody::GetEvents { event_ids } => {
                 self.event_requests.lock().unwrap().push((event_ids.clone(), credentials.clone()));
             }
-            proto::NodeRequestBody::ContinueState { .. } => {
+            proto::NodeRequestBody::ContinueState { .. } | proto::NodeRequestBody::CloseComparison { .. } => {
                 let request = bincode::deserialize(&bincode::serialize(request).unwrap()).unwrap();
                 self.feedback.lock().unwrap().push((credentials.clone(), request));
                 self.feedback_arrived.notify_one();
@@ -120,42 +110,7 @@ impl PolicyAgent for CredentialAgent {
 
     fn query_predicate<C>(&self, credentials: &C) -> Result<ankql::ast::Predicate<ankql::ast::Resolved>, AccessDenied>
     where C: Iterable<Credential> {
-        use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyPath, Value};
-        if credentials.iterable().next().is_none() {
-            return Ok(Predicate::False);
-        }
-        let mut predicate = Predicate::True;
-        if alpha_only(credentials) {
-            for id in self.predicate_denied.lock().unwrap().iter() {
-                predicate = Predicate::And(
-                    Box::new(predicate),
-                    Box::new(Predicate::Comparison {
-                        left: Box::new(Expr::Path(PropertyPath::id())),
-                        operator: ComparisonOperator::NotEqual,
-                        right: Box::new(Expr::Literal(Value::EntityId(*id))),
-                    }),
-                );
-            }
-        }
-        Ok(predicate)
-    }
-
-    fn check_reads<C>(
-        &self,
-        credentials: &C,
-        states: &[(&proto::EntityId, &proto::State)],
-    ) -> std::collections::HashMap<proto::EntityId, AccessDenied>
-    where
-        C: Iterable<Credential>,
-    {
-        let captured = credentials.iterable().cloned().collect::<Vec<_>>();
-        self.read_checks.lock().unwrap().extend(states.iter().map(|(id, _)| (captured.clone(), **id)));
-        let denied = self.hook_denied.lock().unwrap();
-        states
-            .iter()
-            .filter(|(id, _)| alpha_only(credentials) && denied.contains(id))
-            .map(|(id, _)| (**id, AccessDenied::ByPolicy("state denied to alpha")))
-            .collect()
+        Ok(if credentials.iterable().next().is_some() { ankql::ast::Predicate::True } else { ankql::ast::Predicate::False })
     }
 
     fn check_write(&self, _credential: &Credential, _entity: &Entity, _event: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
@@ -275,22 +230,15 @@ async fn live_connecting_history_uses_the_stream_credential_instead_of_the_peer_
 }
 
 #[tokio::test]
-async fn initial_clock_questions_use_the_stream_identity_read_permission() -> Result<()> {
+async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> Result<()> {
     let agent = CredentialAgent::default();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     server.system.create().await?;
     let writer = server.context_async(Credential(0)).await?;
     let trx = writer.begin();
-    let mut ids = Vec::new();
-    for title in ["captured", "predicate-denied", "hook-denied", "off-query"] {
-        ids.push(trx.create(&Record { title: title.into(), artist: "artist".into() }).await?.id());
-    }
+    let record = trx.create(&Record { title: "base".into(), artist: "base".into() }).await?.read()?;
     trx.commit().await?;
-    let [captured, predicate_denied, hook_denied, off_query] = ids.as_slice() else { unreachable!() };
-    let (captured, predicate_denied, hook_denied, off_query) = (*captured, *predicate_denied, *hook_denied, *off_query);
-    agent.predicate_denied.lock().unwrap().insert(predicate_denied);
-    agent.hook_denied.lock().unwrap().insert(hook_denied);
-
+    let id = record.id();
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let metadata = Arc::new(Mutex::new(Vec::<proto::NodeResponse>::new()));
     let metadata_arrived = Arc::new(tokio::sync::Notify::new());
@@ -299,14 +247,32 @@ async fn initial_clock_questions_use_the_stream_identity_read_permission() -> Re
         let metadata = metadata.clone();
         let metadata_arrived = metadata_arrived.clone();
         move |message| {
-            if let proto::NodeMessage::Response(response) = message {
-                if let proto::NodeResponseBody::QuerySubscribed { query_id, .. } = &response.body {
-                    if agent.subscriptions.lock().unwrap().iter().any(|(credential, id, _)| credential.0 == 1 && id == query_id) {
-                        metadata.lock().unwrap().push(bincode::deserialize(&bincode::serialize(response).unwrap()).unwrap());
-                        metadata_arrived.notify_one();
+            match message {
+                proto::NodeMessage::Response(response) => {
+                    if let proto::NodeResponseBody::QuerySubscribed { query_id, .. } = &response.body {
+                        if agent.subscriptions.lock().unwrap().iter().any(|(credential, query, _)| credential.0 == 1 && query == query_id) {
+                            metadata.lock().unwrap().push(bincode::deserialize(&bincode::serialize(response).unwrap()).unwrap());
+                            metadata_arrived.notify_one();
+                            return true;
+                        }
+                    }
+                }
+                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) => {
+                    // Keep the existing beta query at the base head while alpha
+                    // captures a different branch. These are genuine producer
+                    // frames; no response or event is forged for the test.
+                    if matches!(&frame.body, proto::StateFrameBody::Live(items) if items.iter().any(|item| item.delta.entity_id == id))
+                        && agent
+                            .subscriptions
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(credential, _, origin)| credential.0 == 2 && origin == request_id)
+                    {
                         return true;
                     }
                 }
+                _ => {}
             }
             false
         }
@@ -314,19 +280,28 @@ async fn initial_clock_questions_use_the_stream_identity_read_permission() -> Re
     .await;
     client.wait_ready().await?;
     let beta = client.context_async(Credential(2)).await?;
-    assert_eq!(beta.fetch::<RecordView>("true").await?.len(), 4);
     let broader = beta.query_wait::<RecordView>(common::nocache("true")?).await?;
     broader.wait_durable_answered().await?;
-    let mut actual_heads = BTreeMap::new();
-    for id in &ids {
-        actual_heads.insert(*id, client.storage.get_state(*id).await?.payload.state.head);
+    assert_eq!(broader.ids(), [id]);
+    let cached = broader.peek()[0].clone();
+    let local = beta.begin();
+    cached.edit(&local)?.artist()?.set(&"local-artist".to_owned())?;
+
+    // Repeated large title edits make the actual producer prefer its compact
+    // snapshot over the old-to-new event bridge. The prepared local edit still
+    // descends from base, and all beta live deliveries are held.
+    let mut remote_title = String::new();
+    for edit in 0..8 {
+        remote_title = format!("{}-{edit}", "x".repeat(8192));
+        let trx = writer.begin();
+        record.edit(&trx)?.title()?.set(&remote_title)?;
+        trx.commit().await?;
     }
+    let captured_target = record.entity().head();
+    assert_eq!(cached.title()?, "base");
     let alpha = client.context_async(Credential(1)).await?;
-    for id in [predicate_denied, hook_denied] {
-        assert!(matches!(alpha.get_cached::<RecordView>(id).await, Err(ankurah::error::RetrievalError::AccessDenied(_))));
-    }
-    let query = alpha.query::<RecordView>(common::nocache(format!("id = '{captured}'"))?)?;
-    let mut response = tokio::time::timeout(Duration::from_secs(5), async {
+    let query = alpha.query::<RecordView>(common::nocache(format!("id = '{id}'"))?)?;
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let notified = metadata_arrived.notified();
             if let Some(response) = metadata.lock().unwrap().iter().find(|response| {
@@ -338,88 +313,55 @@ async fn initial_clock_questions_use_the_stream_identity_read_permission() -> Re
         }
     })
     .await?;
-    let inventory = agent.initial_inventories.lock().unwrap().iter().find(|(id, _)| *id == query.query_id()).unwrap().1.clone().unwrap();
-    let offered = inventory
-        .regions
-        .iter()
-        .flat_map(|region| match region {
-            proto::KnownRegion::Leaves(page) => page.leaves.iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>(),
-            _ => panic!("one captured row should offer its actual head inline"),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(offered, [captured], "the question's other IDs must be outside the captured query");
-    let proto::NodeResponseBody::QuerySubscribed { state, .. } = &mut response.body else { unreachable!() };
+    let proto::NodeResponseBody::QuerySubscribed { state, .. } = &response.body else { unreachable!() };
     let comparison = state.frame.comparison;
-    let missing = proto::EntityId::random();
-    let proto::StateFrameBody::State { items, .. } = &mut state.frame.body else { unreachable!() };
-    items.push(proto::StateItem::NeedHeads(vec![captured, predicate_denied, hook_denied, off_query, missing]));
-    // A custom responder can ask this in valid metadata, though the stock
-    // producer never asks it. Inspect the real outbound answer before that
-    // producer rejects the unsolicited control; do not claim activation.
-    let message = proto::NodeMessage::Response(response);
-    client.handle_message(bincode::deserialize(&bincode::serialize(&message)?)?).await?;
-    let (credentials, known, unknown) = tokio::time::timeout(Duration::from_secs(5), async {
+    let proto::StateFrameBody::State { items, .. } = &state.frame.body else { unreachable!() };
+    assert!(
+        items.iter().any(|item| matches!(item, proto::StateItem::Repair { target, delta }
+        if delta.entity_id == id && *target == captured_target && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))),
+        "the stock initial producer must offer the exact captured snapshot"
+    );
+    local.commit().await?;
+    let local_head = cached.entity().head();
+    assert!(
+        captured_target.entries().iter().all(|event| !local_head.entries().contains(event)),
+        "the held sender target must be uncovered"
+    );
+    assert_eq!(cached.artist()?, "local-artist");
+    assert_eq!(cached.title()?, "base");
+    assert!(!query.loaded());
+    // Deliver only alpha's unchanged genuine metadata. Releasing the whole
+    // gate would allow beta's later live frames to conceal missing repair.
+    client.handle_message(proto::NodeMessage::Response(response)).await?;
+    tokio::time::timeout(Duration::from_secs(10), query.wait_durable_answered()).await??;
+    assert_eq!(query.ids(), [id]);
+    assert_eq!(query.peek()[0].title()?, remote_title);
+    assert_eq!(query.peek()[0].artist()?, "local-artist");
+    let applied = query.peek()[0].entity().head();
+    assert!(captured_target.entries().iter().all(|event| applied.entries().contains(event)));
+    assert!(local_head.entries().iter().all(|event| applied.entries().contains(event)));
+    assert_eq!(client.storage.get_state(id).await?.payload.state.head, applied);
+    tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let notified = agent.feedback_arrived.notified();
-            let answer = agent.feedback.lock().unwrap().iter().find_map(|(credentials, request)| {
-                let proto::NodeRequestBody::ContinueState { comparison: id, answers, .. } = &request.body else { return None };
-                if *id != comparison {
-                    return None;
-                }
-                answers.iter().find_map(|answer| match answer {
-                    proto::StateAnswer::Heads { known, unknown } => Some((credentials.clone(), known.clone(), unknown.clone())),
-                    _ => None,
-                })
-            });
-            if let Some(answer) = answer {
-                break answer;
+            if agent.feedback.lock().unwrap().iter().any(|(_, request)| matches!(request.body,
+                proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Applied { .. } } if found == comparison)) {
+                break;
             }
             notified.await;
         }
-    })
-    .await?;
-    assert_eq!(credentials, [Credential(1)], "another standing query must not widen this stream's read authority");
-    assert!(agent.subscriptions.lock().unwrap().iter().any(|(credential, id, _)| credential.0 == 2 && *id == broader.query_id()));
-    drop(query);
-    let known = known.into_iter().map(|entity| (entity.entity_id, entity.head)).collect::<BTreeMap<_, _>>();
-    assert_eq!(
-        known,
-        BTreeMap::from([(captured, actual_heads[&captured].clone()), (off_query, actual_heads[&off_query].clone())]),
-        "only captured and authorized off-query clocks may leave the client"
-    );
-    assert_eq!(unknown.into_iter().collect::<BTreeSet<_>>(), BTreeSet::from([predicate_denied, hook_denied, missing]));
-    assert!(agent.read_checks.lock().unwrap().iter().any(|(credentials, id)| *id == off_query && *credentials == [Credential(1)]));
-    Ok(())
-}
-
-#[tokio::test]
-async fn credentialless_identity_read_check_preserves_the_catalog_bypass() -> Result<()> {
-    use ankurah::core::{
-        policy::ContextPolicy,
-        schema::{system_model_id, MODEL_COLLECTION_ID},
-    };
-
-    let agent = CredentialAgent::default();
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
-    let writer = node.context_async(Credential(0)).await?;
-    let trx = writer.begin();
-    let private_id = trx.create(&Record { title: "private".into(), artist: "artist".into() }).await?.id();
-    trx.commit().await?;
-    let proto::ModelId::EntityId(catalog_id) = writer.resolve_model_id::<Record>().await? else { unreachable!() };
-    let catalog = node.storage.get_state(catalog_id).await?;
-    let private = node.storage.get_state(private_id).await?;
-    assert!(catalog.payload.state.memberships.iter().any(|model| *model == system_model_id(MODEL_COLLECTION_ID).unwrap()));
-
-    let credentials = Vec::<Credential>::new();
-    let policy = ContextPolicy::from_credentials(&agent, &credentials);
-    assert_eq!(agent.retrieval_predicate(&credentials)?, ankql::ast::Predicate::False, "the agent grants no credentialless private reads");
-    assert!(policy.check_read(&private_id, &private.payload.state).is_err());
+    }).await?;
+    let feedback = agent.feedback.lock().unwrap();
     assert!(
-        policy.check_read(&catalog_id, &catalog.payload.state).is_ok(),
-        "the added identity-read check must preserve catalog bootstrap"
+        feedback.iter().any(|(_, request)| matches!(&request.body,
+        proto::NodeRequestBody::ContinueState { comparison: found, answers, .. } if *found == comparison && answers.iter().any(|answer|
+            matches!(answer, proto::StateAnswer::NeedRepair { entity_id, target } if *entity_id == id && *target == captured_target)))),
+        "the uncovered initial snapshot must actually request connecting history"
     );
-    // The NeedHeads catalog-membership guard remains independently required:
-    // this proves check_read's credentialless contract, not a wire companion.
+    for (credentials, request) in feedback.iter().filter(|(_, request)| matches!(request.body,
+        proto::NodeRequestBody::ContinueState { comparison: found, .. } | proto::NodeRequestBody::CloseComparison { comparison: found, .. } if found == comparison)) {
+        assert_eq!(*credentials, [Credential(1)], "initial repair and Applied must retain alpha authority despite the beta standing query: {request:?}");
+    }
+    assert!(agent.subscriptions.lock().unwrap().iter().any(|(credential, query, _)| credential.0 == 2 && *query == broader.query_id()));
     Ok(())
 }

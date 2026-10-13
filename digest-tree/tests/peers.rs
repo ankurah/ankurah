@@ -6,8 +6,8 @@ use std::ops::Bound::{Excluded, Included};
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
 use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
 use ankurah_digest_tree::{
-    leaf_address, AddressRange, CanonicalCodec, DigestGroup, DigestTree, HeadHash, KeyCodec, LeafChange, LeafData, LtHash16, Ristretto255,
-    TreeHead, TreeMatch, TreeRequest, TreeSpec, TreeTransaction,
+    leaf_address, AddressRange, CanonicalCodec, DigestGroup, DigestTree, HeadHash, LeafChange, LeafData, LtHash16, Ristretto255, TreeHead,
+    TreeMatch, TreeRequest, TreeSpec, TreeTransaction,
 };
 
 fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([1; 32])) }
@@ -34,7 +34,7 @@ async fn rows<G: DigestGroup>(tx: &mut TreeTransaction<G>, range: &AddressRange)
     let mut result = BTreeMap::new();
     let mut cursor = None;
     loop {
-        let page = tx.page(&scope, &CanonicalCodec, cursor.as_ref(), 17).await.unwrap();
+        let page = tx.page(&scope, cursor.as_ref(), 17).await.unwrap();
         for row in page.leaves {
             let leaf = LeafData { key: row.key, entity_id: row.entity_id, head: row.head };
             result.insert(address(&leaf), leaf);
@@ -175,16 +175,16 @@ async fn underfilled_limits_keep_the_range_needed_to_acquire_members() {
             let opener = build::<Ristretto255>((0..initial).map(|n| leaf(n, 0))).await;
             let responder = build::<Ristretto255>((-10..15).map(|n| leaf(n, 0))).await;
             let request = limited_request(direction.clone(), 10);
-            let ranges = opener.begin().scope(&request, &CanonicalCodec).await.unwrap().ranges().to_vec();
+            let ranges = opener.begin().scope(&request).await.unwrap().ranges().to_vec();
             assert!(!ranges.is_empty());
             reconcile(&opener, &responder, &ranges).await;
             let mut a = opener.begin();
             let mut b = responder.begin();
-            let sa = a.scope(&request, &CanonicalCodec).await.unwrap();
-            let sb = b.scope(&request, &CanonicalCodec).await.unwrap();
+            let sa = a.scope(&request).await.unwrap();
+            let sb = b.scope(&request).await.unwrap();
             assert_eq!(a.count(&sa).await.unwrap(), 10);
             assert_eq!(a.digest(&sa).await.unwrap(), b.digest(&sb).await.unwrap());
-            assert!(a.scope(&limited_request(direction.clone(), 0), &CanonicalCodec).await.unwrap().ranges().is_empty());
+            assert!(a.scope(&limited_request(direction.clone(), 0)).await.unwrap().ranges().is_empty());
         }
     }
 }
@@ -228,8 +228,8 @@ async fn peers_with_different_admissions_compare_a_proven_common_selection() {
     let request = TreeRequest::for_selection(&selection(10), &types).unwrap();
     assert_eq!(broad.spec().serves(&request), Some(TreeMatch::Span));
     assert_eq!(narrow.spec().serves(&request), Some(TreeMatch::Whole));
-    let ranges = broad.begin().scope(&request, &CanonicalCodec).await.unwrap().ranges().to_vec();
-    let narrow_ranges = narrow.begin().scope(&request, &CanonicalCodec).await.unwrap().ranges().to_vec();
+    let ranges = broad.begin().scope(&request).await.unwrap().ranges().to_vec();
+    let narrow_ranges = narrow.begin().scope(&request).await.unwrap().ranges().to_vec();
     // A whole-tree scope omits constraints already enforced by admission.
     // Sending its raw bounds to the broader peer would admit keys 8..=10.
     assert!(narrow_ranges.iter().any(|range| range.contains(&address(&leaf(8, 0)))));
@@ -241,8 +241,8 @@ async fn peers_with_different_admissions_compare_a_proven_common_selection() {
     for n in 8..=10 {
         assert!(tx.leaf(&key(n), leaf(n, 0).entity_id).await.unwrap().is_some());
     }
-    let sa = tx.scope(&request, &CanonicalCodec).await.unwrap();
+    let sa = tx.scope(&request).await.unwrap();
     let mut other = narrow.begin();
-    let sb = other.scope(&request, &CanonicalCodec).await.unwrap();
+    let sb = other.scope(&request).await.unwrap();
     assert_eq!(tx.digest(&sa).await.unwrap(), other.digest(&sb).await.unwrap());
 }

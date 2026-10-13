@@ -1,8 +1,12 @@
 # Cold and retained-query performance
 
 `live_query_startup` exercises two real nodes, Sled, two Tokio workers and
-serialized protocol messages. Identical source runs on the pre-digest public API
-at main `ebdb1727254c675a4d37236ecf23c16c06c4df12` and the candidate.
+serialized protocol messages. The current qualification compares identical public-API
+fixtures against main `ae8962798085dbf6d717429e4b6566940f0051e1`, after PR #526.
+The earlier `ebdb1727254c675a4d37236ecf23c16c06c4df12` comparison remains
+historical in `LIVE_QUERY_STARTUP_RESULTS_PRE_526.md`; its source pins and
+measurements have not been relabelled. See `LIVE_QUERY_STARTUP_RESULTS.md`
+for the measured candidate and immutable artifact pins.
 
 ```sh
 STARTUP_LABEL=candidate cargo bench -p ankurah-tests --bench live_query_startup
@@ -97,7 +101,13 @@ A 180-second fixture timeout fails rather than producing an incomplete success.
 
 Build both with the same compiler and optimized profile and verify shared package
 versions match. Keep the original lockfiles and document additional dependencies.
-Copy only this benchmark source and its target declaration into the baseline.
+For the native baseline overlay, copy `tests/benches/live_query_startup.rs`
+and the identical `compare_live_query_startup.py` runner. Add the
+`[[bench]]` target `name = "live_query_startup"`, `harness = false`, and
+`libc = "0.2"` under `tests/Cargo.toml` dev-dependencies. The validated
+baseline already has the other fixture dependencies; no production source
+is changed. The runner reads the sibling Rust source for its metadata hash,
+so keep the two files together.
 Use separate production-only Cargo targets for baseline, candidate and wasm;
 never share them with private instrumentation. Preserve each executable/package,
 check source hashes before and after builds, and scan artifacts for private
@@ -113,7 +123,10 @@ python3 tests/benches/compare_live_query_startup.py \
   --output /absolute/path/to/new-results-directory
 ```
 
-The runner uses a fresh process per fixture, alternates AB/BA order, refuses to
+The Python runner uses Unix `wait4` and process groups; its process-resource
+collection supports macOS and Linux. The Rust fixture can report null phase
+CPU on other hosts, but the Python resource runner needs a separate adapter there.
+It uses a fresh process per fixture, alternates AB/BA order, refuses to
 overwrite evidence, and saves every failure with its last phase and raw output.
 The default external deadline is 240 seconds. Whole-process child CPU, peak RSS
 and page faults cover setup, prefetch, warmup, transfer, verification and teardown;
@@ -154,8 +167,25 @@ bounds; those need separate evidence.
 
 `tests-wasm/bindings/src/query_parity.rs` and `src/query-parity.test.ts` use
 the same public-API operations against two IndexedDB nodes with serialized
-messages, directional bandwidth lanes and `performance.now`. Copy the module,
-its declaration, serde_json dependency and test identically into the baseline.
+messages, directional bandwidth lanes and `performance.now`. The fixture model
+uses the default numeric LWW position and YrsString body; it is not a pure-LWW
+application benchmark. For the browser baseline overlay, copy
+`tests-wasm/bindings/src/query_parity.rs` and `tests-wasm/src/query-parity.test.ts`,
+and add `mod query_parity;` to the bindings `src/lib.rs`. Add these bindings
+dependencies exactly as in the validated overlay: `serde_json = "1"`,
+`async-trait = "0.1"`, `bincode = "1.3"`, `anyhow = "1.0"`, and
+`gloo-timers = { version = "0.3", features = ["futures"] }`. Keep existing
+wasm dependencies and `web-sys` console support. These are test instrument
+changes, not a backport of digest production code.
+
+The combined validated overlay changes eight files: the two manifests,
+`Cargo.lock`, native fixture and runner, bindings module and declaration, and
+the TypeScript fixture. Original dependency versions remain unchanged; only
+the test packages' dependency edges are added to the effective lockfile. The
+pristine source hashes, exact changed-file hashes and isolated target identities
+are recorded in the current evidence ledger's `baseline-overlay-manifest.json`.
+Keep that original/effective lockfile proof with any future historical adapter.
+
 Build both wasm artifacts with the same release profile and wasm-pack version.
 The default Vitest matrix is functional smoke coverage, not performance evidence.
 Configure `VITE_QUERY_PARITY_SIZES`, `RTTS`, `BPS`, `MODES`, `CACHE`, `REPEATS`

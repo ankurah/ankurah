@@ -8,7 +8,7 @@ use crate::util::ready_chunks::ReadyChunks;
 use crate::util::Iterable;
 use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Applies entity deltas received from a peer, whether they arrive as initial
 /// transfer (Fetch, QuerySubscribed, repair) or as live subscription updates.
@@ -57,14 +57,14 @@ pub(crate) struct DeltaOutcome {
 #[derive(Debug, Default)]
 pub(crate) struct AppliedDeltas {
     heads: HashMap<proto::EntityId, proto::Clock>,
-    divergences: Vec<Divergence>,
+    divergent: HashSet<proto::EntityId>,
 }
 
 impl AppliedDeltas {
     /// The committed head observed while collecting a successful outcome.
     pub(crate) fn observed_head(&self, entity_id: &proto::EntityId) -> Option<proto::Clock> { self.heads.get(entity_id).cloned() }
 
-    pub(crate) fn diverged(&self, entity_id: &proto::EntityId) -> bool { self.divergences.iter().any(|gap| &gap.entity_id == entity_id) }
+    pub(crate) fn diverged(&self, entity_id: &proto::EntityId) -> bool { self.divergent.contains(entity_id) }
 }
 
 impl DeltaOutcome {
@@ -203,7 +203,9 @@ impl NodeApplier {
                 match result {
                     Ok(outcome) => {
                         batch.extend(outcome.change);
-                        applied.divergences.extend(outcome.divergence);
+                        if let Some(divergence) = outcome.divergence {
+                            applied.divergent.insert(divergence.entity_id);
+                        }
                         if let Some(entity) = outcome.entity {
                             applied.heads.insert(entity_id, entity.head());
                         }
@@ -283,7 +285,7 @@ impl NodeApplier {
         }
         // Wire order is untrusted for every multi-event shape: a child applied
         // before its staged parent gap-jumps the head and drops the parent's
-        // operations (V4). The producer also sorts; receivers must not rely on it.
+        // operations. The producer also sorts; receivers must not rely on it.
         crate::event_dag::ordering::topo_sort_events(attested_events)
     }
 

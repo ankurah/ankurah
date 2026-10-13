@@ -245,7 +245,7 @@ mod tests {
         }
         assert_eq!(bincode::serialize(&page).unwrap(), expected);
         for (tag, encoded) in [
-            (2u32, bincode::serialize(&StateItem::Leaves(page.clone())).unwrap()),
+            (1u32, bincode::serialize(&StateItem::Leaves(page.clone())).unwrap()),
             (1, bincode::serialize(&StateAnswer::Leaves(page)).unwrap()),
         ] {
             assert_eq!(encoded, [tag.to_le_bytes().as_slice(), &expected].concat());

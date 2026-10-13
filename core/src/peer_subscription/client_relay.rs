@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, warn};
 
 use crate::error::{NodeDropped, RequestError, RetrievalError};
-use crate::node::ContextData;
+use crate::node::{state_sync, ContextData};
 use crate::session::SessionSet;
 use crate::util::cancel_flag::CancelFlag;
 use crate::util::safeset::SafeSet;
@@ -666,13 +666,13 @@ where
         if canceled() {
             return Err(RequestError::ConnectionLost.into());
         }
-        let (mut stream, response) = node
-            .request_state(
-                peer_id,
-                &context_data,
-                proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_state },
-            )
-            .await?;
+        let (mut stream, response) = state_sync::request_state(
+            &node,
+            peer_id,
+            &context_data,
+            proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_state },
+        )
+        .await?;
         let state = match response {
             proto::NodeResponseBody::QuerySubscribed { query_id: response_query, state } if response_query == query_id => state,
             proto::NodeResponseBody::ComparisonUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
@@ -690,22 +690,22 @@ where
             let comparison = state.frame.comparison;
             crate::task::spawn(async move {
                 if let Some(node) = weak.upgrade() {
-                    let _ = node.abandon_current_state(peer_id, comparison, &credentials, &stream).await;
+                    let _ = state_sync::abandon_current_state(&node, peer_id, comparison, &credentials, &stream).await;
                 }
             });
             return Err(RequestError::ConnectionLost.into());
         }
-        let remote = node
-            .receive_state(
-                peer_id,
-                &context_data,
-                snapshot,
-                state,
-                crate::schema::is_catalog_read(&selection.predicate),
-                Some((query_id, version)),
-                stream,
-            )
-            .await?;
+        let remote = state_sync::receive_state(
+            &node,
+            peer_id,
+            &context_data,
+            snapshot,
+            state,
+            crate::schema::is_catalog_read(&selection.predicate),
+            Some((query_id, version)),
+            stream,
+        )
+        .await?;
         let activated: Result<bool, RetrievalError> = async {
             let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
             let event_getter = crate::retrieval::LocalEventGetter::new(node.storage.clone(), node.durable);
@@ -722,9 +722,9 @@ where
         }
         .await;
         if matches!(activated, Ok(true)) {
-            node.finish_state(peer_id, context_data, remote, Some((query_id, version)));
+            state_sync::finish_state(&node, peer_id, context_data, remote, Some((query_id, version)));
         } else {
-            let _ = node.abandon_current_state(peer_id, remote.comparison, &context_data, &remote.stream).await;
+            let _ = state_sync::abandon_current_state(&node, peer_id, remote.comparison, &context_data, &remote.stream).await;
             activated?;
             return Err(RequestError::ConnectionLost.into());
         }

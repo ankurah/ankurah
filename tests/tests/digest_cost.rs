@@ -13,7 +13,7 @@ use ankurah_storage_sled::SledStorageEngine;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -82,11 +82,9 @@ struct Traffic {
     leaves: usize,
     repairs: usize,
     snapshots: usize,
-    equal: usize,
     completed: usize,
     summaries: usize,
     leaf_questions: usize,
-    clock_questions: usize,
     max_reply_items: usize,
     max_reply_item_bytes: usize,
     elapsed_ms: u128,
@@ -95,7 +93,6 @@ struct Traffic {
 struct Meter {
     model: Option<proto::ModelId>,
     requests: HashSet<proto::RequestId>,
-    closes: HashMap<proto::RequestId, proto::ComparisonId>,
     comparisons: HashSet<proto::ComparisonId>,
     updates: HashSet<proto::UpdateId>,
     traffic: Traffic,
@@ -117,10 +114,8 @@ impl Meter {
                     _ => false,
                 };
                 if include {
-                    if let proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied { .. } } =
-                        &request.body
+                    if let proto::NodeRequestBody::CloseComparison { outcome: proto::ComparisonOutcome::Applied { .. }, .. } = &request.body
                     {
-                        self.closes.insert(request.id.clone(), *comparison);
                         self.traffic.completed += 1;
                     }
                     self.requests.insert(request.id.clone());
@@ -171,10 +166,8 @@ impl Meter {
                     proto::StateItem::Leaves(page) => self.traffic.leaves += page.leaves.len(),
                     proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
                     proto::StateItem::Snapshots(page) => self.traffic.snapshots += page.states.len(),
-                    proto::StateItem::Equal(_) => self.traffic.equal += 1,
                     proto::StateItem::Summary(_) => self.traffic.summaries += 1,
                     proto::StateItem::NeedLeaves(_) => self.traffic.leaf_questions += 1,
-                    proto::StateItem::NeedHeads(ids) => self.traffic.clock_questions += ids.len(),
                     _ => {}
                 }
             }
@@ -297,17 +290,12 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let cold = record("fetch_cold", n, &server, &client, &meter);
         assert_eq!((cold.snapshots, cold.repairs, cold.leaves), (n, 0, 0));
-        assert_eq!((cold.summaries, cold.leaf_questions, cold.clock_questions), (0, 0, 0));
+        assert_eq!((cold.summaries, cold.leaf_questions), (0, 0));
         // Require roughly 96 small rows per exchange, with six exchanges of
         // startup/tail slack. This is a regression target, not a protocol limit.
         assert!(cold.requests <= n.div_ceil(96) + 6, "cold transfer takes too many exchanges: {cold:?}");
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let equal = record("fetch_equal", n, &server, &client, &meter);
-        if n <= 2048 {
-            assert_eq!(equal.equal, 0, "complete initial inventories omit equality echoes");
-        } else {
-            assert!(equal.equal > 0, "Summary comparison still reports equality");
-        }
         assert_eq!((equal.leaves, equal.repairs, equal.snapshots), (0, 0, 0));
         let trx = writer.begin();
         rows[n / 2].edit(&trx)?.value()?.set(&"changed".into())?;
@@ -317,12 +305,8 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         let sparse = record("fetch_sparse", n, &server, &client, &meter);
         assert_eq!(sparse.repairs, 1);
         assert!(sparse.response_bytes < cold.response_bytes / 2);
-        // Allow variation from random entity IDs, but reject walking every
-        // terminal bucket before comparing the intermediate branch summaries.
-        assert!(sparse.equal < 64);
-        if n <= 2048 {
-            assert_eq!(sparse.equal, 0, "unchanged initial pages need no output alongside the repair");
-        }
+        // The actual wire budget rejects walking every terminal bucket
+        // before comparing the intermediate branch summaries.
         assert!(sparse.request_bytes + sparse.response_bytes < 32_768);
         let query = reader.query_wait::<CostRowView>("true").await?;
         query.wait_durable_answered().await?;
@@ -337,13 +321,8 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         })
         .await?;
         let equal = record("reconnect_equal", n, &server, &client, &meter);
-        if n <= 2048 {
-            assert_eq!(equal.equal, 0, "complete initial inventories omit equality echoes");
-        } else {
-            assert!(equal.equal > 0, "Summary comparison still reports equality");
-        }
         assert_eq!((equal.leaves, equal.repairs, equal.snapshots), (0, 0, 0));
-        assert_eq!((equal.summaries, equal.leaf_questions, equal.clock_questions), (0, 0, 0));
+        assert_eq!((equal.summaries, equal.leaf_questions), (0, 0));
         disconnect(&server, &client, &meter);
         let trx = writer.begin();
         rows[n / 2].edit(&trx)?.value()?.set(&"offline-edit".into())?;
@@ -358,10 +337,6 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         .await?;
         let sparse = record("reconnect_sparse", n, &server, &client, &meter);
         assert_eq!(sparse.repairs, 1);
-        assert!(sparse.equal < 64);
-        if n <= 2048 {
-            assert_eq!(sparse.equal, 0, "unchanged initial pages need no output alongside the repair");
-        }
         assert!(sparse.request_bytes + sparse.response_bytes < 32_768);
         assert_eq!(query.ids().len(), n);
         drop(query);
