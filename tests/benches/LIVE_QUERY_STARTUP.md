@@ -48,7 +48,9 @@ in implementation/work counters. The other warm cases disconnect/reconnect.
 another. Reconnection, including registration and catalog work it triggers, is
 timed. The baseline's durable-answer flag is sticky across reconnect, so the
 portable warm landmark requires a new QuerySubscribed to finish application and
-all transport tasks to drain. Reconnect `ready_us` is null. Its `elapsed_us` ends after exact membership
+all transport tasks to drain. The handled subscription counter is gated on the
+retained query ID, so a fresh catalog subscription cannot satisfy it. Reconnect
+`ready_us` is null. Its `elapsed_us` ends after exact membership
 and complete applied State verification, including the clock. `verification_us`
 reports that common O(N) check separately, and `transport_settled_us` records
 the earlier drained-link landmark. The verification-inclusive ratio can mask a

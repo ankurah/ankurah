@@ -9,7 +9,7 @@ use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -80,6 +80,7 @@ struct Meter {
     generation: usize,
     pending: usize,
     subscriptions_applied: usize,
+    query_subscriptions_applied: HashMap<proto::QueryId, usize>,
     last_activity: Option<Instant>,
     uplink_free: Option<Instant>,
     downlink_free: Option<Instant>,
@@ -147,15 +148,21 @@ impl PeerSender for Sender {
             };
             if current {
                 let message = bincode::deserialize(&bytes).expect("decode node message");
-                let subscribed = matches!(&message, proto::NodeMessage::Response(response)
-                    if matches!(response.body, proto::NodeResponseBody::QuerySubscribed { .. }));
+                let subscribed = match &message {
+                    proto::NodeMessage::Response(response) => match &response.body {
+                        proto::NodeResponseBody::QuerySubscribed { query_id, .. } => Some(*query_id),
+                        _ => None,
+                    },
+                    _ => None,
+                };
                 let result = node.handle_message(message).await;
                 let mut meter = meter.lock().unwrap();
                 if meter.connected && meter.generation == generation {
                     if let Err(error) = result {
                         meter.errors.push(error.to_string());
-                    } else if subscribed {
+                    } else if let Some(query_id) = subscribed {
                         meter.subscriptions_applied += 1;
+                        *meter.query_subscriptions_applied.entry(query_id).or_default() += 1;
                     }
                 }
             }
@@ -291,17 +298,17 @@ async fn sample(
         },
         "prefetch coverage"
     );
-    settle(&meter, 0).await?;
+    settle(&meter, 0, None).await?;
     let retained_query = if mode == "cold" {
         None
     } else {
         phase("warm-tree-initialize");
         let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
         query.wait_durable_answered().await?;
-        settle(&meter, 1).await?;
+        settle(&meter, 1, None).await?;
         if mode != "warm_refresh" {
             disconnect(&server, &client, &meter);
-            settle(&meter, 0).await?;
+            settle(&meter, 0, None).await?;
         }
         if mode == "warm_edit" || mode == "warm_membership" {
             let trx = writer.begin();
@@ -316,13 +323,16 @@ async fn sample(
         }
         Some(query)
     };
-    let subscriptions_before = {
+    let retained_query_id = retained_query.as_ref().map(|query| query.query_id());
+    let (subscriptions_before, query_subscriptions_before) = {
         let mut meter = meter.lock().unwrap();
         anyhow::ensure!(meter.errors.is_empty(), "setup peer errors: {:?}", meter.errors);
         meter.traffic = Traffic::default();
         meter.measuring = true;
-        meter.subscriptions_applied
+        let query_count = retained_query_id.map(|id| meter.query_subscriptions_applied.get(&id).copied().unwrap_or(0));
+        (meter.subscriptions_applied, query_count)
     };
+    let required_query_subscription = retained_query_id.zip(query_subscriptions_before).map(|(id, count)| (id, count + 1));
     phase("measure");
     let start = Instant::now();
     let (query, ready_us) = if let Some(query) = retained_query {
@@ -341,7 +351,7 @@ async fn sample(
         let ready_us = start.elapsed().as_micros();
         (query, Some(ready_us))
     };
-    let settled = settle(&meter, subscriptions_before + 1).await?;
+    let settled = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
     let initial_drained_us = settled.duration_since(start).as_micros();
     let settled_traffic = meter.lock().unwrap().traffic.clone();
     phase("verify-applied");
@@ -371,7 +381,7 @@ async fn sample(
     let verification_us = verification_start.elapsed().as_micros();
     let verified_us = start.elapsed().as_micros();
     let elapsed_us = ready_us.unwrap_or(verified_us);
-    let final_settled = settle(&meter, subscriptions_before + 1).await?;
+    let final_settled = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
     let transport_settled_us = final_settled.duration_since(start).as_micros();
     let settled_us = transport_settled_us.max(ready_us.unwrap_or(verified_us));
 
@@ -413,13 +423,19 @@ fn disconnect(server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) {
 /// Public durable-answer flags are sticky on the old baseline across reconnect.
 /// A new QuerySubscribed application plus a drained link is the portable fully
 /// settled landmark. The 2 ms confirmation is excluded from the recorded time.
-async fn settle(meter: &Arc<Mutex<Meter>>, subscriptions: usize) -> anyhow::Result<Instant> {
+async fn settle(
+    meter: &Arc<Mutex<Meter>>,
+    subscriptions: usize,
+    query_subscription: Option<(proto::QueryId, usize)>,
+) -> anyhow::Result<Instant> {
     let quiet_begin = Instant::now();
     loop {
         {
             let meter = meter.lock().unwrap();
             anyhow::ensure!(meter.errors.is_empty(), "peer errors: {:?}", meter.errors);
-            if meter.pending == 0 && meter.subscriptions_applied >= subscriptions {
+            let query_handled =
+                query_subscription.is_none_or(|(id, count)| meter.query_subscriptions_applied.get(&id).copied().unwrap_or(0) >= count);
+            if meter.pending == 0 && meter.subscriptions_applied >= subscriptions && query_handled {
                 let last = meter.last_activity.unwrap_or_else(Instant::now);
                 if last.max(quiet_begin).elapsed() >= Duration::from_millis(2) {
                     return Ok(last);
