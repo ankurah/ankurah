@@ -196,17 +196,14 @@ async fn write(engine: &impl StorageEngine, byte: u8, models: &[ModelId], values
     for (property, value) in values {
         backend.set(*property, Some(Value::String((*value).into())));
     }
-    let event = EventId::from_bytes([byte.wrapping_add(values.len() as u8); 32]);
-    if let Some(operations) = backend.to_operations()? {
-        backend.apply_operations_with_event(&operations, event.clone())?;
-    }
+    let event = ankurah_core::test_helpers::commit_backend(&backend, byte.wrapping_add(values.len() as u8))?;
     let state = Attested::opt(
         EntityState {
             entity_id: id(byte),
             state: State {
                 state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
                 memberships: models.iter().copied().collect(),
-                head: Clock::genesis(event),
+                head: Clock::singleton(&event),
             },
         },
         None,

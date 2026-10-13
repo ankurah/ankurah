@@ -80,8 +80,12 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 #[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 [dev-dependencies]
-wasm-bindgen-test  = "0.3"
-ankurah            = { path = "../../ankurah", features = ["derive", "wasm"], version = "=0.10.0" }
+wasm-bindgen-test = "0.3"
+ankurah = { path = "../../ankurah", features = [
+    "derive",
+    "wasm",
+    "test-helpers",
+], version = "=0.10.0" }
 tracing-subscriber = "0.3"
 
     [package.metadata.wasm-pack.profile.dev.wasm-bindgen]

@@ -54,15 +54,15 @@ An LWW property value moves through three states:
 |-------|---------|
 | **Uncommitted** | User called `set()` inside a transaction; change has not been collected yet |
 | **Pending** | `to_operations()` collected the change; awaiting commit |
-| **Committed** | Applied from a committed event; an `EventId` records which event wrote it |
+| **Committed** | Applied from a committed event; a generation and `EventId` record which event wrote it |
 
-Only **Committed** entries carry an `EventId`. The backend refuses to serialize
+Only **Committed** entries carry a write rank (generation, `EventId`). The backend refuses to serialize
 its state if any entry is still Uncommitted or Pending -- this prevents
 persisting incomplete state.
 
 Serialized LWW state buffers begin with a one-byte version header. The current
-identity-keyed format is version 2 (`0xA2`) and stores durable `PropertyId`
-keys. The decoder deliberately accepts only that version: unversioned,
+format is version 2 (`0xA2`) and stores durable `PropertyId` keys with each
+value's writing generation and event ID. The decoder deliberately accepts only that version: unversioned,
 name-keyed legacy buffers and unknown future versions are refused rather than
 guessed at or lazily rewritten. A store created by an incompatible protocol
 must be reset or migrated explicitly before this binary opens it.
@@ -76,38 +76,34 @@ must choose a single winning value per property. The full algorithm is described
 [LWW Resolution Rules](lww-merge.md#resolution-rules); the conceptual
 steps are:
 
-1. **Seed winners from stored state.** Every existing Committed value becomes a
-   candidate. If its `EventId` is absent from the
-   [accumulated DAG](event-dag.md#key-concepts), the value is flagged
-   **older than meet**.
+1. **Look up touched properties.** Only properties named by layer operations
+   compete. Their stored ranks are consulted on demand; unrelated values are
+   neither scanned nor cloned.
 
-2. **Process layer events.** Each event in the layer may write to the same
-   property. The new candidate is compared against the current winner:
-   - If the current winner is *older than meet*, the new candidate wins
-     unconditionally.
-   - Otherwise, causal ordering decides: a causally newer event replaces an
-     older one.
-   - For **concurrent** events (no causal relationship), the tie is broken by
-     lexicographic `EventId` comparison.
+2. **Process layer events.** Compare each candidate's (generation, event ID)
+   against the stored winner's rank. The greater rank wins, so ordinary
+   resolution needs no ancestry lookup. If both generations are `u32::MAX`,
+   preserve causal overwrite using the layer's complete ancestry, breaking
+   concurrent ties by event ID. This fallback retains the old delivery-order
+   limitation at saturation.
 
 3. **Apply only new winners.** Winners from events not yet in the entity's
    state are written as Committed entries; winners from already-applied events
    need no mutation. Changed properties notify signal subscribers.
 
-### The "older than meet" rule
+### Stored ranks outlive the accumulated DAG
 
-When the stored value's `EventId` is not in the accumulated DAG, it was
-written by an event that predates the [meet point](event-dag.md#key-concepts).
-Any layer candidate is guaranteed to be at least as recent as the meet, so it
-wins unconditionally. This avoids expensive ancestry traversals to events
-outside the DAG.
+A stored writer need not occur in the current merge's accumulated DAG. Its
+persisted rank still lets ordinary generations compete without retrieving
+that event. At saturation, the existing causal fallback requires full history;
+it cannot use absence from a pruned DAG as evidence that a write is older.
 
 ### Why lexicographic EventId comparison is safe
 
 `EventId` is a SHA-256 hash of `(entity_id, operations, parent_clock)`. The
 ordering of hashes has no relationship to wall-clock time, but it provides a
-**deterministic total order**: every replica comparing the same pair of
-concurrent events will pick the same winner. That is all convergence requires.
+**deterministic total order**. Used after generation, it gives one maximum
+over all writes before saturation, regardless of their delivery order.
 See [Determinism](lww-merge.md#determinism) for the formal argument.
 
 
@@ -168,12 +164,13 @@ returns `PropertyError::TransactionClosed`.
 ## End-to-End Merge Flow
 
 1. A remote event arrives and is [staged](event-dag.md#the-staging-pattern).
-   [`Entity::apply_event`](entity-lifecycle.md#how-events-are-applied) calls
+   [`EntityState::apply_events`](entity-lifecycle.md#how-events-are-applied) calls
    [`compare()`](event-dag.md#comparing-two-clocks), which returns
-   `DivergedSince`.
-2. The [`EventAccumulator`](event-dag.md#key-concepts) produces
+   `StrictDescends` or `DivergedSince`.
+2. The comparison result produces
    [`EventLayers`](event-dag.md#event-layers) -- topologically ordered batches
-   of events from the meet point forward.
+   of events from the meet point forward. For `StrictDescends`, the meet is
+   the compared head. Callers cannot substitute a different head.
 3. Each layer is applied to every backend: LWW
    [resolves per-property winners](lww-merge.md#resolution-rules); Yrs
    applies CRDT updates.

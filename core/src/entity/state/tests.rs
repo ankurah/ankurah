@@ -1,5 +1,5 @@
 use super::*;
-use ankurah_proto::{AuthorId, EventStructureError};
+use ankurah_proto::{AuthorId, EventId, EventStructureError};
 use std::sync::Mutex;
 
 /// Serves the staged event and records attempts to read any other history.
@@ -50,7 +50,7 @@ async fn an_update_checks_each_parent_without_reading_its_event() -> anyhow::Res
         );
         assert_eq!(update.generation(), 4);
         let getter = IncomingOnlyGetter::new(&update);
-        let error = state.apply_event(&getter, &update).await.unwrap_err();
+        let error = state.apply_events(&getter, &[&update]).await.unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -64,7 +64,7 @@ async fn an_update_checks_each_parent_without_reading_its_event() -> anyhow::Res
     }
 
     let honest = Event::update(genesis.entity_id, head, AuthorId::Unknown, OperationSet::default());
-    assert!(state.apply_event(&IncomingOnlyGetter::new(&honest), &honest).await?);
+    assert_eq!(state.apply_events(&IncomingOnlyGetter::new(&honest), &[&honest]).await?, vec![true]);
     Ok(())
 }
 
@@ -154,12 +154,12 @@ async fn an_update_claiming_more_than_one_above_the_head_is_refused_before_any_r
 
     let served = ServedGetter::of(&[&genesis, &tip, &forged, &concurrent]);
     let state = EntityState::empty();
-    assert!(state.apply_event(&served, &genesis).await?);
-    assert!(state.apply_event(&served, &tip).await?);
+    assert_eq!(state.apply_events(&served, &[&genesis]).await?, vec![true]);
+    assert_eq!(state.apply_events(&served, &[&tip]).await?, vec![true]);
     assert_eq!(state.head(), Clock::singleton(&tip));
 
     served.asked.lock().unwrap().clear();
-    let error = state.apply_event(&served, &forged).await.unwrap_err();
+    let error = state.apply_events(&served, &[&forged]).await.unwrap_err();
     assert!(
         matches!(
             &error,
@@ -171,7 +171,7 @@ async fn an_update_claiming_more_than_one_above_the_head_is_refused_before_any_r
     assert!(served.asked.lock().unwrap().is_empty(), "the bound reads nothing");
     assert_eq!(state.head(), Clock::singleton(&tip));
 
-    assert!(state.apply_event(&served, &concurrent).await?);
+    assert_eq!(state.apply_events(&served, &[&concurrent]).await?, vec![true]);
     assert_eq!(state.head(), Clock::from_events([&tip, &concurrent]));
     Ok(())
 }
@@ -188,14 +188,48 @@ async fn an_update_above_a_lagging_head_is_refused_until_its_chain_is_applied() 
 
     let served = ServedGetter::of(&[&genesis, &first, &second, &third]);
     let state = EntityState::empty();
-    assert!(state.apply_event(&served, &genesis).await?);
-    let error = state.apply_event(&served, &third).await.unwrap_err();
+    assert_eq!(state.apply_events(&served, &[&genesis]).await?, vec![true]);
+    let error = state.apply_events(&served, &[&third]).await.unwrap_err();
     assert!(matches!(&error, MutationError::LineageError(LineageError::BeyondHead { claimed: 4, head: 1, .. })), "{error}");
     assert_eq!(state.head(), Clock::singleton(&genesis));
 
     for event in [&first, &second, &third] {
-        assert!(state.apply_event(&served, event).await?);
+        assert_eq!(state.apply_events(&served, &[event]).await?, vec![true]);
     }
     assert_eq!(state.head(), Clock::singleton(&third));
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_layer_application_advances_head_only_after_success() -> anyhow::Result<()> {
+    // G -> A -> B -> C; G -> X -> Y. Start at [A, Y], then apply B and C together.
+    let g = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+    let a = Event::update(g.entity_id, Clock::singleton(&g), AuthorId::Unknown, OperationSet::default());
+    let b = Event::update(g.entity_id, Clock::singleton(&a), AuthorId::Unknown, OperationSet::default());
+    let c = Event::update(g.entity_id, Clock::singleton(&b), AuthorId::Unknown, OperationSet::default());
+    let x = Event::update(g.entity_id, Clock::singleton(&g), AuthorId::Unknown, OperationSet::default());
+    let y = Event::update(g.entity_id, Clock::singleton(&x), AuthorId::Unknown, OperationSet::default());
+    let invalid = Event::update(
+        g.entity_id,
+        Clock::singleton(&b),
+        AuthorId::Unknown,
+        OperationSet::from_backends(BTreeMap::from([("missing".into(), vec![ankurah_proto::BackendOperation { diff: vec![] }])])),
+    );
+    let served = ServedGetter::of(&[&g, &a, &b, &c, &x, &y, &invalid]);
+    let state = EntityState::empty();
+    for event in [&g, &a, &x, &y] {
+        assert_eq!(state.apply_events(&served, &[event]).await?, vec![true]);
+    }
+    assert_eq!(state.head(), Clock::from_events([&a, &y]));
+
+    // Failure in the layer after B must not publish an intermediate [B, Y] head.
+    assert!(matches!(
+        state.apply_events(&served, &[&invalid]).await,
+        Err(MutationError::RetrievalError(RetrievalError::InvalidState(message))) if message == "unknown backend: missing"
+    ));
+    assert_eq!(state.head(), Clock::from_events([&a, &y]));
+
+    assert_eq!(state.apply_events(&served, &[&c]).await?, vec![true]);
+    assert_eq!(state.head(), Clock::from_events([&c, &y]));
     Ok(())
 }

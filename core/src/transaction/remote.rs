@@ -73,7 +73,11 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let mut event = event.clone();
         let before = &self.entities.entries[&entity.id()].before;
         let after = entity.read();
-        entity.apply_event(&self.event_getter, &mut event, |event| self.policy.check_write_event(self.node, before, &after, event)).await?;
+        entity
+            .apply_events(&self.event_getter, std::slice::from_mut(&mut event), |event| {
+                self.policy.check_write_event(self.node, before, &after, event)
+            })
+            .await?;
         self.storage.add_events(std::slice::from_ref(&event)).await?;
         let state = EntityState { entity_id: entity.id(), state: entity.to_state()? };
         let attestation = self.policy.attest_state(self.node, &state);

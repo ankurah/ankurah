@@ -287,10 +287,7 @@ fn post_state(post: Post) -> proto::State {
     let backend = LWWBackend::new();
     backend.set(prop("author"), Some(Value::String(post.author.to_string())));
     backend.set(prop("title"), Some(Value::String(post.title.to_string())));
-    let operations = backend.to_operations().expect("LWW diff must serialize").expect("both properties were just set");
-    // A state buffer carries only values an event committed, so the writes are
-    // handed the identity of a synthetic one.
-    backend.apply_operations_with_event(&operations, proto::EventId::from_bytes([1u8; 32])).expect("LWW diff must apply");
+    ankurah_core::test_helpers::commit_backend(&backend, 1).expect("fixture event must apply");
     let buffer = backend.to_state_buffer().expect("committed LWW values must serialize");
     proto::State {
         memberships: [common::model("post")].into(),

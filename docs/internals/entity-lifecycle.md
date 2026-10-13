@@ -164,14 +164,18 @@ protocol):
 **Subscription updates** come in two forms:
 - *EventOnly* -- the common incremental case.
 - *StateAndEvent* -- used for initial subscription delivery and fetch responses.
-  The system first tries the fast path: apply the state snapshot directly. If
-  that succeeds, done. If the state diverges (concurrent edits exist), it falls
-  back to the accompanying events. This two-phase approach ensures events are
-  never silently dropped on divergence.
+  For an existing entity, `apply_and_commit_state` adopts the snapshot if it
+  extends the resident; otherwise it applies the accompanying event batch.
+  Snapshot adoption checks the events against its head without replaying their
+  operations. Both paths persist all accompanying events atomically with the
+  resulting state before publication. A write conflict repeats the decision
+  against a fresh fork, and an already-applied batch produces no change notification.
 
 **Delta application** (fetch/query responses) similarly comes as either a
 *StateSnapshot* (applied directly) or an *EventBridge* (events connecting the
 requester's known head to the responder's).
+Existing entities use the same snapshot coordinator with no accompanying
+events: a concurrent snapshot leaves the resident unchanged, including on retry.
 
 For every multi-event payload -- *EventOnly*, *StateAndEvent*, and
 *EventBridge* alike -- the receiver validates and stages the whole batch, then
@@ -183,50 +187,65 @@ operations would then be silently dropped as `StrictAscends`.
 
 ## How Events Are Applied
 
-The private shared state implementation's `apply_event` is the central
-integration point, used by both local commit and remote delivery. Readable
-`Entity` handles do not expose it. It works in two stages: guard checks, then a retry loop.
+Local commits and remote delivery use `RemoteTrxEntity::apply_events` to prepare
+and admit events on an isolated fork. `EntityState::apply_events` reconciles
+already-admitted batches with a resident whose head moved before publication.
+Both use the same preparation and backend layer application. Readable `Entity`
+handles do not expose these methods.
 
 The head records the event IDs at the frontier of the entity's applied
 history, with a [generation](event-dag.md#generations) for each tip.
 Comparing those heads through the [event DAG](event-dag.md) determines
 whether an incoming event extends, duplicates, or diverges from that history.
+An update can be stored before it is applied to a resident entity, so storage
+presence alone does not establish that its operations have been applied.
+Comparison returns `Equal` or `StrictAscends` for an already-integrated update,
+and application leaves the state unchanged.
 
 ### Guard Ordering
 
-Three guards execute before the main logic, handling edge cases around creation
-events and empty heads:
+Creation and empty-head guards precede application:
 
-1. **Creation event on a non-empty head.** On
-   [durable nodes](node-architecture.md#durable-vs-ephemeral-nodes) where
-   storage is definitive, `event_stored() == true` identifies a re-delivery --
-   no-op, while a not-yet-stored event proves different genesis -- reject as
-   `Disjoint`. On ephemeral nodes, fall through to BFS which distinguishes
-   re-delivery from different genesis.
+1. **Creation event on a non-empty head.** A stored genesis identifies a
+   re-delivery and is a no-op. If the genesis is absent and
+   [storage is definitive](node-architecture.md#durable-vs-ephemeral-nodes),
+   reject it as `Disjoint`. An ephemeral node may have adopted a snapshot
+   without storing its genesis, so absence there requires causal comparison
+   to distinguish re-delivery from a different genesis.
 
-2. **Creation event on an empty head.** Acquire the write lock, re-check that
-   the head is still empty (TOCTOU protection), apply operations, set the head.
+2. **Creation event on an empty head.** Comparison returns an empty meet.
+   Layer construction loads the complete staged creation chain, and locked
+   application checks the starting head before applying it.
 
-3. **Non-creation event on an empty head.** The entity was never created
-   properly. Reject with `InvalidEvent` rather than letting BFS produce a
-   spurious `DivergedSince(meet=[])`.
+3. **Update without a creation chain on an empty head.** Reject with `InvalidEvent`
+   before comparison. A creation batch must supply the genesis and every parent
+   of its subsequent updates in causal order.
+
 
 ### The Retry Loop
 
-After guards pass, `apply_event` enters a bounded retry loop (up to 5
-attempts). Each attempt reads the current head, refuses an event claiming more
-than one above the head's greatest tip generation, runs
-[`compare()`](event-dag.md#comparing-two-clocks) against the event DAG,
-checks its parent [generation annotations](event-dag.md#generations) against
-parent payloads read by comparison or resident tip annotations, unless the event
-is already integrated, and acts on the [`causal relation`](event-dag.md#key-concepts):
+For a batch, preparation checks the generation bound in causal order against
+an advancing head, then compares the batch's final tips against the starting
+head once. All history reads and layer construction finish before application.
+A preparation error rejects the whole batch without changing state or running
+write-policy checks.
+
+`EventLayers` holds the fully loaded layers and the boundaries for each input
+event. Layers belong to the first supplied event that needs their operations.
+Each event is applied before its write-policy check, so that check sees its own
+resulting state without later events. If an operation or policy check fails,
+the caller discards the transaction fork and none of the batch is committed.
+Other entity items in a received update continue independently.
+
+Resident publication retries preparation if the head moved, up to five attempts.
+The comparison's [causal relation](event-dag.md#key-concepts) determines the layers:
 
 | Relation | Action |
 |----------|--------|
 | `Equal` | Already integrated -- no-op |
-| `StrictDescends` | Direct descendant -- apply operations, advance head |
+| `StrictDescends` | Use the compared head as the meet; apply layers and replace the superseded tips |
 | `StrictAscends` | Event is older than current state -- no-op |
-| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#key-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), add the layers' membership additions, update head (remove meet ancestors, insert the event id) so it reflects both tips |
+| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#key-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), add the layers' membership additions, then advance the head through the newly applied events, preserving concurrent tips |
 | `Disjoint` | Different lineage -- error |
 | `BudgetExceeded` | DAG traversal too deep -- error |
 
@@ -272,7 +291,7 @@ fn try_mutate(&self, expected_head: &mut Clock, body: F) -> Result<bool, E> {
 ```
 
 If the head moved, the caller's `expected_head` is updated in place and the
-retry loop re-runs comparison against the fresh value. Both `apply_event` and
+retry loop re-runs comparison against the fresh value. Both `apply_events` and
 `apply_state` use this pattern. Retries are bounded to 5 attempts.
 
 
@@ -327,5 +346,6 @@ This gives clean crash recovery semantics:
 
 6. **StateAndEvent divergence fallback.** When `apply_state` does not apply
    the incoming state (divergence, or the state is older than what the
-   receiver has), the applier falls back to event-by-event application.
-   Events are never silently dropped on divergence.
+   receiver has), the applier falls back to atomic application of the
+   accompanying batch. It does not assume that batch contains the snapshot's
+   entire history or fetch its head events as a substitute on retry.

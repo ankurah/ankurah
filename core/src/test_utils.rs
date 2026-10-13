@@ -16,6 +16,7 @@ type Pause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<(
 pub(crate) struct TestStorage {
     data: Mutex<TestData>,
     pub hold_fetch: Mutex<BTreeMap<ModelId, Pause>>,
+    pub hold_set_state: Mutex<Option<Pause>>,
     pub hold_commit: Mutex<Option<Pause>>,
     pub hold_after_commit: Mutex<Option<Pause>>,
     pub reject_state_read: Mutex<Option<EntityId>>,
@@ -49,6 +50,11 @@ impl StorageTransaction for TestStorageTransaction<'_> {
     }
 
     async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
+        let hold = self.storage.hold_set_state.lock().unwrap().take();
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            release.await.unwrap();
+        }
         if let Some((_, previous)) = self.states.iter_mut().find(|(_, previous)| previous.payload.entity_id == state.payload.entity_id) {
             if previous.payload.state.head != *expected_head {
                 return Err(MutationError::InvalidUpdate("state does not follow the preceding transaction write"));

@@ -8,12 +8,16 @@ use crate::{
         Entity, WeakEntitySet,
     },
     error::{MutationError, RetrievalError, StateError},
+    event_dag::EventLayers,
     property::PropertyError,
     retrieval::{GetEvents, GetState},
     schema::SystemEpoch,
 };
 use ankurah_proto::{Attestation, Attested, Clock, EntityId, Event, EventId, State};
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 
 /// Transaction-local application of existing events and state snapshots, isolated from the resident entity until
 /// storage commits. "Remote" names this input mode, not where the events come from: local commits use it too.
@@ -72,37 +76,42 @@ impl RemoteTrxEntity {
 
     pub fn read(&self) -> Entity { self.0.data().read(ProxyTarget::Remote(self.0.clone()), || RolledBackCreation::Remote(self.id())) }
 
-    pub(crate) async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<crate::entity::StateApplyResult, MutationError>
+    pub(crate) async fn apply_state<G>(&self, getter: &G, state: &State) -> Result<bool, MutationError>
     where G: GetEvents + Send + Sync {
         self.0.data().state.apply_state(getter, state).await
     }
 
-    /// Apply and admit an event before retaining it for publication. Discard this fork on failure.
-    pub(crate) async fn apply_event<G>(
+    /// Prepare the whole batch with one comparison, then apply and check each event in causal order.
+    /// Preparation failure changes nothing. After application or policy failure, discard the fork; do not commit it.
+    pub(crate) async fn apply_events<G>(
         &self,
         getter: &G,
-        event: &mut Attested<Event>,
-        check: impl FnOnce(&Event) -> Result<Option<Attestation>, MutationError>,
-    ) -> Result<bool, MutationError>
+        events: &mut [Attested<Event>],
+        mut check: impl FnMut(&Event) -> Result<Option<Attestation>, MutationError>,
+    ) -> Result<(), MutationError>
     where
         G: GetEvents + Send + Sync,
     {
-        if event.payload.entity_id != self.id() {
+        if events.is_empty() {
+            return Ok(());
+        }
+        if events.iter().any(|event| event.payload.entity_id != self.id()) {
             return Err(MutationError::InvalidEvent);
         }
-
         let data = self.0.data();
-        let getter = TransactionEventGetter::new(&data.events, &event.payload, getter);
-        let applied = data.state.apply_event(&getter, &event.payload).await?;
-
-        if let Some(attestation) = check(&event.payload)? {
-            event.attestations.push(attestation);
+        let mut head = data.state.head();
+        let getter = TransactionEventGetter::new(&data.events, events.iter().map(|event| &event.payload), getter);
+        let prepared = EventLayers::prepare(&getter, events, &head).await?;
+        for (event, layers) in events.iter_mut().zip(prepared.per_event()) {
+            let applied = data.state.apply_prepared_layers(&mut head, layers)?;
+            if let Some(attestation) = check(&event.payload)? {
+                event.attestations.push(attestation);
+            }
+            if applied {
+                data.events.lock().unwrap().push(event.clone());
+            }
         }
-
-        if applied {
-            data.events.lock().unwrap().push(event.clone());
-        }
-        Ok(applied)
+        Ok(())
     }
 
     /// A frozen policy input; it shares neither mutable backends nor pending events with this fork.
@@ -143,14 +152,9 @@ impl RemoteTrxEntity {
             }
         };
 
-        let mut applied_events = Vec::new();
-        for event in events {
-            // A reader may have loaded committed state while this transaction was publishing.
-            // Reconcile against that head rather than overwriting it with the older fork.
-            if resident.state.apply_event(getter, &event.payload).await? {
-                applied_events.push(event);
-            }
-        }
+        // A reader may have loaded committed state while this transaction was publishing.
+        let applied = resident.state.apply_events(getter, &events).await?;
+        let applied_events = events.into_iter().zip(applied).filter_map(|(event, applied)| applied.then_some(event)).collect();
 
         data.committed(resident.clone());
         Ok(EntityChange::new(Entity::from_resident(resident), applied_events))
@@ -184,19 +188,21 @@ impl RemoteTrxEntityInner {
 /// Later events can depend on earlier events in the same uncommitted transaction.
 struct TransactionEventGetter<'a, G> {
     events: &'a Mutex<Vec<Attested<Event>>>,
-    current: &'a Event,
+    batch: BTreeMap<EventId, &'a Event>,
     fallback: &'a G,
 }
 
 impl<'a, G> TransactionEventGetter<'a, G> {
-    fn new(events: &'a Mutex<Vec<Attested<Event>>>, current: &'a Event, fallback: &'a G) -> Self { Self { events, current, fallback } }
+    fn new(events: &'a Mutex<Vec<Attested<Event>>>, batch: impl IntoIterator<Item = &'a Event>, fallback: &'a G) -> Self {
+        Self { events, batch: batch.into_iter().map(|event| (event.id(), event)).collect(), fallback }
+    }
 }
 
 #[async_trait::async_trait]
 impl<G: GetEvents + Send + Sync> GetEvents for TransactionEventGetter<'_, G> {
     async fn get_event(&self, id: &EventId) -> Result<Event, RetrievalError> {
-        if self.current.id() == *id {
-            return Ok(self.current.clone());
+        if let Some(event) = self.batch.get(id) {
+            return Ok((*event).clone());
         }
         if let Some(event) = self.events.lock().unwrap().iter().find(|event| event.payload.id() == *id) {
             return Ok(event.payload.clone());

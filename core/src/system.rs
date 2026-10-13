@@ -192,7 +192,7 @@ where SE: StorageEngine + Send + Sync + 'static
         let attested_event = &mut events[0];
         let system_entity = crate::entity::RemoteTrxEntity::new(&attested_event.payload, self.0.entities.system_epoch())?;
         let event_getter = LocalEventGetter::new(storage.clone(), true);
-        system_entity.apply_event(&event_getter, attested_event, |_| Ok(None)).await?;
+        system_entity.apply_events(&event_getter, std::slice::from_mut(attested_event), |_| Ok(None)).await?;
         let attested_state: Attested<EntityState> = EntityState { entity_id: system_entity.id(), state: system_entity.to_state()? }.into();
         self.store_root(attested_state.clone(), events).await?;
         let (system_entity, _) = system_entity.commit(&self.0.entities, &event_getter).await?.into_parts();

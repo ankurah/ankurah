@@ -297,9 +297,7 @@ mod tests {
         for (property, value) in values {
             backend.set(*property, Some(Value::String((*value).to_owned())));
         }
-        let operations = backend.to_operations().unwrap().expect("state has values");
-        let event_id = EventId::from_bytes([event_byte; 32]);
-        backend.apply_operations_with_event(&operations, event_id.clone()).unwrap();
+        let event = ankurah_core::test_helpers::commit_backend(&backend, event_byte).unwrap();
         Attested::opt(
             EntityState {
                 entity_id,
@@ -307,7 +305,7 @@ mod tests {
                     state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
                     memberships: BTreeSet::new(),
                     // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
-                    head: Clock::genesis(event_id),
+                    head: Clock::singleton(&event),
                 },
             },
             None,

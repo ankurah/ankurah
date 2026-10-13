@@ -6,7 +6,7 @@ use ankurah_core::{
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::Value,
 };
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, EventId, ModelId, PropertyId, State, StateBuffers};
+use ankurah_proto::{Attested, Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers};
 use ankurah_storage_sled::SledStorageEngine;
 
 #[tokio::test]
@@ -54,17 +54,14 @@ async fn signed_zeros_share_equality_and_range_matches() -> anyhow::Result<()> {
 async fn insert(engine: &SledStorageEngine, model: ModelId, property: PropertyId, byte: u8, value: f64) -> anyhow::Result<()> {
     let backend = LWWBackend::new();
     backend.set(property, Some(Value::F64(value)));
-    let event = EventId::from_bytes([byte; 32]);
-    if let Some(operations) = backend.to_operations()? {
-        backend.apply_operations_with_event(&operations, event.clone())?;
-    }
+    let event = ankurah_core::test_helpers::commit_backend(&backend, byte)?;
     let state = Attested::opt(
         EntityState {
             entity_id: EntityId::from_bytes([byte; 32]),
             state: State {
                 state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
                 memberships: BTreeSet::from([model]),
-                head: Clock::genesis(event),
+                head: Clock::singleton(&event),
             },
         },
         None,

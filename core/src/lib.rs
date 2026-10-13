@@ -33,7 +33,7 @@ pub mod session;
 pub mod storage;
 pub mod system;
 pub mod task;
-#[cfg(feature = "test-helpers")]
+#[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 #[cfg(test)]
 mod test_utils;
