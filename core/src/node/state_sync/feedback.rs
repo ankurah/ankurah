@@ -1,0 +1,106 @@
+//! Coalesce cumulative credit while applying later frames; never impose one RTT per frame.
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
+
+use ankurah_proto as proto;
+use anyhow::ensure;
+use futures::FutureExt;
+
+use super::Inbox;
+use crate::{node::Node, policy::PolicyAgent, storage::StorageEngine};
+
+#[derive(Default)]
+pub(super) struct Feedback(Mutex<Pending>);
+
+#[derive(Default)]
+struct Pending {
+    through: u64,
+    answers: VecDeque<proto::StateAnswer>,
+    bytes: usize,
+    dirty: bool,
+    running: bool,
+}
+
+impl Feedback {
+    pub fn queue<SE, PA>(
+        self: &Arc<Self>,
+        node: &Node<SE, PA>,
+        peer: proto::EntityId,
+        credentials: &[PA::ContextData],
+        comparison: proto::ComparisonId,
+        through: u64,
+        answers: Vec<proto::StateAnswer>,
+        inbox: &Arc<Inbox>,
+    ) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        {
+            let mut pending = self.0.lock().unwrap();
+            let bytes = bincode::serialized_size(&answers)? as usize;
+            ensure!(pending.bytes + bytes <= super::WINDOW_BYTES, "state answer queue exceeded limit");
+            pending.bytes += bytes;
+            pending.answers.extend(answers);
+            pending.through = pending.through.max(through);
+            pending.dirty = true;
+            if pending.running {
+                return Ok(());
+            }
+            pending.running = true;
+        }
+        let feedback = self.clone();
+        let node = node.weak();
+        let credentials = credentials.to_vec();
+        let inbox = inbox.clone();
+        crate::task::spawn(async move {
+            let result: anyhow::Result<()> = async {
+                loop {
+                    let (processed_through, answers) = {
+                        let mut pending = feedback.0.lock().unwrap();
+                        if !pending.dirty {
+                            pending.running = false;
+                            return Ok(());
+                        }
+                        let mut answers = Vec::new();
+                        let mut bytes = 0;
+                        while let Some(answer) = pending.answers.front() {
+                            let size = bincode::serialized_size(answer)? as usize;
+                            ensure!(size <= super::PAGE_BYTES, "state answer exceeds limit");
+                            if answers.len() == 128 || bytes + size > super::PAGE_BYTES {
+                                break;
+                            }
+                            bytes += size;
+                            answers.push(pending.answers.pop_front().unwrap());
+                        }
+                        pending.bytes = pending.bytes.saturating_sub(bytes);
+                        pending.dirty = !pending.answers.is_empty();
+                        if !pending.dirty {
+                            pending.bytes = 0;
+                        }
+                        (pending.through, answers)
+                    };
+                    let Some(node) = node.upgrade() else { return Ok(()) };
+                    let request = node
+                        .request(peer, &credentials, proto::NodeRequestBody::ContinueState { comparison, processed_through, answers })
+                        .fuse();
+                    let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(120)).fuse();
+                    futures::pin_mut!(request, timeout);
+                    let response = futures::select! {
+                        response = request => response?,
+                        _ = timeout => anyhow::bail!("state feedback timed out"),
+                    };
+                    ensure!(matches!(response, proto::NodeResponseBody::Success), "state feedback rejected: {response:?}");
+                }
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "state feedback failed");
+                inbox.close();
+            }
+        });
+        Ok(())
+    }
+}

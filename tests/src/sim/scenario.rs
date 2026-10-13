@@ -192,8 +192,7 @@ impl<'a> Workload<'a> {
     pub fn event_only_item(&self, entity: proto::EntityId, events: Vec<Attested<proto::Event>>) -> proto::SubscriptionUpdateItem {
         let fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
-            entity_id: entity,
-            content: proto::UpdateContent::EventOnly(fragments),
+            delta: proto::EntityDelta { entity_id: entity, content: proto::DeltaContent::EventBridge { events: fragments } },
             predicate_relevance: vec![],
         }
     }
@@ -206,8 +205,10 @@ impl<'a> Workload<'a> {
         let state_fragment = proto::StateFragment { state, attestations: proto::AttestationSet::default() };
         let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
         proto::SubscriptionUpdateItem {
-            entity_id: entity,
-            content: proto::UpdateContent::StateAndEvent(state_fragment, event_fragments),
+            delta: proto::EntityDelta {
+                entity_id: entity,
+                content: proto::DeltaContent::StateAndEvents { state: state_fragment, events: event_fragments },
+            },
             predicate_relevance: vec![],
         }
     }

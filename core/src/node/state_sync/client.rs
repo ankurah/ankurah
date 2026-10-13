@@ -1,22 +1,29 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 
 use ankurah_digest_tree::{leaf_address, CanonicalCodec, KeyCodec};
-use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateItem};
+use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrameBody, StateItem};
 use anyhow::{bail, ensure};
 use bincode::Options;
+use futures::FutureExt;
 
-use super::Snapshot;
+use super::{feedback::Feedback, IncomingStream, Snapshot};
 use crate::{
     error::{RequestError, RetrievalError},
     node::{applier::NodeApplier, Node},
     policy::PolicyAgent,
-    retrieval::{CachedEventGetter, LocalStateGetter},
+    retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter},
     storage::StorageEngine,
 };
 
 pub(crate) struct RemoteState {
     pub comparison: proto::ComparisonId,
     pub ids: Vec<proto::EntityId>,
+    pub processed_through: u64,
+    pub stream: IncomingStream,
+    feedback: Arc<Feedback>,
 }
 
 struct Assembly {
@@ -29,6 +36,44 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    /// Install the origin before sending: a pushed continuation may beat metadata.
+    pub(crate) async fn request_state(
+        &self,
+        peer: proto::EntityId,
+        credentials: &Vec<PA::ContextData>,
+        body: proto::NodeRequestBody,
+    ) -> Result<(IncomingStream, proto::NodeResponseBody), RetrievalError> {
+        let query = match &body {
+            proto::NodeRequestBody::SubscribeQuery { query_id, version, .. } => Some((*query_id, *version)),
+            _ => None,
+        };
+        let connection = self.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
+        let catalog = match &body {
+            proto::NodeRequestBody::SubscribeQuery { selection, .. } | proto::NodeRequestBody::Fetch { selection, .. } => {
+                crate::schema::is_catalog_read(&selection.predicate)
+            }
+            _ => false,
+        };
+        let weak = self.weak();
+        let cleanup_credentials = credentials.clone();
+        let late_reply = Arc::new(move |comparison| {
+            let weak = weak.clone();
+            let credentials = cleanup_credentials.clone();
+            crate::task::spawn(async move {
+                if let Some(node) = weak.upgrade() {
+                    if let Some(connection) = node.peer_connections.get(&peer) {
+                        connection.outgoing_comparisons.insert(comparison, catalog);
+                    }
+                    let _ = node.close_comparison(peer, comparison, &credentials, proto::ComparisonOutcome::Abandoned).await;
+                }
+            });
+        });
+        let stream = connection.incoming_states.register(proto::RequestId::new(), query, Some(late_reply))?;
+        drop(connection);
+        let response = state_deadline(self.request_with_id(peer, credentials, stream.request.clone(), body)).await??;
+        Ok((stream, response))
+    }
+
     pub(crate) async fn receive_state(
         &self,
         peer: proto::EntityId,
@@ -37,28 +82,41 @@ where
         initial: proto::StateReply,
         catalog: bool,
         query: Option<(proto::QueryId, u32)>,
+        mut stream: IncomingStream,
     ) -> Result<RemoteState, RetrievalError> {
-        let id = initial.page.comparison;
+        let id = initial.frame.comparison;
         let connection = self.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
-        connection.outgoing_comparisons.insert(id, catalog);
+        stream.bind(id, catalog, connection.outgoing_comparisons.clone());
+        drop(connection);
         let result = async {
             ensure!(initial.spec == snapshot.spec, "peer changed the comparison spec");
             ensure!(initial.scope == [super::whole()], "unsupported materialized result scope");
-            let mut members: BTreeMap<_, _> =
-                snapshot.tree.leaves(&super::whole(), usize::MAX).await?.into_iter().map(|leaf| (leaf.address(), leaf.entity_id)).collect();
+            ensure!(initial.frame.sequence == 0, "initial response did not carry frame zero");
+            stream.inbox.insert(initial.frame)?;
+            let feedback = Arc::new(Feedback::default());
+            let mut members = snapshot.members();
             let mut assemblies: HashMap<proto::EntityId, Assembly> = HashMap::new();
+            let mut required: HashMap<proto::EntityId, proto::Clock> = HashMap::new();
+            let mut repair_attempts: HashMap<proto::EntityId, u8> = HashMap::new();
             let mut assembly_bytes = 0usize;
             let event_getter = CachedEventGetter::new(self, credentials);
             let state_getter = LocalStateGetter::new(self.storage.clone());
-            let mut page = initial.page;
-            for _ in 0..100_000 {
+            let mut complete = false;
+            loop {
                 if let Some((query, version)) = query {
                     ensure!(self.live_queries.get(query).is_some_and(|query| query.is_current(version)), "query comparison superseded");
                 }
-                ensure!(page.comparison == id && page.items.len() <= 128, "invalid comparison reply");
+                let frame = stream.inbox.next(false).await?;
+                let (items, progress) = match frame.body {
+                    StateFrameBody::State { items, progress } => (items, progress),
+                    StateFrameBody::RestartRequired => return Err(RequestError::ConnectionLost.into()),
+                    _ => bail!("initial stream sent live data before activation"),
+                };
+                ensure!(frame.comparison == id && items.len() <= 128, "invalid comparison reply");
                 let mut answers = Vec::new();
                 let mut deltas = Vec::new();
-                for item in page.items {
+                let mut targets = Vec::new();
+                for item in items {
                     match item {
                         StateItem::Equal(_) => {}
                         StateItem::Summary(head) => {
@@ -66,23 +124,7 @@ where
                             answers.push(StateAnswer::Summary(snapshot.head(head.bounds).await?));
                         }
                         StateItem::NeedLeaves(bounds) => answers.push(StateAnswer::Leaves(snapshot.page(bounds).await?)),
-                        StateItem::Leaves(page) => {
-                            ensure!(page.leaves.len() <= super::LEAF_PAGE, "peer sent too many leaves");
-                            let mut previous = None;
-                            for leaf in &page.leaves {
-                                CanonicalCodec.split(snapshot.spec.key_spec(), &leaf.key)?;
-                                let address = leaf_address(&leaf.key, leaf.entity.entity_id);
-                                ensure!(
-                                    page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address),
-                                    "invalid peer leaf page"
-                                );
-                                previous = Some(address);
-                            }
-                            members.retain(|address, _| !page.bounds.contains(address));
-                            for leaf in page.leaves {
-                                members.insert(leaf_address(&leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
-                            }
-                        }
+                        StateItem::Leaves(page) => replace_members(&mut members, &snapshot.spec, page)?,
                         StateItem::NeedHeads(ids) => {
                             ensure!(ids.len() <= 128, "too many requested entity clocks");
                             let mut known = Vec::new();
@@ -113,14 +155,19 @@ where
                         StateItem::Repair { target, delta } => {
                             ensure!(!assemblies.contains_key(&delta.entity_id), "repair interrupted its chunks");
                             check_target(&target, &delta.content)?;
+                            targets.push((delta.entity_id, target));
                             deltas.push(delta);
                         }
-                        StateItem::RepairChunk(chunk) => {
-                            let assembly = assemblies
-                                .entry(chunk.entity_id)
-                                .or_insert_with(|| Assembly { target: chunk.target.clone(), bytes: Vec::new() });
+                        StateItem::RepairChunk { target, chunk } => {
+                            ensure!(!chunk.bytes.is_empty(), "empty repair chunk");
                             ensure!(
-                                assembly.target == chunk.target && chunk.offset == assembly.bytes.len() as u64,
+                                assemblies.contains_key(&chunk.entity_id) || assemblies.len() < super::MAX_INFLIGHT_FRAMES,
+                                "too many partial repairs"
+                            );
+                            let assembly =
+                                assemblies.entry(chunk.entity_id).or_insert_with(|| Assembly { target: target.clone(), bytes: Vec::new() });
+                            ensure!(
+                                assembly.target == target && chunk.offset == assembly.bytes.len() as u64,
                                 "invalid repair chunk sequence"
                             );
                             assembly_bytes =
@@ -129,31 +176,55 @@ where
                             assembly.bytes.extend_from_slice(&chunk.bytes);
                             if chunk.last {
                                 let assembly = assemblies.remove(&chunk.entity_id).unwrap();
-                                let content: proto::DeltaContent = bincode::DefaultOptions::new()
-                                    .with_fixint_encoding()
-                                    .with_limit(assembly.bytes.len() as u64)
-                                    .reject_trailing_bytes()
-                                    .deserialize(&assembly.bytes)?;
+                                let content = decode_delta(&assembly.bytes)?;
                                 check_target(&assembly.target, &content)?;
                                 assembly_bytes -= assembly.bytes.len();
+                                targets.push((chunk.entity_id, assembly.target));
                                 deltas.push(proto::EntityDelta { entity_id: chunk.entity_id, content });
                             }
                         }
+                        StateItem::RepairUnavailable { entity_id, .. } => bail!("peer cannot repair required state for {entity_id}"),
                     }
                 }
-                NodeApplier::apply_deltas(self, &peer, deltas, &event_getter, &state_getter).await?;
-                if page.progress == ComparisonProgress::Complete {
-                    ensure!(answers.is_empty() && assemblies.is_empty(), "peer completed an unfinished comparison");
-                    return Ok(RemoteState { comparison: id, ids: members.into_values().collect() });
+                for (entity_id, target) in &targets {
+                    ensure!(required.get(entity_id).is_none_or(|pending| pending == target), "repair changed its pending target");
                 }
-                page = match self.request(peer, credentials, proto::NodeRequestBody::CompareTree { comparison: id, answers }).await? {
-                    proto::NodeResponseBody::TreeCompared(page) => page,
-                    proto::NodeResponseBody::ComparisonUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
-                    proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
-                    other => return Err(RequestError::UnexpectedResponse(other).into()),
-                };
+                let divergences = NodeApplier::apply_deltas(self, &peer, deltas, &event_getter, &state_getter).await?;
+                for (entity_id, target) in targets {
+                    ensure!(required.get(&entity_id).is_none_or(|pending| *pending == target), "repair changed its pending target");
+                    let actual = match self.entities.get(&entity_id) {
+                        Some(entity) => entity.head(),
+                        None => self.storage.get_state(entity_id).await?.payload.state.head,
+                    };
+                    let divergent = divergences.iter().any(|gap| gap.entity_id == entity_id);
+                    let covered = !divergent && self.covers_target(&actual, &target).await?;
+                    if covered {
+                        required.remove(&entity_id);
+                        repair_attempts.remove(&entity_id);
+                    } else {
+                        ensure!(
+                            required.contains_key(&entity_id) || required.len() < super::MAX_INFLIGHT_FRAMES * 128,
+                            "too many pending repair targets"
+                        );
+                        let attempts = repair_attempts.entry(entity_id).or_default();
+                        ensure!(*attempts < 2, "connecting history failed to cover target");
+                        *attempts += 1;
+                        required.insert(entity_id, target.clone());
+                        answers.push(StateAnswer::NeedRepair { entity_id, target, actual });
+                    }
+                }
+                complete |= progress == ComparisonProgress::Complete;
+                if complete && answers.is_empty() && required.is_empty() && assemblies.is_empty() {
+                    return Ok(RemoteState {
+                        comparison: id,
+                        ids: members.into_values().collect(),
+                        processed_through: frame.sequence,
+                        stream,
+                        feedback,
+                    });
+                }
+                feedback.queue(self, peer, credentials, id, frame.sequence, answers, &stream.inbox)?;
             }
-            bail!("comparison exceeded its round limit")
         }
         .await;
         if result.is_err() {
@@ -170,6 +241,119 @@ where
         })
     }
 
+    async fn covers_target(&self, actual: &proto::Clock, target: &proto::Clock) -> anyhow::Result<bool> {
+        if actual == target || target.entries().iter().all(|entry| actual.entries().contains(entry)) {
+            return Ok(true);
+        }
+        let relation = crate::event_dag::compare(LocalEventGetter::new(self.storage.clone(), self.durable), actual, target, 256).await?;
+        Ok(matches!(
+            relation.relation,
+            crate::event_dag::AbstractCausalRelation::Equal | crate::event_dag::AbstractCausalRelation::StrictDescends { .. }
+        ))
+    }
+
+    /// Readiness follows local activation, not the acknowledgment's round trip.
+    pub(crate) fn finish_state(
+        &self,
+        peer: proto::EntityId,
+        credentials: Vec<PA::ContextData>,
+        remote: RemoteState,
+        query: Option<(proto::QueryId, u32)>,
+    ) {
+        let weak = self.weak();
+        crate::task::spawn(async move {
+            let comparison = remote.comparison;
+            let result: anyhow::Result<()> = async {
+                let applied = async {
+                    let Some(node) = weak.upgrade() else { return Ok::<_, anyhow::Error>(()) };
+                    node.close_comparison(
+                        peer,
+                        comparison,
+                        &credentials,
+                        proto::ComparisonOutcome::Applied { processed_through: remote.processed_through },
+                    )
+                    .await?;
+                    Ok(())
+                }
+                .fuse();
+                if query.is_none() {
+                    return applied.await;
+                }
+                let live = async {
+                    let Some((query_id, version)) = query else { return Ok(()) };
+                    let mut assembly: Option<(proto::EntityId, Vec<(proto::QueryId, proto::MembershipChange)>, Vec<u8>)> = None;
+                    loop {
+                        let frame = remote.stream.inbox.next(assembly.is_none()).await?;
+                        let Some(node) = weak.upgrade() else { return Ok(()) };
+                        ensure!(
+                            node.live_queries.get(query_id).is_some_and(|query| query.is_current(version)),
+                            "live state stream superseded"
+                        );
+                        let items = match frame.body {
+                            StateFrameBody::Live(items) => {
+                                ensure!(assembly.is_none(), "live update interrupted chunks");
+                                ensure!(items.len() <= 128, "live frame item limit exceeded");
+                                items
+                            }
+                            StateFrameBody::LiveChunk { chunk, predicate_relevance } => {
+                                ensure!(!chunk.bytes.is_empty(), "empty live chunk");
+                                ensure!(
+                                    predicate_relevance.len() <= 128 && predicate_relevance.iter().all(|(id, _)| *id == query_id),
+                                    "invalid live chunk relevance"
+                                );
+                                let (id, relevance, bytes) =
+                                    assembly.get_or_insert_with(|| (chunk.entity_id, predicate_relevance.clone(), Vec::new()));
+                                ensure!(
+                                    *id == chunk.entity_id && *relevance == predicate_relevance && chunk.offset == bytes.len() as u64,
+                                    "invalid live chunk sequence"
+                                );
+                                ensure!(bytes.len() + chunk.bytes.len() <= super::MAX_REPAIR_BYTES, "live assembly exceeds limit");
+                                bytes.extend_from_slice(&chunk.bytes);
+                                if chunk.last {
+                                    let (entity_id, predicate_relevance, bytes) = assembly.take().unwrap();
+                                    vec![proto::SubscriptionUpdateItem {
+                                        delta: proto::EntityDelta { entity_id, content: decode_delta(&bytes)? },
+                                        predicate_relevance,
+                                    }]
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            _ => bail!("live state stream requires restart"),
+                        };
+                        ensure!(
+                            items.iter().all(|item| item.predicate_relevance.len() <= 128
+                                && item.predicate_relevance.iter().all(|(id, _)| *id == query_id)),
+                            "live frame names another query"
+                        );
+                        if !items.is_empty() {
+                            NodeApplier::apply_stream_updates(&node, &peer, &credentials, items).await?;
+                        }
+                        remote.feedback.queue(&node, peer, &credentials, comparison, frame.sequence, Vec::new(), &remote.stream.inbox)?;
+                    }
+                }
+                .fuse();
+                futures::pin_mut!(applied, live);
+                futures::select! {
+                    result = applied => { result?; live.await },
+                    result = live => result,
+                }
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "state stream failed");
+                if let Some(node) = weak.upgrade() {
+                    if let Some((query, version)) = query {
+                        if let Some(relay) = &node.subscription_relay {
+                            relay.stream_failed(peer, query, version, &remote.stream.request);
+                        }
+                    }
+                    let _ = node.close_comparison(peer, comparison, &credentials, proto::ComparisonOutcome::Abandoned).await;
+                }
+            }
+        });
+    }
+
     pub(crate) async fn close_comparison(
         &self,
         peer: proto::EntityId,
@@ -177,11 +361,14 @@ where
         credentials: &Vec<PA::ContextData>,
         outcome: proto::ComparisonOutcome,
     ) -> Result<(), RetrievalError> {
-        let result = self.request(peer, credentials, proto::NodeRequestBody::CloseComparison { comparison, outcome }).await;
-        if let Some(connection) = self.peer_connections.get(&peer) {
-            connection.outgoing_comparisons.remove(&comparison);
+        let result = state_deadline(self.request(peer, credentials, proto::NodeRequestBody::CloseComparison { comparison, outcome })).await;
+        // Live feedback still needs the catalog bypass after snapshot release.
+        if matches!(outcome, proto::ComparisonOutcome::Abandoned) {
+            if let Some(connection) = self.peer_connections.get(&peer) {
+                connection.outgoing_comparisons.remove(&comparison);
+            }
         }
-        match result? {
+        match result?? {
             proto::NodeResponseBody::Success => Ok(()),
             proto::NodeResponseBody::ComparisonUnavailable { .. } => Err(RequestError::ConnectionLost.into()),
             proto::NodeResponseBody::Error(error) => Err(RequestError::ServerError(error).into()),
@@ -190,12 +377,56 @@ where
     }
 }
 
+async fn state_deadline<T>(future: impl std::future::Future<Output = T>) -> Result<T, RetrievalError> {
+    let future = future.fuse();
+    let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(120)).fuse();
+    futures::pin_mut!(future, timeout);
+    futures::select! {
+        result = future => Ok(result),
+        _ = timeout => Err(RequestError::ConnectionLost.into()),
+    }
+}
+
+fn decode_delta(bytes: &[u8]) -> anyhow::Result<proto::DeltaContent> {
+    Ok(bincode::DefaultOptions::new().with_fixint_encoding().with_limit(bytes.len() as u64).reject_trailing_bytes().deserialize(bytes)?)
+}
+
 fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow::Result<()> {
     match content {
-        proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndRelation { state, .. } => {
-            ensure!(state.state.head == *target, "snapshot does not match repair target");
+        proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. } => {
+            ensure!(state.state.head == *target, "snapshot does not match repair target")
         }
         proto::DeltaContent::EventBridge { events } => ensure!(!events.is_empty(), "empty event bridge"),
+        proto::DeltaContent::StateAndRelation { .. } => bail!("StateAndRelation is not supported"),
     }
     Ok(())
 }
+
+fn replace_members(members: &mut BTreeMap<Vec<u8>, proto::EntityId>, spec: &proto::TreeSpec, page: proto::LeafPage) -> anyhow::Result<()> {
+    use std::ops::Bound::*;
+    ensure!(page.leaves.len() <= super::LEAF_PAGE, "peer sent too many leaves");
+    let nonempty = match (&page.bounds.start, &page.bounds.end) {
+        (Unbounded, _) | (_, Unbounded) => true,
+        (Included(a), Included(b)) => a <= b,
+        (Included(a) | Excluded(a), Included(b) | Excluded(b)) => a < b,
+    };
+    ensure!(nonempty, "invalid peer leaf bounds");
+    let mut previous = None;
+    for leaf in &page.leaves {
+        CanonicalCodec.split(spec.key_spec(), &leaf.key)?;
+        let address = leaf_address(&leaf.key, leaf.entity.entity_id);
+        ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid peer leaf page");
+        previous = Some(address);
+    }
+    let removed: Vec<_> = members.range((page.bounds.start.clone(), page.bounds.end.clone())).map(|(key, _)| key.clone()).collect();
+    for key in removed {
+        members.remove(&key);
+    }
+    for leaf in page.leaves {
+        members.insert(leaf_address(&leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

@@ -272,7 +272,17 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     agent.deny_reads.store(true, Ordering::SeqCst);
 
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    let frames = Arc::new(Mutex::new(Vec::<proto::StateFrame>::new()));
+    let (_conn, _) = common::GatedConnection::new(&server, &client, {
+        let frames = frames.clone();
+        move |message| {
+            if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+                frames.lock().unwrap().push(frame.clone());
+            }
+            false
+        }
+    })
+    .await;
     client.system.wait_system_ready().await.unwrap();
     let credentials = Vec::<&'static DefaultContext>::new();
 
@@ -301,15 +311,22 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let events = storage.dump_entity_events(entity_id).await?;
         assert!(!events.is_empty());
 
+        let known_state = proto::KnownState {
+            spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
+            regions: vec![proto::KnownRegion::Leaves(proto::LeafPage {
+                bounds: serde_json::from_value(serde_json::json!({ "start": { "Included": [] }, "end": "Unbounded" }))?,
+                leaves: vec![proto::KnownLeaf { key: vec![], entity: proto::KnownEntity { entity_id, head: known_head.clone() } }],
+            })],
+        };
         let requests = [
             proto::NodeRequestBody::Get { ids: vec![entity_id] },
             proto::NodeRequestBody::GetEvents { event_ids: events.iter().map(|event| event.payload.id()).collect() },
-            proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: None },
+            proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: Some(known_state.clone()) },
             proto::NodeRequestBody::SubscribeQuery {
                 query_id: proto::QueryId::new(),
                 selection: Predicate::MemberOf(model).into(),
                 version: 1,
-                known_state: None,
+                known_state: Some(known_state.clone()),
             },
         ];
         for request in requests {
@@ -317,53 +334,53 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                 proto::NodeResponseBody::Get(results) => assert!(matches!(results.as_slice(), [proto::GetResult::Found(_)])),
                 proto::NodeResponseBody::GetEvents(received) => assert_eq!(received.len(), events.len()),
                 proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
-                    let mut page = state.page;
-                    let comparison = page.comparison;
+                    let mut frame = state.frame;
+                    let comparison = frame.comparison;
                     let mut found = false;
                     loop {
-                        let mut answers = Vec::new();
-                        for item in page.items {
-                            match item {
-                                proto::StateItem::Summary(mut head) => {
-                                    head.digest = Default::default();
-                                    answers.push(proto::StateAnswer::Summary(head));
-                                }
-                                proto::StateItem::NeedLeaves(bounds) => {
-                                    answers.push(proto::StateAnswer::Leaves(proto::LeafPage { bounds, leaves: vec![] }));
-                                }
-                                proto::StateItem::NeedHeads(ids) => {
-                                    // Empty query membership does not mean this
-                                    // catalog row's earlier clock is unknown.
-                                    let known = ids
-                                        .contains(&entity_id)
-                                        .then(|| proto::KnownEntity { entity_id, head: known_head.clone() })
-                                        .into_iter()
-                                        .collect();
-                                    let unknown = ids.into_iter().filter(|id| *id != entity_id).collect();
-                                    answers.push(proto::StateAnswer::Heads { known, unknown });
-                                }
-                                proto::StateItem::Repair { delta, .. } if delta.entity_id == entity_id => {
+                        let sequence = frame.sequence;
+                        let proto::StateFrameBody::State { items, progress } = frame.body else { panic!("expected catalog state") };
+                        for item in items {
+                            if let proto::StateItem::Repair { delta, .. } = item {
+                                if delta.entity_id == entity_id {
                                     assert!(
                                         matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1),
                                         "{delta:?}"
                                     );
                                     found = true;
                                 }
-                                _ => {}
                             }
                         }
-                        if page.progress == proto::ComparisonProgress::Complete {
+                        if progress == proto::ComparisonProgress::Complete {
                             break;
                         }
-                        page = match client
-                            .request(server.id, &credentials, proto::NodeRequestBody::CompareTree { comparison, answers })
-                            .await?
-                        {
-                            proto::NodeResponseBody::TreeCompared(page) => page,
-                            other => panic!("catalog comparison failed: {other:?}"),
-                        };
+                        assert!(matches!(
+                            client
+                                .request(
+                                    server.id,
+                                    &credentials,
+                                    proto::NodeRequestBody::ContinueState { comparison, processed_through: sequence, answers: vec![] }
+                                )
+                                .await?,
+                            proto::NodeResponseBody::Success
+                        ));
+                        frame = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            loop {
+                                if let Some(next) = frames
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|frame| frame.comparison == comparison && frame.sequence == sequence + 1)
+                                    .cloned()
+                                {
+                                    break next;
+                                }
+                                tokio::task::yield_now().await;
+                            }
+                        })
+                        .await?;
                     }
-                    assert!(found, "catalog row must be readable through comparison follow-ups");
+                    assert!(found, "catalog row must be readable through the numbered state stream");
                     assert!(matches!(
                         client
                             .request(

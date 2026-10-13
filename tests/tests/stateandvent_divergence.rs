@@ -6,21 +6,20 @@ use anyhow::Result;
 use common::*;
 use std::sync::Arc;
 
-/// Test: StateAndEvent with divergence via subscription
+/// A live StateAndEvents update that diverges from a concurrent local commit.
 ///
-/// This tests the bug in node/applier.rs where StateAndEvent updates
-/// don't apply events when there's divergence between local and incoming state.
+/// The applier (node/applier.rs, apply_snapshot) cannot adopt the sender's
+/// snapshot when the local entity has a concurrent edit. It must merge the
+/// carried events instead, so both branches end up in the entity, in memory
+/// and in storage. Earlier versions saved the events but left the resident
+/// entity on its own branch.
 ///
-/// Bug location: node/applier.rs:96-125
-/// When apply_state returns Ok(false) for DivergedSince, events are saved
-/// to storage but NOT applied to the entity in memory.
-///
-/// This test uses LiveQuery subscription to trigger the StateAndEvent path:
+/// The LiveQuery subscription is what routes the update through that path:
 /// 1. Durable D creates entity A
 /// 2. Ephemeral E subscribes via LiveQuery (sets up subscription)
 /// 3. E and D make concurrent commits
-/// 4. D's commit goes to E via StateAndEvent subscription update
-/// 5. If E committed before receiving D's update, DivergedSince occurs
+/// 4. D's commit goes to E as a StateAndEvents subscription update
+/// 5. If E committed before receiving D's update, the snapshot diverges
 #[tokio::test]
 async fn test_stateandvent_divergence_subscription() -> Result<()> {
     // Setup: Durable D and Ephemeral E connected
@@ -47,7 +46,7 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
 
     // 2. Ephemeral sets up a subscription via LiveQuery
     // This is key - query_wait establishes a predicate subscription with the server
-    // Future changes will come via StateAndEvent updates
+    // Future changes will come via StateAndEvents updates
     let _livequery = ctx_e.query_wait::<RecordView>(nocache(format!("id = '{}'", record_id).as_str())?).await?;
 
     // Verify ephemeral has the entity from subscription initialization
@@ -67,15 +66,15 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
     record_d.edit(&trx_c)?.artist()?.set(&"Artist-from-D".to_owned())?;
 
     // 4. D commits C first
-    // This triggers D to send StateAndEvent(C) to E via subscription
+    // This triggers D to send StateAndEvents(C) to E via subscription
     dag.enumerate(trx_c.commit_and_return_events().await?); // C
 
-    // Small delay to let StateAndEvent be sent (but not necessarily processed by E yet)
+    // Small delay to let StateAndEvents be sent (but not necessarily processed by E yet)
     tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     // 5. E commits B
-    // At this moment, E's local head may be [A] (if StateAndEvent(C) hasn't been processed)
-    // or [C] (if StateAndEvent(C) was already processed)
+    // At this moment, E's local head may be [A] (if StateAndEvents(C) hasn't been processed)
+    // or [C] (if StateAndEvents(C) was already processed)
     // Either way, the concurrent commit should work
     dag.enumerate(trx_b.commit_and_return_events().await?); // B
 
@@ -87,15 +86,15 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
     assert_eq!(final_d.title().unwrap(), "Title-from-E", "Durable should have E's title change");
     assert_eq!(final_d.artist().unwrap(), "Artist-from-D", "Durable should have D's artist change");
 
-    // THE BUG TEST: Verify ephemeral has BOTH changes
-    // If the bug is present, ephemeral will only have its own change (B) and not D's change (C)
+    // Verify ephemeral has BOTH changes: a divergent snapshot must merge its carried
+    // events rather than leave the ephemeral on its own branch (B) without D's change (C)
     let final_e = ctx_e.get::<RecordView>(record_id).await?;
 
     assert_eq!(final_e.title().unwrap(), "Title-from-E", "Ephemeral should have its own title change");
     assert_eq!(
         final_e.artist().unwrap(),
         "Artist-from-D",
-        "BUG CHECK: Ephemeral should have D's artist change via StateAndEvent divergence handling"
+        "Ephemeral should have D's artist change via StateAndEvents divergence handling"
     );
 
     // Verify DAG structure on durable
@@ -115,11 +114,11 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
     Ok(())
 }
 
-/// Test: Two ephemeral nodes with divergence via subscriptions
+/// Two ephemeral nodes with divergence via subscriptions.
 ///
 /// This test uses two ephemeral nodes with LiveQuery subscriptions.
 /// When one ephemeral commits, it goes to durable via CommitTransaction,
-/// then durable sends StateAndEvent to the OTHER ephemeral.
+/// then durable sends StateAndEvents to the OTHER ephemeral.
 #[tokio::test]
 async fn test_two_ephemeral_divergence_subscription() -> Result<()> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
@@ -167,7 +166,7 @@ async fn test_two_ephemeral_divergence_subscription() -> Result<()> {
     record_e1.edit(&trx_b)?.title()?.set(&"Title-from-E1".to_owned())?;
     record_e2.edit(&trx_c)?.artist()?.set(&"Artist-from-E2".to_owned())?;
 
-    // E1 commits B - goes to D via CommitTransaction, D sends StateAndEvent to E2
+    // E1 commits B - goes to D via CommitTransaction, D sends StateAndEvents to E2
     dag.enumerate(trx_b.commit_and_return_events().await?); // B
 
     // Small delay then E2 commits C
@@ -188,10 +187,10 @@ async fn test_two_ephemeral_divergence_subscription() -> Result<()> {
 
     // Ephemeral1 should have both changes
     assert_eq!(final_e1.title().unwrap(), "Title-from-E1", "E1 should have its own title");
-    assert_eq!(final_e1.artist().unwrap(), "Artist-from-E2", "BUG CHECK: E1 should have E2's artist via StateAndEvent");
+    assert_eq!(final_e1.artist().unwrap(), "Artist-from-E2", "E1 should have E2's artist via StateAndEvents");
 
     // Ephemeral2 should have both changes
-    assert_eq!(final_e2.title().unwrap(), "Title-from-E1", "BUG CHECK: E2 should have E1's title via StateAndEvent");
+    assert_eq!(final_e2.title().unwrap(), "Title-from-E1", "E2 should have E1's title via StateAndEvents");
     assert_eq!(final_e2.artist().unwrap(), "Artist-from-E2", "E2 should have its own artist");
 
     // Verify DAG structure

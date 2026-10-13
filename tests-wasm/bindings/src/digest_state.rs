@@ -7,7 +7,12 @@ use ankurah::{
 use std::sync::Mutex;
 
 type TestNode = Node<IndexedDBStorageEngine, PermissiveAgent>;
-type Responses = Arc<Mutex<Vec<proto::NodeResponseBody>>>;
+type Responses = Arc<Mutex<Vec<StateTraffic>>>;
+
+enum StateTraffic {
+    Response(proto::NodeResponseBody),
+    Frame(proto::StateFrame),
+}
 
 #[derive(Clone)]
 struct BrowserSender {
@@ -23,7 +28,10 @@ impl PeerSender for BrowserSender {
         let bytes = bincode::serialize(&message).map_err(anyhow::Error::from)?;
         let message = bincode::deserialize(&bytes).map_err(anyhow::Error::from)?;
         if let proto::NodeMessage::Response(response) = &message {
-            self.responses.lock().unwrap().push(response.body.clone());
+            self.responses.lock().unwrap().push(StateTraffic::Response(response.body.clone()));
+        } else if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = &message
+        {
+            self.responses.lock().unwrap().push(StateTraffic::Frame(frame.clone()));
         }
         wasm_bindgen_futures::spawn_local(async move {
             target.handle_message(message).await.expect("browser peer accepts serialized message");
@@ -56,20 +64,27 @@ fn items(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::Sta
     let ids: Vec<_> = replies
         .iter()
         .filter_map(|reply| match reply {
-            proto::NodeResponseBody::Fetch(state) if query.is_none() => Some(state.page.comparison),
-            proto::NodeResponseBody::QuerySubscribed { query_id, state } if Some(*query_id) == query => Some(state.page.comparison),
+            StateTraffic::Response(proto::NodeResponseBody::Fetch(state)) if query.is_none() => Some(state.frame.comparison),
+            StateTraffic::Response(proto::NodeResponseBody::QuerySubscribed { query_id, state }) if Some(*query_id) == query => {
+                Some(state.frame.comparison)
+            }
             _ => None,
         })
         .collect();
     replies
         .iter()
         .filter_map(|reply| match reply {
-            proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => Some(&state.page),
-            proto::NodeResponseBody::TreeCompared(page) => Some(page),
+            StateTraffic::Response(proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. }) => {
+                Some(&state.frame)
+            }
+            StateTraffic::Frame(frame) => Some(frame),
             _ => None,
         })
         .filter(|page| ids.contains(&page.comparison))
-        .flat_map(|page| page.items.clone())
+        .flat_map(|frame| match &frame.body {
+            proto::StateFrameBody::State { items, .. } => items.clone(),
+            _ => vec![],
+        })
         .collect()
 }
 

@@ -571,6 +571,7 @@ dependencies = [
  "gloo-timers 0.3.0",
  "js-sys",
  "serde",
+ "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

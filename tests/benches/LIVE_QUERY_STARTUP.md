@@ -1,83 +1,124 @@
-# Cold live-query performance
+# Cold and retained-query performance
 
-`live_query_startup` measures a new subscription on a new ephemeral node, using
-two real nodes, Sled, a two-worker Tokio runtime and serialized protocol messages.
-The identical source can run against the pre-digest public API. Its baseline is
-the branch point on main, `ebdb1727254c675a4d37236ecf23c16c06c4df12`.
+`live_query_startup` exercises two real nodes, Sled, two Tokio workers and
+serialized protocol messages. Identical source runs on the pre-digest public API
+at main `ebdb1727254c675a4d37236ecf23c16c06c4df12` and the candidate.
 
 ```sh
 STARTUP_LABEL=candidate cargo bench -p ankurah-tests --bench live_query_startup
 ```
 
-The environment controls the matrix:
-
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `STARTUP_SIZES` | `0,8,32,256,4096` | Server result sizes |
-| `STARTUP_RTT_MS` | `0,50` | Injected round-trip latency in milliseconds |
-| `STARTUP_CACHE` | `empty,half,all` | Local entity coverage before subscription |
-| `STARTUP_REPEATS` | `3` | Fresh-fixture repetitions of each case |
-| `STARTUP_LABEL` | `candidate` | Revision/run label in every JSON record |
+| `STARTUP_RTT_MS` | `0,50` | Propagation round trip in milliseconds |
+| `STARTUP_BPS` | `0` | Full-duplex bytes/second per direction; zero is unlimited |
+| `STARTUP_CACHE` | `empty,half,all` | Entity coverage before cold subscription |
+| `STARTUP_MODES` | `cold` | `cold,warm_refresh,warm_equal,warm_edit,warm_membership` |
+| `STARTUP_REPEATS` | `3` | Fresh-fixture repetitions |
+| `STARTUP_LABEL` | `candidate` | Revision label in every JSON record |
 
-The cache cases all start without an active query or retained query tree.
-`half` and `all` prefetch entities outside the timed interval. Node creation,
-catalog negotiation and server population are also excluded. The timed interval
-starts immediately before `query_wait` and ends after `wait_durable_answered`.
-The harness then verifies the exact membership and every applied entity state.
-Errors and a 180-second sample timeout fail the run rather than produce a fast
-but incomplete sample.
+Cold cases use a new client without an active or retained query tree. Partial
+and full entity cache come from Fetch outside the timed interval. Node creation,
+catalog negotiation, server population and prefetch are excluded from latency.
+`ready_us` starts immediately before `query_wait` and ends after
+`wait_durable_answered`: the durable response and local application must finish.
+`settled_us` also waits for the transport tail after exact verification, including
+acknowledgments. `initial_drained_us` and `settled_traffic` preserve the provisional
+pre-verification drain; asynchronous application can send further control traffic.
+Cold `elapsed_us` is `ready_us`.
 
-`STARTUP` JSON lines record elapsed microseconds, directional message counts and
-serialized bytes, largest message, returned selection rows/bytes, point reads,
-and requested events. Selection rows count returned materialized states, not all
-internal index scan visits. Traffic includes all node messages during the timed
-interval. Point/event counters describe calls or IDs requested through the
-StorageEngine API, not physical disk I/O or cache misses. Traffic
-excludes transport framing. Delay is per message; no bandwidth cap,
-packet loss or real socket cost is simulated. Entity IDs are minted normally, so
-repeat the workload to account for resulting tree-shape variation.
+Warm cases use `cache=all` and retain the same live query. `warm_refresh` keeps
+the connection and calls `update_selection_wait` with the same selection, then
+`wait_durable_answered`; the new version gives a portable applied `ready_us`.
+Query identity is retained; actual internal tree reuse must also be checked
+in implementation/work counters. The other warm cases disconnect/reconnect.
+`warm_equal` has no offline change. `warm_edit` edits one body while offline.
+`warm_membership` additionally moves one entity out of the predicate and adds
+another. Reconnection, including registration and catalog work it triggers, is
+timed. The baseline's durable-answer flag is sticky across reconnect, so the
+portable warm landmark requires a new QuerySubscribed to finish application and
+all transport tasks to drain. Reconnect `ready_us` is null. Its `elapsed_us` ends after exact membership
+and complete applied State verification, including the clock. `verification_us`
+reports that common O(N) check separately, and `transport_settled_us` records
+the earlier drained-link landmark. The verification-inclusive ratio can mask a
+transfer regression and must be assessed alongside transport time and work.
+A two-millisecond quiet confirmation is excluded from the drained-link timestamp
+but included in the verification-inclusive endpoint. Protocol acknowledgment
+tails can follow UI readiness. Every record requires successful exact verification. Zero-row cases use cold/empty only. `warm_refresh` also reports the true versioned readiness endpoint.
+
+The sender schedules serialization on a shared lane per direction, then adds
+RTT/2 propagation. Serialization overlaps propagation and both directions are
+independent. Scheduled delivery runs on real Tokio timers, whose granularity adds
+scheduling variation. There is no real socket, transport framing, packet loss,
+congestion control or physical network. Message counts are not round-trip counts
+when messages are pushed concurrently. A connection generation prevents delayed
+messages from an old link from crossing a reconnect.
+
+`STARTUP` JSON contains both landmarks, directional messages/bytes, largest
+message, returned selection rows/bytes, point reads and requested events. Work and traffic include the transfer and application through exact verification;
+`settled_traffic` preserves the provisional pre-verification snapshot. A final
+post-verification drain includes control traffic emitted by asynchronous activation. Selection rows count returned
+materialized states, not internal index visits. Storage counters describe public
+StorageEngine calls and requested IDs, not physical disk I/O or cache misses.
+The verifier's known direct point reads are subtracted from native work counts,
+while asynchronous application work during verification remains included. Random entity IDs produce tree
+shape variation. `PHASE` diagnostics identify setup or measurement hangs.
+A 180-second fixture timeout fails rather than producing an incomplete success.
 
 ## Comparing revisions
 
-Build both revisions with the same compiler, lockfile and optimized profile,
-copying only this benchmark source and target declaration into the baseline.
-Use separate Cargo target directories for the two source trees: sharing a target
-can reuse incompatible workspace artifacts even when the package versions match.
-Preserve each compiled executable separately; run them sequentially on the same
-quiet machine in alternating baseline/candidate order. Do not run timed samples
-while another build or benchmark is active. Retain raw samples and record source
-revisions, harness hash, compiler, machine, run order and settings.
-
-Use the comparison runner to isolate every fixture in a fresh process, alternate
-revision order, enforce an external deadline and preserve failed samples:
+Build both with the same compiler and optimized profile and verify shared package
+versions match. Keep the original lockfiles and document additional dependencies.
+Copy only this benchmark source and its target declaration into the baseline.
+Use separate Cargo target directories to avoid incompatible workspace artifact
+reuse; preserve each executable. Finish builds before timed sampling and keep the
+machine otherwise quiet.
 
 ```sh
 python3 tests/benches/compare_live_query_startup.py \
   --baseline /absolute/path/to/baseline-binary \
   --candidate /absolute/path/to/candidate-binary \
   --baseline-revision BASE_SHA --candidate-revision CANDIDATE_SHA \
+  --bandwidths 0,1250000 --repeats 7 \
   --output /absolute/path/to/new-results-directory
 ```
 
-Builds must finish before this runner starts. If lockfiles differ because the
-candidate adds dependencies, verify that shared dependency versions match and
-record the difference. Process isolation avoids carrying fixture teardown and
-background work from one sample into the next. A failed sample remains a failure,
-including when other repetitions succeed; raw output and sample counts are kept.
+The runner uses a fresh process per fixture, alternates AB/BA order, refuses to
+overwrite evidence, and saves every failure with its last phase and raw output.
+The default external deadline is 240 seconds. Whole-process child CPU, peak RSS
+and page faults cover setup, prefetch, warmup, transfer, verification and teardown;
+they are resource context, **not transfer-only CPU or memory**. Source/binary/runner
+hashes, compiler, machine, settings and execution order are retained.
 
-Compare each size/cache/RTT case separately: medians and the complete sample range,
-plus work and traffic. A few repetitions do not establish p95/p99 latency. Measure
-small-query startup as well as large transfer throughput; a warm reconnect win
-does not compensate for a material cold-start regression. Investigate repeatable
-increases before landing. Daniel has not accepted a numerical slowdown allowance.
+Compare each mode/size/cache/RTT/bandwidth case independently. Report medians,
+full ranges, standard deviation, median absolute deviation and paired differences,
+alongside work and traffic. Seven samples do not establish p95/p99 latency. Failed
+samples remain failures even if other repetitions succeed. The original two baseline 30-second deadlines have no phase diagnostics.
+Instrumented replay reproduced both workload types hanging in catalog startup:
+the original fixture allowed zero-latency requests to arrive before server-side
+peer registration, where baseline request handling silently ignored them. The
+identical harness now completes server-side registration first. Historical failed
+samples remain failures; replay does not retroactively give them timing values.
 
-For baseline runs the old implementation can send a whole result in one message;
-report that largest-message cost alongside latency. It is a performance reference,
-not a reason to remove bounds from the new protocol. Similarly, cached data may
-still require full tree construction in the candidate: do not call it a warm-tree
-measurement.
+A warm reconnect win does not compensate for a cold startup regression. Small
+query latency and bulk throughput both matter. Daniel has not accepted a numerical
+slowdown allowance. The baseline can send an entire result in one message; report
+its largest-message cost alongside latency. Its performance does not justify
+removing bounds from the new protocol. These native fixtures do not qualify
+million-row scaling, concurrent writes, browser storage or retained allocation
+bounds; those need separate evidence.
 
-Full release qualification separately adds bandwidth limits, concurrent writes,
-browser runs, peak allocations/retained memory and million-row cases after the
-bounded data-source work. These small native measurements alone do not qualify
-those paths. Steady-state live updates remain a separate regression concern.
+## Browser fixtures
+
+`tests-wasm/bindings/src/query_parity.rs` and `src/query-parity.test.ts` use
+the same public-API operations against two IndexedDB nodes with serialized
+messages, directional bandwidth lanes and `performance.now`. Copy the module,
+its declaration, serde_json dependency and test identically into the baseline.
+Build both wasm artifacts with the same release profile and wasm-pack version.
+The default Vitest matrix is functional smoke coverage, not performance evidence.
+Configure `VITE_QUERY_PARITY_SIZES`, `RTTS`, `BPS`, `MODES`, `CACHE`, `REPEATS`
+and `LABEL` using the `VITE_QUERY_PARITY_` prefix; records start `BROWSER_STARTUP`.
+Use fresh browser contexts per measured fixture, alternating baseline/candidate,
+and retain browser version, module/wasm hashes and raw failures. Browser timer
+granularity and IndexedDB task scheduling are part of these measurements.

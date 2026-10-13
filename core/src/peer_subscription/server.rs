@@ -58,10 +58,17 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
 
             if let Some(node) = weak_node.upgrade() {
                 let items = update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect();
-                let result = updates.lock().unwrap().send(&node, peer_id, proto::NodeUpdateBody::SubscriptionUpdate { items });
+                let result = updates.lock().unwrap().send(&node, peer_id, items);
                 if let Err(error) = result {
-                    warn!(%peer_id, %error, "failed to serialize a subscription update; disconnecting peer");
-                    node.deregister_peer(peer_id);
+                    let restarting = error.downcast_ref::<delivery::LiveStreamFailure>().is_some_and(|failed| {
+                        node.peer_connections.get(&peer_id).is_some_and(|peer| peer.comparisons.get(&failed.0).is_some())
+                    });
+                    if restarting {
+                        warn!(%peer_id, %error, "subscription stream rejected an update; awaiting its explicit restart");
+                    } else {
+                        warn!(%peer_id, %error, "subscription delivery failed; disconnecting peer");
+                        node.deregister_peer(peer_id);
+                    }
                 }
             }
         });
@@ -89,7 +96,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         }
         let removed = self.subscription.remove_predicate(query_id);
         queries.remove(&query_id);
-        self.delivery.lock().unwrap().release(node, self.peer_id, query_id);
+        self.delivery.lock().unwrap().remove(query_id);
         removed
     }
 
@@ -158,6 +165,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 states.push(Attested::opt(state, attestation));
             }
             let snapshot = tree.refresh(spec, states).await?;
+            let members = snapshot.states.keys().copied().collect::<Vec<_>>();
             let state = node
                 .start_comparison(
                     self.peer_id,
@@ -170,9 +178,16 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                     known_state,
                 )
                 .await?;
-            if !self.delivery.lock().unwrap().bind(query_id, version, state.page.comparison) {
-                peer.comparisons.remove(&state.page.comparison);
-                return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: state.page.comparison });
+            let bound = self.delivery.lock().unwrap().bind(query_id, version, state.frame.comparison, members, node, self.peer_id);
+            let bound = match bound {
+                Ok(bound) => bound,
+                Err(error) => {
+                    return Err(error);
+                }
+            };
+            if !bound {
+                peer.comparisons.remove(&state.frame.comparison);
+                return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: state.frame.comparison });
             }
             Ok(proto::NodeResponseBody::QuerySubscribed { query_id, state })
         }
@@ -180,14 +195,15 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if response.is_err() {
             queries.remove(&query_id);
             let _ = self.subscription.remove_predicate(query_id);
-            self.delivery.lock().unwrap().release(node, self.peer_id, query_id);
+            self.delivery.lock().unwrap().remove(query_id);
+            peer.comparisons.invalidate_query(query_id);
         }
         response
     }
 
     pub(crate) async fn finish_comparison<SE, PA>(
         &self,
-        node: &Node<SE, PA>,
+        _node: &Node<SE, PA>,
         query: proto::QueryId,
         version: u32,
         comparison: proto::ComparisonId,
@@ -205,8 +221,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if outcome == proto::ComparisonOutcome::Abandoned {
             queries.remove(&query);
             let _ = self.subscription.remove_predicate(query);
+            delivery.remove(query);
         }
-        delivery.release(node, self.peer_id, query);
         Ok(())
     }
 }
@@ -236,8 +252,10 @@ where
     // Events should already be attested
     let attested_events = item.events;
 
-    // Determine content based on whether we have events
-    let content = proto::UpdateContent::StateAndEvent(attested_state.into(), attested_events.into_iter().map(|e| e.into()).collect());
+    let content = proto::DeltaContent::StateAndEvents {
+        state: attested_state.into(),
+        events: attested_events.into_iter().map(|e| e.into()).collect(),
+    };
 
     // Convert predicate relevance from reactor types to proto types
     let predicate_relevance = item
@@ -254,5 +272,5 @@ where
         .collect();
 
     // Create subscription update item
-    Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), content, predicate_relevance })
+    Some(proto::SubscriptionUpdateItem { delta: proto::EntityDelta { entity_id: item.entity.id(), content }, predicate_relevance })
 }

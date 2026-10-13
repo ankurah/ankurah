@@ -65,8 +65,10 @@ fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) 
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
-        entity_id: event.entity_id,
-        content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
+        delta: proto::EntityDelta {
+            entity_id: event.entity_id,
+            content: proto::DeltaContent::EventBridge { events: vec![Attested::opt(event, None).into()] },
+        },
         predicate_relevance: vec![],
     }
 }
@@ -75,8 +77,10 @@ fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
 /// wire order, which the receiver must not trust).
 fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
-        entity_id,
-        content: proto::UpdateContent::EventOnly(events.into_iter().map(|e| Attested::opt(e, None).into()).collect()),
+        delta: proto::EntityDelta {
+            entity_id,
+            content: proto::DeltaContent::EventBridge { events: events.into_iter().map(|e| Attested::opt(e, None).into()).collect() },
+        },
         predicate_relevance: vec![],
     }
 }

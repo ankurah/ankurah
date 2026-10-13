@@ -1,4 +1,4 @@
-//! Cold SubscribeQuery measurements through public APIs, portable to the
+//! Cold SubscribeQuery and retained-query reconnect measurements through public APIs, portable to the
 //! pre-digest baseline. Run with `cargo bench -p ankurah-tests --bench live_query_startup`.
 //! Environment: STARTUP_SIZES=0,8,32,256,4096 STARTUP_RTT_MS=0,50
 //! STARTUP_REPEATS=3 STARTUP_CACHE=empty,half,all STARTUP_LABEL=candidate.
@@ -6,8 +6,8 @@
 //! A new client/query is used for every sample. Catalog negotiation and optional
 //! entity prefetch are excluded; initialization through durable answer and local
 //! application is included. Both directions actually encode/decode the messages.
-//! Delay is injected per message on a real runtime; it models latency, not a
-//! bandwidth limit. Bytes exclude transport framing. No wall-clock CI threshold.
+//! Propagation delay and optional full-duplex bandwidth limits are injected.
+//! STARTUP_MODES=cold,warm_equal,warm_edit,warm_membership STARTUP_BPS=0,1250000. Bytes exclude transport framing. No wall-clock CI threshold.
 
 use std::{
     collections::BTreeSet,
@@ -23,7 +23,7 @@ use ankurah::{
     },
     error::{MutationError, RetrievalError},
     policy::DEFAULT_CONTEXT,
-    proto, Model, Node, PermissiveAgent,
+    proto, Model, Mutable, Node, PermissiveAgent,
 };
 use ankurah_storage_sled::SledStorageEngine;
 use async_trait::async_trait;
@@ -43,6 +43,17 @@ struct Reads {
     point_reads: usize,
     event_calls: usize,
     requested_events: usize,
+}
+
+impl Reads {
+    fn add(&mut self, other: Self) {
+        self.selections += other.selections;
+        self.returned_states += other.returned_states;
+        self.returned_state_bytes += other.returned_state_bytes;
+        self.point_reads += other.point_reads;
+        self.event_calls += other.event_calls;
+        self.requested_events += other.requested_events;
+    }
 }
 
 struct Counted {
@@ -92,7 +103,7 @@ impl StorageEngine for Counted {
     fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) { self.inner.set_catalog_resolver(resolver); }
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 struct Traffic {
     requester_messages: usize,
     responder_messages: usize,
@@ -105,6 +116,12 @@ struct Traffic {
 struct Meter {
     measuring: bool,
     connected: bool,
+    generation: usize,
+    pending: usize,
+    subscriptions_applied: usize,
+    last_activity: Option<Instant>,
+    uplink_free: Option<Instant>,
+    downlink_free: Option<Instant>,
     traffic: Traffic,
     errors: Vec<String>,
 }
@@ -118,6 +135,7 @@ struct Sender {
     requester: bool,
     one_way: Duration,
     meter: Arc<Mutex<Meter>>,
+    bytes_per_second: u64,
 }
 
 #[async_trait]
@@ -125,11 +143,25 @@ impl PeerSender for Sender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         let node = self.target.upgrade().ok_or(SendError::ConnectionClosed)?;
         let bytes = bincode::serialize(&message).expect("encode node message");
-        {
+        let (generation, arrival) = {
             let mut meter = self.meter.lock().unwrap();
             if !meter.connected {
                 return Err(SendError::ConnectionClosed);
             }
+            let now = Instant::now();
+            let lane = if self.requester { &mut meter.uplink_free } else { &mut meter.downlink_free };
+            let begin = lane.unwrap_or(now).max(now);
+            let transmission = if self.bytes_per_second == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_secs_f64(bytes.len() as f64 / self.bytes_per_second as f64)
+            };
+            // Full-duplex FIFO link: serialization is shared by messages in each
+            // direction; propagation overlaps subsequent serialization.
+            let departure = begin + transmission;
+            *lane = Some(departure);
+            meter.pending += 1;
+            meter.last_activity = Some(now);
             if meter.measuring {
                 let traffic = &mut meter.traffic;
                 if self.requester {
@@ -141,23 +173,34 @@ impl PeerSender for Sender {
                 }
                 traffic.max_message_bytes = traffic.max_message_bytes.max(bytes.len());
             }
-        }
+            (meter.generation, departure + self.one_way)
+        };
         let meter = self.meter.clone();
-        let one_way = self.one_way;
         tokio::spawn(async move {
-            if !one_way.is_zero() {
-                tokio::time::sleep(one_way).await;
+            if arrival > Instant::now() {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(arrival)).await;
             }
-            if !meter.lock().unwrap().connected {
-                return;
-            }
-            let message = bincode::deserialize(&bytes).expect("decode node message");
-            if let Err(error) = node.handle_message(message).await {
+            let current = {
+                let meter = meter.lock().unwrap();
+                meter.connected && meter.generation == generation
+            };
+            if current {
+                let message = bincode::deserialize(&bytes).expect("decode node message");
+                let subscribed = matches!(&message, proto::NodeMessage::Response(response)
+                    if matches!(response.body, proto::NodeResponseBody::QuerySubscribed { .. }));
+                let result = node.handle_message(message).await;
                 let mut meter = meter.lock().unwrap();
-                if meter.connected {
-                    meter.errors.push(error.to_string());
+                if meter.connected && meter.generation == generation {
+                    if let Err(error) = result {
+                        meter.errors.push(error.to_string());
+                    } else if subscribed {
+                        meter.subscriptions_applied += 1;
+                    }
                 }
             }
+            let mut meter = meter.lock().unwrap();
+            meter.pending -= 1;
+            meter.last_activity = Some(Instant::now());
         });
         Ok(())
     }
@@ -165,43 +208,77 @@ impl PeerSender for Sender {
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-async fn connect(server: &TestNode, client: &TestNode, rtt_ms: u64, meter: &Arc<Mutex<Meter>>) -> anyhow::Result<()> {
+async fn connect(
+    server: &TestNode,
+    client: &TestNode,
+    rtt_ms: u64,
+    bytes_per_second: u64,
+    meter: &Arc<Mutex<Meter>>,
+) -> anyhow::Result<()> {
     let one_way = Duration::from_micros(rtt_ms * 500);
-    meter.lock().unwrap().connected = true;
-    client
-        .register_peer(
-            server.presence().await?,
-            Box::new(Sender { target: server.weak(), recipient: server.id, requester: true, one_way, meter: meter.clone() }),
-        )
-        .await?;
+    {
+        let mut meter = meter.lock().unwrap();
+        meter.connected = true;
+        meter.generation += 1;
+        meter.uplink_free = None;
+        meter.downlink_free = None;
+    }
+    // Match a completed presence handshake before relay startup can send.
     server
         .register_peer(
             client.presence().await?,
-            Box::new(Sender { target: client.weak(), recipient: client.id, requester: false, one_way, meter: meter.clone() }),
+            Box::new(Sender {
+                target: client.weak(),
+                recipient: client.id,
+                requester: false,
+                one_way,
+                meter: meter.clone(),
+                bytes_per_second,
+            }),
+        )
+        .await?;
+    client
+        .register_peer(
+            server.presence().await?,
+            Box::new(Sender {
+                target: server.weak(),
+                recipient: server.id,
+                requester: true,
+                one_way,
+                meter: meter.clone(),
+                bytes_per_second,
+            }),
         )
         .await?;
     client.wait_ready().await?;
     Ok(())
 }
 
-async fn sample(n: usize, cache: &str, rtt_ms: u64, repeat: usize, label: &str) -> anyhow::Result<()> {
+async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second: u64, repeat: usize, label: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(["cold", "warm_equal", "warm_edit", "warm_membership", "warm_refresh"].contains(&mode), "unknown mode: {mode}");
+    phase("server-create");
     let server = Node::new_durable(Arc::new(Counted::new()?), PermissiveAgent::new());
     server.system.create().await?;
     let writer = server.context_async(DEFAULT_CONTEXT).await?;
     let trx = writer.begin();
     let mut expected = BTreeSet::new();
+    let mut rows = Vec::new();
     for position in 0..n {
         let row = trx.create(&StartupRow { position: position as i64, body: format!("row-{position:08}") }).await?;
         expected.insert(ankurah::Mutable::id(&*row));
+        rows.push(row.read()?);
     }
     trx.commit().await?;
+    phase("server-populated");
     // Also register the model in the empty-result case.
     writer.resolve_model_id::<StartupRow>().await?;
     let client = Node::new(Arc::new(Counted::new()?), PermissiveAgent::new());
     let meter = Arc::new(Mutex::new(Meter::default()));
-    connect(&server, &client, rtt_ms, &meter).await?;
+    phase("connect-catalog");
+    connect(&server, &client, rtt_ms, bytes_per_second, &meter).await?;
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
     reader.resolve_model_id::<StartupRow>().await?;
+    phase("prefetch");
     let cached = match cache {
         "empty" => 0,
         "half" => reader.fetch::<StartupRowView>(format!("position < {}", n / 2)).await?.len(),
@@ -217,45 +294,155 @@ async fn sample(n: usize, cache: &str, rtt_ms: u64, repeat: usize, label: &str) 
         },
         "prefetch coverage"
     );
+    settle(&meter, 0).await?;
+    let retained_query = if mode == "cold" {
+        None
+    } else {
+        phase("warm-tree-initialize");
+        let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
+        query.wait_durable_answered().await?;
+        settle(&meter, 1).await?;
+        if mode != "warm_refresh" {
+            disconnect(&server, &client, &meter);
+            settle(&meter, 0).await?;
+        }
+        if mode == "warm_edit" || mode == "warm_membership" {
+            let trx = writer.begin();
+            rows[n / 2].edit(&trx)?.body()?.replace("offline-edit")?;
+            if mode == "warm_membership" {
+                rows[0].edit(&trx)?.position()?.set(&-1)?;
+                expected.remove(&rows[0].id());
+                let added = trx.create(&StartupRow { position: n as i64, body: "offline-added".into() }).await?;
+                expected.insert(ankurah::Mutable::id(&*added));
+            }
+            trx.commit().await?;
+        }
+        Some(query)
+    };
     server.storage.take();
     client.storage.take();
-    {
+    let subscriptions_before = {
         let mut meter = meter.lock().unwrap();
         anyhow::ensure!(meter.errors.is_empty(), "setup peer errors: {:?}", meter.errors);
+        meter.traffic = Traffic::default();
         meter.measuring = true;
-    }
+        meter.subscriptions_applied
+    };
+    phase("measure");
     let start = Instant::now();
-    let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
-    query.wait_durable_answered().await?;
-    let elapsed_us = start.elapsed().as_micros();
+    let (query, ready_us) = if let Some(query) = retained_query {
+        if mode == "warm_refresh" {
+            query.update_selection_wait("position >= 0").await?;
+            query.wait_durable_answered().await?;
+            let ready_us = start.elapsed().as_micros();
+            (query, Some(ready_us))
+        } else {
+            connect(&server, &client, rtt_ms, bytes_per_second, &meter).await?;
+            (query, None)
+        }
+    } else {
+        let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
+        query.wait_durable_answered().await?;
+        let ready_us = start.elapsed().as_micros();
+        (query, Some(ready_us))
+    };
+    let settled = settle(&meter, subscriptions_before + 1).await?;
+    let initial_drained_us = settled.duration_since(start).as_micros();
+    let settled_traffic = meter.lock().unwrap().traffic.clone();
+    let mut server_reads = server.storage.take();
+    let mut client_reads = client.storage.take();
+    phase("verify-applied");
+    let verification_start = Instant::now();
+    let mut verification_attempts = 0;
+    let mut verification_client_point_reads = 0;
+    while query.ids().into_iter().collect::<BTreeSet<_>>() != expected {
+        anyhow::ensure!(ready_us.is_none(), "ready query has incorrect authoritative membership");
+        verification_attempts += 1;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    // Reconnect has no portable re-answer generation API on the baseline. Await
+    // exact final state rather than mistaking a drained response for application.
+    for id in &expected {
+        let remote = server.storage.get_state(*id).await?;
+        loop {
+            verification_attempts += 1;
+            verification_client_point_reads += 1;
+            match client.storage.get_state(*id).await {
+                Ok(local) if local.payload.state == remote.payload.state => break,
+                Ok(_) | Err(_) if ready_us.is_none() => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                Ok(_) => anyhow::bail!("ready query has incorrect applied state for {id}"),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    let verification_us = verification_start.elapsed().as_micros();
+    let verified_us = start.elapsed().as_micros();
+    let elapsed_us = ready_us.unwrap_or(verified_us);
+    let final_settled = settle(&meter, subscriptions_before + 1).await?;
+    let transport_settled_us = final_settled.duration_since(start).as_micros();
+    let settled_us = transport_settled_us.max(ready_us.unwrap_or(verified_us));
+    let mut server_tail_reads = server.storage.take();
+    let mut client_tail_reads = client.storage.take();
+    // Application can continue asynchronously after transport drains. Retain
+    // its work while subtracting only the verifier's known direct point reads.
+    server_tail_reads.point_reads -= expected.len();
+    client_tail_reads.point_reads -= verification_client_point_reads;
+    server_reads.add(server_tail_reads);
+    client_reads.add(client_tail_reads);
+
     let traffic = {
         let mut meter = meter.lock().unwrap();
         meter.measuring = false;
         anyhow::ensure!(meter.errors.is_empty(), "measured peer errors: {:?}", meter.errors);
         std::mem::take(&mut meter.traffic)
     };
-    let server_reads = server.storage.take();
-    let client_reads = client.storage.take();
-    assert_eq!(query.ids().into_iter().collect::<BTreeSet<_>>(), expected, "authoritative membership");
-    // Validate all payloads outside the timed region, not just their count.
-    for id in expected {
-        let local = client.storage.get_state(id).await?;
-        let remote = server.storage.get_state(id).await?;
-        assert_eq!(local.payload.state, remote.payload.state, "applied entity state");
-    }
     println!(
         "STARTUP {}",
         serde_json::json!({
             "label":label, "entities":n, "cache":cache, "cached_entities":cached,
+            "mode":mode, "bandwidth_bytes_per_second":bytes_per_second,
             "rtt_ms":rtt_ms, "repeat":repeat, "elapsed_us":elapsed_us,
-            "traffic":traffic, "server_reads":server_reads, "client_reads":client_reads,
+            "ready_us":ready_us, "initial_drained_us":initial_drained_us,
+            "settled_us":settled_us, "transport_settled_us":transport_settled_us,
+            "verified_us":verified_us, "verification_us":verification_us, "verification_attempts":verification_attempts, "verified":true,
+            "traffic":traffic, "settled_traffic":settled_traffic, "server_reads":server_reads, "client_reads":client_reads,
         })
     );
+    disconnect(&server, &client, &meter);
+    drop(query);
+    Ok(())
+}
+
+fn phase(name: &str) {
+    eprintln!("PHASE {name}");
+}
+
+fn disconnect(server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) {
     meter.lock().unwrap().connected = false;
     server.deregister_peer(client.id);
     client.deregister_peer(server.id);
-    drop(query);
-    Ok(())
+}
+
+/// Public durable-answer flags are sticky on the old baseline across reconnect.
+/// A new QuerySubscribed application plus a drained link is the portable fully
+/// settled landmark. The 2 ms confirmation is excluded from the recorded time.
+async fn settle(meter: &Arc<Mutex<Meter>>, subscriptions: usize) -> anyhow::Result<Instant> {
+    let quiet_begin = Instant::now();
+    loop {
+        {
+            let meter = meter.lock().unwrap();
+            anyhow::ensure!(meter.errors.is_empty(), "peer errors: {:?}", meter.errors);
+            if meter.pending == 0 && meter.subscriptions_applied >= subscriptions {
+                let last = meter.last_activity.unwrap_or_else(Instant::now);
+                if last.max(quiet_begin).elapsed() >= Duration::from_millis(2) {
+                    return Ok(last);
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
 }
 
 fn numbers(name: &str, default: &str) -> anyhow::Result<Vec<usize>> {
@@ -265,6 +452,8 @@ fn numbers(name: &str, default: &str) -> anyhow::Result<Vec<usize>> {
 fn main() -> anyhow::Result<()> {
     let sizes = numbers("STARTUP_SIZES", "0,8,32,256,4096")?;
     let rtts = numbers("STARTUP_RTT_MS", "0,50")?;
+    let bandwidths = numbers("STARTUP_BPS", "0")?;
+    let modes = std::env::var("STARTUP_MODES").unwrap_or_else(|_| "cold".into());
     let repeats: usize = std::env::var("STARTUP_REPEATS").unwrap_or_else(|_| "3".into()).parse()?;
     let caches = std::env::var("STARTUP_CACHE").unwrap_or_else(|_| "empty,half,all".into());
     let label = std::env::var("STARTUP_LABEL").unwrap_or_else(|_| "candidate".into());
@@ -273,11 +462,19 @@ fn main() -> anyhow::Result<()> {
         for repeat in 0..repeats {
             for &n in &sizes {
                 for &rtt in &rtts {
-                    for cache in caches.split(',') {
-                        if n == 0 && cache != "empty" {
-                            continue;
+                    for &bps in &bandwidths {
+                        for mode in modes.split(',') {
+                            for cache in caches.split(',') {
+                                if (n == 0 && cache != "empty") || (mode != "cold" && (n == 0 || cache != "all")) {
+                                    continue;
+                                }
+                                tokio::time::timeout(
+                                    Duration::from_secs(180),
+                                    sample(n, cache, mode, rtt as u64, bps as u64, repeat, &label),
+                                )
+                                .await??;
+                            }
                         }
-                        tokio::time::timeout(Duration::from_secs(180), sample(n, cache, rtt as u64, repeat, &label)).await??;
                     }
                 }
             }

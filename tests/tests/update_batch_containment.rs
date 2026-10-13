@@ -28,8 +28,10 @@ fn forge_title_event(title_prop: proto::PropertyId, entity_id: proto::EntityId, 
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
     proto::SubscriptionUpdateItem {
-        entity_id: event.entity_id,
-        content: proto::UpdateContent::EventOnly(vec![Attested::opt(event, None).into()]),
+        delta: proto::EntityDelta {
+            entity_id: event.entity_id,
+            content: proto::DeltaContent::EventBridge { events: vec![Attested::opt(event, None).into()] },
+        },
         predicate_relevance: vec![],
     }
 }
@@ -87,8 +89,12 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
 
     let item = proto::SubscriptionUpdateItem {
-        entity_id: rec_id,
-        content: proto::UpdateContent::EventOnly(vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()]),
+        delta: proto::EntityDelta {
+            entity_id: rec_id,
+            content: proto::DeltaContent::EventBridge {
+                events: vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()],
+            },
+        },
         predicate_relevance: vec![],
     };
     let update = proto::NodeUpdate {

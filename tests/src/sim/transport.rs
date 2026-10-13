@@ -99,12 +99,14 @@ fn semantic_descriptor(message: &proto::NodeMessage) -> String {
         proto::NodeMessage::Response(response) => {
             format!("RESP {}", response_descriptor(&response.body))
         }
-        proto::NodeMessage::Update(update) => {
-            let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
-            let mut parts: Vec<String> = items.iter().map(update_item_descriptor).collect();
-            parts.sort();
-            format!("UPD [{}]", parts.join(","))
-        }
+        proto::NodeMessage::Update(update) => match &update.body {
+            proto::NodeUpdateBody::SubscriptionUpdate { items } => {
+                let mut parts: Vec<String> = items.iter().map(update_item_descriptor).collect();
+                parts.sort();
+                format!("UPD [{}]", parts.join(","))
+            }
+            proto::NodeUpdateBody::StateFrame { frame, .. } => format!("FRAME {}", frame_descriptor(frame)),
+        },
         proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
         proto::NodeMessage::UnsubscribeQuery { .. } => "UNSUB".to_string(),
     }
@@ -131,7 +133,9 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
         proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
-        proto::NodeRequestBody::CompareTree { answers, .. } => format!("compare {}", payload_digest(answers)),
+        proto::NodeRequestBody::ContinueState { processed_through, answers, .. } => {
+            format!("continue {processed_through} {}", payload_digest(answers))
+        }
         proto::NodeRequestBody::CloseComparison { outcome, .. } => format!("close {outcome:?}"),
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
@@ -160,7 +164,6 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { state, .. } => format!("subscribed {}", state_descriptor(state)),
-        proto::NodeResponseBody::TreeCompared(page) => format!("compared {}", payload_digest(&(&page.items, page.progress))),
         proto::NodeResponseBody::ComparisonUnavailable { .. } => "comparison unavailable".into(),
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
@@ -170,7 +173,20 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
 }
 
 fn state_descriptor(state: &proto::StateReply) -> String {
-    payload_digest(&(&state.spec, &state.scope, &state.page.items, state.page.progress))
+    format!("{} {}", payload_digest(&(&state.spec, &state.scope)), frame_descriptor(&state.frame))
+}
+
+fn frame_descriptor(frame: &proto::StateFrame) -> String {
+    let body = match &frame.body {
+        proto::StateFrameBody::State { items, progress } => format!("state {}", payload_digest(&(items, progress))),
+        proto::StateFrameBody::Live(items) => format!("live [{}]", items.iter().map(update_item_descriptor).collect::<Vec<_>>().join(",")),
+        proto::StateFrameBody::LiveChunk { chunk, predicate_relevance } => {
+            let membership: Vec<_> = predicate_relevance.iter().map(|(_, change)| change).collect();
+            format!("livechunk {}", payload_digest(&(chunk, membership)))
+        }
+        proto::StateFrameBody::RestartRequired => "restart".into(),
+    };
+    format!("{} {body}", frame.sequence)
 }
 
 /// Compare actual comparison payloads, excluding their random session id.
@@ -182,18 +198,21 @@ fn payload_digest(payload: &impl serde::Serialize) -> String {
 }
 
 fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
-    let entity = item.entity_id;
-    let kind = match &item.content {
-        proto::UpdateContent::EventOnly(fragments) => format!("eventonly:{}", fragment_ids(entity, fragments)),
-        proto::UpdateContent::StateAndEvent(state, fragments) => {
+    let entity = item.delta.entity_id;
+    let kind = match &item.delta.content {
+        proto::DeltaContent::EventBridge { events } => format!("eventbridge:{}", fragment_ids(entity, events)),
+        proto::DeltaContent::StateAndEvents { state, events } => {
             // The state fragment's head clock identifies the snapshot content
             // deterministically (state buffers are a BTreeMap, the head is
             // sorted), so hashing the head plus the event ids distinguishes two
             // batches that differ only in payload.
-            format!("stateandevent:head={}:{}", state.state.head.to_base64_short(), fragment_ids(entity, fragments))
+            format!("stateandevents:head={}:{}", state.state.head.to_base64_short(), fragment_ids(entity, events))
         }
+        proto::DeltaContent::StateSnapshot { state } => format!("snapshot:{}", payload_digest(state)),
+        proto::DeltaContent::StateAndRelation { state, relation } => format!("staterelation:{}", payload_digest(&(state, relation))),
     };
-    format!("{}/{}", entity.to_base64_short(), kind)
+    let membership: Vec<_> = item.predicate_relevance.iter().map(|(_, change)| change).collect();
+    format!("{}/{} relevance:{}", entity.to_base64_short(), kind, payload_digest(&membership))
 }
 
 /// Sorted, joined content-derived event ids for a set of `EventFragment`s.

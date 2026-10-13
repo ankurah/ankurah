@@ -1,27 +1,42 @@
 use super::*;
 use crate::{
     entity::Entity,
-    error::LineageError,
-    policy::PermissiveAgent,
+    error::{LineageError, ValidationError},
+    policy::{AccessDenied, DefaultContext, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT},
     property::backend::{lww::LWWBackend, PropertyBackend},
     retrieval::LocalEventGetter,
     test_utils::TestStorage,
+    util::Iterable,
     value::Value,
 };
+use ankql::ast::{Predicate, Resolved};
 use proto::{
     AuthorId, Clock, EntityId, Event, EventId, EventStructureError, Membership, ModelId, Operation, OperationSet, PropertyId, State,
 };
+use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc};
 
 fn model_a() -> ModelId { ModelId::EntityId(EntityId::from_bytes([1; 32])) }
 fn model_b() -> ModelId { ModelId::EntityId(EntityId::from_bytes([2; 32])) }
 fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([3; 32])) }
+fn other_property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([6; 32])) }
+fn peer() -> EntityId { EntityId::from_bytes([5; 32]) }
 
-fn value_operation(value: &str) -> anyhow::Result<Operation> {
+fn set(property: PropertyId, value: &str) -> anyhow::Result<Operation> {
     let backend = LWWBackend::new();
-    backend.set(property(), Some(Value::String(value.into())));
+    backend.set(property, Some(Value::String(value.into())));
     Ok(Operation::Backend { backend: "lww".into(), operations: backend.to_operations()?.unwrap() })
 }
+
+fn value_operation(value: &str) -> anyhow::Result<Operation> { set(property(), value) }
+
+fn fragment(state: State) -> proto::StateFragment { proto::StateFragment { state, attestations: Default::default() } }
+
+fn fragments(events: impl IntoIterator<Item = Event>) -> Vec<proto::EventFragment> {
+    events.into_iter().map(|event| Attested::opt(event, None).into()).collect()
+}
+
+fn values(entity: &Entity) -> anyhow::Result<BTreeMap<PropertyId, Option<Value>>> { Ok(entity.values()?.into_iter().collect()) }
 
 struct Fixture {
     node: Node<TestStorage, PermissiveAgent>,
@@ -54,64 +69,56 @@ impl Fixture {
         Ok(())
     }
 
-    async fn apply_snapshot(&self, ingress: SnapshotIngress, state: State, event: Event) -> Result<(), MutationError> {
-        let states = LocalStateGetter::new(self.storage.clone());
-        let state = proto::StateFragment { state, attestations: Default::default() };
-        let peer = EntityId::from_bytes([5; 32]);
-        match ingress {
-            SnapshotIngress::Snapshot => {
-                let delta = proto::EntityDelta { entity_id: self.entity.id(), content: proto::DeltaContent::StateSnapshot { state } };
-                NodeApplier::apply_delta(&self.node, &peer, delta, &self.events, &states).await?;
+    /// Deliver one delta for the fixture's entity.
+    async fn apply(&self, content: proto::DeltaContent, delivery: Delivery) -> Result<DeltaOutcome, MutationError> {
+        let delta = proto::EntityDelta { entity_id: self.entity.id(), content };
+        NodeApplier::apply_delta(&self.node, &peer(), delta, delivery, &self.events, &LocalStateGetter::new(self.storage.clone())).await
+    }
+
+    /// The sender's branch: `event` applied over the fixture's current state, as the sender would snapshot it.
+    async fn remote_snapshot(&self, event: &Event) -> anyhow::Result<State> {
+        let fork = RemoteTrxEntity::edit(&self.entity)?;
+        fork.apply_events(&self.events, &mut [Attested::from(event.clone())], |_| Ok(None)).await?;
+        Ok(fork.to_state()?)
+    }
+
+    async fn apply_snapshot(&self, ingress: SnapshotIngress, state: State, event: Event) -> Result<DeltaOutcome, MutationError> {
+        let (content, delivery) = match ingress {
+            SnapshotIngress::InitialSnapshot => (proto::DeltaContent::StateSnapshot { state: fragment(state) }, Delivery::Initial),
+            SnapshotIngress::LiveStateAndEvents | SnapshotIngress::DivergedLiveStateAndEvents => {
+                (proto::DeltaContent::StateAndEvents { state: fragment(state), events: fragments([event]) }, Delivery::Live)
             }
-            SnapshotIngress::StateAndEvent | SnapshotIngress::DivergedStateAndEvent => {
-                let update = proto::SubscriptionUpdateItem {
-                    entity_id: self.entity.id(),
-                    content: proto::UpdateContent::StateAndEvent(state, vec![Attested::opt(event, None).into()]),
-                    predicate_relevance: vec![],
-                };
-                NodeApplier::apply_update(&self.node, &peer, update, &self.events, &states).await?;
-            }
-        }
-        Ok(())
+        };
+        self.apply(content, delivery).await
+    }
+
+    /// Deliver `events` for the fixture's entity through `ingress`; a state shape carries the current state.
+    async fn deliver(&self, ingress: EventIngress, events: Vec<Event>) -> Result<DeltaOutcome, MutationError> {
+        let (content, delivery) = match ingress {
+            EventIngress::LiveBridge => (proto::DeltaContent::EventBridge { events: fragments(events) }, Delivery::Live),
+            EventIngress::LiveStateAndEvents => (
+                proto::DeltaContent::StateAndEvents { state: fragment(self.entity.to_state()?), events: fragments(events) },
+                Delivery::Live,
+            ),
+            EventIngress::InitialBridge => (proto::DeltaContent::EventBridge { events: fragments(events) }, Delivery::Initial),
+        };
+        self.apply(content, delivery).await
     }
 }
 
 #[derive(Clone, Copy)]
 enum SnapshotIngress {
-    Snapshot,
-    StateAndEvent,
-    DivergedStateAndEvent,
+    InitialSnapshot,
+    LiveStateAndEvents,
+    DivergedLiveStateAndEvents,
 }
 
-/// The ingresses that carry events from a peer.
+/// The shapes that carry events from a peer, with the delivery each arrives by.
 #[derive(Clone, Copy, Debug)]
 enum EventIngress {
-    EventOnly,
-    StateAndEvent,
-    EventBridge,
-}
-
-impl Fixture {
-    /// Deliver `events` for the fixture's entity through `ingress`, a state update carrying the current state.
-    async fn deliver(&self, ingress: EventIngress, events: Vec<Event>) -> Result<(), MutationError> {
-        let peer = EntityId::from_bytes([5; 32]);
-        let states = LocalStateGetter::new(self.storage.clone());
-        let fragments = events.into_iter().map(|event| Attested::opt(event, None).into()).collect();
-        let content = match ingress {
-            EventIngress::EventOnly => proto::UpdateContent::EventOnly(fragments),
-            EventIngress::StateAndEvent => proto::UpdateContent::StateAndEvent(
-                proto::StateFragment { state: self.entity.to_state()?, attestations: Default::default() },
-                fragments,
-            ),
-            EventIngress::EventBridge => {
-                let delta =
-                    proto::EntityDelta { entity_id: self.entity.id(), content: proto::DeltaContent::EventBridge { events: fragments } };
-                return NodeApplier::apply_delta(&self.node, &peer, delta, &self.events, &states).await.map(|_| ());
-            }
-        };
-        let update = proto::SubscriptionUpdateItem { entity_id: self.entity.id(), content, predicate_relevance: vec![] };
-        NodeApplier::apply_update(&self.node, &peer, update, &self.events, &states).await.map(|_| ())
-    }
+    LiveBridge,
+    LiveStateAndEvents,
+    InitialBridge,
 }
 
 #[tokio::test]
@@ -133,6 +140,7 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
         &node,
         &EntityId::from_bytes([5; 32]),
         delta.clone(),
+        Delivery::Initial,
         &LocalEventGetter::new(storage.clone(), false),
         &LocalStateGetter::new(storage.clone()),
     )
@@ -145,10 +153,12 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
         &node,
         &EntityId::from_bytes([5; 32]),
         delta,
+        Delivery::Initial,
         &LocalEventGetter::new(storage.clone(), false),
         &LocalStateGetter::new(storage.clone()),
     )
     .await?
+    .change
     .expect("the first snapshot initializes the entity");
     let (entity, _) = change.into_parts();
     assert_eq!(entity.to_state()?, state);
@@ -179,7 +189,7 @@ async fn adopted_snapshot_rejects_false_parent_generations_without_changing_the_
         assert_eq!(forged.generation(), 4);
         let mut snapshot = before.clone();
         snapshot.head = Clock::singleton(&forged);
-        let error = fixture.apply_snapshot(SnapshotIngress::StateAndEvent, snapshot, forged.clone()).await.unwrap_err();
+        let error = fixture.apply_snapshot(SnapshotIngress::LiveStateAndEvents, snapshot, forged.clone()).await.unwrap_err();
         assert!(
             matches!(
                 &error,
@@ -196,7 +206,7 @@ async fn adopted_snapshot_rejects_false_parent_generations_without_changing_the_
     let honest = Event::update(fixture.entity.id(), before.head.clone(), AuthorId::Unknown, OperationSet::default());
     let mut snapshot = before;
     snapshot.head = Clock::singleton(&honest);
-    fixture.apply_snapshot(SnapshotIngress::StateAndEvent, snapshot.clone(), honest.clone()).await?;
+    fixture.apply_snapshot(SnapshotIngress::LiveStateAndEvents, snapshot.clone(), honest.clone()).await?;
     assert_eq!(fixture.entity.to_state()?, snapshot);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
     assert_eq!(fixture.storage.get_events(vec![honest.id()]).await?.len(), 1);
@@ -221,19 +231,19 @@ async fn first_snapshot_checks_cargo_against_local_or_carried_parents_but_allows
         if parent_source == "carried" {
             cargo.push(Attested::from(source.genesis.clone()).into());
         }
-        let update = proto::SubscriptionUpdateItem {
+        let update = proto::EntityDelta {
             entity_id: source.entity.id(),
-            content: proto::UpdateContent::StateAndEvent(
-                proto::StateFragment { state: snapshot.clone(), attestations: Default::default() },
-                cargo,
-            ),
-            predicate_relevance: vec![],
+            content: proto::DeltaContent::StateAndEvents {
+                state: proto::StateFragment { state: snapshot.clone(), attestations: Default::default() },
+                events: cargo,
+            },
         };
         // A first snapshot must not ask its event getter for missing history; the generation check is local-only.
-        let result = NodeApplier::apply_update(
+        let result = NodeApplier::apply_delta(
             &node,
             &EntityId::from_bytes([5; 32]),
             update,
+            Delivery::Live,
             &NoEventReads,
             &LocalStateGetter::new(storage.clone()),
         )
@@ -288,19 +298,19 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
         };
         let (notifications, observed) = mpsc::channel();
         let _listener = resident.as_ref().map(|entity| entity.broadcast().reference().listen(notifications));
-        let update = |carried: Vec<Attested<Event>>| proto::SubscriptionUpdateItem {
+        let update = |carried: Vec<Attested<Event>>| proto::EntityDelta {
             entity_id: source.entity.id(),
-            content: proto::UpdateContent::StateAndEvent(
-                proto::StateFragment { state: snapshot.clone(), attestations: Default::default() },
-                carried.into_iter().map(Into::into).collect(),
-            ),
-            predicate_relevance: vec![],
+            content: proto::DeltaContent::StateAndEvents {
+                state: proto::StateFragment { state: snapshot.clone(), attestations: Default::default() },
+                events: carried.into_iter().map(Into::into).collect(),
+            },
         };
         // The stray event is a sibling of first, so the snapshot does not include it.
-        let error = NodeApplier::apply_update(
+        let error = NodeApplier::apply_delta(
             &node,
             &EntityId::from_bytes([5; 32]),
             update(vec![tip.clone().into(), stray.clone().into(), first.clone().into()]),
+            Delivery::Live,
             &events,
             &states,
         )
@@ -318,14 +328,16 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
         }
 
         // A carried ancestor is valid even though only its descendant remains in the head.
-        let change = NodeApplier::apply_update(
+        let change = NodeApplier::apply_delta(
             &node,
             &EntityId::from_bytes([5; 32]),
             update(vec![tip.clone().into(), first.clone().into()]),
+            Delivery::Live,
             &events,
             &states,
         )
         .await?
+        .change
         .expect("the snapshot was adopted");
         assert_eq!(change.events(), &[Attested::from(first.clone()), Attested::from(tip.clone())]);
         assert_eq!(change.entity().to_state()?, snapshot);
@@ -358,7 +370,7 @@ async fn assert_failed_snapshot_keeps_resident(ingress: SnapshotIngress) -> anyh
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     candidate.apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), |_| Ok(None)).await?;
     let snapshot = candidate.to_state()?;
-    if matches!(ingress, SnapshotIngress::DivergedStateAndEvent) {
+    if matches!(ingress, SnapshotIngress::DivergedLiveStateAndEvents) {
         let local = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
         fixture.commit_event(local).await?;
     }
@@ -403,17 +415,17 @@ async fn assert_failed_snapshot_keeps_resident(ingress: SnapshotIngress) -> anyh
 
 #[tokio::test]
 async fn snapshot_commit_failure_keeps_retained_entity_and_listener_unchanged() -> anyhow::Result<()> {
-    assert_failed_snapshot_keeps_resident(SnapshotIngress::Snapshot).await
+    assert_failed_snapshot_keeps_resident(SnapshotIngress::InitialSnapshot).await
 }
 
 #[tokio::test]
 async fn state_and_event_commit_failure_keeps_retained_entity_and_listener_unchanged() -> anyhow::Result<()> {
-    assert_failed_snapshot_keeps_resident(SnapshotIngress::StateAndEvent).await
+    assert_failed_snapshot_keeps_resident(SnapshotIngress::LiveStateAndEvents).await
 }
 
 #[tokio::test]
 async fn divergent_state_and_event_commit_failure_keeps_retained_entity_and_listener_unchanged() -> anyhow::Result<()> {
-    assert_failed_snapshot_keeps_resident(SnapshotIngress::DivergedStateAndEvent).await
+    assert_failed_snapshot_keeps_resident(SnapshotIngress::DivergedLiveStateAndEvents).await
 }
 
 #[tokio::test]
@@ -426,22 +438,22 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
     let mut events = vec![Attested::from(first), Attested::from(second), Attested::from(last.clone())];
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     candidate.apply_events(&fixture.events, &mut events, |_| Ok(None)).await?;
-    let update = proto::SubscriptionUpdateItem {
+    let update = proto::EntityDelta {
         entity_id: fixture.entity.id(),
-        content: proto::UpdateContent::StateAndEvent(
-            proto::StateFragment { state: candidate.to_state()?, attestations: Default::default() },
-            events.iter().cloned().map(Into::into).collect(),
-        ),
-        predicate_relevance: vec![],
+        content: proto::DeltaContent::StateAndEvents {
+            state: proto::StateFragment { state: candidate.to_state()?, attestations: Default::default() },
+            events: events.iter().cloned().map(Into::into).collect(),
+        },
     };
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
     *fixture.storage.hold_set_state.lock().unwrap() = Some((entered, release_rx));
     let mut applying = Box::pin(async {
-        NodeApplier::apply_update(
+        NodeApplier::apply_delta(
             &fixture.node,
             &EntityId::from_bytes([5; 32]),
             update,
+            Delivery::Live,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
         )
@@ -463,7 +475,7 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
     release.send(()).unwrap();
     // Replaying only the snapshot tip would jump from generation 2 to 4 and fail with BeyondHead.
-    let change = applying.await?.expect("the carried events merged");
+    let change = applying.await?.change.expect("the carried events merged");
 
     assert_eq!(fixture.entity.head(), Clock::from_events([&local, &last]));
     assert_eq!(fixture.entity.values()?, vec![(property(), Some(Value::String("incoming".into())))]);
@@ -484,22 +496,22 @@ async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_a
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
     let snapshot = candidate.to_state()?;
-    let update = proto::SubscriptionUpdateItem {
+    let update = proto::EntityDelta {
         entity_id: fixture.entity.id(),
-        content: proto::UpdateContent::StateAndEvent(
-            proto::StateFragment { state: snapshot.clone(), attestations: Default::default() },
-            vec![Attested::from(incoming.clone()).into()],
-        ),
-        predicate_relevance: vec![],
+        content: proto::DeltaContent::StateAndEvents {
+            state: proto::StateFragment { state: snapshot.clone(), attestations: Default::default() },
+            events: vec![Attested::from(incoming.clone()).into()],
+        },
     };
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
     *fixture.storage.hold_set_state.lock().unwrap() = Some((entered, release_rx));
     let mut applying = Box::pin(async {
-        NodeApplier::apply_update(
+        NodeApplier::apply_delta(
             &fixture.node,
             &EntityId::from_bytes([5; 32]),
             update,
+            Delivery::Live,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
         )
@@ -511,7 +523,7 @@ async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_a
     let (notifications, observed) = mpsc::channel();
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
     release.send(()).unwrap();
-    assert!(applying.await?.is_none());
+    assert!(applying.await?.change.is_none());
 
     assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
     assert_eq!(fixture.entity.to_state()?, snapshot);
@@ -542,6 +554,7 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
             &fixture.node,
             &EntityId::from_bytes([5; 32]),
             delta,
+            Delivery::Initial,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
         )
@@ -557,7 +570,7 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     release.send(()).unwrap();
 
     // An initially divergent bare snapshot is ignored too: a retry must make the same decision.
-    assert!(applying.await?.is_none());
+    assert!(applying.await?.change.is_none());
     assert_eq!(fixture.entity.to_state()?, before);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
@@ -592,10 +605,12 @@ async fn unchanged_bare_snapshots_do_not_write_storage() -> anyhow::Result<()> {
             &fixture.node,
             &EntityId::from_bytes([5; 32]),
             delta,
+            Delivery::Initial,
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
         )
         .await?
+        .change
         .is_none());
         assert_eq!(fixture.entity.to_state()?, current);
         assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, current);
@@ -612,12 +627,12 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
     let snapshot = candidate.to_state()?;
-    fixture.apply_snapshot(SnapshotIngress::Snapshot, snapshot.clone(), incoming.clone()).await?;
+    fixture.apply_snapshot(SnapshotIngress::InitialSnapshot, snapshot.clone(), incoming.clone()).await?;
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
 
     let (notifications, observed) = mpsc::channel();
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
-    fixture.deliver(EventIngress::StateAndEvent, vec![incoming.clone()]).await?;
+    fixture.deliver(EventIngress::LiveStateAndEvents, vec![incoming.clone()]).await?;
     assert_eq!(fixture.storage.get_events(vec![incoming.id()]).await?, vec![Attested::from(incoming)]);
     assert_eq!(fixture.entity.to_state()?, snapshot);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
@@ -627,7 +642,7 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
 
 #[tokio::test]
 async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+    for ingress in [EventIngress::LiveBridge, EventIngress::LiveStateAndEvents, EventIngress::InitialBridge] {
         let fixture = Fixture::new().await?;
         let foreign = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
         cache(&fixture.storage, &[&foreign]).await?;
@@ -685,19 +700,21 @@ async fn event_only_discards_the_batch_without_partial_failed_operations() -> an
     let getter = CountedHistory { inner: &fixture.events, tip: fixture.genesis.id(), tip_reads: 0.into() };
     let (notifications, observed) = mpsc::channel();
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
-    let update = proto::SubscriptionUpdateItem {
+    let update = proto::EntityDelta {
         entity_id: fixture.entity.id(),
-        content: proto::UpdateContent::EventOnly(vec![
-            Attested::opt(accepted.clone(), None).into(),
-            Attested::opt(failed.clone(), None).into(),
-            Attested::from(later.clone()).into(),
-        ]),
-        predicate_relevance: vec![],
+        content: proto::DeltaContent::EventBridge {
+            events: vec![
+                Attested::opt(accepted.clone(), None).into(),
+                Attested::opt(failed.clone(), None).into(),
+                Attested::from(later.clone()).into(),
+            ],
+        },
     };
-    let error = NodeApplier::apply_update(
+    let error = NodeApplier::apply_delta(
         &fixture.node,
         &EntityId::from_bytes([5; 32]),
         update,
+        Delivery::Live,
         &getter,
         &LocalStateGetter::new(fixture.storage.clone()),
     )
@@ -721,7 +738,7 @@ async fn event_only_discards_the_batch_without_partial_failed_operations() -> an
 
 #[tokio::test]
 async fn state_and_event_bridges_discard_the_batch_on_operation_failure() -> anyhow::Result<()> {
-    for ingress in [EventIngress::StateAndEvent, EventIngress::EventBridge] {
+    for ingress in [EventIngress::LiveStateAndEvents, EventIngress::InitialBridge] {
         let fixture = Fixture::new().await?;
         let before = fixture.entity.to_state()?;
         let first =
@@ -751,7 +768,7 @@ async fn state_and_event_bridges_discard_the_batch_on_operation_failure() -> any
 /// bound before any read. Preparation failure rejects the entire batch on every ingress.
 #[tokio::test]
 async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+    for ingress in [EventIngress::LiveBridge, EventIngress::LiveStateAndEvents, EventIngress::InitialBridge] {
         for parent_in_batch in [false, true] {
             let fixture = Fixture::new().await?;
             let genesis = fixture.entity.head();
@@ -781,7 +798,7 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
 /// No event in the batch is applied when history preparation fails.
 #[tokio::test]
 async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_is_judged() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+    for ingress in [EventIngress::LiveBridge, EventIngress::LiveStateAndEvents, EventIngress::InitialBridge] {
         let fixture = Fixture::new().await?;
         let genesis = fixture.entity.head();
         let honest = Event::update(fixture.entity.id(), genesis.clone(), AuthorId::Unknown, OperationSet::default());
@@ -833,7 +850,10 @@ async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_
     let snapshot = State { memberships: [model_a()].into(), head: head.clone(), ..State::default() };
     let state = proto::StateFragment { state: snapshot, attestations: Default::default() };
     let delta = proto::EntityDelta { entity_id: genesis.entity_id, content: proto::DeltaContent::StateSnapshot { state } };
-    let change = NodeApplier::apply_delta(&node, &peer, delta, &events, &states).await?.expect("the snapshot creates the entity");
+    let change = NodeApplier::apply_delta(&node, &peer, delta, Delivery::Initial, &events, &states)
+        .await?
+        .change
+        .expect("the snapshot creates the entity");
     let (entity, _) = change.into_parts();
     assert!(storage.get_events(vec![newer.id(), older.id()]).await?.is_empty(), "a snapshot brings no events");
 
@@ -844,12 +864,11 @@ async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_
     }
     // Understate the older parent's known generation of 2.
     let under_claimed = Event::update(genesis.entity_id, Clock::new(vec![(1, older.id())])?, AuthorId::Unknown, OperationSet::default());
-    let update = proto::SubscriptionUpdateItem {
+    let update = proto::EntityDelta {
         entity_id: genesis.entity_id,
-        content: proto::UpdateContent::EventOnly(vec![Attested::opt(under_claimed.clone(), None).into()]),
-        predicate_relevance: vec![],
+        content: proto::DeltaContent::EventBridge { events: vec![Attested::opt(under_claimed.clone(), None).into()] },
     };
-    let error = NodeApplier::apply_update(&node, &peer, update, &events, &states).await.unwrap_err();
+    let error = NodeApplier::apply_delta(&node, &peer, update, Delivery::Live, &events, &states).await.unwrap_err();
     assert!(
         matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: 1, known: 2, .. })),
         "{error}"
@@ -987,7 +1006,10 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     let snapshot = State { memberships: [model_a()].into(), head: Clock::singleton(&tip), ..State::default() };
     let state = proto::StateFragment { state: snapshot, attestations: Default::default() };
     let delta = proto::EntityDelta { entity_id: genesis.entity_id, content: proto::DeltaContent::StateSnapshot { state } };
-    let change = NodeApplier::apply_delta(&node, &peer, delta, &events, &states).await?.expect("the snapshot creates the entity");
+    let change = NodeApplier::apply_delta(&node, &peer, delta, Delivery::Initial, &events, &states)
+        .await?
+        .change
+        .expect("the snapshot creates the entity");
     let (entity, _) = change.into_parts();
     cache(&storage, &[&genesis, &tip]).await?;
     let admitted_head = Clock::from_events([&tip, &update]);
@@ -1043,7 +1065,10 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
         let snapshot = State { memberships: [model_a()].into(), head: Clock::singleton(&tip), ..State::default() };
         let state = proto::StateFragment { state: snapshot, attestations: Default::default() };
         let delta = proto::EntityDelta { entity_id: genesis.entity_id, content: proto::DeltaContent::StateSnapshot { state } };
-        let change = NodeApplier::apply_delta(&node, &peer, delta, &events, &states).await?.expect("the snapshot creates the entity");
+        let change = NodeApplier::apply_delta(&node, &peer, delta, Delivery::Initial, &events, &states)
+            .await?
+            .change
+            .expect("the snapshot creates the entity");
         let (entity, _) = change.into_parts();
         cache(&storage, &[&genesis, &tip]).await?;
         let admitted_head = Clock::from_events([&tip, &update]);
@@ -1211,19 +1236,20 @@ async fn one_comparison_prepares_and_persists_a_concurrent_batch() -> anyhow::Re
     );
     let b = Event::update(fixture.entity.id(), Clock::singleton(&a), AuthorId::Unknown, OperationSet(vec![value_operation("second")?]));
     let getter = CountedHistory { inner: &fixture.events, tip: resident.id(), tip_reads: 0.into() };
-    let update = proto::SubscriptionUpdateItem {
+    let update = proto::EntityDelta {
         entity_id: fixture.entity.id(),
-        content: proto::UpdateContent::EventOnly(vec![Attested::from(b.clone()).into(), Attested::from(a.clone()).into()]),
-        predicate_relevance: vec![],
+        content: proto::DeltaContent::EventBridge { events: vec![Attested::from(b.clone()).into(), Attested::from(a.clone()).into()] },
     };
-    let change = NodeApplier::apply_update(
+    let change = NodeApplier::apply_delta(
         &fixture.node,
         &EntityId::from_bytes([5; 32]),
         update,
+        Delivery::Live,
         &getter,
         &LocalStateGetter::new(fixture.storage.clone()),
     )
     .await?
+    .change
     .expect("the batch applied");
     assert_eq!(getter.tip_reads.load(std::sync::atomic::Ordering::Relaxed), 1, "persistence must use the prepared fork");
     assert_eq!(fixture.entity.head(), Clock::from_events([&resident, &b]));
@@ -1320,5 +1346,347 @@ async fn supplied_batch_can_exceed_the_single_event_history_budget() -> anyhow::
         .await?;
     assert_eq!(checks, count);
     assert_eq!(candidate.head(), head);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_concurrent_snapshot_without_events_is_reported_not_adopted() -> anyhow::Result<()> {
+    for delivery in [Delivery::Initial, Delivery::Live] {
+        let fixture = Fixture::new().await?;
+        let remote =
+            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![set(property(), "remote")?]));
+        // The comparison reads the sender's history through the getter, as a peer-backed getter would fetch it.
+        fixture.events.stage_event(remote.clone());
+        let snapshot = fixture.remote_snapshot(&remote).await?;
+        let local = Event::update(
+            fixture.entity.id(),
+            fixture.entity.head(),
+            AuthorId::Unknown,
+            OperationSet(vec![set(other_property(), "local")?]),
+        );
+        fixture.commit_event(local.clone()).await?;
+        let before = fixture.entity.to_state()?;
+        let (notifications, observed) = mpsc::channel();
+        let _listener = fixture.entity.broadcast().reference().listen(notifications);
+
+        let outcome = fixture.apply(proto::DeltaContent::StateSnapshot { state: fragment(snapshot.clone()) }, delivery).await?;
+        let divergence = outcome.divergence.expect("a concurrent snapshot is not covered");
+        assert_eq!(divergence.entity_id, fixture.entity.id());
+        assert_eq!(divergence.target, snapshot.head);
+        assert_eq!(divergence.actual, Clock::singleton(&local));
+        assert!(outcome.change.is_none(), "{delivery:?}");
+
+        assert_eq!(outcome.entity, Some(fixture.entity.clone()));
+        assert_eq!(fixture.entity.to_state()?, before);
+        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
+        assert!(fixture.storage.get_events(vec![remote.id()]).await?.is_empty());
+        assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+    Ok(())
+}
+
+/// A concurrent snapshot whose connecting events are carried merges those events: the local
+/// edit survives, the sender's branch is incorporated, and the target counts as covered.
+#[tokio::test]
+async fn a_concurrent_snapshot_with_its_events_merges_and_keeps_the_local_edit() -> anyhow::Result<()> {
+    for delivery in [Delivery::Initial, Delivery::Live] {
+        let fixture = Fixture::new().await?;
+        let remote =
+            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![set(property(), "remote")?]));
+        let snapshot = fixture.remote_snapshot(&remote).await?;
+        let local = Event::update(
+            fixture.entity.id(),
+            fixture.entity.head(),
+            AuthorId::Unknown,
+            OperationSet(vec![set(other_property(), "local")?]),
+        );
+        fixture.commit_event(local.clone()).await?;
+        let (notifications, observed) = mpsc::channel();
+        let _listener = fixture.entity.broadcast().reference().listen(notifications);
+
+        let outcome = fixture
+            .apply(proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([remote.clone()]) }, delivery)
+            .await?;
+        assert!(outcome.divergence.is_none(), "{delivery:?}");
+
+        let change = outcome.change.expect("the merged branch is published");
+        let published: &[Attested<Event>] = match delivery {
+            Delivery::Initial => &[],
+            Delivery::Live => &[Attested::from(remote.clone())],
+        };
+        assert_eq!(change.events(), published, "{delivery:?}");
+        assert_eq!(fixture.entity.head(), Clock::from_events([&local, &remote]));
+        assert_eq!(
+            values(&fixture.entity)?,
+            BTreeMap::from([(property(), Some(Value::String("remote".into()))), (other_property(), Some(Value::String("local".into()))),])
+        );
+        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, fixture.entity.to_state()?);
+        assert_eq!(fixture.storage.get_events(vec![remote.id()]).await?.len(), 1);
+        assert_eq!(observed.try_recv()?, ());
+        assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    }
+    Ok(())
+}
+
+/// Equal and older snapshots are covered already: nothing changes, nothing is published, and
+/// events carried beside them that the entity has applied are not applied again.
+#[tokio::test]
+async fn equal_and_older_snapshots_are_covered_without_change() -> anyhow::Result<()> {
+    for delivery in [Delivery::Initial, Delivery::Live] {
+        let fixture = Fixture::new().await?;
+        let older = fixture.entity.to_state()?;
+        let next =
+            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("next")?]));
+        fixture.commit_event(next.clone()).await?;
+        let current = fixture.entity.to_state()?;
+        let (notifications, observed) = mpsc::channel();
+        let _listener = fixture.entity.broadcast().reference().listen(notifications);
+
+        let shapes = [
+            proto::DeltaContent::StateSnapshot { state: fragment(current.clone()) },
+            proto::DeltaContent::StateSnapshot { state: fragment(older.clone()) },
+            proto::DeltaContent::StateAndEvents { state: fragment(current.clone()), events: fragments([next.clone()]) },
+            proto::DeltaContent::StateAndEvents { state: fragment(older.clone()), events: fragments([fixture.genesis.clone()]) },
+        ];
+        for content in shapes {
+            let description = format!("{delivery:?}: {content:?}");
+            let outcome = fixture.apply(content, delivery).await?;
+            assert!(outcome.divergence.is_none(), "{description}");
+            assert!(outcome.change.is_none(), "{description}");
+
+            assert_eq!(outcome.entity, Some(fixture.entity.clone()), "{description}");
+            assert_eq!(fixture.entity.to_state()?, current, "{description}");
+            assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{description}");
+        }
+        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, current);
+    }
+    Ok(())
+}
+
+/// The same advance publishes differently by delivery: an initial transfer notifies an advanced entity
+/// with no events, so another established query holding it sees no event update; a live update
+/// publishes the events it applied.
+#[tokio::test]
+async fn delivery_decides_whether_applied_events_are_published() -> anyhow::Result<()> {
+    #[derive(Clone, Copy, Debug)]
+    enum Shape {
+        Snapshot,
+        StateAndEvents,
+        Bridge,
+    }
+    for delivery in [Delivery::Initial, Delivery::Live] {
+        for shape in [Shape::Snapshot, Shape::StateAndEvents, Shape::Bridge] {
+            let fixture = Fixture::new().await?;
+            let incoming = Event::update(
+                fixture.entity.id(),
+                fixture.entity.head(),
+                AuthorId::Unknown,
+                OperationSet(vec![value_operation("incoming")?]),
+            );
+            // A bare snapshot's comparison reads the sender's history through the getter.
+            fixture.events.stage_event(incoming.clone());
+            let snapshot = fixture.remote_snapshot(&incoming).await?;
+            let content = match shape {
+                Shape::Snapshot => proto::DeltaContent::StateSnapshot { state: fragment(snapshot.clone()) },
+                Shape::StateAndEvents => {
+                    proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([incoming.clone()]) }
+                }
+                Shape::Bridge => proto::DeltaContent::EventBridge { events: fragments([incoming.clone()]) },
+            };
+            let (notifications, observed) = mpsc::channel();
+            let _listener = fixture.entity.broadcast().reference().listen(notifications);
+
+            let outcome = fixture.apply(content, delivery).await?;
+            assert!(outcome.divergence.is_none(), "{delivery:?} {shape:?}");
+
+            let change = outcome.change.expect("the entity advanced");
+            let published: &[Attested<Event>] = match (delivery, shape) {
+                (Delivery::Live, Shape::StateAndEvents | Shape::Bridge) => &[Attested::from(incoming.clone())],
+                _ => &[],
+            };
+            assert_eq!(change.events(), published, "{delivery:?} {shape:?}");
+            assert_eq!(change.entity(), &fixture.entity);
+            assert_eq!(fixture.entity.to_state()?, snapshot, "{delivery:?} {shape:?}");
+            assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
+            let stored = fixture.storage.get_events(vec![incoming.id()]).await?.len();
+            assert_eq!(stored, if matches!(shape, Shape::Snapshot) { 0 } else { 1 }, "{delivery:?} {shape:?}");
+            assert_eq!(observed.try_recv()?, (), "{delivery:?} {shape:?}");
+            assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn state_and_relation_is_refused() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let relation = proto::CausalAssertionFragment { relation: proto::CausalRelation::Equal, attestations: Default::default() };
+    let content = proto::DeltaContent::StateAndRelation { state: fragment(fixture.entity.to_state()?), relation };
+    let error = fixture.apply(content, Delivery::Initial).await.expect_err("unsupported");
+    assert!(matches!(error, MutationError::InvalidUpdate(_)), "{error}");
+    Ok(())
+}
+
+/// A sequenced stream applies under the credentials captured for its query, so it needs no
+/// standing subscription with the peer; the unsequenced wrapper still refuses without one.
+#[tokio::test]
+async fn stream_updates_apply_under_captured_credentials_without_a_standing_subscription() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let incoming =
+        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let snapshot = fixture.remote_snapshot(&incoming).await?;
+    let before = fixture.entity.to_state()?;
+    let item = || proto::SubscriptionUpdateItem {
+        delta: proto::EntityDelta {
+            entity_id: fixture.entity.id(),
+            content: proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([incoming.clone()]) },
+        },
+        predicate_relevance: vec![],
+    };
+
+    let error = NodeApplier::apply_updates(&fixture.node, &peer(), vec![item()]).await.expect_err("no standing subscription with the peer");
+    assert!(matches!(&error, ApplyError::MutationError(cause) if matches!(**cause, MutationError::InvalidUpdate(_))), "{error}");
+    assert_eq!(fixture.entity.to_state()?, before);
+    assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
+
+    NodeApplier::apply_stream_updates(&fixture.node, &peer(), &vec![DEFAULT_CONTEXT], vec![item()]).await?;
+    assert_eq!(fixture.entity.to_state()?, snapshot);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
+    assert_eq!(fixture.storage.get_events(vec![incoming.id()]).await?.len(), 1);
+    Ok(())
+}
+
+/// A policy agent that trusts nothing a peer sends.
+#[derive(Clone)]
+struct RejectingAgent;
+
+#[async_trait::async_trait]
+impl PolicyAgent for RejectingAgent {
+    type ContextData = &'static DefaultContext;
+
+    fn check_write_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &Self::ContextData,
+        _: &Entity,
+        _: &Entity,
+        _: &Event,
+    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+        Ok(None)
+    }
+
+    fn sign_request<SE: StorageEngine, C: Iterable<Self::ContextData>>(
+        &self,
+        _: &crate::node::NodeInner<SE, Self>,
+        _: &C,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, AccessDenied> {
+        Ok(vec![])
+    }
+
+    async fn check_request<SE: StorageEngine, A: Iterable<proto::AuthData> + Send + Sync>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &A,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, ValidationError> {
+        Ok(vec![])
+    }
+
+    fn query_predicate<C: Iterable<Self::ContextData>>(&self, _: &C) -> Result<Predicate<Resolved>, AccessDenied> { Ok(Predicate::True) }
+
+    fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<proto::Attestation> { None }
+
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &Attested<Event>,
+    ) -> Result<(), AccessDenied> {
+        Err(AccessDenied::ByPolicy("the event attestation is not trusted"))
+    }
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &Attested<proto::EntityState>,
+    ) -> Result<(), AccessDenied> {
+        Err(AccessDenied::ByPolicy("the state attestation is not trusted"))
+    }
+
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &EntityId,
+        _: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied> {
+        Err(AccessDenied::ByPolicy("the causal assertion is not trusted"))
+    }
+}
+
+/// Every delta shape is validated against policy before anything is stored, applied, or published,
+/// for a resident entity and for one this node has never seen.
+#[tokio::test]
+async fn untrusted_attestations_are_refused_before_anything_is_stored() -> anyhow::Result<()> {
+    let source = Fixture::new().await?;
+    let incoming =
+        Event::update(source.entity.id(), source.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let snapshot = source.remote_snapshot(&incoming).await?;
+    let shapes = || {
+        [
+            proto::DeltaContent::StateSnapshot { state: fragment(snapshot.clone()) },
+            proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([incoming.clone()]) },
+            proto::DeltaContent::EventBridge { events: fragments([incoming.clone()]) },
+        ]
+    };
+
+    for resident in [false, true] {
+        for delivery in [Delivery::Initial, Delivery::Live] {
+            let storage = Arc::new(TestStorage::default());
+            let node = Node::new(storage.clone(), RejectingAgent);
+            node.system.wait_loaded().await?;
+            let events = LocalEventGetter::new(storage.clone(), false);
+            let states = LocalStateGetter::new(storage.clone());
+            let entity = if resident {
+                // Local history is trusted; only what the peer sends is refused.
+                events.stage_event(source.genesis.clone());
+                let (entity, _) = NodeApplier::apply_and_commit_events(&node, &[Attested::from(source.genesis.clone())], &events)
+                    .await?
+                    .expect("the genesis creates the entity")
+                    .into_parts();
+                Some(entity)
+            } else {
+                None
+            };
+            let before = entity.as_ref().map(Entity::to_state).transpose()?;
+            let (notifications, observed) = mpsc::channel();
+            let _listener = entity.as_ref().map(|entity| entity.broadcast().reference().listen(notifications));
+
+            for content in shapes() {
+                let description = format!("resident {resident}, {delivery:?}: {content:?}");
+                let delta = proto::EntityDelta { entity_id: source.entity.id(), content };
+                let error = NodeApplier::apply_delta(&node, &peer(), delta, delivery, &events, &states).await.expect_err("refused");
+                assert!(matches!(error, MutationError::AccessDenied(AccessDenied::ByPolicy(_))), "{description}: {error}");
+                assert!(storage.get_events(vec![incoming.id()]).await?.is_empty(), "{description}");
+                match (&entity, &before) {
+                    (Some(entity), Some(before)) => {
+                        assert_eq!(&entity.to_state()?, before, "{description}");
+                        assert_eq!(&storage.get_state(entity.id()).await?.payload.state, before, "{description}");
+                        assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{description}");
+                    }
+                    _ => {
+                        assert!(node.entities.get(&source.entity.id()).is_none(), "{description}");
+                        assert!(
+                            matches!(storage.get_state(source.entity.id()).await, Err(RetrievalError::EntityNotFound(_))),
+                            "{description}"
+                        );
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }

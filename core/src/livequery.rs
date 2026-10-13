@@ -133,8 +133,14 @@ impl EntityLiveQuery {
         Ok(())
     }
     pub(crate) fn digest_tree(&self) -> Arc<crate::node::state_sync::QueryTree> { self.0.tree.clone() }
-    pub(crate) async fn activate_remote(&self, version: u32, entities: Vec<Entity>) -> Result<bool, RetrievalError> {
-        self.0.activate_remote(version, entities).await
+    pub(crate) async fn activate_remote(
+        &self,
+        version: u32,
+        entities: Vec<Entity>,
+        origin: &proto::RequestId,
+        canceled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool, RetrievalError> {
+        self.0.activate_remote(version, entities, origin, canceled).await
     }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
     /// The latest installed selection and version; `None` until initial resolution.
@@ -158,6 +164,9 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
     async fn subscription_established(&self, version: u32) {
         if let Some(inner) = self.0.upgrade() {
             tracing::debug!("Subscription established for query {}: {}", inner.query_id, version);
+            if inner.remote_stream_pending(version) {
+                return;
+            }
             if inner.remote_activated_version.load(Ordering::Acquire) == version {
                 inner.mark_durable_answered(version);
                 return;
@@ -176,6 +185,18 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
         if let Some(inner) = self.0.upgrade() {
             tracing::info!("Setting last error for LiveQuery {}: {}", inner.query_id, error);
             inner.fail_initialization(version, error);
+        }
+    }
+
+    fn stream_bound(&self, version: u32, origin: proto::RequestId, canceled: Arc<dyn Fn() -> bool + Send + Sync>) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.bind_remote_stream(version, origin, canceled.as_ref());
+        }
+    }
+
+    fn subscription_lost(&self, version: u32, origin: &proto::RequestId) {
+        if let Some(inner) = self.0.upgrade() {
+            inner.lose_remote_stream(version, origin);
         }
     }
 }

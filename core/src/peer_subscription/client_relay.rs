@@ -23,6 +23,9 @@ pub trait RemoteQuerySubscriber: Clone + Send + Sync + 'static {
 
     /// Record a permanent failure for this subscription version.
     fn set_last_error(&self, version: u32, error: RetrievalError);
+
+    fn stream_bound(&self, _version: u32, _origin: proto::RequestId, _canceled: Arc<dyn Fn() -> bool + Send + Sync>) {}
+    fn subscription_lost(&self, _version: u32, _origin: &proto::RequestId) {}
 }
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,7 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
     pub status: Status,
     pub livequery: Q,
     cancel: CancelFlag,
+    stream_origin: Option<proto::RequestId>,
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
@@ -121,6 +125,11 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|error| error.into_inner());
         for state in subscriptions.values() {
             state.cancel.cancel();
+            if let Status::Established(peer, _) | Status::Requested(peer, _) = state.status {
+                if let Some(node) = self.inner.node.get() {
+                    node.cancel_query(peer, state.content.query_id);
+                }
+            }
         }
         subscriptions.clear();
         self.inner.connected_peers.clear();
@@ -151,7 +160,12 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             let peer = previous.and_then(|state| {
                 state.cancel.cancel();
                 match state.status {
-                    Status::Established(peer, _) | Status::Requested(peer, _) => Some(peer),
+                    Status::Established(peer, _) | Status::Requested(peer, _) => {
+                        if let Some(node) = self.inner.node.get() {
+                            node.cancel_query(peer, query_id);
+                        }
+                        Some(peer)
+                    }
                     _ => None,
                 }
             });
@@ -162,6 +176,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     status: peer.map_or(Status::PendingRemote, |peer| Status::Requested(peer, version)),
                     livequery,
                     cancel: cancel.clone(),
+                    stream_origin: None,
                 },
             );
             peer
@@ -197,9 +212,13 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                     match state.status {
                         Status::Established(peer_id, _) | Status::Requested(peer_id, _) => {
+                            if let Some(node) = self.inner.node.get() {
+                                node.cancel_query(peer_id, query_id);
+                            }
                             // Update to new version, mark as requested for this peer
                             state.status = Status::Requested(peer_id, version);
                             state.cancel.cancel_and_swap();
+                            state.stream_origin = None;
                             Some((peer_id, state.content.sessions.clone(), state.cancel.clone()))
                             // Return the peer_id to send update to
                         }
@@ -246,7 +265,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                 // Send the updated predicate to the peer, under the
                 // credentials current at send time.
-                match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version).await {
+                let attempt = cancel.clone();
+                let canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || attempt.canceled());
+                match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version, canceled).await {
                     _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
                     Ok(()) => {
                         // Deltas applied successfully, now activate the livequery
@@ -287,6 +308,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 if let Status::Established(peer_id, _) | Status::Requested(peer_id, _) = &info.status {
                     let node = self.inner.node.get();
                     if let Some(node) = node {
+                        node.cancel_query(*peer_id, query_id);
                         let node = node.clone();
                         let peer_id = *peer_id;
                         crate::task::spawn(async move {
@@ -313,15 +335,25 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         // Remove from connected peers
         self.inner.connected_peers.remove(&peer_id);
 
+        let mut lost = Vec::new();
         for info in self.inner.subscriptions.lock().expect("poisoned lock").values_mut() {
             if let Status::Established(established_peer_id, _) | Status::Requested(established_peer_id, _) = &info.status {
                 if *established_peer_id == peer_id {
                     // Update state to pending
                     info.status = Status::PendingRemote;
                     info.cancel.cancel();
+                    if let Some(node) = self.inner.node.get() {
+                        node.cancel_query(peer_id, info.content.query_id);
+                    }
+                    if let Some(origin) = info.stream_origin.take() {
+                        lost.push((info.livequery.clone(), info.content.version, origin));
+                    }
                     warn!("Predicate {} orphaned due to peer {} disconnect", info.content.query_id, peer_id);
                 }
             }
+        }
+        for (query, version, origin) in lost {
+            query.subscription_lost(version, &origin);
         }
 
         // Resubscribe any orphaned subscriptions
@@ -339,6 +371,47 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         self.inner.connected_peers.insert(peer_id);
 
         // Trigger setup with all connected peers
+        self.setup_remote_subscriptions();
+    }
+
+    pub(crate) fn bind_stream(&self, peer: proto::EntityId, query: proto::QueryId, version: u32, origin: proto::RequestId) -> bool {
+        let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(info) = subscriptions.get_mut(&query) else { return false };
+        if info.content.version != version
+            || info.cancel.canceled()
+            || !matches!(info.status, Status::Requested(id, current) if id == peer && current == version)
+        {
+            return false;
+        }
+        if self.inner.node.get().is_some_and(|node| !node.stream_is_current(peer, &origin)) {
+            return false;
+        }
+        info.stream_origin = Some(origin.clone());
+        let subscriber = info.livequery.clone();
+        let attempt = info.cancel.clone();
+        let canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || attempt.canceled());
+        drop(subscriptions);
+        subscriber.stream_bound(version, origin, canceled);
+        true
+    }
+
+    pub(crate) fn stream_failed(&self, peer: proto::EntityId, query: proto::QueryId, version: u32, origin: &proto::RequestId) {
+        let subscriber = {
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(info) = subscriptions.get_mut(&query) else { return };
+            if info.content.version != version
+                || info.stream_origin.as_ref() != Some(origin)
+                || !matches!(info.status, Status::Requested(id, current) | Status::Established(id, current) if id == peer && current == version)
+            {
+                return;
+            }
+            info.cancel.cancel();
+            let subscriber = info.livequery.clone();
+            info.stream_origin = None;
+            info.status = Status::PendingRemote;
+            subscriber
+        };
+        subscriber.subscription_lost(version, origin);
         self.setup_remote_subscriptions();
     }
 
@@ -439,7 +512,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
         // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
-        match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version).await {
+        let attempt = cancel.clone();
+        let canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || attempt.canceled());
+        match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version, canceled).await {
             _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
             Ok(()) => {
                 // Deltas applied successfully, now activate the livequery
@@ -543,11 +618,15 @@ pub trait TNode<CD: ContextData>: Send + Sync {
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
         version: u32,
+        canceled: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(), RetrievalError>;
 
     /// Send a predicate unregistration message to a remote peer
     /// This is a one-way message, no response expected
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error>;
+
+    fn cancel_query(&self, _peer_id: proto::EntityId, _query_id: proto::QueryId) {}
+    fn stream_is_current(&self, _peer_id: proto::EntityId, _origin: &proto::RequestId) -> bool { true }
 }
 
 /// Implementation of TNode for WeakNode
@@ -564,8 +643,12 @@ where
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
         version: u32,
+        canceled: Arc<dyn Fn() -> bool + Send + Sync>,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
+        if canceled() {
+            return Err(RequestError::ConnectionLost.into());
+        }
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
         let tree = node.live_queries.get(query_id).ok_or(NodeDropped)?.digest_tree();
@@ -577,8 +660,11 @@ where
             .collect::<Result<Vec<_>, _>>()?;
         let mut snapshot = tree.snapshot(&selection, &node.catalog, states).await?;
         let known_state = Some(snapshot.offer().await?);
-        let response = node
-            .request(
+        if canceled() {
+            return Err(RequestError::ConnectionLost.into());
+        }
+        let (stream, response) = node
+            .request_state(
                 peer_id,
                 &context_data,
                 proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_state },
@@ -590,6 +676,21 @@ where
             proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
             other => return Err(RequestError::UnexpectedResponse(other).into()),
         };
+        let connection = node.peer_connections.get(&peer_id).ok_or(RequestError::PeerNotConnected)?;
+        if canceled()
+            || !connection.incoming_states.is_current(&stream.request)
+            || !node.subscription_relay.as_ref().is_some_and(|relay| relay.bind_stream(peer_id, query_id, version, stream.request.clone()))
+        {
+            let weak = node.weak();
+            let credentials = context_data.clone();
+            let comparison = state.frame.comparison;
+            crate::task::spawn(async move {
+                if let Some(node) = weak.upgrade() {
+                    let _ = node.close_comparison(peer_id, comparison, &credentials, proto::ComparisonOutcome::Abandoned).await;
+                }
+            });
+            return Err(RequestError::ConnectionLost.into());
+        }
         let remote = node
             .receive_state(
                 peer_id,
@@ -598,26 +699,31 @@ where
                 state,
                 crate::schema::is_catalog_read(&selection.predicate),
                 Some((query_id, version)),
+                stream,
             )
             .await?;
         let activated: Result<bool, RetrievalError> = async {
             let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
             let event_getter = crate::retrieval::LocalEventGetter::new(node.storage.clone(), node.durable);
             let mut entities = Vec::with_capacity(remote.ids.len());
-            for id in remote.ids {
+            for id in &remote.ids {
                 entities.push(
-                    node.entities.get_or_retrieve(&state_getter, &event_getter, &id).await?.ok_or(RetrievalError::EntityNotFound(id))?,
+                    node.entities.get_or_retrieve(&state_getter, &event_getter, id).await?.ok_or(RetrievalError::EntityNotFound(*id))?,
                 );
             }
             match node.live_queries.get(query_id) {
-                Some(query) => query.activate_remote(version, entities).await,
+                Some(query) => query.activate_remote(version, entities, &remote.stream.request, canceled.as_ref()).await,
                 None => Ok(false),
             }
         }
         .await;
-        let outcome = if matches!(activated, Ok(true)) { proto::ComparisonOutcome::Applied } else { proto::ComparisonOutcome::Abandoned };
-        node.close_comparison(peer_id, remote.comparison, &context_data, outcome).await?;
-        activated?;
+        if matches!(activated, Ok(true)) {
+            node.finish_state(peer_id, context_data, remote, Some((query_id, version)));
+        } else {
+            let _ = node.close_comparison(peer_id, remote.comparison, &context_data, proto::ComparisonOutcome::Abandoned).await;
+            activated?;
+            return Err(RequestError::ConnectionLost.into());
+        }
 
         Ok(())
     }
@@ -629,6 +735,20 @@ where
         node.request_remote_unsubscribe(query_id, vec![peer_id]).await?;
 
         Ok(())
+    }
+
+    fn cancel_query(&self, peer_id: proto::EntityId, query_id: proto::QueryId) {
+        if let Some(node) = self.upgrade() {
+            if let Some(connection) = node.peer_connections.get(&peer_id) {
+                connection.incoming_states.cancel_query(query_id);
+            }
+        }
+    }
+
+    fn stream_is_current(&self, peer_id: proto::EntityId, origin: &proto::RequestId) -> bool {
+        self.upgrade()
+            .and_then(|node| node.peer_connections.get(&peer_id))
+            .is_some_and(|connection| connection.incoming_states.is_current(origin))
     }
 }
 
@@ -696,6 +816,7 @@ mod tests {
             selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
             _version: u32,
+            _canceled: Arc<dyn Fn() -> bool + Send + Sync>,
         ) -> Result<(), RetrievalError> {
             self.sent_requests.lock().unwrap().push((peer_id, query_id, Some(selection.clone())));
 
@@ -1139,6 +1260,35 @@ mod tests {
         stale.send(Err(RequestError::ConnectionLost)).unwrap();
         settle().await;
         assert!(matches!(relay.get_status(query_id), Some(Status::Established(_, 1))), "{:?}", relay.get_status(query_id));
+    }
+
+    #[tokio::test]
+    async fn old_stream_failure_cannot_restart_a_same_version_replacement() {
+        let (relay, sender, peer) = connected_relay();
+        let query = proto::QueryId::new();
+        let original_reply = sender.hold_next_reply();
+        subscribe(&relay, query);
+        settle().await;
+        let original = proto::RequestId::new();
+        assert!(relay.bind_stream(peer, query, 1, original.clone()));
+        original_reply.send(Ok(())).unwrap();
+        settle().await;
+        assert!(matches!(relay.get_status(query), Some(Status::Established(_, 1))));
+
+        let replacement_reply = sender.hold_next_reply();
+        relay.stream_failed(peer, query, 1, &original);
+        settle().await;
+        assert!(matches!(relay.get_status(query), Some(Status::Requested(_, 1))));
+        let replacement = proto::RequestId::new();
+        assert!(relay.bind_stream(peer, query, 1, replacement.clone()));
+        relay.stream_failed(peer, query, 1, &original);
+        assert!(matches!(relay.get_status(query), Some(Status::Requested(_, 1))));
+        assert!(!relay.inner.subscriptions.lock().unwrap()[&query].cancel.canceled());
+        replacement_reply.send(Ok(())).unwrap();
+        settle().await;
+        relay.stream_failed(peer, query, 1, &original);
+        assert!(matches!(relay.get_status(query), Some(Status::Established(_, 1))));
+        assert_eq!(sender.get_sent_requests().len(), 2);
     }
 
     /// While a registration request is in flight on a peer, an update and an unsubscribe go to that peer

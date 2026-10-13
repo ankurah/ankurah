@@ -150,8 +150,10 @@ async fn an_ephemeral_node_admits_an_honest_update_over_parents_it_does_not_hold
     assert_eq!(update.parent, proto::Clock::genesis(genesis.clone()));
 
     let item = proto::SubscriptionUpdateItem {
-        entity_id: id,
-        content: proto::UpdateContent::EventOnly(vec![proto::Attested::opt(update, None).into()]),
+        delta: proto::EntityDelta {
+            entity_id: id,
+            content: proto::DeltaContent::EventBridge { events: vec![proto::Attested::opt(update, None).into()] },
+        },
         predicate_relevance: vec![],
     };
     let body = proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] };

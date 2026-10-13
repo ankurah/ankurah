@@ -317,6 +317,7 @@ where
         self.durable_peers.remove(&node_id);
         // Get and cleanup subscriptions before removing the peer
         if let Some(peer_state) = self.peer_connections.remove(&node_id) {
+            peer_state.incoming_states.close();
             action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
             // ReactorSubscription is automatically unsubscribed on drop
         }
@@ -337,9 +338,18 @@ where
     where
         C: Iterable<PA::ContextData>,
     {
+        self.request_with_id(node_id, cdata, proto::RequestId::new(), request_body).await
+    }
+
+    pub(crate) async fn request_with_id<C: Iterable<PA::ContextData>>(
+        &self,
+        node_id: proto::EntityId,
+        cdata: &C,
+        request_id: proto::RequestId,
+        request_body: proto::NodeRequestBody,
+    ) -> Result<proto::NodeResponseBody, RequestError> {
         self.system.check_not_halted()?;
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
-        let request_id = proto::RequestId::new();
 
         let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
 
@@ -351,11 +361,11 @@ where
             self.policy_agent.sign_request(self, cdata, &request)?
         };
 
-        {
-            let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
-            connection.pending_requests.insert(request_id, response_tx);
-            connection.send_message(proto::NodeMessage::Request { auth, request })?;
-        }
+        let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
+        connection.pending_requests.insert(request_id.clone(), response_tx);
+        let _pending = peer_state::PendingRequest { connection: Arc::downgrade(&connection), id: request_id };
+        connection.send_message(proto::NodeMessage::Request { auth, request })?;
+        drop(connection);
 
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
@@ -460,19 +470,40 @@ where
                         },
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                     };
-                    let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                    let comparison = match &body {
+                        proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
+                            Some(state.frame.comparison)
+                        }
+                        _ => None,
+                    };
+                    let result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
                         request_id,
                         from: self.id,
                         to: from,
                         body,
                     }));
+                    if result.is_ok() {
+                        if let Some(id) = comparison {
+                            self.kick_comparison(from, id);
+                        }
+                    }
                 }
             }
             proto::NodeMessage::Response(response) => {
                 debug!("Node {} received response {}", self.id, response);
                 let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
-                if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
-                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                let comparison = match &response.body {
+                    proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
+                        Some(state.frame.comparison)
+                    }
+                    _ => None,
+                };
+                let delivered =
+                    connection.pending_requests.remove(&response.request_id).is_some_and(|tx| tx.send(Ok(response.body)).is_ok());
+                if !delivered {
+                    if let Some(comparison) = comparison {
+                        connection.incoming_states.late_response(&response.request_id, comparison);
+                    }
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
@@ -497,10 +528,7 @@ where
         let credentials: Vec<_> = cdata.iterable().cloned().collect();
         if initial {
             if let Some(state) = peer.comparisons.replay_initial(&request.id, &fingerprint, &credentials)? {
-                return Ok(match request.body {
-                    proto::NodeRequestBody::SubscribeQuery { query_id, .. } => proto::NodeResponseBody::QuerySubscribed { query_id, state },
-                    _ => proto::NodeResponseBody::Fetch(state),
-                });
+                return Ok(state);
             }
         }
         match request.body {
@@ -559,30 +587,11 @@ where
                     .subscribe_query(self, request.id, fingerprint, query_id, selection, cdata, version, known_state)
                     .await
             }
-            proto::NodeRequestBody::CompareTree { comparison, answers } => {
-                self.compare_tree(request.from, request.id, comparison, answers, credentials).await
+            proto::NodeRequestBody::ContinueState { comparison, processed_through, answers } => {
+                self.continue_state(request.from, request.id, comparison, processed_through, answers, credentials).await
             }
             proto::NodeRequestBody::CloseComparison { comparison, outcome } => {
-                let peer = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("peer disconnected"))?;
-                if let Some(session) = peer.comparisons.get(&comparison) {
-                    anyhow::ensure!(session.permits(&credentials), "comparison credentials changed");
-                    if outcome == proto::ComparisonOutcome::Applied {
-                        anyhow::ensure!(session.complete().await, "comparison has unanswered work");
-                    }
-                    // Expiry or unsubscribe may have removed the session while
-                    // we waited. Only the owner of the live session can finish
-                    // its handoff; a stale Arc cannot acknowledge activation.
-                    if peer.comparisons.remove(&comparison).is_none() {
-                        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison });
-                    }
-                    if let Some((query, version)) = session.query {
-                        peer.subscription_handler.finish_comparison(self, query, version, comparison, outcome).await?;
-                    }
-                    peer.comparisons.finish(comparison);
-                } else if outcome == proto::ComparisonOutcome::Applied && !peer.comparisons.was_closed(&comparison) {
-                    return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison });
-                }
-                Ok(proto::NodeResponseBody::Success)
+                self.close_state(request.from, comparison, outcome, credentials).await
             }
         }
     }
@@ -593,6 +602,7 @@ where
         };
 
         match notification.body {
+            proto::NodeUpdateBody::StateFrame { request_id, frame } => _connection.incoming_states.route(&request_id, frame),
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
                 self.system.require_system_ready()?;
@@ -835,21 +845,21 @@ where
                 .collect::<Result<Vec<_>, _>>()?;
             let mut snapshot = tree.snapshot(&selection, &self.catalog, states).await?;
             let known_state = Some(snapshot.offer().await?);
-            let response =
-                self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection: selection.clone(), known_state }).await?;
+            let (stream, response) =
+                self.request_state(peer_id, cdata, proto::NodeRequestBody::Fetch { selection: selection.clone(), known_state }).await?;
             let state = match response {
                 proto::NodeResponseBody::Fetch(state) => state,
                 proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
                 other => return Err(RequestError::UnexpectedResponse(other).into()),
             };
-            let remote =
-                match self.receive_state(peer_id, cdata, snapshot, state, crate::schema::is_catalog_read(&selection.predicate), None).await
-                {
-                    Err(RetrievalError::RequestError(RequestError::ConnectionLost)) if attempt == 0 => continue,
-                    result => result?,
-                };
-            self.close_comparison(peer_id, remote.comparison, cdata, proto::ComparisonOutcome::Applied).await?;
-            let ids: std::collections::HashSet<_> = remote.ids.into_iter().collect();
+            let remote = match self
+                .receive_state(peer_id, cdata, snapshot, state, crate::schema::is_catalog_read(&selection.predicate), None, stream)
+                .await
+            {
+                Err(RetrievalError::RequestError(RequestError::ConnectionLost)) if attempt == 0 => continue,
+                result => result?,
+            };
+            let ids: std::collections::HashSet<_> = remote.ids.iter().copied().collect();
             // Filter before applying LIMIT: an unreadable or former result in the
             // local cache must not displace an authoritative peer result.
             let mut local_selection = selection.clone();
@@ -859,6 +869,7 @@ where
             if let Some(limit) = selection.limit {
                 entities.truncate(limit as usize);
             }
+            self.finish_state(peer_id, cdata.clone(), remote, None);
             return Ok(entities);
         }
         Err(RequestError::ConnectionLost.into())

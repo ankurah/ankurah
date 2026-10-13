@@ -160,9 +160,8 @@ impl Scheduler {
                         selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy)
                     }
                     proto::NodeRequestBody::SubscribeQuery { .. } => true,
-                    proto::NodeRequestBody::CompareTree { comparison, .. } | proto::NodeRequestBody::CloseComparison { comparison, .. } => {
-                        self.catalog_comparisons.contains(comparison)
-                    }
+                    proto::NodeRequestBody::ContinueState { comparison, .. }
+                    | proto::NodeRequestBody::CloseComparison { comparison, .. } => self.catalog_comparisons.contains(comparison),
                     _ => return false,
                 };
                 if !protected {
@@ -176,13 +175,16 @@ impl Scheduler {
                 if protected {
                     match &response.body {
                         proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
-                            self.catalog_comparisons.insert(state.page.comparison);
+                            self.catalog_comparisons.insert(state.frame.comparison);
                         }
                         _ => {}
                     }
                 }
                 protected
             }
+            proto::NodeMessage::Update(update) => matches!(&update.body, proto::NodeUpdateBody::StateFrame { request_id, frame }
+                if matches!(frame.body, proto::StateFrameBody::State { .. })
+                    && (self.catalog_requests.contains(request_id) || self.catalog_comparisons.contains(&frame.comparison))),
             _ => false,
         }
     }

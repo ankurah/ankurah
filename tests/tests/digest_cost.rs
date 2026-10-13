@@ -75,6 +75,9 @@ impl StorageEngine for Counted {
 struct Traffic {
     request_bytes: usize,
     response_bytes: usize,
+    update_bytes: usize,
+    ack_bytes: usize,
+    frames: usize,
     requests: usize,
     leaves: usize,
     repairs: usize,
@@ -93,6 +96,7 @@ struct Meter {
     requests: HashSet<proto::RequestId>,
     closes: HashMap<proto::RequestId, proto::ComparisonId>,
     comparisons: HashSet<proto::ComparisonId>,
+    updates: HashSet<proto::UpdateId>,
     traffic: Traffic,
     started: Option<Instant>,
     one_way_ms: u64,
@@ -107,16 +111,16 @@ impl Meter {
                     proto::NodeRequestBody::Fetch { selection, .. } | proto::NodeRequestBody::SubscribeQuery { selection, .. } => {
                         self.model.is_some_and(|model| selection.predicate.referenced_models().contains(&model))
                     }
-                    proto::NodeRequestBody::CompareTree { comparison, .. } | proto::NodeRequestBody::CloseComparison { comparison, .. } => {
-                        self.comparisons.contains(comparison)
-                    }
+                    proto::NodeRequestBody::ContinueState { comparison, .. }
+                    | proto::NodeRequestBody::CloseComparison { comparison, .. } => self.comparisons.contains(comparison),
                     _ => false,
                 };
                 if include {
-                    if let proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied } =
+                    if let proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied { .. } } =
                         &request.body
                     {
                         self.closes.insert(request.id.clone(), *comparison);
+                        self.traffic.completed += 1;
                     }
                     self.requests.insert(request.id.clone());
                     self.traffic.requests += 1;
@@ -124,36 +128,54 @@ impl Meter {
                 }
             }
             proto::NodeMessage::Response(response) if self.requests.contains(&response.request_id) => {
-                if self.closes.contains_key(&response.request_id) && matches!(response.body, proto::NodeResponseBody::Success) {
-                    self.traffic.completed += 1;
-                }
                 self.traffic.response_bytes += bincode::serialized_size(message).unwrap() as usize;
                 let page = match &response.body {
                     proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
-                        self.comparisons.insert(state.page.comparison);
-                        Some(&state.page)
+                        self.comparisons.insert(state.frame.comparison);
+                        Some(&state.frame)
                     }
-                    proto::NodeResponseBody::TreeCompared(page) => Some(page),
                     _ => None,
                 };
                 if let Some(page) = page {
-                    self.traffic.max_reply_items = self.traffic.max_reply_items.max(page.items.len());
-                    let bytes = page.items.iter().map(|item| bincode::serialized_size(item).unwrap() as usize).sum();
-                    self.traffic.max_reply_item_bytes = self.traffic.max_reply_item_bytes.max(bytes);
-                    for item in &page.items {
-                        match item {
-                            proto::StateItem::Leaves(page) => self.traffic.leaves += page.leaves.len(),
-                            proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
-                            proto::StateItem::Equal(_) => self.traffic.equal += 1,
-                            proto::StateItem::Summary(_) => self.traffic.summaries += 1,
-                            proto::StateItem::NeedLeaves(_) => self.traffic.leaf_questions += 1,
-                            proto::StateItem::NeedHeads(ids) => self.traffic.clock_questions += ids.len(),
-                            _ => {}
-                        }
+                    self.observe_frame(page);
+                }
+            }
+            proto::NodeMessage::Update(update) => {
+                if let proto::NodeUpdateBody::StateFrame { request_id, frame } = &update.body {
+                    if self.requests.contains(request_id) {
+                        self.updates.insert(update.id.clone());
+                        let bytes = bincode::serialized_size(message).unwrap() as usize;
+                        self.traffic.update_bytes += bytes;
+                        self.traffic.response_bytes += bytes;
+                        self.observe_frame(frame);
                     }
                 }
             }
+            proto::NodeMessage::UpdateAck(ack) if self.updates.contains(&ack.id) => {
+                let bytes = bincode::serialized_size(message).unwrap() as usize;
+                self.traffic.ack_bytes += bytes;
+                self.traffic.request_bytes += bytes;
+            }
             _ => {}
+        }
+    }
+    fn observe_frame(&mut self, frame: &proto::StateFrame) {
+        self.traffic.frames += 1;
+        if let proto::StateFrameBody::State { items, .. } = &frame.body {
+            self.traffic.max_reply_items = self.traffic.max_reply_items.max(items.len());
+            let bytes = items.iter().map(|item| bincode::serialized_size(item).unwrap() as usize).sum();
+            self.traffic.max_reply_item_bytes = self.traffic.max_reply_item_bytes.max(bytes);
+            for item in items {
+                match item {
+                    proto::StateItem::Leaves(page) => self.traffic.leaves += page.leaves.len(),
+                    proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
+                    proto::StateItem::Equal(_) => self.traffic.equal += 1,
+                    proto::StateItem::Summary(_) => self.traffic.summaries += 1,
+                    proto::StateItem::NeedLeaves(_) => self.traffic.leaf_questions += 1,
+                    proto::StateItem::NeedHeads(ids) => self.traffic.clock_questions += ids.len(),
+                    _ => {}
+                }
+            }
         }
     }
     fn take(&mut self) -> Traffic {
@@ -273,7 +295,7 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let cold = record("fetch_cold", n, &server, &client, &meter);
         assert_eq!(cold.repairs, n);
-        assert_eq!((cold.summaries, cold.leaf_questions, cold.clock_questions), (0, 0, n));
+        assert_eq!((cold.summaries, cold.leaf_questions, cold.clock_questions), (0, 0, 0));
         // Require roughly 96 small rows per exchange, with six exchanges of
         // startup/tail slack. This is a regression target, not a protocol limit.
         assert!(cold.requests <= n.div_ceil(96) + 6, "cold transfer takes too many exchanges: {cold:?}");

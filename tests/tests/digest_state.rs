@@ -11,33 +11,42 @@ use std::{
 };
 
 #[derive(Clone, Default)]
-struct Trace(Arc<Mutex<Vec<NodeResponseBody>>>);
+struct Trace(Arc<Mutex<Vec<NodeResponseBody>>>, Arc<Mutex<Vec<proto::StateFrame>>>);
 impl Trace {
     fn record(&self, message: &NodeMessage) {
         if let NodeMessage::Response(response) = message {
             self.0.lock().unwrap().push(response.body.clone());
+        } else if let NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+            self.1.lock().unwrap().push(frame.clone());
         }
     }
-    fn clear(&self) { self.0.lock().unwrap().clear(); }
+    fn clear(&self) {
+        self.0.lock().unwrap().clear();
+        self.1.lock().unwrap().clear();
+    }
     fn items(&self, query: Option<proto::QueryId>) -> Vec<StateItem> {
         let messages = self.0.lock().unwrap();
         let comparisons: HashSet<_> = messages
             .iter()
             .filter_map(|message| match message {
-                NodeResponseBody::Fetch(state) if query.is_none() => Some(state.page.comparison),
-                NodeResponseBody::QuerySubscribed { query_id, state } if Some(*query_id) == query => Some(state.page.comparison),
+                NodeResponseBody::Fetch(state) if query.is_none() => Some(state.frame.comparison),
+                NodeResponseBody::QuerySubscribed { query_id, state } if Some(*query_id) == query => Some(state.frame.comparison),
                 _ => None,
             })
             .collect();
+        let pushed = self.1.lock().unwrap();
         messages
             .iter()
             .filter_map(|message| match message {
-                NodeResponseBody::Fetch(state) | NodeResponseBody::QuerySubscribed { state, .. } => Some(&state.page),
-                NodeResponseBody::TreeCompared(page) => Some(page),
+                NodeResponseBody::Fetch(state) | NodeResponseBody::QuerySubscribed { state, .. } => Some(&state.frame),
                 _ => None,
             })
-            .filter(|page| comparisons.contains(&page.comparison))
-            .flat_map(|page| page.items.clone())
+            .chain(pushed.iter())
+            .filter(|frame| comparisons.contains(&frame.comparison))
+            .flat_map(|frame| match &frame.body {
+                proto::StateFrameBody::State { items, .. } => items.clone(),
+                _ => vec![],
+            })
             .collect()
     }
 }
@@ -108,7 +117,7 @@ async fn fetch_equal_head_and_sparse_changes_avoid_full_inventory() -> Result<()
 }
 
 #[tokio::test]
-async fn fetch_repairs_former_matches_and_uses_heads_held_outside_the_query() -> Result<()> {
+async fn fetch_repairs_former_matches_and_preserves_state_held_outside_the_query() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
@@ -130,7 +139,11 @@ async fn fetch_repairs_former_matches_and_uses_heads_held_outside_the_query() ->
     trx.commit().await?;
     trace.clear();
     assert_eq!(reader.fetch::<PetView>("age = '2'").await?.len(), 1);
-    assert!(bridge_for(&trace.items(None), pet.id()), "the new result can be known locally under another selection");
+    assert!(
+        trace.items(None).iter().any(|item| matches!(item, StateItem::Repair { delta, target }
+        if delta.entity_id == pet.id() && *target == pet.entity().head())),
+        "a new result offers the current target even when state was held under another selection"
+    );
     assert_eq!(retained.age()?, "2");
 
     let trx = writer.begin();
@@ -144,7 +157,7 @@ async fn fetch_repairs_former_matches_and_uses_heads_held_outside_the_query() ->
 }
 
 #[tokio::test]
-async fn empty_query_pages_mix_new_snapshots_and_bridges_from_other_queries() -> Result<()> {
+async fn empty_query_inventory_sends_snapshots_without_asserting_global_entity_absence() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
@@ -176,14 +189,15 @@ async fn empty_query_pages_mix_new_snapshots_and_bridges_from_other_queries() ->
     assert_eq!(reader.fetch::<PetView>("age = '2'").await?.len(), 192);
     let items = trace.items(None);
     assert!(items.iter().all(|item| !matches!(item, StateItem::Summary(_) | StateItem::NeedLeaves(_))));
-    assert!(known.iter().all(|pet| bridge_for(&items, pet.id())));
+    assert!(known.iter().all(|pet| items.iter().any(|item| matches!(item, StateItem::Repair { delta, target }
+        if delta.entity_id == pet.id() && *target == pet.entity().head()))));
     assert_eq!(
         items
             .iter()
             .filter(|item| matches!(item, StateItem::Repair { delta, .. }
         if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })))
             .count(),
-        96
+        192
     );
     Ok(())
 }
@@ -247,7 +261,7 @@ async fn large_snapshot_is_chunked_and_applied_before_fetch_returns() -> Result<
     assert_eq!(fetched[0].title()?, payload);
     let items = trace.items(None);
     let chunks: Vec<_> =
-        items.iter().filter_map(|item| if let StateItem::RepairChunk(chunk) = item { Some(chunk) } else { None }).collect();
+        items.iter().filter_map(|item| if let StateItem::RepairChunk { chunk, .. } = item { Some(chunk) } else { None }).collect();
     assert!(chunks.len() >= 5);
     assert_eq!(chunks[0].offset, 0);
     for pair in chunks.windows(2) {
@@ -314,7 +328,10 @@ async fn live_catchup_holds_edits_until_activation_then_reconnects_from_retained
     })
     .await;
     wait_for(|| !trace.items(Some(query.query_id())).is_empty()).await;
-    assert!(matches!(trace.items(Some(query.query_id())).as_slice(), [StateItem::Equal(_)]));
+    assert!(
+        trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Equal(_) | StateItem::Leaves(_))),
+        "retained clocks need no repair on reconnect"
+    );
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("4")?;
     trx.commit().await?;
@@ -404,20 +421,26 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
         )
         .await?;
     let NodeResponseBody::Fetch(state) = response else { panic!("{response:?}") };
-    let comparison = state.page.comparison;
+    let comparison = state.frame.comparison;
     assert!(matches!(
         client
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied }
+                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied { processed_through: 1 } }
             )
             .await?,
         NodeResponseBody::Error(_)
     ));
     let no_credentials = Vec::<&'static ankurah::policy::DefaultContext>::new();
     assert!(matches!(
-        client.request(server.id, &no_credentials, proto::NodeRequestBody::CompareTree { comparison, answers: vec![] }).await?,
+        client
+            .request(
+                server.id,
+                &no_credentials,
+                proto::NodeRequestBody::ContinueState { comparison, processed_through: 0, answers: vec![] }
+            )
+            .await?,
         NodeResponseBody::Error(_)
     ));
     assert!(matches!(
@@ -425,8 +448,9 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CompareTree {
+                proto::NodeRequestBody::ContinueState {
                     comparison,
+                    processed_through: 0,
                     answers: vec![proto::StateAnswer::Heads { known: vec![], unknown: vec![EntityId::random()] }],
                 }
             )
@@ -444,7 +468,13 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
         NodeResponseBody::Success
     ));
     assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::CompareTree { comparison, answers: vec![] }).await?,
+        client
+            .request(
+                server.id,
+                &DEFAULT_CONTEXT,
+                proto::NodeRequestBody::ContinueState { comparison, processed_through: 0, answers: vec![] }
+            )
+            .await?,
         NodeResponseBody::ComparisonUnavailable { .. }
     ));
     Ok(())
@@ -490,7 +520,7 @@ async fn former_match_reentering_during_catchup_is_not_lost_to_a_noop_live_updat
 }
 
 #[tokio::test]
-async fn retry_replays_the_same_snapshot_and_followup_without_advancing_twice() -> Result<()> {
+async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
@@ -508,13 +538,13 @@ async fn retry_replays_the_same_snapshot_and_followup_without_advancing_twice() 
     client.wait_ready().await?;
     let model = writer.resolve_model_id::<Pet>().await?;
     let body = proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::MemberOf(model).into(), known_state: None };
-    let initial_request = proto::RequestId::new();
+    let origin = proto::RequestId::new();
     for _ in 0..2 {
         server
             .handle_message(NodeMessage::Request {
                 auth: vec![proto::AuthData(vec![])],
                 request: proto::NodeRequest {
-                    id: initial_request.clone(),
+                    id: origin.clone(),
                     from: client.id,
                     to: server.id,
                     body: bincode::deserialize(&bincode::serialize(&body)?)?,
@@ -522,7 +552,7 @@ async fn retry_replays_the_same_snapshot_and_followup_without_advancing_twice() 
             })
             .await?;
     }
-    let initial = || {
+    let replies = || {
         trace
             .0
             .lock()
@@ -534,61 +564,30 @@ async fn retry_replays_the_same_snapshot_and_followup_without_advancing_twice() 
             })
             .collect::<Vec<_>>()
     };
-    wait_for(|| initial().len() == 2).await;
-    let first = initial().remove(0);
-    assert_eq!(bincode::serialize(&first)?, bincode::serialize(&initial()[1])?);
-    let comparison = first.page.comparison;
-    let StateItem::Summary(mut head) = first.page.items[0].clone() else { panic!("expected initial summary") };
-    head.digest = Default::default();
-    let body = proto::NodeRequestBody::CompareTree { comparison, answers: vec![proto::StateAnswer::Summary(head)] };
-    let followup = proto::RequestId::new();
+    wait_for(|| replies().len() == 2).await;
+    let initial = replies().remove(0);
+    assert_eq!(bincode::serialize(&initial)?, bincode::serialize(&replies()[1])?);
+    let comparison = initial.frame.comparison;
+    let feedback = proto::NodeRequestBody::ContinueState { comparison, processed_through: 0, answers: vec![] };
+    let request = proto::RequestId::new();
     for _ in 0..2 {
         server
             .handle_message(NodeMessage::Request {
                 auth: vec![proto::AuthData(vec![])],
                 request: proto::NodeRequest {
-                    id: followup.clone(),
+                    id: request.clone(),
                     from: client.id,
                     to: server.id,
-                    body: bincode::deserialize(&bincode::serialize(&body)?)?,
+                    body: bincode::deserialize(&bincode::serialize(&feedback)?)?,
                 },
             })
             .await?;
     }
-    let pages = || {
-        trace
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|body| match body {
-                NodeResponseBody::TreeCompared(page) if page.comparison == comparison => Some(page.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-    };
-    wait_for(|| pages().len() == 2).await;
-    assert_eq!(bincode::serialize(&pages()[0])?, bincode::serialize(&pages()[1])?);
-    let unknown = pages()[0]
-        .items
-        .iter()
-        .find_map(|item| match item {
-            StateItem::NeedHeads(ids) => Some(ids.clone()),
-            _ => None,
-        })
-        .expect("empty membership still needs actual entity clocks");
-    let advanced = client
-        .request(
-            server.id,
-            &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CompareTree { comparison, answers: vec![proto::StateAnswer::Heads { known: vec![], unknown }] },
-        )
-        .await?;
-    assert!(matches!(advanced, NodeResponseBody::TreeCompared(_)));
+    assert!(trace.1.lock().unwrap().iter().all(|frame| frame.comparison != comparison), "receipt retries cannot create extra state output");
     server
         .handle_message(NodeMessage::Request {
             auth: vec![proto::AuthData(vec![])],
-            request: proto::NodeRequest { id: followup, from: client.id, to: server.id, body },
+            request: proto::NodeRequest { id: origin, from: client.id, to: server.id, body },
         })
         .await?;
     wait_for(|| {
@@ -600,22 +599,25 @@ async fn retry_replays_the_same_snapshot_and_followup_without_advancing_twice() 
             .any(|body| matches!(body, NodeResponseBody::ComparisonUnavailable { comparison: id } if *id == comparison))
     })
     .await;
-    client
-        .request(
-            server.id,
-            &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned },
-        )
-        .await?;
+    assert!(matches!(
+        client
+            .request(
+                server.id,
+                &DEFAULT_CONTEXT,
+                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned }
+            )
+            .await?,
+        NodeResponseBody::Success
+    ));
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_restarts_when_the_responder_discards_its_comparison() -> Result<()> {
+async fn fetch_restarts_when_unfinished_chunk_transfer_expires() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
-    let pet = trx.create(&Pet { name: "Rex".into(), age: "1".into() }).await?.read()?;
+    let pet = trx.create(&Pet { name: "x".repeat(5 * 1024 * 1024), age: "1".into() }).await?.read()?;
     trx.commit().await?;
     let held = Arc::new(Mutex::new(None));
     let (_connection, gate) = GatedConnection::new(&server, &client, {
@@ -625,7 +627,7 @@ async fn fetch_restarts_when_the_responder_discards_its_comparison() -> Result<(
                 if let NodeResponseBody::Fetch(state) = &response.body {
                     let mut comparison = held.lock().unwrap();
                     if comparison.is_none() {
-                        *comparison = Some(state.page.comparison);
+                        *comparison = Some(state.frame.comparison);
                         return true;
                     }
                 }
@@ -639,13 +641,7 @@ async fn fetch_restarts_when_the_responder_discards_its_comparison() -> Result<(
     let fetch = tokio::spawn(async move { reader.fetch::<PetView>("true").await });
     wait_for(|| held.lock().unwrap().is_some()).await;
     let comparison = held.lock().unwrap().unwrap();
-    client
-        .request(
-            server.id,
-            &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned },
-        )
-        .await?;
+    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("2")?;
     trx.commit().await?;
@@ -700,7 +696,7 @@ async fn catchup_batches_many_edits_with_their_connecting_events() -> Result<()>
 
 #[tokio::test]
 async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent() -> Result<()> {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
@@ -709,12 +705,54 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
     let target = Arc::new(Mutex::new(None));
     let parked = Arc::new(AtomicBool::new(false));
     let trace = Trace::default();
+    let metadata = Arc::new(AtomicUsize::new(0));
+    let causal_reads = Arc::new(AtomicUsize::new(0));
+    let chunk_bytes = Arc::new(AtomicUsize::new(0));
+    let complete = Arc::new(AtomicUsize::new(0));
     let (_connection, gate) = GatedConnection::new(&server, &client, {
         let target = target.clone();
         let parked = parked.clone();
         let trace = trace.clone();
+        let metadata = metadata.clone();
+        let causal_reads = causal_reads.clone();
+        let chunk_bytes = chunk_bytes.clone();
+        let complete = complete.clone();
         move |message| {
             trace.record(message);
+            match message {
+                NodeMessage::Response(proto::NodeResponse { body: NodeResponseBody::GetEvents(events), .. }) => {
+                    causal_reads.fetch_add(events.len(), Ordering::Relaxed);
+                }
+                NodeMessage::Response(proto::NodeResponse { body: NodeResponseBody::QuerySubscribed { query_id, .. }, .. })
+                    if Some(*query_id) == *target.lock().unwrap() =>
+                {
+                    metadata.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            let frame = match message {
+                NodeMessage::Response(proto::NodeResponse {
+                    body: NodeResponseBody::Fetch(state) | NodeResponseBody::QuerySubscribed { state, .. },
+                    ..
+                }) => Some(&state.frame),
+                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                _ => None,
+            };
+            if let Some(proto::StateFrame { body: proto::StateFrameBody::State { items, progress }, .. }) = frame {
+                chunk_bytes.fetch_add(
+                    items
+                        .iter()
+                        .map(|item| match item {
+                            StateItem::RepairChunk { chunk, .. } => chunk.bytes.len(),
+                            _ => 0,
+                        })
+                        .sum(),
+                    Ordering::Relaxed,
+                );
+                if *progress == proto::ComparisonProgress::Complete {
+                    complete.fetch_add(1, Ordering::Relaxed);
+                }
+            }
             matches!(message, NodeMessage::Response(response)
                 if matches!(&response.body, NodeResponseBody::QuerySubscribed { query_id, .. }
                     if Some(*query_id) == *target.lock().unwrap() && !parked.swap(true, Ordering::AcqRel)))
@@ -726,28 +764,54 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
     let query = reader.query::<RecordView>(nocache("true")?)?;
     *target.lock().unwrap() = Some(query.query_id());
     wait_for(|| parked.load(Ordering::Acquire)).await;
-    assert!(matches!(trace.items(Some(query.query_id())).as_slice(), [StateItem::Equal(_)]));
-    let payload = "x".repeat(5 * 1024 * 1024); // State plus event exceed the 8 MiB handoff buffer.
-    let trx = writer.begin();
-    record.edit(&trx)?.title()?.set(&payload)?;
-    trx.commit().await?;
-    wait_for(|| retained.entity().head() == record.entity().head()).await;
+    assert!(
+        trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Equal(_) | StateItem::Leaves(_))),
+        "cached initialization supplies membership without repair"
+    );
+    let mut payload = String::new();
+    for edit in 0..8 {
+        payload = format!("{}-{edit}", "x".repeat(5 * 1024 * 1024));
+        let trx = writer.begin();
+        record.edit(&trx)?.title()?.set(&payload)?;
+        trx.commit().await?;
+    }
+    assert_eq!(retained.title()?, "old", "live output remains held until Applied");
+    let recovery_started = std::time::Instant::now();
     gate.release_held(&client).await;
-    tokio::time::timeout(Duration::from_secs(30), query.wait_durable_answered()).await??;
-    assert_eq!(query.peek()[0].title()?, payload);
-    assert!(trace.0.lock().unwrap().iter().any(|body| matches!(body, NodeResponseBody::ComparisonUnavailable { .. })));
+    let recovery = tokio::time::timeout(Duration::from_secs(120), async {
+        query.wait_durable_answered().await?;
+        while !query.peek().first().is_some_and(|row| row.title().as_deref() == Ok(payload.as_str())) {
+            tokio::task::yield_now().await;
+        }
+        query.wait_durable_answered().await?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+    let phase = serde_json::json!({ "recovery_ms": recovery_started.elapsed().as_millis(), "metadata_responses": metadata.load(Ordering::Relaxed), "causal_event_reads": causal_reads.load(Ordering::Relaxed), "repair_chunk_bytes": chunk_bytes.load(Ordering::Relaxed), "complete_frames": complete.load(Ordering::Relaxed), "loaded": query.loaded(), "value_bytes": query.peek().first().and_then(|row| row.title().ok()).map(|value| value.len()) });
+    println!("OVERFLOW_RECOVERY_PHASE {phase}");
+    recovery.map_err(|error| anyhow::anyhow!("{error}; {phase}"))??;
+    assert_eq!(query.peek()[0].entity().head(), record.entity().head(), "recovery must incorporate the final target");
+    assert!(trace.1.lock().unwrap().iter().any(|frame| matches!(frame.body, proto::StateFrameBody::RestartRequired)));
     assert!(trace.items(Some(query.query_id())).len() >= 2, "the query must obtain a fresh comparison");
     Ok(())
 }
 
 #[tokio::test]
-async fn expiring_an_unfinished_query_releases_other_queries_and_its_snapshot() -> Result<()> {
+async fn expiring_unfinished_generation_signals_restart_while_established_queries_keep_flowing() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
     let pet = trx.create(&Pet { name: "Rex".into(), age: "1".into() }).await?.read()?;
     trx.commit().await?;
-    let _connection = LocalProcessConnection::new(&server, &client).await?;
+    let trace = Trace::default();
+    let (_connection, _) = GatedConnection::new(&server, &client, {
+        let trace = trace.clone();
+        move |message| {
+            trace.record(message);
+            false
+        }
+    })
+    .await;
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
     let established = reader.query_wait::<PetView>("true").await?;
     established.wait_durable_answered().await?;
@@ -765,35 +829,137 @@ async fn expiring_an_unfinished_query_releases_other_queries_and_its_snapshot() 
         )
         .await?;
     let NodeResponseBody::QuerySubscribed { state, .. } = response else { panic!("{response:?}") };
-    let comparison = state.page.comparison;
+    let comparison = state.frame.comparison;
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("2")?;
     trx.commit().await?;
-    assert_eq!(established.peek()[0].age()?, "1", "another comparison holds live delivery");
-    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
     wait_for(|| established.peek()[0].age().unwrap() == "2").await;
-    assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::CompareTree { comparison, answers: vec![] }).await?,
-        NodeResponseBody::ComparisonUnavailable { .. }
-    ));
-    let response = client
-        .request(
-            server.id,
-            &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::MemberOf(model).into(), known_state: None },
-        )
-        .await?;
-    let NodeResponseBody::Fetch(state) = response else { panic!("{response:?}") };
-    ankurah::core::test_helpers::expire_comparison(&server, client.id, state.page.comparison).await?;
+    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
+    wait_for(|| {
+        trace
+            .1
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.comparison == comparison && matches!(frame.body, proto::StateFrameBody::RestartRequired))
+    })
+    .await;
     assert!(matches!(
         client
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CompareTree { comparison: state.page.comparison, answers: vec![] }
+                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied { processed_through: 0 } }
             )
             .await?,
         NodeResponseBody::ComparisonUnavailable { .. }
     ));
+    assert!(matches!(
+        client
+            .request(
+                server.id,
+                &DEFAULT_CONTEXT,
+                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned }
+            )
+            .await?,
+        NodeResponseBody::Success
+    ));
+    let trx = writer.begin();
+    pet.edit(&trx)?.age()?.replace("3")?;
+    trx.commit().await?;
+    wait_for(|| established.peek()[0].age().unwrap() == "3").await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pushed_chunks_can_outrun_metadata_and_arrive_out_of_order_without_early_activation() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let payload = "x".repeat(180_000);
+    let trx = writer.begin();
+    let record = trx.create(&Record { title: payload.clone(), artist: "artist".into() }).await?.read()?;
+    trx.commit().await?;
+    let target = Arc::new(Mutex::new(None));
+    let comparison = Arc::new(Mutex::new(None));
+    let parked = Arc::new(AtomicBool::new(false));
+    let trace = Trace::default();
+    let (_connection, gate) = GatedConnection::new(&server, &client, {
+        let target = target.clone();
+        let comparison = comparison.clone();
+        let parked = parked.clone();
+        let trace = trace.clone();
+        move |message| {
+            trace.record(message);
+            match message {
+                NodeMessage::Response(proto::NodeResponse { body: NodeResponseBody::QuerySubscribed { query_id, state }, .. })
+                    if Some(*query_id) == *target.lock().unwrap() =>
+                {
+                    *comparison.lock().unwrap() = Some(state.frame.comparison);
+                    parked.store(true, Ordering::Release);
+                    true
+                }
+                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
+                    Some(frame.comparison) == *comparison.lock().unwrap()
+                }
+                _ => false,
+            }
+        }
+    })
+    .await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    reader.resolve_model_id::<Record>().await?;
+    let query = reader.query::<RecordView>(nocache("true")?)?;
+    *target.lock().unwrap() = Some(query.query_id());
+    wait_for(|| {
+        parked.load(Ordering::Acquire)
+            && trace.items(Some(query.query_id())).iter().filter(|item| matches!(item, StateItem::RepairChunk { .. })).count() >= 5
+    })
+    .await;
+    gate.release_last(&client, 1).await;
+    assert!(!query.loaded(), "a final chunk cannot activate before its metadata and earlier frames");
+    gate.release_first(&client, 1).await;
+    assert!(!query.loaded(), "metadata cannot activate an incomplete chunk assembly");
+    gate.release_held(&client).await;
+    query.wait_durable_answered().await?;
+    assert_eq!(query.ids(), [record.id()]);
+    assert_eq!(query.peek()[0].title()?, payload);
+    assert_eq!(query.peek()[0].entity().head(), record.entity().head());
+    Ok(())
+}
+
+#[tokio::test]
+async fn byte_smaller_snapshot_advances_a_retained_older_entity_truthfully() -> Result<()> {
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let record = trx.create(&Record { title: "old".into(), artist: "retained".into() }).await?.read()?;
+    trx.commit().await?;
+    let trace = Trace::default();
+    let (_connection, _) = GatedConnection::new(&server, &client, {
+        let trace = trace.clone();
+        move |message| {
+            trace.record(message);
+            false
+        }
+    })
+    .await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let retained = reader.fetch::<RecordView>("true").await?.remove(0);
+    let mut value = String::new();
+    for edit in 0..8 {
+        value = format!("{}-{edit}", "x".repeat(8192));
+        let trx = writer.begin();
+        record.edit(&trx)?.title()?.set(&value)?;
+        trx.commit().await?;
+    }
+    trace.clear();
+    let fetched = reader.fetch::<RecordView>("true").await?;
+    assert_eq!(fetched[0].title()?, value);
+    assert_eq!(retained.title()?, value);
+    assert_eq!(retained.artist()?, "retained");
+    assert_eq!(retained.entity().head(), record.entity().head());
+    assert!(trace.items(None).iter().any(|item| matches!(item, StateItem::Repair { delta, .. }
+        if delta.entity_id == record.id() && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))));
     Ok(())
 }

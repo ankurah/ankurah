@@ -44,13 +44,13 @@ async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> a
 
     release.send(()).unwrap();
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = subscribe.await? else { panic!("expected comparison") };
-    let comparison = state.page.comparison;
+    let comparison = state.frame.comparison;
     let connection = node.peer_connections.get(&peer).unwrap();
     let session = Arc::downgrade(&connection.comparisons.get(&comparison).unwrap());
     unsubscribe.await?;
     assert!(session.upgrade().is_none(), "unsubscribe must release the frozen snapshot and its timer");
     assert!(matches!(
-        node.compare_tree(peer, proto::RequestId::new(), comparison, vec![], vec![]).await?,
+        node.continue_state(peer, proto::RequestId::new(), comparison, 0, vec![], vec![]).await?,
         proto::NodeResponseBody::ComparisonUnavailable { .. }
     ));
     Ok(())
@@ -331,5 +331,33 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
     let notified: Vec<_> =
         received.try_iter().flat_map(|update| update.items).flat_map(|item| item.events).map(|event| event.payload.id()).collect();
     assert_eq!(notified, expected_events);
+    Ok(())
+}
+
+#[tokio::test]
+async fn canceled_state_requests_release_waiters_and_disconnect_wakes_remaining_requests() -> anyhow::Result<()> {
+    let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let peer = proto::EntityId::random();
+    let (sent, _messages) = std::sync::mpsc::channel();
+    node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await?;
+    let credentials = vec![DEFAULT_CONTEXT];
+    {
+        let request = node.request_state(
+            peer,
+            &credentials,
+            proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::True.into(), known_state: None },
+        );
+        tokio::pin!(request);
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(node.peer_connections.get(&peer).unwrap().pending_requests.len(), 1);
+    }
+    assert!(node.peer_connections.get(&peer).unwrap().pending_requests.is_empty());
+    let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: Vec::new() });
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    node.deregister_peer(peer);
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(1), request).await?.is_err());
     Ok(())
 }

@@ -16,7 +16,8 @@ pub struct PeerState<CD: ContextData> {
     pub(super) pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pub(crate) initial_comparison: tokio::sync::Mutex<()>,
     pub(crate) comparisons: super::state_sync::Comparisons<CD>,
-    pub(crate) outgoing_comparisons: SafeMap<proto::ComparisonId, bool>,
+    pub(crate) outgoing_comparisons: std::sync::Arc<SafeMap<proto::ComparisonId, bool>>,
+    pub(crate) incoming_states: std::sync::Arc<super::state_sync::IncomingStates>,
 }
 
 impl<CD: ContextData> PeerState<CD> {
@@ -29,9 +30,23 @@ impl<CD: ContextData> PeerState<CD> {
             pending_updates: SafeMap::new(),
             initial_comparison: tokio::sync::Mutex::new(()),
             comparisons: Default::default(),
-            outgoing_comparisons: SafeMap::new(),
+            outgoing_comparisons: Default::default(),
+            incoming_states: Default::default(),
         }
     }
 
     pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
+}
+
+/// Remove a request waiter even when its caller is canceled or times out.
+pub(super) struct PendingRequest<CD: ContextData> {
+    pub connection: std::sync::Weak<PeerState<CD>>,
+    pub id: proto::RequestId,
+}
+impl<CD: ContextData> Drop for PendingRequest<CD> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.upgrade() {
+            connection.pending_requests.remove(&self.id);
+        }
+    }
 }

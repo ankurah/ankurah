@@ -47,7 +47,7 @@ pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) 
         NodeRequestBody::Fetch { selection, .. } | NodeRequestBody::SubscribeQuery { selection, .. } => {
             is_catalog_read(&selection.predicate)
         }
-        NodeRequestBody::CompareTree { .. }
+        NodeRequestBody::ContinueState { .. }
         | NodeRequestBody::CloseComparison { .. }
         | NodeRequestBody::Get { .. }
         | NodeRequestBody::GetEvents { .. }

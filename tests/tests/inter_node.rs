@@ -169,11 +169,10 @@ async fn server_edits_subscription() -> Result<()> {
     Ok(())
 }
 
-// A second subscription's snapshot can arrive after another query already holds
-// the entity at that head. Applying the unchanged snapshot must not notify the
-// established query with an empty-events Update, which could race its next real
-// update (#202). Hold query B's response until query A is watching, then release
-// the unchanged snapshot and verify that A receives no notification.
+// Regression for a query's initial repair notifying another established query
+// about an entity that did not advance (#202). Hold query B's initial response
+// until query A is watching the same entity at that head; releasing B's no-op
+// repair must not publish a spurious Update with no events to A.
 #[tokio::test]
 async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

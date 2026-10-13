@@ -19,8 +19,7 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
         to: entity,
         body: proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
-                entity_id: entity,
-                content: proto::UpdateContent::EventOnly(vec![frag]),
+                delta: proto::EntityDelta { entity_id: entity, content: proto::DeltaContent::EventBridge { events: vec![frag] } },
                 predicate_relevance: vec![],
             }],
         },
@@ -50,21 +49,27 @@ fn digest_is_stable_for_identical_content() {
 #[test]
 fn comparison_digest_tracks_repair_content_but_not_session_ids() {
     let reply = |event: proto::Event| {
-        proto::NodeMessage::Response(proto::NodeResponse {
-            request_id: proto::RequestId::new(),
+        proto::NodeMessage::Update(proto::NodeUpdate {
+            id: proto::UpdateId::new(),
             from: event.entity_id,
             to: event.entity_id,
-            body: proto::NodeResponseBody::TreeCompared(proto::ComparisonReply {
-                comparison: proto::ComparisonId::new(),
-                items: vec![proto::StateItem::Repair {
-                    target: proto::Clock::singleton(&event),
-                    delta: proto::EntityDelta {
-                        entity_id: event.entity_id,
-                        content: proto::DeltaContent::EventBridge { events: vec![model::attest(event).into()] },
+            body: proto::NodeUpdateBody::StateFrame {
+                request_id: proto::RequestId::new(),
+                frame: proto::StateFrame {
+                    comparison: proto::ComparisonId::new(),
+                    sequence: 1,
+                    body: proto::StateFrameBody::State {
+                        items: vec![proto::StateItem::Repair {
+                            target: proto::Clock::singleton(&event),
+                            delta: proto::EntityDelta {
+                                entity_id: event.entity_id,
+                                content: proto::DeltaContent::EventBridge { events: vec![model::attest(event).into()] },
+                            },
+                        }],
+                        progress: proto::ComparisonProgress::Complete,
                     },
-                }],
-                progress: proto::ComparisonProgress::Complete,
-            }),
+                },
+            },
         })
     };
     let one = model::genesis_event(1, model::Field::Title, "one");
@@ -72,4 +77,59 @@ fn comparison_digest_tracks_repair_content_but_not_session_ids() {
     let first = message_digest(&reply(one.clone()));
     assert_eq!(first, message_digest(&reply(one)), "fresh correlation ids must not change the trace");
     assert_ne!(first, message_digest(&reply(two)), "same-size replies with different repairs must differ");
+}
+
+fn frame_message(sequence: u64, body: proto::StateFrameBody) -> proto::NodeMessage {
+    proto::NodeMessage::Update(proto::NodeUpdate {
+        id: proto::UpdateId::new(),
+        from: proto::EntityId::from_bytes([1; 32]),
+        to: proto::EntityId::from_bytes([2; 32]),
+        body: proto::NodeUpdateBody::StateFrame {
+            request_id: proto::RequestId::new(),
+            frame: proto::StateFrame { comparison: proto::ComparisonId::new(), sequence, body },
+        },
+    })
+}
+
+#[test]
+fn live_frame_digest_tracks_sequence_and_membership_without_random_route_ids() {
+    let event = model::genesis_event(3, model::Field::Title, "live");
+    let frame = |sequence, change| {
+        frame_message(
+            sequence,
+            proto::StateFrameBody::Live(vec![proto::SubscriptionUpdateItem {
+                delta: proto::EntityDelta {
+                    entity_id: event.entity_id,
+                    content: proto::DeltaContent::EventBridge { events: vec![model::attest(event.clone()).into()] },
+                },
+                predicate_relevance: vec![(proto::QueryId::new(), change)],
+            }]),
+        )
+    };
+    let first = message_digest(&frame(2, proto::MembershipChange::Add));
+    assert_eq!(first, message_digest(&frame(2, proto::MembershipChange::Add)), "fresh stream and query ids must not perturb the trace");
+    assert_ne!(first, message_digest(&frame(3, proto::MembershipChange::Add)), "frame ordering is meaningful");
+    assert_ne!(first, message_digest(&frame(2, proto::MembershipChange::Remove)), "membership effects are meaningful");
+}
+
+#[test]
+fn live_chunk_digest_tracks_fragment_bytes_and_offsets() {
+    let frame = |offset, bytes: Vec<u8>| {
+        frame_message(
+            5,
+            proto::StateFrameBody::LiveChunk {
+                chunk: proto::EntityDeltaChunk {
+                    entity_id: proto::EntityId::from_bytes([3; 32]),
+                    offset,
+                    bytes: bytes.into(),
+                    last: false,
+                },
+                predicate_relevance: vec![(proto::QueryId::new(), proto::MembershipChange::Add)],
+            },
+        )
+    };
+    let first = message_digest(&frame(0, vec![1, 2]));
+    assert_eq!(first, message_digest(&frame(0, vec![1, 2])));
+    assert_ne!(first, message_digest(&frame(0, vec![1, 3])), "same-size fragments with different bytes must differ");
+    assert_ne!(first, message_digest(&frame(2, vec![1, 2])), "fragment position is meaningful");
 }
