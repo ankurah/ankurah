@@ -22,7 +22,9 @@ pub use ankurah_digest_tree::{AddressRange, TreeHead, TreeSpec};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-use crate::{Clock, EntityDelta, EntityDeltaChunk, EntityId, KnownEntity, MembershipChange, QueryId, SubscriptionUpdateItem};
+use crate::{
+    Attested, Clock, EntityDelta, EntityDeltaChunk, EntityId, EntityState, KnownEntity, MembershipChange, QueryId, SubscriptionUpdateItem,
+};
 
 /// A responder-issued handle for one comparison, scoped to the requesting peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -132,6 +134,9 @@ pub enum StateItem {
     /// Required causal repair cannot be supplied within policy/history/work limits.
     /// Fail this Fetch or initialization; do not report ready with a known gap.
     RepairUnavailable { entity_id: EntityId, target: Clock },
+    /// Exhaustive captured membership with inline snapshots, avoiding a separate
+    /// leaf inventory and duplicate repair targets for a cold range.
+    Snapshots(SnapshotPage),
 }
 
 /// Answers for any subset of the outstanding regions/entities in a comparison.
@@ -166,6 +171,17 @@ pub struct LeafPage {
     pub bounds: AddressRange,
     /// Strictly increasing by canonical key bytes followed by entity ID.
     pub leaves: Vec<KnownLeaf>,
+}
+
+/// An exhaustive range page in canonical address order, including empty gaps.
+/// Derive keys and target clocks from these captured snapshots before applying
+/// them: a newer or concurrent local state may have a different key or head.
+/// Normal attestation, causal validation and target coverage still apply.
+/// Oversized snapshots use Leaves plus RepairChunk instead of a partial page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotPage {
+    pub bounds: AddressRange,
+    pub states: Vec<Attested<EntityState>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

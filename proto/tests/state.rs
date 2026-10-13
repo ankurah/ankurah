@@ -378,6 +378,29 @@ fn shared_state_and_events_preserve_history_and_attestations_in_repair_and_live_
 }
 
 #[test]
+fn snapshot_pages_preserve_attestations_and_omit_duplicate_leaf_and_target_data() {
+    let entity = known(3);
+    let state = Attested {
+        payload: EntityState { entity_id: entity.entity_id, state: State { head: entity.head.clone(), ..Default::default() } },
+        attestations: AttestationSet(vec![Attestation(vec![11, 12])]),
+    };
+    let bounds = AddressRange::under(&NodePrefix::root());
+    let page = StateItem::Snapshots(SnapshotPage { bounds: bounds.clone(), states: vec![state.clone()] });
+    let StateItem::Snapshots(received) = wire(&page) else { panic!("snapshot page") };
+    assert_eq!(received.bounds, bounds);
+    assert_eq!(received.states[0].payload, state.payload);
+    assert_eq!(received.states[0].attestations, state.attestations);
+    let separate = vec![
+        StateItem::Leaves(LeafPage { bounds, leaves: vec![KnownLeaf { key: vec![], entity: entity.clone() }] }),
+        StateItem::Repair {
+            target: entity.head,
+            delta: EntityDelta { entity_id: entity.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } },
+        },
+    ];
+    assert!(bincode::serialized_size(&vec![page]).unwrap() < bincode::serialized_size(&separate).unwrap());
+}
+
+#[test]
 fn head_deserialization_preserves_the_tree_crates_validation() {
     let root = NodePrefix::root();
     let bounds = AddressRange::under(&NodePrefix::root());
