@@ -22,6 +22,8 @@ pub use ankurah_digest_tree::{AddressRange, TreeHead, TreeSpec};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+mod compact_initial_page;
+
 use crate::{
     Attested, Clock, EntityDelta, EntityDeltaChunk, EntityId, EntityState, KnownEntity, MembershipChange, QueryId, SubscriptionUpdateItem,
 };
@@ -55,7 +57,7 @@ pub struct KnownState {
 pub enum KnownRegion {
     Summary(TreeHead),
     /// Exhaustive for its bounds; an empty page explicitly describes an empty range.
-    Leaves(LeafPage),
+    Leaves(#[serde(with = "compact_initial_page")] LeafPage),
 }
 
 /// Initial Fetch or SubscribeQuery response; frame.sequence must be zero.
