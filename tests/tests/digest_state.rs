@@ -1206,3 +1206,95 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn cold_query_with_2049_interleaved_cached_rows_uses_a_summary_frontier() -> Result<()> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // 4096 half-cache is exactly the 2048-leaf inventory cap. This extra
+    // pair makes the genuinely partial requester offer a Summary frontier.
+    const COUNT: usize = 4098;
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let mut rows = Vec::new();
+    for i in 0..COUNT {
+        rows.push(trx.create(&Record { title: format!("row-{i:06}"), artist: format!("artist-{i:06}") }).await?.read()?);
+    }
+    trx.commit().await?;
+    let expected = rows.iter().map(|row| Ok((row.id(), row.entity().to_state()?))).collect::<Result<BTreeMap<_, _>>>()?;
+    assert_eq!(expected.len(), COUNT);
+
+    // Gate the server side only to observe actual outgoing requests. No
+    // response is held or synthesized, and catalog offers are excluded by id.
+    let offers = Arc::new(Mutex::new(Vec::<(proto::QueryId, proto::KnownState)>::new()));
+    let (_connection, _) = GatedConnection::new(&client, &server, {
+        let offers = offers.clone();
+        move |message| {
+            if let NodeMessage::Request { request, .. } = message {
+                if let proto::NodeRequestBody::SubscribeQuery { query_id, known_state: Some(known), .. } = &request.body {
+                    offers.lock().unwrap().push((*query_id, known.clone()));
+                }
+            }
+            false
+        }
+    })
+    .await;
+    client.wait_ready().await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let wanted_cache = (0..COUNT).step_by(2).map(|i| rows[i].id()).collect::<BTreeSet<_>>();
+    let predicates = (0..COUNT).step_by(2).map(|i| format!("title = 'row-{i:06}'")).collect::<Vec<_>>();
+    let mut prefetched = BTreeSet::new();
+    for batch in predicates.chunks(32) {
+        prefetched.extend(reader.fetch::<RecordView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
+    }
+    assert_eq!(prefetched, wanted_cache, "public Fetch batches must cache exactly the alternating rows");
+    assert_eq!(prefetched.len(), 2049);
+    let model = reader.resolve_model_id::<Record>().await?;
+    let cached = client.storage.fetch_states(&ankql::ast::Predicate::MemberOf(model).into()).await?;
+    assert_eq!(
+        cached.iter().map(|state| state.payload.entity_id).collect::<BTreeSet<_>>(),
+        wanted_cache,
+        "the missing rows must still be absent before the first full query"
+    );
+
+    // There is no earlier full query/refresh to hydrate the omitted rows.
+    let query = reader.query::<RecordView>(nocache("title >= 'row-' ORDER BY title ASC")?)?;
+    tokio::time::timeout(Duration::from_secs(30), query.wait_durable_answered()).await??;
+    // Capture synchronously immediately after the versioned ready wait. Each
+    // full state/head is atomic; no async verifier or drain can rescue it.
+    // The fixture has no writes after server setup, so comparison is stable.
+    let installed =
+        query.resultset().read().iter_entities().map(|(id, entity)| Ok((id, entity.to_state()?))).collect::<Result<BTreeMap<_, _>>>()?;
+    assert_eq!(installed, expected, "ready must expose every exact entity, full state and head");
+    let own_offers =
+        offers.lock().unwrap().iter().filter(|(id, _)| *id == query.query_id()).map(|(_, known)| known.clone()).collect::<Vec<_>>();
+    assert_eq!(own_offers.len(), 1, "the cold query must have one actual initial offer, excluding catalog requests");
+    let known = &own_offers[0];
+    assert!(
+        known.regions.iter().all(|region| matches!(region, proto::KnownRegion::Summary(_))),
+        "the partial cache must offer Summary-only"
+    );
+    let offered_count = known
+        .regions
+        .iter()
+        .map(|region| match region {
+            proto::KnownRegion::Summary(head) => head.digest.count(),
+            _ => unreachable!(),
+        })
+        .sum::<i64>();
+    assert_eq!(offered_count, 2049, "the frontier must describe only the genuinely cached alternating membership");
+    assert_eq!(known.spec.key_spec().keyparts.len(), 1, "the real ordered title selection must retain its planner key");
+    assert_eq!(
+        known.spec.key_spec().keyparts[0].key,
+        resolved_prop(&client, Record::descriptor(), "title"),
+        "the frontier must use the actual resolved title property, not an arbitrary one-part key"
+    );
+
+    // Persistence is deliberately checked only after the immutable ready
+    // capture passed; subsequent reads cannot conceal incomplete activation.
+    for (id, state) in &installed {
+        assert_eq!(client.storage.get_state(*id).await?.payload.state, *state);
+    }
+    Ok(())
+}
