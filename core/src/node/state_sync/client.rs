@@ -124,7 +124,22 @@ where
                             answers.push(StateAnswer::Summary(snapshot.head(head.bounds).await?));
                         }
                         StateItem::NeedLeaves(bounds) => answers.push(StateAnswer::Leaves(snapshot.page(bounds).await?)),
-                        StateItem::Leaves(page) => replace_members(&mut members, &snapshot.spec, page)?,
+                        StateItem::Leaves(page) => replace_members(&mut members, &snapshot.spec, page, super::LEAF_PAGE)?,
+                        StateItem::Snapshots(page) => {
+                            // Membership comes from the captured sender state,
+                            // before the applier can merge a newer local state.
+                            let leaves = snapshot_leaves(&snapshot.spec, &page)?;
+                            replace_members(&mut members, &snapshot.spec, leaves, super::MAX_SNAPSHOT_ROWS)?;
+                            for state in page.states {
+                                let entity_id = state.payload.entity_id;
+                                ensure!(!assemblies.contains_key(&entity_id), "snapshot interrupted repair chunks");
+                                targets.push((entity_id, state.payload.state.head.clone()));
+                                deltas.push(proto::EntityDelta {
+                                    entity_id,
+                                    content: proto::DeltaContent::StateSnapshot { state: state.into() },
+                                });
+                            }
+                        }
                         StateItem::NeedHeads(ids) => {
                             ensure!(ids.len() <= 128, "too many requested entity clocks");
                             let mut known = Vec::new();
@@ -215,22 +230,16 @@ where
                 }
                 complete |= progress == ComparisonProgress::Complete;
                 if complete && answers.is_empty() && required.is_empty() && assemblies.is_empty() {
-                    return Ok(RemoteState {
-                        comparison: id,
-                        ids: members.into_values().collect(),
-                        processed_through: frame.sequence,
-                        stream,
-                        feedback,
-                    });
+                    return Ok((members.into_values().collect(), frame.sequence, feedback));
                 }
                 feedback.queue(self, peer, credentials, id, frame.sequence, answers, &stream.inbox)?;
             }
         }
         .await;
         if result.is_err() {
-            let _ = self.close_comparison(peer, id, credentials, proto::ComparisonOutcome::Abandoned).await;
+            let _ = self.abandon_current_state(peer, id, credentials, &stream).await;
         }
-        result.map_err(|error: anyhow::Error| {
+        let (ids, processed_through, feedback) = result.map_err(|error: anyhow::Error| {
             if let Some(error) = error.downcast_ref::<RetrievalError>() {
                 return error.clone();
             }
@@ -238,7 +247,8 @@ where
                 return error.clone().into();
             }
             error.into()
-        })
+        })?;
+        Ok(RemoteState { comparison: id, ids, processed_through, stream, feedback })
     }
 
     async fn covers_target(&self, actual: &proto::Clock, target: &proto::Clock) -> anyhow::Result<bool> {
@@ -343,15 +353,38 @@ where
             if let Err(error) = result {
                 tracing::warn!(%error, "state stream failed");
                 if let Some(node) = weak.upgrade() {
+                    if !node.owns_state_stream(peer, &remote.stream) {
+                        return;
+                    }
                     if let Some((query, version)) = query {
                         if let Some(relay) = &node.subscription_relay {
                             relay.stream_failed(peer, query, version, &remote.stream.request);
                         }
                     }
-                    let _ = node.close_comparison(peer, comparison, &credentials, proto::ComparisonOutcome::Abandoned).await;
+                    let _ = node.abandon_current_state(peer, comparison, &credentials, &remote.stream).await;
                 }
             }
         });
+    }
+
+    fn owns_state_stream(&self, peer: proto::EntityId, stream: &IncomingStream) -> bool {
+        self.peer_connections.get(&peer).is_some_and(|connection| connection.incoming_states.is_current(&stream.request))
+            && stream.query.is_none_or(|(query, version)| self.live_queries.get(query).is_some_and(|query| query.is_current(version)))
+    }
+
+    /// Superseded bound streams belong to replacement/unsubscribe cleanup;
+    /// abandoning them here can erase the tree before replacement is prepared.
+    pub(crate) async fn abandon_current_state(
+        &self,
+        peer: proto::EntityId,
+        comparison: proto::ComparisonId,
+        credentials: &Vec<PA::ContextData>,
+        stream: &IncomingStream,
+    ) -> Result<(), RetrievalError> {
+        if self.owns_state_stream(peer, stream) {
+            self.close_comparison(peer, comparison, credentials, proto::ComparisonOutcome::Abandoned).await?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn close_comparison(
@@ -402,9 +435,32 @@ fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow:
     Ok(())
 }
 
-fn replace_members(members: &mut BTreeMap<Vec<u8>, proto::EntityId>, spec: &proto::TreeSpec, page: proto::LeafPage) -> anyhow::Result<()> {
+fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow::Result<proto::LeafPage> {
+    ensure!(page.states.len() <= super::MAX_SNAPSHOT_ROWS, "peer sent too many snapshots");
+    let mut ids = std::collections::HashSet::new();
+    let leaves = page
+        .states
+        .iter()
+        .map(|state| {
+            let entity_id = state.payload.entity_id;
+            ensure!(ids.insert(entity_id), "duplicate entity in snapshot page");
+            Ok(proto::KnownLeaf {
+                key: super::tree::key(spec, state)?,
+                entity: proto::KnownEntity { entity_id, head: state.payload.state.head.clone() },
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(proto::LeafPage { bounds: page.bounds.clone(), leaves })
+}
+
+fn replace_members(
+    members: &mut BTreeMap<Vec<u8>, proto::EntityId>,
+    spec: &proto::TreeSpec,
+    page: proto::LeafPage,
+    max_rows: usize,
+) -> anyhow::Result<()> {
     use std::ops::Bound::*;
-    ensure!(page.leaves.len() <= super::LEAF_PAGE, "peer sent too many leaves");
+    ensure!(page.leaves.len() <= max_rows, "peer sent too many leaves");
     let nonempty = match (&page.bounds.start, &page.bounds.end) {
         (Unbounded, _) | (_, Unbounded) => true,
         (Included(a), Included(b)) => a <= b,

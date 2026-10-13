@@ -74,6 +74,13 @@ fn bridge_for(items: &[StateItem], id: EntityId) -> bool {
         if delta.entity_id == id && matches!(delta.content, proto::DeltaContent::EventBridge { .. }))
     })
 }
+fn offers_target(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool {
+    items.iter().any(|item| match item {
+        StateItem::Snapshots(page) => page.states.iter().any(|state| state.payload.entity_id == id && state.payload.state.head == *head),
+        StateItem::Repair { target, delta } => delta.entity_id == id && target == head,
+        _ => false,
+    })
+}
 
 #[tokio::test]
 async fn fetch_equal_head_and_sparse_changes_avoid_full_inventory() -> Result<()> {
@@ -97,10 +104,22 @@ async fn fetch_equal_head_and_sparse_changes_avoid_full_inventory() -> Result<()
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 256);
     let cold = trace.items(None);
-    assert!(cold.iter().filter(|item| matches!(item, StateItem::Leaves(_))).count() > 1, "cold fetch must page its leaves");
+    assert!(cold.iter().filter(|item| matches!(item, StateItem::Snapshots(_))).count() > 1, "cold fetch must page its snapshots");
+    assert_eq!(cold.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 256);
+    assert!(
+        !cold.iter().any(|item| matches!(item, StateItem::Leaves(_) | StateItem::Repair { .. })),
+        "cold inline snapshots also carry membership and targets"
+    );
     trace.clear();
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 256);
-    assert!(matches!(trace.items(None).as_slice(), [StateItem::Equal(_)]), "equal results need only a root comparison");
+    let equal = trace.items(None);
+    assert!(equal.iter().any(|item| matches!(item, StateItem::Equal(_))));
+    assert!(
+        equal
+            .iter()
+            .all(|item| matches!(item, StateItem::Equal(_)) || matches!(item, StateItem::Snapshots(page) if page.states.is_empty())),
+        "equal regions and empty frontier gaps need no result identities or repair: {equal:?}"
+    );
 
     let trx = writer.begin();
     pets[117].edit(&trx)?.age()?.replace("2")?;
@@ -140,8 +159,7 @@ async fn fetch_repairs_former_matches_and_preserves_state_held_outside_the_query
     trace.clear();
     assert_eq!(reader.fetch::<PetView>("age = '2'").await?.len(), 1);
     assert!(
-        trace.items(None).iter().any(|item| matches!(item, StateItem::Repair { delta, target }
-        if delta.entity_id == pet.id() && *target == pet.entity().head())),
+        offers_target(&trace.items(None), pet.id(), &pet.entity().head()),
         "a new result offers the current target even when state was held under another selection"
     );
     assert_eq!(retained.age()?, "2");
@@ -189,16 +207,8 @@ async fn empty_query_inventory_sends_snapshots_without_asserting_global_entity_a
     assert_eq!(reader.fetch::<PetView>("age = '2'").await?.len(), 192);
     let items = trace.items(None);
     assert!(items.iter().all(|item| !matches!(item, StateItem::Summary(_) | StateItem::NeedLeaves(_))));
-    assert!(known.iter().all(|pet| items.iter().any(|item| matches!(item, StateItem::Repair { delta, target }
-        if delta.entity_id == pet.id() && *target == pet.entity().head()))));
-    assert_eq!(
-        items
-            .iter()
-            .filter(|item| matches!(item, StateItem::Repair { delta, .. }
-        if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })))
-            .count(),
-        192
-    );
+    assert!(known.iter().all(|pet| offers_target(&items, pet.id(), &pet.entity().head())));
+    assert_eq!(items.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 192);
     Ok(())
 }
 
@@ -473,6 +483,20 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 server.id,
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::ContinueState { comparison, processed_through: 0, answers: vec![] }
+            )
+            .await?,
+        NodeResponseBody::Success
+    ));
+    assert!(matches!(
+        client
+            .request(
+                server.id,
+                &DEFAULT_CONTEXT,
+                proto::NodeRequestBody::ContinueState {
+                    comparison,
+                    processed_through: 0,
+                    answers: vec![proto::StateAnswer::Heads { known: vec![], unknown: vec![] }],
+                }
             )
             .await?,
         NodeResponseBody::ComparisonUnavailable { .. }
@@ -917,5 +941,83 @@ async fn byte_smaller_snapshot_advances_a_retained_older_entity_truthfully() -> 
     assert_eq!(retained.entity().head(), record.entity().head());
     assert!(trace.items(None).iter().any(|item| matches!(item, StateItem::Repair { delta, .. }
         if delta.entity_id == record.id() && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))));
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_change() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let record = trx.create(&Record { title: "a-000".into(), artist: "outside".into() }).await?.read()?;
+    let mut expected = HashSet::from([record.id()]);
+    for i in 1..200 {
+        expected.insert(trx.create(&Record { title: format!("a-{i:03}"), artist: "remote".into() }).await?.id());
+    }
+    trx.commit().await?;
+    let target = Arc::new(Mutex::new(None));
+    let parked = Arc::new(AtomicBool::new(false));
+    let trace = Trace::default();
+    let (_connection, gate) = GatedConnection::new(&server, &client, {
+        let target = target.clone();
+        let parked = parked.clone();
+        let trace = trace.clone();
+        move |message| {
+            trace.record(message);
+            matches!(message, NodeMessage::Response(response)
+                if matches!(&response.body, NodeResponseBody::QuerySubscribed { query_id, .. }
+                    if Some(*query_id) == *target.lock().unwrap() && !parked.swap(true, Ordering::AcqRel)))
+        }
+    })
+    .await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let retained = reader.get::<RecordView>(record.id()).await?;
+    let local = reader.begin();
+    retained.edit(&local)?.title()?.set(&"zz-local".to_owned())?;
+    let remote = writer.begin();
+    record.edit(&remote)?.artist()?.set(&"remote".to_owned())?;
+    remote.commit().await?;
+    let captured = record.entity().head();
+    let query = reader.query::<RecordView>(nocache("artist = 'remote' ORDER BY title ASC LIMIT 200")?)?;
+    *target.lock().unwrap() = Some(query.query_id());
+    wait_for(|| parked.load(Ordering::Acquire)).await;
+    let offered = trace.items(Some(query.query_id()));
+    let page = offered
+        .iter()
+        .find_map(|item| match item {
+            StateItem::Snapshots(page) if page.states.iter().any(|state| state.payload.entity_id == record.id()) => Some(page),
+            _ => None,
+        })
+        .expect("the outside-query entity must be offered as a captured snapshot");
+    assert!(matches!(page.bounds.end, std::ops::Bound::Included(_)), "the first page must have a finite key boundary");
+    assert_eq!(page.states[0].payload.entity_id, record.id());
+    assert_eq!(page.states[0].payload.state.head, captured);
+    local.commit().await?;
+    let local_head = retained.entity().head();
+    assert_eq!(retained.title()?, "zz-local");
+    assert_eq!(retained.artist()?, "outside", "the held sender branch has not reached the receiver");
+    assert!(
+        captured.entries().iter().all(|event| !local_head.entries().contains(event)),
+        "the local branch must be concurrent with the offered target"
+    );
+    assert!(!query.loaded());
+    gate.release_held(&client).await;
+    query.wait_durable_answered().await?;
+    assert_eq!(query.ids().into_iter().collect::<HashSet<_>>(), expected, "captured page keys must preserve every result identity");
+    assert_eq!(retained.title()?, "zz-local", "snapshot application must preserve the local key edit");
+    assert_eq!(retained.artist()?, "remote", "connecting history must incorporate the sender branch");
+    let merged = retained.entity().head();
+    assert!(captured.entries().iter().all(|event| merged.entries().contains(event)));
+    assert!(local_head.entries().iter().all(|event| merged.entries().contains(event)));
+    assert_eq!(
+        client.storage.get_state(record.id()).await?.payload.state.head,
+        merged,
+        "covered branches must be persisted before readiness"
+    );
+    assert!(
+        bridge_for(&trace.items(Some(query.query_id())), record.id()),
+        "the uncovered snapshot target must request and apply connecting events"
+    );
     Ok(())
 }

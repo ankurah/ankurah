@@ -53,6 +53,9 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
     pub livequery: Q,
     cancel: CancelFlag,
     stream_origin: Option<proto::RequestId>,
+    // Retry/readiness status can change while the peer still owns a query.
+    // Keep its cleanup owner until unsubscribe or peer teardown.
+    assigned_peer: Option<proto::EntityId>,
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
@@ -125,7 +128,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|error| error.into_inner());
         for state in subscriptions.values() {
             state.cancel.cancel();
-            if let Status::Established(peer, _) | Status::Requested(peer, _) = state.status {
+            if let Some(peer) = state.assigned_peer {
                 if let Some(node) = self.inner.node.get() {
                     node.cancel_query(peer, state.content.query_id);
                 }
@@ -159,8 +162,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             let previous = subscriptions.remove(&query_id);
             let peer = previous.and_then(|state| {
                 state.cancel.cancel();
-                match state.status {
-                    Status::Established(peer, _) | Status::Requested(peer, _) => {
+                match state.assigned_peer {
+                    Some(peer) => {
                         if let Some(node) = self.inner.node.get() {
                             node.cancel_query(peer, query_id);
                         }
@@ -177,6 +180,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     livequery,
                     cancel: cancel.clone(),
                     stream_origin: None,
+                    assigned_peer: peer,
                 },
             );
             peer
@@ -305,7 +309,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = subscriptions.remove(&query_id) {
                 info.cancel.cancel();
-                if let Status::Established(peer_id, _) | Status::Requested(peer_id, _) = &info.status {
+                if let Some(peer_id) = &info.assigned_peer {
                     let node = self.inner.node.get();
                     if let Some(node) = node {
                         node.cancel_query(*peer_id, query_id);
@@ -337,6 +341,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         let mut lost = Vec::new();
         for info in self.inner.subscriptions.lock().expect("poisoned lock").values_mut() {
+            if info.assigned_peer == Some(peer_id) {
+                info.assigned_peer = None;
+            }
             if let Status::Established(established_peer_id, _) | Status::Requested(established_peer_id, _) = &info.status {
                 if *established_peer_id == peer_id {
                     // Update state to pending
@@ -480,6 +487,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 .filter_map(|info| {
                     if let Status::PendingRemote = info.status {
                         info.status = Status::Requested(target_peer, info.content.version);
+                        info.assigned_peer = Some(target_peer);
                         info.cancel.cancel_and_swap();
                         Some((info.content.clone(), info.cancel.clone()))
                     } else {
@@ -663,7 +671,7 @@ where
         if canceled() {
             return Err(RequestError::ConnectionLost.into());
         }
-        let (stream, response) = node
+        let (mut stream, response) = node
             .request_state(
                 peer_id,
                 &context_data,
@@ -677,6 +685,7 @@ where
             other => return Err(RequestError::UnexpectedResponse(other).into()),
         };
         let connection = node.peer_connections.get(&peer_id).ok_or(RequestError::PeerNotConnected)?;
+        stream.bind(state.frame.comparison, crate::schema::is_catalog_read(&selection.predicate), connection.outgoing_comparisons.clone());
         if canceled()
             || !connection.incoming_states.is_current(&stream.request)
             || !node.subscription_relay.as_ref().is_some_and(|relay| relay.bind_stream(peer_id, query_id, version, stream.request.clone()))
@@ -686,7 +695,7 @@ where
             let comparison = state.frame.comparison;
             crate::task::spawn(async move {
                 if let Some(node) = weak.upgrade() {
-                    let _ = node.close_comparison(peer_id, comparison, &credentials, proto::ComparisonOutcome::Abandoned).await;
+                    let _ = node.abandon_current_state(peer_id, comparison, &credentials, &stream).await;
                 }
             });
             return Err(RequestError::ConnectionLost.into());
@@ -720,7 +729,7 @@ where
         if matches!(activated, Ok(true)) {
             node.finish_state(peer_id, context_data, remote, Some((query_id, version)));
         } else {
-            let _ = node.close_comparison(peer_id, remote.comparison, &context_data, proto::ComparisonOutcome::Abandoned).await;
+            let _ = node.abandon_current_state(peer_id, remote.comparison, &context_data, &remote.stream).await;
             activated?;
             return Err(RequestError::ConnectionLost.into());
         }
@@ -969,6 +978,7 @@ mod tests {
 
         // Verify subscription is marked as pending again
         assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)));
+        assert_eq!(relay.inner.subscriptions.lock().unwrap().get(&query_id).unwrap().assigned_peer, None);
     }
 
     #[tokio::test]
@@ -1049,6 +1059,49 @@ mod tests {
 
         // Verify subscription remains in failed state (non-retryable error)
         assert!(matches!(relay.get_status(query_id), Some(Status::Failed)));
+    }
+
+    #[tokio::test]
+    async fn pending_and_failed_queries_keep_their_cleanup_peer_until_unsubscribe() {
+        for error in [RequestError::ConnectionLost, RequestError::ServerError("invalid preparation".into())] {
+            let relay = SubscriptionRelay::new_test();
+            let node = Arc::new(MockMessageSender::<ModelId>::new());
+            relay.set_node(node.clone()).unwrap();
+            let peer = EntityId::random();
+            let query = proto::QueryId::new();
+            relay.notify_peer_connected(peer);
+            relay.subscribe_query(query, create_test_selection(), create_test_model_id().into(), 1, MockLiveQuery);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !matches!(relay.get_status(query), Some(Status::Established(_, 1))) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            node.set_fail_next(error);
+            relay.subscribe_query(query, create_test_selection(), create_test_model_id().into(), 2, MockLiveQuery);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !matches!(relay.get_status(query), Some(Status::PendingRemote | Status::Failed)) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(relay.inner.subscriptions.lock().unwrap().get(&query).unwrap().assigned_peer, Some(peer));
+            relay.unsubscribe_predicate(query);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while !node
+                    .get_sent_requests()
+                    .iter()
+                    .any(|(found_peer, found_query, selection)| *found_peer == peer && *found_query == query && selection.is_none())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(relay.get_status(query).is_none());
+        }
     }
 
     #[tokio::test]

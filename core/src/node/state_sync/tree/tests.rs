@@ -124,8 +124,8 @@ async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() 
     let initial = (0..70).map(|id| state(id, 1)).collect::<Vec<_>>();
     let mut old = query.refresh(spec(), initial.clone()).await?;
     let inventory = old.offer().await?;
-    let [proto::KnownRegion::Summary(original)] = inventory.regions.as_slice() else { panic!("large inventories need a summary") };
-    let original = original.clone();
+    assert!(inventory.regions.iter().all(|region| matches!(region, proto::KnownRegion::Summary(_))));
+    let original = old.head(super::super::whole()).await?;
     let generation = query.0.lock().await.as_ref().unwrap().generation.clone();
     let mut unchanged = query.refresh(spec(), initial).await?;
     assert!(Arc::ptr_eq(&generation, &query.0.lock().await.as_ref().unwrap().generation));
@@ -143,5 +143,51 @@ async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() 
         assert_eq!(incremental.head(super::super::whole()).await?, recomputed.head(super::super::whole()).await?);
         assert_eq!(old.head(super::super::whole()).await?, original);
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_including_empty_gaps() -> anyhow::Result<()> {
+    let states = (0..4096u32)
+        .map(|n| {
+            let mut state = state(0, 1);
+            let mut bytes = [0; EntityId::BYTE_LEN];
+            bytes[..4].copy_from_slice(&n.to_be_bytes());
+            state.payload.entity_id = EntityId::from_bytes(bytes);
+            state
+        })
+        .collect::<Vec<_>>();
+    let query = QueryTree::default();
+    let mut snapshot = query.refresh(spec(), states.clone()).await?;
+    let inventory = snapshot.offer().await?;
+    assert!(inventory.regions.len() > 1, "a new large tree must offer its bounded cached descendants");
+    assert!(inventory.regions.len() <= OFFER_REGIONS);
+    assert!(bincode::serialized_size(&inventory)? <= OFFER_BYTES);
+    let mut next = super::super::whole().start;
+    let mut digests = Vec::new();
+    let mut empty = false;
+    for region in inventory.regions {
+        let proto::KnownRegion::Summary(head) = region else { panic!("large offer must contain only summaries") };
+        assert_eq!(head.bounds.start, next, "regions must be disjoint and exactly adjacent");
+        assert_eq!(snapshot.head(head.bounds.clone()).await?.digest, head.digest, "each head describes its exact captured range");
+        empty |= head.digest.count() == 0;
+        digests.push(head.digest);
+        next = match head.bounds.end {
+            Bound::Included(end) => Bound::Excluded(end),
+            Bound::Excluded(end) => Bound::Included(end),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+    }
+    assert_eq!(next, super::super::whole().end);
+    assert!(empty, "gaps before and after the populated addresses must remain explicit");
+    let root = snapshot.head(super::super::whole()).await?;
+    assert_eq!(ankurah_digest_tree::Digest::checked_sum(digests.iter().copied())?, root.digest);
+
+    let mut warm = query.refresh(spec(), states).await?;
+    let retained = warm.offer().await?;
+    let [proto::KnownRegion::Summary(retained_root)] = retained.regions.as_slice() else {
+        panic!("retained equality must use its cheap root offer")
+    };
+    assert_eq!(*retained_root, root);
     Ok(())
 }

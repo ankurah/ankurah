@@ -81,6 +81,7 @@ struct Traffic {
     requests: usize,
     leaves: usize,
     repairs: usize,
+    snapshots: usize,
     equal: usize,
     completed: usize,
     summaries: usize,
@@ -169,6 +170,7 @@ impl Meter {
                 match item {
                     proto::StateItem::Leaves(page) => self.traffic.leaves += page.leaves.len(),
                     proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
+                    proto::StateItem::Snapshots(page) => self.traffic.snapshots += page.states.len(),
                     proto::StateItem::Equal(_) => self.traffic.equal += 1,
                     proto::StateItem::Summary(_) => self.traffic.summaries += 1,
                     proto::StateItem::NeedLeaves(_) => self.traffic.leaf_questions += 1,
@@ -294,14 +296,15 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         reset(&server, &client, &meter);
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let cold = record("fetch_cold", n, &server, &client, &meter);
-        assert_eq!(cold.repairs, n);
+        assert_eq!((cold.snapshots, cold.repairs, cold.leaves), (n, 0, 0));
         assert_eq!((cold.summaries, cold.leaf_questions, cold.clock_questions), (0, 0, 0));
         // Require roughly 96 small rows per exchange, with six exchanges of
         // startup/tail slack. This is a regression target, not a protocol limit.
         assert!(cold.requests <= n.div_ceil(96) + 6, "cold transfer takes too many exchanges: {cold:?}");
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let equal = record("fetch_equal", n, &server, &client, &meter);
-        assert_eq!((equal.equal, equal.leaves, equal.repairs), (1, 0, 0));
+        assert!(equal.equal > 0);
+        assert_eq!((equal.leaves, equal.repairs, equal.snapshots), (0, 0, 0));
         let trx = writer.begin();
         rows[n / 2].edit(&trx)?.value()?.set(&"changed".into())?;
         trx.commit().await?;

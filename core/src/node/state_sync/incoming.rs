@@ -31,7 +31,10 @@ impl Registry {
     fn remove(&mut self, request: &RequestId) -> Option<(LateReply, proto::ComparisonId)> {
         if let Some(stream) = self.streams.remove(request) {
             stream.inbox.close();
-            if let Some(handler) = stream.late_reply {
+            // Once metadata was bound, replacement/unsubscribe owns remote
+            // cleanup. Only an unbound request needs to abandon an orphan id
+            // learned after its receiver has gone away.
+            if let Some(handler) = stream.late_reply.filter(|_| stream.comparison.is_none()) {
                 if let Some(comparison) = stream.deferred_comparison {
                     return Some((handler, comparison));
                 }
@@ -52,6 +55,7 @@ impl Registry {
 
 pub(crate) struct IncomingStream {
     pub request: RequestId,
+    pub query: Option<(proto::QueryId, u32)>,
     pub inbox: Arc<Inbox>,
     owner: Weak<IncomingStates>,
     comparison: Option<(proto::ComparisonId, Arc<crate::util::safemap::SafeMap<proto::ComparisonId, bool>>)>,
@@ -73,6 +77,9 @@ impl IncomingStream {
                 stream.comparison = Some(id);
                 stream.deferred_comparison = None;
             }
+            // The caller consumed this metadata even if cancellation removed
+            // the origin first. Its subscription owner now handles cleanup.
+            registry.retired.retain(|(request, _)| request != &self.request);
         }
         comparisons.insert(id, catalog);
         self.comparison = Some((id, comparisons));
@@ -124,7 +131,7 @@ impl IncomingStates {
         for (handler, comparison) in cleanup {
             handler(comparison);
         }
-        Ok(IncomingStream { request, inbox, owner: Arc::downgrade(self), comparison: None })
+        Ok(IncomingStream { request, query, inbox, owner: Arc::downgrade(self), comparison: None })
     }
 
     pub fn route(&self, request: &RequestId, frame: StateFrame) -> anyhow::Result<()> {
@@ -363,6 +370,53 @@ mod tests {
             drop(registry.register(RequestId::new(), None, Some(handler.clone()))?);
         }
         assert_eq!(registry.0.lock().unwrap().retired.len(), 128);
+        Ok(())
+    }
+
+    #[test]
+    fn canceled_bound_query_ignores_late_frames_and_releases_its_catalog_entry() -> anyhow::Result<()> {
+        let registry = Arc::new(IncomingStates::default());
+        let query = proto::QueryId::new();
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let handler: LateReply = {
+            let cancelled = cancelled.clone();
+            Arc::new(move |id| cancelled.lock().unwrap().push(id))
+        };
+        let mut stream = registry.register(RequestId::new(), Some((query, 1)), Some(handler))?;
+        let request = stream.request.clone();
+        let comparison = proto::ComparisonId::new();
+        let comparisons = Arc::new(crate::util::safemap::SafeMap::new());
+        stream.bind(comparison, true, comparisons.clone());
+        registry.cancel_query(query);
+        assert!(!registry.is_current(&request));
+        assert!(stream.inbox.state.lock().unwrap().closed);
+        registry.route(&request, frame(comparison, 1))?;
+        registry.late_response(&request, comparison);
+        assert!(cancelled.lock().unwrap().is_empty(), "late traffic from a replaced bound stream cannot abandon the standing query");
+        drop(stream);
+        assert!(comparisons.get(&comparison).is_none());
+        assert!(registry.0.lock().unwrap().retired.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn consuming_canceled_metadata_disarms_its_unbound_orphan_handler() -> anyhow::Result<()> {
+        let registry = Arc::new(IncomingStates::default());
+        let query = proto::QueryId::new();
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+        let handler: LateReply = {
+            let cancelled = cancelled.clone();
+            Arc::new(move |id| cancelled.lock().unwrap().push(id))
+        };
+        let mut stream = registry.register(RequestId::new(), Some((query, 1)), Some(handler))?;
+        registry.cancel_query(query);
+        assert_eq!(registry.0.lock().unwrap().retired.len(), 1, "unconsumed metadata still needs orphan cleanup");
+        let comparison = proto::ComparisonId::new();
+        stream.bind(comparison, false, Arc::new(crate::util::safemap::SafeMap::new()));
+        registry.route(&stream.request, frame(comparison, 1))?;
+        registry.late_response(&stream.request, comparison);
+        assert!(cancelled.lock().unwrap().is_empty(), "consumed metadata belongs to the superseding subscription's cleanup");
+        assert!(registry.0.lock().unwrap().retired.is_empty());
         Ok(())
     }
 

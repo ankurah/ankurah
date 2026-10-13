@@ -145,8 +145,17 @@ impl Delivery {
             node.send_update(peer, proto::NodeUpdateBody::SubscriptionUpdate { items });
             return Ok(());
         }
-        self.route_updates(items, |comparison, items| {
-            node.queue_live(peer, comparison, items).map_err(|error| error.context(LiveStreamFailure(comparison)))
+        self.route_updates(items, |comparison, items| match node.queue_live(peer, comparison, items) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if node.peer_connections.get(&peer).is_some_and(|peer| peer.comparisons.get(&comparison).is_some()) {
+                    Err(error)
+                } else {
+                    // Retain the binding for exact-generation cleanup by its
+                    // owner; removing it here would hide the standing query.
+                    Ok(())
+                }
+            }
         })
     }
 
@@ -155,8 +164,14 @@ impl Delivery {
         items: Vec<proto::SubscriptionUpdateItem>,
         mut queue: impl FnMut(proto::ComparisonId, Vec<proto::SubscriptionUpdateItem>) -> anyhow::Result<()>,
     ) -> anyhow::Result<()> {
+        let mut failed_queries = HashSet::new();
+        let mut stream_failure = None;
+        let mut pending_failure = None;
         for item in items {
             for (query, route) in &mut self.routes {
+                if failed_queries.contains(query) {
+                    continue;
+                }
                 if route.comparison.is_some()
                     && !route.members.contains(&item.delta.entity_id)
                     && !item.predicate_relevance.iter().any(|(id, _)| id == query)
@@ -167,21 +182,33 @@ impl Delivery {
                 item.predicate_relevance.retain(|(id, _)| id == query);
                 if let Some(comparison) = route.comparison {
                     if route.admits(&item) {
-                        queue(comparison, vec![item])?;
+                        if let Err(error) = queue(comparison, vec![item]) {
+                            failed_queries.insert(*query);
+                            stream_failure.get_or_insert_with(|| error.context(LiveStreamFailure(comparison)));
+                        }
                     }
                 } else {
-                    let size = usize::try_from(bincode::serialized_size(&item)?)?;
-                    anyhow::ensure!(
-                        self.bytes.saturating_add(size) <= MAX_PENDING_BYTES,
-                        "subscription initialization live queue overflow"
-                    );
-                    self.bytes += size;
-                    route.bytes += size;
-                    route.pending.push_back((item, size));
+                    let result: anyhow::Result<()> = (|| {
+                        let size = usize::try_from(bincode::serialized_size(&item)?)?;
+                        anyhow::ensure!(
+                            self.bytes.saturating_add(size) <= MAX_PENDING_BYTES,
+                            "subscription initialization live queue overflow"
+                        );
+                        self.bytes += size;
+                        route.bytes += size;
+                        route.pending.push_back((item, size));
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        failed_queries.insert(*query);
+                        pending_failure.get_or_insert(error);
+                    }
                 }
             }
         }
-        Ok(())
+        // Every healthy bound route receives the whole batch. Initialization
+        // failures still require disconnect and must not be hidden by a stopped stream.
+        pending_failure.or(stream_failure).map_or(Ok(()), Err)
     }
 
     pub fn remove(&mut self, query: proto::QueryId) {
@@ -194,6 +221,26 @@ impl Delivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        connector::{PeerSender, SendError},
+        policy::PermissiveAgent,
+        test_utils::TestStorage,
+    };
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct CaptureSender {
+        peer: proto::EntityId,
+        messages: Arc<Mutex<Vec<proto::NodeMessage>>>,
+    }
+    impl PeerSender for CaptureSender {
+        fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+            self.messages.lock().unwrap().push(message);
+            Ok(())
+        }
+        fn recipient_node_id(&self) -> proto::EntityId { self.peer }
+        fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+    }
 
     fn item(entity: proto::EntityId, relevance: Vec<(proto::QueryId, proto::MembershipChange)>) -> proto::SubscriptionUpdateItem {
         let event = proto::Event::update(entity, proto::Clock::default(), proto::AuthorId::Unknown, proto::OperationSet::default());
@@ -305,5 +352,105 @@ mod tests {
         assert!(delivery.routes.contains_key(&query));
         assert!(delivery.routes[&query].comparison.is_none());
         assert_eq!(delivery.bytes, 0);
+    }
+
+    #[test]
+    fn failed_bound_stream_does_not_skip_other_streams_or_later_items() -> anyhow::Result<()> {
+        let failed_query = proto::QueryId::new();
+        let healthy_query = proto::QueryId::new();
+        let failed = proto::ComparisonId::new();
+        let healthy = proto::ComparisonId::new();
+        let failed_entity = proto::EntityId::random();
+        let healthy_entity = proto::EntityId::random();
+        let mut delivery = Delivery::default();
+        delivery.begin(failed_query, 1);
+        delivery.bind_route(failed_query, 1, failed, [failed_entity]);
+        delivery.begin(healthy_query, 1);
+        delivery.bind_route(healthy_query, 1, healthy, [healthy_entity]);
+        let changes = vec![item(healthy_entity, vec![]), item(healthy_entity, vec![])];
+        let mut batch = vec![item(failed_entity, vec![])];
+        batch.extend(changes.clone());
+        let mut received = Vec::new();
+        let failure = delivery
+            .route_updates(batch, |stream, items| {
+                if stream == failed {
+                    anyhow::bail!("stopped stream");
+                }
+                assert_eq!(stream, healthy);
+                received.extend(items);
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(failure.downcast_ref::<LiveStreamFailure>().unwrap().0, failed);
+        assert_eq!(bincode::serialize(&received)?, bincode::serialize(&changes)?);
+        assert!(delivery.matches(healthy_query, 1, healthy));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_stream_does_not_hide_initialization_overflow() {
+        let failed_query = proto::QueryId::new();
+        let initializing_query = proto::QueryId::new();
+        let failed = proto::ComparisonId::new();
+        let entity = proto::EntityId::random();
+        let mut delivery = Delivery::default();
+        delivery.begin(failed_query, 1);
+        delivery.bind_route(failed_query, 1, failed, [entity]);
+        delivery.begin(initializing_query, 1);
+        let mut oversized = item(proto::EntityId::random(), vec![]);
+        let proto::DeltaContent::StateAndEvents { state, .. } = &mut oversized.delta.content else { unreachable!() };
+        state.state.state_buffers.0.insert("large".to_owned(), vec![0; MAX_PENDING_BYTES]);
+        let error = delivery.route_updates(vec![item(entity, vec![]), oversized], |_, _| anyhow::bail!("stopped stream")).unwrap_err();
+        assert!(error.downcast_ref::<LiveStreamFailure>().is_none(), "initialization failure must still require connection recovery");
+        assert!(error.to_string().contains("initialization live queue overflow"));
+    }
+
+    #[tokio::test]
+    async fn removed_comparison_route_is_stale_and_healthy_stream_still_receives() -> anyhow::Result<()> {
+        let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+        let peer = proto::EntityId::random();
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        node.register_peer(
+            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+            Box::new(CaptureSender { peer, messages: messages.clone() }),
+        )
+        .await?;
+        let stale_query = proto::QueryId::new();
+        let healthy_query = proto::QueryId::new();
+        let stale_entity = proto::EntityId::random();
+        let healthy_entity = proto::EntityId::random();
+        let mut delivery = Delivery::default();
+        let mut streams = Vec::new();
+        for (query, entity) in [(stale_query, stale_entity), (healthy_query, healthy_entity)] {
+            let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
+            let snapshot = crate::node::state_sync::QueryTree::default().refresh(spec, vec![]).await?;
+            let initial =
+                node.start_comparison(peer, proto::RequestId::new(), vec![], vec![], Some((query, 1)), false, snapshot, None).await?;
+            delivery.begin(query, 1);
+            assert!(delivery.bind_route(query, 1, initial.frame.comparison, [entity]));
+            streams.push(initial.frame.comparison);
+        }
+        // Reproduce the cleanup window: comparison is gone, route is still bound.
+        node.close_state(peer, streams[0], proto::ComparisonOutcome::Abandoned, vec![]).await?;
+        node.close_state(peer, streams[1], proto::ComparisonOutcome::Applied { processed_through: 0 }, vec![]).await?;
+        delivery.send(&node, peer, vec![item(stale_entity, vec![]), item(healthy_entity, vec![])])?;
+        assert!(node.peer_connections.get(&peer).is_some(), "retiring one stream must preserve the peer");
+        assert!(delivery.matches(stale_query, 1, streams[0]), "retain the binding for its owner's standing-query cleanup");
+        assert!(delivery.matches(healthy_query, 1, streams[1]));
+        node.pump_comparison(peer, streams[1]).await?;
+        assert!(messages.lock().unwrap().iter().any(|message| matches!(
+            message,
+            proto::NodeMessage::Update(proto::NodeUpdate {
+                body: proto::NodeUpdateBody::StateFrame {
+                    frame: proto::StateFrame { comparison, body: proto::StateFrameBody::Live(items), .. }, ..
+                }, ..
+            }) if *comparison == streams[1] && items.iter().any(|item| item.delta.entity_id == healthy_entity)
+        )));
+        let replacement = proto::ComparisonId::new();
+        delivery.begin(stale_query, 2);
+        assert!(delivery.bind_route(stale_query, 2, replacement, []));
+        assert!(!delivery.matches(stale_query, 1, streams[0]), "old cleanup must not match the replacement");
+        assert!(delivery.matches(stale_query, 2, replacement));
+        Ok(())
     }
 }

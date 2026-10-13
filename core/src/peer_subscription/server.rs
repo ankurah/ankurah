@@ -60,11 +60,10 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 let items = update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect();
                 let result = updates.lock().unwrap().send(&node, peer_id, items);
                 if let Err(error) = result {
-                    let restarting = error.downcast_ref::<delivery::LiveStreamFailure>().is_some_and(|failed| {
-                        node.peer_connections.get(&peer_id).is_some_and(|peer| peer.comparisons.get(&failed.0).is_some())
-                    });
-                    if restarting {
-                        warn!(%peer_id, %error, "subscription stream rejected an update; awaiting its explicit restart");
+                    if error.downcast_ref::<delivery::LiveStreamFailure>().is_some() {
+                        // Queue failure schedules this stream's restart. It may
+                        // already have retired while the callback was routing.
+                        warn!(%peer_id, %error, "subscription stream rejected an update; awaiting its explicit restart or cleanup");
                     } else {
                         warn!(%peer_id, %error, "subscription delivery failed; disconnecting peer");
                         node.deregister_peer(peer_id);
@@ -273,4 +272,11 @@ where
 
     // Create subscription update item
     Some(proto::SubscriptionUpdateItem { delta: proto::EntityDelta { entity_id: item.entity.id(), content }, predicate_relevance })
+}
+
+#[cfg(test)]
+impl<CD: ContextData> SubscriptionHandler<CD> {
+    pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<crate::node::state_sync::QueryTree>)> {
+        self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.tree.clone()))
+    }
 }

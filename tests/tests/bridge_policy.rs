@@ -86,6 +86,52 @@ async fn comparison_membership_removes_denied_cached_rows_from_fetch_and_liveque
 }
 
 #[tokio::test]
+async fn snapshot_pages_validate_received_state_attestations_before_fetch_succeeds() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server.system.create().await?;
+    let writer = server.context_async(DEFAULT_CONTEXT).await?;
+    let trx = writer.begin();
+    let id = trx.create(&Pet { name: "Nori".into(), age: "3".into() }).await?.id();
+    trx.commit().await?;
+    let agent = BridgePolicyAgent::new();
+    agent.deny_received_states.lock().unwrap().insert(id);
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let pages = Arc::new(Mutex::new(Vec::new()));
+    let (_connection, _) = common::GatedConnection::new(&server, &client, {
+        let pages = pages.clone();
+        move |message| {
+            let frame = match message {
+                proto::NodeMessage::Response(proto::NodeResponse { body: proto::NodeResponseBody::Fetch(state), .. }) => Some(&state.frame),
+                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                _ => None,
+            };
+            if let Some(proto::StateFrame { body: proto::StateFrameBody::State { items, .. }, .. }) = frame {
+                for item in items {
+                    if let proto::StateItem::Snapshots(page) = item {
+                        pages.lock().unwrap().push(page.clone());
+                    }
+                }
+            }
+            false
+        }
+    })
+    .await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    assert!(reader.fetch::<PetView>("true").await.is_err(), "rejected state attestation must fail the snapshot-page fetch");
+    assert!(pages.lock().unwrap().iter().any(|page| page.states.iter().any(|state| state.payload.entity_id == id)));
+    assert!(agent.received_state_checks.lock().unwrap().contains(&id), "SnapshotPage must reach ordinary received-state validation");
+    assert!(
+        matches!(client.storage.get_state(id).await, Err(ankurah::core::error::RetrievalError::EntityNotFound(missing)) if missing == id)
+    );
+    agent.deny_received_states.lock().unwrap().clear();
+    let accepted = reader.fetch::<PetView>("true").await?;
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].id(), id);
+    assert_eq!(accepted[0].name()?, "Nori");
+    Ok(())
+}
+
+#[tokio::test]
 async fn state_read_hook_filters_fetch_cache_and_live_updates() -> Result<()> {
     use ankurah::{core::error::RetrievalError, model::View};
     use ankurah_signals::Peek;
@@ -134,6 +180,8 @@ struct BridgePolicyAgent {
     deny_read_events: Arc<Mutex<HashSet<EventId>>>,
     deny_reads: Arc<AtomicBool>,
     deny_read_states: Arc<Mutex<HashSet<proto::EntityId>>>,
+    deny_received_states: Arc<Mutex<HashSet<proto::EntityId>>>,
+    received_state_checks: Arc<Mutex<HashSet<proto::EntityId>>>,
 }
 
 impl BridgePolicyAgent {
@@ -143,6 +191,8 @@ impl BridgePolicyAgent {
             deny_read_events: Arc::new(Mutex::new(HashSet::new())),
             deny_reads: Arc::new(AtomicBool::new(false)),
             deny_read_states: Arc::new(Mutex::new(HashSet::new())),
+            deny_received_states: Arc::new(Mutex::new(HashSet::new())),
+            received_state_checks: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -212,9 +262,14 @@ impl PolicyAgent for BridgePolicyAgent {
         &self,
         _node: &NodeAlias<SE, Self>,
         _from_node: &proto::EntityId,
-        _state: &Attested<proto::EntityState>,
+        state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
-        Ok(())
+        self.received_state_checks.lock().unwrap().insert(state.payload.entity_id);
+        if self.deny_received_states.lock().unwrap().contains(&state.payload.entity_id) {
+            Err(AccessDenied::InsufficientAttestation)
+        } else {
+            Ok(())
+        }
     }
 
     fn query_predicate<C>(&self, _data: &C) -> Result<Predicate<ankql::ast::Resolved>, AccessDenied>

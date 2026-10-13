@@ -16,6 +16,10 @@ type States = BTreeMap<EntityId, Arc<Attested<EntityState>>>;
 type Members = BTreeMap<Vec<u8>, EntityId>;
 type Cache = tokio::sync::Mutex<Option<Cached>>;
 
+const OFFER_BYTES: u64 = 16 * 1024;
+const OFFER_REGIONS: usize = 128;
+const OFFER_REFINEMENTS: usize = 32;
+
 /// Retained by an active query; Fetch uses a temporary instance. Refresh changes
 /// only leaves whose entity head or membership changed, preserving the tree layout.
 #[derive(Default)]
@@ -155,7 +159,7 @@ impl QueryTree {
     }
 }
 
-fn key(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<Vec<u8>> {
+pub(super) fn key(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<Vec<u8>> {
     if spec.key_spec().keyparts.is_empty() {
         return Ok(Vec::new());
     }
@@ -232,7 +236,46 @@ impl Snapshot {
                 return Ok(inventory);
             }
         }
-        Ok(proto::KnownState { spec: self.spec.clone(), regions: vec![proto::KnownRegion::Summary(self.head(super::whole()).await?)] })
+        // A retained tree cheaply answers equality with its root. A newly
+        // built tree offers bounded descendants too, so initial comparison
+        // can recognize cached regions without another refinement exchange.
+        let retained = self.tree.is_some();
+        let root = self.head(super::whole()).await?;
+        let mut frontier = vec![(root, true)];
+        if !retained {
+            for _ in 0..OFFER_REFINEMENTS {
+                let Some(index) = frontier
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (head, expandable))| *expandable && head.digest.count() > super::LEAF_PAGE as i64)
+                    .max_by_key(|(_, (head, _))| head.digest.count())
+                    .map(|(index, _)| index)
+                else {
+                    break;
+                };
+                frontier[index].1 = false;
+                let children = self.refine(&frontier[index].0).await?;
+                if children.as_slice() == [frontier[index].0.clone()] {
+                    continue;
+                }
+                let mut candidate = frontier.clone();
+                candidate.splice(index..=index, children.into_iter().map(|head| (head, true)));
+                if candidate.len() > OFFER_REGIONS {
+                    continue;
+                }
+                let inventory = proto::KnownState {
+                    spec: self.spec.clone(),
+                    regions: candidate.iter().map(|(head, _)| proto::KnownRegion::Summary(head.clone())).collect(),
+                };
+                if bincode::serialized_size(&inventory)? <= OFFER_BYTES {
+                    frontier = candidate;
+                }
+            }
+        }
+        Ok(proto::KnownState {
+            spec: self.spec.clone(),
+            regions: frontier.into_iter().map(|(head, _)| proto::KnownRegion::Summary(head)).collect(),
+        })
     }
 
     pub async fn page(&mut self, bounds: proto::AddressRange) -> anyhow::Result<proto::LeafPage> {
@@ -262,6 +305,13 @@ impl Snapshot {
     pub async fn refine(&mut self, head: &TreeHead) -> anyhow::Result<Vec<TreeHead>> { Ok(self.tree().await?.refine(head).await?) }
 
     pub fn members(&self) -> Members { (*self.members).clone() }
+
+    pub fn states_in(&self, bounds: &proto::AddressRange, limit: usize) -> impl Iterator<Item = (&[u8], &Attested<EntityState>)> {
+        self.members
+            .range((bounds.start.clone(), bounds.end.clone()))
+            .take(limit)
+            .map(|(address, id)| (address.as_slice(), self.states[id].as_ref()))
+    }
 }
 
 #[cfg(test)]

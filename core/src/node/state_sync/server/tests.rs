@@ -66,6 +66,88 @@ fn live_item(bytes: usize) -> proto::SubscriptionUpdateItem {
 }
 
 #[tokio::test]
+async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal_buckets() -> anyhow::Result<()> {
+    let (node, _, _) = node().await?;
+    let mut source = states(256, 8);
+    for (i, state) in source.iter_mut().enumerate() {
+        let mut id = [0; proto::EntityId::BYTE_LEN];
+        id[0] = if i < 128 { 0x20 } else { 0xa0 };
+        id[31] = (i % 128) as u8;
+        state.payload.entity_id = proto::EntityId::from_bytes(id);
+    }
+    let missing = source[0].payload.entity_id;
+    let mut responder = snapshot(source.clone()).await?;
+    let root = responder.head(super::super::whole()).await?;
+    let frontier = responder.refine(&root).await?;
+    let original =
+        frontier.iter().find(|head| head.digest.count() > LEAF_PAGE as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
+    let bounds = original.bounds.clone();
+    let clipped = responder.head(bounds.clone()).await?;
+    let refined = responder.refine(&clipped).await?;
+    assert!(
+        matches!(refined.as_slice(), [head] if head.bounds == bounds && head.prefix != clipped.prefix),
+        "fixture must expose a same-bounds responder subtree"
+    );
+    let cached = source.iter().filter(|state| state.payload.entity_id != missing).cloned().collect::<Vec<_>>();
+    let mut requester = snapshot(cached.clone()).await?;
+    let mut regions = Vec::new();
+    for head in frontier {
+        regions.push(proto::KnownRegion::Summary(requester.head(head.bounds).await?));
+    }
+    let known = proto::KnownState { spec: spec(), regions };
+    let mut comparison = Comparison::new(responder, Some(known))?;
+    let mut repairs = Vec::new();
+    let mut narrower_questions = 0;
+    let mut leaf_pages = 0;
+    let mut finished = false;
+    for _ in 0..64 {
+        let body = comparison.reply(&node, &vec![], false).await?;
+        assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
+        let StateFrameBody::State { items, progress } = body else { panic!("state frame") };
+        let mut answers = Vec::new();
+        for item in items {
+            match item {
+                StateItem::Summary(head) => {
+                    assert_ne!(head.bounds, bounds, "the requester already supplied this exact digest");
+                    narrower_questions += 1;
+                    answers.push(StateAnswer::Summary(requester.head(head.bounds).await?));
+                }
+                StateItem::NeedLeaves(bounds) => {
+                    leaf_pages += 1;
+                    answers.push(StateAnswer::Leaves(requester.page(bounds).await?));
+                }
+                StateItem::NeedHeads(ids) => {
+                    let mut known = Vec::new();
+                    let mut unknown = Vec::new();
+                    for entity_id in ids {
+                        if let Some(state) = cached.iter().find(|state| state.payload.entity_id == entity_id) {
+                            known.push(proto::KnownEntity { entity_id, head: state.payload.state.head.clone() });
+                        } else {
+                            unknown.push(entity_id);
+                        }
+                    }
+                    answers.push(StateAnswer::Heads { known, unknown });
+                }
+                StateItem::Repair { delta, .. } => repairs.push(delta.entity_id),
+                StateItem::Equal(_) | StateItem::Leaves(_) => {}
+                other => panic!("unexpected frontier comparison item: {other:?}"),
+            }
+        }
+        if progress == ComparisonProgress::Complete {
+            assert!(answers.is_empty());
+            finished = true;
+            break;
+        }
+        comparison.answer(answers).await?;
+    }
+    assert!(finished, "comparison must finish within bounded work turns");
+    assert!(narrower_questions >= 2, "mixed children and terminal page bounds still require their own digests");
+    assert!(leaf_pages >= 1, "terminal mismatch must still request the requester's bounded inventory");
+    assert_eq!(repairs, [missing], "only the uncached entity needs repair");
+    Ok(())
+}
+
+#[tokio::test]
 async fn small_cold_and_inline_partial_inventories_complete_in_frame_zero() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let source = states(8, 16);
@@ -78,9 +160,102 @@ async fn small_cold_and_inline_partial_inventories_complete_in_frame_zero() -> a
         let (items, progress) = state_items(&initial.frame);
         assert_eq!(initial.frame.sequence, 0);
         assert_eq!(progress, ComparisonProgress::Complete);
-        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), repairs);
+        let transferred = items
+            .iter()
+            .map(|item| match item {
+                StateItem::Repair { .. } => 1,
+                StateItem::Snapshots(page) => page.states.len(),
+                _ => 0,
+            })
+            .sum::<usize>();
+        assert_eq!(transferred, repairs);
         assert!(!items.iter().any(|item| matches!(item, StateItem::NeedHeads(_) | StateItem::NeedLeaves(_) | StateItem::Summary(_))));
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_pages_tile_gaps_split_by_bytes_and_resume_after_an_oversized_row() -> anyhow::Result<()> {
+    let (node, _, _) = node().await?;
+    let mut source = states(5, PAGE_BYTES / 4);
+    for (index, state) in source.iter_mut().enumerate() {
+        state.payload.entity_id = proto::EntityId::from_bytes([index as u8 + 1; 32]);
+    }
+    source[2].payload.state.state_buffers.0.insert("lww".into(), vec![9; PAGE_BYTES * 2]);
+    let large = source[2].clone();
+    let mut comparison = Comparison::new(snapshot(source.clone()).await?, None)?;
+    let mut start = super::super::whole().start;
+    let mut received = Vec::new();
+    let mut chunks = Vec::new();
+    let mut inline_after_chunks = false;
+    while !comparison.complete {
+        let body = comparison.reply(&node, &vec![], false).await?;
+        assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
+        let StateFrameBody::State { items, .. } = body else { panic!("state frame") };
+        for item in items {
+            let bounds = match item {
+                StateItem::Snapshots(page) => {
+                    assert!(page.states.len() < super::super::MAX_SNAPSHOT_ROWS, "bytes, not row count, split these pages");
+                    if !chunks.is_empty() {
+                        inline_after_chunks = true;
+                    }
+                    received.extend(page.states.iter().map(|state| state.payload.entity_id));
+                    Some(page.bounds)
+                }
+                StateItem::Leaves(page) => {
+                    assert_eq!(page.leaves.len(), 1);
+                    assert_eq!(page.leaves[0].entity.entity_id, large.payload.entity_id);
+                    received.push(page.leaves[0].entity.entity_id);
+                    Some(page.bounds)
+                }
+                StateItem::RepairChunk { target, chunk } => {
+                    assert_eq!(chunk.entity_id, large.payload.entity_id);
+                    assert_eq!(target, large.payload.state.head);
+                    assert_eq!(chunk.offset as usize, chunks.len());
+                    chunks.extend_from_slice(&chunk.bytes);
+                    None
+                }
+                other => panic!("unexpected cold item: {other:?}"),
+            };
+            if let Some(bounds) = bounds {
+                assert_eq!(bounds.start, start, "page coverage must have no gaps or overlap");
+                start = opposite(&bounds.end);
+            }
+        }
+    }
+    assert_eq!(start, std::ops::Bound::Unbounded, "the final page includes the trailing gap");
+    assert_eq!(received, source.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>());
+    assert!(inline_after_chunks);
+    let decoded: proto::DeltaContent = bincode::deserialize(&chunks)?;
+    let proto::DeltaContent::StateSnapshot { state } = decoded else { panic!("chunked snapshot") };
+    assert_eq!(state.state, large.payload.state);
+    for state in &source {
+        assert_eq!(comparison.offered.get(&state.payload.entity_id), Some(&state.payload.state.head));
+    }
+    comparison
+        .answer(vec![StateAnswer::NeedRepair {
+            entity_id: source[0].payload.entity_id,
+            target: source[0].payload.state.head.clone(),
+            actual: Default::default(),
+        }])
+        .await?;
+    assert!(comparison.pending_repairs.contains(&source[0].payload.entity_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_another_range() -> anyhow::Result<()> {
+    let (node, _, _) = node().await?;
+    let source = states(1, 10);
+    let id = source[0].payload.entity_id;
+    let mut comparison = Comparison::new(snapshot(source.clone()).await?, None)?;
+    comparison.known_clocks.insert(id, source[0].payload.state.head.clone());
+    let StateFrameBody::State { items, progress } = comparison.reply(&node, &vec![], false).await? else { panic!("state frame") };
+    assert_eq!(progress, ComparisonProgress::Complete);
+    assert!(matches!(items.as_slice(), [StateItem::Leaves(page)] if page.leaves[0].entity.entity_id == id));
+    assert!(comparison.offered.is_empty(), "equal supplied state must not be sent again");
+    let mut comparison = Comparison::new(snapshot(source).await?, None)?;
+    assert!(comparison.reply(&node, &vec![], true).await.is_err(), "an exhaustive catalog page cannot skip an inadmissible row");
     Ok(())
 }
 
@@ -90,7 +265,7 @@ async fn empty_inventory_is_complete_without_questions() -> anyhow::Result<()> {
     let initial = node.start_comparison(peer, proto::RequestId::new(), vec![], vec![], None, false, snapshot(vec![]).await?, None).await?;
     let (items, progress) = state_items(&initial.frame);
     assert_eq!(progress, ComparisonProgress::Complete);
-    assert!(matches!(items, [StateItem::Leaves(page)] if page.leaves.is_empty()));
+    assert!(matches!(items, [StateItem::Snapshots(page)] if page.states.is_empty()));
     Ok(())
 }
 
@@ -368,5 +543,52 @@ async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_outpu
     drop(messages);
     assert!(matches!(node.close_state(peer, id, proto::ComparisonOutcome::Abandoned, vec![]).await?, proto::NodeResponseBody::Success));
     assert!(node.peer_connections.get(&peer).is_some(), "successful restart control preserves other streams on this connection");
+    Ok(())
+}
+
+#[tokio::test]
+async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> anyhow::Result<()> {
+    let (node, peer, messages) = node().await?;
+    for catalog in [false, true] {
+        let credentials = if catalog { vec![] } else { vec![crate::policy::DEFAULT_CONTEXT] };
+        let initial = node
+            .start_comparison(peer, proto::RequestId::new(), vec![], credentials.clone(), None, catalog, snapshot(vec![]).await?, None)
+            .await?;
+        let id = initial.frame.comparison;
+        let receipt = || proto::NodeRequestBody::ContinueState { comparison: id, processed_through: 0, answers: vec![] };
+        assert_eq!(node.comparison_bypasses_policy(peer, &receipt(), false), catalog);
+        let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+        assert!(session.permits(&credentials));
+        let authenticated = [crate::policy::DEFAULT_CONTEXT];
+        assert!(!session.permits(if catalog { &authenticated } else { &[] }));
+        node.close_state(peer, id, proto::ComparisonOutcome::Applied { processed_through: 0 }, credentials).await?;
+        assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_none());
+        assert_eq!(node.comparison_bypasses_policy(peer, &receipt(), false), catalog);
+
+        // Ordinary policy yields one nonempty credential for this auth entry.
+        // Catalog controls must retain their original credentialless bypass.
+        for (auth, succeeds) in [(vec![proto::AuthData(vec![])], true), (vec![], catalog)] {
+            let request = proto::RequestId::new();
+            node.handle_message(proto::NodeMessage::Request {
+                auth,
+                request: proto::NodeRequest { id: request.clone(), from: peer, to: node.id, body: receipt() },
+            })
+            .await?;
+            let messages = messages.lock().unwrap();
+            let response = messages
+                .iter()
+                .find_map(|message| match message {
+                    proto::NodeMessage::Response(response) if response.request_id == request => Some(&response.body),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(matches!(response, proto::NodeResponseBody::Success), succeeds);
+            if !succeeds {
+                assert!(matches!(response, proto::NodeResponseBody::ComparisonUnavailable { comparison } if *comparison == id));
+            }
+        }
+    }
+    let unknown = proto::NodeRequestBody::ContinueState { comparison: proto::ComparisonId::new(), processed_through: 0, answers: vec![] };
+    assert!(!node.comparison_bypasses_policy(peer, &unknown, false), "unknown controls must pass through policy");
     Ok(())
 }

@@ -44,6 +44,7 @@ struct RetiredOrigin<CD> {
     fingerprint: Vec<u8>,
     credentials: Vec<CD>,
     last_sent: u64,
+    catalog: bool,
 }
 impl<CD: ContextData> Default for Comparisons<CD> {
     fn default() -> Self {
@@ -115,6 +116,7 @@ impl<CD: ContextData> Comparisons<CD> {
             fingerprint: session.fingerprint.clone(),
             credentials: session.credentials.clone(),
             last_sent: session.sent.load(Ordering::Acquire),
+            catalog: session.catalog,
         });
         if retired.len() > MAX_COMPARISONS {
             retired.pop_front();
@@ -122,6 +124,12 @@ impl<CD: ContextData> Comparisons<CD> {
         Some(session)
     }
     pub fn was_closed(&self, id: &ComparisonId) -> bool { self.closed.lock().unwrap().contains(id) }
+    fn bypasses_policy(&self, id: &ComparisonId) -> bool {
+        if let Some(session) = self.get(id) {
+            return session.catalog;
+        }
+        self.retired.lock().unwrap().iter().find(|origin| &origin.id == id).is_some_and(|origin| origin.catalog)
+    }
     pub fn finish(&self, id: ComparisonId) {
         self.remove(&id);
         let mut closed = self.closed.lock().unwrap();
@@ -197,9 +205,10 @@ impl<CD: ContextData> Session<CD> {
 enum Work {
     Compare { head: proto::TreeHead, prefix: NodePrefix },
     Offer(proto::TreeHead),
-    Expand(proto::TreeHead),
+    Expand { local: proto::TreeHead, known: proto::TreeHead },
     AskLeaves(AddressRange),
     SendLeaves(AddressRange),
+    SendSnapshots(AddressRange),
     Item(StateItem),
     Repair(proto::EntityId, Option<proto::Clock>),
     History { entity_id: proto::EntityId, target: proto::Clock },
@@ -212,7 +221,6 @@ struct Comparison {
     leaves: Vec<AddressRange>,
     heads: HashSet<proto::EntityId>,
     repaired: HashSet<proto::EntityId>,
-    hints: HashMap<Vec<u8>, proto::TreeHead>,
     known_clocks: HashMap<proto::EntityId, proto::Clock>,
     offered: HashMap<proto::EntityId, proto::Clock>,
     pending_repairs: HashSet<proto::EntityId>,
@@ -322,7 +330,7 @@ where
         if outgoing {
             connection.outgoing_comparisons.get(id).is_some_and(|catalog| catalog)
         } else {
-            connection.comparisons.get(id).is_none_or(|session| session.catalog)
+            connection.comparisons.bypasses_policy(id)
         }
     }
     pub(crate) async fn start_comparison(
@@ -811,7 +819,6 @@ impl Comparison {
             leaves: Vec::new(),
             heads: HashSet::new(),
             repaired: HashSet::new(),
-            hints: HashMap::new(),
             known_clocks: HashMap::new(),
             offered: HashMap::new(),
             pending_repairs: HashSet::new(),
@@ -858,7 +865,7 @@ impl Comparison {
             if start != bounds.start {
                 let gap = AddressRange::new(start.clone(), opposite(&bounds.start));
                 if valid_range(&gap) {
-                    comparison.work.push_back(Work::SendLeaves(gap));
+                    comparison.work.push_back(Work::SendSnapshots(gap));
                 }
             }
             start = opposite(&bounds.end);
@@ -878,14 +885,18 @@ impl Comparison {
                             comparison.work.push_back(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head.clone())));
                         }
                     }
-                    comparison.work.push_back(Work::SendLeaves(page.bounds));
+                    comparison.work.push_back(if page.leaves.is_empty() {
+                        Work::SendSnapshots(page.bounds)
+                    } else {
+                        Work::SendLeaves(page.bounds)
+                    });
                 }
             }
         }
         if !matches!(start, std::ops::Bound::Unbounded) {
             let rest = AddressRange::new(start, super::whole().end);
             if valid_range(&rest) {
-                comparison.work.push_back(Work::SendLeaves(rest));
+                comparison.work.push_back(Work::SendSnapshots(rest));
             }
         }
         Ok(comparison)
@@ -989,6 +1000,70 @@ impl Comparison {
         Ok(())
     }
 
+    fn snapshot_page<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        credentials: &Vec<PA::ContextData>,
+        catalog: bool,
+        bounds: AddressRange,
+    ) -> anyhow::Result<StateItem>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        use std::ops::Bound::Included;
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+        let rows = self.snapshot.states_in(&bounds, super::MAX_SNAPSHOT_ROWS + 1).collect::<Vec<_>>();
+        let mut states = Vec::new();
+        let mut bytes = 0;
+        let mut last = None;
+        for (address, state) in rows.iter().take(super::MAX_SNAPSHOT_ROWS) {
+            let id = state.payload.entity_id;
+            policy.check_read(&id, &state.payload.state)?;
+            ensure!(
+                !catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy),
+                "snapshot page is outside catalog scope"
+            );
+            let clipped = AddressRange::new(bounds.start.clone(), Included(address.to_vec()));
+            // Reserve the larger possible page end, plus the item tag and vector length.
+            let overhead = 12 + bincode::serialized_size(&bounds)?.max(bincode::serialized_size(&clipped)?) as usize;
+            let size = bincode::serialized_size(state)? as usize;
+            let known = self.known_clocks.get(&id).cloned();
+            if known.is_some() || overhead + bytes + size > PAGE_BYTES / 2 {
+                if !states.is_empty() {
+                    break;
+                }
+                // A moved member may have supplied its clock in another range.
+                // Keep that bridge choice, and use the same fallback for a row
+                // too large to fit inline. Only this one row needs Leaves/Repair.
+                let end = if rows.len() == 1 { bounds.end.clone() } else { Included(address.to_vec()) };
+                let page_bounds = AddressRange::new(bounds.start.clone(), end);
+                if page_bounds.end != bounds.end {
+                    self.work.push_front(Work::SendSnapshots(bounds.after(address)));
+                }
+                self.work.push_front(Work::Repair(id, known));
+                return Ok(StateItem::Leaves(proto::LeafPage {
+                    bounds: page_bounds,
+                    leaves: vec![proto::KnownLeaf {
+                        key: address[..address.len() - proto::EntityId::BYTE_LEN].to_vec(),
+                        entity: proto::KnownEntity { entity_id: id, head: state.payload.state.head.clone() },
+                    }],
+                }));
+            }
+            bytes += size;
+            last = Some(address.to_vec());
+            states.push((*state).clone());
+        }
+        let end = if states.len() == rows.len() {
+            bounds.end.clone()
+        } else {
+            let last = last.expect("a partial snapshot page contains at least one row");
+            self.work.push_front(Work::SendSnapshots(bounds.after(&last)));
+            Included(last)
+        };
+        Ok(StateItem::Snapshots(proto::SnapshotPage { bounds: AddressRange::new(bounds.start, end), states }))
+    }
+
     async fn reply<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
@@ -1014,7 +1089,7 @@ impl Comparison {
             let Some(work) = self.work.pop_front() else { break };
             // Keep this in step with tree/storage/history access in the arms below.
             let expensive = match &work {
-                Work::Compare { .. } | Work::Expand(_) | Work::SendLeaves(_) => true,
+                Work::Compare { .. } | Work::Expand { .. } | Work::SendLeaves(_) | Work::SendSnapshots(_) => true,
                 Work::Repair(id, known) => known.is_some() || !self.snapshot.states.contains_key(id),
                 Work::History { .. } => true,
                 _ => false,
@@ -1046,30 +1121,34 @@ impl Comparison {
                     }
                 }
                 Work::Compare { head: known, prefix } => {
-                    let mut local = self.snapshot.head(known.bounds.clone()).await?;
-                    // The answering peer's topology may differ. Continue from
-                    // the responder prefix retained with this question.
-                    local.prefix = prefix;
-                    if local.digest == known.digest {
-                        Some(StateItem::Equal(known.bounds))
-                    } else if known.digest == ankurah_digest_tree::Digest::empty() {
-                        // No membership left to compare in this region. The peer
-                        // may still hold these entities under a different query.
-                        self.work.push_front(Work::SendLeaves(known.bounds));
-                        None
-                    } else if local.digest.count() <= LEAF_PAGE as i64 {
-                        self.work.push_front(Work::AskLeaves(known.bounds));
-                        None
+                    if known.digest == ankurah_digest_tree::Digest::empty() {
+                        if self.snapshot.states_in(&known.bounds, 1).next().is_none() {
+                            Some(StateItem::Equal(known.bounds))
+                        } else {
+                            self.work.push_front(Work::SendSnapshots(known.bounds));
+                            None
+                        }
                     } else {
-                        self.work.push_front(Work::Expand(local));
-                        None
+                        let mut local = self.snapshot.head(known.bounds.clone()).await?;
+                        // The answering peer's topology may differ. Continue from
+                        // the responder prefix retained with this question.
+                        local.prefix = prefix;
+                        if local.digest == known.digest {
+                            Some(StateItem::Equal(known.bounds))
+                        } else if local.digest.count() <= LEAF_PAGE as i64 {
+                            self.work.push_front(Work::AskLeaves(known.bounds));
+                            None
+                        } else {
+                            self.work.push_front(Work::Expand { local, known });
+                            None
+                        }
                     }
                 }
                 Work::Offer(head) => {
                     self.summaries.insert(range_id(&head.bounds), head.prefix.clone());
                     Some(StateItem::Summary(head))
                 }
-                Work::Expand(head) => {
+                Work::Expand { local: head, known } => {
                     // Descend locally within the work budget, preserving cached
                     // prefixes so a reply may assist several levels at once.
                     let refined = self.snapshot.refine(&head).await?;
@@ -1081,9 +1160,12 @@ impl Comparison {
                         self.work.push_back(Work::Offer(self.snapshot.head(page.bounds).await?));
                     } else {
                         for head in refined {
-                            self.work.push_back(match self.hints.remove(&range_id(&head.bounds)) {
-                                Some(hint) => Work::Compare { head: hint, prefix: head.prefix },
-                                None => Work::Offer(head),
+                            self.work.push_back(if head.bounds == known.bounds {
+                                // A new local prefix does not change the exact
+                                // digest already supplied for these bounds.
+                                Work::Compare { head: known.clone(), prefix: head.prefix }
+                            } else {
+                                Work::Offer(head)
                             });
                         }
                     }
@@ -1105,6 +1187,7 @@ impl Comparison {
                     }
                     Some(StateItem::Leaves(page))
                 }
+                Work::SendSnapshots(bounds) => Some(self.snapshot_page(node, credentials, catalog, bounds)?),
                 Work::Item(item) => Some(item),
                 Work::Repair(id, known) => {
                     if !self.repaired.insert(id) {
@@ -1172,6 +1255,13 @@ impl Comparison {
                 }
                 bytes += size;
                 match &item {
+                    StateItem::Snapshots(page) => {
+                        for state in &page.states {
+                            let id = state.payload.entity_id;
+                            self.repaired.insert(id);
+                            self.offered.insert(id, state.payload.state.head.clone());
+                        }
+                    }
                     StateItem::Repair { target, delta } => {
                         self.offered.insert(delta.entity_id, target.clone());
                         self.pending_repairs.remove(&delta.entity_id);
