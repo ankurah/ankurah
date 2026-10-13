@@ -57,6 +57,7 @@ pub struct KnownState {
 pub enum KnownRegion {
     Summary(TreeHead),
     /// Exhaustive for its bounds; an empty page explicitly describes an empty range.
+    /// Replies need only describe changes; Complete confirms unchanged members too.
     Leaves(#[serde(with = "compact_initial_page")] LeafPage),
 }
 

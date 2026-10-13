@@ -303,7 +303,11 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         assert!(cold.requests <= n.div_ceil(96) + 6, "cold transfer takes too many exchanges: {cold:?}");
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let equal = record("fetch_equal", n, &server, &client, &meter);
-        assert!(equal.equal > 0);
+        if n <= 2048 {
+            assert_eq!(equal.equal, 0, "complete initial inventories omit equality echoes");
+        } else {
+            assert!(equal.equal > 0, "Summary comparison still reports equality");
+        }
         assert_eq!((equal.leaves, equal.repairs, equal.snapshots), (0, 0, 0));
         let trx = writer.begin();
         rows[n / 2].edit(&trx)?.value()?.set(&"changed".into())?;
@@ -316,6 +320,9 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         // Allow variation from random entity IDs, but reject walking every
         // terminal bucket before comparing the intermediate branch summaries.
         assert!(sparse.equal < 64);
+        if n <= 2048 {
+            assert_eq!(sparse.equal, 0, "unchanged initial pages need no output alongside the repair");
+        }
         assert!(sparse.request_bytes + sparse.response_bytes < 32_768);
         let query = reader.query_wait::<CostRowView>("true").await?;
         query.wait_durable_answered().await?;
@@ -330,7 +337,11 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         })
         .await?;
         let equal = record("reconnect_equal", n, &server, &client, &meter);
-        assert!(equal.equal > 0);
+        if n <= 2048 {
+            assert_eq!(equal.equal, 0, "complete initial inventories omit equality echoes");
+        } else {
+            assert!(equal.equal > 0, "Summary comparison still reports equality");
+        }
         assert_eq!((equal.leaves, equal.repairs, equal.snapshots), (0, 0, 0));
         assert_eq!((equal.summaries, equal.leaf_questions, equal.clock_questions), (0, 0, 0));
         disconnect(&server, &client, &meter);
@@ -348,6 +359,9 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         let sparse = record("reconnect_sparse", n, &server, &client, &meter);
         assert_eq!(sparse.repairs, 1);
         assert!(sparse.equal < 64);
+        if n <= 2048 {
+            assert_eq!(sparse.equal, 0, "unchanged initial pages need no output alongside the repair");
+        }
         assert!(sparse.request_bytes + sparse.response_bytes < 32_768);
         assert_eq!(query.ids().len(), n);
         drop(query);

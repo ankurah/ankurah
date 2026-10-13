@@ -813,7 +813,8 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
         assert_eq!(comparison.known_clocks.len(), count);
         assert!(comparison.work.iter().all(|work| matches!(work, Work::InitialLeaves(_))));
         let items = initial_items(&node, &mut comparison).await?;
-        assert!(items.iter().all(|item| matches!(item, StateItem::Equal(_))), "equal membership must not be echoed");
+        assert!(items.is_empty(), "equal initial pages need no response items");
+        assert!(comparison.complete, "the full captured inventory was compared before Complete");
     }
     let before = ordered_states(128, 2);
     let mut after = before.clone();
@@ -990,10 +991,22 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let mut known = requester.offer().await?;
     let point = before[0].payload.entity_id.to_bytes().to_vec();
     let page = requester.page(AddressRange::new(std::ops::Bound::Included(point.clone()), std::ops::Bound::Included(point))).await?;
-    let mut exact = Comparison::new(snapshot(before.clone()).await?, None)?;
-    exact.work.clear();
-    exact.expand_initial_leaves(page.clone())?;
-    assert!(matches!(exact.work.front(), Some(Work::Item(StateItem::Equal(bounds))) if *bounds == page.bounds));
+    let mut exact = Comparison::new(
+        snapshot(before.clone()).await?,
+        Some(proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Leaves(page.clone())] }),
+    )?;
+    let point_work = exact.work.iter().position(|work| matches!(work, Work::InitialLeaves(_))).unwrap();
+    let Some(Work::InitialLeaves(validated)) = exact.work.remove(point_work) else { panic!("validated exact point") };
+    assert_eq!(validated.bounds, page.bounds);
+    let unknown_gaps = exact.work.len();
+    exact.expand_initial_leaves(validated)?;
+    assert_eq!(exact.work.len(), unknown_gaps, "a validated equal point adds no equality echo");
+    assert_eq!(exact.known_clocks.len(), 1);
+    let (node, _, _) = node().await?;
+    let items = initial_items(&node, &mut exact).await?;
+    assert!(exact.complete);
+    assert!(items.iter().all(|item| matches!(item, StateItem::Snapshots(_))), "unknown gaps still require membership output");
+    assert_eq!(items.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 2047);
     known.regions.push(known.regions[0].clone());
     assert!(Comparison::new(snapshot(before.clone()).await?, Some(known)).is_err(), "overlapping pages must fail before comparison");
     let extra = positioned_state(3, 10000, 1)?;

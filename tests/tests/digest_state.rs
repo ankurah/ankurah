@@ -113,12 +113,12 @@ async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo(
     trace.clear();
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 256);
     let equal = trace.items(None);
-    assert!(equal.iter().any(|item| matches!(item, StateItem::Equal(_))));
+    assert!(equal.is_empty(), "the equal initial inventory needs no response items: {equal:?}");
     assert!(
-        equal
-            .iter()
-            .all(|item| matches!(item, StateItem::Equal(_)) || matches!(item, StateItem::Snapshots(page) if page.states.is_empty())),
-        "the initial inventory needs no response identity echo or repair when equal: {equal:?}"
+        trace.0.lock().unwrap().iter().any(|body| matches!(body,
+        NodeResponseBody::Fetch(state) if matches!(state.frame.body,
+            proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))),
+        "empty comparison output must still finish with Complete"
     );
 
     let trx = writer.begin();
@@ -126,14 +126,18 @@ async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo(
     trx.commit().await?;
     trace.clear();
     let fetched = reader.fetch::<PetView>("true").await?;
-    assert_eq!(fetched.iter().find(|pet| pet.id() == pets[117].id()).unwrap().age()?, "2");
+    let changed = fetched.iter().find(|pet| pet.id() == pets[117].id()).unwrap();
+    assert_eq!(changed.age()?, "2");
+    assert_eq!(changed.entity().head(), pets[117].entity().head());
     let items = trace.items(None);
     assert!(bridge_for(&items, pets[117].id()), "a changed leaf should use its actual clock for an event bridge");
+    assert!(offers_target(&items, pets[117].id(), &pets[117].entity().head()), "the one repair must cover the captured target");
     // The request carries a complete initial inventory; the response must
     // repair only the changed head rather than echoing unchanged identities.
     let leaves: usize = items.iter().map(|item| if let StateItem::Leaves(page) = item { page.leaves.len() } else { 0 }).sum();
     assert_eq!(leaves, 0, "a changed head with unchanged membership needs no response identity echo");
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 1);
+    assert!(items.iter().all(|item| matches!(item, StateItem::Repair { .. })), "only the changed target needs output: {items:?}");
     Ok(())
 }
 

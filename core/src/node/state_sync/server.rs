@@ -1042,9 +1042,6 @@ impl Comparison {
         if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
             work.push(Work::SendSnapshots(gap));
         }
-        if work.is_empty() {
-            work.push(Work::Item(StateItem::Equal(page.bounds.clone())));
-        }
         // Splitting a valid region can repeat long keys in its bounds. Keep
         // the original regional exchange when those patches cannot fit.
         let mut fits = true;
