@@ -148,7 +148,7 @@ pub enum StateAnswer {
     /// The requester's digest over the exact bounds named by the head.
     Summary(TreeHead),
     Leaves(LeafPage),
-    /// `unknown` explicitly identifies entities for which no clock is held.
+    /// `unknown` identifies entities with no clock available to share under this comparison's read authority.
     /// Omitted entity IDs remain unanswered, not unknown.
     Heads {
         known: Vec<KnownEntity>,

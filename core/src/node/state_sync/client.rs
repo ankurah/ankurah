@@ -13,7 +13,7 @@ use super::{feedback::Feedback, IncomingStream, Snapshot};
 use crate::{
     error::{RequestError, RetrievalError},
     node::{applier::NodeApplier, Node},
-    policy::PolicyAgent,
+    policy::{ContextPolicy, PolicyAgent},
     retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter},
     storage::StorageEngine,
 };
@@ -142,6 +142,7 @@ where
                         }
                         StateItem::NeedHeads(ids) => {
                             ensure!(ids.len() <= 128, "too many requested entity clocks");
+                            let policy = ContextPolicy::from_credentials(&self.policy_agent, credentials);
                             let mut known = Vec::new();
                             let mut unknown = Vec::new();
                             for entity_id in ids {
@@ -150,8 +151,9 @@ where
                                 } else {
                                     match self.storage.get_state(entity_id).await {
                                         Ok(state)
-                                            if !catalog
-                                                || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy) =>
+                                            if (!catalog
+                                                || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy))
+                                                && policy.check_read(&entity_id, &state.payload.state).is_ok() =>
                                         {
                                             Some(state.payload.state.head)
                                         }
