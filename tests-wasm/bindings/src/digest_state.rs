@@ -59,7 +59,7 @@ async fn connect(server: &TestNode, client: &TestNode, responses: &Responses) ->
     Ok(())
 }
 
-fn items(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::StateItem> {
+fn frames(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::StateFrame> {
     let replies = responses.lock().unwrap();
     let ids: Vec<_> = replies
         .iter()
@@ -81,8 +81,21 @@ fn items(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::Sta
             _ => None,
         })
         .filter(|page| ids.contains(&page.comparison))
-        .flat_map(|frame| match &frame.body {
-            proto::StateFrameBody::State { items, .. } => items.clone(),
+        .cloned()
+        .collect()
+}
+
+fn completed(responses: &Responses, query: Option<proto::QueryId>) -> bool {
+    frames(responses, query)
+        .iter()
+        .any(|frame| matches!(&frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))
+}
+
+fn items(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::StateItem> {
+    frames(responses, query)
+        .into_iter()
+        .flat_map(|frame| match frame.body {
+            proto::StateFrameBody::State { items, .. } => items,
             _ => vec![],
         })
         .collect()
@@ -112,7 +125,8 @@ async fn run(db_prefix: &str) -> anyhow::Result<()> {
     anyhow::ensure!(reader.fetch::<TestUserView>("true").await?.len() == 64, "cold Fetch membership");
     responses.lock().unwrap().clear();
     anyhow::ensure!(reader.fetch::<TestUserView>("true").await?.len() == 64, "warm Fetch membership");
-    anyhow::ensure!(matches!(items(&responses, None).as_slice(), [proto::StateItem::Equal(_)]), "warm Fetch must compare equal");
+    anyhow::ensure!(completed(&responses, None), "warm Fetch must complete its comparison");
+    anyhow::ensure!(items(&responses, None).is_empty(), "equal warm Fetch must return no changes");
     let trx = writer.begin();
     users[17].edit(&trx)?.name()?.replace("changed")?;
     trx.commit().await?;
@@ -140,16 +154,14 @@ async fn run(db_prefix: &str) -> anyhow::Result<()> {
     responses.lock().unwrap().clear();
     connect(&server, &client, &responses).await?;
     for _ in 0..500 {
-        if !items(&responses, Some(query.query_id())).is_empty() {
+        if completed(&responses, Some(query.query_id())) {
             break;
         }
         gloo_timers::future::TimeoutFuture::new(10).await;
     }
     anyhow::ensure!(query.ids().len() == 65, "reconnect membership");
-    anyhow::ensure!(
-        matches!(items(&responses, Some(query.query_id())).as_slice(), [proto::StateItem::Equal(_)]),
-        "reconnect must compare retained state"
-    );
+    anyhow::ensure!(completed(&responses, Some(query.query_id())), "reconnect must complete its own comparison");
+    anyhow::ensure!(items(&responses, Some(query.query_id())).is_empty(), "equal reconnect must return no changes");
     let trx = writer.begin();
     trx.create(&TestUser { name: "after-reconnect".into() }).await?;
     trx.commit().await?;
