@@ -837,13 +837,8 @@ where
 
         let tree = state_sync::QueryTree::default();
         for attempt in 0..2 {
-            let states = self
-                .fetch_entities_from_local(&selection)
-                .await?
-                .into_iter()
-                .map(|entity| entity.to_entity_state().map(|state| Attested::opt(state, None)))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut snapshot = tree.snapshot(&selection, &self.catalog, states).await?;
+            let entities = self.fetch_entities_from_local(&selection).await?;
+            let mut snapshot = tree.snapshot(&selection, &self.catalog, entities).await?;
             let known_state = Some(snapshot.offer().await?);
             let (stream, response) =
                 self.request_state(peer_id, cdata, proto::NodeRequestBody::Fetch { selection: selection.clone(), known_state }).await?;

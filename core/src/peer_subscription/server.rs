@@ -154,16 +154,17 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             let context = crate::context::Context::new_weak(node, sessions);
             let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(context.clone()));
             let matching = self.subscription.upsert_query(query_id, selection, gap_fetcher, context.0, version).await?;
+            let paths = crate::node::state_sync::QueryTree::key_paths(&spec);
             let mut states = Vec::new();
             for entity in matching {
-                let state = entity.to_entity_state()?;
+                let (state, values) = entity.to_entity_state_with_values(&paths)?;
                 if policy.check_read(&state.entity_id, &state.state).is_err() {
                     continue;
                 }
                 let attestation = node.policy_agent.attest_state(node, &state);
-                states.push(Attested::opt(state, attestation));
+                states.push((Attested::opt(state, attestation), values));
             }
-            let snapshot = tree.refresh(spec, states).await?;
+            let snapshot = tree.refresh_captured(spec, states).await?;
             let members = snapshot.states.keys().copied().collect::<Vec<_>>();
             let state = node
                 .start_comparison(

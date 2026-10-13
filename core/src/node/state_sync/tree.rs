@@ -10,7 +10,12 @@ use ankurah_digest_tree::{
 };
 use ankurah_proto::{self as proto, Attested, EntityId, EntityState, TreeHead, TreeSpec};
 
-use crate::{entity::TemporaryEntity, schema::catalog::CatalogManager, selection::filter::ValueLookup};
+use crate::{
+    entity::{Entity, TemporaryEntity},
+    schema::catalog::CatalogManager,
+    selection::filter::ValueLookup,
+    value::Value,
+};
 
 type States = BTreeMap<EntityId, Arc<Attested<EntityState>>>;
 type Members = BTreeMap<Vec<u8>, EntityId>;
@@ -29,9 +34,30 @@ pub(crate) struct QueryTree(Arc<Cache>);
 struct Cached {
     spec: TreeSpec,
     tree: Option<DigestTree>,
-    states: States,
+    rows: BTreeMap<EntityId, CapturedRow>,
     members: Arc<Members>,
     generation: Arc<()>,
+}
+
+/// The key and serialized state are captured from the same entity version.
+struct CapturedRow {
+    key: Vec<u8>,
+    state: Arc<Attested<EntityState>>,
+}
+
+impl CapturedRow {
+    fn member(&self) -> (Vec<u8>, EntityId) {
+        let id = self.state.payload.entity_id;
+        (leaf_address(&self.key, id), id)
+    }
+
+    fn leaf(&self) -> LeafData {
+        LeafData {
+            key: self.key.clone(),
+            entity_id: self.state.payload.entity_id,
+            head: HeadHash::of(self.state.payload.state.head.ids().map(|id| id.clone().to_bytes())),
+        }
+    }
 }
 
 pub(crate) struct Snapshot {
@@ -87,7 +113,7 @@ impl QueryTree {
         &self,
         selection: &Selection<Resolved>,
         catalog: &CatalogManager,
-        states: Vec<Attested<EntityState>>,
+        entities: Vec<Entity>,
     ) -> anyhow::Result<Snapshot> {
         // Keep a valid layout even if catalog arrival now permits a richer one.
         let cached = self.0.lock().await.as_ref().map(|cached| cached.spec.clone());
@@ -97,56 +123,100 @@ impl QueryTree {
                     == TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone())
             })
             .unwrap_or_else(|| Self::spec(selection, catalog));
-        self.refresh(spec, states).await
+        let paths = Self::key_paths(&spec);
+        let rows = entities
+            .into_iter()
+            .map(|entity| {
+                let (state, values) = entity.to_entity_state_with_values(&paths)?;
+                Ok((Attested::opt(state, None), values))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.refresh_captured(spec, rows).await
+    }
+
+    pub fn key_paths(spec: &TreeSpec) -> Vec<PropertyPath> {
+        spec.key_spec()
+            .keyparts
+            .iter()
+            .map(|part| {
+                let mut path = PropertyPath::from(part.key);
+                path.subpath = part.sub_path.clone().unwrap_or_default();
+                path
+            })
+            .collect()
+    }
+
+    /// Values must be captured with the state under the same entity read lock.
+    pub async fn refresh_captured(
+        &self,
+        spec: TreeSpec,
+        rows: Vec<(Attested<EntityState>, Vec<Option<Value>>)>,
+    ) -> anyhow::Result<Snapshot> {
+        let rows = rows
+            .into_iter()
+            .map(|(state, values)| {
+                let key = CanonicalCodec.encode_nullable(spec.key_spec(), &values)?;
+                Ok((state, key))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.refresh_keyed(spec, rows).await
     }
 
     pub async fn refresh(&self, spec: TreeSpec, states: Vec<Attested<EntityState>>) -> anyhow::Result<Snapshot> {
-        let states: States = states.into_iter().map(|state| (state.payload.entity_id, Arc::new(state))).collect();
+        let rows = states
+            .into_iter()
+            .map(|state| {
+                let key = key(&spec, &state)?;
+                Ok((state, key))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        self.refresh_keyed(spec, rows).await
+    }
+
+    async fn refresh_keyed(&self, spec: TreeSpec, rows: Vec<(Attested<EntityState>, Vec<u8>)>) -> anyhow::Result<Snapshot> {
+        let rows: BTreeMap<_, _> =
+            rows.into_iter().map(|(state, key)| (state.payload.entity_id, CapturedRow { key, state: Arc::new(state) })).collect();
         let mut cache = self.0.lock().await;
         let retained = cache.as_ref().is_some_and(|cached| cached.spec == spec);
         if cache.as_ref().is_none_or(|cached| cached.spec != spec) {
-            let members = states.values().map(|state| member(&spec, state)).collect::<anyhow::Result<Members>>()?;
-            *cache = Some(Cached { spec: spec.clone(), tree: None, states, members: Arc::new(members), generation: Arc::new(()) });
+            let members = rows.values().map(CapturedRow::member).collect();
+            *cache = Some(Cached { spec: spec.clone(), tree: None, rows, members: Arc::new(members), generation: Arc::new(()) });
         } else {
             let cached = cache.as_mut().unwrap();
             let changes = cached
-                .states
+                .rows
                 .iter()
-                .filter(|(id, before)| states.get(id).is_none_or(|after| after.payload.state.head != before.payload.state.head))
+                .filter(|(id, before)| rows.get(id).is_none_or(|after| after.state.payload.state.head != before.state.payload.state.head))
                 .count()
-                + states.keys().filter(|id| !cached.states.contains_key(id)).count();
+                + rows.keys().filter(|id| !cached.rows.contains_key(id)).count();
             // Individual topology maintenance wins for sparse changes. A
             // dense inventory fill is cheaper to construct once on demand.
-            let bulk = changes >= BULK_REFRESH_CHANGES && changes >= cached.states.len().div_ceil(4);
+            let bulk = changes >= BULK_REFRESH_CHANGES && changes >= cached.rows.len().div_ceil(4);
             let mut tx = if bulk { None } else { cached.tree.as_ref().map(DigestTree::begin) };
             let mut members = cached.members.clone();
             let mut changed = false;
-            for (id, before) in &cached.states {
-                let after = states.get(id);
-                if after.is_some_and(|after| after.payload.state.head == before.payload.state.head) {
+            for (id, before) in &cached.rows {
+                let after = rows.get(id);
+                if after.is_some_and(|after| after.state.payload.state.head == before.state.payload.state.head) {
                     continue;
                 }
                 changed = true;
-                Arc::make_mut(&mut members).remove(&member(&spec, before)?.0);
+                Arc::make_mut(&mut members).remove(&before.member().0);
                 if let Some(after) = after {
-                    let (address, id) = member(&spec, after)?;
+                    let (address, id) = after.member();
                     Arc::make_mut(&mut members).insert(address, id);
                 }
                 if let Some(tx) = &mut tx {
-                    tx.apply_change(LeafChange {
-                        before: Some(leaf(&spec, before)?),
-                        after: after.map(|state| leaf(&spec, state)).transpose()?,
-                    })
-                    .await?;
+                    tx.apply_change(LeafChange { before: Some(before.leaf()), after: after.map(CapturedRow::leaf) }).await?;
                 }
             }
-            for (id, after) in &states {
-                if !cached.states.contains_key(id) {
+            for (id, after) in &rows {
+                if !cached.rows.contains_key(id) {
                     changed = true;
-                    let (address, id) = member(&spec, after)?;
+                    let (address, id) = after.member();
                     Arc::make_mut(&mut members).insert(address, id);
                     if let Some(tx) = &mut tx {
-                        tx.apply_change(LeafChange { before: None, after: Some(leaf(&spec, after)?) }).await?;
+                        tx.apply_change(LeafChange { before: None, after: Some(after.leaf()) }).await?;
                     }
                 }
             }
@@ -156,7 +226,7 @@ impl QueryTree {
             if bulk {
                 cached.tree = None;
             }
-            cached.states = states;
+            cached.rows = rows;
             cached.members = members;
             if changed {
                 cached.generation = Arc::new(());
@@ -167,7 +237,7 @@ impl QueryTree {
             spec,
             tree: cached.tree.as_ref().map(DigestTree::begin),
             retained,
-            states: cached.states.clone(),
+            states: cached.rows.iter().map(|(id, row)| (*id, row.state.clone())).collect(),
             members: cached.members.clone(),
             cache: Arc::downgrade(&self.0),
             generation: cached.generation.clone(),
@@ -180,29 +250,8 @@ pub(super) fn key(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Res
         return Ok(Vec::new());
     }
     let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
-    let values = spec
-        .key_spec()
-        .keyparts
-        .iter()
-        .map(|part| {
-            let mut path = PropertyPath::from(part.key);
-            path.subpath = part.sub_path.clone().unwrap_or_default();
-            entity.value_at(&path)
-        })
-        .collect::<Vec<_>>();
+    let values = QueryTree::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
     Ok(CanonicalCodec.encode_nullable(spec.key_spec(), &values)?)
-}
-
-fn member(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<(Vec<u8>, EntityId)> {
-    Ok((leaf_address(&key(spec, state)?, state.payload.entity_id), state.payload.entity_id))
-}
-
-fn leaf(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<LeafData> {
-    Ok(LeafData {
-        key: key(spec, state)?,
-        entity_id: state.payload.entity_id,
-        head: HeadHash::of(state.payload.state.head.ids().map(|id| id.clone().to_bytes())),
-    })
 }
 
 impl Snapshot {

@@ -660,13 +660,8 @@ where
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
         let tree = node.live_queries.get(query_id).ok_or(NodeDropped)?.digest_tree();
-        let states = node
-            .fetch_entities_from_local(&selection)
-            .await?
-            .into_iter()
-            .map(|entity| entity.to_entity_state().map(|state| proto::Attested::opt(state, None)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut snapshot = tree.snapshot(&selection, &node.catalog, states).await?;
+        let entities = node.fetch_entities_from_local(&selection).await?;
+        let mut snapshot = tree.snapshot(&selection, &node.catalog, entities).await?;
         let known_state = Some(snapshot.offer().await?);
         if canceled() {
             return Err(RequestError::ConnectionLost.into());

@@ -5,6 +5,7 @@ use crate::{
     retrieval::GetEvents,
     value::Value,
 };
+use ankurah_core_types::PropertyPath;
 use ankurah_proto::{Clock, Event, ModelId, OperationSet, PropertyId, State};
 use ankurah_signals::broadcast::Broadcast;
 use std::{
@@ -107,6 +108,32 @@ impl EntityState {
     pub(crate) fn head(&self) -> Clock { self.inner.read().unwrap().head.clone() }
 
     pub(crate) fn to_state(&self) -> Result<State, StateError> { self.inner.read().unwrap().to_state() }
+
+    pub(crate) fn to_entity_state_with_values(
+        &self,
+        entity_id: ankurah_proto::EntityId,
+        paths: &[PropertyPath],
+    ) -> Result<(ankurah_proto::EntityState, Vec<Option<Value>>), StateError> {
+        let inner = self.inner.read().unwrap();
+        let state = inner.to_state()?;
+        let values = paths
+            .iter()
+            .map(|path| {
+                let property = path.property_id();
+                let value = if property == PropertyId::Id {
+                    Some(Value::EntityId(entity_id))
+                } else {
+                    inner.backends.values().find_map(|backend| backend.property_value(&property))
+                };
+                if path.subpath.is_empty() {
+                    value
+                } else {
+                    value.and_then(|value| value.extract_at_path(&path.subpath))
+                }
+            })
+            .collect();
+        Ok((ankurah_proto::EntityState { entity_id, state }, values))
+    }
 
     pub(super) fn fork(&self) -> Self { Self::new(self.inner.read().unwrap().fork()) }
 

@@ -21,6 +21,99 @@ fn numbered_state(id: u32, head: u8) -> Attested<EntityState> {
     state
 }
 
+fn keyed_spec() -> TreeSpec {
+    TreeSpec::new(
+        KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(
+            proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN])),
+            ValueType::I64,
+        )]),
+        ankql::ast::Predicate::True,
+    )
+}
+
+fn keyed_state(id: u32, head: u8, value: Option<Value>) -> anyhow::Result<(Attested<EntityState>, Vec<Option<Value>>)> {
+    use crate::property::backend::{LWWBackend, PropertyBackend};
+    let property = proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN]));
+    let backend = LWWBackend::new();
+    backend.set(property, value);
+    let operations = backend.to_operations()?.unwrap();
+    backend.apply_operations_with_event(&operations, proto::EventId::from_bytes([head; 32]))?;
+    let values = vec![backend.get(&property)];
+    let mut state = numbered_state(id, head);
+    state.payload.state.state_buffers = proto::StateBuffers([("lww".into(), backend.to_state_buffer()?)].into());
+    Ok((state, values))
+}
+
+#[tokio::test]
+async fn captured_keys_match_decoded_states_across_sparse_movement_and_dense_refresh() -> anyhow::Result<()> {
+    let initial =
+        (0..256).map(|id| keyed_state(id, 1, (id != 11).then_some(Value::I64(id as i64 - 128)))).collect::<anyhow::Result<Vec<_>>>()?;
+    let query = QueryTree::default();
+    let mut old = query.refresh_captured(keyed_spec(), initial.clone()).await?;
+    let original = old.head(super::super::whole()).await?;
+    let original_members = old.members();
+    let oracle = QueryTree::default();
+    let mut decoded = oracle.refresh(keyed_spec(), initial.iter().map(|(state, _)| state.clone()).collect()).await?;
+    assert_eq!(original, decoded.head(super::super::whole()).await?);
+    assert_eq!(original_members, decoded.members());
+
+    let mut sparse = initial;
+    sparse[7] = keyed_state(7, 2, Some(Value::I64(9999)))?;
+    sparse.retain(|(state, _)| state.payload.entity_id != numbered_state(21, 1).payload.entity_id);
+    sparse.push(keyed_state(256, 2, Some(Value::I64(-5000)))?);
+    let dense = sparse
+        .iter()
+        .enumerate()
+        .map(|(n, (state, _))| {
+            let id = u32::from_be_bytes(state.payload.entity_id.to_bytes()[..4].try_into().unwrap());
+            keyed_state(id, 3, Some(Value::I64(n as i64 + 12345)))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    for (rows, built) in [(sparse, true), (dense, false)] {
+        let mut captured = query.refresh_captured(keyed_spec(), rows.clone()).await?;
+        assert_eq!(captured.tree.is_some(), built, "sparse movement stays incremental; dense refresh defers reconstruction");
+        let oracle = QueryTree::default();
+        let mut decoded = oracle.refresh(keyed_spec(), rows.into_iter().map(|(state, _)| state).collect()).await?;
+        assert_eq!(captured.members(), decoded.members());
+        assert_eq!(captured.head(super::super::whole()).await?, decoded.head(super::super::whole()).await?);
+        assert_eq!(old.members(), original_members);
+        assert_eq!(old.head(super::super::whole()).await?, original);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn captured_key_encoding_failure_preserves_the_existing_cache() -> anyhow::Result<()> {
+    let rows = (0..80).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
+    let query = QueryTree::default();
+    let mut snapshot = query.refresh_captured(keyed_spec(), rows).await?;
+    let original = snapshot.head(super::super::whole()).await?;
+    let (generation, members, states) = {
+        let cache = query.0.lock().await;
+        let cache = cache.as_ref().unwrap();
+        (cache.generation.clone(), cache.members.clone(), cache.rows.iter().map(|(id, row)| (*id, row.state.clone())).collect::<States>())
+    };
+    // Both value vectors match their serialized states. The second state has
+    // a property type incompatible with the retained integer key layout.
+    let invalid = vec![keyed_state(0, 2, Some(Value::I64(77)))?, keyed_state(1, 2, Some(Value::String("wrong type".into())))?];
+    assert!(query.refresh_captured(keyed_spec(), invalid).await.is_err());
+    let mut tree = {
+        let cache = query.0.lock().await;
+        let cache = cache.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&generation, &cache.generation));
+        assert!(Arc::ptr_eq(&members, &cache.members));
+        assert_eq!(cache.rows.len(), states.len());
+        for (id, row) in &cache.rows {
+            assert!(Arc::ptr_eq(&row.state, &states[id]));
+        }
+        cache.tree.as_ref().expect("the existing tree must remain built").begin()
+    };
+    let scope = tree.scope_ranges([super::super::whole()]);
+    assert_eq!(tree.digest(&scope).await?, original.digest);
+    assert_eq!(snapshot.head(super::super::whole()).await?, original);
+    Ok(())
+}
+
 #[tokio::test]
 async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> anyhow::Result<()> {
     let query = QueryTree::default();
