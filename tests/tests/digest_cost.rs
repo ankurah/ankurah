@@ -330,7 +330,9 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         })
         .await?;
         let equal = record("reconnect_equal", n, &server, &client, &meter);
-        assert_eq!((equal.equal, equal.leaves, equal.repairs), (1, 0, 0));
+        assert!(equal.equal > 0);
+        assert_eq!((equal.leaves, equal.repairs, equal.snapshots), (0, 0, 0));
+        assert_eq!((equal.summaries, equal.leaf_questions, equal.clock_questions), (0, 0, 0));
         disconnect(&server, &client, &meter);
         let trx = writer.begin();
         rows[n / 2].edit(&trx)?.value()?.set(&"offline-edit".into())?;

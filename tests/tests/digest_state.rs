@@ -83,7 +83,7 @@ fn offers_target(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool
 }
 
 #[tokio::test]
-async fn fetch_equal_head_and_sparse_changes_avoid_full_inventory() -> Result<()> {
+async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
@@ -118,7 +118,7 @@ async fn fetch_equal_head_and_sparse_changes_avoid_full_inventory() -> Result<()
         equal
             .iter()
             .all(|item| matches!(item, StateItem::Equal(_)) || matches!(item, StateItem::Snapshots(page) if page.states.is_empty())),
-        "equal regions and empty frontier gaps need no result identities or repair: {equal:?}"
+        "the initial inventory needs no response identity echo or repair when equal: {equal:?}"
     );
 
     let trx = writer.begin();
@@ -129,8 +129,10 @@ async fn fetch_equal_head_and_sparse_changes_avoid_full_inventory() -> Result<()
     assert_eq!(fetched.iter().find(|pet| pet.id() == pets[117].id()).unwrap().age()?, "2");
     let items = trace.items(None);
     assert!(bridge_for(&items, pets[117].id()), "a changed leaf should use its actual clock for an event bridge");
+    // The request carries a complete initial inventory; the response must
+    // repair only the changed head rather than echoing unchanged identities.
     let leaves: usize = items.iter().map(|item| if let StateItem::Leaves(page) = item { page.leaves.len() } else { 0 }).sum();
-    assert!(leaves <= 128, "one changed leaf should exchange at most one bounded region, not all 256 result identities: {leaves}");
+    assert_eq!(leaves, 0, "a changed head with unchanged membership needs no response identity echo");
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 1);
     Ok(())
 }
@@ -1023,32 +1025,55 @@ async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_cha
 }
 
 #[tokio::test]
+async fn initial_inventory_snapshot_first_joins_preserve_globally_cached_branches_before_ready() -> Result<()> {
+    snapshot_first_joins_preserve_cached_branches(256, true).await
+}
+
+#[tokio::test]
 async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branches_before_ready() -> Result<()> {
+    snapshot_first_joins_preserve_cached_branches(2049, false).await
+}
+
+fn snapshot_offer(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool {
+    items.iter().any(|item| match item {
+        StateItem::Repair { target, delta } => {
+            delta.entity_id == id && target == head && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
+        }
+        StateItem::Snapshots(page) => page.states.iter().any(|state| state.payload.entity_id == id && state.payload.state.head == *head),
+        _ => false,
+    })
+}
+
+async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inventory: bool) -> Result<()> {
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicBool, Ordering};
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
-    // More than 128 members forces a retained Summary frontier, rather than
-    // the small exhaustive initial inventory. Unchanged payload favors a
-    // bridge for the former match's single key edit.
+    // Moderate results offer complete initial Leaves; above 2048 rows uses
+    // a bounded retained Summary frontier. Padded keys preserve lexical order
+    // in both cases; unchanged payload favors the former match's event bridge.
     let unchanged = "unchanged-".to_owned() + &"p".repeat(1024);
     let mut rows = Vec::new();
-    for i in 0..256 {
-        rows.push(trx.create(&Record { title: format!("a-{i:03}"), artist: unchanged.clone() }).await?.read()?);
+    for i in 0..count {
+        rows.push(trx.create(&Record { title: format!("a-{i:06}"), artist: unchanged.clone() }).await?.read()?);
     }
     let older = trx.create(&Record { title: "z-older".into(), artist: unchanged.clone() }).await?.read()?;
     let concurrent = trx.create(&Record { title: "z-concurrent".into(), artist: unchanged.clone() }).await?.read()?;
     let newer = trx.create(&Record { title: "z-newer".into(), artist: unchanged.clone() }).await?.read()?;
     trx.commit().await?;
-    let former = rows[40].clone();
-    let selection = "true ORDER BY title ASC LIMIT 256";
+    let former_index = count / 6;
+    let former = rows[former_index].clone();
+    let older_title = format!("a-{:06}5", count / 4);
+    let concurrent_title = format!("a-{:06}5", count / 2);
+    let newer_title = format!("a-{:06}5", count * 3 / 4);
+    let selection = format!("true ORDER BY title ASC LIMIT {count}");
     let (connection, _) = GatedConnection::new(&server, &client, |_| false).await;
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
     let cached_older = reader.get::<RecordView>(older.id()).await?;
     let cached_concurrent = reader.get::<RecordView>(concurrent.id()).await?;
     let cached_newer = reader.get::<RecordView>(newer.id()).await?;
-    let query = reader.query::<RecordView>(nocache(selection)?)?;
+    let query = reader.query::<RecordView>(nocache(selection.as_str())?)?;
     query.wait_durable_answered().await?;
     assert_eq!(query.ids().into_iter().collect::<HashSet<_>>(), rows.iter().map(|row| row.id()).collect());
     let cached_former = reader.get::<RecordView>(former.id()).await?;
@@ -1056,12 +1081,12 @@ async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branche
     // Receive this sender head before going offline, then make the receiver
     // strictly newer while moving its key outside the local ordered result.
     let trx = writer.begin();
-    newer.edit(&trx)?.title()?.set(&"a-1925".to_owned())?;
+    newer.edit(&trx)?.title()?.set(&newer_title)?;
     trx.commit().await?;
     let newer_target = newer.entity().head();
     // Materialize a fresh answer here instead of making setup depend on
     // ordinary live ORDER BY/LIMIT insertion behavior.
-    query.update_selection_wait(selection).await?;
+    query.update_selection_wait(selection.as_str()).await?;
     query.wait_durable_answered().await?;
     assert_eq!(cached_newer.entity().head(), newer_target);
     assert!(query.ids().contains(&newer.id()));
@@ -1077,8 +1102,8 @@ async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branche
     let concurrent_local = cached_concurrent.entity().head();
     let older_before = cached_older.entity().head();
     let trx = writer.begin();
-    older.edit(&trx)?.title()?.set(&"a-0645".to_owned())?;
-    concurrent.edit(&trx)?.title()?.set(&"a-1275".to_owned())?;
+    older.edit(&trx)?.title()?.set(&older_title)?;
+    concurrent.edit(&trx)?.title()?.set(&concurrent_title)?;
     former.edit(&trx)?.title()?.set(&"zz-former".to_owned())?;
     trx.commit().await?;
     let older_target = older.entity().head();
@@ -1090,18 +1115,18 @@ async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branche
     let expected: HashSet<_> = rows
         .iter()
         .enumerate()
-        .filter(|(index, _)| *index != 40 && *index < 254)
+        .filter(|(index, _)| *index != former_index && *index < count - 2)
         .map(|(_, row)| row.id())
         .chain([older.id(), concurrent.id(), newer.id()])
         .collect();
-    assert_eq!(expected.len(), 256);
-    assert_eq!(writer.fetch::<RecordView>(selection).await?.into_iter().map(|row| row.id()).collect::<HashSet<_>>(), expected);
+    assert_eq!(expected.len(), count);
+    assert_eq!(writer.fetch::<RecordView>(selection.as_str()).await?.into_iter().map(|row| row.id()).collect::<HashSet<_>>(), expected);
     assert!([older.id(), concurrent.id(), newer.id()].iter().all(|id| expected.contains(id)));
     assert!(!expected.contains(&former.id()));
 
     // A new version makes readiness assertions independent of the previous
     // answer's flags while retaining the query's comparison tree.
-    query.update_selection(selection)?;
+    query.update_selection(selection.as_str())?;
     let history_held = Arc::new(AtomicBool::new(false));
     let trace = Trace::default();
     let (_connection, gate) = GatedConnection::new(&server, &client, {
@@ -1132,29 +1157,24 @@ async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branche
     wait_for(|| {
         let items = trace.items(Some(query.query_id()));
         history_held.load(Ordering::Acquire)
-            && [older.id(), concurrent.id(), newer.id()].iter().all(|id| {
-                items.iter().any(|item| {
-                    matches!(item, StateItem::Repair { delta, .. }
-                    if delta.entity_id == *id && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))
-                })
-            })
+            && [(older.id(), &older_target), (concurrent.id(), &concurrent_target), (newer.id(), &newer_target)]
+                .iter()
+                .all(|(id, head)| snapshot_offer(&items, *id, head))
     })
     .await;
     let offered = trace.items(Some(query.query_id()));
     for (id, target) in [(older.id(), &older_target), (concurrent.id(), &concurrent_target), (newer.id(), &newer_target)] {
-        assert!(
-            offered.iter().any(|item| matches!(item,
-                StateItem::Repair { target: actual, delta }
-                    if delta.entity_id == id && actual == target
-                        && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
-            )),
-            "an absent query member must offer its captured snapshot first: {id}"
-        );
+        assert!(snapshot_offer(&offered, id, target), "an absent query member must offer its exact captured snapshot target first: {id}");
         assert!(
             !offered.iter().any(|item| matches!(item, StateItem::NeedHeads(ids) if ids.contains(&id))),
             "query absence must use snapshot-first repair without an extra clock question: {id}"
         );
     }
+    // The gate observes inbound responses, not the outgoing KnownState. A
+    // frontier necessarily asks for refinement/leaves here; the complete
+    // initial inventory handles these sparse changes without that feedback.
+    let asks_for_inventory = offered.iter().any(|item| matches!(item, StateItem::Summary(_) | StateItem::NeedLeaves(_)));
+    assert_eq!(asks_for_inventory, !initial_inventory, "fixture must exercise the intended initial knowledge path");
     assert!(!query.loaded(), "Complete cannot activate membership while a snapshot target remains uncovered");
     assert!(query.wait_durable_answered().now_or_never().is_none(), "uncovered causal repair must block readiness");
     assert_eq!(cached_concurrent.artist()?, "local-concurrent");
@@ -1162,9 +1182,9 @@ async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branche
     gate.release_held(&client).await;
     tokio::time::timeout(Duration::from_secs(10), query.wait_durable_answered()).await??;
     assert_eq!(query.ids().into_iter().collect::<HashSet<_>>(), expected, "membership comes from captured sender keys");
-    assert_eq!(cached_older.title()?, "a-0645");
+    assert_eq!(cached_older.title()?, older_title);
     assert_eq!(cached_older.entity().head(), older_target);
-    assert_eq!(cached_concurrent.title()?, "a-1275");
+    assert_eq!(cached_concurrent.title()?, concurrent_title);
     assert_eq!(cached_concurrent.artist()?, "local-concurrent", "connecting history must retain the independent local edit");
     let merged = cached_concurrent.entity().head();
     assert!(concurrent_target.entries().iter().all(|entry| merged.entries().contains(entry)));

@@ -127,7 +127,7 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
     let query = QueryTree::default();
     let initial = (0..256).map(|id| numbered_state(id, 1)).collect::<Vec<_>>();
     let mut old = query.refresh(spec(), initial).await?;
-    assert!(old.offer().await?.regions.len() > 1, "a fresh tree offers its bounded frontier");
+    assert!(old.offer().await?.regions.len() > 1, "the complete inventory spans bounded pages");
     let original = old.head(super::super::whole()).await?;
 
     // Addition, replacement, and removal each cross the measured dense threshold.
@@ -144,7 +144,9 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
         assert_eq!(refreshed.members(), recomputed.members());
         let offer = refreshed.offer().await?;
         assert!(offer.regions.len() > 1, "a retained bulk rebuild must still offer bounded regions");
-        assert_eq!(offered_digest(&offer)?, recomputed.head(super::super::whole()).await?.digest);
+        assert!(offer.regions.iter().all(|region| matches!(region, proto::KnownRegion::Leaves(_))));
+        assert!(refreshed.tree.is_none(), "offering a complete inventory stays lazy");
+        assert_eq!(refreshed.head(super::super::whole()).await?, recomputed.head(super::super::whole()).await?);
         assert_eq!(old.head(super::super::whole()).await?, original);
     }
 
@@ -159,7 +161,7 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
 }
 
 #[tokio::test]
-async fn retained_unbuilt_cache_offers_a_frontier_after_initial_membership_fill() -> anyhow::Result<()> {
+async fn retained_unbuilt_cache_offers_a_complete_inventory_after_initial_membership_fill() -> anyhow::Result<()> {
     let query = QueryTree::default();
     let mut initial = query.refresh(spec(), vec![]).await?;
     assert!(matches!(initial.offer().await?.regions.as_slice(), [proto::KnownRegion::Leaves(_)]));
@@ -167,7 +169,18 @@ async fn retained_unbuilt_cache_offers_a_frontier_after_initial_membership_fill(
     assert!(refreshed.tree.is_none());
     let offer = refreshed.offer().await?;
     assert!(offer.regions.len() > 1);
-    assert_eq!(offered_digest(&offer)?.count(), 256);
+    assert_eq!(
+        offer
+            .regions
+            .iter()
+            .map(|region| match region {
+                proto::KnownRegion::Leaves(page) => page.leaves.len(),
+                _ => panic!("complete leaves"),
+            })
+            .sum::<usize>(),
+        256
+    );
+    assert!(refreshed.tree.is_none());
     Ok(())
 }
 
@@ -315,8 +328,8 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
     assert!(old.tree.is_none());
     let offer = old.offer().await?;
     assert!(
-        matches!(offer.regions.as_slice(), [proto::KnownRegion::Summary(_)]),
-        "a partial inventory cannot be an exhaustive initial offer"
+        offer.regions.iter().all(|region| matches!(region, proto::KnownRegion::Leaves(_))),
+        "multiple bounded pages may form one complete initial inventory"
     );
 
     let changed = (0..super::super::INLINE_LEAVES)
@@ -388,7 +401,8 @@ async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() 
     let initial = (0..70).map(|id| state(id, 1)).collect::<Vec<_>>();
     let mut old = query.refresh(spec(), initial.clone()).await?;
     let inventory = old.offer().await?;
-    assert!(inventory.regions.iter().all(|region| matches!(region, proto::KnownRegion::Summary(_))));
+    assert!(inventory.regions.iter().all(|region| matches!(region, proto::KnownRegion::Leaves(_))));
+    assert!(old.tree.is_none());
     let original = old.head(super::super::whole()).await?;
     let generation = query.0.lock().await.as_ref().unwrap().generation.clone();
     let mut unchanged = query.refresh(spec(), initial).await?;
@@ -457,5 +471,88 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
         .iter()
         .all(|region| matches!(region, proto::KnownRegion::Summary(head) if head.digest.count() <= super::super::LEAF_PAGE as i64)));
     assert_eq!(offered_digest(&retained)?, root.digest);
+    Ok(())
+}
+
+#[tokio::test]
+async fn complete_initial_inventories_are_bounded_lazy_and_immutable() -> anyhow::Result<()> {
+    for count in [256, super::super::INITIAL_INVENTORY_LEAVES] {
+        let query = QueryTree::default();
+        let mut old = query.refresh(spec(), (0..count as u32).map(|id| numbered_state(id, 1)).collect()).await?;
+        let offer = old.offer().await?;
+        assert!(bincode::serialized_size(&offer)? <= super::super::INITIAL_INVENTORY_BYTES as u64);
+        let mut start = super::super::whole().start;
+        let mut received = Vec::new();
+        for region in &offer.regions {
+            let proto::KnownRegion::Leaves(page) = region else { panic!("complete bounded leaf inventory") };
+            assert_eq!(page.bounds.start, start);
+            assert!(page.leaves.len() <= super::super::LEAF_PAGE);
+            assert!(bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::super::PAGE_BYTES as u64);
+            received.extend(page.leaves.iter().map(|leaf| leaf.entity.entity_id));
+            start = match &page.bounds.end {
+                Bound::Included(end) => Bound::Excluded(end.clone()),
+                Bound::Unbounded => Bound::Unbounded,
+                _ => panic!("exhaustive page advances at its last point"),
+            };
+        }
+        assert_eq!(start, super::super::whole().end);
+        assert_eq!(received, old.members().values().copied().collect::<Vec<_>>());
+        assert!(old.tree.is_none());
+        assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
+        query.refresh(spec(), vec![numbered_state(17, 2)]).await?;
+        assert_eq!(bincode::serialize(&old.offer().await?)?, bincode::serialize(&offer)?);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_initial_inventory_falls_back_for_count_or_total_bytes() -> anyhow::Result<()> {
+    let query = QueryTree::default();
+    let mut too_many = query.refresh(spec(), (0..2049).map(|id| numbered_state(id, 1)).collect()).await?;
+    let offer = too_many.offer().await?;
+    assert!(offer.regions.iter().all(|region| matches!(region, proto::KnownRegion::Summary(_))));
+    assert_eq!(offered_digest(&offer)?.count(), 2049);
+
+    let head = proto::Clock::new(
+        (0u32..200)
+            .map(|n| {
+                let mut bytes = [0; 32];
+                bytes[..4].copy_from_slice(&n.to_be_bytes());
+                (1, proto::EventId::from_bytes(bytes))
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut wide = query
+        .refresh(
+            spec(),
+            (0..64)
+                .map(|id| {
+                    let mut state = numbered_state(id, 1);
+                    state.payload.state.head = head.clone();
+                    state
+                })
+                .collect(),
+        )
+        .await?;
+    let mut pages = Vec::new();
+    let mut remaining = super::super::whole();
+    loop {
+        let page = wide.page(remaining).await?;
+        let end = page.bounds.end.clone();
+        pages.push(proto::KnownRegion::Leaves(page));
+        if end == super::super::whole().end {
+            break;
+        }
+        let Bound::Included(last) = end else { panic!("progress") };
+        remaining = super::super::whole().after(&last);
+    }
+    let oversized = proto::KnownState { spec: spec(), regions: pages };
+    assert!(bincode::serialized_size(&oversized)? > super::super::INITIAL_INVENTORY_BYTES as u64);
+    let offer = wide.offer().await?;
+    assert!(
+        offer.regions.iter().all(|region| matches!(region, proto::KnownRegion::Summary(_))),
+        "no partial leaf cover may escape the initial budget"
+    );
+    assert_eq!(offered_digest(&offer)?.count(), 64);
     Ok(())
 }

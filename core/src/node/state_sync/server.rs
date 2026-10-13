@@ -1,6 +1,6 @@
 use super::{
-    Snapshot, CONTROL_BYTES, FRAME_BYTES, INLINE_LEAVES, LEAF_PAGE, MAX_INFLIGHT_FRAMES, MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS,
-    PAGE_WORK, WINDOW_BYTES,
+    Snapshot, CONTROL_BYTES, FRAME_BYTES, INITIAL_INVENTORY_BYTES, INITIAL_INVENTORY_LEAVES, INLINE_LEAVES, LEAF_PAGE, MAX_INFLIGHT_FRAMES,
+    MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS, PAGE_WORK, WINDOW_BYTES,
 };
 use crate::{
     node::Node,
@@ -209,6 +209,7 @@ enum Work {
     Offer(proto::TreeHead),
     Expand { local: proto::TreeHead, known: proto::TreeHead },
     AskLeaves(AddressRange),
+    InitialLeaves(proto::LeafPage),
     AnswerLeaves { page: proto::LeafPage, rest: Option<AddressRange> },
     SendLeaves(AddressRange),
     SendSnapshots(AddressRange),
@@ -832,7 +833,7 @@ impl Comparison {
         let mut regions = if let Some(known) = known {
             ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
             ensure!(
-                known.regions.len() <= 128 && bincode::serialized_size(&known)? as usize <= FRAME_BYTES,
+                known.regions.len() <= 128 && bincode::serialized_size(&known)? as usize <= INITIAL_INVENTORY_BYTES,
                 "initial inventory exceeds limit"
             );
             known.regions
@@ -856,6 +857,7 @@ impl Comparison {
         });
         let mut start = super::whole().start;
         let mut frontier = Some(Vec::new());
+        let mut leaf_count = 0;
         for region in regions {
             ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
             let bounds = match &region {
@@ -885,20 +887,15 @@ impl Comparison {
                 proto::KnownRegion::Leaves(page) => {
                     frontier = None;
                     comparison.validate_leaves(&page)?;
+                    leaf_count += page.leaves.len();
+                    ensure!(leaf_count <= INITIAL_INVENTORY_LEAVES, "initial inventory exceeds leaf limit");
                     for leaf in &page.leaves {
                         ensure!(
                             comparison.known_clocks.insert(leaf.entity.entity_id, leaf.entity.head.clone()).is_none(),
                             "duplicate entity in initial inventory"
                         );
-                        if !comparison.snapshot.states.contains_key(&leaf.entity.entity_id) {
-                            comparison.work.push_back(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head.clone())));
-                        }
                     }
-                    comparison.work.push_back(if page.leaves.is_empty() {
-                        Work::SendSnapshots(page.bounds)
-                    } else {
-                        Work::SendLeaves(page.bounds)
-                    });
+                    comparison.work.push_back(Work::InitialLeaves(page));
                 }
             }
         }
@@ -916,6 +913,7 @@ impl Comparison {
 
     fn validate_leaves(&self, page: &proto::LeafPage) -> anyhow::Result<()> {
         ensure!(valid_range(&page.bounds) && page.leaves.len() <= LEAF_PAGE, "invalid leaf inventory size or bounds");
+        ensure!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64, "initial leaf page exceeds byte limit");
         let mut previous = None;
         for leaf in &page.leaves {
             CanonicalCodec.split(self.snapshot.spec.key_spec(), &leaf.key)?;
@@ -993,6 +991,79 @@ impl Comparison {
                     self.work.push_back(Work::AnswerLeaves { page, rest });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn expand_initial_leaves(&mut self, page: proto::LeafPage) -> anyhow::Result<()> {
+        use std::ops::Bound::{Excluded, Included};
+
+        let mut work = Vec::new();
+        let former = page
+            .leaves
+            .iter()
+            .filter(|leaf| !self.snapshot.states.contains_key(&leaf.entity.entity_id))
+            .map(|leaf| leaf.entity.entity_id)
+            .collect::<Vec<_>>();
+        let mut start = page.bounds.start.clone();
+        let mut removal: Option<AddressRange> = None;
+        let flush_removal = |removal: &mut Option<AddressRange>, work: &mut Vec<Work>| {
+            if let Some(bounds) = removal.take() {
+                work.push(Work::Item(StateItem::Leaves(proto::LeafPage { bounds, leaves: Vec::new() })));
+            }
+        };
+        for leaf in page.leaves {
+            let address = leaf_address(&leaf.key, leaf.entity.entity_id);
+            let gap = AddressRange::new(start, Excluded(address.clone()));
+            if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
+                flush_removal(&mut removal, &mut work);
+                work.push(Work::SendSnapshots(gap));
+            }
+            let point = AddressRange::new(Included(address.clone()), Included(address.clone()));
+            if let Some((_, state)) = self.snapshot.states_in(&point, 1).next() {
+                flush_removal(&mut removal, &mut work);
+                if state.payload.state.head != leaf.entity.head {
+                    work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head)));
+                }
+            } else {
+                // Only bridge removed points across gaps proven empty above.
+                // Membership patches remain independent of repair deduplication.
+                if let Some(removal) = &mut removal {
+                    removal.end = Included(address.clone());
+                } else {
+                    removal = Some(point);
+                }
+                work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head)));
+            }
+            start = Excluded(address);
+        }
+        flush_removal(&mut removal, &mut work);
+        let gap = AddressRange::new(start, page.bounds.end.clone());
+        if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
+            work.push(Work::SendSnapshots(gap));
+        }
+        if work.is_empty() {
+            work.push(Work::Item(StateItem::Equal(page.bounds.clone())));
+        }
+        // Splitting a valid region can repeat long keys in its bounds. Keep
+        // the original regional exchange when those patches cannot fit.
+        let mut fits = true;
+        for item in &work {
+            fits &= match item {
+                Work::Item(item) => bincode::serialized_size(item)? <= PAGE_BYTES as u64,
+                Work::SendSnapshots(bounds) => {
+                    let item = StateItem::Snapshots(proto::SnapshotPage { bounds: bounds.clone(), states: Vec::new() });
+                    bincode::serialized_size(&item)? <= (PAGE_BYTES / 2) as u64
+                }
+                _ => true,
+            };
+        }
+        if !fits {
+            work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].clone()))).collect();
+            work.push(Work::SendLeaves(page.bounds));
+        }
+        for item in work.into_iter().rev() {
+            self.work.push_front(item);
         }
         Ok(())
     }
@@ -1125,7 +1196,8 @@ impl Comparison {
             let Some(work) = self.work.pop_front() else { break };
             // Keep this in step with tree/storage/history access in the arms below.
             let expensive = match &work {
-                Work::AnswerLeaves { .. }
+                Work::InitialLeaves(_)
+                | Work::AnswerLeaves { .. }
                 | Work::CompareFrontier(_)
                 | Work::Compare { .. }
                 | Work::Expand { .. }
@@ -1221,6 +1293,10 @@ impl Comparison {
                             });
                         }
                     }
+                    None
+                }
+                Work::InitialLeaves(page) => {
+                    self.expand_initial_leaves(page)?;
                     None
                 }
                 Work::AnswerLeaves { page, rest } => {

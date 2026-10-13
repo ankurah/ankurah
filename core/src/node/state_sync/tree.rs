@@ -291,14 +291,21 @@ impl Snapshot {
     }
 
     pub async fn offer(&mut self) -> anyhow::Result<proto::KnownState> {
-        if self.members.len() <= super::INLINE_LEAVES {
-            if let Ok(page) = self.page(super::whole()).await {
-                if page.bounds == super::whole() {
-                    let inventory = proto::KnownState { spec: self.spec.clone(), regions: vec![proto::KnownRegion::Leaves(page)] };
-                    if bincode::serialized_size(&inventory)? <= super::FRAME_BYTES as u64 {
-                        return Ok(inventory);
-                    }
+        if self.members.len() <= super::INITIAL_INVENTORY_LEAVES {
+            let mut inventory = proto::KnownState { spec: self.spec.clone(), regions: Vec::new() };
+            let mut remaining = super::whole();
+            while inventory.regions.len() < OFFER_REGIONS {
+                let Ok(page) = self.page(remaining).await else { break };
+                let end = page.bounds.end.clone();
+                inventory.regions.push(proto::KnownRegion::Leaves(page));
+                if bincode::serialized_size(&inventory)? > super::INITIAL_INVENTORY_BYTES as u64 {
+                    break;
                 }
+                if end == super::whole().end {
+                    return Ok(inventory);
+                }
+                let std::ops::Bound::Included(last) = end else { break };
+                remaining = super::whole().after(&last);
             }
         }
         // A bounded disjoint frontier recognizes both equal inventories and
