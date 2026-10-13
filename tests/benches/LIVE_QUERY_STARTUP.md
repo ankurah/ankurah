@@ -23,9 +23,11 @@ and full entity cache come from Fetch outside the timed interval. Node creation,
 catalog negotiation, server population and prefetch are excluded from latency.
 `ready_us` starts immediately before `query_wait` and ends after
 `wait_durable_answered`: the durable response and local application must finish.
-`settled_us` also waits for the transport tail after exact verification, including
-acknowledgments. `initial_drained_us` and `settled_traffic` preserve the provisional
-pre-verification drain; asynchronous application can send further control traffic.
+After state verification, one transport drain checks subscription delivery and
+the acknowledgment tail. `initial_drained_us` and `transport_settled_us` are
+legacy aliases for the same wire-activity landmark observed by that check;
+`settled_traffic` and `traffic` cover the same interval. The wire landmark can
+precede verification completion; `verified_us` reports that completion separately.
 Cold `elapsed_us` is `ready_us`.
 
 Warm cases retain the same live query. Reconnect cases use `cache=all`.
@@ -48,20 +50,28 @@ in implementation/work counters. The other warm cases disconnect/reconnect.
 another. Reconnection, including registration and catalog work it triggers, is
 timed. The baseline's durable-answer flag is sticky across reconnect. Before
 measurement, both fixtures call the public resultset `set_loaded(false)` metadata
-setter and arm an O(1) `Signal.listen` callback on that retained resultset. This
+setter and arm a `Signal.listen` callback on that retained resultset. This
 changes no selection, version, membership, cache or tree and schedules no work.
 Intermediate dirty/membership broadcasts still see false; the first fresh
 loaded=true callback observes local result installation after the reactor's
 membership and gap work. `local_result_installed_us` and reconnect `elapsed_us`
-record that callback. This precedes initialization/durable bookkeeping, so
+record the callback's initial timestamp, before its O(N) state capture. This
+precedes initialization/durable bookkeeping, so
 reconnect `ready_us` remains null. The handled subscription counter also requires
 a new response for the retained query ID; catalog responses cannot satisfy it.
-Every installed result must immediately match the exact expected IDs and complete
-applied State/head. Verification fails on mismatch rather than waiting for later
-repair. `verification_us` reports the separate O(N) check; `verified_us` and the
-final drained endpoint retain end-to-end work/traffic evidence.
+The reconnect callback captures immutable membership and complete resident
+State/head synchronously after recording readiness. Primary cases capture
+immediately after the versioned wait, before any asynchronous verification or
+transport drain. Each entity's state is atomic; the collection is not one globally
+atomic snapshot. This fixture performs no writes after measurement begins.
+Captured IDs and states must exactly match the static sender. A later repair
+cannot change that captured evidence. Asynchronous storage reads separately check
+persistence after the landmark. `local_result_capture_us` and native capture CPU
+report reconnect capture work, excluded from readiness; primary capture belongs
+to `verification_us`. `verified_us` reports capture comparison and persistence
+verification completion, followed by the own-query response gate and one drain.
 A two-millisecond quiet confirmation is excluded from the drained-link timestamp
-but included in the verification-inclusive endpoint. Protocol acknowledgment
+but included in drain CPU intervals. Protocol acknowledgment
 tails can follow UI readiness. Every record requires successful exact verification. Zero-row cases use cold/empty only. `warm_refresh` also reports the true versioned readiness endpoint.
 
 The sender schedules serialization on a shared lane per direction, then adds
@@ -73,9 +83,9 @@ when messages are pushed concurrently. A connection generation prevents delayed
 messages from an old link from crossing a reconnect.
 
 `STARTUP` JSON contains both landmarks, directional messages/bytes, largest
-message, returned selection rows/bytes, point reads and requested events. Work and traffic include the transfer and application through exact verification;
-`settled_traffic` preserves the provisional pre-verification snapshot. A final
-post-verification drain includes control traffic emitted by asynchronous activation. Selection rows count returned
+message, returned selection rows/bytes, point reads and requested events. Work
+and traffic include transfer, verification and the single post-verification drain,
+including control traffic emitted by asynchronous activation. Selection rows count returned
 materialized states, not internal index visits. Storage counters describe public
 StorageEngine calls and requested IDs, not physical disk I/O or cache misses.
 The verifier's known direct point reads are subtracted from native work counts,
@@ -88,9 +98,11 @@ A 180-second fixture timeout fails rather than producing an incomplete success.
 Build both with the same compiler and optimized profile and verify shared package
 versions match. Keep the original lockfiles and document additional dependencies.
 Copy only this benchmark source and its target declaration into the baseline.
-Use separate Cargo target directories to avoid incompatible workspace artifact
-reuse; preserve each executable. Finish builds before timed sampling and keep the
-machine otherwise quiet.
+Use separate production-only Cargo targets for baseline, candidate and wasm;
+never share them with private instrumentation. Preserve each executable/package,
+check source hashes before and after builds, and scan artifacts for private
+production diagnostics; source stability alone cannot detect stale dependency
+reuse. Finish builds before timed sampling and document any unrelated host load.
 
 ```sh
 python3 tests/benches/compare_live_query_startup.py \
@@ -108,8 +120,9 @@ and page faults cover setup, prefetch, warmup, transfer, verification and teardo
 they are resource context, **not transfer-only CPU or memory**. On Unix,
 `phase_process_cpu` separately samples process user/system CPU with `getrusage`:
 setup ends at measurement start; `through_ready` ends at the public durable-ready
-landmark (null for reconnect); initial drain, local result installation, verification, verified completion,
-and final drain have their own intervals. These counters combine client/server
+landmark (null for reconnect); local installation, reconnect capture, verification,
+verified completion and post-verification drain have their own intervals. Initial
+and final drain CPU fields are aliases for the same cumulative interval. These counters combine client/server
 and every background thread active during the interval; they are not attributed
 CPU for one query task. Cumulative intervals overlap and must not be summed. Drain CPU snapshots are
 taken after the 2 ms quiet confirmation, while the recorded wire-drain wall
