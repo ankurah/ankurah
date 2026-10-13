@@ -1831,3 +1831,56 @@ async fn initial_batch_keeps_a_concurrent_snapshot_divergent() -> anyhow::Result
     assert!(fixture.storage.get_events(vec![remote.id()]).await?.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn adopted_snapshot_reports_change_when_a_reader_loaded_the_committed_state() -> anyhow::Result<()> {
+    for delivery in [Delivery::Initial, Delivery::Live] {
+        let fixture = Fixture::new().await?;
+        let incoming = Event::update(
+            fixture.entity.id(),
+            fixture.entity.head(),
+            AuthorId::Unknown,
+            OperationSet(vec![value_operation("incoming")?, Operation::Membership(Membership::Add(model_b()))]),
+        );
+        fixture.events.stage_event(incoming.clone());
+        let snapshot = fixture.remote_snapshot(&incoming).await?;
+        let content = match delivery {
+            Delivery::Initial => proto::DeltaContent::StateSnapshot { state: fragment(snapshot.clone()) },
+            Delivery::Live => {
+                proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([incoming.clone()]) }
+            }
+        };
+        let (committed, committed_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        *fixture.storage.hold_after_commit.lock().unwrap() = Some((committed, release_rx));
+        let mut applying = Box::pin(fixture.apply(content, delivery));
+        assert!(futures::poll!(&mut applying).is_pending());
+        committed_rx.await?;
+
+        // Storage is committed, but the applier has not published. A reader can
+        // load that state into the resident without notifying query membership.
+        let stored = fixture.storage.get_state(fixture.entity.id()).await?.payload.state;
+        assert_eq!(stored, snapshot);
+        let (advanced, _) = fixture
+            .node
+            .entities
+            .with_state(&LocalStateGetter::new(fixture.storage.clone()), &fixture.events, fixture.entity.id(), stored)
+            .await?;
+        assert_eq!(advanced, Some(true));
+        assert!(fixture.entity.has_membership(&model_b()));
+        release.send(()).unwrap();
+
+        let outcome = applying.await?;
+        let change = outcome.change.expect("the committed snapshot still needs a reactor notification");
+        assert_eq!(change.entity().to_state()?, snapshot);
+        assert_eq!(
+            change.events(),
+            match delivery {
+                Delivery::Initial => Vec::new(),
+                Delivery::Live => vec![Attested::from(incoming)],
+            }
+        );
+        assert!(outcome.divergence.is_none());
+    }
+    Ok(())
+}
