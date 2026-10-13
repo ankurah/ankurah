@@ -20,10 +20,14 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server_ctx = server.context(c)?;
     let client_ctx = client.context(c)?;
 
+    // Keep unchanged state larger than the two year edits to exercise event-bridge reconnect.
+    let album_name = format!("Test Album {}", "x".repeat(4096));
+    let predicate = format!("name = '{album_name}'");
+
     // Create an album on the server
     let server_album = {
         let trx = server_ctx.begin();
-        let album = trx.create(&Album { name: "Test Album".into(), year: "2020".into() }).await?;
+        let album = trx.create(&Album { name: album_name, year: "2020".into() }).await?;
         let album: AlbumView = album.read()?;
         trx.commit().await?;
         album
@@ -33,7 +37,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert_eq!(0, client_storage.dump_entity_events(album_id.clone()).await?.len()); // before subscribe
 
     // Subscribe on the client
-    let client_query = client_ctx.query_wait::<AlbumView>(nocache("name = 'Test Album'")?).await?;
+    let client_query = client_ctx.query_wait::<AlbumView>(nocache(predicate.as_str())?).await?;
 
     //But the livequery should have the album
     use ankurah::signals::Peek;
@@ -67,7 +71,7 @@ async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     // Resubscribe on the client
     // in the repro, it's failling here rather than on the arrival of the StateFragment
-    let client_query2 = client_ctx.query_wait::<AlbumView>(nocache("name = 'Test Album'")?).await?;
+    let client_query2 = client_ctx.query_wait::<AlbumView>(nocache(predicate.as_str())?).await?;
 
     // Update: We don't need to subscribe to the livequery or wait for this test anymore, because the LiveQuery is already initialized
     // and we can just inspect the LiveQuery directly
