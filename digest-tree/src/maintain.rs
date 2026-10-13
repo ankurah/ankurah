@@ -8,7 +8,39 @@ use ankurah_core_types::EntityId;
 use crate::digest::{Digest, DigestGroup, HeadHash, Leaf};
 use crate::layout;
 use crate::map::{MapAccess, MapName};
+use crate::tree::PreparedLeaf;
 use crate::{AddressRange, CanonicalCodec, KeyCodec, LeafRow, NodePrefix, NodeRow, TreeError, TreeTransaction};
+
+#[cfg(not(target_arch = "wasm32"))]
+const PARALLEL_PREPARATION_MIN_LEAVES: usize = 1024;
+const PREPARATION_BATCH_LEAVES: usize = 1024;
+
+#[cfg(not(target_arch = "wasm32"))]
+fn preparation_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
+        if workers == 1 {
+            return None;
+        }
+        rayon::ThreadPoolBuilder::new().num_threads(workers).build().ok()
+    })
+    .as_ref()
+}
+
+fn prepare_leaves<G: DigestGroup>(leaves: Vec<LeafData>) -> Vec<PreparedLeaf<G>> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if leaves.len() >= PARALLEL_PREPARATION_MIN_LEAVES {
+        use rayon::prelude::*;
+
+        if let Some(pool) = preparation_pool() {
+            return pool.install(|| leaves.into_par_iter().map(|leaf| PreparedLeaf::new(leaf.row::<G>())).collect());
+        }
+    }
+    leaves.into_iter().map(|leaf| PreparedLeaf::new(leaf.row::<G>())).collect()
+}
 
 /// The target maximum number of leaves in a terminal bucket.
 /// Merging at half this size avoids repeatedly splitting and merging near the threshold.
@@ -238,6 +270,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Replace the entire tree with these already-admitted leaves. Duplicate
     /// addresses are rejected. The replacement is atomic at commit; failure
     /// or cancellation prevents this transaction from committing.
+    ///
+    /// On native targets, large batches prepare leaf hashes and encodings on
+    /// a shared pool of up to four workers; transaction writes stay serial.
+    /// Builds fall back to serial preparation when workers are unavailable.
     pub async fn build(&mut self, leaves: impl IntoIterator<Item = LeafData>) -> Result<(), TreeError> {
         self.generation += 1;
         let mut mutation = self.mutation();
@@ -247,13 +283,15 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     async fn build_inner(&mut self, leaves: impl IntoIterator<Item = LeafData>) -> Result<(), TreeError> {
         self.transaction.change_structure();
-        let mut rows = BTreeMap::new();
+        // Preserve the first invalid key or duplicate in input order before
+        // workers perform the independent hashing and row encoding.
+        let mut admitted = BTreeMap::new();
         for leaf in leaves {
             if let Some(spec) = &self.spec {
                 CanonicalCodec.split(spec.key_spec(), &leaf.key)?;
             }
-            let row = leaf.row::<G>();
-            if rows.insert(row.address(), row).is_some() {
+            let address = crate::leaf_address(&leaf.key, leaf.entity_id);
+            if admitted.insert(address, leaf).is_some() {
                 return Err(TreeError::DuplicateLeaf);
             }
         }
@@ -263,9 +301,15 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 self.transaction.delete_if(map, &key, &value).await?;
             }
         }
-        let rows = rows.into_values().collect::<Vec<_>>();
-        for row in &rows {
-            self.put_leaf(row.clone(), None).await?;
+        let mut admitted = admitted.into_values();
+        let mut rows = Vec::with_capacity(admitted.len());
+        while admitted.len() != 0 {
+            let batch = admitted.by_ref().take(PREPARATION_BATCH_LEAVES).collect();
+            let prepared = prepare_leaves::<G>(batch);
+            for leaf in &prepared {
+                self.put_prepared_leaf(leaf, None).await?;
+            }
+            rows.extend(prepared.into_iter().map(PreparedLeaf::into_row));
         }
         // These rows already contain the admitted leaf elements. Building the
         // summaries from them avoids reading and decoding our own writes.
@@ -470,5 +514,170 @@ mod tests {
         assert!(matches!(invalid.build([data.clone(), data]).await, Err(TreeError::DuplicateLeaf)));
         assert!(matches!(invalid.commit().await, Err(TreeError::Conflict)));
         assert_eq!(tree.begin().audit().await.unwrap().leaves, 1);
+    }
+
+    fn without_runtime(future: impl std::future::Future<Output = ()>) {
+        let mut future = std::pin::pin!(future);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(future.as_mut().poll(&mut context).is_ready(), "memory builds require no async runtime");
+    }
+
+    async fn compare_prepared_build_to_serial<G: DigestGroup>() {
+        use ankurah_core_types::{IndexKeyPart, PropertyId, Value, ValueType};
+
+        let property = PropertyId::EntityId(EntityId::from_bytes([7; 32]));
+        let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property, ValueType::I64)]), Predicate::True);
+        let leaves = (0u64..2048)
+            .rev()
+            .map(|n| {
+                let mut id = [0; EntityId::BYTE_LEN];
+                id[..8].copy_from_slice(&(n / 2).to_be_bytes());
+                LeafData {
+                    key: CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(n as i64)]).unwrap(),
+                    entity_id: EntityId::from_bytes(id),
+                    head: HeadHash::of([id, [3; 32]]),
+                }
+            })
+            .collect::<Vec<_>>();
+        let prepared_maps = crate::MemoryMaps::new();
+        let serial_maps = crate::MemoryMaps::new();
+        let mut prepared = TreeTransaction::<G, _>::bind(&spec, prepared_maps.begin());
+        prepared.build(leaves.clone()).await.unwrap();
+        prepared.commit().await.unwrap();
+
+        // Oracle follows the original serial builder, including serial hashing
+        // and encoding inside put_leaf, rather than the prepared-value path.
+        let mut serial = TreeTransaction::<G, _>::bind(&spec, serial_maps.begin());
+        let rows = leaves
+            .iter()
+            .map(|leaf| {
+                let row = leaf.row::<G>();
+                (row.address(), row)
+            })
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect::<Vec<_>>();
+        for row in &rows {
+            serial.put_leaf(row.clone(), None).await.unwrap();
+        }
+        serial.write_subtree(&NodePrefix::root(), &rows).await.unwrap();
+        serial.commit().await.unwrap();
+        for map in [MapName::Leaves, MapName::Lookup, MapName::Nodes] {
+            let bounds = (Bound::Unbounded, Bound::Unbounded);
+            assert_eq!(
+                prepared_maps.begin().scan(map, bounds, usize::MAX).await.unwrap(),
+                serial_maps.begin().scan(map, bounds, usize::MAX).await.unwrap(),
+                "all canonical bytes and topology must match the serial oracle: {map:?}"
+            );
+        }
+        let mut old = TreeTransaction::<G, _>::bind(&spec, prepared_maps.begin());
+        let old_root = old.node(&NodePrefix::root()).await.unwrap();
+        assert_eq!(old.audit().await.unwrap().entities, 1024, "two keys per entity retain lookup semantics");
+        let mut changed = leaves;
+        changed[0].head = HeadHash::of([[9; 32]]);
+        let mut replacement = TreeTransaction::<G, _>::bind(&spec, prepared_maps.begin());
+        replacement.build(changed).await.unwrap();
+        replacement.commit().await.unwrap();
+        assert_eq!(old.node(&NodePrefix::root()).await.unwrap(), old_root, "replacement must not mutate a captured snapshot");
+        assert_ne!(TreeTransaction::<G, _>::bind(&spec, prepared_maps.begin()).node(&NodePrefix::root()).await.unwrap(), old_root);
+    }
+
+    #[test]
+    fn large_prepared_builds_match_serial_bytes_for_both_groups_without_a_runtime() {
+        without_runtime(async {
+            compare_prepared_build_to_serial::<Ristretto255>().await;
+            compare_prepared_build_to_serial::<crate::LtHash16>().await;
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(pool) = preparation_pool() {
+            assert!(pool.current_num_threads() <= 4);
+        }
+    }
+
+    #[test]
+    fn large_build_admission_preserves_first_error_and_poisons_the_transaction() {
+        without_runtime(async {
+            let maps = crate::MemoryMaps::new();
+            let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
+            let leaves = (0u64..2048)
+                .map(|n| {
+                    let mut id = [0; EntityId::BYTE_LEN];
+                    id[..8].copy_from_slice(&n.to_be_bytes());
+                    LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+                })
+                .collect::<Vec<_>>();
+            let mut setup = TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin());
+            setup.build([leaves[0].clone()]).await.unwrap();
+            setup.commit().await.unwrap();
+            for duplicate_first in [true, false] {
+                let mut input = leaves.clone();
+                let duplicate = leaves[0].clone();
+                let mut invalid = leaves[1].clone();
+                invalid.key = vec![1];
+                input.extend(if duplicate_first { [duplicate, invalid] } else { [invalid, duplicate] });
+                let mut tx = TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin());
+                let error = tx.build(input).await.unwrap_err();
+                assert!(if duplicate_first {
+                    matches!(error, TreeError::DuplicateLeaf)
+                } else {
+                    matches!(error, TreeError::InvalidKey(_))
+                });
+                tx.apply_change(LeafChange { before: None, after: None }).await.unwrap();
+                assert!(matches!(tx.commit().await, Err(TreeError::Conflict)));
+                assert_eq!(TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, 1);
+            }
+        });
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct LaterBatchPanic;
+
+    impl DigestGroup for LaterBatchPanic {
+        type Element = <Ristretto255 as DigestGroup>::Element;
+        const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
+        const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
+        fn zero() -> Self::Element { Ristretto255::zero() }
+        fn add(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::add(sum, other); }
+        fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
+        fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
+        fn hash_leaf(bytes: &[u8]) -> Self::Element {
+            // Empty key: two length fields precede the entity's bytes.
+            assert_ne!(bytes.get(16..24), Some(2047u64.to_be_bytes().as_slice()), "injected later-batch hash panic");
+            Ristretto255::hash_leaf(bytes)
+        }
+        fn encode(element: &Self::Element, bytes: &mut [u8]) { Ristretto255::encode(element, bytes); }
+        fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> { Ristretto255::decode(bytes) }
+    }
+
+    #[test]
+    fn later_preparation_panic_poisons_prior_buffered_batches() {
+        let maps = crate::MemoryMaps::new();
+        let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
+        let leaves = (0u64..2048)
+            .map(|n| {
+                let mut id = [0; EntityId::BYTE_LEN];
+                id[..8].copy_from_slice(&n.to_be_bytes());
+                LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+            })
+            .collect::<Vec<_>>();
+        without_runtime(async {
+            let mut setup = TreeTransaction::<LaterBatchPanic, _>::bind(&spec, maps.begin());
+            setup.build([leaves[0].clone()]).await.unwrap();
+            setup.commit().await.unwrap();
+        });
+        let mut tx = TreeTransaction::<LaterBatchPanic, _>::bind(&spec, maps.begin());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            without_runtime(async {
+                tx.build(leaves).await.unwrap();
+            });
+        }));
+        assert!(result.is_err(), "the worker panic must propagate to the mutation owner");
+        without_runtime(async {
+            // The first batch was written before the later hash panicked.
+            assert_eq!(tx.leaves(&AddressRange::all(), usize::MAX).await.unwrap().len(), 1024);
+            tx.apply_change(LeafChange { before: None, after: None }).await.unwrap();
+            assert!(matches!(tx.commit().await, Err(TreeError::Conflict)));
+            assert_eq!(TreeTransaction::<LaterBatchPanic, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, 1);
+        });
     }
 }

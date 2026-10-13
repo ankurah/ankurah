@@ -222,7 +222,7 @@ async fn cancelled_mutations_cannot_commit_partial_work() {
         tx.transaction.suspend_after_put = true;
         match operation {
             "head" => cancel_after_yield(tx.apply_change(LeafChange { before: Some(leaf(100, 1)), after: Some(leaf(100, 2)) })),
-            "build" => cancel_after_yield(tx.build((0..64).map(|n| leaf(n, 2)))),
+            "build" => cancel_after_yield(tx.build((0..2048).map(|n| leaf(n, 2)))),
             "compact" => cancel_after_yield(tx.compact_node(&NodePrefix::root())),
             _ => unreachable!(),
         }

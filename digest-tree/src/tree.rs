@@ -27,6 +27,21 @@ use crate::prefix::NodePrefix;
 use crate::rows::{leaf_address, AddressRange, LeafRow, NodeRow};
 use crate::spec::TreeSpec;
 
+// Its bytes can only be made from the row they accompany.
+pub(crate) struct PreparedLeaf<G: DigestGroup> {
+    row: LeafRow<G>,
+    value: Vec<u8>,
+}
+
+impl<G: DigestGroup> PreparedLeaf<G> {
+    pub(crate) fn new(row: LeafRow<G>) -> Self {
+        let value = layout::leaf_value(&row);
+        Self { row, value }
+    }
+
+    pub(crate) fn into_row(self) -> LeafRow<G> { self.row }
+}
+
 /// A digest tree: the spec that defines which leaves it admits and the order
 /// it keeps them in, and the memory-resident maps that hold its rows, with its
 /// leaves summed in the group `G`, ristretto255 unless the tree names another.
@@ -245,9 +260,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// key under its entity. [`TreeError::Conflict`] when another change got
     /// there first.
     pub(crate) async fn put_leaf(&mut self, row: LeafRow<G>, expected: Option<&LeafRow<G>>) -> Result<(), TreeError> {
+        self.put_prepared_leaf(&PreparedLeaf::new(row), expected).await
+    }
+
+    pub(crate) async fn put_prepared_leaf(&mut self, prepared: &PreparedLeaf<G>, expected: Option<&LeafRow<G>>) -> Result<(), TreeError> {
+        let row = &prepared.row;
         debug_assert!(expected.is_none_or(|expected| expected.address() == row.address()), "the expectation is for the row's own address");
         let expected = expected.map(layout::leaf_value);
-        self.transaction.put_if(MapName::Leaves, &row.address(), expected.as_deref(), &layout::leaf_value(&row)).await?;
+        self.transaction.put_if(MapName::Leaves, &row.address(), expected.as_deref(), &prepared.value).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if keys.insert(row.key.clone()) {
             if keys.len() == 2 {
