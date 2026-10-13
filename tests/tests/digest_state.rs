@@ -343,11 +343,14 @@ async fn live_catchup_holds_edits_until_activation_then_reconnects_from_retained
         }
     })
     .await;
-    wait_for(|| !trace.items(Some(query.query_id())).is_empty()).await;
-    assert!(
-        trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Equal(_) | StateItem::Leaves(_))),
-        "retained clocks need no repair on reconnect"
-    );
+    wait_for(|| {
+        trace.0.lock().unwrap().iter().any(|body| matches!(body,
+            NodeResponseBody::QuerySubscribed { query_id, state }
+                if *query_id == query.query_id() && matches!(&state.frame.body,
+                    proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. })))
+    })
+    .await;
+    assert!(trace.items(Some(query.query_id())).is_empty(), "retained equal clocks need no state items on reconnect");
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("4")?;
     trx.commit().await?;
