@@ -66,12 +66,15 @@ def summarize(data):
               "median_requester_messages": statistics.median(x["traffic"]["requester_messages"] for x in data),
               "median_bytes": statistics.median(x["traffic"]["requester_bytes"] + x["traffic"]["responder_bytes"] for x in data),
               "largest_message_bytes": max(x["traffic"]["max_message_bytes"] for x in data)}
+    if all("local_result_installed_us" in x for x in data):
+        installed = [x["local_result_installed_us"] for x in data]
+        result["local_result_installed_distribution_ms"] = distribution([value / 1000 for value in installed]) if all(value is not None for value in installed) else None
     for name in ("process_user_cpu_seconds", "process_system_cpu_seconds", "process_peak_rss_bytes"):
         result[name] = distribution([x["resources"][name] for x in data])
     if all("phase_process_cpu" in x for x in data):
         result["phase_process_cpu_us"] = {}
-        for phase in ("setup", "through_ready", "through_initial_drain", "verification", "through_verified", "after_verification_drain", "through_final_drain"):
-            values = [x["phase_process_cpu"][phase] for x in data]
+        for phase in ("setup", "through_ready", "through_initial_drain", "through_local_result_installed", "verification", "through_verified", "after_verification_drain", "through_final_drain"):
+            values = [x["phase_process_cpu"].get(phase) for x in data]
             result["phase_process_cpu_us"][phase] = {
                 name: distribution([value[name] for value in values]) for name in ("user_us", "system_us")
             } if all(value is not None for value in values) else None
@@ -119,7 +122,7 @@ def main():
         "scope": "cold no-query-tree durable answer or retained-query reconnect fully settled; setup/prefetch excluded from latency",
         "transport": "serialized real-node in-process full-duplex link; per-direction shared bandwidth serialization plus one-way RTT/2 propagation; no transport framing or socket cost",
         "resource_scope": "CPU and peak RSS cover whole isolated fixture process; storage counters and traffic cover timed transfer plus settle tail",
-        "warm_endpoint": "same-selection refresh uses versioned durable ready; reconnect requires new QuerySubscribed plus exact membership/state/clock verification; final drain tracked separately",
+        "warm_endpoint": "same-selection refresh uses versioned durable ready; reconnect resets public resultset loading metadata before arm/timing, observes first fresh loaded=true local result installation via O(1) Signal.listen, requires its own new QuerySubscribed, and immediately verifies exact membership/state/clock; installation precedes durable bookkeeping, ready_us is null, final drain tracked separately",
     }
     (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
     results, failures, summary = [], [], []

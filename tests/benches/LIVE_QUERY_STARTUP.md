@@ -46,15 +46,20 @@ in implementation/work counters. The other warm cases disconnect/reconnect.
 `warm_equal` has no offline change. `warm_edit` edits one body while offline.
 `warm_membership` additionally moves one entity out of the predicate and adds
 another. Reconnection, including registration and catalog work it triggers, is
-timed. The baseline's durable-answer flag is sticky across reconnect, so the
-portable warm landmark requires a new QuerySubscribed to finish application and
-all transport tasks to drain. The handled subscription counter is gated on the
-retained query ID, so a fresh catalog subscription cannot satisfy it. Reconnect
-`ready_us` is null. Its `elapsed_us` ends after exact membership
-and complete applied State verification, including the clock. `verification_us`
-reports that common O(N) check separately, and `transport_settled_us` records
-the earlier drained-link landmark. The verification-inclusive ratio can mask a
-transfer regression and must be assessed alongside transport time and work.
+timed. The baseline's durable-answer flag is sticky across reconnect. Before
+measurement, both fixtures call the public resultset `set_loaded(false)` metadata
+setter and arm an O(1) `Signal.listen` callback on that retained resultset. This
+changes no selection, version, membership, cache or tree and schedules no work.
+Intermediate dirty/membership broadcasts still see false; the first fresh
+loaded=true callback observes local result installation after the reactor's
+membership and gap work. `local_result_installed_us` and reconnect `elapsed_us`
+record that callback. This precedes initialization/durable bookkeeping, so
+reconnect `ready_us` remains null. The handled subscription counter also requires
+a new response for the retained query ID; catalog responses cannot satisfy it.
+Every installed result must immediately match the exact expected IDs and complete
+applied State/head. Verification fails on mismatch rather than waiting for later
+repair. `verification_us` reports the separate O(N) check; `verified_us` and the
+final drained endpoint retain end-to-end work/traffic evidence.
 A two-millisecond quiet confirmation is excluded from the drained-link timestamp
 but included in the verification-inclusive endpoint. Protocol acknowledgment
 tails can follow UI readiness. Every record requires successful exact verification. Zero-row cases use cold/empty only. `warm_refresh` also reports the true versioned readiness endpoint.
@@ -103,7 +108,7 @@ and page faults cover setup, prefetch, warmup, transfer, verification and teardo
 they are resource context, **not transfer-only CPU or memory**. On Unix,
 `phase_process_cpu` separately samples process user/system CPU with `getrusage`:
 setup ends at measurement start; `through_ready` ends at the public durable-ready
-landmark (null for reconnect); initial drain, verification, verified completion,
+landmark (null for reconnect); initial drain, local result installation, verification, verified completion,
 and final drain have their own intervals. These counters combine client/server
 and every background thread active during the interval; they are not attributed
 CPU for one query task. Cumulative intervals overlap and must not be summed. Drain CPU snapshots are

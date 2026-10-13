@@ -25,6 +25,7 @@ use ankurah::{
     policy::DEFAULT_CONTEXT,
     proto, Model, Mutable, Node, PermissiveAgent,
 };
+use ankurah_signals::Signal;
 use ankurah_storage_sled::SledStorageEngine;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -152,6 +153,8 @@ struct Meter {
     pending: usize,
     subscriptions_applied: usize,
     query_subscriptions_applied: HashMap<proto::QueryId, usize>,
+    local_result_installed_at: Option<Instant>,
+    local_result_installed_cpu: Option<ProcessCpu>,
     last_activity: Option<Instant>,
     uplink_free: Option<Instant>,
     downlink_free: Option<Instant>,
@@ -387,6 +390,29 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     };
     server.storage.take();
     client.storage.take();
+    // Reset public loading metadata without changing selection, version, state or tree.
+    // A first loaded=true resultset notification then observes local installation;
+    // dirty/membership broadcasts before final installation still see loaded=false.
+    let _installation_guard = if mode != "cold" && mode != "warm_refresh" {
+        let resultset = retained_query.as_ref().expect("retained reconnect query").resultset();
+        resultset.set_loaded(false);
+        let observed = retained_query.as_ref().unwrap().resultset();
+        let meter = meter.clone();
+        Some(resultset.listen(Arc::new(move |_| {
+            if observed.is_loaded() {
+                let mut meter = meter.lock().unwrap();
+                if meter.measuring && meter.local_result_installed_at.is_none() {
+                    meter.local_result_installed_at = Some(Instant::now());
+                    match ProcessCpu::now() {
+                        Ok(cpu) => meter.local_result_installed_cpu = cpu,
+                        Err(error) => meter.errors.push(format!("installation CPU snapshot: {error}")),
+                    }
+                }
+            }
+        })))
+    } else {
+        None
+    };
     let retained_query_id = retained_query.as_ref().map(|query| query.query_id());
     let (subscriptions_before, query_subscriptions_before) = {
         let mut meter = meter.lock().unwrap();
@@ -422,37 +448,44 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
     let settled_traffic = meter.lock().unwrap().traffic.clone();
     let mut server_reads = server.storage.take();
     let mut client_reads = client.storage.take();
+    let local_result_installed_us = if ready_us.is_none() {
+        phase("wait-local-result-installed");
+        loop {
+            if let Some(error) = query.error().value() {
+                anyhow::bail!("reconnect initialization failed: {error}");
+            }
+            let installed = {
+                let meter = meter.lock().unwrap();
+                anyhow::ensure!(meter.errors.is_empty(), "peer errors: {:?}", meter.errors);
+                meter.local_result_installed_at
+            };
+            if let Some(installed) = installed {
+                break Some(installed.duration_since(start).as_micros());
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    } else {
+        None
+    };
     phase("verify-applied");
     let verification_cpu_start = ProcessCpu::now()?;
     let verification_start = Instant::now();
-    let mut verification_attempts = 0;
-    let mut verification_client_point_reads = 0;
-    while query.ids().into_iter().collect::<BTreeSet<_>>() != expected {
-        anyhow::ensure!(ready_us.is_none(), "ready query has incorrect authoritative membership");
-        verification_attempts += 1;
-        tokio::time::sleep(Duration::from_millis(1)).await;
-    }
-    // Reconnect has no portable re-answer generation API on the baseline. Await
-    // exact final state rather than mistaking a drained response for application.
+    let verification_attempts = expected.len();
+    let verification_client_point_reads = expected.len();
+    // Both landmarks precede verification: versioned durable-ready for primary
+    // cases and a fresh loaded=true local installation notification for reconnect.
+    // A mismatched set or state at that landmark fails; verification never waits
+    // for a later repair that would make the recorded installation too early.
+    anyhow::ensure!(query.ids().into_iter().collect::<BTreeSet<_>>() == expected, "installed query has incorrect authoritative membership");
     for id in &expected {
         let remote = server.storage.get_state(*id).await?;
-        loop {
-            verification_attempts += 1;
-            verification_client_point_reads += 1;
-            match client.storage.get_state(*id).await {
-                Ok(local) if local.payload.state == remote.payload.state => break,
-                Ok(_) | Err(_) if ready_us.is_none() => {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Ok(_) => anyhow::bail!("ready query has incorrect applied state for {id}"),
-                Err(error) => return Err(error.into()),
-            }
-        }
+        let local = client.storage.get_state(*id).await?;
+        anyhow::ensure!(local.payload.state == remote.payload.state, "installed query has incorrect applied state for {id}");
     }
     let verification_us = verification_start.elapsed().as_micros();
     let verified_us = start.elapsed().as_micros();
     let verified_cpu = ProcessCpu::now()?;
-    let elapsed_us = ready_us.unwrap_or(verified_us);
+    let elapsed_us = ready_us.or(local_result_installed_us).expect("ready or installed landmark");
     let final_settled = settle(&meter, subscriptions_before + 1, required_query_subscription).await?;
     let transport_settled_us = final_settled.duration_since(start).as_micros();
     let final_drain_cpu = ProcessCpu::now()?;
@@ -478,7 +511,7 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
             "label":label, "entities":n, "cache":cache, "cached_entities":cached,
             "mode":mode, "bandwidth_bytes_per_second":bytes_per_second,
             "rtt_ms":rtt_ms, "repeat":repeat, "elapsed_us":elapsed_us,
-            "ready_us":ready_us, "initial_drained_us":initial_drained_us,
+            "ready_us":ready_us, "local_result_installed_us":local_result_installed_us, "initial_drained_us":initial_drained_us,
             "settled_us":settled_us, "transport_settled_us":transport_settled_us,
             "verified_us":verified_us, "verification_us":verification_us, "verification_attempts":verification_attempts, "verified":true,
             "traffic":traffic, "settled_traffic":settled_traffic, "server_reads":server_reads, "client_reads":client_reads,
@@ -487,6 +520,7 @@ async fn sample(n: usize, cache: &str, mode: &str, rtt_ms: u64, bytes_per_second
                 "setup":cpu_delta(sample_cpu_start, measurement_cpu_start),
                 "through_ready":cpu_delta(measurement_cpu_start, ready_cpu),
                 "through_initial_drain":cpu_delta(measurement_cpu_start, initial_drain_cpu),
+                "through_local_result_installed":cpu_delta(measurement_cpu_start, meter.lock().unwrap().local_result_installed_cpu),
                 "verification":cpu_delta(verification_cpu_start, verified_cpu),
                 "through_verified":cpu_delta(measurement_cpu_start, verified_cpu),
                 "after_verification_drain":cpu_delta(verified_cpu, final_drain_cpu),
@@ -510,8 +544,9 @@ fn disconnect(server: &TestNode, client: &TestNode, meter: &Arc<Mutex<Meter>>) {
 }
 
 /// Public durable-answer flags are sticky on the old baseline across reconnect.
-/// A new QuerySubscribed application plus a drained link is the portable fully
-/// settled landmark. The 2 ms confirmation is excluded from the recorded time.
+/// A handled QuerySubscribed response and drained link form a transport landmark.
+/// Fresh local installation is observed separately; response delivery does not
+/// prove activation. The 2 ms confirmation is excluded from the recorded time.
 async fn settle(
     meter: &Arc<Mutex<Meter>>,
     subscriptions: usize,
