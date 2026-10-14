@@ -12,6 +12,7 @@ import catalog
 import historical
 import dataset as data
 import pipeline
+import semantics
 
 
 def fixture():
@@ -97,6 +98,23 @@ class DatasetTests(unittest.TestCase):
                             data.measurement_series(other, "layers/diamond_chain_drain/4"))
         other["harness"]["workload_semantics"][name] = "different-timed-boundary-v2"
         self.assertNotEqual(data.measurement_series(run, name), data.measurement_series(other, name))
+
+    def test_borrowed_fixture_timings_do_not_join_clone_inclusive_history(self):
+        benchmark = (pipeline.ROOT / "core/benches/event_dag.rs").read_bytes()
+        names = ["compare/diamond_chain/64", "layers/diamond_chain_prepare/64"]
+        contracts = semantics.audited_workloads(benchmark, names)
+        self.assertEqual(contracts, {
+            names[0]: "dag-borrowed-compare-assert-v1",
+            names[1]: "dag-borrowed-diamond-prepare-assert-v1",
+        })
+        self.assertEqual(semantics.audited_workloads(benchmark + b"// changed fixture", names), {})
+        run, _, _ = fixture()
+        run["harness"]["workload_semantics"] = contracts
+        old = copy.deepcopy(run)
+        old["harness"]["workload_semantics"] = {name: contract.replace("borrowed", "cloned")
+                                               for name, contract in contracts.items()}
+        for name in names:
+            self.assertNotEqual(data.measurement_series(run, name), data.measurement_series(old, name))
 
     def test_publication_retry_and_repeated_measurement(self):
         bundle, plan = complete_fixture()

@@ -12,7 +12,7 @@ Nothing in these files activates a runner or publishes data before the changes l
 For current main, Cargo metadata automatically discovers all registered benchmark
 targets. Explicit Criterion targets (`harness=false`) are compiled and enumerated
 with `--list`; every returned workload is measured without a UI/config list edit.
-The current instrument includes cloned in-memory DAG comparison/layer preparation,
+The current instrument includes DAG comparison/layer preparation with a borrowed fixture,
 clock/topological ordering, and the Sled/local-process lanes. Fixture setup remains outside each lane's measured
 region; final-state, stored-event and delivery-path assertions remain enabled.
 The lane API repair unwraps fallible reads/property access and awaits context
@@ -32,11 +32,12 @@ Each measurement has an explicit `series` incorporating the workload contract,
 lane (`local`/`hosted`/`stable`), machine identity/OS/hardware, compiler/target,
 profile and build configuration, measurement parameters and operator series
 generation. `semantics.py` explicitly audits known instrument bytes against a
-shared semantic version: seeded DAG shape, clone inside the timer, timed async
+shared semantic version: seeded DAG shape, borrowed versus cloned fixture, timed async
 operation, result assertions, and drain versus prepare boundary. API-only fixture
 adapters can share a series after that audit. Unknown instrument bytes default to
 an exact harness hash, so changed workloads never silently join old lines. Exact
 harness/adapter hashes always remain provenance and part of source deduplication.
+Borrowed DAG timings form separate series from the clone-inclusive history.
 Different series must not be connected. Source lockfile and manifest
 hashes remain provenance and part of exact-source deduplication, but dependency
 updates do not split a trend: dependencies are part of the changing library.

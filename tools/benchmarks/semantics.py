@@ -22,16 +22,22 @@ AUDITED = {
 }
 
 
+# Same fixtures with a borrowed retriever and assertions enabled.
+BORROWED = "9560d42cdcb30f3cf33546574bfce435d0423da2310b2b6b9c8c0a7dd008ecd4"
+
+
 def audited_workloads(benchmark, names):
-    assertions = AUDITED.get(hashlib.sha256(benchmark).hexdigest())
+    fingerprint = hashlib.sha256(benchmark).hexdigest()
+    fixture = "borrowed" if fingerprint == BORROWED else "cloned"
+    assertions = "assert" if fixture == "borrowed" else AUDITED.get(fingerprint)
     if assertions is None:
         return {}
     result = {}
     for name in names:
         if name.startswith("compare/"):
-            result[name] = f"dag-cloned-compare-{assertions}-v1"
+            result[name] = f"dag-{fixture}-compare-{assertions}-v1"
         elif name.startswith("layers/diamond_chain_drain/"):
-            result[name] = f"dag-cloned-diamond-drain-{assertions}-v1"
+            result[name] = f"dag-{fixture}-diamond-drain-{assertions}-v1"
         elif name.startswith("layers/diamond_chain_prepare/"):
-            result[name] = f"dag-cloned-diamond-prepare-{assertions}-v1"
+            result[name] = f"dag-{fixture}-diamond-prepare-{assertions}-v1"
     return result

@@ -11,11 +11,11 @@
 //! DAG generation is deterministic (fixed content-addressed seeds, no RNG
 //! state carried between cases) and events are served from an in-memory
 //! `GetEvents` map, so there are no storage engines in the hot path and
-//! results are reproducible across runs and machines. Ids are content
+//! the timer excludes cloning the fixture map. Ids are content
 //! addressed, so a given shape at a given size always produces the same DAG.
 //!
 //! Groups:
-//! - `compare`: the causal comparison across DAG shapes (linear deep, uneven
+//! - `compare`: the causal comparison across DAG shapes (linear deep,
 //!   diamond chains, wide antichains, disjoint graphs).
 //! - `layers`: preparing application layers, including comparison and batch validation.
 //! - `clock`: membership, normalizing construction, and insert on `Clock`.
@@ -36,7 +36,6 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 
 /// In-memory event source: the whole DAG lives in a `HashMap`, so `compare`
 /// exercises only the traversal/accumulation logic, never storage IO.
-#[derive(Clone)]
 struct MemRetriever {
     events: HashMap<EventId, Event>,
 }
@@ -202,21 +201,21 @@ fn bench_compare(c: &mut Criterion) {
         group.throughput(Throughput::Elements(s.events));
         group.bench_with_input(BenchmarkId::new("linear_deep", depth), &s, |b, s| {
             b.to_async(&rt).iter(|| async {
-                let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
+                let r = compare(&s.retriever, &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+                assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
                 std::hint::black_box(r.relation());
             });
         });
     }
 
-    // Uneven diamond chains: two concurrent tips, DivergedSince at the last join.
+    // Diamond chains: two concurrent tips, DivergedSince at the last join.
     for n in [4usize, 16, 64] {
         let s = diamond_chain(n);
         group.throughput(Throughput::Elements(s.events));
         group.bench_with_input(BenchmarkId::new("diamond_chain", n), &s, |b, s| {
             b.to_async(&rt).iter(|| async {
-                let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::DivergedSince { .. }));
+                let r = compare(&s.retriever, &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+                assert!(matches!(r.relation(), AbstractCausalRelation::DivergedSince { .. }));
                 std::hint::black_box(r.relation());
             });
         });
@@ -228,8 +227,8 @@ fn bench_compare(c: &mut Criterion) {
         group.throughput(Throughput::Elements(s.events));
         group.bench_with_input(BenchmarkId::new("wide_antichain", width), &s, |b, s| {
             b.to_async(&rt).iter(|| async {
-                let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
+                let r = compare(&s.retriever, &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+                assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
                 std::hint::black_box(r.relation());
             });
         });
@@ -241,8 +240,8 @@ fn bench_compare(c: &mut Criterion) {
         group.throughput(Throughput::Elements(s.events));
         group.bench_with_input(BenchmarkId::new("disjoint", depth), &s, |b, s| {
             b.to_async(&rt).iter(|| async {
-                let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::Disjoint { .. }));
+                let r = compare(&s.retriever, &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+                assert!(matches!(r.relation(), AbstractCausalRelation::Disjoint { .. }));
                 std::hint::black_box(r.relation());
             });
         });
@@ -267,7 +266,7 @@ fn bench_layers(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::new("diamond_chain_prepare", n), &s, |b, s| {
             let events: Vec<_> = s.subject.ids().map(|id| &s.retriever.events[id]).collect();
             b.to_async(&rt).iter(|| async {
-                let layers = prepare_layers(&s.retriever.clone(), &events, &s.comparison).await.unwrap();
+                let layers = prepare_layers(&s.retriever, &events, &s.comparison).await.unwrap();
                 let count: usize = layers.iter().map(|layer| layer.to_apply + layer.already_applied).sum();
                 std::hint::black_box(count);
             });

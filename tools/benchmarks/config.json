@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "harness_id": "dag-cloned-prepare-and-lanes-v1",
+  "harness_id": "dag-borrowed-prepare-and-lanes-v1",
   "toolchain": "nightly-2026-04-27",
   "profile": "release",
   "parameters": {"warm_up_seconds": 1, "measurement_seconds": 3, "sample_size": 40, "confidence_level": 0.95},
