@@ -1,0 +1,53 @@
+diff --git a/core/benches/event_dag.rs b/core/benches/event_dag.rs
+index d74e6c66..d222889b 100644
+--- a/core/benches/event_dag.rs
++++ b/core/benches/event_dag.rs
+@@ -199,7 +199,7 @@ fn bench_compare(c: &mut Criterion) {
+         group.bench_with_input(BenchmarkId::new("linear_deep", depth), &s, |b, s| {
+             b.to_async(&rt).iter(|| async {
+                 let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
++                assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
+                 std::hint::black_box(r.relation());
+             });
+         });
+@@ -212,7 +212,7 @@ fn bench_compare(c: &mut Criterion) {
+         group.bench_with_input(BenchmarkId::new("diamond_chain", n), &s, |b, s| {
+             b.to_async(&rt).iter(|| async {
+                 let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::DivergedSince { .. }));
++                assert!(matches!(r.relation(), AbstractCausalRelation::DivergedSince { .. }));
+                 std::hint::black_box(r.relation());
+             });
+         });
+@@ -225,7 +225,7 @@ fn bench_compare(c: &mut Criterion) {
+         group.bench_with_input(BenchmarkId::new("wide_antichain", width), &s, |b, s| {
+             b.to_async(&rt).iter(|| async {
+                 let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
++                assert!(matches!(r.relation(), AbstractCausalRelation::StrictDescends { .. }));
+                 std::hint::black_box(r.relation());
+             });
+         });
+@@ -238,7 +238,7 @@ fn bench_compare(c: &mut Criterion) {
+         group.bench_with_input(BenchmarkId::new("disjoint", depth), &s, |b, s| {
+             b.to_async(&rt).iter(|| async {
+                 let r = compare(s.retriever.clone(), &s.subject, &s.comparison, DEFAULT_BUDGET).await.unwrap();
+-                debug_assert!(matches!(r.relation(), AbstractCausalRelation::Disjoint { .. }));
++                assert!(matches!(r.relation(), AbstractCausalRelation::Disjoint { .. }));
+                 std::hint::black_box(r.relation());
+             });
+         });
+diff --git a/core/src/bench_support.rs b/core/src/bench_support.rs
+index 8b3fee2e..d5ee3846 100644
+--- a/core/src/bench_support.rs
++++ b/core/src/bench_support.rs
+@@ -18,7 +18,7 @@ use crate::retrieval::GetEvents;
+ use ankurah_proto::{Attested, Clock, Event, EventId};
+ 
+ pub use crate::event_dag::relation::AbstractCausalRelation;
+-pub use crate::event_dag::DEFAULT_BUDGET;
++pub const DEFAULT_BUDGET: usize = crate::event_dag::DEFAULT_BUDGET;
+ 
+ /// Sizes of a drained layer. The internal `EventLayer` keeps its event vecs
+ /// `pub(crate)`; the benches only need the counts (to drive draining and to

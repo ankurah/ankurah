@@ -1,0 +1,47 @@
+diff --git a/core/Cargo.toml b/core/Cargo.toml
+index 4cff44e6..454a121b 100644
+--- a/core/Cargo.toml
++++ b/core/Cargo.toml
+@@ -9,6 +9,7 @@ homepage      = "https://github.com/ankurah/ankurah"
+ repository    = "https://github.com/ankurah/ankurah"
+ 
+ [features]
++bench-internals = []
+ wasm = [
+     "wasm-bindgen",
+     "wasm-bindgen-futures",
+@@ -63,5 +64,10 @@ base64               = { version = "0.22" }
+ uniffi               = { version = "0.29", optional = true }
+ 
+ [dev-dependencies]
++criterion = { version = "=0.5.1", features = ["async_tokio"] }
+ maplit         = "1.0"
+ ankurah-derive = { path = "../derive", version = "=0.9.1" }
++
++[[bench]]
++name = "event_dag"
++harness = false
+diff --git a/core/src/event_dag/relation.rs b/core/src/event_dag/relation.rs
+index e6597aa0..18185bd4 100644
+--- a/core/src/event_dag/relation.rs
++++ b/core/src/event_dag/relation.rs
+@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
+ /// Causal relationship between two clocks in the event DAG.
+ /// Aligned with proto::CausalRelation for wire compatibility.
+ #[derive(Debug, PartialEq, Eq, Clone)]
+-pub(crate) enum AbstractCausalRelation<Id> {
++pub enum AbstractCausalRelation<Id> {
+     /// Identical lattice points.
+     Equal,
+ 
+diff --git a/core/src/lib.rs b/core/src/lib.rs
+index 74b5929b..483683f8 100644
+--- a/core/src/lib.rs
++++ b/core/src/lib.rs
+@@ -39,3 +39,6 @@ pub use type_resolver::TypeResolver;
+ 
+ pub use ankurah_proto as proto;
+ pub use ankurah_proto::EntityId;
++
++#[cfg(feature = "bench-internals")]
++pub mod bench_support;

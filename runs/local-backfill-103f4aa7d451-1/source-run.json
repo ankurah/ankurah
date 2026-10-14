@@ -1,0 +1,27 @@
+{
+  "id": "local-backfill-103f4aa7d451-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm@0.5.4",
+      "url": "https://crates.io/crates/ankurah-websocket-client-wasm/0.5.4"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-103f4aa7d451-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:59.023490+00:00",
+  "source": {
+    "committed_at": "2025-08-06T11:15:08-07:00",
+    "label": "ankurah-websocket-client-wasm-v0.5.4",
+    "repository": "ankurah/ankurah",
+    "sha": "103f4aa7d45156161ebbcaffa6acbff7ea76f43b",
+    "tree_sha": "b83935ec5dc7c6278b9fc6921d4f3e5b4031af8b"
+  },
+  "status": "unsupported"
+}

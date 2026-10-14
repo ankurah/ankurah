@@ -1,0 +1,26 @@
+{
+  "build": [
+    "cargo",
+    "+nightly-2026-04-27",
+    "bench",
+    "--offline",
+    "--locked",
+    "--profile",
+    "release",
+    "-p",
+    "ankurah-core",
+    "--bench",
+    "event_dag",
+    "--features",
+    "bench-internals",
+    "--no-run",
+    "--message-format=json"
+  ],
+  "metadata": [
+    "cargo",
+    "+nightly-2026-04-27",
+    "metadata",
+    "--offline",
+    "--format-version=1"
+  ]
+}

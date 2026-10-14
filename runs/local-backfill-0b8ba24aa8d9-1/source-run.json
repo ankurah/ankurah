@@ -1,0 +1,32 @@
+{
+  "id": "local-backfill-0b8ba24aa8d9-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.1.3",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.1.3"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.1.5",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.1.5"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah@0.1.5",
+      "url": "https://crates.io/crates/ankurah/0.1.5"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-0b8ba24aa8d9-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:55.765662+00:00",
+  "source": {
+    "committed_at": "2025-02-07T18:08:13-05:00",
+    "label": "ankurah@0.1.5",
+    "repository": "ankurah/ankurah",
+    "sha": "0b8ba24aa8d90afbed75edf9d7e6e878e14bd307",
+    "tree_sha": "b991856d40faf795e9db8c19c0313c17a2975e4d"
+  },
+  "status": "unsupported"
+}

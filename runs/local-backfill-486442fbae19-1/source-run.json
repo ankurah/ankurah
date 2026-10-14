@@ -1,0 +1,22 @@
+{
+  "id": "local-backfill-486442fbae19-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "pr",
+      "label": "#25",
+      "url": "https://github.com/ankurah/ankurah/pull/25"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-486442fbae19-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:54.948583+00:00",
+  "source": {
+    "committed_at": "2025-01-13T17:24:45-08:00",
+    "label": "PR #25",
+    "repository": "ankurah/ankurah",
+    "sha": "486442fbae19a531dfa506ebf0b3f97d607c4680",
+    "tree_sha": "48e464324a0982304e44c04f5d04521750ca9986"
+  },
+  "status": "unsupported"
+}

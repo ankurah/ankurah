@@ -1,0 +1,453 @@
+{
+  "build_sha256": "53ea6ee55d037ecf0e4d56deb20e51b20c50d2c959c46138a338a8f8a6bce8d9",
+  "compiler": {
+    "target": "aarch64-apple-darwin",
+    "version": "rustc 1.97.0-nightly (ca9a134e0 2026-04-26)"
+  },
+  "elapsed_seconds": 95.5,
+  "harness": {
+    "adapter_version": "historical-dag-surface-v1",
+    "description": "Historical DAG with cloned in-memory fixtures; verified result assertions; retained instrument adapter.",
+    "id": "local-dag-cloned-drain-v1",
+    "reference_sha": "893721a97551e379b2db6c45de472cfa0b99b04f",
+    "sha256": "fc8bfd8e76d2e033aed02546a947ef9462003552ab31000d90726e4bb3cd7f87",
+    "source_url": "backfill/runs/local-backfill-aa75219cf922-1/adapter.json",
+    "workload_semantics": {
+      "compare/diamond_chain/16": "dag-cloned-compare-assert-v1",
+      "compare/diamond_chain/4": "dag-cloned-compare-assert-v1",
+      "compare/diamond_chain/64": "dag-cloned-compare-assert-v1",
+      "compare/disjoint/10": "dag-cloned-compare-assert-v1",
+      "compare/disjoint/100": "dag-cloned-compare-assert-v1",
+      "compare/linear_deep/10": "dag-cloned-compare-assert-v1",
+      "compare/linear_deep/100": "dag-cloned-compare-assert-v1",
+      "compare/linear_deep/1000": "dag-cloned-compare-assert-v1",
+      "compare/wide_antichain/16": "dag-cloned-compare-assert-v1",
+      "compare/wide_antichain/4": "dag-cloned-compare-assert-v1",
+      "compare/wide_antichain/64": "dag-cloned-compare-assert-v1",
+      "layers/diamond_chain_drain/16": "dag-cloned-diamond-drain-assert-v1",
+      "layers/diamond_chain_drain/4": "dag-cloned-diamond-drain-assert-v1",
+      "layers/diamond_chain_drain/64": "dag-cloned-diamond-drain-assert-v1"
+    }
+  },
+  "id": "local-backfill-aa75219cf922-1",
+  "kind": "local",
+  "lockfile_sha256": "df64cb0300657171211b7d98f1c21e6894e9d0792d360c3ef60b183796710f3b",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankql-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankql@0.9.1",
+      "url": "https://crates.io/crates/ankql/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-cli-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-cli-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process@0.9.1",
+      "url": "https://crates.io/crates/ankurah-connector-local-process/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core@0.9.1",
+      "url": "https://crates.io/crates/ankurah-core/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive@0.9.1",
+      "url": "https://crates.io/crates/ankurah-derive/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-jwt-auth-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-jwt-auth-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-jwt-auth@0.9.1",
+      "url": "https://crates.io/crates/ankurah-jwt-auth/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto@0.9.1",
+      "url": "https://crates.io/crates/ankurah-proto/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-signals-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals@0.9.1",
+      "url": "https://crates.io/crates/ankurah-signals/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-common-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-common-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-common@0.9.1",
+      "url": "https://crates.io/crates/ankurah-storage-common/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm@0.9.1",
+      "url": "https://crates.io/crates/ankurah-storage-indexeddb-wasm/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres@0.9.1",
+      "url": "https://crates.io/crates/ankurah-storage-postgres/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled@0.9.1",
+      "url": "https://crates.io/crates/ankurah-storage-sled/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sqlite-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sqlite-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sqlite@0.9.1",
+      "url": "https://crates.io/crates/ankurah-storage-sqlite/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm@0.9.1",
+      "url": "https://crates.io/crates/ankurah-websocket-client-wasm/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client@0.9.1",
+      "url": "https://crates.io/crates/ankurah-websocket-client/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server@0.9.1",
+      "url": "https://crates.io/crates/ankurah-websocket-server/0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah@0.9.1",
+      "url": "https://crates.io/crates/ankurah/0.9.1"
+    }
+  ],
+  "measurements": [
+    {
+      "confidence_level": 0.95,
+      "lower": 71634.27570387129,
+      "median": 72262.84250356126,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/diamond_chain/16:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 72805.40542903042,
+      "workload": "compare/diamond_chain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 17956.31834464555,
+      "median": 18055.647443977592,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/diamond_chain/4:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 18174.228736670106,
+      "workload": "compare/diamond_chain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 301683.8846153846,
+      "median": 302525.0369463869,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/diamond_chain/64:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 303391.47238658776,
+      "workload": "compare/diamond_chain/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 26284.00706743567,
+      "median": 26312.093792517007,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/disjoint/10:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 26372.75992063492,
+      "workload": "compare/disjoint/10"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 264816.2295168067,
+      "median": 265656.0,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/disjoint/100:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 266613.8955026455,
+      "workload": "compare/disjoint/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 14670.385565862709,
+      "median": 14756.628367346939,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/linear_deep/10:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 14905.48263686427,
+      "workload": "compare/linear_deep/10"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 133573.3024691358,
+      "median": 133890.15,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/linear_deep/100:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 134688.89240397804,
+      "workload": "compare/linear_deep/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 2565950.84375,
+      "median": 2573644.808857809,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/linear_deep/1000:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 2588212.5357142854,
+      "workload": "compare/linear_deep/1000"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 30418.680022008804,
+      "median": 30632.389485024778,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/wide_antichain/16:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 30741.74537293178,
+      "workload": "compare/wide_antichain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 10066.97642478953,
+      "median": 10077.89781418939,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/wide_antichain/4:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 10108.248717442777,
+      "workload": "compare/wide_antichain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 109266.22242647059,
+      "median": 109722.4550802139,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/wide_antichain/64:da60b6abfb67aecc8d1a5a7535d01248383865c131e2dc98643c0124f91703db",
+      "unit": "ns",
+      "upper": 110033.15493697478,
+      "workload": "compare/wide_antichain/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 83822.88731060606,
+      "median": 84010.24909197734,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-diamond-drain-assert-v1:layers/diamond_chain_drain/16:72aa352e6787fa1a3c1b214db57d5ef97b0bcf2a86337780ca29e70df169f821",
+      "unit": "ns",
+      "upper": 84233.65194128788,
+      "workload": "layers/diamond_chain_drain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 20982.96097285068,
+      "median": 21097.95139838881,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-diamond-drain-assert-v1:layers/diamond_chain_drain/4:72aa352e6787fa1a3c1b214db57d5ef97b0bcf2a86337780ca29e70df169f821",
+      "unit": "ns",
+      "upper": 21155.545593635252,
+      "workload": "layers/diamond_chain_drain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 353740.44919786096,
+      "median": 354402.1502525252,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-diamond-drain-assert-v1:layers/diamond_chain_drain/64:72aa352e6787fa1a3c1b214db57d5ef97b0bcf2a86337780ca29e70df169f821",
+      "unit": "ns",
+      "upper": 355583.65454545454,
+      "workload": "layers/diamond_chain_drain/64"
+    }
+  ],
+  "original_lockfile_sha256": "4936b37f5809db9d5900c8dcb2885901aca9617b3f99bf4dcaa24cbb28ac8df1",
+  "parameters": {
+    "confidence_level": 0.95,
+    "measurement_seconds": 3,
+    "sample_size": 40,
+    "warm_up_seconds": 1
+  },
+  "profile": "release",
+  "profile_sha256": "897a80d75d365c3085775074c1c19666fbb56fe4f2c97b97f1199fe1761326f8",
+  "raw_url": "backfill/runs/local-backfill-aa75219cf922-1/raw.json",
+  "recorded_at": "2026-10-13T21:19:35.230304+00:00",
+  "runner": {
+    "hardware": "Apple M4 Max, 128 GiB",
+    "id": "daniel-m4-max-local-backfill-2026-10-13",
+    "label": "Daniel\u2019s Apple M4 Max (local)",
+    "os": "macOS-26.7.1-arm64-arm-64bit-Mach-O"
+  },
+  "source": {
+    "committed_at": "2026-08-06T18:36:06-07:00",
+    "label": "ankurah@0.9.1",
+    "repository": "ankurah/ankurah",
+    "sha": "aa75219cf9224882e8fb2895392f00b528ccf830",
+    "tree_sha": "9f22fc815a9c989885dfc72b6e38e810c82442c3"
+  },
+  "status": "ok"
+}

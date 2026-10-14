@@ -1,0 +1,132 @@
+{
+  "id": "local-backfill-c9c7da9ce363-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankql-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankql@0.2.1",
+      "url": "https://crates.io/crates/ankql/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process@0.2.1",
+      "url": "https://crates.io/crates/ankurah-connector-local-process/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core@0.2.1",
+      "url": "https://crates.io/crates/ankurah-core/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive@0.2.1",
+      "url": "https://crates.io/crates/ankurah-derive/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto@0.2.1",
+      "url": "https://crates.io/crates/ankurah-proto/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-react-signals-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-react-signals-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm@0.2.1",
+      "url": "https://crates.io/crates/ankurah-storage-indexeddb-wasm/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres@0.2.1",
+      "url": "https://crates.io/crates/ankurah-storage-postgres/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled@0.2.1",
+      "url": "https://crates.io/crates/ankurah-storage-sled/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm@0.2.1",
+      "url": "https://crates.io/crates/ankurah-websocket-client-wasm/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.2.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server@0.2.1",
+      "url": "https://crates.io/crates/ankurah-websocket-server/0.2.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah@0.2.1",
+      "url": "https://crates.io/crates/ankurah/0.2.1"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-c9c7da9ce363-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:56.411332+00:00",
+  "source": {
+    "committed_at": "2025-03-10T22:09:59-07:00",
+    "label": "ankurah@0.2.1",
+    "repository": "ankurah/ankurah",
+    "sha": "c9c7da9ce3633eb08fe342b84d8303603c4dc1c6",
+    "tree_sha": "aa8a14597d7b612a94bb6c4e6c3ffd546fa64a51"
+  },
+  "status": "unsupported"
+}

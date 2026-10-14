@@ -1,0 +1,27 @@
+{
+  "id": "local-backfill-9c972e8e4d92-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres@0.1.2",
+      "url": "https://crates.io/crates/ankurah-storage-postgres/0.1.2"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-9c972e8e4d92-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:55.584640+00:00",
+  "source": {
+    "committed_at": "2025-02-02T18:44:20-08:00",
+    "label": "ankurah-storage-postgres-v0.1.2",
+    "repository": "ankurah/ankurah",
+    "sha": "9c972e8e4d923a0694830e528cb26aecb6afdde6",
+    "tree_sha": "582d1ee36426837467eacba9ab88e44cd3a0cfb0"
+  },
+  "status": "unsupported"
+}

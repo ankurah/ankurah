@@ -1,0 +1,77 @@
+{
+  "id": "local-backfill-88a0fe5f029f-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process@0.5.2",
+      "url": "https://crates.io/crates/ankurah-connector-local-process/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core@0.5.2",
+      "url": "https://crates.io/crates/ankurah-core/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive@0.5.2",
+      "url": "https://crates.io/crates/ankurah-derive/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto@0.5.2",
+      "url": "https://crates.io/crates/ankurah-proto/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals@0.5.2",
+      "url": "https://crates.io/crates/ankurah-signals/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm@0.5.2",
+      "url": "https://crates.io/crates/ankurah-storage-indexeddb-wasm/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres@0.5.2",
+      "url": "https://crates.io/crates/ankurah-storage-postgres/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled@0.5.2",
+      "url": "https://crates.io/crates/ankurah-storage-sled/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm@0.5.2",
+      "url": "https://crates.io/crates/ankurah-websocket-client-wasm/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client@0.5.2",
+      "url": "https://crates.io/crates/ankurah-websocket-client/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server@0.5.2",
+      "url": "https://crates.io/crates/ankurah-websocket-server/0.5.2"
+    },
+    {
+      "kind": "release",
+      "label": "v0.5.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/v0.5.2"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-88a0fe5f029f-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:58.744594+00:00",
+  "source": {
+    "committed_at": "2025-07-28T14:38:52-07:00",
+    "label": "v0.5.2",
+    "repository": "ankurah/ankurah",
+    "sha": "88a0fe5f029f70fc7394f9371415ba652447f7bc",
+    "tree_sha": "630fc33eddeccfbaeaadf3983cd641741965ccbf"
+  },
+  "status": "unsupported"
+}

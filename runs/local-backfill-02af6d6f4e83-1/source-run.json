@@ -1,0 +1,52 @@
+{
+  "id": "local-backfill-02af6d6f4e83-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "pr",
+      "label": "#154",
+      "url": "https://github.com/ankurah/ankurah/pull/154"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core@0.6.0",
+      "url": "https://crates.io/crates/ankurah-core/0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-signals-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals@0.6.0",
+      "url": "https://crates.io/crates/ankurah-signals/0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah@0.6.0",
+      "url": "https://crates.io/crates/ankurah/0.6.0"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-02af6d6f4e83-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:59.715763+00:00",
+  "source": {
+    "committed_at": "2025-10-11T08:22:56-07:00",
+    "label": "ankurah@0.6.0",
+    "repository": "ankurah/ankurah",
+    "sha": "02af6d6f4e831fadcf8614ac231556a60d00823c",
+    "tree_sha": "52b238445642ceef683596cf636fb67a07521004"
+  },
+  "status": "unsupported"
+}

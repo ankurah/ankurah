@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "benchmarks": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "target": "event_dag",
+      "status": "discovered",
+      "workloads": [
+        {
+          "id": "compare/linear_deep/10",
+          "original_workload": "compare/linear_deep/10",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/linear_deep/100",
+          "original_workload": "compare/linear_deep/100",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/linear_deep/1000",
+          "original_workload": "compare/linear_deep/1000",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/diamond_chain/4",
+          "original_workload": "compare/diamond_chain/4",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/diamond_chain/16",
+          "original_workload": "compare/diamond_chain/16",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/diamond_chain/64",
+          "original_workload": "compare/diamond_chain/64",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/wide_antichain/4",
+          "original_workload": "compare/wide_antichain/4",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/wide_antichain/16",
+          "original_workload": "compare/wide_antichain/16",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/wide_antichain/64",
+          "original_workload": "compare/wide_antichain/64",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/disjoint/10",
+          "original_workload": "compare/disjoint/10",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/disjoint/100",
+          "original_workload": "compare/disjoint/100",
+          "unit": "ns"
+        },
+        {
+          "id": "layers/diamond_chain_prepare/4",
+          "original_workload": "layers/diamond_chain_prepare/4",
+          "unit": "ns"
+        },
+        {
+          "id": "layers/diamond_chain_prepare/16",
+          "original_workload": "layers/diamond_chain_prepare/16",
+          "unit": "ns"
+        },
+        {
+          "id": "layers/diamond_chain_prepare/64",
+          "original_workload": "layers/diamond_chain_prepare/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/contains/8",
+          "original_workload": "clock/contains/8",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/normalize_from/8",
+          "original_workload": "clock/normalize_from/8",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/join/8",
+          "original_workload": "clock/join/8",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/contains/64",
+          "original_workload": "clock/contains/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/normalize_from/64",
+          "original_workload": "clock/normalize_from/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/join/64",
+          "original_workload": "clock/join/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/contains/512",
+          "original_workload": "clock/contains/512",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/normalize_from/512",
+          "original_workload": "clock/normalize_from/512",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/join/512",
+          "original_workload": "clock/join/512",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/toposort/shuffled_chain/16",
+          "original_workload": "toposort/shuffled_chain/16",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/toposort/shuffled_chain/128",
+          "original_workload": "toposort/shuffled_chain/128",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/toposort/shuffled_chain/1024",
+          "original_workload": "toposort/shuffled_chain/1024",
+          "unit": "ns"
+        }
+      ],
+      "source_sha": "6bbca24e760797e396ab70e8d5366804ce063213",
+      "cataloged_at": "2026-10-13T20:39:09.995550+00:00"
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "package": "ankurah-tests",
+      "target": "lane_perf",
+      "status": "registered",
+      "workloads": [],
+      "source_sha": "6bbca24e760797e396ab70e8d5366804ce063213",
+      "cataloged_at": "2026-10-13T20:39:09.995550+00:00"
+    }
+  ]
+}

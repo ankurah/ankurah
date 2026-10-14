@@ -1,0 +1,7 @@
+{
+  "logs": [
+    "/Users/daniel/Documents/Codex/2026-10-02/hi-i-m-doing-my-line/work/benchmark-dashboard-2026-10-13/local-backfill/runs/local-backfill-6bad43500d25-2/metadata.log",
+    "/Users/daniel/Documents/Codex/2026-10-02/hi-i-m-doing-my-line/work/benchmark-dashboard-2026-10-13/local-backfill/runs/local-backfill-6bad43500d25-2/build.log"
+  ],
+  "reason": "Historical instrument compile failed; inspect build.log for an API/dependency adapter requirement"
+}

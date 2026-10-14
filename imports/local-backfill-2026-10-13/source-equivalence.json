@@ -1,0 +1,16 @@
+{
+  "source_sha": "6bbca24e760797e396ab70e8d5366804ce063213",
+  "label": "Reviewed PR #526 head (measured before merge)",
+  "merged_tree_equivalent": {
+    "sha": "ae8962798085dbf6d717429e4b6566940f0051e1",
+    "tree_sha": "1c92c0ce2a57287cfc73e84feab46d703cb24ef3",
+    "merged_at": "2026-10-13T20:36:23Z",
+    "url": "https://github.com/ankurah/ankurah/commit/ae8962798085dbf6d717429e4b6566940f0051e1"
+  },
+  "marker": {
+    "kind": "pr",
+    "label": "#526 \u00b7 same tree as merged commit",
+    "url": "https://github.com/ankurah/ankurah/pull/526"
+  },
+  "verified_at": "2026-10-13T20:50:18.939941+00:00"
+}

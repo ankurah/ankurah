@@ -1,0 +1,67 @@
+{
+  "id": "local-backfill-37b3e6d9ac13-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankql-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankql@0.1.2",
+      "url": "https://crates.io/crates/ankql/0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core@0.1.2",
+      "url": "https://crates.io/crates/ankurah-core/0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive@0.1.2",
+      "url": "https://crates.io/crates/ankurah-derive/0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm@0.1.2",
+      "url": "https://crates.io/crates/ankurah-storage-indexeddb-wasm/0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled@0.1.2",
+      "url": "https://crates.io/crates/ankurah-storage-sled/0.1.2"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-37b3e6d9ac13-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:33:55.498190+00:00",
+  "source": {
+    "committed_at": "2025-02-02T18:22:49-08:00",
+    "label": "ankql-v0.1.2",
+    "repository": "ankurah/ankurah",
+    "sha": "37b3e6d9ac1310b654e281d43031b4604806ea01",
+    "tree_sha": "6deb9cd2a46e7cb93e1315121b9e995d34688aed"
+  },
+  "status": "unsupported"
+}

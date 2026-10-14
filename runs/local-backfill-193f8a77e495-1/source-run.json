@@ -1,0 +1,152 @@
+{
+  "id": "local-backfill-193f8a77e495-1",
+  "kind": "local",
+  "markers": [
+    {
+      "kind": "pr",
+      "label": "#253",
+      "url": "https://github.com/ankurah/ankurah/pull/253"
+    },
+    {
+      "kind": "release",
+      "label": "ankql-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankql@0.8.0",
+      "url": "https://crates.io/crates/ankql/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process@0.8.0",
+      "url": "https://crates.io/crates/ankurah-connector-local-process/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core@0.8.0",
+      "url": "https://crates.io/crates/ankurah-core/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive@0.8.0",
+      "url": "https://crates.io/crates/ankurah-derive/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto@0.8.0",
+      "url": "https://crates.io/crates/ankurah-proto/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-signals-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals@0.8.0",
+      "url": "https://crates.io/crates/ankurah-signals/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-common-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-common-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-common@0.8.0",
+      "url": "https://crates.io/crates/ankurah-storage-common/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres@0.8.0",
+      "url": "https://crates.io/crates/ankurah-storage-postgres/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled@0.8.0",
+      "url": "https://crates.io/crates/ankurah-storage-sled/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sqlite-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sqlite-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sqlite@0.8.0",
+      "url": "https://crates.io/crates/ankurah-storage-sqlite/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client@0.8.0",
+      "url": "https://crates.io/crates/ankurah-websocket-client/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.8.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server@0.8.0",
+      "url": "https://crates.io/crates/ankurah-websocket-server/0.8.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah@0.8.0",
+      "url": "https://crates.io/crates/ankurah/0.8.0"
+    }
+  ],
+  "raw_url": "backfill/runs/local-backfill-193f8a77e495-1/raw.json",
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration",
+  "recorded_at": "2026-10-13T20:34:01.381727+00:00",
+  "source": {
+    "committed_at": "2026-07-02T17:34:50-07:00",
+    "label": "ankurah@0.8.0",
+    "repository": "ankurah/ankurah",
+    "sha": "193f8a77e49540b8411da2f8724a07cbed3a765a",
+    "tree_sha": "baea31dbd3872bedc39c6d54f89703730dd5b343"
+  },
+  "status": "unsupported"
+}

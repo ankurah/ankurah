@@ -1,0 +1,6 @@
+{
+  "logs": [
+    "/Users/daniel/Documents/Codex/2026-10-02/hi-i-m-doing-my-line/work/benchmark-dashboard-2026-10-13/local-backfill/runs/local-backfill-6bad43500d25-3/metadata.log"
+  ],
+  "reason": "Offline benchmark dependency resolution failed; see metadata.log"
+}

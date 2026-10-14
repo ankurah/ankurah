@@ -1,0 +1,40 @@
+{
+  "build": [
+    "cargo",
+    "+nightly-2026-04-27",
+    "bench",
+    "--offline",
+    "--locked",
+    "--profile",
+    "release",
+    "-p",
+    "ankurah-core",
+    "--bench",
+    "event_dag",
+    "--features",
+    "bench-internals",
+    "--no-run",
+    "--message-format=json"
+  ],
+  "measure": [
+    "/Users/daniel/Documents/Codex/2026-10-02/hi-i-m-doing-my-line/work/benchmark-dashboard-2026-10-13/local-backfill/targets/61c27ee1149a/release/deps/event_dag-b71942844f5aa3e3",
+    "--bench",
+    "^(compare/|layers/)",
+    "--warm-up-time",
+    "1",
+    "--measurement-time",
+    "3",
+    "--sample-size",
+    "40",
+    "--confidence-level",
+    "0.95",
+    "--noplot"
+  ],
+  "metadata": [
+    "cargo",
+    "+nightly-2026-04-27",
+    "metadata",
+    "--offline",
+    "--format-version=1"
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "logs": [],
+  "reason": "No audited adapter: selected event_dag comparison primitive does not exist in this source; earlier algorithms need a separate workload contract, not merely benchmark registration"
+}
