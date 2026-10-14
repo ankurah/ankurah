@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "harness_id": "dag-cloned-prepare-and-lanes-v1",
+  "toolchain": "nightly-2026-04-27",
+  "profile": "release",
+  "parameters": {"warm_up_seconds": 1, "measurement_seconds": 3, "sample_size": 40, "confidence_level": 0.95},
+  "suites": [
+    {
+      "package": "ankurah-core",
+      "bench": "event_dag",
+      "features": ["bench-internals"],
+      "file": "core/benches/event_dag.rs",
+      "filter": "^(compare/|layers/)",
+      "workloads": ["compare/linear_deep/10", "compare/linear_deep/100", "compare/linear_deep/1000", "compare/diamond_chain/4", "compare/diamond_chain/16", "compare/diamond_chain/64", "compare/wide_antichain/4", "compare/wide_antichain/16", "compare/wide_antichain/64", "compare/disjoint/10", "compare/disjoint/100", "layers/diamond_chain_prepare/4", "layers/diamond_chain_prepare/16", "layers/diamond_chain_prepare/64"]
+    },
+    {
+      "package": "ankurah-tests",
+      "bench": "lane_perf",
+      "features": [],
+      "file": "tests/benches/lane_perf.rs",
+      "filter": "^(single_writer_commit/|commit_to_subscriber_latency/|bridge_catchup/(100|1000)$)",
+      "workloads": ["single_writer_commit/durable_lww_overwrite", "commit_to_subscriber_latency/server_edit_to_client_change", "bridge_catchup/100", "bridge_catchup/1000"]
+    }
+  ],
+  "sample_size_overrides": {"commit_to_subscriber_latency": 30, "bridge_catchup": 10}
+}

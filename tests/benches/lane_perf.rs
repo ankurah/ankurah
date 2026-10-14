@@ -104,13 +104,13 @@ fn bench_single_writer_commit(c: &mut Criterion) {
             rt.block_on(async move {
                 let node = durable();
                 node.system.create().await.unwrap();
-                let ctx = node.context(CTX).unwrap();
+                let ctx = node.context_async(CTX).await.unwrap();
 
                 // Seed one entity to edit repeatedly.
                 let doc = {
                     let trx = ctx.begin();
                     let doc = trx.create(&Doc { title: "seed".into(), body: "0".into() }).await.unwrap();
-                    let read = doc.read();
+                    let read = doc.read().unwrap();
                     trx.commit().await.unwrap();
                     read
                 };
@@ -119,7 +119,7 @@ fn bench_single_writer_commit(c: &mut Criterion) {
                 let start = Instant::now();
                 for i in 0..iters {
                     let trx = ctx.begin();
-                    doc.edit(&trx).unwrap().body().set(&i.to_string()).unwrap();
+                    doc.edit(&trx).unwrap().body().unwrap().set(&i.to_string()).unwrap();
                     trx.commit().await.unwrap();
                 }
                 start.elapsed()
@@ -157,14 +157,14 @@ fn bench_commit_to_subscriber_latency(c: &mut Criterion) {
                 let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
                 client.system.wait_system_ready().await.unwrap();
 
-                let server_ctx = server.context(CTX).unwrap();
-                let client_ctx = client.context(CTX).unwrap();
+                let server_ctx = server.context_async(CTX).await.unwrap();
+                let client_ctx = client.context_async(CTX).await.unwrap();
 
                 // Seed an entity the query will match.
                 let doc = {
                     let trx = server_ctx.begin();
                     let doc = trx.create(&Doc { title: "watched".into(), body: "0".into() }).await.unwrap();
-                    let read = doc.read();
+                    let read = doc.read().unwrap();
                     trx.commit().await.unwrap();
                     read
                 };
@@ -195,7 +195,7 @@ fn bench_commit_to_subscriber_latency(c: &mut Criterion) {
                     let start = Instant::now();
                     {
                         let trx = server_ctx.begin();
-                        doc.edit(&trx).unwrap().body().set(&format!("v{i}")).unwrap();
+                        doc.edit(&trx).unwrap().body().unwrap().set(&format!("v{i}")).unwrap();
                         trx.commit().await.unwrap();
                     }
                     notified.await;
@@ -255,17 +255,17 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
                         // --- Setup (excluded): server with a depth-deep chain. ---
                         let server = durable();
                         server.system.create().await.unwrap();
-                        let server_ctx = server.context(CTX).unwrap();
+                        let server_ctx = server.context_async(CTX).await.unwrap();
                         let doc = {
                             let trx = server_ctx.begin();
                             let doc = trx.create(&Doc { title: "chain".into(), body: "0".into() }).await.unwrap();
-                            let read = doc.read();
+                            let read = doc.read().unwrap();
                             trx.commit().await.unwrap();
                             read
                         };
                         for i in 0..depth {
                             let trx = server_ctx.begin();
-                            doc.edit(&trx).unwrap().body().set(&i.to_string()).unwrap();
+                            doc.edit(&trx).unwrap().body().unwrap().set(&i.to_string()).unwrap();
                             trx.commit().await.unwrap();
                         }
                         let doc_id = doc.id();
@@ -274,7 +274,7 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
                         let client = ephemeral();
                         let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
                         client.system.wait_system_ready().await.unwrap();
-                        let client_ctx = client.context(CTX).unwrap();
+                        let client_ctx = client.context_async(CTX).await.unwrap();
 
                         // --- Measured: the first fetch (StateSnapshot served). ---
                         let start = Instant::now();
@@ -338,11 +338,11 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         // soon-to-be-stale head. ---
                         let server = durable();
                         server.system.create().await.unwrap();
-                        let server_ctx = server.context(CTX).unwrap();
+                        let server_ctx = server.context_async(CTX).await.unwrap();
                         let doc = {
                             let trx = server_ctx.begin();
                             let doc = trx.create(&Doc { title: "chain".into(), body: "0".into() }).await.unwrap();
-                            let read = doc.read();
+                            let read = doc.read().unwrap();
                             trx.commit().await.unwrap();
                             read
                         };
@@ -351,7 +351,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         let client = ephemeral();
                         let conn = LocalProcessConnection::new(&client, &server).await.unwrap();
                         client.system.wait_system_ready().await.unwrap();
-                        let client_ctx = client.context(CTX).unwrap();
+                        let client_ctx = client.context_async(CTX).await.unwrap();
 
                         // First fetch: persists the entity locally at the current
                         // head (snapshot-served; apply_deltas runs before fetch
@@ -363,7 +363,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         drop(conn);
                         for i in 1..=gap {
                             let trx = server_ctx.begin();
-                            doc.edit(&trx).unwrap().body().set(&i.to_string()).unwrap();
+                            doc.edit(&trx).unwrap().body().unwrap().set(&i.to_string()).unwrap();
                             trx.commit().await.unwrap();
                         }
 
@@ -421,7 +421,7 @@ fn bench_subscription_establishment(c: &mut Criterion) {
                         // --- Setup (excluded): server with N resident entities. ---
                         let server = durable();
                         server.system.create().await.unwrap();
-                        let server_ctx = server.context(CTX).unwrap();
+                        let server_ctx = server.context_async(CTX).await.unwrap();
                         {
                             let trx = server_ctx.begin();
                             for i in 0..n {
@@ -433,7 +433,7 @@ fn bench_subscription_establishment(c: &mut Criterion) {
                         let client = ephemeral();
                         let _conn = LocalProcessConnection::new(&client, &server).await.unwrap();
                         client.system.wait_system_ready().await.unwrap();
-                        let client_ctx = client.context(CTX).unwrap();
+                        let client_ctx = client.context_async(CTX).await.unwrap();
 
                         // --- Measured: establish + initialize a broad live query. ---
                         // The predicate matches every resident entity, so the

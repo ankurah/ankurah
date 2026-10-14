@@ -1,0 +1,41 @@
+name: Reconcile benchmark coverage
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+env:
+  BENCHMARK_SERIES_GENERATION: ${{ vars.BENCHMARK_SERIES_GENERATION || '1' }}
+
+jobs:
+  discover:
+    if: github.repository == 'ankurah/ankurah' && github.ref == 'refs/heads/main' && vars.BENCHMARK_BACKFILL_ENABLED == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Discover and submit at most ten missing historical points
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LANE: ${{ vars.BENCHMARK_STABLE_ENABLED == 'true' && 'stable' || 'hosted' }}
+        run: python3 tools/benchmarks/backfill.py --kind "$LANE" --output backfill-plan.json --dispatch --limit 10
+      - name: Refresh the durable coverage catalog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run benchmark-history.yml --ref main -f catalog=true
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: benchmark-backfill-plan
+          path: backfill-plan.json
+          retention-days: 30
