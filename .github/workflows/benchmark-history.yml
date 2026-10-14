@@ -1,0 +1,147 @@
+name: Benchmark history
+run-name: 'Benchmark ${{ inputs.ref || github.sha }} (${{ inputs.lane || ''auto'' }})'
+
+# No PR trigger. The existing Benchmarks workflow is the hosted PR smoke test.
+on:
+  push:
+    branches: [main]
+    tags: ['*']
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Exact main-history SHA or release tag (empty means main)'
+        default: ''
+        type: string
+      lane:
+        description: 'Stable requires the dedicated runner to be activated'
+        default: auto
+        type: choice
+        options: [auto, hosted, stable]
+      repeat:
+        description: 'Measure again even when an identical SHA/configuration exists'
+        default: false
+        type: boolean
+      harness_ref:
+        description: 'Optional reviewed main-history SHA containing the historical DAG harness'
+        default: ''
+        type: string
+      catalog:
+        description: 'Refresh durable release/PR coverage from GitHub and crates.io'
+        default: false
+        type: boolean
+
+permissions: {}
+
+# Do not add workflow concurrency: its pending-run replacement can lose merge points.
+env:
+  BENCHMARK_SERIES_GENERATION: ${{ vars.BENCHMARK_SERIES_GENERATION || '1' }}
+  BENCHMARK_REQUEST_ID: '${{ github.run_id }}-${{ github.run_attempt }}'
+  BENCHMARK_RUN_URL: 'https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}'
+
+jobs:
+  plan:
+    if: >-
+      github.repository == 'ankurah/ankurah' &&
+      (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      control_sha: ${{ steps.plan.outputs.control_sha }}
+      toolchain: ${{ steps.plan.outputs.toolchain }}
+      lane: ${{ steps.plan.outputs.lane }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        env:
+          REQUESTED_REF: ${{ inputs.ref || github.sha }}
+          REQUESTED_LANE: ${{ inputs.lane || 'auto' }}
+          REPEAT: ${{ inputs.repeat || false }}
+          HARNESS_REF: ${{ inputs.harness_ref }}
+          CATALOG: ${{ inputs.catalog || false }}
+          STABLE_ENABLED: ${{ vars.BENCHMARK_STABLE_ENABLED }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          lane=hosted
+          if [ "$REQUESTED_LANE" = stable ] && [ "$STABLE_ENABLED" != true ]; then
+            echo 'The stable runner is not activated. See tools/benchmarks/README.md.' >&2
+            exit 1
+          fi
+          if [ "$REQUESTED_LANE" != hosted ] && [ "$STABLE_ENABLED" = true ]; then lane=stable; fi
+          args=()
+          if [ "$REPEAT" = true ]; then args+=(--repeat); fi
+          if [ -n "$HARNESS_REF" ]; then args+=(--harness-ref "$HARNESS_REF"); fi
+          if [ "$CATALOG" = true ]; then args+=(--catalog); fi
+          python3 tools/benchmarks/pipeline.py plan --ref "$REQUESTED_REF" --kind "$lane" --output request.json "${args[@]}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: benchmark-request
+          path: request.json
+          retention-days: 30
+          if-no-files-found: error
+
+  measure:
+    needs: plan
+    # The group must be restricted to this workflow on main/protected release tags.
+    # Its single ephemeral runner queues every job and holds no ambient credentials.
+    runs-on: ${{ needs.plan.outputs.lane == 'stable' && fromJSON('{"group":"ankurah-benchmarks","labels":"ankurah-benchmark"}') || 'ubuntu-24.04' }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.plan.outputs.control_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: benchmark-request
+          path: request
+      - name: Install the pinned compiler
+        env:
+          TOOLCHAIN: ${{ needs.plan.outputs.toolchain }}
+        run: rustup toolchain install "$TOOLCHAIN" --profile minimal
+      - name: Measure or record an unsupported historical source
+        env:
+          BENCHMARK_RUNNER_ID: ${{ needs.plan.outputs.lane == 'stable' && vars.BENCHMARK_RUNNER_ID || '' }}
+          BENCHMARK_HARDWARE: ${{ needs.plan.outputs.lane == 'stable' && vars.BENCHMARK_HARDWARE || '' }}
+        run: python3 tools/benchmarks/pipeline.py measure --plan request/request.json --output result.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: benchmark-result
+          path: result.json
+          retention-days: 30
+          if-no-files-found: warn
+
+  publish:
+    needs: [plan, measure]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      # Fresh hosted machine; only the trusted controller is checked out/executed.
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.plan.outputs.control_sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: benchmark-request
+          path: request
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        continue-on-error: true
+        with:
+          name: benchmark-result
+          path: result
+      - name: Validate JSON and append results with optimistic push retries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/benchmarks/pipeline.py publish --plan request/request.json --bundle result/result.json
