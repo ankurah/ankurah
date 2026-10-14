@@ -69,7 +69,7 @@ def harness_configuration(harness_ref=None):
             config["suites"][0]["workloads"] = [name.replace("diamond_chain_prepare", "diamond_chain_drain")
                                                   for name in config["suites"][0]["workloads"]]
         elif 'BenchmarkId::new("diamond_chain_prepare"' in source:
-            config["harness_id"] = "dag-cloned-prepare-v1"
+            config["harness_id"] = "dag-prepare-v1"
         else:
             raise ValueError("Historical DAG timing boundary is not recognized; an explicit adapter is required")
     if not harness_ref:
@@ -99,8 +99,8 @@ def plan(args):
                "source": {"repository": REPOSITORY, "ref": args.ref, "sha": None, "label": args.ref},
                "control_sha": control_sha, "config": config, "repeat": args.repeat, "harness_ref": harness_sha,
                "harness": {"id": config["harness_id"], "sha256": harness_hash, "workload_semantics": config.get("workload_semantics", {}), "series_generation": config.get("series_generation", "1"),
-                           "description": "Historical cloned DAG harness; end-to-end lanes excluded." if harness_sha else
-                                          "Cloned in-memory DAG comparison and layer preparation; real Sled/local transport lanes.",
+                           "description": "Historical DAG harness; end-to-end lanes excluded." if harness_sha else
+                                          "Borrowed in-memory DAG comparison and layer preparation; real Sled/local transport lanes.",
                            "source_url": f"https://github.com/{REPOSITORY}/tree/{harness_sha or control_sha}/core/benches"}}
     try:
         sha = source_sha(args.ref)
@@ -116,7 +116,7 @@ def plan(args):
                 config, harness_sha, files, harness_hash = harness_configuration(select_harness(ROOT, sha))
                 request.update(config=config, harness_ref=harness_sha)
                 request["harness"].update(id=config["harness_id"], sha256=harness_hash, workload_semantics=config.get("workload_semantics", {}), series_generation=config.get("series_generation", "1"),
-                    description="Historical cloned DAG harness; end-to-end lanes excluded.",
+                    description="Historical DAG harness; end-to-end lanes excluded.",
                     source_url=f"https://github.com/{REPOSITORY}/tree/{harness_sha}/core/benches")
         else:
             request["markers"].append({"kind": "main", "label": sha[:8], "url": f"https://github.com/{REPOSITORY}/commit/{sha}"})
