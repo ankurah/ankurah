@@ -1,0 +1,41 @@
+{
+  "id": "38605370454-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.1.3",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.1.3"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.1.5",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.1.5"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38605370454-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-02-07T18:08:13-05:00",
+    "label": "0b8ba24aa8d90afbed75edf9d7e6e878e14bd307",
+    "publication_verification": {
+      "crate": "ankurah",
+      "published_at": "2025-02-07T23:08:54.934123Z",
+      "sha": "0b8ba24aa8d90afbed75edf9d7e6e878e14bd307",
+      "tag": "ankurah-v0.1.5",
+      "url": "https://crates.io/crates/ankurah/0.1.5",
+      "vcs": {
+        "git": {
+          "sha1": "0b8ba24aa8d90afbed75edf9d7e6e878e14bd307"
+        },
+        "path_in_vcs": "ankurah"
+      },
+      "version": "0.1.5"
+    },
+    "ref": "0b8ba24aa8d90afbed75edf9d7e6e878e14bd307",
+    "repository": "ankurah/ankurah",
+    "sha": "0b8ba24aa8d90afbed75edf9d7e6e878e14bd307"
+  },
+  "status": "unsupported"
+}
