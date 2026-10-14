@@ -1,0 +1,36 @@
+{
+  "id": "38560535911-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.1.2"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38560535911-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-02-02T18:44:20-08:00",
+    "label": "9c972e8e4d923a0694830e528cb26aecb6afdde6",
+    "publication_verification": {
+      "crate": "ankurah-storage-postgres",
+      "published_at": "2025-02-03T02:44:35.227227Z",
+      "sha": "9c972e8e4d923a0694830e528cb26aecb6afdde6",
+      "tag": "ankurah-storage-postgres-v0.1.2",
+      "url": "https://crates.io/crates/ankurah-storage-postgres/0.1.2",
+      "vcs": {
+        "git": {
+          "sha1": "9c972e8e4d923a0694830e528cb26aecb6afdde6"
+        },
+        "path_in_vcs": "storage/postgres"
+      },
+      "version": "0.1.2"
+    },
+    "ref": "9c972e8e4d923a0694830e528cb26aecb6afdde6",
+    "repository": "ankurah/ankurah",
+    "sha": "9c972e8e4d923a0694830e528cb26aecb6afdde6"
+  },
+  "status": "unsupported"
+}
