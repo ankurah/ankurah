@@ -1,0 +1,56 @@
+{
+  "id": "38560531319-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankql-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.1.2"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.1.2",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.1.2"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38560531319-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-02-02T18:22:49-08:00",
+    "label": "37b3e6d9ac1310b654e281d43031b4604806ea01",
+    "publication_verification": {
+      "crate": "ankql",
+      "published_at": "2025-02-03T02:23:01.147656Z",
+      "sha": "37b3e6d9ac1310b654e281d43031b4604806ea01",
+      "tag": "ankql-v0.1.2",
+      "url": "https://crates.io/crates/ankql/0.1.2",
+      "vcs": {
+        "git": {
+          "sha1": "37b3e6d9ac1310b654e281d43031b4604806ea01"
+        },
+        "path_in_vcs": "ankql"
+      },
+      "version": "0.1.2"
+    },
+    "ref": "37b3e6d9ac1310b654e281d43031b4604806ea01",
+    "repository": "ankurah/ankurah",
+    "sha": "37b3e6d9ac1310b654e281d43031b4604806ea01"
+  },
+  "status": "unsupported"
+}
