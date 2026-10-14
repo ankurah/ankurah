@@ -38818,7 +38818,7 @@
     },
     {
       "harness_ref": null,
-      "harness_sha256": "7ea4105dedd11a436eea3b8cb2303bf1aab1da308a1536604da9974f6e0f5327",
+      "harness_sha256": "55dfb93d8e393c282a420bc55118c79b192ef34491c9084f0638f7a2b54286eb",
       "kind": "hosted",
       "markers": [
         {
@@ -38837,7 +38837,7 @@
     },
     {
       "harness_ref": null,
-      "harness_sha256": "7ea4105dedd11a436eea3b8cb2303bf1aab1da308a1536604da9974f6e0f5327",
+      "harness_sha256": "55dfb93d8e393c282a420bc55118c79b192ef34491c9084f0638f7a2b54286eb",
       "kind": "hosted",
       "markers": [
         {
@@ -38846,17 +38846,33 @@
           "url": "https://github.com/ankurah/ankurah/pull/527"
         }
       ],
-      "run_ids": [
-        "38490669379-1",
-        "38520871438-1",
-        "38605400188-1",
-        "38635123358-1"
-      ],
       "source": {
         "committed_at": "2026-10-13T17:31:27-07:00",
         "label": "PR #527",
         "repository": "ankurah/ankurah",
         "sha": "ad6eecd0c68fcac1397392312db33003f407bf5b"
+      },
+      "status": "pending"
+    },
+    {
+      "harness_ref": null,
+      "harness_sha256": "55dfb93d8e393c282a420bc55118c79b192ef34491c9084f0638f7a2b54286eb",
+      "kind": "hosted",
+      "markers": [
+        {
+          "kind": "pr",
+          "label": "#528",
+          "url": "https://github.com/ankurah/ankurah/pull/528"
+        }
+      ],
+      "run_ids": [
+        "38640625295-1"
+      ],
+      "source": {
+        "committed_at": "2026-10-14T14:29:04-07:00",
+        "label": "PR #528",
+        "repository": "ankurah/ankurah",
+        "sha": "b5fcfd3eac3ea4247c4bd7613c439393beb42aad"
       },
       "status": "measured"
     }
