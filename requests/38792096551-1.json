@@ -1,0 +1,87 @@
+{
+  "id": "38792096551-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "e1f697d7",
+      "url": "https://github.com/ankurah/ankurah/commit/e1f697d77f10fc231f1d799d54c763624f95e8a7"
+    },
+    {
+      "kind": "release",
+      "label": "ankql-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-react-signals-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-react-signals-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.4.7"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.4.7",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.4.7"
+    },
+    {
+      "kind": "pr",
+      "label": "#111",
+      "url": "https://github.com/ankurah/ankurah/pull/111"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38792096551-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-05-26T19:03:01-07:00",
+    "label": "e1f697d77f10fc231f1d799d54c763624f95e8a7",
+    "ref": "e1f697d77f10fc231f1d799d54c763624f95e8a7",
+    "repository": "ankurah/ankurah",
+    "sha": "e1f697d77f10fc231f1d799d54c763624f95e8a7"
+  },
+  "status": "unsupported"
+}
