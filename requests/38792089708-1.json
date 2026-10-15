@@ -1,0 +1,91 @@
+{
+  "id": "38792089708-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankql-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-react-signals-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-react-signals-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.4.6"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.4.6",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.4.6"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38792089708-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-05-26T16:11:20-07:00",
+    "label": "3959930863590ad7914267fc4f78201dc7e272ea",
+    "publication_verification": {
+      "crate": "ankql",
+      "published_at": "2025-05-26T23:11:29.493024Z",
+      "sha": "3959930863590ad7914267fc4f78201dc7e272ea",
+      "tag": "ankql-v0.4.6",
+      "url": "https://crates.io/crates/ankql/0.4.6",
+      "vcs": {
+        "git": {
+          "sha1": "3959930863590ad7914267fc4f78201dc7e272ea"
+        },
+        "path_in_vcs": "ankql"
+      },
+      "version": "0.4.6"
+    },
+    "ref": "3959930863590ad7914267fc4f78201dc7e272ea",
+    "repository": "ankurah/ankurah",
+    "sha": "3959930863590ad7914267fc4f78201dc7e272ea"
+  },
+  "status": "unsupported"
+}
