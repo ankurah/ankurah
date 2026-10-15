@@ -1,0 +1,67 @@
+{
+  "id": "38816949480-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "4271e3d8",
+      "url": "https://github.com/ankurah/ankurah/commit/4271e3d899324efec8d62a9a252d65161a740c4d"
+    },
+    {
+      "kind": "release",
+      "label": "ankql-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-signals-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.5.4"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.5.4",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.5.4"
+    },
+    {
+      "kind": "pr",
+      "label": "#129",
+      "url": "https://github.com/ankurah/ankurah/pull/129"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38816949480-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-08-06T10:54:03-07:00",
+    "label": "4271e3d899324efec8d62a9a252d65161a740c4d",
+    "ref": "4271e3d899324efec8d62a9a252d65161a740c4d",
+    "repository": "ankurah/ankurah",
+    "sha": "4271e3d899324efec8d62a9a252d65161a740c4d"
+  },
+  "status": "unsupported"
+}
