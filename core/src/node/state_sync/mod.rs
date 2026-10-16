@@ -7,7 +7,7 @@ mod incoming;
 mod server;
 mod tree;
 
-pub(crate) use client::{abandon_current_state, finish_state, receive_state, request_state};
+pub(crate) use client::{abandon_current_state, finish_state, receive_state, request_state, RefreshHandle};
 pub(crate) use incoming::{Inbox, IncomingStates, IncomingStream};
 pub(crate) use server::expire_comparison;
 #[cfg(test)]

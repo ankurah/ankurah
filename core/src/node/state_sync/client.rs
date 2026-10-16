@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use ankurah_digest_tree::{leaf_address, CanonicalCodec};
 use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrameBody, StateItem};
@@ -18,17 +15,14 @@ use crate::{
     storage::StorageEngine,
 };
 
+mod driver;
+mod projection;
+pub(crate) use driver::RefreshHandle;
+
 pub(crate) struct RemoteState {
     pub comparison: proto::ComparisonId,
     pub ids: Vec<proto::EntityId>,
-    pub processed_through: u64,
-    pub stream: IncomingStream,
-    feedback: Arc<Feedback>,
-}
-
-struct Assembly {
-    target: proto::Clock,
-    bytes: Vec<u8>,
+    driver: driver::Driver,
 }
 
 /// Install the origin before sending: a pushed continuation may beat metadata.
@@ -77,7 +71,7 @@ pub(crate) async fn receive_state<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     credentials: &Vec<PA::ContextData>,
-    mut snapshot: Snapshot,
+    snapshot: Snapshot,
     initial: proto::StateReply,
     catalog: bool,
     query: Option<(proto::QueryId, u32)>,
@@ -87,138 +81,35 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let id = initial.frame.comparison;
+    let comparison = initial.frame.comparison;
     let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
-    stream.bind(id, catalog, connection.outgoing_comparisons.clone());
+    stream.bind(comparison, catalog, connection.outgoing_comparisons.clone());
     drop(connection);
+    if initial.spec != snapshot.spec || initial.frame.sequence != 0 {
+        return Err(RetrievalError::Other("invalid initial comparison metadata".into()));
+    }
+    stream.inbox.insert(initial.frame)?;
+    let mut driver = driver::Driver::new(snapshot, initial.round, stream, comparison)?;
     let result = async {
-        ensure!(initial.spec == snapshot.spec, "peer changed the comparison spec");
-        ensure!(initial.frame.sequence == 0, "initial response did not carry frame zero");
-        stream.inbox.insert(initial.frame)?;
-        let feedback = Arc::new(Feedback::default());
-        let mut members = snapshot.members();
-        let mut assemblies: HashMap<proto::EntityId, Assembly> = HashMap::new();
-        let mut required: HashMap<proto::EntityId, proto::Clock> = HashMap::new();
-        let mut repair_attempts: HashMap<proto::EntityId, u8> = HashMap::new();
-        let mut assembly_bytes = 0usize;
-        let event_getter = CachedEventGetter::new(node, credentials);
-        let state_getter = LocalStateGetter::new(node.storage.clone());
-        let mut complete = false;
-        loop {
-            if let Some((query, version)) = query {
-                ensure!(node.live_queries.get(query).is_some_and(|query| query.is_current(version)), "query comparison superseded");
-            }
-            let frame = stream.inbox.next(false).await?;
-            let (items, progress) = match frame.body {
-                StateFrameBody::State { items, progress } => (items, progress),
-                StateFrameBody::RestartRequired => return Err(RequestError::ConnectionLost.into()),
-                _ => bail!("initial stream sent live data before activation"),
-            };
-            ensure!(frame.comparison == id && items.len() <= 128, "invalid comparison reply");
-            let mut answers = Vec::new();
-            let mut deltas = Vec::new();
-            let mut targets = Vec::new();
-            for item in items {
-                match item {
-                    StateItem::Summary(head) => {
-                        let _: proto::TreeHead = proto::TreeHead::from_bytes(&head.to_bytes())?;
-                        answers.push(StateAnswer::Summary(snapshot.head(head.bounds).await?));
-                    }
-                    StateItem::NeedLeaves(bounds) => answers.push(StateAnswer::Leaves(snapshot.page(bounds)?)),
-                    StateItem::Leaves(page) => replace_members(&mut members, &snapshot.spec, page, super::LEAF_PAGE)?,
-                    StateItem::Snapshots(page) => {
-                        // Membership comes from the captured sender state,
-                        // before the applier can merge a newer local state.
-                        let leaves = snapshot_leaves(&snapshot.spec, &page)?;
-                        replace_members(&mut members, &snapshot.spec, leaves, super::MAX_SNAPSHOT_ROWS)?;
-                        for state in page.states {
-                            let entity_id = state.payload.entity_id;
-                            ensure!(!assemblies.contains_key(&entity_id), "snapshot interrupted repair chunks");
-                            targets.push((entity_id, state.payload.state.head.clone()));
-                            deltas.push(proto::EntityDelta {
-                                entity_id,
-                                content: proto::DeltaContent::StateSnapshot { state: state.into() },
-                            });
-                        }
-                    }
-                    StateItem::Repair { target, delta } => {
-                        ensure!(!assemblies.contains_key(&delta.entity_id), "repair interrupted its chunks");
-                        check_target(&target, &delta.content)?;
-                        targets.push((delta.entity_id, target));
-                        deltas.push(delta);
-                    }
-                    StateItem::RepairChunk { target, chunk } => {
-                        ensure!(!chunk.bytes.is_empty(), "empty repair chunk");
-                        ensure!(
-                            assemblies.contains_key(&chunk.entity_id) || assemblies.len() < super::MAX_INFLIGHT_FRAMES,
-                            "too many partial repairs"
-                        );
-                        let assembly =
-                            assemblies.entry(chunk.entity_id).or_insert_with(|| Assembly { target: target.clone(), bytes: Vec::new() });
-                        ensure!(assembly.target == target && chunk.offset == assembly.bytes.len() as u64, "invalid repair chunk sequence");
-                        assembly_bytes =
-                            assembly_bytes.checked_add(chunk.bytes.len()).ok_or_else(|| anyhow::anyhow!("repair size overflow"))?;
-                        ensure!(assembly_bytes <= super::MAX_REPAIR_BYTES, "repair assembly exceeds limit");
-                        assembly.bytes.extend_from_slice(&chunk.bytes);
-                        if chunk.last {
-                            let assembly = assemblies.remove(&chunk.entity_id).unwrap();
-                            let content = decode_delta(&assembly.bytes)?;
-                            check_target(&assembly.target, &content)?;
-                            assembly_bytes -= assembly.bytes.len();
-                            targets.push((chunk.entity_id, assembly.target));
-                            deltas.push(proto::EntityDelta { entity_id: chunk.entity_id, content });
-                        }
-                    }
-                    StateItem::RepairUnavailable { entity_id, .. } => bail!("peer cannot repair required state for {entity_id}"),
-                }
-            }
-            for (entity_id, target) in &targets {
-                ensure!(required.get(entity_id).is_none_or(|pending| pending == target), "repair changed its pending target");
-            }
-            let applied = NodeApplier::apply_deltas(node, &peer, deltas, &event_getter, &state_getter).await?;
-            for (entity_id, target) in targets {
-                ensure!(required.get(&entity_id).is_none_or(|pending| *pending == target), "repair changed its pending target");
-                let actual = match applied.observed_head(&entity_id).or_else(|| node.entities.get(&entity_id).map(|entity| entity.head())) {
-                    Some(head) => head,
-                    None => node.storage.get_state(entity_id).await?.payload.state.head,
-                };
-                let covered = !applied.diverged(&entity_id) && covers_target(node, &actual, &target).await?;
-                if covered {
-                    required.remove(&entity_id);
-                    repair_attempts.remove(&entity_id);
-                } else {
-                    ensure!(
-                        required.contains_key(&entity_id) || required.len() < super::MAX_INFLIGHT_FRAMES * 128,
-                        "too many pending repair targets"
-                    );
-                    let attempts = repair_attempts.entry(entity_id).or_default();
-                    ensure!(*attempts < 2, "connecting history failed to cover target");
-                    *attempts += 1;
-                    required.insert(entity_id, target.clone());
-                    answers.push(StateAnswer::NeedRepair { entity_id, target });
-                }
-            }
-            complete |= progress == ComparisonProgress::Complete;
-            if complete && answers.is_empty() && required.is_empty() && assemblies.is_empty() {
-                return Ok((members.into_values().collect(), frame.sequence, feedback));
-            }
-            feedback.queue(node, peer, credentials, id, frame.sequence, answers, &stream.inbox)?;
-        }
+        driver.prepare(node, query).await?;
+        driver.drive(node, peer, credentials, query, true).await
     }
     .await;
-    if result.is_err() {
-        let _ = abandon_current_state(node, peer, id, credentials, &stream).await;
+    if let Err(error) = result {
+        let _ = abandon_current_state(node, peer, comparison, credentials, &driver.stream).await;
+        return Err(stream_error(error));
     }
-    let (ids, processed_through, feedback) = result.map_err(|error: anyhow::Error| {
-        if let Some(error) = error.downcast_ref::<RetrievalError>() {
-            return error.clone();
-        }
-        if let Some(error) = error.downcast_ref::<RequestError>() {
-            return error.clone().into();
-        }
-        error.into()
-    })?;
-    Ok(RemoteState { comparison: id, ids, processed_through, stream, feedback })
+    Ok(RemoteState { comparison, ids: driver.ids(), driver })
+}
+
+fn stream_error(error: anyhow::Error) -> RetrievalError {
+    if let Some(error) = error.downcast_ref::<RetrievalError>() {
+        return error.clone();
+    }
+    if let Some(error) = error.downcast_ref::<RequestError>() {
+        return error.clone().into();
+    }
+    error.into()
 }
 
 async fn covers_target<SE, PA>(node: &Node<SE, PA>, actual: &proto::Clock, target: &proto::Clock) -> anyhow::Result<bool>
@@ -236,7 +127,7 @@ where
     ))
 }
 
-/// Readiness follows local activation, not the acknowledgment's round trip.
+/// The same owner continues receiving while the round acknowledgment is in flight.
 pub(crate) fn finish_state<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
@@ -249,97 +140,31 @@ pub(crate) fn finish_state<SE, PA>(
 {
     let weak = node.weak();
     crate::task::spawn(async move {
-        let comparison = remote.comparison;
-        let result: anyhow::Result<()> = async {
-            let applied = async {
-                let Some(node) = weak.upgrade() else { return Ok::<_, anyhow::Error>(()) };
-                close_comparison(
-                    &node,
-                    peer,
-                    comparison,
-                    &credentials,
-                    proto::ComparisonOutcome::Applied { processed_through: remote.processed_through },
-                )
-                .await?;
-                Ok(())
-            }
-            .fuse();
-            if query.is_none() {
-                return applied.await;
-            }
-            let live = async {
-                let Some((query_id, version)) = query else { return Ok(()) };
-                let mut assembly: Option<(proto::EntityId, Vec<(proto::QueryId, proto::MembershipChange)>, Vec<u8>)> = None;
-                loop {
-                    let frame = remote.stream.inbox.next(assembly.is_none()).await?;
-                    let Some(node) = weak.upgrade() else { return Ok(()) };
-                    ensure!(node.live_queries.get(query_id).is_some_and(|query| query.is_current(version)), "live state stream superseded");
-                    let items = match frame.body {
-                        StateFrameBody::Live(items) => {
-                            ensure!(assembly.is_none(), "live update interrupted chunks");
-                            ensure!(items.len() <= 128, "live frame item limit exceeded");
-                            items
-                        }
-                        StateFrameBody::LiveChunk { chunk, predicate_relevance } => {
-                            ensure!(!chunk.bytes.is_empty(), "empty live chunk");
-                            ensure!(
-                                predicate_relevance.len() <= 128 && predicate_relevance.iter().all(|(id, _)| *id == query_id),
-                                "invalid live chunk relevance"
-                            );
-                            let (id, relevance, bytes) =
-                                assembly.get_or_insert_with(|| (chunk.entity_id, predicate_relevance.clone(), Vec::new()));
-                            ensure!(
-                                *id == chunk.entity_id && *relevance == predicate_relevance && chunk.offset == bytes.len() as u64,
-                                "invalid live chunk sequence"
-                            );
-                            ensure!(bytes.len() + chunk.bytes.len() <= super::MAX_REPAIR_BYTES, "live assembly exceeds limit");
-                            bytes.extend_from_slice(&chunk.bytes);
-                            if chunk.last {
-                                let (entity_id, predicate_relevance, bytes) = assembly.take().unwrap();
-                                vec![proto::SubscriptionUpdateItem {
-                                    delta: proto::EntityDelta { entity_id, content: decode_delta(&bytes)? },
-                                    predicate_relevance,
-                                }]
-                            } else {
-                                Vec::new()
-                            }
-                        }
-                        _ => bail!("live state stream requires restart"),
-                    };
-                    ensure!(
-                        items
-                            .iter()
-                            .all(|item| item.predicate_relevance.len() <= 128
-                                && item.predicate_relevance.iter().all(|(id, _)| *id == query_id)),
-                        "live frame names another query"
-                    );
-                    if !items.is_empty() {
-                        NodeApplier::apply_stream_updates(&node, &peer, &credentials, items).await?;
-                    }
-                    remote.feedback.queue(&node, peer, &credentials, comparison, frame.sequence, Vec::new(), &remote.stream.inbox)?;
-                }
-            }
-            .fuse();
-            futures::pin_mut!(applied, live);
-            futures::select! {
-                result = applied => { result?; live.await },
-                result = live => result,
+        let mut driver = remote.driver;
+        let Some(node) = weak.upgrade() else { return };
+        driver.acknowledge_round(&node, peer, &credentials);
+        if let Some((id, version)) = query {
+            if let Some(query) = node.live_queries.get(id) {
+                query.set_refresh(version, &driver.stream.request, driver.refresh_handle());
             }
         }
-        .await;
+        let result =
+            if query.is_some() { driver.drive(&node, peer, &credentials, query, false).await } else { driver.finish_fetch().await };
         if let Err(error) = result {
             tracing::warn!(%error, "state stream failed");
-            if let Some(node) = weak.upgrade() {
-                if !owns_state_stream(&node, peer, &remote.stream) {
-                    return;
-                }
-                if let Some((query, version)) = query {
-                    if let Some(relay) = &node.subscription_relay {
-                        relay.stream_failed(peer, query, version, &remote.stream.request);
+            if !owns_state_stream(&node, peer, &driver.stream) {
+                return;
+            }
+            if let Some((id, version)) = query {
+                if let Some(relay) = &node.subscription_relay {
+                    if driver.terminal {
+                        relay.stream_terminal(peer, id, version, &driver.stream.request, stream_error(error));
+                    } else {
+                        relay.stream_failed(peer, id, version, &driver.stream.request);
                     }
                 }
-                let _ = abandon_current_state(&node, peer, comparison, &credentials, &remote.stream).await;
             }
+            let _ = abandon_current_state(&node, peer, remote.comparison, &credentials, &driver.stream).await;
         }
     });
 }

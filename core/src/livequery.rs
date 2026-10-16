@@ -132,6 +132,23 @@ impl EntityLiveQuery {
             .await;
         Ok(())
     }
+    /// Recompare this query on its current standing stream. Completion covers the
+    /// captured source round; later live publications do not move that goal.
+    pub async fn refresh(&self) -> Result<(), RetrievalError> {
+        self.0.refresh_handle().ok_or_else(|| RetrievalError::Other("query has no active remote stream".into()))?.refresh().await
+    }
+    pub(crate) fn set_remote_candidates(
+        &self,
+        version: u32,
+        origin: &proto::RequestId,
+        ids: impl IntoIterator<Item = proto::EntityId>,
+    ) -> bool {
+        self.0.set_candidates(version, origin, ids)
+    }
+    pub(crate) fn set_refresh(&self, version: u32, origin: &proto::RequestId, refresh: crate::node::state_sync::RefreshHandle) {
+        self.0.set_refresh(version, origin, refresh);
+    }
+    pub(crate) fn resolved_selection(&self) -> Option<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.value() }
     pub(crate) fn digest_tree(&self) -> Arc<crate::node::state_sync::QueryTree> { self.0.tree.clone() }
     pub(crate) async fn activate_remote(
         &self,
@@ -140,7 +157,16 @@ impl EntityLiveQuery {
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<bool, RetrievalError> {
-        self.0.activate_remote(version, entities, origin, canceled).await
+        self.0.install_remote(version, entities, origin, canceled, true).await
+    }
+    pub(crate) async fn install_remote_partial(
+        &self,
+        version: u32,
+        entities: Vec<Entity>,
+        origin: &proto::RequestId,
+        canceled: &(dyn Fn() -> bool + Send + Sync),
+    ) -> Result<bool, RetrievalError> {
+        self.0.install_remote(version, entities, origin, canceled, false).await
     }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
     /// The latest installed selection and version; `None` until initial resolution.

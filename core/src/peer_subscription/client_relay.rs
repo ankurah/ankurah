@@ -422,6 +422,29 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         self.setup_remote_subscriptions();
     }
 
+    pub(crate) fn stream_terminal(
+        &self,
+        peer: proto::EntityId,
+        query: proto::QueryId,
+        version: u32,
+        origin: &proto::RequestId,
+        error: RetrievalError,
+    ) {
+        let subscriber = {
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|error| error.into_inner());
+            let Some(info) = subscriptions.get_mut(&query) else { return };
+            if info.content.version != version || info.stream_origin.as_ref() != Some(origin) || info.assigned_peer != Some(peer) {
+                return;
+            }
+            info.cancel.cancel();
+            info.status = Status::Failed;
+            info.stream_origin = None;
+            info.livequery.clone()
+        };
+        subscriber.subscription_lost(version, origin);
+        subscriber.set_last_error(version, error);
+    }
+
     /// Whether a query is established with, or being sent to, this peer.
     pub(crate) fn has_subscription_with_peer(&self, peer_id: &proto::EntityId) -> bool {
         self.inner
@@ -706,28 +729,7 @@ where
             stream,
         )
         .await?;
-        let activated: Result<bool, RetrievalError> = async {
-            let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-            let event_getter = crate::retrieval::LocalEventGetter::new(node.storage.clone(), node.durable);
-            let mut entities = Vec::with_capacity(remote.ids.len());
-            for id in &remote.ids {
-                entities.push(
-                    node.entities.get_or_retrieve(&state_getter, &event_getter, id).await?.ok_or(RetrievalError::EntityNotFound(*id))?,
-                );
-            }
-            match node.live_queries.get(query_id) {
-                Some(query) => query.activate_remote(version, entities, &remote.stream.request, canceled.as_ref()).await,
-                None => Ok(false),
-            }
-        }
-        .await;
-        if matches!(activated, Ok(true)) {
-            state_sync::finish_state(&node, peer_id, context_data, remote, Some((query_id, version)));
-        } else {
-            let _ = state_sync::abandon_current_state(&node, peer_id, remote.comparison, &context_data, &remote.stream).await;
-            activated?;
-            return Err(RequestError::ConnectionLost.into());
-        }
+        state_sync::finish_state(&node, peer_id, context_data, remote, Some((query_id, version)));
 
         Ok(())
     }

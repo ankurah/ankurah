@@ -172,7 +172,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         source: Arc<dyn LocalEntitySource<E>>,
     ) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.queries.contains_key(&query_id) {
+        if let Some(query) = state.queries.get_mut(&query_id) {
+            query.source = source;
+            query.gap_fetcher = gap_fetcher;
             return false;
         }
         state.queries.insert(query_id, QueryState { selection: None, gap_fetcher, source, paused: false, resultset, version: 0 });
@@ -239,7 +241,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             let before: IndexMap<_, _> = rw_resultset.iter_entities().map(|(id, entity)| (id, entity.clone())).collect();
             let included = included_entities
                 .into_iter()
-                .filter(|entity| query_state.source.can_read(entity) && evaluate_predicate(entity, &selection.predicate).unwrap_or(false))
+                .filter(|entity| {
+                    query_state.source.can_read(entity)
+                        && query_state.source.admits_query_entity(entity)
+                        && evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
+                })
                 .collect();
             // Replace as a set before applying its order/limit. Adding to the
             // old limited set first could evict an authoritative new member.
@@ -263,7 +269,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             rw_resultset.mark_all_dirty();
 
             for entity in included_entities {
-                if evaluate_predicate(&entity, &selection.predicate).unwrap_or(false) && query_state.source.can_read(&entity) {
+                if evaluate_predicate(&entity, &selection.predicate).unwrap_or(false)
+                    && query_state.source.can_read(&entity)
+                    && query_state.source.admits_query_entity(&entity)
+                {
                     let entity_id = AbstractEntity::id(&entity);
 
                     if !rw_resultset.contains(&entity_id) {
@@ -277,7 +286,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
             rw_resultset.retain_dirty(|entity| {
                 let can_read = query_state.source.can_read(entity);
-                if can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false) {
+                if can_read
+                    && query_state.source.admits_query_entity(entity)
+                    && evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
+                {
                     return true;
                 };
                 let entity_id = entity.id();
@@ -378,7 +390,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 debug!("Subscription {} evaluating entity {} for query {}", self.id(), entity_id, query_id);
 
                 let can_read = query_state.source.can_read(entity);
-                let matches = can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
+                let matches = can_read
+                    && query_state.source.admits_query_entity(entity)
+                    && evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
                 let did_match = query_state.resultset.contains_key(&entity_id);
                 if membership_only && matches == did_match {
                     continue;
@@ -482,7 +496,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         resultset.clear_gap_dirty();
 
         // Process gap fill
-        let gap_filled_entities = Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
+        let gap_filled_entities = self.process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
 
         // Register entity watchers and append entities
         if !gap_filled_entities.is_empty() {
@@ -507,7 +521,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         resultset.clear_gap_dirty();
 
         // Process gap fill
-        let gap_filled_entities = Self::process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
+        let gap_filled_entities = self.process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
 
         // Register entity watchers and push items for gap-filled entities
         if !gap_filled_entities.is_empty() {
@@ -519,7 +533,20 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         }
     }
 
+    // A local gap request may finish after a peer installs its candidate window.
+    // Recheck the current source rather than the one that started that request.
+    fn admits_gap_entity(&self, query_id: proto::QueryId, selection: &ankql::ast::Selection<Resolved>, entity: &E) -> bool {
+        let state = self.state.lock().unwrap();
+        state.queries.get(&query_id).is_some_and(|query| {
+            query.selection.as_ref() == Some(selection)
+                && query.source.can_read(entity)
+                && query.source.admits_query_entity(entity)
+                && evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
+        })
+    }
+
     async fn process_gap_fill_entities(
+        &self,
         query_id: proto::QueryId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
         selection: ankql::ast::Selection<Resolved>,
@@ -534,6 +561,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 if !gap_entities.is_empty() {
                     tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
 
+                    let gap_entities: Vec<_> =
+                        gap_entities.into_iter().filter(|entity| self.admits_gap_entity(query_id, &selection, entity)).collect();
                     let mut write = resultset.write();
                     let mut added_entities = Vec::new();
 
@@ -571,7 +600,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Process all gap fills concurrently
         let gap_fill_futures = gaps_to_fill.into_iter().map(|(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)| {
-            Self::process_gap_fill(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)
+            self.process_gap_fill(query_id, gap_fetcher, selection, resultset, last_entity, gap_size)
         });
 
         let gap_results: Vec<(ankurah_proto::QueryId, Vec<ReactorUpdateItem<E, Ev>>)> = future::join_all(gap_fill_futures).await;
@@ -617,6 +646,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 
     async fn process_gap_fill(
+        &self,
         query_id: proto::QueryId,
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<E>>,
         selection: ankql::ast::Selection<Resolved>,
@@ -631,6 +661,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 if !gap_entities.is_empty() {
                     tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
 
+                    let gap_entities: Vec<_> =
+                        gap_entities.into_iter().filter(|entity| self.admits_gap_entity(query_id, &selection, entity)).collect();
                     let mut write = resultset.write();
                     let mut gap_items = Vec::new();
 

@@ -48,6 +48,9 @@ pub trait LocalEntitySource<E: AbstractEntity + Filterable + Send + 'static = En
     /// Recheck an entity before publishing it, including changes arriving after the initial fetch.
     fn can_read(&self, _entity: &E) -> bool { true }
 
+    /// Membership authority is separate from readability: a readable removal still notifies.
+    fn admits_query_entity(&self, _entity: &E) -> bool { true }
+
     async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<E>, RetrievalError>;
 }
 
@@ -64,6 +67,8 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
 /// Hook trait for performing actions before notification is sent
 pub trait PreNotifyHook {
     fn is_current(&self, _version: u32) -> bool { true }
+    /// Partial peer updates may publish membership before initialization finishes.
+    fn marks_loaded(&self) -> bool { true }
     fn pre_notify(&self, version: u32);
 }
 
@@ -348,7 +353,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             return Ok(());
         }
 
-        resultset.set_loaded(true);
+        if pre_notify_hook.marks_loaded() {
+            resultset.set_loaded(true);
+        }
         pre_notify_hook.pre_notify(version);
         #[cfg(test)]
         self.pause_publication_if_requested(&selection).await;

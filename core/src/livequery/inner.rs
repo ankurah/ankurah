@@ -47,6 +47,9 @@ struct RemoteStream {
     version: u32,
     origin: proto::RequestId,
     activated: bool,
+    installed: bool,
+    candidates: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
+    refresh: Option<crate::node::state_sync::RefreshHandle>,
 }
 
 impl LiveQueryInner {
@@ -154,11 +157,36 @@ impl LiveQueryInner {
                 results.set_loaded(false);
             }
             self.durable_version.store(version.saturating_sub(1), Ordering::Release);
-            *stream = Some(RemoteStream { version, origin, activated: false });
+            *stream = Some(RemoteStream {
+                version,
+                origin,
+                activated: false,
+                installed: false,
+                candidates: Arc::new(std::sync::RwLock::new(results.iter_entities().map(|(id, _)| id).collect())),
+                refresh: None,
+            });
         }
         drop(stream);
         drop(state);
         drop(results);
+    }
+
+    pub(super) fn set_candidates(&self, version: u32, origin: &proto::RequestId, ids: impl IntoIterator<Item = proto::EntityId>) -> bool {
+        let stream = self.remote_stream.lock().unwrap();
+        let Some(stream) = stream.as_ref().filter(|stream| stream.version == version && &stream.origin == origin) else { return false };
+        *stream.candidates.write().unwrap() = ids.into_iter().collect();
+        true
+    }
+
+    pub(super) fn set_refresh(&self, version: u32, origin: &proto::RequestId, refresh: crate::node::state_sync::RefreshHandle) {
+        let mut stream = self.remote_stream.lock().unwrap();
+        if let Some(stream) = stream.as_mut().filter(|stream| stream.version == version && &stream.origin == origin) {
+            stream.refresh = Some(refresh);
+        }
+    }
+
+    pub(super) fn refresh_handle(&self) -> Option<crate::node::state_sync::RefreshHandle> {
+        self.remote_stream.lock().unwrap().as_ref().filter(|stream| stream.activated).and_then(|stream| stream.refresh.clone())
     }
 
     pub(super) fn remote_stream_pending(&self, version: u32) -> bool {
@@ -252,17 +280,25 @@ impl LiveQueryInner {
         Ok(())
     }
 
-    pub(super) async fn activate_remote(
+    pub(super) async fn install_remote(
         &self,
         version: u32,
         entities: Vec<Entity>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
+        complete: bool,
     ) -> Result<bool, RetrievalError> {
         let Some((selection, stored_version)) = self.selection.value() else { return Ok(false) };
         if version != stored_version || canceled() || !self.remote_stream_current(version, origin) {
             return Ok(false);
         }
+        let source = {
+            let stream = self.remote_stream.lock().unwrap();
+            let Some(stream) = stream.as_ref().filter(|stream| stream.version == version && &stream.origin == origin) else {
+                return Ok(false);
+            };
+            Arc::new(PeerQuerySource { context: self.context.clone(), candidates: stream.candidates.clone() })
+        };
         self.context
             .node()?
             .reactor()
@@ -270,11 +306,11 @@ impl LiveQueryInner {
                 self.subscription.id(),
                 self.query_id,
                 selection,
-                self.context.clone(),
+                source.clone(),
                 self.resultset.clone(),
-                self.gap_fetcher.clone(),
+                source,
                 version,
-                RemoteActivation { query: self, origin, canceled },
+                RemoteActivation { query: self, origin, canceled, complete },
                 entities,
             )
             .await?;
@@ -303,20 +339,55 @@ impl LiveQueryInner {
     }
 }
 
+/// The source owns the remote candidate window. Local merge/policy evaluation
+/// may remove candidates, but a local cache scan cannot invent a source winner.
+struct PeerQuerySource {
+    context: Arc<dyn DynContextInner>,
+    candidates: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
+}
+#[async_trait::async_trait]
+impl crate::reactor::LocalEntitySource for PeerQuerySource {
+    fn can_read(&self, entity: &Entity) -> bool { self.context.can_read(entity) }
+    fn admits_query_entity(&self, entity: &Entity) -> bool { self.candidates.read().unwrap().contains(&entity.id()) }
+    async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
+        Ok(self.context.fetch_entities_from_local(selection).await?.into_iter().filter(|entity| self.admits_query_entity(entity)).collect())
+    }
+}
+#[async_trait::async_trait]
+impl GapFetcher<Entity> for PeerQuerySource {
+    async fn fetch_gap(
+        &self,
+        _selection: &ankql::ast::Selection<Resolved>,
+        _last: Option<&Entity>,
+        _size: usize,
+    ) -> Result<Vec<Entity>, RetrievalError> {
+        // A remote LIMIT window is refilled by coherent source publications.
+        // Local storage can contain predicate matches outside that window.
+        Ok(Vec::new())
+    }
+}
+
 struct RemoteActivation<'a> {
     query: &'a LiveQueryInner,
     origin: &'a proto::RequestId,
     canceled: &'a (dyn Fn() -> bool + Send + Sync),
+    complete: bool,
 }
 
 impl crate::reactor::PreNotifyHook for RemoteActivation<'_> {
     fn is_current(&self, version: u32) -> bool { !(self.canceled)() && self.query.remote_stream_current(version, self.origin) }
+
+    fn marks_loaded(&self) -> bool { self.complete }
 
     fn pre_notify(&self, version: u32) {
         let state = self.query.version_lock.lock().unwrap_or_else(|error| error.into_inner());
         let mut stream = self.query.remote_stream.lock().unwrap();
         let Some(current) = stream.as_mut().filter(|stream| stream.version == version && &stream.origin == self.origin) else { return };
         if (self.canceled)() || !self.query.is_current(version) {
+            return;
+        }
+        current.installed = true;
+        if !self.complete {
             return;
         }
         current.activated = true;
@@ -337,7 +408,8 @@ impl crate::reactor::PreNotifyHook for RemoteActivation<'_> {
 struct LocalActivation<'a>(&'a LiveQueryInner);
 impl PreNotifyHook for LocalActivation<'_> {
     fn is_current(&self, version: u32) -> bool {
-        self.0.is_current(version) && self.0.remote_activated_version.load(Ordering::Acquire) != version
+        self.0.is_current(version)
+            && !self.0.remote_stream.lock().unwrap().as_ref().is_some_and(|stream| stream.version == version && stream.installed)
     }
     fn pre_notify(&self, version: u32) { self.0.mark_initialized(version); }
 }
@@ -372,7 +444,7 @@ mod tests {
         let current = proto::RequestId::new();
         let canceled = || false;
         query.0.bind_remote_stream(1, original.clone(), &canceled);
-        RemoteActivation { query: &query.0, origin: &original, canceled: &canceled }.pre_notify(1);
+        RemoteActivation { query: &query.0, origin: &original, canceled: &canceled, complete: true }.pre_notify(1);
         query.0.resultset.set_loaded(true);
         query.0.mark_durable_answered(1);
         query.wait_durable_answered().await.unwrap();
@@ -397,10 +469,10 @@ mod tests {
 
         query.0.bind_remote_stream(1, current.clone(), &canceled);
         query.0.lose_remote_stream(1, &original);
-        RemoteActivation { query: &query.0, origin: &original, canceled: &canceled }.pre_notify(1);
+        RemoteActivation { query: &query.0, origin: &original, canceled: &canceled, complete: true }.pre_notify(1);
         query.0.mark_durable_answered(1);
         assert!(futures::poll!(&mut waiting).is_pending());
-        RemoteActivation { query: &query.0, origin: &current, canceled: &canceled }.pre_notify(1);
+        RemoteActivation { query: &query.0, origin: &current, canceled: &canceled, complete: true }.pre_notify(1);
         query.0.mark_durable_answered(1);
         waiting.await.unwrap();
         query.0.lose_remote_stream(1, &original);
@@ -413,7 +485,7 @@ mod tests {
         let origin = proto::RequestId::new();
         query.0.bind_remote_stream(1, origin.clone(), &|| false);
         let canceled = || true;
-        let activation = RemoteActivation { query: &query.0, origin: &origin, canceled: &canceled };
+        let activation = RemoteActivation { query: &query.0, origin: &origin, canceled: &canceled, complete: true };
         assert!(!activation.is_current(1));
         activation.pre_notify(1);
         query.0.mark_durable_answered(1);
@@ -429,7 +501,7 @@ mod tests {
         let replacement = proto::RequestId::new();
         let canceled = || false;
         query.0.bind_remote_stream(1, original.clone(), &canceled);
-        RemoteActivation { query: &query.0, origin: &original, canceled: &canceled }.pre_notify(1);
+        RemoteActivation { query: &query.0, origin: &original, canceled: &canceled, complete: true }.pre_notify(1);
         query.0.mark_durable_answered(1);
         query.wait_durable_answered().await.unwrap();
         query.0.bind_remote_stream(1, replacement.clone(), &canceled);
@@ -437,7 +509,7 @@ mod tests {
         let waiting = query.wait_durable_answered();
         tokio::pin!(waiting);
         assert!(futures::poll!(&mut waiting).is_pending());
-        RemoteActivation { query: &query.0, origin: &replacement, canceled: &canceled }.pre_notify(1);
+        RemoteActivation { query: &query.0, origin: &replacement, canceled: &canceled, complete: true }.pre_notify(1);
         query.0.mark_durable_answered(1);
         waiting.await.unwrap();
     }
