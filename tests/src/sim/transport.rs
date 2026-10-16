@@ -133,9 +133,10 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
         proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
-        proto::NodeRequestBody::ContinueState { processed_through, answers, .. } => {
-            format!("continue {processed_through} {}", payload_digest(answers))
+        proto::NodeRequestBody::ContinueState { round, processed_through, applied_through, answers, .. } => {
+            format!("continue {}", payload_digest(&(round, processed_through, applied_through, answers)))
         }
+        proto::NodeRequestBody::RefreshState { round, known_state, .. } => format!("refresh {}", payload_digest(&(round, known_state))),
         proto::NodeRequestBody::CloseComparison { outcome, .. } => format!("close {outcome:?}"),
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
@@ -172,17 +173,21 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
     }
 }
 
-fn state_descriptor(state: &proto::StateReply) -> String { format!("{} {}", payload_digest(&state.spec), frame_descriptor(&state.frame)) }
+fn state_descriptor(state: &proto::StateReply) -> String {
+    format!("{} {}", payload_digest(&(&state.spec, state.round)), frame_descriptor(&state.frame))
+}
 
 fn frame_descriptor(frame: &proto::StateFrame) -> String {
     let body = match &frame.body {
-        proto::StateFrameBody::State { items, progress } => format!("state {}", payload_digest(&(items, progress))),
-        proto::StateFrameBody::Live(items) => format!("live [{}]", items.iter().map(update_item_descriptor).collect::<Vec<_>>().join(",")),
-        proto::StateFrameBody::LiveChunk { chunk, predicate_relevance } => {
-            let membership: Vec<_> = predicate_relevance.iter().map(|(_, change)| change).collect();
-            format!("livechunk {}", payload_digest(&(chunk, membership)))
+        proto::StateFrameBody::BeginRound(round) => format!("begin {}", payload_digest(round)),
+        proto::StateFrameBody::State { round, items, progress } => format!("state {}", payload_digest(&(round, items, progress))),
+        proto::StateFrameBody::Live { revision, items, complete } => format!("live {}", payload_digest(&(revision, items, complete))),
+        proto::StateFrameBody::LiveChunk { revision, chunk, member, complete } => {
+            format!("livechunk {}", payload_digest(&(revision, chunk, member, complete)))
         }
+        proto::StateFrameBody::LiveRepair { items } => format!("liverepair {}", payload_digest(items)),
         proto::StateFrameBody::RestartRequired => "restart".into(),
+        proto::StateFrameBody::SourceUnavailable => "source unavailable".into(),
     };
     format!("{} {body}", frame.sequence)
 }
