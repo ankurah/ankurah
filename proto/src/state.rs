@@ -1,4 +1,4 @@
-//! Snapshot-bound state transfer shared by Fetch and SubscribeQuery.
+//! Bounded comparison rounds within a standing query's state stream.
 //!
 //! The initial response carries metadata and frame zero. Later frames are pushed
 //! through NodeUpdate, correlated with the originating request and comparison.
@@ -6,13 +6,11 @@
 //! it returns Success rather than carrying another frame. Responders choose
 //! byte/work/window limits beneath the protocol's hard resource caps.
 //!
-//! Complete commits the captured result and a standing subscription delivery
-//! route. The requester becomes ready after causal repair and local activation,
-//! then sends Applied without waiting for its reply. Live frames remain queued
-//! until Applied arrives and then continue on the same numbered stream.
-//! Snapshot cleanup never silently revokes that standing route: subsequent
-//! failure requires RestartRequired or disconnect. Abandoned cancels the exact
-//! generation; Applied releases snapshot resources and permits live delivery.
+//! Live publications may interleave with comparison pages. Each round describes
+//! one frozen source revision; later membership decisions must survive its
+//! installation. Complete ends enumeration, while Applied confirms actual
+//! coverage of that finite round and releases its snapshot. Neither gates live
+//! delivery. A standing stream may compare another frozen offer in a later round.
 //!
 //! Frame acknowledgments are flow control, not global application claims.
 //! Peers, connection generations, credentials, snapshots, spec and query version
@@ -24,11 +22,9 @@ use ulid::Ulid;
 
 mod compact_initial_page;
 
-use crate::{
-    Attested, Clock, EntityDelta, EntityDeltaChunk, EntityId, EntityState, KnownEntity, MembershipChange, QueryId, SubscriptionUpdateItem,
-};
+use crate::{Attested, Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId, EntityState, KnownEntity};
 
-/// A responder-issued handle for one comparison, scoped to the requesting peer.
+/// A responder-issued state stream handle, scoped to one peer connection/query generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ComparisonId(Ulid);
 
@@ -61,10 +57,20 @@ pub enum KnownRegion {
     Leaves(#[serde(with = "compact_initial_page")] LeafPage),
 }
 
-/// Initial response for the full exact materialized selection; frame.sequence must be zero.
+/// One captured query version. Revisions order publications in this stream,
+/// not entity histories or other peers. Round numbers start at zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateRound {
+    pub number: u64,
+    pub revision: u64,
+}
+
+/// Initial response for the full exact materialized selection. Its round begins
+/// before frame zero and every subsequent live publication in this stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReply {
     pub spec: TreeSpec,
+    pub round: StateRound,
     pub frame: StateFrame,
 }
 
@@ -79,23 +85,53 @@ pub struct StateFrame {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateFrameBody {
+    /// Accept the requester's already-frozen offer for the next round. This marker
+    /// precedes its questions/pages and every live publication after its revision.
+    BeginRound(StateRound),
     State {
+        round: u64,
         items: Vec<StateItem>,
         progress: ComparisonProgress,
     },
-    /// Subscription only, after Applied. Query id/version are bound by the stream.
-    /// All live updates for this generation use this same sequence and byte window.
-    /// ContinueState credits Live after application; a stalled stream may require restart.
-    Live(Vec<SubscriptionUpdateItem>),
-    /// Same entity encoding/assembly as RepairChunk. Relevance stays fixed for all
-    /// fragments and is applied only with the complete validated delta. No other
-    /// Live item interleaves; the relevance list is independently bounded.
-    LiveChunk {
-        chunk: EntityDeltaChunk,
-        predicate_relevance: Vec<(QueryId, MembershipChange)>,
+    /// Absolute source membership plus optional causal data. A publication may
+    /// span frames; only `complete` advances its membership/application boundary.
+    Live {
+        revision: u64,
+        items: Vec<QueryChange>,
+        complete: bool,
     },
+    /// Same entity encoding as RepairChunk. The membership decision stays fixed
+    /// across fragments. `complete` requires the final fragment and finishes this
+    /// whole publication, not merely this entity. Comparison frames may interleave.
+    LiveChunk {
+        revision: u64,
+        member: Option<QueryMember>,
+        chunk: EntityDeltaChunk,
+        complete: bool,
+    },
+    /// Connecting data for previously offered live targets. Only Repair,
+    /// RepairChunk and RepairUnavailable items are permitted; none authors membership.
+    LiveRepair { items: Vec<StateItem> },
     /// Mark this generation unavailable and restart; never claim completion.
     RestartRequired,
+}
+
+/// The sender's captured key and target. Keep these separate from the key/head
+/// of a newer or concurrently merged local entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryMember {
+    pub key: Vec<u8>,
+    pub head: Clock,
+}
+
+/// One absolute membership decision. None means absent, including removals
+/// for which the source may not disclose entity data. A Present with no data
+/// still requires proof that the local entity covers its target head.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryChange {
+    pub entity_id: EntityId,
+    pub member: Option<QueryMember>,
+    pub delta: Option<DeltaContent>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -103,7 +139,7 @@ pub enum ComparisonProgress {
     /// Further work or questions remain; the responder pushes while credit permits.
     /// On late repair frames this does not revoke a prior Complete handoff.
     Continue,
-    /// Initial offers have been sent and the subscription route is established.
+    /// All offers for this finite round have been sent.
     /// This does not claim application: late NeedRepair is allowed. Readiness
     /// requires actual target coverage, no pending repair, and local activation.
     Complete,
@@ -182,12 +218,15 @@ pub struct KnownLeaf {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ComparisonOutcome {
-    /// After Complete, all offered targets are covered and local result activation
-    /// succeeded. Release the snapshot and drain the standing Live stream.
+    /// After Complete, the round's offered targets are covered and local result
+    /// installation succeeded. Release only that round's snapshot.
     /// processed_through covers every initial/repair frame, including late repairs
     /// after Complete. It returns frame credit (including frame 0) as well.
     /// The requester need not await the reply before reporting readiness.
-    Applied { processed_through: u64 },
+    Applied { round: u64, processed_through: u64 },
+    /// Discard only this round, preserving the standing stream and its live
+    /// publications. It may be followed by a new frozen offer and round.
+    Cancelled { round: u64 },
     /// Cancel this exact stream/query generation, including after Complete.
     /// Never remove a replacement query generation.
     Abandoned,

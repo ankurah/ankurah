@@ -174,11 +174,25 @@ pub enum NodeRequestBody {
     /// explicit pending NeedRepair; it is not the global Applied acknowledgment.
     ContinueState {
         comparison: ComparisonId,
+        /// Answers belong to this round; None addresses live-target repair.
+        /// Credit-only feedback needs no active round.
+        round: Option<u64>,
         processed_through: u64,
+        /// Actual causal coverage through a complete live publication, distinct
+        /// from frame receipt credit. Releases retained live repair targets.
+        applied_through: Option<u64>,
         answers: Vec<StateAnswer>,
     },
-    /// Applied releases snapshot resources and starts the standing Live stream;
-    /// Abandoned cancels only this bound generation. Both are idempotent.
+    /// Compare another frozen offer on the standing stream. One round at a time;
+    /// the number must be the previous round plus one. The responder sends an
+    /// ordered BeginRound marker and returns Success, without an extra page poll.
+    RefreshState {
+        comparison: ComparisonId,
+        round: u64,
+        known_state: KnownState,
+    },
+    /// Applied/Cancelled release only the named round; Abandoned cancels the
+    /// entire bound stream/query generation. Repeated acknowledgments are safe.
     /// The response is Success; readiness does not wait for the Applied reply.
     CloseComparison {
         comparison: ComparisonId,
@@ -305,8 +319,11 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
-            NodeRequestBody::ContinueState { comparison, processed_through, answers } => {
+            NodeRequestBody::ContinueState { comparison, processed_through, answers, .. } => {
                 write!(f, "ContinueState {comparison} through:{processed_through} answers:{}", answers.len())
+            }
+            NodeRequestBody::RefreshState { comparison, round, known_state } => {
+                write!(f, "RefreshState {comparison} round:{round} regions:{}", known_state.regions.len())
             }
             NodeRequestBody::CloseComparison { comparison, outcome } => write!(f, "CloseComparison {comparison} {outcome:?}"),
         }
