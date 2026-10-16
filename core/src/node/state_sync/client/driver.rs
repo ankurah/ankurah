@@ -1,5 +1,5 @@
 use super::*;
-use crate::{changes::EntityChange, node::applier::Delivery};
+use crate::{changes::EntityChange, node::applier::Delivery, reactor::ChangeNotification};
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -106,6 +106,7 @@ struct Assembly {
     target: proto::Clock,
     bytes: Vec<u8>,
     member: Option<proto::QueryMember>,
+    sender: tokio::sync::oneshot::Sender<proto::EntityDelta>,
 }
 struct PendingRound {
     number: u64,
@@ -119,6 +120,9 @@ pub(super) struct Driver {
     goals: Goals,
     round_jobs: usize,
     jobs: FuturesUnordered<BoxFuture<'static, anyhow::Result<Applied>>>,
+    queued_jobs: BTreeMap<proto::EntityId, VecDeque<BoxFuture<'static, anyhow::Result<Applied>>>>,
+    active_entities: HashSet<proto::EntityId>,
+    application_jobs: usize,
     assemblies: BTreeMap<TargetKey, Assembly>,
     assembly_bytes: usize,
     observed: HashMap<proto::EntityId, proto::Clock>,
@@ -161,6 +165,9 @@ impl Driver {
             goals: Goals::default(),
             round_jobs: 0,
             jobs: FuturesUnordered::new(),
+            queued_jobs: BTreeMap::new(),
+            active_entities: HashSet::new(),
+            application_jobs: 0,
             assemblies: BTreeMap::new(),
             assembly_bytes: 0,
             observed,
@@ -263,27 +270,51 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(self.jobs.len() < super::super::MAX_INFLIGHT_FRAMES * 128, "application queue exceeded limit");
         let bytes = bincode::serialized_size(&delta)? as usize;
         ensure!(
             self.application_bytes + self.assembly_bytes + bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
             "application byte queue exceeded limit"
         );
         self.application_bytes += bytes;
+        let id = delta.entity_id;
+        self.reserve_application(node, peer, credentials, owner, id, repair, Box::pin(async move { Some(delta) }))
+    }
+
+    /// Reserve at the first chunk, not after assembly. Later data for this ID
+    /// must not overtake an earlier payload whose bytes are still arriving.
+    fn reserve_application<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        peer: proto::EntityId,
+        credentials: &[PA::ContextData],
+        owner: Owner,
+        id: proto::EntityId,
+        repair: Option<proto::Clock>,
+        input: BoxFuture<'static, Option<proto::EntityDelta>>,
+    ) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        ensure!(self.application_jobs < super::super::MAX_INFLIGHT_FRAMES * 128, "application queue exceeded limit");
+        self.application_jobs += 1;
         match owner {
             Owner::Round(_) => self.round_jobs += 1,
             Owner::Live(revision) => self.publication(revision)?.jobs += 1,
             Owner::Repair => {}
         }
-        let repair = repair.map(|target| target_key(delta.entity_id, &target));
+        let repair = repair.map(|target| target_key(id, &target));
         if let Some(key) = &repair {
             self.applying_repairs.insert(key.clone());
         }
         let node = node.weak();
         let credentials = credentials.to_vec();
-        self.jobs.push(Box::pin(async move {
+        let job = Box::pin(async move {
+            // Dropping a cancelled round's partial assembly releases its reserved
+            // slot without applying or announcing membership.
+            let Some(delta) = input.await else { return Ok(Applied { owner, id, head: None, change: None, bytes: 0, repair }) };
+            let bytes = bincode::serialized_size(&delta)? as usize;
             let node = node.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
-            let id = delta.entity_id;
             let events = CachedEventGetter::new(&node, &credentials);
             let states = LocalStateGetter::new(node.storage.clone());
             let outcome = NodeApplier::apply_delta(
@@ -297,8 +328,17 @@ impl Driver {
             .await?;
             let head = outcome.entity.as_ref().map(|entity| entity.head());
             Ok(Applied { owner, id, head, change: outcome.change, bytes, repair })
-        }));
+        });
+        self.push_application(id, job);
         Ok(())
+    }
+
+    fn push_application(&mut self, id: proto::EntityId, job: BoxFuture<'static, anyhow::Result<Applied>>) {
+        if self.active_entities.insert(id) {
+            self.jobs.push(job);
+        } else {
+            self.queued_jobs.entry(id).or_default().push_back(job);
+        }
     }
 
     async fn observe<SE, PA>(&mut self, node: &Node<SE, PA>, applied: Applied) -> anyhow::Result<Option<EntityChange>>
@@ -307,6 +347,17 @@ impl Driver {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         self.application_bytes -= applied.bytes;
+        self.application_jobs = self.application_jobs.saturating_sub(1);
+        self.active_entities.remove(&applied.id);
+        if let Some(queued) = self.queued_jobs.get_mut(&applied.id) {
+            if let Some(next) = queued.pop_front() {
+                self.active_entities.insert(applied.id);
+                self.jobs.push(next);
+            }
+            if queued.is_empty() {
+                self.queued_jobs.remove(&applied.id);
+            }
+        }
         if let Some(key) = &applied.repair {
             self.applying_repairs.remove(key);
         }
@@ -320,30 +371,34 @@ impl Driver {
             _ => {}
         }
         if let Some(head) = applied.head {
-            for goal in self
-                .goals
-                .for_id_mut(&applied.id)
-                .chain(self.publications.iter_mut().flat_map(|publication| publication.goals.for_id_mut(&applied.id)))
-            {
-                if goal.id == applied.id && !goal.covered && covers_target(node, &head, &goal.head).await? {
-                    goal.covered = true;
-                }
-            }
-            if let Some(member) = self.projection.members.get(&applied.id) {
-                if (self.baseline_installed || self.projection.has_live_decision(&applied.id))
-                    && covers_target(node, &head, &member.head).await?
-                {
-                    self.membership_dirty |= self.eligible.insert(applied.id);
-                }
-            }
-            if self.projection.members.contains_key(&applied.id)
-                || self.goals.rows.contains_key(&applied.id)
-                || self.publications.iter().any(|publication| publication.goals.rows.contains_key(&applied.id))
-            {
-                self.observed.insert(applied.id, head);
-            }
+            self.observe_head(node, applied.id, head).await?;
         }
         Ok(applied.change)
+    }
+
+    async fn observe_head<SE, PA>(&mut self, node: &Node<SE, PA>, id: proto::EntityId, head: proto::Clock) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        for goal in self.goals.for_id_mut(&id).chain(self.publications.iter_mut().flat_map(|publication| publication.goals.for_id_mut(&id)))
+        {
+            if goal.id == id && !goal.covered && covers_target(node, &head, &goal.head).await? {
+                goal.covered = true;
+            }
+        }
+        if let Some(member) = self.projection.members.get(&id) {
+            if (self.baseline_installed || self.projection.has_live_decision(&id)) && covers_target(node, &head, &member.head).await? {
+                self.membership_dirty |= self.eligible.insert(id);
+            }
+        }
+        if self.projection.members.contains_key(&id)
+            || self.goals.rows.contains_key(&id)
+            || self.publications.iter().any(|publication| publication.goals.rows.contains_key(&id))
+        {
+            self.observed.insert(id, head);
+        }
+        Ok(())
     }
 
     fn add_goal(&mut self, owner: Owner, id: proto::EntityId, target: proto::Clock) -> anyhow::Result<()> {
@@ -355,13 +410,20 @@ impl Driver {
         }
     }
 
-    fn chunk(
+    fn chunk<SE, PA>(
         &mut self,
+        node: &Node<SE, PA>,
+        peer: proto::EntityId,
+        credentials: &[PA::ContextData],
         owner: Owner,
         target: proto::Clock,
         member: Option<proto::QueryMember>,
         chunk: proto::EntityDeltaChunk,
-    ) -> anyhow::Result<Option<proto::EntityDelta>> {
+    ) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
         ensure!(!chunk.bytes.is_empty(), "empty delta chunk");
         let key = bincode::serialize(&(
             match owner {
@@ -372,13 +434,25 @@ impl Driver {
             chunk.entity_id,
             &target,
         ))?;
-        ensure!(self.assemblies.contains_key(&key) || self.assemblies.len() < super::super::MAX_INFLIGHT_FRAMES, "too many partial deltas");
-        let assembly = self.assemblies.entry(key.clone()).or_insert_with(|| Assembly {
-            owner,
-            target: target.clone(),
-            bytes: Vec::new(),
-            member: member.clone(),
-        });
+        if !self.assemblies.contains_key(&key) {
+            ensure!(
+                self.assemblies.len() < super::super::MAX_INFLIGHT_FRAMES && chunk.offset == 0,
+                "too many or out-of-order partial deltas"
+            );
+            let (sender, receive) = tokio::sync::oneshot::channel();
+            self.reserve_application(
+                node,
+                peer,
+                credentials,
+                owner,
+                chunk.entity_id,
+                (!matches!(owner, Owner::Live(_))).then(|| target.clone()),
+                Box::pin(async move { receive.await.ok() }),
+            )?;
+            self.assemblies
+                .insert(key.clone(), Assembly { owner, target: target.clone(), bytes: Vec::new(), member: member.clone(), sender });
+        }
+        let assembly = self.assemblies.get_mut(&key).unwrap();
         ensure!(
             assembly.owner == owner
                 && assembly.target == target
@@ -394,16 +468,43 @@ impl Driver {
         );
         self.assembly_bytes += chunk.bytes.len();
         assembly.bytes.extend_from_slice(&chunk.bytes);
-        if !chunk.last {
-            return Ok(None);
+        if chunk.last {
+            let assembly = self.assemblies.remove(&key).unwrap();
+            let content = decode_delta(&assembly.bytes)?;
+            if !matches!(owner, Owner::Live(_)) {
+                check_target(&assembly.target, &content)?;
+            }
+            let delta = proto::EntityDelta { entity_id: chunk.entity_id, content };
+            self.assembly_bytes -= assembly.bytes.len();
+            self.application_bytes += bincode::serialized_size(&delta)? as usize;
+            ensure!(
+                self.application_bytes + self.assembly_bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
+                "application byte queue exceeded limit"
+            );
+            if matches!(owner, Owner::Live(_)) {
+                self.add_live_delta_targets(
+                    match owner {
+                        Owner::Live(revision) => revision,
+                        _ => unreachable!(),
+                    },
+                    delta.entity_id,
+                    &assembly.member,
+                    Some(&delta.content),
+                )?;
+                self.record_change(
+                    match owner {
+                        Owner::Live(revision) => revision,
+                        _ => unreachable!(),
+                    },
+                    delta.entity_id,
+                    assembly.member,
+                )?;
+            } else {
+                self.repair_arrived(delta.entity_id, &assembly.target);
+            }
+            let _ = assembly.sender.send(delta);
         }
-        let assembly = self.assemblies.remove(&key).unwrap();
-        self.assembly_bytes -= assembly.bytes.len();
-        let content = decode_delta(&assembly.bytes)?;
-        if !matches!(owner, Owner::Live(_)) {
-            check_target(&assembly.target, &content)?;
-        }
-        Ok(Some(proto::EntityDelta { entity_id: chunk.entity_id, content }))
+        Ok(())
     }
 
     async fn items<SE, PA>(
@@ -468,11 +569,7 @@ impl Driver {
                 }
                 StateItem::RepairChunk { target, chunk } => {
                     self.add_goal(owner, chunk.entity_id, target.clone())?;
-                    let repair_target = target.clone();
-                    if let Some(delta) = self.chunk(owner, target, None, chunk)? {
-                        self.repair_arrived(delta.entity_id, &repair_target);
-                        self.enqueue(node, peer, credentials, owner, delta, Some(repair_target))?;
-                    }
+                    self.chunk(node, peer, credentials, owner, target, None, chunk)?;
                 }
                 StateItem::RepairUnavailable { entity_id, target } => {
                     let required = |goals: &Goals| {
@@ -485,11 +582,7 @@ impl Driver {
                         self.observed.get(&entity_id).cloned().or_else(|| node.entities.get(&entity_id).map(|entity| entity.head()));
                     if let Some(head) = actual {
                         if covers_target(node, &head, &target).await? {
-                            self.observe(
-                                node,
-                                Applied { owner: Owner::Repair, id: entity_id, head: Some(head), change: None, bytes: 0, repair: None },
-                            )
-                            .await?;
+                            self.observe_head(node, entity_id, head).await?;
                             continue;
                         }
                     }
@@ -498,6 +591,40 @@ impl Driver {
             }
         }
         Ok(answers)
+    }
+
+    fn add_live_delta_targets(
+        &mut self,
+        revision: u64,
+        id: proto::EntityId,
+        member: &Option<proto::QueryMember>,
+        content: Option<&proto::DeltaContent>,
+    ) -> anyhow::Result<()> {
+        if let Some(member) = member {
+            CanonicalCodec.split(self.spec.key_spec(), &member.key)?;
+            self.add_goal(Owner::Live(revision), id, member.head.clone())?;
+        }
+        if let Some(content) = content {
+            let target = match content {
+                proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. } => {
+                    state.state.head.clone()
+                }
+                proto::DeltaContent::EventBridge { .. } => {
+                    member.as_ref().ok_or_else(|| anyhow::anyhow!("absent event bridge has no target"))?.head.clone()
+                }
+                _ => bail!("unsupported live delta"),
+            };
+            self.add_goal(Owner::Live(revision), id, target)?;
+        }
+        Ok(())
+    }
+    fn record_change(&mut self, revision: u64, id: proto::EntityId, member: Option<proto::QueryMember>) -> anyhow::Result<()> {
+        let publication = self.publication(revision)?;
+        if let Some(previous) = publication.changes.insert(id, member.clone()) {
+            publication.change_bytes -= bincode::serialized_size(&(id, previous))? as usize;
+        }
+        publication.change_bytes += bincode::serialized_size(&(id, member))? as usize;
+        Ok(())
     }
 
     async fn live<SE, PA>(
@@ -515,29 +642,18 @@ impl Driver {
     {
         ensure!(items.len() <= 128, "live item limit exceeded");
         for item in items {
-            let id = item.entity_id;
-            if let Some(member) = &item.member {
-                CanonicalCodec.split(self.spec.key_spec(), &member.key)?;
-                self.add_goal(Owner::Live(revision), id, member.head.clone())?;
-            }
+            self.add_live_delta_targets(revision, item.entity_id, &item.member, item.delta.as_ref())?;
             if let Some(content) = item.delta {
-                let target = match &content {
-                    proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. } => {
-                        state.state.head.clone()
-                    }
-                    proto::DeltaContent::EventBridge { .. } => {
-                        item.member.as_ref().ok_or_else(|| anyhow::anyhow!("absent event bridge has no target"))?.head.clone()
-                    }
-                    _ => bail!("unsupported live delta"),
-                };
-                self.add_goal(Owner::Live(revision), id, target)?;
-                self.enqueue(node, peer, credentials, Owner::Live(revision), proto::EntityDelta { entity_id: id, content }, None)?;
+                self.enqueue(
+                    node,
+                    peer,
+                    credentials,
+                    Owner::Live(revision),
+                    proto::EntityDelta { entity_id: item.entity_id, content },
+                    None,
+                )?;
             }
-            let publication = self.publication(revision)?;
-            if let Some(previous) = publication.changes.insert(id, item.member.clone()) {
-                publication.change_bytes -= bincode::serialized_size(&(id, previous))? as usize;
-            }
-            publication.change_bytes += bincode::serialized_size(&(id, item.member))? as usize;
+            self.record_change(revision, item.entity_id, item.member)?;
         }
         if complete {
             ensure!(
@@ -605,18 +721,11 @@ impl Driver {
                 let target = None::<proto::Clock>;
                 // Absent chunk data must be snapshot-bearing: decode before learning its data target.
                 let target = target.unwrap_or_default();
-                if let Some(delta) = self.chunk(Owner::Live(revision), target, member.clone(), chunk)? {
-                    self.live(
-                        node,
-                        peer,
-                        credentials,
-                        revision,
-                        vec![proto::QueryChange { entity_id: delta.entity_id, member, delta: Some(delta.content) }],
-                        complete,
-                    )
-                    .await?;
-                } else {
-                    ensure!(!complete, "publication completed inside a chunk");
+                let last = chunk.last;
+                self.chunk(node, peer, credentials, Owner::Live(revision), target, member, chunk)?;
+                ensure!(last || !complete, "publication completed inside a chunk");
+                if complete {
+                    self.live(node, peer, credentials, revision, vec![], true).await?;
                 }
             }
             StateFrameBody::LiveRepair { items } => {
@@ -932,7 +1041,7 @@ impl Driver {
             }
             let event = {
                 let inbox = self.stream.inbox.clone();
-                let can_receive = self.application_bytes < super::super::WINDOW_BYTES;
+                let can_receive = self.application_bytes < super::super::WINDOW_BYTES || !self.assemblies.is_empty();
                 let idle = self.projection.round.is_none() && self.jobs.is_empty();
                 let frame = async {
                     if can_receive {
@@ -991,9 +1100,7 @@ impl Driver {
                         self.install(&node, query, false).await?;
                         self.membership_dirty = false;
                     }
-                    if !changes.is_empty() {
-                        node.reactor.notify_change(changes).await;
-                    }
+                    notify_changes(&node, changes).await;
                 }
                 Event::Control(control) => {
                     control?;
@@ -1030,6 +1137,28 @@ impl Driver {
     }
     pub fn ids(&self) -> Vec<proto::EntityId> { self.projection.members.keys().copied().collect() }
     pub fn refresh_handle(&self) -> RefreshHandle { self.refresh.clone() }
+}
+
+/// Reactor batches must contain each identity at most once; it coalesces
+/// repeated identities and therefore cannot represent two event batches for one ID.
+async fn notify_changes<SE, PA>(node: &Node<SE, PA>, changes: Vec<EntityChange>)
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let mut batch = Vec::new();
+    let mut ids = HashSet::new();
+    for change in changes {
+        if !ids.insert(change.entity().id()) {
+            node.reactor.notify_change(std::mem::take(&mut batch)).await;
+            ids.clear();
+            ids.insert(change.entity().id());
+        }
+        batch.push(change);
+    }
+    if !batch.is_empty() {
+        node.reactor.notify_change(batch).await;
+    }
 }
 
 #[cfg(test)]

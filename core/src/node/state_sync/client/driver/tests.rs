@@ -127,3 +127,140 @@ async fn live_coverage_can_finish_round_with_queued_repair_and_ignore_late_unava
     );
     Ok(())
 }
+
+async fn committed_entity(node: &TestNode) -> anyhow::Result<(proto::Event, crate::entity::Entity)> {
+    node.system.wait_loaded().await?;
+    let genesis = proto::Event::genesis(
+        Some(id(90)),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(proto::ModelId::EntityId(id(91))))]),
+    );
+    let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+    let events = CachedEventGetter::new(node, &credentials);
+    let states = LocalStateGetter::new(node.storage.clone());
+    let outcome = NodeApplier::apply_delta(
+        node,
+        &id(90),
+        proto::EntityDelta {
+            entity_id: genesis.entity_id,
+            content: proto::DeltaContent::EventBridge { events: vec![proto::Attested::opt(genesis.clone(), None).into()] },
+        },
+        Delivery::Initial,
+        &events,
+        &states,
+    )
+    .await?;
+    Ok((genesis, outcome.entity.unwrap()))
+}
+fn edit(entity: proto::EntityId, parent: proto::Clock, model: u8) -> proto::Event {
+    proto::Event::update(
+        entity,
+        parent,
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(proto::ModelId::EntityId(id(model))))]),
+    )
+}
+fn bridge(event: proto::Event) -> proto::EntityDelta {
+    proto::EntityDelta {
+        entity_id: event.entity_id,
+        content: proto::DeltaContent::EventBridge { events: vec![proto::Attested::opt(event, None).into()] },
+    }
+}
+
+#[tokio::test]
+async fn held_live_application_cannot_be_overtaken_by_refresh_snapshot() -> anyhow::Result<()> {
+    use crate::{retrieval::SuspenseEvents, storage::StorageTransaction};
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let event = edit(entity.id(), entity.head(), 92);
+    let getter = LocalEventGetter::new(node.storage.clone(), false);
+    getter.stage_event(event.clone());
+    let fork = crate::entity::RemoteTrxEntity::edit(&entity)?;
+    fork.apply_events(&getter, &mut [proto::Attested::opt(event.clone(), None)], |_| Ok(None)).await?;
+    let newer = fork.to_state()?;
+    // History can already be cached independently of the entity's application.
+    // Without the owner FIFO, this later snapshot could adopt that head first.
+    let mut transaction = node.storage.transaction();
+    transaction.add_events(&[proto::Attested::opt(event.clone(), None)]).await?;
+    transaction.commit().await?.committed()?;
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    *node.storage.hold_set_state.lock().unwrap() = Some((entered, release_rx));
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Live(11), bridge(event.clone()), None)?;
+    driver.enqueue(
+        &node,
+        id(90),
+        &[crate::policy::DEFAULT_CONTEXT],
+        Owner::Round(0),
+        proto::EntityDelta {
+            entity_id: entity.id(),
+            content: proto::DeltaContent::StateSnapshot { state: proto::StateFragment { state: newer, attestations: Default::default() } },
+        },
+        None,
+    )?;
+    {
+        let next = driver.jobs.next();
+        tokio::pin!(next);
+        assert!(futures::poll!(&mut next).is_pending());
+    }
+    entered_rx.await?;
+    {
+        let next = driver.jobs.next();
+        tokio::pin!(next);
+        assert!(futures::poll!(&mut next).is_pending(), "the later snapshot must not run while the earlier live commit is held");
+    }
+    release.send(()).unwrap();
+    let live = driver.jobs.next().await.unwrap()?;
+    assert_eq!(live.change.as_ref().unwrap().events().iter().map(|event| event.payload.id()).collect::<Vec<_>>(), [event.id()]);
+    driver.observe(&node, live).await?;
+    let snapshot = driver.jobs.next().await.unwrap()?;
+    assert!(snapshot.change.as_ref().is_none_or(|change| change.events().is_empty()));
+    driver.observe(&node, snapshot).await?;
+    assert_eq!(entity.head(), proto::Clock::singleton(&event));
+    assert_eq!(driver.application_jobs, 0);
+    assert_eq!(driver.application_bytes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> anyhow::Result<()> {
+    use crate::{context::Context, reactor::fetch_gap::QueryGapFetcher};
+    use ankurah_signals::Subscribe;
+    let (node, _, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let context = Context::new(node.clone(), crate::policy::DEFAULT_CONTEXT);
+    let subscription = node.reactor.subscribe();
+    let query = proto::QueryId::new();
+    node.reactor
+        .upsert_query_from_peer(
+            subscription.id(),
+            query,
+            ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
+            context.0.clone(),
+            crate::resultset::EntityResultSet::empty(),
+            Arc::new(QueryGapFetcher::new(context.clone())),
+            1,
+            (),
+            vec![entity.clone()],
+        )
+        .await?;
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = received.clone();
+    let _listener = subscription.subscribe(move |update: crate::reactor::ReactorUpdate| {
+        observed.lock().unwrap().extend(update.items.into_iter().flat_map(|item| item.events.into_iter().map(|event| event.payload.id())));
+    });
+    let first = edit(entity.id(), entity.head(), 92);
+    let second = edit(entity.id(), proto::Clock::singleton(&first), 93);
+    let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+    let getter = CachedEventGetter::new(&node, &credentials);
+    let states = LocalStateGetter::new(node.storage.clone());
+    let mut changes = Vec::new();
+    for event in [first.clone(), second.clone()] {
+        let outcome = NodeApplier::apply_delta(&node, &id(90), bridge(event), Delivery::Live, &getter, &states).await?;
+        changes.extend(outcome.change);
+    }
+    assert_eq!(changes.len(), 2);
+    notify_changes(&node, changes).await;
+    assert_eq!(*received.lock().unwrap(), [first.id(), second.id()], "a ready batch cannot coalesce away the second event vector");
+    Ok(())
+}
