@@ -390,6 +390,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             &mut reactor_update_items,
             authoritative,
             membership.as_ref(),
+            pre_notify_hook.marks_loaded(),
         )?;
 
         // Merge source events with the same membership transition, rather than
@@ -1217,6 +1218,162 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_are_add() {
+        struct Partial;
+        impl PreNotifyHook for Partial {
+            fn marks_loaded(&self) -> bool { false }
+            fn pre_notify(&self, _: u32) {}
+        }
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let cached = TestEntity::new("cached", "pending");
+        let arrival = TestEntity::new("remote arrival", "pending");
+        let live = TestEntity::new("live during replacement", "ready");
+        let baseline = TestEntity::new("replacement baseline", "ready");
+        let reconnected = TestEntity::new("reconnected arrival", "ready");
+        let resultset = EntityResultSet::empty();
+        let gate = Arc::new(std::sync::RwLock::new([cached.id, arrival.id, live.id, baseline.id, reconnected.id].into_iter().collect()));
+        let source = |version| Arc::new(CandidateWindow(gate.clone(), QueryOrigin { version, ..origin(query) }));
+        reactor
+            .upsert_query_and_notify(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(MockNode { entities: vec![cached] }),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+            )
+            .await
+            .unwrap();
+        let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = subscription.subscribe(watch);
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                source(1),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![arrival.clone()],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updates()[0].items[0].predicate_relevance,
+            vec![(query, MembershipChange::Add)],
+            "cached first remote arrival is incremental"
+        );
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'ready'"),
+                source(2),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                2,
+                Partial,
+                vec![],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        updates();
+        let event = TestEvent { id: proto::EventId::from_bytes([44; 32]), changes: HashMap::new() };
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'ready'"),
+                source(2),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                2,
+                Partial,
+                vec![live.clone()],
+                PeerQueryMembership::default(),
+                vec![ReactorUpdateItem { entity: live, events: vec![event.clone()], predicate_relevance: vec![] }],
+            )
+            .await
+            .unwrap();
+        let live_update = updates();
+        assert_eq!(
+            live_update[0].items[0].predicate_relevance,
+            vec![(query, MembershipChange::Add)],
+            "live publication is incremental even while replacement baseline is pending"
+        );
+        assert_eq!(live_update[0].items[0].events, vec![event]);
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'ready'"),
+                source(2),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                2,
+                (),
+                vec![baseline],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updates()[0].items[0].predicate_relevance,
+            vec![(query, MembershipChange::Initial)],
+            "finite replacement baseline remains Initial after partial preparation"
+        );
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'ready'"),
+                source(2),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                2,
+                Partial,
+                vec![],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(updates().is_empty());
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'ready'"),
+                source(2),
+                resultset,
+                Arc::new(MockGapFetcher::new()),
+                2,
+                (),
+                vec![reconnected],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            updates()[0].items[0].predicate_relevance,
+            vec![(query, MembershipChange::Add)],
+            "same-version reconnect is incremental"
+        );
     }
 
     #[tokio::test]

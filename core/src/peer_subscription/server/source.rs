@@ -15,15 +15,14 @@ use crate::{
 use ankql::ast::{Resolved, Selection};
 use ankurah_digest_tree::CanonicalCodec;
 use ankurah_proto::{self as proto, Attested};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    sync::Arc,
-};
+use indexmap::IndexMap;
+use std::{collections::BTreeSet, sync::Arc};
 use tokio::sync::{mpsc, oneshot};
 
 const MAX_READ_ATTEMPTS: usize = 8;
 
-type Rows = BTreeMap<proto::EntityId, Row>;
+// Limited reads retain storage query order for unchanged refill entrants.
+type Rows = IndexMap<proto::EntityId, Row>;
 type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
 
 struct Row {
@@ -141,7 +140,7 @@ impl QueryProjection {
         if let Some(row) = self.evaluate(policy, change.state.clone())? {
             self.rows.insert(change.state.entity_id, row);
         } else {
-            self.rows.remove(&change.state.entity_id);
+            self.rows.swap_remove(&change.state.entity_id);
         }
         Ok(())
     }

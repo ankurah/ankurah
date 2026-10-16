@@ -69,6 +69,8 @@ pub(super) struct QueryState<E: AbstractEntity + Filterable + Send + 'static> {
     pub(crate) paused: bool, // When true, skip notifications (used during initialization and updates)
     pub(crate) resultset: EntityResultSet<E>,
     pub(crate) version: u32,
+    /// Remains pending across partial publications of a replacement selection.
+    initializing: bool,
 }
 
 // We would call this ReactorSubscription, but that name is reserved for the public API
@@ -186,7 +188,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             query.gap_fetcher = gap_fetcher;
             return false;
         }
-        state.queries.insert(query_id, QueryState { selection: None, gap_fetcher, source, paused: false, resultset, version: 0 });
+        state.queries.insert(
+            query_id,
+            QueryState { selection: None, gap_fetcher, source, paused: false, resultset, version: 0, initializing: true },
+        );
         true
     }
 
@@ -223,11 +228,16 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         reactor_updates: &mut A,
         authoritative: bool,
         membership: Option<&crate::reactor::PeerQueryMembership>,
+        complete: bool,
     ) -> anyhow::Result<Vec<E>> {
         let mut state_guard = self.state.lock().unwrap();
         let state = &mut *state_guard;
 
         let query_state = state.queries.get_mut(&query_id).ok_or_else(|| anyhow::anyhow!("Query not found for update"))?;
+        if query_state.version != version {
+            query_state.initializing = true;
+        }
+        let initial_baseline = query_state.initializing && complete;
         let is_first_update = query_state.selection.is_none();
         let old_selection = query_state.selection.replace(selection.clone());
 
@@ -282,7 +292,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             for (id, entity) in rw_resultset.iter_entities() {
                 if !before.contains_key(&id) {
                     state.entities.insert(id, entity.clone());
-                    if membership.is_some() && !is_first_update {
+                    if membership.is_some() && !initial_baseline {
                         reactor_updates.push_add(entity, query_id);
                     } else {
                         reactor_updates.push_initial(entity, query_id);
@@ -338,6 +348,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         query_state.paused = false;
         query_state.version = version;
+        if complete {
+            query_state.initializing = false;
+        }
 
         drop(rw_resultset);
 
@@ -768,7 +781,15 @@ impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::
         match state.queries.entry(query_id) {
             Entry::Vacant(v) => {
                 let resultset = EntityResultSet::empty();
-                v.insert(QueryState { selection: None, gap_fetcher, source, paused: false, resultset: resultset.clone(), version: 0 });
+                v.insert(QueryState {
+                    selection: None,
+                    gap_fetcher,
+                    source,
+                    paused: false,
+                    resultset: resultset.clone(),
+                    version: 0,
+                    initializing: true,
+                });
                 resultset
             }
             Entry::Occupied(o) => o.get().resultset.clone(),

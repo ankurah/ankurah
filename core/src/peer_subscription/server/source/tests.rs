@@ -159,6 +159,33 @@ async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read(
 }
 
 #[tokio::test]
+async fn limited_projection_keeps_storage_query_order_independently_of_digest_keys() -> anyhow::Result<()> {
+    let node = node().await?;
+    let a = genesis("01")?;
+    let b = genesis("02")?;
+    apply(&node, &a).await?;
+    apply(&node, &b).await?;
+    // Deliberately oppose ID order and requested ascending label order.
+    let (first, last) = if a.entity_id > b.entity_id { (&a, &b) } else { (&b, &a) };
+    apply(&node, &update(first, "01")?).await?;
+    apply(&node, &update(last, "02")?).await?;
+    let selection = selection(Some(2));
+    let by_id = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
+    let captured = capture_query(&node, selection, by_id, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    assert_eq!(
+        captured.projection.rows.keys().copied().collect::<Vec<_>>(),
+        vec![first.entity_id, last.entity_id],
+        "unchanged refill entrants must retain storage query order, not entity-ID order"
+    );
+    assert_eq!(
+        captured.snapshot.members().values().copied().collect::<Vec<_>>(),
+        vec![last.entity_id, first.entity_id],
+        "digest address order is independently allowed to be by ID"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn limited_capture_retries_to_discover_an_unchanged_replacement() -> anyhow::Result<()> {
     let node = node().await?;
     let [a, b, c]: [proto::Event; 3] = ["01", "02", "03"].map(genesis).into_iter().collect::<anyhow::Result<Vec<_>>>()?.try_into().unwrap();

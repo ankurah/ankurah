@@ -113,7 +113,17 @@ async fn test_inter_node_gap_filling_desc() -> Result<(), Box<dyn std::error::Er
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     let server = server.context_async(DEFAULT_CONTEXT).await.unwrap();
     let client = client.context_async(DEFAULT_CONTEXT).await.unwrap();
-    let ids = create_albums(&server, 2020..=2027).await?;
+    let mut ids = create_albums(&server, 2020..=2027).await?;
+    // Make replacement ID order oppose DESC year order, so an ID-keyed
+    // intermediate map cannot accidentally satisfy the callback-order assertion.
+    if ids[2] > ids[3] {
+        let trx = server.begin();
+        trx.get::<Album>(&ids[2]).await?.year()?.replace("2023")?;
+        trx.get::<Album>(&ids[3]).await?.year()?.replace("2022")?;
+        trx.commit().await?;
+        ids.swap(2, 3);
+    }
+    assert!(ids[2] < ids[3]);
 
     let watcher = TestWatcher::changeset();
     let query = client.query_wait::<AlbumView>(nocache("year >= '2020' ORDER BY year DESC LIMIT 4")?).await?;
