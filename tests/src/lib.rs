@@ -6,3 +6,5 @@
 
 pub mod catalog_forge;
 pub mod sim;
+
+pub mod state_stream_fixture;

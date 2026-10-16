@@ -5,7 +5,7 @@
 //! cardinality (e.g. "eventonly:2"), two runs of one seed that delivered
 //! different batches of the same size at the same position would hash equal, and
 //! the audit would false-pass a real divergence. These tests pin that the digest
-//! is content-faithful for the subscription-update payloads.
+//! is content-faithful for the live state-frame payloads.
 
 use ankurah::proto::{self, Attested};
 use ankurah_tests::sim::model;
@@ -17,11 +17,20 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
         id: proto::UpdateId::new(),
         from: entity,
         to: entity,
-        body: proto::NodeUpdateBody::SubscriptionUpdate {
-            items: vec![proto::SubscriptionUpdateItem {
-                delta: proto::EntityDelta { entity_id: entity, content: proto::DeltaContent::EventBridge { events: vec![frag] } },
-                predicate_relevance: vec![],
-            }],
+        body: proto::NodeUpdateBody::StateFrame {
+            request_id: proto::RequestId::new(),
+            frame: proto::StateFrame {
+                comparison: proto::ComparisonId::new(),
+                sequence: 1,
+                body: proto::StateFrameBody::Live {
+                    revision: 1,
+                    items: vec![ankurah_tests::state_stream_fixture::change(proto::EntityDelta {
+                        entity_id: entity,
+                        content: proto::DeltaContent::EventBridge { events: vec![frag] },
+                    })],
+                    complete: true,
+                },
+            },
         },
     })
 }

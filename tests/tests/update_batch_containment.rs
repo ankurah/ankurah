@@ -5,8 +5,8 @@ use ankurah::core::storage::StorageEngine;
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent, View};
-use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
+use ankurah_tests::state_stream_fixture::ScriptedConnection;
 use anyhow::Result;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -26,20 +26,16 @@ fn forge_title_event(title_prop: proto::PropertyId, entity_id: proto::EntityId, 
     )
 }
 
-fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
-    proto::SubscriptionUpdateItem {
-        delta: proto::EntityDelta {
-            entity_id: event.entity_id,
-            content: proto::DeltaContent::EventBridge { events: vec![Attested::opt(event, None).into()] },
-        },
-        predicate_relevance: vec![],
+fn event_delta(event: proto::Event) -> proto::EntityDelta {
+    proto::EntityDelta {
+        entity_id: event.entity_id,
+        content: proto::DeltaContent::EventBridge { events: vec![Attested::opt(event, None).into()] },
     }
 }
 
-/// A multi-event EventOnly item delivered child-first must apply
-/// parent-first: wire order is untrusted for every multi-event shape, not
-/// just bridges. Without the sort, the child gap-jumps the head (its parents
-/// resolve via staging) and the parent's operations are silently dropped as
+/// A multi-event bridge delivered child-first must apply parent-first:
+/// wire order is untrusted for the whole entity delta. Without the sort, the
+/// child gap-jumps the head (its parents resolve via staging) and the parent's operations are silently dropped as
 /// already-history.
 #[tokio::test]
 async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
@@ -47,13 +43,11 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    let conn = ScriptedConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context_async(c).await?;
     let ctx_c = client.context_async(c).await?;
-
-    let _relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
     let rec_id = {
         let trx = ctx_s.begin();
@@ -62,6 +56,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         trx.commit().await?;
         id
     };
+    let relay = ctx_c.query_wait::<RecordView>("true").await?;
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
 
@@ -88,22 +83,13 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let ev_child = forge_title_event(title_prop, rec_id, proto::Clock::singleton(&ev_parent), "t-child");
     let (id_parent, id_child) = (ev_parent.id(), ev_child.id());
 
-    let item = proto::SubscriptionUpdateItem {
-        delta: proto::EntityDelta {
-            entity_id: rec_id,
-            content: proto::DeltaContent::EventBridge {
-                events: vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()],
-            },
+    let delta = proto::EntityDelta {
+        entity_id: rec_id,
+        content: proto::DeltaContent::EventBridge {
+            events: vec![Attested::opt(ev_child, None).into(), Attested::opt(ev_parent, None).into()],
         },
-        predicate_relevance: vec![],
     };
-    let update = proto::NodeUpdate {
-        id: proto::UpdateId::new(),
-        from: server.id,
-        to: client.id,
-        body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
-    };
-    client.handle_message(proto::NodeMessage::Update(update)).await?;
+    assert!(!conn.deliver(&relay, vec![delta]).await?, "valid child-first bridge keeps its stream active");
 
     // Both events applied in causal order: the parent's write survives.
     assert_eq!(view.title().unwrap(), "t-child", "child's write applied");
@@ -115,26 +101,20 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     Ok(())
 }
 
-/// V6: one bad item in a subscription update batch must not poison the rest.
-/// The middle item is an EventOnly (non-creation) for an entity the client
-/// has never seen: the empty-head guard rejects it. Items one and three must
-/// still apply, and the speculatively materialized empty-head resident for
-/// the unknown entity must be evicted rather than left as a phantom.
+/// A malformed publication fails its registered origin. An earlier complete
+/// publication remains durable; a later valid frame on that failed origin
+/// cannot apply. The unknown entity must leave neither state nor an event.
 #[tokio::test]
-async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
+async fn test_unknown_entity_fails_stream_without_corrupting_prior_publication() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    let conn = ScriptedConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context_async(c).await?;
     let ctx_c = client.context_async(c).await?;
-
-    // A live subscription (to anything) establishes the relay context that
-    // apply_updates requires for this peer. Held for the test's duration.
-    let _relay_context = ctx_c.query_wait::<RecordView>("true").await?;
 
     // Two records created on the server; the client materializes them at
     // their creation heads and holds them resident.
@@ -146,6 +126,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
         trx.commit().await?;
         ids
     };
+    let relay = ctx_c.query_wait::<RecordView>("true").await?;
     let view_a = ctx_c.get::<RecordView>(a_id).await?;
     let view_b = ctx_c.get::<RecordView>(b_id).await?;
     assert_eq!(view_a.title().unwrap(), "a0");
@@ -153,33 +134,21 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
 
     let title_prop = common::resolved_prop(&server, Record::descriptor(), "title");
 
-    // Forge the batch: valid events for A and B (parented on their current
-    // heads), and a non-creation event for an entity the client knows nothing
-    // about in the middle.
+    // Forge successive publications: valid A, an unknown non-creation
+    // entity, then valid B, all on the same registered stream origin.
     let ev_a = forge_title_event(title_prop, a_id, view_a.entity().head().clone(), "a1");
     let ev_b = forge_title_event(title_prop, b_id, view_b.entity().head().clone(), "b1");
     let unknown_id = proto::EntityId::random();
     let ev_unknown = forge_title_event(title_prop, unknown_id, proto::Clock::genesis(proto::EventId::from_bytes([7u8; 32])), "ghost");
     let (id_ev_a, id_ev_b) = (ev_a.id(), ev_b.id());
 
-    let update = proto::NodeUpdate {
-        id: proto::UpdateId::new(),
-        from: server.id,
-        to: client.id,
-        body: proto::NodeUpdateBody::SubscriptionUpdate {
-            items: vec![event_only_item(ev_a), event_only_item(ev_unknown), event_only_item(ev_b)],
-        },
-    };
+    assert!(
+        conn.deliver(&relay, vec![event_delta(ev_a), event_delta(ev_unknown), event_delta(ev_b)]).await?,
+        "the malformed publication must fail the registered stream"
+    );
 
-    // handle_message reports per-update failures to the sender via
-    // NodeUpdateAck::Error rather than its own return value; the aggregate
-    // ApplyError::Items surfaces there. What this test pins is the state
-    // outcome: containment, not batch poisoning.
-    client.handle_message(proto::NodeMessage::Update(update)).await?;
-
-    // Items one and three applied despite the failure in the middle.
-    assert_eq!(view_a.title().unwrap(), "a1", "item 1 must apply");
-    assert_eq!(view_b.title().unwrap(), "b1", "item 3 must apply");
+    assert_eq!(view_a.title().unwrap(), "a1", "earlier complete publication remains applied");
+    assert_eq!(view_b.title().unwrap(), "b0", "later same-origin publication must not apply");
 
     // The events that advance canonical state are durable on the client. The
     // unknown entity's invalid event never enters the append-only store.
@@ -187,7 +156,7 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     let b_events: Vec<_> = client.storage.dump_entity_events(b_id).await?.iter().map(|e| e.payload.id()).collect();
     let unknown_events: Vec<_> = client.storage.dump_entity_events(unknown_id).await?.iter().map(|e| e.payload.id()).collect();
     assert!(a_events.contains(&id_ev_a), "A's forged event must be committed on the client");
-    assert!(b_events.contains(&id_ev_b), "B's forged event must be committed on the client");
+    assert!(!b_events.contains(&id_ev_b), "later same-origin event must not be committed");
     assert!(unknown_events.is_empty(), "the unknown entity's invalid event must not enter the append-only store");
 
     // The speculative empty-head resident for the unknown entity was evicted:

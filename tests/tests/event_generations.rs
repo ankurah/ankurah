@@ -136,30 +136,24 @@ async fn an_ephemeral_node_admits_an_honest_update_over_parents_it_does_not_hold
     client.system.wait_system_ready().await?;
     let server_ctx = server.context_async(c).await?;
     let client_ctx = client.context_async(c).await?;
-    // A standing query with the server lets the client accept pushed updates from it.
-    let _relay = client_ctx.query_wait::<RecordView>("title = 'no-such-title'").await?;
 
     let trx = server_ctx.begin();
     let id = trx.create(&Record { title: "t0".to_owned(), artist: "a0".to_owned() }).await?.id();
     trx.commit().await?;
     let genesis = proto::EventId::from(id.to_bytes());
     let record = client_ctx.get::<RecordView>(id).await?;
+    let _relay = client_ctx.query_wait::<RecordView>("true").await?;
     let trx = server_ctx.begin();
     server_ctx.get::<RecordView>(id).await?.edit(&trx)?.title()?.set(&"t1".to_owned())?;
     let update = trx.commit_and_return_events().await?.remove(0);
     assert_eq!(update.parent, proto::Clock::genesis(genesis.clone()));
 
-    let item = proto::SubscriptionUpdateItem {
-        delta: proto::EntityDelta {
-            entity_id: id,
-            content: proto::DeltaContent::EventBridge { events: vec![proto::Attested::opt(update, None).into()] },
-        },
-        predicate_relevance: vec![],
-    };
-    let body = proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] };
-    client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate { id: proto::UpdateId::new(), from: server.id, to: client.id, body }))
-        .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while record.title().unwrap() != "t1" {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
 
     assert_eq!(record.title()?, "t1", "the honest update is admitted");
     assert!(!requested.lock().unwrap().contains(&genesis), "nothing asked the server for the parent");

@@ -1,13 +1,11 @@
 //! Wire-level adversarial suite (Phase 2 workstream C item 4, part 2).
 //!
 //! Every arm maps to a named claim in specs/concurrency/threat-model.md
-//! (C4-NN) and asserts phase 1 batch-containment semantics: a malformed or
-//! malicious item in a delivery is rejected and reported (the aggregate error
-//! travels to the sender on the ack path, so `handle_message` returns `Ok`
-//! while `NodeUpdateAckBody::Error` carries the failure) while sibling valid
-//! items still apply and the reactor is notified for the successful subset.
-//! The injection seam is `handle_message` with a hand-forged `NodeUpdate`,
-//! matching tests/tests/update_batch_containment.rs.
+//! (C4-NN) and asserts sequenced-stream containment semantics: a malformed or
+//! malicious delta fails its registered state stream without corrupting its
+//! entity. Earlier complete publications remain applied; later frames cannot
+//! continue the failed origin. The scripted peer uses the actual SubscribeQuery
+//! handle, sequence and publication targets, not an unsequenced mutation route.
 //!
 //! Arms targeting OPEN gaps (G-1, G-3, G-4) are `#[ignore]` red tests naming
 //! the gap id and owning issue; they pin what SHOULD happen and un-ignore when
@@ -19,8 +17,8 @@ use ankurah::core::property::backend::{lww::LWWBackend, PropertyBackend};
 use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent, View};
-use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
+use ankurah_tests::state_stream_fixture::ScriptedConnection;
 use anyhow::Result;
 use common::*;
 use std::collections::BTreeMap;
@@ -63,49 +61,24 @@ fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) 
     event
 }
 
-fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
-    proto::SubscriptionUpdateItem {
-        delta: proto::EntityDelta {
-            entity_id: event.entity_id,
-            content: proto::DeltaContent::EventBridge { events: vec![Attested::opt(event, None).into()] },
-        },
-        predicate_relevance: vec![],
+fn event_only_item(event: proto::Event) -> proto::EntityDelta { event_only_multi(event.entity_id, vec![event]) }
+fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> proto::EntityDelta {
+    proto::EntityDelta {
+        entity_id,
+        content: proto::DeltaContent::EventBridge { events: events.into_iter().map(|event| Attested::opt(event, None).into()).collect() },
     }
-}
-
-/// A single EventOnly item carrying several events (delivered in the given
-/// wire order, which the receiver must not trust).
-fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> proto::SubscriptionUpdateItem {
-    proto::SubscriptionUpdateItem {
-        delta: proto::EntityDelta {
-            entity_id,
-            content: proto::DeltaContent::EventBridge { events: events.into_iter().map(|e| Attested::opt(e, None).into()).collect() },
-        },
-        predicate_relevance: vec![],
-    }
-}
-
-fn deliver(from: proto::EntityId, to: proto::EntityId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
-    proto::NodeMessage::Update(proto::NodeUpdate {
-        id: proto::UpdateId::new(),
-        from,
-        to,
-        body: proto::NodeUpdateBody::SubscriptionUpdate { items },
-    })
 }
 
 /// Standard two-node fixture: a durable server that owns the data and an
-/// ephemeral client that holds a live relay context so `apply_updates` accepts
-/// forged deliveries attributed to the server. Returns the wired-up client and
-/// server plus their contexts; the connection guard is leaked into a Box so
-/// the caller only has to hold what it names.
+/// ephemeral client that holds a real standing stream for scripted deliveries.
+/// The connection guard and real query retain the registered origin.
 struct Fixture {
     server: Node<SledStorageEngine, PermissiveAgent>,
     client: Node<SledStorageEngine, PermissiveAgent>,
     ctx_s: ankurah::Context,
     ctx_c: ankurah::Context,
     model: proto::ModelId,
-    _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent>,
+    _conn: ScriptedConnection,
     _relay: ankurah::LiveQuery<RecordView>,
 }
 
@@ -113,12 +86,11 @@ async fn fixture() -> Result<Fixture> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
+    let _conn = ScriptedConnection::new(&server, &client).await?;
     let ctx_s = server.context_async(c).await?;
     let ctx_c = client.context_async(c).await?;
-    // A live subscription establishes the relay context apply_updates requires
-    // for this peer; held for the test's duration.
-    let _relay = ctx_c.query_wait::<RecordView>("title = 'no-such-title'").await?;
+    // A real standing query establishes the route and captured credential source.
+    let _relay = ctx_c.query_wait::<RecordView>("true").await?;
     let model = ctx_c.resolve_model_id::<Record>().await?;
     Ok(Fixture { server, client, ctx_s, ctx_c, model, _conn, _relay })
 }
@@ -135,6 +107,14 @@ async fn seed_record(f: &Fixture, title: &str, artist: &str) -> Result<(proto::E
     };
     let view = f.ctx_c.get::<RecordView>(id).await?;
     assert_eq!(view.title().unwrap(), title);
+    // Finish the real source publication before the scripted peer takes over
+    // this origin's sequence and revision counters.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !f._relay.ids().contains(&id) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     Ok((id, view))
 }
 
@@ -199,7 +179,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
             proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
+    assert!(!f._conn.deliver(&f._relay, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])]).await?);
 
     // The head is now the antichain {ev_b, ev_c}. Take one merge event and
     // re-parent a copy of it on the same two ids in the opposite order;
@@ -214,7 +194,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
     assert_eq!(ev_merge_a.id(), ev_merge_b.id(), "parent-clock input order must not change event identity");
 
     // Deliver the merge event; the resulting head is a single valid tip.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_merge_a.clone())])).await?;
+    assert!(!f._conn.deliver(&f._relay, vec![event_only_item(ev_merge_a.clone())]).await?);
     let head = view.entity().head();
     assert_eq!(head.len(), 1, "merge collapses the antichain to one tip");
     assert!(head.contains(&ev_merge_a.id()), "the merge event is the head");
@@ -228,9 +208,9 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
 
 /// C4-11 + C4-12 (via a forged parent, C4-09): an event whose parent clock
 /// references a nonexistent event id cannot ground its lineage. On the
-/// receiver it fails as a contained per-item error (the BFS fetch of the
-/// missing parent returns not-found), the sibling valid item still applies and
-/// notifies, and no phantom residue or head movement is left for the forged
+/// receiver it fails the stream (the BFS fetch of the missing parent returns
+/// not-found). The earlier complete valid publication remains applied, and
+/// no phantom residue or head movement is left for the forged
 /// entity. The forger cannot manufacture happened-before against history that
 /// does not exist.
 #[tokio::test]
@@ -247,12 +227,12 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     let ev_b_forged = forge_title_event(&f, b_id, dangling, "forged");
     let id_forged = ev_b_forged.id();
 
-    // handle_message returns Ok; the per-item failure rides the ack path.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_b_forged)])).await?;
+    // The valid publication completes before the malformed one fails this origin.
+    assert!(f._conn.deliver(&f._relay, vec![event_only_item(ev_a), event_only_item(ev_b_forged)]).await?);
 
     // A applied; B is unchanged, its head did not move, the forged event is not
     // committed, and B's real state survives.
-    assert_eq!(view_a.title().unwrap(), "a1", "sibling valid item must apply");
+    assert_eq!(view_a.title().unwrap(), "a1", "earlier complete publication must remain applied");
     assert_eq!(view_b.title().unwrap(), "b0", "forged event with a dangling parent must not apply");
     let b_head = view_b.entity().head();
     assert!(!b_head.contains(&id_forged), "forged event must not enter B's head");
@@ -261,18 +241,16 @@ async fn forged_dangling_parent_is_contained() -> Result<()> {
     Ok(())
 }
 
-/// C4-07: wholesale StrictDescends adoption (replace head, replay chain) must
-/// not fire when the subject smuggles a foreign line. A batch that extends the
-/// current head with a legitimate child AND an independent second genesis
-/// (V3's `{B, X}` over `{A}` shape) must merge the two lines, never adopt the
-/// subject clock wholesale. The forged independent root is contained: the
-/// legitimate child applies, the visible state is the merge of both branches,
-/// and the head remains a valid antichain.
+/// C4-07: a bridge smuggling a second genesis must fail atomically. Even its
+/// otherwise valid child cannot persist when the same entity delta contains
+/// an invalid foreign creation. The registered origin fails without replacing
+/// the real head or leaking either event into storage.
 #[tokio::test]
 async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Result<()> {
     let f = fixture().await?;
     let (rec_id, view) = seed_record(&f, "t0", "a0").await?;
     let head0 = view.entity().head().clone();
+    let before = view.entity().to_state()?;
 
     // A legitimate child B of the current head, and an independent genesis X
     // (empty parent) for the same entity id: X shares no lineage with the head.
@@ -292,21 +270,12 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
     let id_b = ev_b.id();
     let id_x = ev_x.id();
 
-    // Deliver both in one item. Whatever the applier's per-item verdict, the
-    // security property is: the legitimate child's write is not lost, and the
-    // foreign root does not get adopted as the sole head (which would discard
-    // the real genesis lineage).
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b, ev_x])])).await?;
+    assert!(f._conn.deliver(&f._relay, vec![event_only_multi(rec_id, vec![ev_b, ev_x])]).await?);
 
-    let head = view.entity().head();
-    // The original genesis lineage must not have been wholesale-replaced by the
-    // foreign root standing alone.
-    assert_ne!(head, proto::Clock::genesis(id_x), "foreign genesis must not be adopted as the wholesale head");
-    // The legitimate child either applied (its write survives) or the item was
-    // contained; in neither case may the foreign root have overwritten the
-    // entity to its own value.
-    assert_ne!(view.artist().unwrap(), "foreign-x", "foreign genesis must not win LWW as an adopted head");
-    let _ = id_b; // documented: id_b is the legitimate child's id
+    assert_eq!(view.entity().head(), head0, "invalid bridge cannot move the real head");
+    assert_eq!(view.entity().to_state()?, before, "invalid bridge cannot apply a valid prefix");
+    let committed = committed_event_ids(&f.client, rec_id).await?;
+    assert!(!committed.contains(&id_b) && !committed.contains(&id_x), "neither event in the rejected delta is committed");
     Ok(())
 }
 
@@ -389,7 +358,7 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
     let id1 = ev1.id();
     let id2 = ev2.id();
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev1, ev2])])).await?;
+    assert!(f._conn.deliver(&f._relay, vec![event_only_multi(rec_id, vec![ev1, ev2])]).await?);
 
     // Neither fabricated-parent event grounds (their parents do not exist), so
     // the entity is unchanged and no fabricated event enters the head.
@@ -407,7 +376,7 @@ async fn fabricated_cycle_batch_is_contained() -> Result<()> {
 /// valid event many times, and the same batch out of order, applies it exactly
 /// once: the visible state is stable after the first application, the head does
 /// not drift, the reactor is notified exactly once, and repeated redelivery
-/// never errors the batch. Content addressing collapses identical replays by
+/// never fails the stream. Content addressing collapses identical replays by
 /// id; the comparison engine skips an already-integrated event.
 #[tokio::test]
 async fn replay_flood_is_idempotent() -> Result<()> {
@@ -424,11 +393,11 @@ async fn replay_flood_is_idempotent() -> Result<()> {
 
     // Flood: 10 identical single-event deliveries, none may error.
     for _ in 0..10 {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev.clone())])).await?;
+        assert!(!f._conn.deliver(&f._relay, vec![event_only_item(ev.clone())]).await?);
     }
     // And the same event redelivered inside a multi-event batch alongside
     // itself (duplicate within one item), out of order.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])])).await?;
+    assert!(!f._conn.deliver(&f._relay, vec![event_only_multi(rec_id, vec![ev.clone(), ev.clone()])]).await?);
 
     assert_eq!(view.title().unwrap(), "t1", "state reflects exactly one application");
     let head = view.entity().head();
@@ -463,7 +432,15 @@ async fn forged_second_genesis_rejected_on_durable_node() -> Result<()> {
     let alt = forge_genesis_claiming(&f, rec_id, "ALT-GENESIS");
     assert!(alt.is_entity_create(), "alt is a creation event");
     let alt_id = alt.id();
-    f.server.handle_message(deliver(f.client.id, f.server.id, vec![event_only_item(alt)])).await?;
+    let response = f
+        .client
+        .request(
+            f.server.id,
+            &c,
+            proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![Attested::opt(alt, None)] },
+        )
+        .await;
+    assert!(matches!(response, Ok(proto::NodeResponseBody::Error(_)) | Err(_)), "forged genesis must be rejected");
 
     // The durable node rejected it (Disjoint): the committed event set is
     // unchanged and the alt genesis is not present.
@@ -490,7 +467,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
 
     let alt = forge_genesis_claiming(&f, rec_id, "ALT-EPH");
     let alt_id = alt.id();
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(alt)])).await?;
+    assert!(f._conn.deliver(&f._relay, vec![event_only_item(alt)]).await?);
 
     assert_eq!(view.title().unwrap(), "t0", "ephemeral node must not adopt the forged genesis' value");
     let head_after = view.entity().head();
@@ -503,7 +480,7 @@ async fn forged_second_genesis_rejected_on_ephemeral_node() -> Result<()> {
 /// C4-12: a non-creation EventOnly for an entity the receiver has never
 /// materialized is rejected (empty-head guard), and the speculatively
 /// materialized empty-head resident is evicted rather than left as a phantom.
-/// Delivered as a sibling of a valid item to also pin containment.
+/// Delivered after a valid complete publication to pin failure containment.
 #[tokio::test]
 async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     let f = fixture().await?;
@@ -514,9 +491,9 @@ async fn phantom_entity_is_evicted_on_failed_apply() -> Result<()> {
     // Non-creation event (non-empty parent) for an entity the client never saw.
     let ev_unknown = forge_title_event(&f, unknown_id, proto::Clock::genesis(proto::EventId::from_bytes([7u8; 32])), "ghost");
 
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev_a), event_only_item(ev_unknown)])).await?;
+    assert!(f._conn.deliver(&f._relay, vec![event_only_item(ev_a), event_only_item(ev_unknown)]).await?);
 
-    assert_eq!(view_a.title().unwrap(), "a1", "sibling valid item applies");
+    assert_eq!(view_a.title().unwrap(), "a1", "earlier complete publication remains applied");
     // The phantom empty-head resident was evicted: get() forces a retrieval
     // that fails (the server never had the entity) instead of returning an
     // empty-state view.
@@ -560,10 +537,8 @@ async fn oversized_event_batch_is_rejected() -> Result<()> {
     }
 
     let before = committed_event_ids(&f.client, rec_id).await?.len();
-    // handle_message returns Ok regardless (error rides the ack path); the
-    // observable expectation once #246 lands is that NOTHING from an oversized
-    // batch is committed. Today many events commit, so this assertion fails.
-    f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, events)])).await?;
+    // Once the event-count policy lands, reject the publication as a whole.
+    assert!(f._conn.deliver(&f._relay, vec![event_only_multi(rec_id, events)]).await?);
     let after = committed_event_ids(&f.client, rec_id).await?.len();
 
     assert_eq!(after, before, "an oversized batch must be rejected wholesale, committing nothing (G-3, #246)");
@@ -625,7 +600,7 @@ async fn equivocation_flood_antichain_is_bounded() -> Result<()> {
     const FLOOD: usize = 256;
     let siblings: Vec<proto::Event> = (0..FLOOD).map(|i| forge_title_event(&f, rec_id, head0.clone(), &format!("equiv-{i}"))).collect();
     for ev in siblings {
-        f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_item(ev)])).await?;
+        assert!(!f._conn.deliver(&f._relay, vec![event_only_item(ev)]).await?);
     }
 
     // A finite cap (whatever #246 chooses) would keep the head far below the

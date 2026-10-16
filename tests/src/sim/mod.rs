@@ -33,11 +33,11 @@
 //!   position and the seeded RNG) and are excluded from the semantic trace
 //!   digest, so they do not perturb the audit.
 //! - `Node::get_durable_peer_random()` uses `rand::thread_rng()` and is reached
-//!   by the event-gap-fill path in the SubscriptionUpdate applier
+//!   by the event-gap-fill path in the state-stream applier
 //!   (`CachedEventGetter`) when an event's parents are missing locally. The
 //!   harness avoids triggering it: every event a scenario delivers arrives with
 //!   its parents already present (single-event acceptance-retry on the
-//!   CommitTransaction path; pre-placed lineages on the SubscriptionUpdate
+//!   CommitTransaction path; pre-placed lineages on the state-stream
 //!   path). A future scenario that deliberately induces a cross-peer gap would
 //!   reach this `thread_rng` and must expect a determinism-audit failure until
 //!   that production path is made seedable. This boundary is flagged in the PR.

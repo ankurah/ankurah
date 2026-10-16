@@ -39,7 +39,7 @@ use ankurah_tests::sim::{body, coherence, run_recording, FaultConfig, Field, Loc
 /// must only grow.
 ///
 /// Each edit wave is drained with `settle()` before the next. A live ephemeral
-/// subscriber receives each committed change as a relayed `SubscriptionUpdate`
+/// subscriber receives each committed change as a sequenced live state frame
 /// whose outbound batching uses a real timer (`relay.rs` `ready_chunks`);
 /// piling several undrained edits into one faulted barrier lets that relay
 /// traffic accumulate against the timer and stalls the drain in wall-clock time
@@ -84,7 +84,7 @@ fn monotonic_reads_under_faults() {
 ///
 /// This asserts reproducibility of the session-guarantee outcome, not byte-equal
 /// traces. A scenario holding a live subscription cannot promise an identical
-/// trace on replay: the client relay drives outbound `SubscriptionUpdate`
+/// trace on replay: the client relay drives outbound live state frames
 /// batching on a real timer (`ready_chunks`) and sends on `task::spawn` tasks
 /// whose interleaving the seeded RNG does not control, so under machine load the
 /// relay Updates can land in different drain rounds and the trace digest differs

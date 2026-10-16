@@ -28,6 +28,7 @@ pub struct Workload<'a> {
     rng: &'a mut SimRng,
     trace: &'a mut Trace,
     next_entity: u64,
+    scripted_origins: std::collections::HashMap<(usize, usize), proto::ComparisonId>,
     /// How many update events this workload has forged. Folded into each one's
     /// nonce, so two edits the schedule asked for separately stay two events
     /// even when their content and parent are identical.
@@ -39,8 +40,8 @@ pub struct Workload<'a> {
     heads: std::collections::HashMap<proto::EntityId, proto::Clock>,
     /// Live subscriptions held open for the run's duration. Dropping a
     /// `LiveQuery` tears down its relay context, so scenarios that inject
-    /// SubscriptionUpdates keep them alive here.
-    subscriptions: Vec<ankurah::LiveQuery<super::model::SimRecordView>>,
+    /// scripted state-stream publications keep them alive here.
+    subscriptions: Vec<(usize, ankurah::LiveQuery<super::model::SimRecordView>)>,
     /// Recording subscriptions whose observed notification stream is checked for
     /// the C5 session guarantees after quiescence. Each also holds its `LiveQuery`
     /// and guard alive, so a recording subscription need not also be pushed to
@@ -123,12 +124,11 @@ impl<'a> Workload<'a> {
 
     /// Establish a live subscription on an (ephemeral) node against `predicate`,
     /// then settle so the SubscribeQuery request and its response flow. This is
-    /// the precondition for injecting SubscriptionUpdates at that node: the
-    /// applier requires a relay context for the sending peer. The subscription
+    /// the precondition for injecting sequenced publications at that node. The subscription
     /// is held open for the rest of the run.
     pub async fn subscribe(&mut self, node: usize, predicate: &str) {
         let lq = self.nodes[node].subscribe(predicate).expect("subscribe registers");
-        self.subscriptions.push(lq);
+        self.subscriptions.push((node, lq));
         self.settle().await;
     }
 
@@ -149,26 +149,47 @@ impl<'a> Workload<'a> {
         index
     }
 
-    /// Build and deliver a `StateAndEvents` SubscriptionUpdate carrying `origin`'s
-    /// current full state and event lineage for `entity` to `dst`, through the
-    /// scheduler. The groundable state snapshot always applies; used to prove
-    /// the SubscriptionUpdate path works and as the valid items around an
-    /// adversarial one.
-    pub async fn deliver_state_update(&mut self, origin: usize, dst: usize, entity: proto::EntityId) {
-        let item = self.state_and_event_item(origin, entity).await;
-        let message = self.subscription_update_message(origin, dst, vec![item]);
-        self.scheduler.enqueue(origin, dst, message);
+    /// Freeze the existing route before source-only adversarial changes, so
+    /// ordinary source frames cannot pre-apply the payload under test.
+    pub fn begin_scripted_stream(&mut self, origin: usize, dst: usize) -> proto::ComparisonId {
+        if let Some(comparison) = self.scripted_origins.get(&(origin, dst)) {
+            return *comparison;
+        }
+        let query =
+            self.subscriptions.iter().rev().find(|(node, _)| *node == dst).expect("standing subscription for scripted peer").1.query_id();
+        let comparison = self.nodes[origin].captured_origin(query, self.nodes[dst].id());
+        self.nodes[origin].begin_scripted(comparison);
+        self.scripted_origins.insert((origin, dst), comparison);
+        comparison
+    }
+    /// Create at the source without the simulation's independent commit-message
+    /// fanout; the scripted state frame must be what materializes the receiver.
+    pub async fn create_source_only(&mut self, origin: usize, field: Field, value: &str) -> proto::EntityId {
+        let event = model::genesis_event(self.next_entity, field, value);
+        self.next_entity += 1;
+        let id = event.entity_id;
+        let head = proto::Clock::singleton(&event);
+        self.nodes[origin].origin_commit(vec![model::attest(event)]).await.expect("source creation");
+        self.created.push(id);
+        self.heads.insert(id, head);
+        id
     }
 
-    /// Deliver an arbitrary set of pre-built subscription-update items as one
-    /// batch from `origin` to `dst`. This is the seam scenarios use to construct
-    /// the exact V4/V6 wire shapes (adversarially ordered EventBridge fragments, a
-    /// mix of valid and unknown-entity items). Delivered once, not
-    /// acceptance-retried, since the point is to exercise the applier's handling
-    /// of that specific batch.
-    pub fn deliver_items(&mut self, origin: usize, dst: usize, items: Vec<proto::SubscriptionUpdateItem>) {
-        let message = self.subscription_update_message(origin, dst, items);
-        self.scheduler.enqueue(origin, dst, message);
+    /// Deliver a captured snapshot on the actual standing stream.
+    pub async fn deliver_state_update(&mut self, origin: usize, dst: usize, entity: proto::EntityId) {
+        let delta = self.state_and_event_item(origin, entity).await;
+        self.deliver_items(origin, dst, vec![delta]).await;
+    }
+    /// A malicious source sends complete publications in order. Earlier valid
+    /// work can apply before failure; later frames retain the failed origin.
+    pub async fn deliver_items(&mut self, origin: usize, dst: usize, deltas: Vec<proto::EntityDelta>) -> bool {
+        let comparison = self.begin_scripted_stream(origin, dst);
+        for delta in deltas {
+            let message = self.nodes[origin].scripted_publication(comparison, delta);
+            self.scheduler.enqueue(origin, dst, message);
+            self.settle().await;
+        }
+        self.nodes[origin].origin_failed(comparison)
     }
 
     /// Apply forged events at a single node through the real remote-commit path,
@@ -185,42 +206,23 @@ impl<'a> Workload<'a> {
         }
     }
 
-    /// Build an `EventBridge` subscription-update item carrying the given forged
-    /// events (as fragments) for `entity`, in the exact order passed. Scenarios
-    /// pass a deliberately adversarial (e.g. child-first) order to probe the V4
-    /// bridge-ordering shape; the applier must still apply parent-first.
-    pub fn event_only_item(&self, entity: proto::EntityId, events: Vec<Attested<proto::Event>>) -> proto::SubscriptionUpdateItem {
-        let fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
-        proto::SubscriptionUpdateItem {
-            delta: proto::EntityDelta { entity_id: entity, content: proto::DeltaContent::EventBridge { events: fragments } },
-            predicate_relevance: vec![],
+    /// Explicit event delta; the stream fixture derives its captured target.
+    pub fn event_only_item(&self, entity: proto::EntityId, events: Vec<Attested<proto::Event>>) -> proto::EntityDelta {
+        proto::EntityDelta {
+            entity_id: entity,
+            content: proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() },
         }
     }
-
-    /// A `StateAndEvents` item for an entity from `origin`'s current stored
-    /// state and lineage.
-    pub async fn state_and_event_item(&self, origin: usize, entity: proto::EntityId) -> proto::SubscriptionUpdateItem {
+    pub async fn state_and_event_item(&self, origin: usize, entity: proto::EntityId) -> proto::EntityDelta {
         let state = self.nodes[origin].entity_state(entity).await.expect("origin holds entity state");
         let events = model::causal_sort(self.nodes[origin].stored_events(entity).await);
-        let state_fragment = proto::StateFragment { state, attestations: proto::AttestationSet::default() };
-        let event_fragments: Vec<proto::EventFragment> = events.into_iter().map(|e| e.into()).collect();
-        proto::SubscriptionUpdateItem {
-            delta: proto::EntityDelta {
-                entity_id: entity,
-                content: proto::DeltaContent::StateAndEvents { state: state_fragment, events: event_fragments },
+        proto::EntityDelta {
+            entity_id: entity,
+            content: proto::DeltaContent::StateAndEvents {
+                state: proto::StateFragment { state, attestations: proto::AttestationSet::default() },
+                events: events.into_iter().map(Into::into).collect(),
             },
-            predicate_relevance: vec![],
         }
-    }
-
-    /// Wrap items into a `NodeMessage::Update` addressed from `origin` to `dst`.
-    fn subscription_update_message(&self, origin: usize, dst: usize, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
-            from: self.nodes[origin].id(),
-            to: self.nodes[dst].id(),
-            body: proto::NodeUpdateBody::SubscriptionUpdate { items },
-        })
     }
 
     /// Reserve a deterministic entity id that is never created and must never be
@@ -446,6 +448,7 @@ where
                 rng: &mut rng,
                 trace: &mut trace,
                 next_entity: 0,
+                scripted_origins: Default::default(),
                 next_edit: 0,
                 created: Vec::new(),
                 heads: std::collections::HashMap::new(),

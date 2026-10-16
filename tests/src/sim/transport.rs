@@ -26,20 +26,126 @@ pub struct Outbound {
     pub message: proto::NodeMessage,
 }
 
-/// Shared sink for node-emitted messages, drained by the scheduler each step.
+/// Shared sink plus captured standing-route metadata for malicious-wire scenarios.
 #[derive(Clone, Default)]
-pub struct Captured(Arc<Mutex<Vec<Outbound>>>);
-
+pub struct Captured {
+    queue: Arc<Mutex<Vec<Outbound>>>,
+    streams: Arc<Mutex<std::collections::HashMap<proto::ComparisonId, ScriptedRoute>>>,
+}
+struct ScriptedRoute {
+    request: proto::RequestId,
+    query: proto::QueryId,
+    from: proto::EntityId,
+    to: proto::EntityId,
+    source_index: usize,
+    comparison: proto::ComparisonId,
+    next_sequence: u64,
+    next_revision: u64,
+    scripted: bool,
+    abandoned: bool,
+}
 impl Captured {
     pub fn new() -> Self { Self::default() }
-
-    fn push(&self, out: Outbound) { self.0.lock().unwrap().push(out); }
-
-    /// Remove and return everything captured since the last drain, preserving
-    /// insertion order. The scheduler decides what to do with them.
-    pub fn drain(&self) -> Vec<Outbound> { std::mem::take(&mut *self.0.lock().unwrap()) }
-
-    pub fn is_empty(&self) -> bool { self.0.lock().unwrap().is_empty() }
+    fn push(&self, out: Outbound) {
+        let mut streams = self.streams.lock().unwrap();
+        match &out.message {
+            proto::NodeMessage::Response(response) => {
+                if let proto::NodeResponseBody::QuerySubscribed { query_id, state } = &response.body {
+                    streams.insert(
+                        state.frame.comparison,
+                        ScriptedRoute {
+                            request: response.request_id.clone(),
+                            query: *query_id,
+                            from: response.from,
+                            to: response.to,
+                            source_index: out.src,
+                            comparison: state.frame.comparison,
+                            next_sequence: state.frame.sequence + 1,
+                            next_revision: state.round.revision + 1,
+                            scripted: false,
+                            abandoned: false,
+                        },
+                    );
+                }
+            }
+            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
+                if let Some(stream) = streams.get_mut(&frame.comparison) {
+                    if stream.scripted {
+                        return;
+                    }
+                    stream.next_sequence = stream.next_sequence.max(frame.sequence + 1);
+                    if let proto::StateFrameBody::Live { revision, .. } | proto::StateFrameBody::LiveChunk { revision, .. } = frame.body {
+                        stream.next_revision = stream.next_revision.max(revision + 1);
+                    }
+                }
+            }
+            proto::NodeMessage::Request { request, .. } => {
+                let comparison = match request.body {
+                    proto::NodeRequestBody::ContinueState { comparison, .. }
+                    | proto::NodeRequestBody::CloseComparison { comparison, .. } => Some(comparison),
+                    _ => None,
+                };
+                if let Some(stream) = comparison.and_then(|id| streams.get_mut(&id)).filter(|stream| stream.scripted) {
+                    if matches!(request.body, proto::NodeRequestBody::CloseComparison { outcome: proto::ComparisonOutcome::Abandoned, .. })
+                    {
+                        stream.abandoned = true;
+                    }
+                    // This scenario has become a malicious source. Its control
+                    // responses still cross the same seeded transport scheduler.
+                    self.queue.lock().unwrap().push(Outbound {
+                        src: stream.source_index,
+                        message: proto::NodeMessage::Response(proto::NodeResponse {
+                            request_id: request.id.clone(),
+                            from: request.to,
+                            to: request.from,
+                            body: proto::NodeResponseBody::Success,
+                        }),
+                    });
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.queue.lock().unwrap().push(out);
+    }
+    pub fn drain(&self) -> Vec<Outbound> { std::mem::take(&mut *self.queue.lock().unwrap()) }
+    pub fn is_empty(&self) -> bool { self.queue.lock().unwrap().is_empty() }
+    /// Select an actual captured origin once; callers retain this comparison
+    /// across failure, never selecting a replacement query generation.
+    pub fn captured_origin(&self, query: proto::QueryId, to: proto::EntityId) -> proto::ComparisonId {
+        let streams = self.streams.lock().unwrap();
+        let found: Vec<_> = streams.values().filter(|stream| stream.query == query && stream.to == to).collect();
+        assert_eq!(found.len(), 1, "one unambiguous standing query origin");
+        found[0].comparison
+    }
+    pub fn origin_failed(&self, comparison: proto::ComparisonId) -> bool {
+        self.streams.lock().unwrap().get(&comparison).is_some_and(|stream| stream.abandoned)
+    }
+    pub fn begin_scripted(&self, comparison: proto::ComparisonId) {
+        self.streams.lock().unwrap().get_mut(&comparison).expect("captured origin").scripted = true;
+    }
+    pub fn scripted_publication(&self, comparison: proto::ComparisonId, delta: proto::EntityDelta) -> proto::NodeMessage {
+        let mut streams = self.streams.lock().unwrap();
+        let stream = streams.get_mut(&comparison).expect("captured standing origin");
+        stream.scripted = true;
+        let frame = proto::StateFrame {
+            comparison: stream.comparison,
+            sequence: stream.next_sequence,
+            body: proto::StateFrameBody::Live {
+                revision: stream.next_revision,
+                items: vec![crate::state_stream_fixture::change(delta)],
+                complete: true,
+            },
+        };
+        stream.next_sequence += 1;
+        stream.next_revision += 1;
+        proto::NodeMessage::Update(proto::NodeUpdate {
+            id: proto::UpdateId::new(),
+            from: stream.from,
+            to: stream.to,
+            body: proto::NodeUpdateBody::StateFrame { request_id: stream.request.clone(), frame },
+        })
+    }
 }
 
 /// `PeerSender` bound to one logical source node, feeding `Captured`.
@@ -100,11 +206,6 @@ fn semantic_descriptor(message: &proto::NodeMessage) -> String {
             format!("RESP {}", response_descriptor(&response.body))
         }
         proto::NodeMessage::Update(update) => match &update.body {
-            proto::NodeUpdateBody::SubscriptionUpdate { items } => {
-                let mut parts: Vec<String> = items.iter().map(update_item_descriptor).collect();
-                parts.sort();
-                format!("UPD [{}]", parts.join(","))
-            }
             proto::NodeUpdateBody::StateFrame { frame, .. } => format!("FRAME {}", frame_descriptor(frame)),
         },
         proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
@@ -198,38 +299,4 @@ fn payload_digest(payload: &impl serde::Serialize) -> String {
     use base64::{engine::general_purpose, Engine as _};
     use sha2::{Digest, Sha256};
     general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bincode::serialize(payload).expect("comparison payload serializes")))
-}
-
-fn update_item_descriptor(item: &proto::SubscriptionUpdateItem) -> String {
-    let entity = item.delta.entity_id;
-    let kind = match &item.delta.content {
-        proto::DeltaContent::EventBridge { events } => format!("eventbridge:{}", fragment_ids(entity, events)),
-        proto::DeltaContent::StateAndEvents { state, events } => {
-            // The state fragment's head clock identifies the snapshot content
-            // deterministically (state buffers are a BTreeMap, the head is
-            // sorted), so hashing the head plus the event ids distinguishes two
-            // batches that differ only in payload.
-            format!("stateandevents:head={}:{}", state.state.head.to_base64_short(), fragment_ids(entity, events))
-        }
-        proto::DeltaContent::StateSnapshot { state } => format!("snapshot:{}", payload_digest(state)),
-        proto::DeltaContent::StateAndRelation { state, relation } => format!("staterelation:{}", payload_digest(&(state, relation))),
-    };
-    let membership: Vec<_> = item.predicate_relevance.iter().map(|(_, change)| change).collect();
-    format!("{}/{} relevance:{}", entity.to_base64_short(), kind, payload_digest(&membership))
-}
-
-/// Sorted, joined content-derived event ids for a set of `EventFragment`s.
-/// `EventFragment` omits the event id, but every field the id hashes is in
-/// the fragment's body (plus the entity id the caller supplies), so we
-/// rebuild the event and recompute it: this makes the digest faithful to the
-/// batch's actual events, not merely their count. Keying on the count alone
-/// would let two different batches for one entity share a digest and
-/// false-pass the determinism audit.
-fn fragment_ids(entity: proto::EntityId, fragments: &[proto::EventFragment]) -> String {
-    let mut ids: Vec<String> = fragments
-        .iter()
-        .map(|f| proto::Event { entity_id: entity, parent: f.parent.clone(), body: f.body.clone() }.id().to_base64_short())
-        .collect();
-    ids.sort();
-    ids.join("+")
 }

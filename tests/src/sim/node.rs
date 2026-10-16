@@ -54,6 +54,15 @@ impl SimNode {
             .expect("sim peers share this build's protocol version");
     }
 
+    pub fn captured_origin(&self, query: proto::QueryId, to: proto::EntityId) -> proto::ComparisonId {
+        self.captured.captured_origin(query, to)
+    }
+    pub fn origin_failed(&self, comparison: proto::ComparisonId) -> bool { self.captured.origin_failed(comparison) }
+    pub fn begin_scripted(&self, comparison: proto::ComparisonId) { self.captured.begin_scripted(comparison); }
+    pub fn scripted_publication(&self, comparison: proto::ComparisonId, delta: proto::EntityDelta) -> proto::NodeMessage {
+        self.captured.scripted_publication(comparison, delta)
+    }
+
     /// Ingest a forged batch of events directly through the production remote
     /// commit path, as if this node had received a `CommitTransaction` it
     /// accepted. Used to seed a change at an origin node deterministically.
@@ -66,9 +75,8 @@ impl SimNode {
     }
 
     /// Register a live query for `SimRecord` on this (ephemeral) node against a
-    /// predicate. This drives the real subscription relay to register a context
-    /// for the durable peer, which the `SubscriptionUpdate` applier
-    /// (`apply_updates`) requires before it will process a batch from that peer.
+    /// predicate. This establishes the real sequenced route and captured
+    /// credential source before adversarial publications can be injected.
     /// The returned `LiveQuery` must be held for the subscription's lifetime.
     /// The scheduler must be settled after this so the SubscribeQuery request
     /// and its response flow.
