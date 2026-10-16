@@ -94,7 +94,8 @@ pub enum StateFrameBody {
         progress: ComparisonProgress,
     },
     /// Absolute source membership plus optional causal data. A publication may
-    /// span frames; only `complete` advances its membership/application boundary.
+    /// span frames. After `complete` and actual target coverage, the receiver
+    /// publishes its membership and accepted events together, in revision order.
     Live {
         revision: u64,
         items: Vec<QueryChange>,
@@ -229,7 +230,9 @@ pub struct KnownLeaf {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ComparisonOutcome {
     /// After Complete, the round's offered targets are covered and local result
-    /// installation succeeded. Release only that round's snapshot.
+    /// installation succeeded, including live publications through its captured
+    /// revision. Later live publications do not hold completion open.
+    /// Release only that round's snapshot.
     /// processed_through covers enumeration through Complete and returns frame
     /// credit (including frame 0). Independent live application may already cover
     /// a target whose requested history is still in flight; that work can retire.

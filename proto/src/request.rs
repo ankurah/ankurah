@@ -179,8 +179,9 @@ pub enum NodeRequestBody {
         /// Credit-only feedback needs no active round.
         round: Option<u64>,
         processed_through: u64,
-        /// Actual causal coverage through a complete live publication, distinct
-        /// from frame receipt credit. Releases retained live repair targets.
+        /// Actual causal coverage and local publication through a complete live
+        /// revision, distinct from frame receipt credit. Releases retained live
+        /// repair targets.
         applied_through: Option<u64>,
         answers: Vec<StateAnswer>,
     },

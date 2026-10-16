@@ -77,3 +77,42 @@ async fn live_limit_replacement_publishes_one_membership_batch_with_both_event_s
     assert_eq!(watcher.quiesce().await, 0, "the publication must not also emit separate duplicate changes");
     Ok(())
 }
+
+#[tokio::test]
+async fn reconnect_updates_an_existing_member_without_replaying_historical_events() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server.system.create().await?;
+    server.wait_ready().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let pet = trx.create(&Pet { name: "Rex".into(), age: "1".into() }).await?.read()?;
+    trx.commit().await?;
+    let connection = LocalProcessConnection::new(&client, &server).await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let query = reader.query_wait::<PetView>(nocache("true")?).await?;
+    query.wait_durable_answered().await?;
+    let retained = query.peek()[0].clone();
+    drop(connection);
+    let trx = writer.begin();
+    pet.edit(&trx)?.age()?.replace("2")?;
+    trx.commit().await?;
+    assert_eq!(retained.age()?, "1", "the client missed the offline edit");
+    let watcher = TestWatcher::changeset_with_event_ids();
+    let _guard = query.subscribe(&watcher);
+    let _connection = LocalProcessConnection::new(&client, &server).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while retained.age().as_deref() != Ok("2") {
+            tokio::task::yield_now().await;
+        }
+        query.wait_durable_answered().await
+    })
+    .await??;
+    assert_eq!(query.ids(), [pet.id()]);
+    let changes = watcher.quiesce_drain().await;
+    let updates: Vec<_> = changes.iter().flatten().filter(|(id, _, _)| *id == pet.id()).collect();
+    assert_eq!(updates.len(), 1, "refreshing an existing row emits one update: {changes:?}");
+    assert_eq!(updates[0].1, ChangeKind::Update);
+    assert!(updates[0].2.is_empty(), "initial transfer must not replay missed historical events");
+    Ok(())
+}
