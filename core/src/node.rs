@@ -317,8 +317,7 @@ where
         // Get and cleanup subscriptions before removing the peer
         if let Some(peer_state) = self.peer_connections.remove(&node_id) {
             peer_state.incoming_states.close();
-            action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
-            // ReactorSubscription is automatically unsubscribed on drop
+            action_info!(self, "unsubscribing", "query streams for peer {}", node_id);
         }
 
         // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)

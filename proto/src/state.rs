@@ -132,7 +132,9 @@ pub struct QueryMember {
 
 /// One absolute membership decision. None means absent, including removals
 /// for which the source may not disclose entity data. A Present with no data
-/// still requires proof that the local entity covers its target head.
+/// still requires proof that the local entity covers its target head. An Absent
+/// with data must carry a state target; an EventBridge alone has no explicit
+/// target and is permitted only with Present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryChange {
     pub entity_id: EntityId,

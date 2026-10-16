@@ -132,6 +132,7 @@ struct Stream {
     live_repairs: VecDeque<Work>,
     pending_live_repairs: HashSet<Vec<u8>>,
     last_live_complete: Option<u64>,
+    completed_live: VecDeque<(u64, u64)>,
     applied_through: Option<u64>,
     next_lane: usize,
 }
@@ -293,6 +294,13 @@ impl Stream {
             self.retained.len() < MAX_INFLIGHT_FRAMES && self.bytes + bytes <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 },
             "state replay window exhausted"
         );
+        if let StateFrameBody::Live { revision, complete: true, .. } | StateFrameBody::LiveChunk { revision, complete: true, .. } =
+            &frame.body
+        {
+            ensure!(self.completed_live.len() < MAX_LIVE_ITEMS, "unapplied live publication window exhausted");
+            self.last_live_complete = Some(*revision);
+            self.completed_live.push_back((*revision, frame.sequence));
+        }
         self.last_sent = frame.sequence;
         self.bytes += bytes;
         self.retained.push_back(Retained { frame: Arc::new(frame), bytes });
@@ -335,9 +343,17 @@ impl Stream {
     }
 
     fn acknowledge_live(&mut self, revision: u64) -> anyhow::Result<()> {
-        ensure!(self.last_live_complete.is_some_and(|last| revision <= last), "application exceeds completed live publications");
         if self.applied_through.is_some_and(|previous| revision <= previous) {
             return Ok(());
+        }
+        let sequence = self
+            .completed_live
+            .iter()
+            .find_map(|(sent, sequence)| (*sent == revision).then_some(*sequence))
+            .ok_or_else(|| anyhow::anyhow!("application does not name a completed live publication"))?;
+        ensure!(self.processed.is_some_and(|processed| sequence <= processed), "application exceeds processed frames");
+        while self.completed_live.front().is_some_and(|(sent, _)| *sent <= revision) {
+            self.completed_live.pop_front();
         }
         // Membership-only publications may have no target ledger entry. The
         // ordered complete boundary, rather than the presence of a target, is authoritative.
@@ -365,9 +381,6 @@ impl Stream {
                 complete,
             };
             assembly.offset = end;
-            if complete {
-                self.last_live_complete = Some(assembly.revision);
-            }
             if last {
                 self.live_chunk = None;
             }
@@ -420,7 +433,6 @@ impl Stream {
         let complete = queue.publications.front().unwrap().items.is_empty();
         if complete {
             queue.publications.pop_front();
-            self.last_live_complete = Some(revision);
         }
         Ok(Some(StateFrameBody::Live { revision, items, complete }))
     }
@@ -578,6 +590,7 @@ where
         live_repairs: VecDeque::new(),
         pending_live_repairs: HashSet::new(),
         last_live_complete: None,
+        completed_live: VecDeque::new(),
         applied_through: None,
         next_lane: 0,
     };
@@ -846,6 +859,10 @@ where
     let session = connection.comparisons.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
     ensure!(session.query.is_some(), "Fetch has no live route");
     ensure!(revision > session.initial_round.revision, "live publication does not follow the initial cut");
+    ensure!(
+        items.iter().all(|item| item.member.is_some() || !matches!(item.delta, Some(proto::DeltaContent::EventBridge { .. }))),
+        "absent live bridge has no explicit causal target"
+    );
     let sizes = items.iter().map(|item| bincode::serialized_size(item).map(|size| size as usize)).collect::<Result<Vec<_>, _>>()?;
     let bytes = sizes.iter().sum::<usize>();
     let mut queue = session.live.lock().unwrap();
@@ -1027,6 +1044,7 @@ where
     state.last_refresh = None;
     state.live_chunk = None;
     state.live_targets.clear();
+    state.completed_live.clear();
     state.target_bytes = 0;
     state.live_repairs.clear();
     state.pending_live_repairs.clear();
