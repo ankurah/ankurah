@@ -822,6 +822,22 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     assert!(next_capture.upgrade().is_none());
     assert!(session.state.lock().await.comparison.is_none());
     assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_some(), "the standing stream survives");
+    for round in 2..=32 {
+        let next = snapshot(states(1, 8)).await?;
+        let captured = Arc::downgrade(next.states.values().next().unwrap());
+        schedule_round(&node, peer, id, round, round, next, empty.offer().await?).await?;
+        pump_comparison(&node, peer, id).await?;
+        let last = session.state.lock().await.required_through;
+        close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round, processed_through: last }, vec![]).await?;
+        assert!(captured.upgrade().is_none(), "round {round} retained captured rows");
+        let state = session.state.lock().await;
+        assert!(state.comparison.is_none() && state.pending_round.is_none());
+        assert!(state.retained.is_empty());
+        assert_eq!(state.bytes, 0);
+    }
+    let connection = node.peer_connections.get(&peer).unwrap();
+    assert_eq!(connection.comparisons.sessions.lock().unwrap().len(), 1);
+    assert_eq!(connection.comparisons.origins.lock().unwrap().len(), 1, "new rounds do not allocate new stream origins");
     Ok(())
 }
 
@@ -931,6 +947,14 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
     let target = proto::Clock::singleton(&genesis);
     let mut trx = node.storage.transaction();
     trx.add_events(&[proto::Attested::opt(genesis.clone(), None)]).await?;
+    trx.set_state(
+        &Default::default(),
+        &proto::Attested::from(proto::EntityState {
+            entity_id: genesis.entity_id,
+            state: proto::State { head: target.clone(), ..Default::default() },
+        }),
+    )
+    .await?;
     trx.commit().await?;
     let initial = start_comparison(
         &node,
