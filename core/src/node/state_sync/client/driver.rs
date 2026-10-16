@@ -1005,7 +1005,9 @@ impl Driver {
             } else {
                 HashSet::new()
             };
-            self.round_changed.retain(|id| !actual_changes.contains(id) || !notified.contains(id));
+            for id in actual_changes.intersection(&notified) {
+                self.round_changed.remove(id);
+            }
             self.applied_through = Some(publication.revision);
             advanced = true;
         }
