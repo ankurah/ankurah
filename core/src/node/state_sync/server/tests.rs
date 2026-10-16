@@ -795,6 +795,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let (node, peer, _) = node().await?;
     let first = snapshot(states(1, 8)).await?;
     let captured = Arc::downgrade(first.states.values().next().unwrap());
+    let old = first.states.values().next().unwrap().payload.clone();
     let initial =
         start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], Some((proto::QueryId::new(), 1)), false, 0, first, None)
             .await?;
@@ -813,7 +814,32 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     pump_comparison(&node, peer, id).await?;
     close_state(&node, peer, id, applied, vec![]).await?;
     assert!(next_capture.upgrade().is_some(), "repeating an old Applied cannot release the new snapshot");
-    assert!(continue_state(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, vec![], vec![]).await.is_err());
+    let (members, targets) = {
+        let state = session.state.lock().await;
+        let comparison = state.comparison.as_ref().unwrap();
+        assert!(comparison.work.is_empty());
+        assert!(comparison.pending_repairs.is_empty());
+        (comparison.snapshot.members(), comparison.offered.clone())
+    };
+    for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.state.head }]] {
+        assert!(
+            matches!(
+                continue_state(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, answers, vec![]).await?,
+                proto::NodeResponseBody::Success
+            ),
+            "late round-zero feedback must be harmless after a newer live decision covered its target"
+        );
+        let state = session.state.lock().await;
+        let comparison = state.comparison.as_ref().unwrap();
+        assert_eq!(state.round.number, 1);
+        assert_eq!(comparison.snapshot.members(), members);
+        assert_eq!(comparison.offered, targets);
+        assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
+    }
+    assert!(
+        continue_state(&node, peer, proto::RequestId::new(), id, Some(2), 0, None, vec![], vec![]).await.is_err(),
+        "future-round feedback is invalid"
+    );
     let last = session.state.lock().await.required_through;
     assert_eq!(session.state.lock().await.round.number, 1);
     let applied = proto::ComparisonOutcome::Applied { round: 1, processed_through: last };
@@ -1057,13 +1083,26 @@ async fn absent_event_bridge_is_rejected_before_it_can_create_an_unrepairable_ta
 }
 
 #[tokio::test]
-async fn unavailable_late_repair_cannot_be_acknowledged_as_applied() -> anyhow::Result<()> {
+async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair_receipt() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let source = states(1, 1);
-    let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(source.clone()).await?, None)
-            .await?;
+    let initial = start_comparison(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((proto::QueryId::new(), 1)),
+        false,
+        0,
+        snapshot(source.clone()).await?,
+        None,
+    )
+    .await?;
+    assert_eq!(state_items(&initial.frame).1, ComparisonProgress::Complete);
     let id = initial.frame.comparison;
+    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    session.pumping.store(true, Ordering::Release);
     let entity = &source[0].payload;
     continue_state(
         &node,
@@ -1078,13 +1117,47 @@ async fn unavailable_late_repair_cannot_be_acknowledged_as_applied() -> anyhow::
     )
     .await?;
     pump_comparison(&node, peer, id).await?;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let last = {
+        let state = session.state.lock().await;
+        let frame = &state.retained.back().unwrap().frame;
+        assert!(state_items(frame).0.iter().any(|item| matches!(item, StateItem::RepairUnavailable { .. })));
+        assert_eq!(state.required_through, 0, "late repair must not move the finite enumeration boundary");
+        assert!(state.last_sent > 0);
+        state.last_sent
+    };
+    // A live delivery may have covered the target independently. The receiver
+    // proves that coverage; the sender accepts its claim through Complete.
+    close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, vec![]).await?;
+    {
+        let state = session.state.lock().await;
+        assert!(state.comparison.is_none());
+        assert!(
+            state.retained.iter().any(|retained| retained.frame.sequence == last),
+            "late repair still consumes receipt credit after the snapshot retires"
+        );
+    }
+    let mut empty = snapshot(vec![]).await?;
+    let offer = empty.offer().await?;
+    schedule_round(&node, peer, id, 1, 1, empty, offer).await?;
+    pump_comparison(&node, peer, id).await?;
+    continue_state(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        id,
+        Some(0),
+        last,
+        None,
+        vec![StateAnswer::NeedRepair { entity_id: entity.entity_id, target: entity.state.head.clone() }],
+        vec![],
+    )
+    .await?;
     let state = session.state.lock().await;
-    let frame = &state.retained.back().unwrap().frame;
-    assert!(state_items(frame).0.iter().any(|item| matches!(item, StateItem::RepairUnavailable { .. })));
-    let last = state.last_sent;
-    drop(state);
-    assert!(close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: last }, vec![]).await.is_err());
+    let comparison = state.comparison.as_ref().unwrap();
+    assert_eq!(state.round.number, 1);
+    assert!(comparison.snapshot.members().is_empty());
+    assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
+    assert!(state.retained.iter().all(|retained| retained.frame.sequence > last));
     Ok(())
 }
 
