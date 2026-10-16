@@ -1,5 +1,4 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, subscription::QueryId, DeltaContent, EntityDelta};
-use crate::{RequestId, StateFrame};
+use crate::{id::EntityId, RequestId, StateFrame};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -8,8 +7,6 @@ pub struct UpdateId(Ulid);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeUpdateBody {
-    /// New events for a subscription
-    SubscriptionUpdate { items: Vec<SubscriptionUpdateItem> },
     /// Continuation of Fetch or SubscribeQuery; route by the original request
     /// even if this frame outruns its metadata response. Apply only after frame 0
     /// validates. UpdateAck is routing receipt here; ContinueState returns credit.
@@ -25,26 +22,6 @@ pub enum MembershipChange {
     Add,
     /// Entity no longer matches predicate (was matching before)  
     Remove,
-}
-
-/// A single entity update with all subscription relevance information
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct SubscriptionUpdateItem {
-    pub delta: EntityDelta,
-    /// Which predicates this update is relevant to and how
-    /// Uses PredicateId for remote subscriptions
-    pub predicate_relevance: Vec<(QueryId, MembershipChange)>,
-}
-
-impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
-    type Error = anyhow::Error;
-    fn try_from(value: SubscriptionUpdateItem) -> Result<Self, Self::Error> {
-        match value.delta.content {
-            DeltaContent::StateSnapshot { state } | DeltaContent::StateAndEvents { state, .. } => Ok((value.delta.entity_id, state).into()),
-            DeltaContent::EventBridge { .. } => Err(anyhow::anyhow!("Cannot convert event-only update to entity state")),
-            DeltaContent::StateAndRelation { .. } => Err(anyhow::anyhow!("StateAndRelation is not supported for live updates")),
-        }
-    }
 }
 
 /// An update from one node to another
@@ -101,24 +78,10 @@ impl std::fmt::Display for NodeUpdateBody {
             NodeUpdateBody::StateFrame { request_id, frame } => {
                 write!(f, "StateFrame {request_id} {} sequence:{}", frame.comparison, frame.sequence)
             }
-            NodeUpdateBody::SubscriptionUpdate { items } => {
-                write!(f, "SubscriptionUpdate [{}]", items.iter().map(|i| format!("{}", i)).collect::<Vec<_>>().join(", "))
-            }
         }
     }
 }
 
-impl std::fmt::Display for SubscriptionUpdateItem {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.delta)?;
-
-        if !self.predicate_relevance.is_empty() {
-            write!(f, " predicates:{}", self.predicate_relevance.len())?;
-        }
-
-        Ok(())
-    }
-}
 impl std::fmt::Display for NodeUpdateAckBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

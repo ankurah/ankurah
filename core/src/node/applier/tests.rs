@@ -1572,32 +1572,22 @@ async fn concurrent_identical_live_states_publish_once() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The unsequenced wrapper requires a standing subscription. The stream owner
-/// uses apply_delta directly with its captured credential source.
+/// The stream owner applies a delta with its captured credential source; no
+/// unrelated relay subscription is required by the shared entity applier.
 #[tokio::test]
-async fn unsequenced_updates_require_a_subscription_but_single_delta_application_does_not() -> anyhow::Result<()> {
+async fn live_delta_application_uses_its_captured_event_source() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let incoming =
         Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
     let snapshot = fixture.remote_snapshot(&incoming).await?;
-    let before = fixture.entity.to_state()?;
-    let item = || proto::SubscriptionUpdateItem {
-        delta: proto::EntityDelta {
-            entity_id: fixture.entity.id(),
-            content: proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([incoming.clone()]) },
-        },
-        predicate_relevance: vec![],
+    let delta = proto::EntityDelta {
+        entity_id: fixture.entity.id(),
+        content: proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([incoming.clone()]) },
     };
-
-    let error = NodeApplier::apply_updates(&fixture.node, &peer(), vec![item()]).await.expect_err("no standing subscription with the peer");
-    assert!(matches!(&error, ApplyError::MutationError(cause) if matches!(**cause, MutationError::InvalidUpdate(_))), "{error}");
-    assert_eq!(fixture.entity.to_state()?, before);
-    assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
-
     NodeApplier::apply_delta(
         &fixture.node,
         &peer(),
-        item().delta,
+        delta,
         Delivery::Live,
         &fixture.events,
         &LocalStateGetter::new(fixture.storage.clone()),

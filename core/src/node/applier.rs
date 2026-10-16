@@ -2,7 +2,7 @@ use crate::entity::RemoteTrxEntity;
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
 use crate::reactor::ChangeNotification;
-use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::retrieval::{LocalStateGetter, SuspenseEvents};
 use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
@@ -55,85 +55,6 @@ impl DeltaOutcome {
 }
 
 impl NodeApplier {
-    /// Apply a batch of live updates pushed outside any sequenced stream, from a
-    /// peer we hold a standing query with. Such a push names no single query,
-    /// so it runs under the union of every standing query's credentials with
-    /// that peer. Every item is attempted; successful changes are notified before
-    /// aggregated failures are returned.
-    pub(crate) async fn apply_updates<SE, PA>(
-        node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
-        items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> Result<(), ApplyError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let Some(relay) = &node.subscription_relay else {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay").into());
-        };
-        // A peer may push only what we asked it for, so a push is admissible
-        // only against a standing query of ours with that peer.
-        if !relay.has_subscription_with_peer(from_peer_id) {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription with").into());
-        }
-        let credentials = relay.get_contexts_for_peer(from_peer_id);
-        tracing::debug!("received subscription update for {} items", items.len());
-        let event_getter = CachedEventGetter::new(node, &credentials);
-        let state_getter = LocalStateGetter::new(node.storage.clone());
-
-        let mut changes = Vec::new();
-        let mut memberships = Vec::new();
-        let mut errors: Vec<ApplyErrorItem> = Vec::new();
-        for item in items {
-            let entity_id = item.delta.entity_id;
-            match Self::apply_delta(node, from_peer_id, item.delta, Delivery::Live, &event_getter, &state_getter).await {
-                Ok(outcome) => {
-                    changes.extend(outcome.change);
-                    let failure = outcome.divergence.map(Self::live_divergence_failure);
-                    match failure {
-                        Some(cause) => {
-                            tracing::warn!("failed to apply update for {}: {}", entity_id, cause);
-                            errors.push(ApplyErrorItem { entity_id, cause });
-                        }
-                        None => {
-                            if let Some(entity) = outcome.entity {
-                                memberships.extend(item.predicate_relevance.into_iter().map(|(query, _)| (query, entity.clone())));
-                            }
-                        }
-                    }
-                }
-                Err(cause) => {
-                    tracing::warn!("failed to apply update for {}: {}", entity_id, cause);
-                    errors.push(ApplyErrorItem { entity_id, cause });
-                }
-            }
-        }
-
-        node.reactor.notify_change(changes).await;
-        for (query, entity) in memberships {
-            if let Some(query) = node.live_queries.get(query) {
-                if let Err(error) = query.refresh_membership(entity).await {
-                    tracing::debug!(%error, "query disappeared during membership delivery");
-                }
-            }
-        }
-
-        if !errors.is_empty() {
-            return Err(ApplyError::Items(errors));
-        }
-        Ok(())
-    }
-
-    /// A live update carries the sender's own commit with the events that connect
-    /// it, so an entity that still diverges afterwards is missing an earlier
-    /// update. That is a broken stream, not progress: the batch reports it as a
-    /// failure so the stream owner can restart from a known generation.
-    fn live_divergence_failure(divergence: Divergence) -> MutationError {
-        tracing::warn!(entity = %divergence.entity_id, target = %divergence.target, actual = %divergence.actual, "live update left local state divergent");
-        MutationError::InvalidUpdate("live update diverged from local state and its events did not connect them")
-    }
-
     /// Apply initial-transfer deltas concurrently, notifying the reactor for each
     /// batch that completes together. A concurrent bare snapshot may leave the
     /// local entity unchanged; callers needing causal coverage use apply_delta

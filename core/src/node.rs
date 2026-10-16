@@ -625,12 +625,6 @@ where
 
         match notification.body {
             proto::NodeUpdateBody::StateFrame { request_id, frame } => _connection.incoming_states.route(&request_id, frame),
-            proto::NodeUpdateBody::SubscriptionUpdate { items } => {
-                tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                self.system.require_system_ready()?;
-                crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
-                Ok(())
-            }
         }
     }
 
