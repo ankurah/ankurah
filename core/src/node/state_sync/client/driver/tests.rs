@@ -70,15 +70,11 @@ async fn finite_round_waits_its_pre_cut_publications_but_not_later_data() -> any
     Ok(())
 }
 
-async fn query_driver(
-    node: &TestNode,
-    entity: &crate::entity::Entity,
-) -> anyhow::Result<(Driver, Arc<super::super::super::IncomingStates>, crate::livequery::EntityLiveQuery)> {
+async fn local_query(node: &TestNode) -> anyhow::Result<crate::livequery::EntityLiveQuery> {
     use crate::{
         context::Context,
         livequery::{EntityLiveQuery, QueryResolution},
         node::CachePolicy,
-        peer_subscription::RemoteQuerySubscriber,
     };
     let query = EntityLiveQuery::new(
         Context::new(node.clone(), crate::policy::DEFAULT_CONTEXT).0,
@@ -86,18 +82,33 @@ async fn query_driver(
         QueryResolution::Resolved(ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }),
     )?;
     tokio::time::timeout(std::time::Duration::from_secs(2), query.wait_initialized()).await??;
+    Ok(query)
+}
+
+async fn bind_query_driver(
+    node: &TestNode,
+    entity: &crate::entity::Entity,
+    query: crate::livequery::EntityLiveQuery,
+) -> anyhow::Result<(Driver, Arc<super::super::super::IncomingStates>, crate::livequery::EntityLiveQuery)> {
+    use crate::peer_subscription::RemoteQuerySubscriber;
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
     let snapshot = super::super::super::QueryTree::default()
         .refresh(spec, vec![proto::Attested::opt(proto::EntityState { entity_id: entity.id(), state: entity.to_state()? }, None)])
         .await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
-    let stream = registry.register(proto::RequestId::new(), None, None)?;
+    let stream = registry.register(proto::RequestId::new(), Some((query.query_id(), 1)), None)?;
     query.weak().stream_bound(1, stream.request.clone(), Arc::new(|| false));
     let mut driver = Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::ComparisonId::new())?;
     driver.prepare(node, Some((query.query_id(), 1))).await?;
     Ok((driver, registry, query))
 }
 
+async fn query_driver(
+    node: &TestNode,
+    entity: &crate::entity::Entity,
+) -> anyhow::Result<(Driver, Arc<super::super::super::IncomingStates>, crate::livequery::EntityLiveQuery)> {
+    bind_query_driver(node, entity, local_query(node).await?).await
+}
 #[tokio::test]
 async fn live_present_for_known_but_ineligible_row_requires_an_install() -> anyhow::Result<()> {
     let (node, _, _registry) = fixture(vec![]).await?;
@@ -197,6 +208,218 @@ async fn actual_owner_publication_retires_round_update_but_metadata_only_does_no
         if actual_live {
             assert_eq!(updates[0].items[0].events[0].payload.id(), event.id());
         }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_round_pins_applied_residents_through_install_without_storage_reload() -> anyhow::Result<()> {
+    let (node, _, _registry) = fixture(vec![]).await?;
+    let query = local_query(&node).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let entity_id = entity.id();
+    let (mut driver, _registry, query) = bind_query_driver(&node, &entity, query).await?;
+    query.resultset().clear();
+    driver.eligible.clear();
+    let event = edit(entity_id, entity.head(), 92);
+    driver.projection.round.as_mut().unwrap().members.get_mut(&entity_id).unwrap().head = proto::Clock::singleton(&event);
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(event), None)?;
+    drop(entity);
+    let applied = driver.jobs.next().await.unwrap()?;
+    drop(driver.observe(&node, applied).await?);
+    assert_eq!(driver.round_pins.len(), 1);
+    let resident = node.entities.get(&entity_id).expect("the finite round owns this resident");
+    assert_eq!(driver.round_pin_bytes, bincode::serialized_size(&resident.to_state()?)? as usize + proto::EntityId::BYTE_LEN);
+    drop(resident);
+    *node.storage.reject_state_read.lock().unwrap() = Some(entity_id);
+    driver.projection.round.as_mut().unwrap().complete = true;
+    assert!(driver.complete_round(&node, Some((query.query_id(), 1))).await?);
+    assert!(query.resultset().contains_key(&entity_id));
+    assert!(driver.round_pins.is_empty());
+    assert_eq!(driver.round_pin_bytes, 0);
+    drop(query);
+    assert!(node.entities.get(&entity_id).is_none(), "round completion leaves no hidden residency");
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_round_skips_warm_residents_and_releases_cancelled_pins() -> anyhow::Result<()> {
+    let (node, _, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let (mut warm_driver, _registry, warm_query) = query_driver(&node, &entity).await?;
+    warm_driver.pin_round_entity(&node, &entity);
+    assert!(warm_driver.round_pins.is_empty(), "warm query members already keep their resident alive");
+    drop(warm_driver);
+    drop(warm_query);
+    drop(entity);
+
+    let query = local_query(&node).await?;
+    // Use a new row so the query's original local result cannot own the
+    // resident whose cancellation lifetime is being tested.
+    let genesis = proto::Event::genesis(
+        Some(id(89)),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(proto::ModelId::EntityId(id(88))))]),
+    );
+    let entity_id = genesis.entity_id;
+    let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+    let entity = NodeApplier::apply_delta(
+        &node,
+        &id(90),
+        bridge(genesis),
+        Delivery::Initial,
+        &CachedEventGetter::new(&node, &credentials),
+        &LocalStateGetter::new(node.storage.clone()),
+    )
+    .await?
+    .entity
+    .unwrap();
+    let (mut driver, _registry, query) = bind_query_driver(&node, &entity, query).await?;
+    let event = edit(entity_id, entity.head(), 92);
+    driver.enqueue(&node, id(90), &credentials, Owner::Round(0), bridge(event), None)?;
+    drop(entity);
+    let applied = driver.jobs.next().await.unwrap()?;
+    drop(driver.observe(&node, applied).await?);
+    assert!(driver.round_pins.contains_key(&entity_id));
+    driver.cancel_round(&node, id(90), &[])?;
+    assert!(driver.round_pins.is_empty());
+    assert_eq!(driver.round_pin_bytes, 0);
+    assert!(node.entities.get(&entity_id).is_none());
+    drop(query);
+    Ok(())
+}
+
+#[tokio::test]
+async fn round_pin_refresh_evicts_large_merged_resident_and_query_still_installs() -> anyhow::Result<()> {
+    use crate::{
+        property::backend::{LWWBackend, PropertyBackend},
+        value::Value,
+    };
+    let (node, _, _registry) = fixture(vec![]).await?;
+    let query = local_query(&node).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let entity_id = entity.id();
+    let (mut driver, _registry, query) = bind_query_driver(&node, &entity, query).await?;
+    query.resultset().clear();
+    driver.eligible.clear();
+    let initial = edit(entity_id, entity.head(), 92);
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(initial), None)?;
+    let applied = driver.jobs.next().await.unwrap()?;
+    drop(driver.observe(&node, applied).await?);
+    assert!(driver.round_pins.contains_key(&entity_id));
+
+    let backend = LWWBackend::new();
+    backend.set(proto::PropertyId::EntityId(id(94)), Some(Value::String("x".repeat(super::super::super::WINDOW_BYTES))));
+    let large = proto::Event::update(
+        entity_id,
+        entity.head(),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![proto::Operation::Backend { backend: "lww".into(), operations: backend.to_operations()?.unwrap() }]),
+    );
+    let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+    // An independent application grows the canonical resident. The next tiny
+    // round delta must be sized by the merged state, not its own wire bytes.
+    NodeApplier::apply_delta(
+        &node,
+        &id(90),
+        bridge(large),
+        Delivery::Initial,
+        &CachedEventGetter::new(&node, &credentials),
+        &LocalStateGetter::new(node.storage.clone()),
+    )
+    .await?;
+    let tiny = edit(entity_id, entity.head(), 95);
+    let target = proto::Clock::singleton(&tiny);
+    driver.projection.round.as_mut().unwrap().members.get_mut(&entity_id).unwrap().head = target.clone();
+    driver.goals.add(entity_id, target.clone(), false)?;
+    let tiny = bridge(tiny);
+    assert!(bincode::serialized_size(&tiny)? < 1024);
+    driver.enqueue(&node, id(90), &credentials, Owner::Round(0), tiny, None)?;
+    let applied = driver.jobs.next().await.unwrap()?;
+    drop(driver.observe(&node, applied).await?);
+    assert!(driver.round_pins.is_empty(), "the actual large resident exceeds the optional admission budget");
+    assert_eq!(driver.round_pin_bytes, 0);
+    drop(entity);
+    assert!(node.entities.get(&entity_id).is_none(), "fallback permits the resident to expire");
+    driver.projection.round.as_mut().unwrap().complete = true;
+    assert!(driver.complete_round(&node, Some((query.query_id(), 1))).await?);
+    assert_eq!(query.resultset().read().iter_entities().find(|(id, _)| *id == entity_id).unwrap().1.head(), target);
+    assert!(driver.round_pins.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_round_does_not_retain_or_reload_changes_for_a_nonexistent_query_owner() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let entity_id = entity.id();
+    let event = edit(entity_id, entity.head(), 92);
+    let target = proto::Clock::singleton(&event);
+    driver.projection.round.as_mut().unwrap().members.insert(entity_id, proto::QueryMember { key: vec![], head: target.clone() });
+    driver.goals.add(entity_id, target, false)?;
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(event), None)?;
+    drop(entity);
+    let applied = driver.jobs.next().await.unwrap()?;
+    drop(driver.observe(&node, applied).await?);
+    assert!(driver.round_changed.is_empty());
+    assert!(driver.round_pins.is_empty());
+    assert!(node.entities.get(&entity_id).is_none());
+    *node.storage.reject_state_read.lock().unwrap() = Some(entity_id);
+    driver.projection.round.as_mut().unwrap().complete = true;
+    assert!(driver.complete_round(&node, None).await?, "Fetch completion has no owner callback to reload");
+    assert_eq!(driver.ids(), [entity_id]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn round_pins_retire_only_after_actual_owner_state_notification() -> anyhow::Result<()> {
+    for actual_live in [true, false] {
+        let (node, _, _registry) = fixture(vec![]).await?;
+        let query = local_query(&node).await?;
+        let (_, entity) = committed_entity(&node).await?;
+        let entity_id = entity.id();
+        let (mut driver, _registry, query) = bind_query_driver(&node, &entity, query).await?;
+        let owner = Some((query.query_id(), 1));
+        let updates = Arc::new(std::sync::Mutex::new(0));
+        let recorded = updates.clone();
+        let _guard = query.listen_updates(move |_| *recorded.lock().unwrap() += 1);
+        let initial = edit(entity_id, entity.head(), 92);
+        driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(initial), None)?;
+        let applied = driver.jobs.next().await.unwrap()?;
+        drop(driver.observe(&node, applied).await?);
+        assert!(driver.round_pins.contains_key(&entity_id));
+        let event = edit(entity_id, entity.head(), 93);
+        let target = if actual_live { proto::Clock::singleton(&event) } else { entity.head() };
+        driver
+            .live(
+                &node,
+                id(90),
+                &[crate::policy::DEFAULT_CONTEXT],
+                11,
+                vec![proto::QueryChange {
+                    entity_id,
+                    member: Some(proto::QueryMember { key: vec![], head: target }),
+                    delta: actual_live.then(|| bridge(event).content),
+                }],
+                true,
+            )
+            .await?;
+        if actual_live {
+            let applied = driver.jobs.next().await.unwrap()?;
+            drop(driver.observe(&node, applied).await?);
+        }
+        driver.commit_publications(&node, owner).await?;
+        assert_eq!(driver.round_changed.contains(&entity_id), !actual_live);
+        assert_eq!(driver.round_pins.contains_key(&entity_id), !actual_live);
+        let before = *updates.lock().unwrap();
+        driver.projection.round.as_mut().unwrap().complete = true;
+        assert!(driver.complete_round(&node, owner).await?);
+        assert_eq!(
+            *updates.lock().unwrap(),
+            before + usize::from(!actual_live),
+            "a metadata-only publication cannot retire the pending finite state update"
+        );
+        assert!(driver.round_pins.is_empty());
     }
     Ok(())
 }
@@ -337,8 +560,9 @@ fn bridge(event: proto::Event) -> proto::EntityDelta {
 
 #[tokio::test]
 async fn initial_state_advance_is_retained_for_finite_owner_notification_without_historical_events() -> anyhow::Result<()> {
-    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    let (node, _, _registry) = fixture(vec![]).await?;
     let (_, entity) = committed_entity(&node).await?;
+    let (mut driver, _registry, query) = query_driver(&node, &entity).await?;
     let event = edit(entity.id(), entity.head(), 92);
     driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(event), None)?;
     let applied = driver.jobs.next().await.unwrap()?;
@@ -348,7 +572,7 @@ async fn initial_state_advance_is_retained_for_finite_owner_notification_without
     assert_eq!(driver.round_changed, [entity.id()].into_iter().collect());
     driver.check_retained()?;
     driver.projection.round.as_mut().unwrap().complete = true;
-    assert!(driver.complete_round(&node, None).await?);
+    assert!(driver.complete_round(&node, Some((query.query_id(), 1))).await?);
     assert!(driver.round_changed.is_empty(), "finite retirement releases changed identities");
     Ok(())
 }

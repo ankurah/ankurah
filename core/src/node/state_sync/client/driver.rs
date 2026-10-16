@@ -124,6 +124,11 @@ pub(super) struct Driver {
     goals: Goals,
     round_jobs: usize,
     round_changed: HashSet<proto::EntityId>,
+    // Optional residency until this finite query round installs. The budget
+    // measures full encoded state at admission, not heap usage: canonical
+    // entities remain mutable and may grow before their next observation.
+    round_pins: HashMap<proto::EntityId, (crate::entity::Entity, usize)>,
+    round_pin_bytes: usize,
     jobs: FuturesUnordered<BoxFuture<'static, anyhow::Result<Applied>>>,
     queued_jobs: BTreeMap<proto::EntityId, VecDeque<BoxFuture<'static, anyhow::Result<Applied>>>>,
     active_entities: HashSet<proto::EntityId>,
@@ -173,6 +178,8 @@ impl Driver {
             goals: Goals::default(),
             round_jobs: 0,
             round_changed: HashSet::new(),
+            round_pins: HashMap::new(),
+            round_pin_bytes: 0,
             jobs: FuturesUnordered::new(),
             queued_jobs: BTreeMap::new(),
             active_entities: HashSet::new(),
@@ -416,9 +423,12 @@ impl Driver {
                 Owner::Repair => self.projection.round.is_some() && self.goals.rows.contains_key(&applied.id),
                 Owner::Live(_) => false,
             };
-            if round_changed {
+            if self.stream.query.is_some() && round_changed {
                 ensure!(self.round_changed.contains(&applied.id) || self.round_changed.len() < 100_000, "too many changed round entities");
                 self.round_changed.insert(applied.id);
+            }
+            if self.round_changed.contains(&applied.id) {
+                self.pin_round_entity(node, applied.change.as_ref().unwrap().entity());
             }
             if applied.owner == Owner::Repair {
                 // Repair is Initial delivery: its history is not a new source
@@ -433,6 +443,48 @@ impl Driver {
             }
         }
         Ok(applied.change)
+    }
+
+    fn remove_round_pin(&mut self, id: &proto::EntityId) {
+        if let Some((_, bytes)) = self.round_pins.remove(id) {
+            self.round_pin_bytes -= bytes;
+        }
+    }
+
+    fn clear_round_pins(&mut self) {
+        self.round_pins.clear();
+        self.round_pin_bytes = 0;
+    }
+
+    fn pin_round_entity<SE, PA>(&mut self, node: &Node<SE, PA>, entity: &crate::entity::Entity)
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let id = entity.id();
+        // Refresh the charge after any observed actual change, including live
+        // data advancing a row already retained for this round.
+        self.remove_round_pin(&id);
+        let Some((query, _)) = self.stream.query else { return };
+        let Some(query) = node.live_queries.get(query) else { return };
+        if query.resultset().contains_key(&id) || self.round_pins.len() >= 100_000 || self.round_pin_bytes >= super::super::WINDOW_BYTES {
+            return;
+        }
+        let Some(bytes) = entity
+            .to_state()
+            .ok()
+            .and_then(|state| bincode::serialized_size(&state).ok())
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .and_then(|bytes| bytes.checked_add(proto::EntityId::BYTE_LEN))
+        else {
+            return;
+        };
+        // Pinning is an optimization. A large state or exhausted admission
+        // budget falls back to the ordinary storage reload at installation.
+        if bytes <= super::super::WINDOW_BYTES - self.round_pin_bytes {
+            self.round_pin_bytes += bytes;
+            self.round_pins.insert(id, (entity.clone(), bytes));
+        }
     }
 
     async fn observe_head<SE, PA>(&mut self, node: &Node<SE, PA>, id: proto::EntityId, head: proto::Clock) -> anyhow::Result<()>
@@ -1007,6 +1059,7 @@ impl Driver {
             };
             for id in actual_changes.intersection(&notified) {
                 self.round_changed.remove(id);
+                self.remove_round_pin(id);
             }
             self.applied_through = Some(publication.revision);
             advanced = true;
@@ -1051,12 +1104,17 @@ impl Driver {
         let states = LocalStateGetter::new(node.storage.clone());
         let history = LocalEventGetter::new(node.storage.clone(), node.durable);
         for id in &self.round_changed {
-            if let Some(entity) = node.entities.get_or_retrieve(&states, &history, id).await? {
+            let entity = match self.round_pins.get(id) {
+                Some((entity, _)) => Some(entity.clone()),
+                None => node.entities.get_or_retrieve(&states, &history, id).await?,
+            };
+            if let Some(entity) = entity {
                 changes.push(EntityChange::new(entity, vec![]));
             }
         }
         self.install(node, query, true, replace, changes).await?;
         self.round_changed.clear();
+        self.clear_round_pins();
         self.prune_observed();
         self.baseline_installed = true;
         self.membership_dirty = false;
@@ -1078,6 +1136,7 @@ impl Driver {
         self.goals = Goals::default();
         self.round_jobs = 0;
         self.round_changed.clear();
+        self.clear_round_pins();
         self.assemblies.retain(|_, assembly| {
             if assembly.owner == Owner::Round(number) {
                 self.assembly_bytes -= assembly.bytes.len();
