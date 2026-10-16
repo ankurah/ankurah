@@ -7,7 +7,6 @@ use crate::{
     property::backend::{lww::LWWBackend, PropertyBackend},
     retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
     selection::filter::Filterable,
-    storage::StorageTransaction,
     test_utils::{TestStorage, TestStorageTransaction},
 };
 use ankql::ast::{OrderByItem, OrderDirection, Predicate};
@@ -154,7 +153,7 @@ async fn unlimited_capture_folds_an_entrant_and_an_ahead_resident_without_replay
 #[tokio::test]
 async fn limited_capture_retries_to_discover_an_unchanged_replacement() -> anyhow::Result<()> {
     let node = node().await?;
-    let [a, b, c] = ["01", "02", "03"].map(genesis).into_iter().collect::<anyhow::Result<Vec<_>>>()?.try_into().unwrap();
+    let [a, b, c]: [proto::Event; 3] = ["01", "02", "03"].map(genesis).into_iter().collect::<anyhow::Result<Vec<_>>>()?.try_into().unwrap();
     for event in [&a, &b, &c] {
         apply(&node, event).await?;
     }
@@ -215,20 +214,22 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
         None,
     )
     .await?;
-    let mut actor = Actor::new(peer, state.frame.comparison, vec![DEFAULT_CONTEXT], projection, cursor, revision);
+    let mut actor = QuerySource::new(peer, state.frame.comparison, vec![DEFAULT_CONTEXT], projection, cursor, revision);
     let moved_a = update(&events[0], "09")?;
     apply(&node, &moved_a).await?;
     let batch = actor.cursor.next().await?;
     let (entered, release) = hold_fetch(&node);
-    let refill = actor.refill(&node, vec![batch]);
-    tokio::pin!(refill);
-    assert!(futures::poll!(&mut refill).is_pending());
-    entered.await?;
-    // The in-flight read selected B,C. C moves past A before its rows
-    // are captured, so accepting that stale list would miss unchanged A.
-    apply(&node, &update(&events[2], "10")?).await?;
-    release.send(()).unwrap();
-    refill.await?;
+    {
+        let refill = actor.refill(&node, vec![batch]);
+        tokio::pin!(refill);
+        assert!(futures::poll!(&mut refill).is_pending());
+        entered.await?;
+        // The in-flight read selected B,C. C moves past A before its rows
+        // are captured, so accepting that stale list would miss unchanged A.
+        apply(&node, &update(&events[2], "10")?).await?;
+        release.send(()).unwrap();
+        refill.await?;
+    }
     assert_eq!(actor.projection.rows.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[0].entity_id, events[1].entity_id]));
     assert_eq!(actor.projection.rows.len(), 2);
     let current = tree.current_snapshot().await?;
@@ -273,6 +274,16 @@ impl PolicyAgent for RestrictedDiscovery {
         _: &C,
     ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
         Ok(Predicate::True)
+    }
+    fn check_write_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &Self::ContextData,
+        _: &crate::entity::Entity,
+        _: &crate::entity::Entity,
+        _: &proto::Event,
+    ) -> Result<Option<proto::Attestation>, crate::policy::AccessDenied> {
+        Ok(None)
     }
     fn check_write(
         &self,
@@ -334,5 +345,39 @@ async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_
     assert!(changes[0].member.is_none());
     assert!(changes[0].delta.is_some(), "readable former matches still carry causal data");
     assert!(captured.projection.rows.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree() -> anyhow::Result<()> {
+    let node = node().await?;
+    let mut initial = Vec::new();
+    for value in ["01", "02", "03"] {
+        let event = genesis(value)?;
+        apply(&node, &event).await?;
+        initial.push(event);
+    }
+    let peer = proto::EntityId::from_bytes([26; 32]);
+    node.register_peer(
+        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+        Box::new(Sender(peer)),
+    )
+    .await?;
+    let handler = crate::peer_subscription::SubscriptionHandler::new(peer, &node);
+    let query = proto::QueryId::new();
+    handler.subscribe_query(&node, proto::RequestId::new(), Vec::new(), query, selection(Some(2)), Some(&DEFAULT_CONTEXT), 1, None).await?;
+    let (_, original_tree) = handler.query_tree_for_test(query).await.unwrap();
+    let (entered, release) = hold_fetch(&node);
+    apply(&node, &update(&initial[0], "09")?).await?;
+    entered.await?;
+    handler.subscribe_query(&node, proto::RequestId::new(), Vec::new(), query, selection(Some(1)), Some(&DEFAULT_CONTEXT), 2, None).await?;
+    assert!(release.send(()).is_err(), "the old generation's pending read must be dropped before replacement installs");
+    let (version, reused) = handler.query_tree_for_test(query).await.unwrap();
+    assert_eq!(version, 2);
+    assert!(Arc::ptr_eq(&original_tree, &reused));
+    let snapshot = reused.current_snapshot().await?;
+    assert_eq!(snapshot.states.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
+    handler.remove_predicate(&node, query).await?;
+    node.deregister_peer(peer);
     Ok(())
 }

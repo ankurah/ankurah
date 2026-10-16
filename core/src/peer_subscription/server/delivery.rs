@@ -24,6 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 const MAX_READ_ATTEMPTS: usize = 8;
 
 type Rows = BTreeMap<proto::EntityId, Row>;
+type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
 
 struct Row {
     state: Arc<proto::EntityState>,
@@ -34,11 +35,11 @@ struct Row {
 pub(crate) struct CapturedQuery {
     pub(crate) revision: u64,
     pub(crate) snapshot: Snapshot,
-    pub(super) projection: Projection,
+    pub(super) projection: QueryProjection,
     pub(super) cursor: SourceCursor,
 }
 
-pub(super) struct Projection {
+pub(super) struct QueryProjection {
     selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     rows: Rows,
@@ -68,7 +69,7 @@ where
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     selection.predicate = policy.filter_predicate(selection.predicate)?;
     let (mut start, mut cursor) = node.source_publications.subscribe().await?;
-    let mut projection = Projection { selection, spec, rows: Rows::new(), tree };
+    let mut projection = QueryProjection { selection, spec, rows: Rows::new(), tree };
     let mut attempts = 0;
     let window = loop {
         attempts += 1;
@@ -86,7 +87,7 @@ where
             for batch in &window.batches {
                 projection.check_catalog(batch)?;
                 for change in &batch.changes {
-                    projection.fold(node, &credentials, change)?;
+                    projection.fold(&policy, change)?;
                 }
             }
             break window;
@@ -96,7 +97,7 @@ where
     Ok(CapturedQuery { revision: window.revision.0, snapshot, projection, cursor })
 }
 
-impl Projection {
+impl QueryProjection {
     fn check_catalog(&self, batch: &SourceBatch) -> anyhow::Result<()> {
         anyhow::ensure!(
             crate::schema::is_catalog_read(&self.selection.predicate)
@@ -106,17 +107,7 @@ impl Projection {
         Ok(())
     }
 
-    fn evaluate<SE, PA>(
-        &self,
-        node: &Node<SE, PA>,
-        credentials: &Vec<PA::ContextData>,
-        state: Arc<proto::EntityState>,
-    ) -> anyhow::Result<Option<Row>>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+    fn evaluate<PA: PolicyAgent>(&self, policy: &ReadPolicy<'_, PA>, state: Arc<proto::EntityState>) -> anyhow::Result<Option<Row>> {
         if policy.check_read(&state.entity_id, &state.state).is_err() {
             return Ok(None);
         }
@@ -136,21 +127,18 @@ impl Projection {
     {
         node.system.check_not_halted()?;
         let states = node.storage.fetch_states(&self.selection).await?;
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
         let mut rows = Rows::new();
         for state in states {
-            if let Some(row) = self.evaluate(node, credentials, Arc::new(state.payload))? {
+            if let Some(row) = self.evaluate(&policy, Arc::new(state.payload))? {
                 rows.insert(row.state.entity_id, row);
             }
         }
         Ok(rows)
     }
 
-    fn fold<SE, PA>(&mut self, node: &Node<SE, PA>, credentials: &Vec<PA::ContextData>, change: &SourceChange) -> anyhow::Result<()>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        if let Some(row) = self.evaluate(node, credentials, change.state.clone())? {
+    fn fold<PA: PolicyAgent>(&mut self, policy: &ReadPolicy<'_, PA>, change: &SourceChange) -> anyhow::Result<()> {
+        if let Some(row) = self.evaluate(policy, change.state.clone())? {
             self.rows.insert(change.state.entity_id, row);
         } else {
             self.rows.remove(&change.state.entity_id);
@@ -174,14 +162,13 @@ impl Projection {
         self.rows.values().map(|row| Self::attested(node, row)).collect()
     }
 
-    fn change<SE, PA>(&self, node: &Node<SE, PA>, credentials: &Vec<PA::ContextData>, change: &SourceChange) -> proto::QueryChange
+    fn change<SE, PA>(&self, node: &Node<SE, PA>, policy: &ReadPolicy<'_, PA>, change: &SourceChange) -> proto::QueryChange
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let entity_id = change.state.entity_id;
         let member = self.rows.get(&entity_id).map(|row| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() });
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
         let delta = policy.check_read(&entity_id, &change.state.state).is_ok().then(|| proto::DeltaContent::StateAndEvents {
             state: Attested::opt((*change.state).clone(), node.policy_agent.attest_state(node, &change.state)).into(),
             events: change.events.iter().cloned().map(Into::into).collect(),
@@ -199,20 +186,21 @@ impl Projection {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
         let mut changed = Vec::new();
         let mut rows = Vec::new();
         let mut removed = Vec::new();
         for change in &batch.changes {
             let id = change.state.entity_id;
             let was_member = self.rows.contains_key(&id);
-            self.fold(node, credentials, change)?;
+            self.fold(&policy, change)?;
             if let Some(row) = self.rows.get(&id) {
                 rows.push(Self::attested(node, row));
             } else if was_member {
                 removed.push(id);
             }
             if was_member || self.rows.contains_key(&id) {
-                changed.push(self.change(node, credentials, change));
+                changed.push(self.change(node, &policy, change));
             }
         }
         self.tree.apply_captured(rows, removed).await?;
@@ -220,21 +208,21 @@ impl Projection {
     }
 }
 
-pub(super) struct Actor<CD: ContextData> {
+pub(super) struct QuerySource<CD: ContextData> {
     peer: proto::EntityId,
     comparison: proto::ComparisonId,
     credentials: Vec<CD>,
-    projection: Projection,
+    projection: QueryProjection,
     cursor: SourceCursor,
     revision: u64,
 }
 
-impl<CD: ContextData> Actor<CD> {
+impl<CD: ContextData> QuerySource<CD> {
     pub(super) fn new(
         peer: proto::EntityId,
         comparison: proto::ComparisonId,
         credentials: Vec<CD>,
-        projection: Projection,
+        projection: QueryProjection,
         cursor: SourceCursor,
         revision: u64,
     ) -> Self {
@@ -281,10 +269,11 @@ impl<CD: ContextData> Actor<CD> {
     {
         self.projection.check_catalog(&batch)?;
         if self.projection.selection.limit.is_some() {
+            let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
             let mut relevant = false;
             for change in &batch.changes {
                 relevant |= self.projection.rows.contains_key(&change.state.entity_id)
-                    || self.projection.evaluate(node, &self.credentials, change.state.clone())?.is_some();
+                    || self.projection.evaluate(&policy, change.state.clone())?.is_some();
             }
             if relevant {
                 self.refill(node, vec![batch]).await?;
@@ -331,13 +320,14 @@ impl<CD: ContextData> Actor<CD> {
             }
         };
         let previous = std::mem::replace(&mut self.projection.rows, rows);
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
         let mut changed = Vec::new();
         let mut included = BTreeSet::new();
         for batch in pending {
             for source in &batch.changes {
                 let id = source.state.entity_id;
                 if previous.contains_key(&id) || self.projection.rows.contains_key(&id) {
-                    changed.push(self.projection.change(node, &self.credentials, source));
+                    changed.push(self.projection.change(node, &policy, source));
                     included.insert(id);
                 }
             }
@@ -346,11 +336,7 @@ impl<CD: ContextData> Actor<CD> {
             if !included.contains(id)
                 && previous.get(id).is_none_or(|before| before.key != row.key || before.state.state.head != row.state.state.head)
             {
-                changed.push(self.projection.change(
-                    node,
-                    &self.credentials,
-                    &SourceChange { state: row.state.clone(), events: Vec::new() },
-                ));
+                changed.push(self.projection.change(node, &policy, &SourceChange { state: row.state.clone(), events: Vec::new() }));
             }
         }
         for id in previous.keys() {
@@ -372,8 +358,21 @@ impl<CD: ContextData> Actor<CD> {
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let window = self.cursor.fence().await?;
-        if self.projection.selection.limit.is_some() && !window.batches.is_empty() {
-            self.refill(node, window.batches).await?;
+        if self.projection.selection.limit.is_some() {
+            let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
+            let mut relevant = false;
+            for batch in &window.batches {
+                self.projection.check_catalog(batch)?;
+                for change in &batch.changes {
+                    relevant |= self.projection.rows.contains_key(&change.state.entity_id)
+                        || self.projection.evaluate(&policy, change.state.clone())?.is_some();
+                }
+            }
+            if relevant {
+                self.refill(node, window.batches).await?;
+            } else {
+                self.revision = window.revision.0;
+            }
         } else {
             for batch in window.batches {
                 self.publish(node, batch).await?;

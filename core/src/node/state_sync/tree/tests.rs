@@ -229,6 +229,7 @@ async fn initial_complete_keeps_complete_inventory_digests_lazy() -> anyhow::Res
             vec![],
             standing.then(|| (proto::QueryId::new(), 1)),
             false,
+            0,
             snapshot,
             known,
         )
@@ -257,6 +258,7 @@ async fn a_moderate_first_refresh_repairs_changed_heads_without_building_a_diges
         vec![],
         Some((subscription, 1)),
         false,
+        0,
         query.refresh(spec(), rows.clone()).await?,
         None,
     )
@@ -278,11 +280,12 @@ async fn a_moderate_first_refresh_repairs_changed_heads_without_building_a_diges
         vec![],
         Some((subscription, 2)),
         false,
+        0,
         captured,
         Some(known),
     )
     .await?;
-    let proto::StateFrameBody::State { items, progress } = reply.frame.body else { panic!("state") };
+    let proto::StateFrameBody::State { items, progress, .. } = reply.frame.body else { panic!("state") };
     assert_eq!(progress, proto::ComparisonProgress::Complete);
     assert!(items.iter().any(|item| matches!(item, proto::StateItem::Repair { target, delta }
         if delta.entity_id == changed[17].payload.entity_id && *target == changed[17].payload.state.head)));
@@ -312,6 +315,7 @@ async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_t
         vec![],
         Some((subscription, 1)),
         false,
+        0,
         query.refresh(spec(), rows.clone()).await?,
         Some(known.clone()),
     )
@@ -329,6 +333,7 @@ async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_t
         vec![],
         Some((subscription, 2)),
         false,
+        0,
         query.refresh(spec(), larger.clone()).await?,
         Some(known.clone()),
     )
@@ -349,6 +354,7 @@ async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_t
         vec![],
         Some((subscription, 3)),
         false,
+        0,
         shrunk,
         Some(known),
     )
@@ -422,11 +428,12 @@ async fn small_inventory_exceeding_the_byte_budget_falls_back_to_a_summary() -> 
         vec![],
         Some((proto::QueryId::new(), 1)),
         false,
+        0,
         captured,
         Some(inventory),
     )
     .await?;
-    let proto::StateFrameBody::State { items, progress } = reply.frame.body else { panic!("state") };
+    let proto::StateFrameBody::State { items, progress, .. } = reply.frame.body else { panic!("state") };
     assert_eq!(progress, proto::ComparisonProgress::Complete);
     assert!(items.is_empty(), "equal retained frontiers need no response items");
     assert!(responder.0.lock().await.as_ref().unwrap().tree.is_some());

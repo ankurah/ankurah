@@ -108,7 +108,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let comparison = state.frame.comparison;
         // Moving the snapshot into the round must not consume the independent
         // cursor/projection that owns every later source publication.
-        let actor = delivery::Actor::new(self.peer_id, comparison, credentials.clone(), projection, cursor, revision);
+        let actor = delivery::QuerySource::new(self.peer_id, comparison, credentials.clone(), projection, cursor, revision);
         let (commands, receiver) = mpsc::channel(8);
         let (stop, canceled) = oneshot::channel();
         let (stopped, done) = oneshot::channel();
