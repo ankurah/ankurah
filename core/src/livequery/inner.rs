@@ -308,15 +308,15 @@ impl LiveQueryInner {
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
         complete: bool,
-    ) -> Result<bool, RetrievalError> {
-        let Some((selection, stored_version)) = self.selection.value() else { return Ok(false) };
+    ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
+        let Some((selection, stored_version)) = self.selection.value() else { return Ok(None) };
         if version != stored_version || canceled() || !self.remote_stream_current(version, origin) {
-            return Ok(false);
+            return Ok(None);
         }
         let source = {
             let stream = self.remote_stream.lock().unwrap();
             let Some(stream) = stream.as_ref().filter(|stream| stream.version == version && &stream.origin == origin) else {
-                return Ok(false);
+                return Ok(None);
             };
             Arc::new(PeerQuerySource {
                 origin: crate::reactor::QueryOrigin { query: self.query_id, version, request: origin.clone() },
@@ -325,7 +325,8 @@ impl LiveQueryInner {
                 admission: stream.admission.clone(),
             })
         };
-        self.context
+        let notified = self
+            .context
             .node()?
             .reactor()
             .upsert_query_from_peer(
@@ -349,9 +350,9 @@ impl LiveQueryInner {
             )
             .await?;
         if canceled() || !self.remote_stream_current(version, origin) {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(true)
+        Ok(Some(notified))
     }
 
     /// Mark the current version initialized before the reactor notifies result observers.

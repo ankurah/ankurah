@@ -149,7 +149,7 @@ impl EntityLiveQuery {
         changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<bool, RetrievalError> {
+    ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
         self.0.install_remote(version, entities, membership, changes, origin, canceled, true).await
     }
     pub(crate) async fn install_remote_partial(
@@ -160,8 +160,16 @@ impl EntityLiveQuery {
         changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<bool, RetrievalError> {
+    ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
         self.0.install_remote(version, entities, membership, changes, origin, canceled, false).await
+    }
+    #[cfg(test)]
+    pub(crate) fn listen_updates(
+        &self,
+        listener: impl Fn(crate::reactor::ReactorUpdate) + Send + Sync + 'static,
+    ) -> ankurah_signals::SubscriptionGuard {
+        use ankurah_signals::Subscribe;
+        self.0.subscription.subscribe(listener)
     }
     pub(crate) fn subscription_id(&self) -> crate::reactor::ReactorSubscriptionId { self.0.subscription.id() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }

@@ -313,6 +313,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     ) -> anyhow::Result<()> {
         self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None, None, vec![])
             .await
+            .map(|_| ())
     }
 
     pub(crate) async fn upsert_query_from_peer<H: PreNotifyHook>(
@@ -328,7 +329,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         entities: Vec<E>,
         membership: PeerQueryMembership,
         changes: Vec<ReactorUpdateItem<E, Ev>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<HashSet<proto::EntityId>> {
         self.install_query(
             subscription_id,
             query_id,
@@ -358,14 +359,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         entities: Option<Vec<E>>,
         membership: Option<PeerQueryMembership>,
         changes: Vec<ReactorUpdateItem<E, Ev>>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<HashSet<proto::EntityId>> {
         let authoritative = entities.is_some();
         let included_entities = match entities {
             Some(entities) => entities,
             None => node.fetch_entities_from_local(&selection).await?,
         };
         if !pre_notify_hook.is_current(version) {
-            return Ok(());
+            return Ok(HashSet::new());
         }
 
         let notify = self.0.notify_lock.lock().await;
@@ -375,7 +376,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         };
 
         if !pre_notify_hook.is_current(version) {
-            return Ok(());
+            return Ok(HashSet::new());
         }
 
         let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node.clone());
@@ -422,7 +423,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             self.0.notify_lock.lock().await
         };
         if !pre_notify_hook.is_current(version) {
-            return Ok(());
+            return Ok(HashSet::new());
         }
 
         if pre_notify_hook.marks_loaded() {
@@ -431,11 +432,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         pre_notify_hook.pre_notify(version);
         #[cfg(test)]
         self.pause_publication_if_requested(&selection).await;
+        let notified =
+            if membership.is_some() { reactor_update_items.iter().map(|item| item.entity.id()).collect() } else { HashSet::new() };
         if is_new || !reactor_update_items.is_empty() {
             subscription.send_update(reactor_update_items);
         }
 
-        Ok(())
+        Ok(notified)
     }
 
     /// Notify subscriptions about an entity change
@@ -479,20 +482,21 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         query: proto::QueryId,
         changes: Vec<C>,
         preserve: HashSet<proto::EntityId>,
-    ) {
+    ) -> HashSet<proto::EntityId> {
         let _notify = self.0.notify_lock.lock().await;
         let subscription = self.0.subscriptions.lock().unwrap().get(&subscription_id).cloned();
-        let Some(subscription) = subscription else { return };
+        let Some(subscription) = subscription else { return HashSet::new() };
         let changes = Arc::new(changes);
         let mut candidates = CandidateChanges::new(changes.clone());
         for offset in 0..changes.len() {
             candidates.add_query(query, offset);
         }
-        let changes = subscription.evaluate_publication(candidates, &preserve);
+        let (changes, notified) = subscription.evaluate_publication(candidates, &preserve);
         let mut watchers = self.0.watcher_set.lock().unwrap();
         for change in changes {
             watchers.apply_watcher_change(change);
         }
+        notified
     }
 
     /// Clear current subscription results and watchers when the owner stops running.

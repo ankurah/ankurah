@@ -227,12 +227,12 @@ impl Driver {
         complete: bool,
         replace: HashSet<proto::EntityId>,
         changes: Vec<EntityChange>,
-    ) -> anyhow::Result<()>
+    ) -> anyhow::Result<HashSet<proto::EntityId>>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let Some((id, version)) = query else { return Ok(()) };
+        let Some((id, version)) = query else { return Ok(HashSet::new()) };
         let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
         ensure!(query.set_remote_candidates(version, &self.stream.request, self.eligible.iter().copied()), "query stream superseded");
         let state_getter = LocalStateGetter::new(node.storage.clone());
@@ -258,9 +258,9 @@ impl Driver {
         } else {
             query.install_remote_partial(version, entities, membership, changes, origin, &canceled).await?
         };
-        ensure!(installed, "query stream superseded during installation");
+        let notified = installed.ok_or_else(|| anyhow::anyhow!("query stream superseded during installation"))?;
         self.partial_removals.clear();
-        Ok(())
+        Ok(notified)
     }
 
     fn publication(&mut self, revision: u64) -> anyhow::Result<&mut Publication> {
@@ -986,18 +986,26 @@ impl Driver {
                 }
             }
             self.projection.publish(publication.revision, publication.changes.into_iter().collect())?;
-            if self.membership_dirty {
-                self.install(node, query, false, HashSet::new(), changes).await?;
+            let actual_changes: HashSet<_> =
+                if self.round_changed.is_empty() { HashSet::new() } else { changes.iter().map(|change| change.entity().id()).collect() };
+            let notified = if self.membership_dirty {
+                let notified = self.install(node, query, false, HashSet::new(), changes).await?;
                 self.membership_dirty = false;
+                notified
             } else if let Some((id, version)) = query {
                 if let Some(query) = node.live_queries.get(id) {
                     let origin = crate::reactor::QueryOrigin { query: id, version, request: self.stream.request.clone() };
                     let changes =
                         changes.into_iter().map(|change| StreamChange { change, origin: Some(origin.clone()), deferred: false }).collect();
                     let preserve = self.publications.iter().flat_map(|publication| publication.changes.keys()).copied().collect();
-                    node.reactor.notify_query_changes(query.subscription_id(), id, changes, preserve).await;
+                    node.reactor.notify_query_changes(query.subscription_id(), id, changes, preserve).await
+                } else {
+                    HashSet::new()
                 }
-            }
+            } else {
+                HashSet::new()
+            };
+            self.round_changed.retain(|id| !actual_changes.contains(id) || !notified.contains(id));
             self.applied_through = Some(publication.revision);
             advanced = true;
         }

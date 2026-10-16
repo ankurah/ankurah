@@ -70,23 +70,22 @@ async fn finite_round_waits_its_pre_cut_publications_but_not_later_data() -> any
     Ok(())
 }
 
-#[tokio::test]
-async fn live_present_for_known_but_ineligible_row_requires_an_install() -> anyhow::Result<()> {
+async fn query_driver(
+    node: &TestNode,
+    entity: &crate::entity::Entity,
+) -> anyhow::Result<(Driver, Arc<super::super::super::IncomingStates>, crate::livequery::EntityLiveQuery)> {
     use crate::{
         context::Context,
         livequery::{EntityLiveQuery, QueryResolution},
         node::CachePolicy,
         peer_subscription::RemoteQuerySubscriber,
     };
-    let (node, _, _registry) = fixture(vec![]).await?;
-    let (_, entity) = committed_entity(&node).await?;
     let query = EntityLiveQuery::new(
         Context::new(node.clone(), crate::policy::DEFAULT_CONTEXT).0,
         CachePolicy::Local,
         QueryResolution::Resolved(ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }),
     )?;
     tokio::time::timeout(std::time::Duration::from_secs(2), query.wait_initialized()).await??;
-    query.resultset().clear();
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
     let snapshot = super::super::super::QueryTree::default()
         .refresh(spec, vec![proto::Attested::opt(proto::EntityState { entity_id: entity.id(), state: entity.to_state()? }, None)])
@@ -95,8 +94,19 @@ async fn live_present_for_known_but_ineligible_row_requires_an_install() -> anyh
     let stream = registry.register(proto::RequestId::new(), None, None)?;
     query.weak().stream_bound(1, stream.request.clone(), Arc::new(|| false));
     let mut driver = Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::ComparisonId::new())?;
+    driver.prepare(node, Some((query.query_id(), 1))).await?;
+    Ok((driver, registry, query))
+}
+
+#[tokio::test]
+async fn live_present_for_known_but_ineligible_row_requires_an_install() -> anyhow::Result<()> {
+    let (node, _, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let (mut driver, _registry, query) = query_driver(&node, &entity).await?;
+    query.resultset().clear();
+    driver.eligible.clear();
+    query.set_remote_candidates(1, &driver.stream.request, []);
     let owner = Some((query.query_id(), 1));
-    driver.prepare(&node, owner).await?;
     assert!(driver.eligible.is_empty());
     driver
         .live(
@@ -122,6 +132,72 @@ async fn live_present_for_known_but_ineligible_row_requires_an_install() -> anyh
     );
     assert_eq!(driver.projection.revision, 11);
     assert_eq!(driver.applied_through, Some(11));
+    Ok(())
+}
+
+#[tokio::test]
+async fn actual_owner_publication_retires_round_update_but_metadata_only_does_not() -> anyhow::Result<()> {
+    for actual_live in [true, false] {
+        let (node, _, _registry) = fixture(vec![]).await?;
+        let (_, entity) = committed_entity(&node).await?;
+        let (mut driver, _registry, query) = query_driver(&node, &entity).await?;
+        let owner = Some((query.query_id(), 1));
+        let updates = Arc::new(std::sync::Mutex::new(Vec::<crate::reactor::ReactorUpdate>::new()));
+        let recorded = updates.clone();
+        let _guard = query.listen_updates(move |update| recorded.lock().unwrap().push(update));
+        let initial = edit(entity.id(), entity.head(), 92);
+        driver.projection.round.as_mut().unwrap().members.get_mut(&entity.id()).unwrap().head = proto::Clock::singleton(&initial);
+        driver.goals.add(entity.id(), proto::Clock::singleton(&initial), false)?;
+        driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(initial), None)?;
+        let applied = driver.jobs.next().await.unwrap()?;
+        driver.observe(&node, applied).await?;
+        assert!(driver.round_changed.contains(&entity.id()));
+        let event = edit(entity.id(), entity.head(), 93);
+        let target = if actual_live { proto::Clock::singleton(&event) } else { entity.head() };
+        driver
+            .live(
+                &node,
+                id(90),
+                &[crate::policy::DEFAULT_CONTEXT],
+                11,
+                vec![proto::QueryChange {
+                    entity_id: entity.id(),
+                    member: Some(proto::QueryMember { key: vec![], head: target }),
+                    delta: actual_live.then(|| bridge(event.clone()).content),
+                }],
+                true,
+            )
+            .await?;
+        if actual_live {
+            let applied = driver.jobs.next().await.unwrap()?;
+            let deferred = driver.deferred_notification(applied.owner, applied.id);
+            let change = driver.observe(&node, applied).await?.unwrap();
+            notify_changes(
+                &node,
+                Some(crate::reactor::QueryOrigin { query: query.query_id(), version: 1, request: driver.stream.request.clone() }),
+                vec![(change, deferred)],
+            )
+            .await;
+        }
+        assert!(updates.lock().unwrap().is_empty(), "raw data application is not an owner publication");
+        driver.commit_publications(&node, owner).await?;
+        assert_eq!(driver.round_changed.contains(&entity.id()), !actual_live);
+        assert_eq!(updates.lock().unwrap().len(), usize::from(actual_live));
+        driver.projection.round.as_mut().unwrap().complete = true;
+        assert!(driver.complete_round(&node, owner).await?);
+        let updates = updates.lock().unwrap();
+        assert_eq!(
+            updates.len(),
+            1,
+            "finite completion cannot duplicate a real prior owner update, but still reports a metadata-only no-op's pending state change"
+        );
+        assert_eq!(updates[0].items.len(), 1);
+        assert!(updates[0].items[0].predicate_relevance.is_empty());
+        assert_eq!(updates[0].items[0].events.len(), usize::from(actual_live));
+        if actual_live {
+            assert_eq!(updates[0].items[0].events[0].payload.id(), event.id());
+        }
+    }
     Ok(())
 }
 

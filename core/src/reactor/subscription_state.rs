@@ -383,21 +383,24 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Evaluate candidate changes for this subscription and spawn gap filling/notification task
     /// Returns watcher changes that need to be applied to the global WatcherSet
     pub fn evaluate_changes<C: ChangeNotification<Entity = E, Event = Ev>>(self, candidates: CandidateChanges<C>) -> Vec<WatcherChange> {
-        self.evaluate_candidates(candidates, None)
+        self.evaluate_candidates(candidates, None, None)
     }
 
     pub(super) fn evaluate_publication<C: ChangeNotification<Entity = E, Event = Ev>>(
         self,
         candidates: CandidateChanges<C>,
         preserve: &HashSet<proto::EntityId>,
-    ) -> Vec<WatcherChange> {
-        self.evaluate_candidates(candidates, Some(preserve))
+    ) -> (Vec<WatcherChange>, HashSet<proto::EntityId>) {
+        let mut notified = HashSet::new();
+        let watchers = self.evaluate_candidates(candidates, Some(preserve), Some(&mut notified));
+        (watchers, notified)
     }
 
     fn evaluate_candidates<C: ChangeNotification<Entity = E, Event = Ev>>(
         self,
         candidates: CandidateChanges<C>,
         preserve: Option<&HashSet<proto::EntityId>>,
+        notified: Option<&mut HashSet<proto::EntityId>>,
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
         let mut items: IndexMap<proto::EntityId, ReactorUpdateItem<E, Ev>> = IndexMap::new();
@@ -514,6 +517,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         // Spawn background task for gap filling and notification
         // fill_gaps_and_notify will register entity watchers for gap-filled entities
+        if let Some(notified) = notified {
+            notified.extend(items.keys().copied());
+        }
         let update_items: Vec<ReactorUpdateItem<E, Ev>> = items.into_values().collect();
         if !gaps_to_fill.is_empty() {
             crate::task::spawn(self.clone().fill_gaps_and_notify(update_items, gaps_to_fill, broadcast));
