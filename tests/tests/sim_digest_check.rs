@@ -59,6 +59,7 @@ fn comparison_digest_tracks_repair_content_but_not_session_ids() {
                     comparison: proto::ComparisonId::new(),
                     sequence: 1,
                     body: proto::StateFrameBody::State {
+                        round: 0,
                         items: vec![proto::StateItem::Repair {
                             target: proto::Clock::singleton(&event),
                             delta: proto::EntityDelta {
@@ -94,22 +95,24 @@ fn frame_message(sequence: u64, body: proto::StateFrameBody) -> proto::NodeMessa
 #[test]
 fn live_frame_digest_tracks_sequence_and_membership_without_random_route_ids() {
     let event = model::genesis_event(3, model::Field::Title, "live");
-    let frame = |sequence, change| {
+    let frame = |sequence, change: bool| {
         frame_message(
             sequence,
-            proto::StateFrameBody::Live(vec![proto::SubscriptionUpdateItem {
-                delta: proto::EntityDelta {
+            proto::StateFrameBody::Live {
+                revision: 7,
+                items: vec![proto::QueryChange {
                     entity_id: event.entity_id,
-                    content: proto::DeltaContent::EventBridge { events: vec![model::attest(event.clone()).into()] },
-                },
-                predicate_relevance: vec![(proto::QueryId::new(), change)],
-            }]),
+                    member: change.then(|| proto::QueryMember { key: vec![], head: proto::Clock::singleton(&event) }),
+                    delta: None,
+                }],
+                complete: true,
+            },
         )
     };
-    let first = message_digest(&frame(2, proto::MembershipChange::Add));
-    assert_eq!(first, message_digest(&frame(2, proto::MembershipChange::Add)), "fresh stream and query ids must not perturb the trace");
-    assert_ne!(first, message_digest(&frame(3, proto::MembershipChange::Add)), "frame ordering is meaningful");
-    assert_ne!(first, message_digest(&frame(2, proto::MembershipChange::Remove)), "membership effects are meaningful");
+    let first = message_digest(&frame(2, true));
+    assert_eq!(first, message_digest(&frame(2, true)), "fresh stream ids must not perturb the trace");
+    assert_ne!(first, message_digest(&frame(3, true)), "frame ordering is meaningful");
+    assert_ne!(first, message_digest(&frame(2, false)), "membership effects are meaningful");
 }
 
 #[test]
@@ -124,7 +127,9 @@ fn live_chunk_digest_tracks_fragment_bytes_and_offsets() {
                     bytes: bytes.into(),
                     last: false,
                 },
-                predicate_relevance: vec![(proto::QueryId::new(), proto::MembershipChange::Add)],
+                revision: 8,
+                member: Some(proto::QueryMember { key: vec![], head: proto::Clock::genesis(proto::EventId::from_bytes([3; 32])) }),
+                complete: false,
             },
         )
     };

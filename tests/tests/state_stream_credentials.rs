@@ -145,8 +145,8 @@ async fn live_connecting_history_uses_the_stream_credential_instead_of_the_peer_
             if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) =
                 message
             {
-                if let proto::StateFrameBody::Live(items) = &frame.body {
-                    if items.iter().any(|item| item.delta.entity_id == id) {
+                if let proto::StateFrameBody::Live { items, .. } = &frame.body {
+                    if items.iter().any(|item| item.entity_id == id) {
                         frames.lock().unwrap().push((request_id.clone(), frame.clone()));
                         arrived.notify_one();
                         return true;
@@ -202,13 +202,22 @@ async fn live_connecting_history_uses_the_stream_credential_instead_of_the_peer_
     assert_eq!(state.payload.state.head, target_head);
     // Replace a held live frame with an honest target whose carried child
     // needs the omitted parent. The real receiver must fetch that history.
-    frame.body = proto::StateFrameBody::Live(vec![proto::SubscriptionUpdateItem {
-        delta: proto::EntityDelta {
+    let (revision, mut member) = match &frame.body {
+        proto::StateFrameBody::Live { revision, items, .. } => {
+            (*revision, items.iter().find(|item| item.entity_id == id).unwrap().member.clone().expect("matching row remains present"))
+        }
+        _ => unreachable!(),
+    };
+    member.head = target_head.clone();
+    frame.body = proto::StateFrameBody::Live {
+        revision,
+        items: vec![proto::QueryChange {
             entity_id: id,
-            content: proto::DeltaContent::StateAndEvents { state: state.into(), events: vec![Attested::opt(child, None).into()] },
-        },
-        predicate_relevance: vec![],
-    }]);
+            member: Some(member),
+            delta: Some(proto::DeltaContent::StateAndEvents { state: state.into(), events: vec![Attested::opt(child, None).into()] }),
+        }],
+        complete: true,
+    };
     client
         .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
             id: proto::UpdateId::new(),
@@ -261,7 +270,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
                     // Keep the existing beta query at the base head while alpha
                     // captures a different branch. These are genuine producer
                     // frames; no response or event is forged for the test.
-                    if matches!(&frame.body, proto::StateFrameBody::Live(items) if items.iter().any(|item| item.delta.entity_id == id))
+                    if matches!(&frame.body, proto::StateFrameBody::Live { items, .. } if items.iter().any(|item| item.entity_id == id))
                         && agent
                             .subscriptions
                             .lock()

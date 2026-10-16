@@ -394,7 +394,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                     let mut found = false;
                     loop {
                         let sequence = frame.sequence;
-                        let proto::StateFrameBody::State { items, progress } = frame.body else { panic!("expected catalog state") };
+                        let proto::StateFrameBody::State { items, progress, .. } = frame.body else { panic!("expected catalog state") };
                         for item in items {
                             if let proto::StateItem::Repair { delta, .. } = item {
                                 if delta.entity_id == entity_id {
@@ -414,7 +414,13 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                                 .request(
                                     server.id,
                                     &credentials,
-                                    proto::NodeRequestBody::ContinueState { comparison, processed_through: sequence, answers: vec![] }
+                                    proto::NodeRequestBody::ContinueState {
+                                        comparison,
+                                        round: None,
+                                        processed_through: sequence,
+                                        applied_through: None,
+                                        answers: vec![]
+                                    }
                                 )
                                 .await?,
                             proto::NodeResponseBody::Success
