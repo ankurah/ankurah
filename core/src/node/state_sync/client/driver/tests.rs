@@ -23,12 +23,11 @@ async fn finite_round_finishes_while_newer_publication_target_remains_uncovered(
     let (node, mut driver, _registry) = fixture(vec![state(1)]).await?;
     driver.goals.add(id(1), head(1), true)?;
     driver.projection.round.as_mut().unwrap().complete = true;
-    driver.projection.publish(11, vec![(id(1), Some(member(2)))])?;
     let mut goals = Goals::default();
     goals.add(id(1), head(2), false)?;
     driver.publications.push_back(Publication {
         revision: 11,
-        changes: IndexMap::new(),
+        changes: [(id(1), Some(member(2)))].into_iter().collect(),
         applied: BTreeMap::new(),
         retained_bytes: 0,
         change_bytes: 0,
@@ -38,9 +37,91 @@ async fn finite_round_finishes_while_newer_publication_target_remains_uncovered(
     });
     assert!(driver.complete_round(&node, None).await?, "a later hot target must not move the captured round goal");
     assert!(driver.projection.round.is_none());
-    assert_eq!(driver.projection.members[&id(1)].head, head(2), "closing a round retains the newer source decision");
+    assert_eq!(driver.projection.members[&id(1)].head, head(1), "an uncovered later decision is not publicly committed");
     assert!(!driver.publications[0].goals.covered(), "the round does not certify the later target");
     assert_eq!(driver.applied_through, None, "round readiness is not a publication coverage receipt");
+    Ok(())
+}
+
+#[tokio::test]
+async fn finite_round_waits_its_pre_cut_publications_but_not_later_data() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![state(1)]).await?;
+    driver.projection.round.as_mut().unwrap().descriptor.revision = 20;
+    driver.projection.round.as_mut().unwrap().complete = true;
+    let mut goals = Goals::default();
+    goals.add(id(2), head(2), false)?;
+    driver.publications.push_back(Publication {
+        revision: 15,
+        changes: IndexMap::new(),
+        applied: BTreeMap::new(),
+        retained_bytes: 0,
+        change_bytes: 0,
+        goals,
+        jobs: 0,
+        complete: true,
+    });
+    assert!(!driver.complete_round(&node, None).await?, "pre-cut application/notification is part of the finite boundary");
+    driver.publications[0].goals.values_mut().for_each(|goal| goal.covered = true);
+    driver.commit_publications(&node, None).await?;
+    assert_eq!(driver.applied_through, Some(15));
+    assert!(driver.projection.round.as_ref().unwrap().absent_ids().next().is_none(), "pre-cut publications do not overlay R");
+    assert!(driver.complete_round(&node, None).await?);
+    assert_eq!(driver.projection.revision, 20);
+    Ok(())
+}
+
+#[tokio::test]
+async fn live_present_for_known_but_ineligible_row_requires_an_install() -> anyhow::Result<()> {
+    use crate::{
+        context::Context,
+        livequery::{EntityLiveQuery, QueryResolution},
+        node::CachePolicy,
+        peer_subscription::RemoteQuerySubscriber,
+    };
+    let (node, _, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let query = EntityLiveQuery::new(
+        Context::new(node.clone(), crate::policy::DEFAULT_CONTEXT).0,
+        CachePolicy::Local,
+        QueryResolution::Resolved(ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None }),
+    )?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), query.wait_initialized()).await??;
+    query.resultset().clear();
+    let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
+    let snapshot = super::super::super::QueryTree::default()
+        .refresh(spec, vec![proto::Attested::opt(proto::EntityState { entity_id: entity.id(), state: entity.to_state()? }, None)])
+        .await?;
+    let registry = Arc::new(super::super::super::IncomingStates::default());
+    let stream = registry.register(proto::RequestId::new(), None, None)?;
+    query.weak().stream_bound(1, stream.request.clone(), Arc::new(|| false));
+    let mut driver = Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::ComparisonId::new())?;
+    let owner = Some((query.query_id(), 1));
+    driver.prepare(&node, owner).await?;
+    assert!(driver.eligible.is_empty());
+    driver
+        .live(
+            &node,
+            id(90),
+            &[],
+            11,
+            vec![proto::QueryChange {
+                entity_id: entity.id(),
+                member: Some(proto::QueryMember { key: vec![], head: entity.head() }),
+                delta: None,
+            }],
+            true,
+        )
+        .await?;
+    assert!(!driver.eligible.contains(&entity.id()), "metadata receipt alone cannot publish membership");
+    assert_eq!(driver.projection.revision, 10);
+    driver.commit_publications(&node, owner).await?;
+    assert!(driver.eligible.contains(&entity.id()));
+    assert!(
+        query.resultset().contains_key(&entity.id()),
+        "new eligibility must install the candidate window even when the captured key is unchanged"
+    );
+    assert_eq!(driver.projection.revision, 11);
+    assert_eq!(driver.applied_through, Some(11));
     Ok(())
 }
 
@@ -179,6 +260,24 @@ fn bridge(event: proto::Event) -> proto::EntityDelta {
 }
 
 #[tokio::test]
+async fn initial_state_advance_is_retained_for_finite_owner_notification_without_historical_events() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let event = edit(entity.id(), entity.head(), 92);
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(event), None)?;
+    let applied = driver.jobs.next().await.unwrap()?;
+    let change = applied.change.as_ref().expect("a real initial delivery advances state");
+    assert!(change.events().is_empty(), "historical repair is not a new live event batch");
+    driver.observe(&node, applied).await?;
+    assert_eq!(driver.round_changed, [entity.id()].into_iter().collect());
+    driver.check_retained()?;
+    driver.projection.round.as_mut().unwrap().complete = true;
+    assert!(driver.complete_round(&node, None).await?);
+    assert!(driver.round_changed.is_empty(), "finite retirement releases changed identities");
+    Ok(())
+}
+
+#[tokio::test]
 async fn held_live_application_cannot_be_overtaken_by_refresh_snapshot() -> anyhow::Result<()> {
     use crate::{retrieval::SuspenseEvents, storage::StorageTransaction};
     let (node, mut driver, _registry) = fixture(vec![]).await?;
@@ -273,7 +372,7 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
         changes.extend(outcome.change);
     }
     assert_eq!(changes.len(), 2);
-    notify_changes(&node, None, changes).await;
+    notify_changes(&node, None, changes.into_iter().map(|change| (change, true)).collect()).await;
     assert_eq!(*received.lock().unwrap(), [first.id(), second.id()], "a ready batch cannot coalesce away the second event vector");
     Ok(())
 }

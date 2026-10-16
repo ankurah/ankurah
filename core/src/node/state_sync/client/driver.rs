@@ -123,6 +123,7 @@ pub(super) struct Driver {
     spec: proto::TreeSpec,
     goals: Goals,
     round_jobs: usize,
+    round_changed: HashSet<proto::EntityId>,
     jobs: FuturesUnordered<BoxFuture<'static, anyhow::Result<Applied>>>,
     queued_jobs: BTreeMap<proto::EntityId, VecDeque<BoxFuture<'static, anyhow::Result<Applied>>>>,
     active_entities: HashSet<proto::EntityId>,
@@ -171,6 +172,7 @@ impl Driver {
             spec,
             goals: Goals::default(),
             round_jobs: 0,
+            round_changed: HashSet::new(),
             jobs: FuturesUnordered::new(),
             queued_jobs: BTreeMap::new(),
             active_entities: HashSet::new(),
@@ -407,6 +409,28 @@ impl Driver {
         }
         if let Some(head) = applied.head {
             self.observe_head(node, applied.id, head).await?;
+        }
+        if applied.change.is_some() {
+            let round_changed = match applied.owner {
+                Owner::Round(number) => number == self.round_number && self.projection.round.is_some(),
+                Owner::Repair => self.projection.round.is_some() && self.goals.rows.contains_key(&applied.id),
+                Owner::Live(_) => false,
+            };
+            if round_changed {
+                ensure!(self.round_changed.contains(&applied.id) || self.round_changed.len() < 100_000, "too many changed round entities");
+                self.round_changed.insert(applied.id);
+            }
+            if applied.owner == Owner::Repair {
+                // Repair is Initial delivery: its history is not a new source
+                // event batch. Still publish an actual state advance at the
+                // waiting publication's own coherent boundary.
+                for publication in &mut self.publications {
+                    if publication.goals.rows.contains_key(&applied.id) && !publication.applied.contains_key(&applied.id) {
+                        publication.applied.insert(applied.id, vec![]);
+                        publication.retained_bytes += proto::EntityId::BYTE_LEN;
+                    }
+                }
+            }
         }
         Ok(applied.change)
     }
@@ -796,7 +820,10 @@ impl Driver {
         let ids: usize = self.publications.iter().map(|publication| publication.goals.count).sum();
         let changes: usize = self.publications.iter().map(|publication| publication.change_bytes).sum();
         ensure!(targets <= super::super::WINDOW_BYTES && ids <= 100_000, "unapplied live target window exhausted");
-        ensure!(changes + self.projection.retained_bytes() <= super::super::WINDOW_BYTES, "live membership window exhausted");
+        ensure!(
+            changes + self.projection.retained_bytes() + self.round_changed.len() * proto::EntityId::BYTE_LEN <= super::super::WINDOW_BYTES,
+            "membership notification window exhausted"
+        );
         let retained: usize = self.publications.iter().map(|publication| publication.retained_bytes).sum();
         ensure!(
             retained + self.application_bytes + self.assembly_bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
@@ -911,6 +938,12 @@ impl Driver {
         }
     }
 
+    fn deferred_notification(&self, owner: Owner, id: proto::EntityId) -> bool {
+        !matches!(owner, Owner::Repair)
+            || self.goals.rows.contains_key(&id)
+            || self.publications.iter().any(|publication| publication.changes.contains_key(&id) || publication.goals.rows.contains_key(&id))
+    }
+
     fn can_receive(&self) -> bool { self.application_bytes < super::super::WINDOW_BYTES || !self.assemblies.is_empty() }
 
     async fn commit_publications<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<()>
@@ -934,7 +967,7 @@ impl Driver {
                     _ => true,
                 };
                 if member.is_some() {
-                    self.eligible.insert(*id);
+                    self.membership_dirty |= self.eligible.insert(*id);
                     self.partial_removals.remove(id);
                 } else {
                     self.eligible.remove(id);
@@ -961,7 +994,8 @@ impl Driver {
                     let origin = crate::reactor::QueryOrigin { query: id, version, request: self.stream.request.clone() };
                     let changes =
                         changes.into_iter().map(|change| StreamChange { change, origin: Some(origin.clone()), deferred: false }).collect();
-                    node.reactor.notify_query_changes(query.subscription_id(), id, changes).await;
+                    let preserve = self.publications.iter().flat_map(|publication| publication.changes.keys()).copied().collect();
+                    node.reactor.notify_query_changes(query.subscription_id(), id, changes, preserve).await;
                 }
             }
             self.applied_through = Some(publication.revision);
@@ -1003,7 +1037,16 @@ impl Driver {
             }
         }
         self.eligible.retain(|id| self.projection.members.contains_key(id));
-        self.install(node, query, true, replace, vec![]).await?;
+        let mut changes = Vec::with_capacity(self.round_changed.len());
+        let states = LocalStateGetter::new(node.storage.clone());
+        let history = LocalEventGetter::new(node.storage.clone(), node.durable);
+        for id in &self.round_changed {
+            if let Some(entity) = node.entities.get_or_retrieve(&states, &history, id).await? {
+                changes.push(EntityChange::new(entity, vec![]));
+            }
+        }
+        self.install(node, query, true, replace, changes).await?;
+        self.round_changed.clear();
         self.prune_observed();
         self.baseline_installed = true;
         self.membership_dirty = false;
@@ -1024,6 +1067,7 @@ impl Driver {
         self.round_waiter = None;
         self.goals = Goals::default();
         self.round_jobs = 0;
+        self.round_changed.clear();
         self.assemblies.retain(|_, assembly| {
             if assembly.owner == Owner::Round(number) {
                 self.assembly_bytes -= assembly.bytes.len();
@@ -1203,13 +1247,17 @@ impl Driver {
                 }
                 Event::Job(job) => {
                     let mut changes = Vec::new();
-                    if let Some(change) = self.observe(&node, job?).await? {
-                        changes.push(change);
+                    let job = job?;
+                    let deferred = self.deferred_notification(job.owner, job.id);
+                    if let Some(change) = self.observe(&node, job).await? {
+                        changes.push((change, deferred));
                     }
                     for _ in 1..128 {
                         let Some(Some(job)) = self.jobs.next().now_or_never() else { break };
-                        if let Some(change) = self.observe(&node, job?).await? {
-                            changes.push(change);
+                        let job = job?;
+                        let deferred = self.deferred_notification(job.owner, job.id);
+                        if let Some(change) = self.observe(&node, job).await? {
+                            changes.push((change, deferred));
                         }
                     }
                     notify_changes(
@@ -1277,20 +1325,20 @@ impl ChangeNotification for StreamChange {
 
 /// Reactor batches must contain each identity at most once; it coalesces
 /// repeated identities and therefore cannot represent two event batches for one ID.
-async fn notify_changes<SE, PA>(node: &Node<SE, PA>, origin: Option<crate::reactor::QueryOrigin>, changes: Vec<EntityChange>)
+async fn notify_changes<SE, PA>(node: &Node<SE, PA>, origin: Option<crate::reactor::QueryOrigin>, changes: Vec<(EntityChange, bool)>)
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let mut batch = Vec::new();
     let mut ids = HashSet::new();
-    for change in changes {
+    for (change, deferred) in changes {
         if !ids.insert(change.entity().id()) {
             node.reactor.notify_change(std::mem::take(&mut batch)).await;
             ids.clear();
             ids.insert(change.entity().id());
         }
-        batch.push(StreamChange { change, origin: origin.clone(), deferred: true });
+        batch.push(StreamChange { change, origin: origin.clone(), deferred });
     }
     if !batch.is_empty() {
         node.reactor.notify_change(batch).await;

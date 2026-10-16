@@ -126,6 +126,7 @@ impl Projection {
             }
         }
         self.members = round.members;
+        self.revision = self.revision.max(round.descriptor.revision);
         Ok(baseline)
     }
 

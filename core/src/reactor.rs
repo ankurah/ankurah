@@ -478,6 +478,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         subscription_id: ReactorSubscriptionId,
         query: proto::QueryId,
         changes: Vec<C>,
+        preserve: HashSet<proto::EntityId>,
     ) {
         let _notify = self.0.notify_lock.lock().await;
         let subscription = self.0.subscriptions.lock().unwrap().get(&subscription_id).cloned();
@@ -487,7 +488,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         for offset in 0..changes.len() {
             candidates.add_query(query, offset);
         }
-        let changes = subscription.evaluate_changes(candidates);
+        let changes = subscription.evaluate_publication(candidates, &preserve);
         let mut watchers = self.0.watcher_set.lock().unwrap();
         for change in changes {
             watchers.apply_watcher_change(change);
@@ -1091,6 +1092,154 @@ mod tests {
             .unwrap();
         assert_eq!(resultset.len(), 1);
         assert!(resultset.contains_key(&source_row.id));
+    }
+
+    #[tokio::test]
+    async fn finite_peer_install_notifies_an_existing_state_advance_without_historical_events() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let entity = TestEntity::new("before", "pending");
+        let resultset = EntityResultSet::empty();
+        let gate = Arc::new(std::sync::RwLock::new([entity.id].into_iter().collect()));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(gate.clone(), origin(query))),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![entity.clone()],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = subscription.subscribe(watch);
+        entity.state.lock().unwrap().insert(prop("name"), "after".into());
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(gate, origin(query))),
+                resultset,
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![entity.clone()],
+                PeerQueryMembership { replace: [entity.id].into_iter().collect(), ..Default::default() },
+                vec![ReactorUpdateItem { entity, events: vec![], predicate_relevance: vec![] }],
+            )
+            .await
+            .unwrap();
+        let updates = updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].items.len(), 1);
+        assert!(updates[0].items[0].events.is_empty());
+        assert!(updates[0].items[0].predicate_relevance.is_empty(), "same identity is Update, not repeated Initial/Add");
+    }
+
+    #[tokio::test]
+    async fn pending_publication_preserves_visible_predicate_and_sort_until_joint_commit() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let exiting = TestEntity::new("AAA", "pending");
+        let entrant = TestEntity::new("MMM", "pending");
+        let resultset = EntityResultSet::empty();
+        let gate = Arc::new(std::sync::RwLock::new([exiting.id, entrant.id].into_iter().collect()));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' ORDER BY name ASC LIMIT 1"),
+                Arc::new(CandidateWindow(gate.clone(), origin(query))),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![exiting.clone()],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = subscription.subscribe(watch);
+        // The exit's data applied, but the same publication's entrant still
+        // needs history. The public row/key remains at the committed cut.
+        exiting.state.lock().unwrap().insert(prop("status"), "done".into());
+        exiting.state.lock().unwrap().insert(prop("name"), "ZZZ".into());
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' ORDER BY name ASC LIMIT 1"),
+                Arc::new(CandidateWindow(gate.clone(), origin(query))),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![exiting.clone(), entrant.clone()],
+                PeerQueryMembership {
+                    replace: [exiting.id].into_iter().collect(),
+                    remove: HashSet::new(),
+                    preserve: [exiting.id].into_iter().collect(),
+                },
+                vec![],
+            )
+            .await
+            .unwrap();
+        assert!(resultset.contains_key(&exiting.id), "finite baseline cannot leak a pending predicate/sort exit");
+        assert!(!resultset.contains_key(&entrant.id));
+        assert!(updates().is_empty(), "there is no empty-event premature removal");
+        let earlier = TestEvent { id: proto::EventId::from_bytes([41; 32]), changes: HashMap::new() };
+        reactor
+            .notify_query_changes(
+                subscription.id(),
+                query,
+                vec![OwnChange { change: TestChange { entity: exiting.clone(), events: vec![earlier.clone()] }, origin: origin(query) }],
+                [exiting.id].into_iter().collect(),
+            )
+            .await;
+        let earlier_updates = updates();
+        assert_eq!(earlier_updates.len(), 1);
+        assert_eq!(earlier_updates[0].items.len(), 1);
+        assert!(earlier_updates[0].items[0].predicate_relevance.is_empty(), "an earlier ready edit cannot expose a later pending exit");
+        assert_eq!(earlier_updates[0].items[0].events, vec![earlier]);
+        assert!(resultset.contains_key(&exiting.id));
+
+        gate.write().unwrap().remove(&exiting.id);
+        let event = TestEvent { id: proto::EventId::from_bytes([42; 32]), changes: HashMap::new() };
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' ORDER BY name ASC LIMIT 1"),
+                Arc::new(CandidateWindow(gate, origin(query))),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![entrant.clone()],
+                PeerQueryMembership { replace: HashSet::new(), remove: [exiting.id].into_iter().collect(), preserve: HashSet::new() },
+                vec![ReactorUpdateItem { entity: exiting.clone(), events: vec![event.clone()], predicate_relevance: vec![] }],
+            )
+            .await
+            .unwrap();
+        let updates = updates();
+        assert_eq!(updates.len(), 1, "one coherent publication owns the notification boundary");
+        assert_eq!(updates[0].items.len(), 2);
+        assert_eq!(updates[0].items[0].predicate_relevance, vec![(query, MembershipChange::Remove)]);
+        assert_eq!(updates[0].items[0].events, vec![event]);
+        assert_eq!(updates[0].items[1].predicate_relevance, vec![(query, MembershipChange::Add)]);
+        assert!(resultset.contains_key(&entrant.id));
+        assert!(!resultset.contains_key(&exiting.id));
     }
 
     #[tokio::test]

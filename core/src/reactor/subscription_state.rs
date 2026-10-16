@@ -383,17 +383,26 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Evaluate candidate changes for this subscription and spawn gap filling/notification task
     /// Returns watcher changes that need to be applied to the global WatcherSet
     pub fn evaluate_changes<C: ChangeNotification<Entity = E, Event = Ev>>(self, candidates: CandidateChanges<C>) -> Vec<WatcherChange> {
-        self.evaluate_candidates(candidates, false)
+        self.evaluate_candidates(candidates, false, None)
     }
 
     pub fn evaluate_membership<C: ChangeNotification<Entity = E, Event = Ev>>(self, candidates: CandidateChanges<C>) -> Vec<WatcherChange> {
-        self.evaluate_candidates(candidates, true)
+        self.evaluate_candidates(candidates, true, None)
+    }
+
+    pub(super) fn evaluate_publication<C: ChangeNotification<Entity = E, Event = Ev>>(
+        self,
+        candidates: CandidateChanges<C>,
+        preserve: &HashSet<proto::EntityId>,
+    ) -> Vec<WatcherChange> {
+        self.evaluate_candidates(candidates, false, Some(preserve))
     }
 
     fn evaluate_candidates<C: ChangeNotification<Entity = E, Event = Ev>>(
         self,
         candidates: CandidateChanges<C>,
         membership_only: bool,
+        preserve: Option<&HashSet<proto::EntityId>>,
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
         let mut items: IndexMap<proto::EntityId, ReactorUpdateItem<E, Ev>> = IndexMap::new();
@@ -435,8 +444,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                     // source member nor undo a later authorized local/Fetch view.
                     continue;
                 }
-                let matches = can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
                 let did_match = query_state.resultset.contains_key(&entity_id);
+                let matches = can_read
+                    && if preserve.is_some_and(|ids| ids.contains(&entity_id)) {
+                        did_match
+                    } else {
+                        evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
+                    };
                 if membership_only && matches == did_match {
                     continue;
                 }
