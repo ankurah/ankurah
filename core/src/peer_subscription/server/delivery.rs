@@ -1,488 +1,389 @@
-//! Keep each query generation on its comparison's numbered live stream.
-use crate::{node::Node, policy::PolicyAgent, storage::StorageEngine};
-use ankurah_proto as proto;
-use std::collections::{HashMap, HashSet, VecDeque};
+//! A query's source projection, driven by immutable commit publications.
+use crate::{
+    entity::TemporaryEntity,
+    node::{
+        source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
+        state_sync::{QueryTree, Snapshot},
+        Node, WeakNode,
+    },
+    policy::{ContextPolicy, PolicyAgent},
+    selection::filter::{evaluate_predicate, ValueLookup},
+    session::ContextData,
+    storage::StorageEngine,
+    value::Value,
+};
+use ankql::ast::{Resolved, Selection};
+use ankurah_digest_tree::CanonicalCodec;
+use ankurah_proto::{self as proto, Attested};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
+use tokio::sync::{mpsc, oneshot};
 
-const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+const MAX_READ_ATTEMPTS: usize = 8;
 
-#[derive(Debug, thiserror::Error)]
-#[error("live stream {0} rejected its queued update")]
-pub(super) struct LiveStreamFailure(pub proto::ComparisonId);
+type Rows = BTreeMap<proto::EntityId, Row>;
 
-#[derive(Default)]
-pub(super) struct Delivery {
-    routes: HashMap<proto::QueryId, Route>,
-    bytes: usize,
+struct Row {
+    state: Arc<proto::EntityState>,
+    values: Vec<Option<Value>>,
+    key: Vec<u8>,
 }
 
-struct Route {
-    version: u32,
-    comparison: Option<proto::ComparisonId>,
-    members: HashSet<proto::EntityId>,
-    pending: VecDeque<(proto::SubscriptionUpdateItem, usize)>,
-    bytes: usize,
+pub(crate) struct CapturedQuery {
+    pub(crate) revision: u64,
+    pub(crate) snapshot: Snapshot,
+    pub(super) projection: Projection,
+    pub(super) cursor: SourceCursor,
 }
 
-impl Route {
-    fn update_members(&mut self, item: &proto::SubscriptionUpdateItem) {
-        for (_, change) in &item.predicate_relevance {
-            match change {
-                proto::MembershipChange::Initial | proto::MembershipChange::Add => {
-                    self.members.insert(item.delta.entity_id);
+pub(super) struct Projection {
+    selection: Selection<Resolved>,
+    spec: proto::TreeSpec,
+    rows: Rows,
+    tree: Arc<QueryTree>,
+}
+
+pub(super) struct Refresh {
+    pub(super) number: u64,
+    pub(super) known: proto::KnownState,
+    pub(super) response: oneshot::Sender<anyhow::Result<()>>,
+}
+
+/// Register before scanning, then fold a complete source window or validate the
+/// whole limited selection. No scan holds the source commit gate.
+pub(crate) async fn capture_query<SE, PA>(
+    node: &Node<SE, PA>,
+    selection: Selection<Resolved>,
+    spec: proto::TreeSpec,
+    credentials: Vec<PA::ContextData>,
+    tree: Arc<QueryTree>,
+) -> anyhow::Result<CapturedQuery>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let (mut start, mut cursor) = node.source_publications.subscribe().await?;
+    let mut projection = Projection { selection, spec, rows: Rows::new(), tree };
+    let mut attempts = 0;
+    let window = loop {
+        attempts += 1;
+        anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
+        projection.rows = projection.read(node, &credentials).await?;
+        if projection.selection.limit.is_some() {
+            match cursor.validate(start).await {
+                Err(SourceError::Changed) => {
+                    start = cursor.fence().await?.revision;
                 }
-                proto::MembershipChange::Remove => {
-                    self.members.remove(&item.delta.entity_id);
+                result => break result?,
+            }
+        } else {
+            let window = cursor.fence().await?;
+            for batch in &window.batches {
+                projection.check_catalog(batch)?;
+                for change in &batch.changes {
+                    projection.fold(node, &credentials, change)?;
                 }
             }
+            break window;
         }
-    }
-
-    fn admits(&mut self, item: &proto::SubscriptionUpdateItem) -> bool {
-        let was_member = self.members.contains(&item.delta.entity_id);
-        self.update_members(item);
-        was_member || self.members.contains(&item.delta.entity_id) || !item.predicate_relevance.is_empty()
-    }
+    };
+    let snapshot = projection.tree.refresh_captured(projection.spec.clone(), projection.attested_rows(node)).await?;
+    Ok(CapturedQuery { revision: window.revision.0, snapshot, projection, cursor })
 }
 
-impl Delivery {
-    pub fn begin(&mut self, query: proto::QueryId, version: u32) {
-        self.remove(query);
-        self.routes.insert(query, Route { version, comparison: None, members: HashSet::new(), pending: VecDeque::new(), bytes: 0 });
+impl Projection {
+    fn check_catalog(&self, batch: &SourceBatch) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            crate::schema::is_catalog_read(&self.selection.predicate)
+                || !batch.changes.iter().any(|change| change.state.state.memberships.iter().any(crate::schema::is_catalog_model)),
+            "query catalog changed; reopen the query generation"
+        );
+        Ok(())
     }
 
-    pub fn bind<SE, PA>(
-        &mut self,
-        query: proto::QueryId,
-        version: u32,
-        comparison: proto::ComparisonId,
-        members: impl IntoIterator<Item = proto::EntityId>,
+    fn evaluate<SE, PA>(
+        &self,
         node: &Node<SE, PA>,
-        peer: proto::EntityId,
-    ) -> anyhow::Result<bool>
+        credentials: &Vec<PA::ContextData>,
+        state: Arc<proto::EntityState>,
+    ) -> anyhow::Result<Option<Row>>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        if !self.bind_route(query, version, comparison, members) {
-            return Ok(false);
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+        if policy.check_read(&state.entity_id, &state.state).is_err() {
+            return Ok(None);
         }
-        // The comparison owns bounded framing and holds emission until Applied.
-        // Preserve every connecting event batch instead of coalescing snapshots.
-        while let Some(item) = self.next_pending(query) {
-            crate::node::state_sync::queue_live(node, peer, comparison, vec![item])
-                .map_err(|error| error.context(LiveStreamFailure(comparison)))?;
+        let entity = TemporaryEntity::new(state.entity_id, &state.state)?;
+        if !evaluate_predicate(&entity, &self.selection.predicate)? {
+            return Ok(None);
         }
-        Ok(true)
+        let values = QueryTree::key_paths(&self.spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+        let key = CanonicalCodec.encode_nullable(self.spec.key_spec(), &values)?;
+        Ok(Some(Row { state, values, key }))
     }
 
-    fn bind_route(
-        &mut self,
-        query: proto::QueryId,
-        version: u32,
-        comparison: proto::ComparisonId,
-        members: impl IntoIterator<Item = proto::EntityId>,
-    ) -> bool {
-        let Some(route) = self.routes.get_mut(&query).filter(|route| route.version == version && route.comparison.is_none()) else {
-            return false;
-        };
-        route.comparison = Some(comparison);
-        route.members = members.into_iter().collect();
-        // Capture may occur between queued notifications. First derive the
-        // final membership, then rewind to the beginning of that queue.
-        for (item, _) in &route.pending {
-            for (_, change) in &item.predicate_relevance {
-                match change {
-                    proto::MembershipChange::Initial | proto::MembershipChange::Add => {
-                        route.members.insert(item.delta.entity_id);
-                    }
-                    proto::MembershipChange::Remove => {
-                        route.members.remove(&item.delta.entity_id);
-                    }
-                }
-            }
-        }
-        for (item, _) in route.pending.iter().rev() {
-            for (_, change) in item.predicate_relevance.iter().rev() {
-                match change {
-                    proto::MembershipChange::Initial | proto::MembershipChange::Add => {
-                        route.members.remove(&item.delta.entity_id);
-                    }
-                    proto::MembershipChange::Remove => {
-                        route.members.insert(item.delta.entity_id);
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    fn next_pending(&mut self, query: proto::QueryId) -> Option<proto::SubscriptionUpdateItem> {
-        let route = self.routes.get_mut(&query)?;
-        while let Some((item, size)) = route.pending.pop_front() {
-            route.bytes -= size;
-            self.bytes -= size;
-            if route.admits(&item) {
-                return Some(item);
-            }
-        }
-        None
-    }
-
-    pub fn matches(&self, query: proto::QueryId, version: u32, comparison: proto::ComparisonId) -> bool {
-        self.routes.get(&query).is_some_and(|route| route.version == version && route.comparison == Some(comparison))
-    }
-
-    pub fn send<SE, PA>(
-        &mut self,
-        node: &Node<SE, PA>,
-        peer: proto::EntityId,
-        items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> anyhow::Result<()>
+    async fn read<SE, PA>(&self, node: &Node<SE, PA>, credentials: &Vec<PA::ContextData>) -> anyhow::Result<Rows>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        self.route_updates(items, |comparison, items| match crate::node::state_sync::queue_live(node, peer, comparison, items) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                if node.peer_connections.get(&peer).is_some_and(|peer| peer.comparisons.get(&comparison).is_some()) {
-                    Err(error)
-                } else {
-                    // Retain the binding for exact-generation cleanup by its
-                    // owner; removing it here would hide the standing query.
-                    Ok(())
-                }
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+        let mut selection = self.selection.clone();
+        selection.predicate = policy.filter_predicate(selection.predicate)?;
+        let entities = node.fetch_entities_from_local(&selection).await?;
+        let mut rows = Rows::new();
+        for entity in entities {
+            let state = Arc::new(entity.to_entity_state()?);
+            if let Some(row) = self.evaluate(node, credentials, state)? {
+                rows.insert(row.state.entity_id, row);
             }
-        })
+        }
+        Ok(rows)
     }
 
-    fn route_updates(
+    fn fold<SE, PA>(&mut self, node: &Node<SE, PA>, credentials: &Vec<PA::ContextData>, change: &SourceChange) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        if let Some(row) = self.evaluate(node, credentials, change.state.clone())? {
+            self.rows.insert(change.state.entity_id, row);
+        } else {
+            self.rows.remove(&change.state.entity_id);
+        }
+        Ok(())
+    }
+
+    fn attested<SE, PA>(node: &Node<SE, PA>, row: &Row) -> (Attested<proto::EntityState>, Vec<Option<Value>>)
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        (Attested::opt((*row.state).clone(), node.policy_agent.attest_state(node, &row.state)), row.values.clone())
+    }
+
+    fn attested_rows<SE, PA>(&self, node: &Node<SE, PA>) -> Vec<(Attested<proto::EntityState>, Vec<Option<Value>>)>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        self.rows.values().map(|row| Self::attested(node, row)).collect()
+    }
+
+    fn change<SE, PA>(&self, node: &Node<SE, PA>, credentials: &Vec<PA::ContextData>, change: &SourceChange) -> proto::QueryChange
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let entity_id = change.state.entity_id;
+        let member = self.rows.get(&entity_id).map(|row| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() });
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+        let delta = policy.check_read(&entity_id, &change.state.state).is_ok().then(|| proto::DeltaContent::StateAndEvents {
+            state: Attested::opt((*change.state).clone(), node.policy_agent.attest_state(node, &change.state)).into(),
+            events: change.events.iter().cloned().map(Into::into).collect(),
+        });
+        proto::QueryChange { entity_id, member, delta }
+    }
+
+    async fn apply<SE, PA>(
         &mut self,
-        items: Vec<proto::SubscriptionUpdateItem>,
-        mut queue: impl FnMut(proto::ComparisonId, Vec<proto::SubscriptionUpdateItem>) -> anyhow::Result<()>,
-    ) -> anyhow::Result<()> {
-        let mut failed_queries = HashSet::new();
-        let mut stream_failure = None;
-        let mut pending_failure = None;
-        for item in items {
-            for (query, route) in &mut self.routes {
-                if failed_queries.contains(query) {
-                    continue;
-                }
-                if route.comparison.is_some()
-                    && !route.members.contains(&item.delta.entity_id)
-                    && !item.predicate_relevance.iter().any(|(id, _)| id == query)
-                {
-                    continue;
-                }
-                let mut item = item.clone();
-                item.predicate_relevance.retain(|(id, _)| id == query);
-                if let Some(comparison) = route.comparison {
-                    if route.admits(&item) {
-                        if let Err(error) = queue(comparison, vec![item]) {
-                            failed_queries.insert(*query);
-                            stream_failure.get_or_insert_with(|| error.context(LiveStreamFailure(comparison)));
+        node: &Node<SE, PA>,
+        credentials: &Vec<PA::ContextData>,
+        batch: &SourceBatch,
+    ) -> anyhow::Result<Vec<proto::QueryChange>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let mut changed = Vec::new();
+        let mut rows = Vec::new();
+        let mut removed = Vec::new();
+        for change in &batch.changes {
+            let id = change.state.entity_id;
+            let was_member = self.rows.contains_key(&id);
+            self.fold(node, credentials, change)?;
+            if let Some(row) = self.rows.get(&id) {
+                rows.push(Self::attested(node, row));
+            } else if was_member {
+                removed.push(id);
+            }
+            if was_member || self.rows.contains_key(&id) {
+                changed.push(self.change(node, credentials, change));
+            }
+        }
+        self.tree.apply_captured(rows, removed).await?;
+        Ok(changed)
+    }
+}
+
+pub(super) struct Actor<CD: ContextData> {
+    peer: proto::EntityId,
+    comparison: proto::ComparisonId,
+    credentials: Vec<CD>,
+    projection: Projection,
+    cursor: SourceCursor,
+    revision: u64,
+}
+
+impl<CD: ContextData> Actor<CD> {
+    pub(super) fn new(
+        peer: proto::EntityId,
+        comparison: proto::ComparisonId,
+        credentials: Vec<CD>,
+        projection: Projection,
+        cursor: SourceCursor,
+        revision: u64,
+    ) -> Self {
+        Self { peer, comparison, credentials, projection, cursor, revision }
+    }
+
+    pub(super) async fn run<SE, PA>(mut self, weak: WeakNode<SE, PA>, mut commands: mpsc::Receiver<Refresh>) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        loop {
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else { return Ok(()); };
+                    let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
+                    let snapshot = match self.refresh(&node).await {
+                        Ok(snapshot) => snapshot,
+                        Err(error) => {
+                            let _ = command.response.send(Err(anyhow::anyhow!("query capture failed: {error}")));
+                            return Err(error);
                         }
-                    }
-                } else {
-                    let result: anyhow::Result<()> = (|| {
-                        let size = usize::try_from(bincode::serialized_size(&item)?)?;
-                        anyhow::ensure!(
-                            self.bytes.saturating_add(size) <= MAX_PENDING_BYTES,
-                            "subscription initialization live queue overflow"
-                        );
-                        self.bytes += size;
-                        route.bytes += size;
-                        route.pending.push_back((item, size));
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        failed_queries.insert(*query);
-                        pending_failure.get_or_insert(error);
-                    }
+                    };
+                    // Bad or premature round requests do not invalidate an
+                    // otherwise sound source projection.
+                    let result = crate::node::state_sync::schedule_round(
+                        &node, self.peer, self.comparison, command.number, self.revision, snapshot, command.known,
+                    ).await;
+                    let _ = command.response.send(result);
+                }
+                batch = self.cursor.next() => {
+                    let batch = batch?;
+                    let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
+                    self.publish(&node, batch).await?;
                 }
             }
         }
-        // Every healthy bound route receives the whole batch. Initialization
-        // failures still require disconnect and must not be hidden by a stopped stream.
-        pending_failure.or(stream_failure).map_or(Ok(()), Err)
     }
 
-    pub fn remove(&mut self, query: proto::QueryId) {
-        if let Some(route) = self.routes.remove(&query) {
-            self.bytes -= route.bytes;
+    async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Arc<SourceBatch>) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        self.projection.check_catalog(&batch)?;
+        if self.projection.selection.limit.is_some() {
+            let mut relevant = false;
+            for change in &batch.changes {
+                relevant |= self.projection.rows.contains_key(&change.state.entity_id)
+                    || self.projection.evaluate(node, &self.credentials, change.state.clone())?.is_some();
+            }
+            if relevant {
+                self.refill(node, vec![batch]).await?;
+            } else {
+                self.revision = batch.revision.0;
+            }
+        } else {
+            let changes = self.projection.apply(node, &self.credentials, &batch).await?;
+            if !changes.is_empty() {
+                crate::node::state_sync::queue_live(node, self.peer, self.comparison, batch.revision.0, changes)?;
+            }
+            self.revision = batch.revision.0;
         }
+        Ok(())
+    }
+
+    async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<Arc<SourceBatch>>) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        for batch in &pending {
+            self.projection.check_catalog(batch)?;
+        }
+        let mut bytes = pending.iter().map(|batch| batch.bytes).sum::<usize>();
+        let mut attempts = 0;
+        let (rows, revision) = loop {
+            attempts += 1;
+            anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
+            let window = self.cursor.fence().await?;
+            for batch in window.batches {
+                self.projection.check_catalog(&batch)?;
+                anyhow::ensure!(
+                    pending.len() < MAX_PENDING_BATCHES && batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes),
+                    SourceError::Lagged
+                );
+                bytes += batch.bytes;
+                pending.push(batch);
+            }
+            let rows = self.projection.read(node, &self.credentials).await?;
+            match self.cursor.validate(window.revision).await {
+                Err(SourceError::Changed) => continue,
+                result => break (rows, result?.revision.0),
+            }
+        };
+        let previous = std::mem::replace(&mut self.projection.rows, rows);
+        let mut changed = Vec::new();
+        let mut included = BTreeSet::new();
+        for batch in pending {
+            for source in &batch.changes {
+                let id = source.state.entity_id;
+                if previous.contains_key(&id) || self.projection.rows.contains_key(&id) {
+                    changed.push(self.projection.change(node, &self.credentials, source));
+                    included.insert(id);
+                }
+            }
+        }
+        for (id, row) in &self.projection.rows {
+            if !included.contains(id)
+                && previous.get(id).is_none_or(|before| before.key != row.key || before.state.state.head != row.state.state.head)
+            {
+                changed.push(self.projection.change(
+                    node,
+                    &self.credentials,
+                    &SourceChange { state: row.state.clone(), events: Vec::new() },
+                ));
+            }
+        }
+        for id in previous.keys() {
+            if !included.contains(id) && !self.projection.rows.contains_key(id) {
+                // Rank eviction still authors absence even though this entity
+                // itself did not change during the validated read.
+                changed.push(proto::QueryChange { entity_id: *id, member: None, delta: None });
+            }
+        }
+        self.projection.tree.refresh_captured(self.projection.spec.clone(), self.projection.attested_rows(node)).await?;
+        crate::node::state_sync::queue_live(node, self.peer, self.comparison, revision, changed)?;
+        self.revision = revision;
+        Ok(())
+    }
+
+    async fn refresh<SE, PA>(&mut self, node: &Node<SE, PA>) -> anyhow::Result<Snapshot>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        let window = self.cursor.fence().await?;
+        if self.projection.selection.limit.is_some() && !window.batches.is_empty() {
+            self.refill(node, window.batches).await?;
+        } else {
+            for batch in window.batches {
+                self.publish(node, batch).await?;
+            }
+            // An empty fence can still advance the source publication boundary.
+            self.revision = window.revision.0;
+        }
+        self.projection.tree.current_snapshot().await
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        connector::{PeerSender, SendError},
-        policy::PermissiveAgent,
-        test_utils::TestStorage,
-    };
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone)]
-    struct CaptureSender {
-        peer: proto::EntityId,
-        messages: Arc<Mutex<Vec<proto::NodeMessage>>>,
-    }
-    impl PeerSender for CaptureSender {
-        fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-            self.messages.lock().unwrap().push(message);
-            Ok(())
-        }
-        fn recipient_node_id(&self) -> proto::EntityId { self.peer }
-        fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
-    }
-
-    fn item(entity: proto::EntityId, relevance: Vec<(proto::QueryId, proto::MembershipChange)>) -> proto::SubscriptionUpdateItem {
-        let event = proto::Event::update(entity, proto::Clock::default(), proto::AuthorId::Unknown, proto::OperationSet::default());
-        proto::SubscriptionUpdateItem {
-            delta: proto::EntityDelta {
-                entity_id: entity,
-                content: proto::DeltaContent::StateAndEvents {
-                    state: proto::StateFragment { state: Default::default(), attestations: Default::default() },
-                    events: vec![proto::Attested::opt(event, None).into()],
-                },
-            },
-            predicate_relevance: relevance,
-        }
-    }
-
-    #[test]
-    fn initializing_query_does_not_gate_bound_query_and_relevance_is_partitioned() -> anyhow::Result<()> {
-        let warm = proto::QueryId::new();
-        let cold = proto::QueryId::new();
-        let warm_stream = proto::ComparisonId::new();
-        let cold_stream = proto::ComparisonId::new();
-        let entity = proto::EntityId::random();
-        let mut delivery = Delivery::default();
-        delivery.begin(warm, 1);
-        assert!(delivery.bind_route(warm, 1, warm_stream, [entity]));
-        delivery.begin(cold, 1);
-        let mut sent = Vec::new();
-        delivery.route_updates(
-            vec![item(entity, vec![(warm, proto::MembershipChange::Remove), (cold, proto::MembershipChange::Add)])],
-            |stream, items| {
-                sent.push((stream, items));
-                Ok(())
-            },
-        )?;
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, warm_stream);
-        assert_eq!(sent[0].1[0].predicate_relevance, vec![(warm, proto::MembershipChange::Remove)]);
-        assert!(delivery.bytes > 0);
-        assert!(delivery.bind_route(cold, 1, cold_stream, [entity]));
-        let pending = delivery.next_pending(cold).unwrap();
-        assert_eq!(pending.predicate_relevance, vec![(cold, proto::MembershipChange::Add)]);
-        assert!(delivery.next_pending(cold).is_none());
-        assert_eq!(delivery.bytes, 0);
-        assert!(delivery.matches(warm, 1, warm_stream));
-        assert!(delivery.matches(cold, 1, cold_stream));
-        sent.clear();
-        delivery.route_updates(vec![item(entity, vec![])], |stream, items| {
-            sent.push((stream, items));
-            Ok(())
-        })?;
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].0, cold_stream, "ordinary changes follow current membership even without relevance");
-        Ok(())
-    }
-
-    #[test]
-    fn removal_during_capture_preserves_all_connecting_events() -> anyhow::Result<()> {
-        let query = proto::QueryId::new();
-        let stream = proto::ComparisonId::new();
-        let entity = proto::EntityId::random();
-        let first = item(entity, vec![]);
-        let remove = item(entity, vec![(query, proto::MembershipChange::Remove)]);
-        let outsider = item(proto::EntityId::random(), vec![]);
-        let mut delivery = Delivery::default();
-        delivery.begin(query, 1);
-        delivery.route_updates(vec![first.clone(), remove.clone(), outsider], |_, _| panic!("unbound updates must wait"))?;
-        assert!(delivery.bind_route(query, 1, stream, []));
-        let received = [delivery.next_pending(query).unwrap(), delivery.next_pending(query).unwrap()];
-        assert_eq!(bincode::serialize(&received)?, bincode::serialize(&[first, remove])?);
-        assert!(delivery.next_pending(query).is_none());
-        assert_eq!(delivery.bytes, 0);
-        assert!(delivery.routes[&query].members.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn replacement_discards_only_that_query_generation() -> anyhow::Result<()> {
-        let query = proto::QueryId::new();
-        let other = proto::QueryId::new();
-        let old = proto::ComparisonId::new();
-        let active = proto::ComparisonId::new();
-        let mut delivery = Delivery::default();
-        delivery.begin(other, 1);
-        assert!(delivery.bind_route(other, 1, active, []));
-        delivery.begin(query, 1);
-        delivery.route_updates(vec![item(proto::EntityId::random(), vec![])], |_, _| Ok(()))?;
-        assert!(delivery.bytes > 0);
-        delivery.begin(query, 2);
-        assert_eq!(delivery.bytes, 0);
-        assert!(!delivery.bind_route(query, 1, old, []));
-        let replacement = proto::ComparisonId::new();
-        assert!(delivery.bind_route(query, 2, replacement, []));
-        assert!(!delivery.matches(query, 1, old));
-        assert!(delivery.matches(query, 2, replacement));
-        delivery.remove(query);
-        assert!(delivery.matches(other, 1, active));
-        Ok(())
-    }
-
-    #[test]
-    fn pending_overflow_fails_without_releasing_or_flushing_routes() {
-        let query = proto::QueryId::new();
-        let mut delivery = Delivery::default();
-        delivery.begin(query, 1);
-        let mut oversized = item(proto::EntityId::random(), vec![]);
-        let proto::DeltaContent::StateAndEvents { state, .. } = &mut oversized.delta.content else { unreachable!() };
-        state.state.state_buffers.0.insert("large".to_owned(), vec![0; MAX_PENDING_BYTES]);
-        assert!(delivery.route_updates(vec![oversized], |_, _| panic!("overflow must never flush unsequenced updates")).is_err());
-        assert!(delivery.routes.contains_key(&query));
-        assert!(delivery.routes[&query].comparison.is_none());
-        assert_eq!(delivery.bytes, 0);
-    }
-
-    #[test]
-    fn failed_bound_stream_does_not_skip_other_streams_or_later_items() -> anyhow::Result<()> {
-        let failed_query = proto::QueryId::new();
-        let healthy_query = proto::QueryId::new();
-        let failed = proto::ComparisonId::new();
-        let healthy = proto::ComparisonId::new();
-        let failed_entity = proto::EntityId::random();
-        let healthy_entity = proto::EntityId::random();
-        let mut delivery = Delivery::default();
-        delivery.begin(failed_query, 1);
-        delivery.bind_route(failed_query, 1, failed, [failed_entity]);
-        delivery.begin(healthy_query, 1);
-        delivery.bind_route(healthy_query, 1, healthy, [healthy_entity]);
-        let changes = vec![item(healthy_entity, vec![]), item(healthy_entity, vec![])];
-        let mut batch = vec![item(failed_entity, vec![])];
-        batch.extend(changes.clone());
-        let mut received = Vec::new();
-        let failure = delivery
-            .route_updates(batch, |stream, items| {
-                if stream == failed {
-                    anyhow::bail!("stopped stream");
-                }
-                assert_eq!(stream, healthy);
-                received.extend(items);
-                Ok(())
-            })
-            .unwrap_err();
-        assert_eq!(failure.downcast_ref::<LiveStreamFailure>().unwrap().0, failed);
-        assert_eq!(bincode::serialize(&received)?, bincode::serialize(&changes)?);
-        assert!(delivery.matches(healthy_query, 1, healthy));
-        Ok(())
-    }
-
-    #[test]
-    fn failed_stream_does_not_hide_initialization_overflow() {
-        let failed_query = proto::QueryId::new();
-        let initializing_query = proto::QueryId::new();
-        let failed = proto::ComparisonId::new();
-        let entity = proto::EntityId::random();
-        let mut delivery = Delivery::default();
-        delivery.begin(failed_query, 1);
-        delivery.bind_route(failed_query, 1, failed, [entity]);
-        delivery.begin(initializing_query, 1);
-        let mut oversized = item(proto::EntityId::random(), vec![]);
-        let proto::DeltaContent::StateAndEvents { state, .. } = &mut oversized.delta.content else { unreachable!() };
-        state.state.state_buffers.0.insert("large".to_owned(), vec![0; MAX_PENDING_BYTES]);
-        let error = delivery.route_updates(vec![item(entity, vec![]), oversized], |_, _| anyhow::bail!("stopped stream")).unwrap_err();
-        assert!(error.downcast_ref::<LiveStreamFailure>().is_none(), "initialization failure must still require connection recovery");
-        assert!(error.to_string().contains("initialization live queue overflow"));
-    }
-
-    #[tokio::test]
-    async fn removed_last_route_drops_late_notifications() -> anyhow::Result<()> {
-        let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        let peer = proto::EntityId::random();
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        node.register_peer(
-            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-            Box::new(CaptureSender { peer, messages: messages.clone() }),
-        )
-        .await?;
-        let query = proto::QueryId::new();
-        let entity = proto::EntityId::random();
-        let mut delivery = Delivery::default();
-        delivery.begin(query, 1);
-        assert!(delivery.bind_route(query, 1, proto::ComparisonId::new(), [entity]));
-        delivery.remove(query);
-        messages.lock().unwrap().clear();
-
-        delivery.send(&node, peer, vec![item(entity, vec![(query, proto::MembershipChange::Remove)])])?;
-        assert!(messages.lock().unwrap().is_empty(), "late notifications must not escape on an unsequenced stream");
-        assert_eq!(delivery.bytes, 0);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn removed_comparison_route_is_stale_and_healthy_stream_still_receives() -> anyhow::Result<()> {
-        let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        let peer = proto::EntityId::random();
-        let messages = Arc::new(Mutex::new(Vec::new()));
-        node.register_peer(
-            proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-            Box::new(CaptureSender { peer, messages: messages.clone() }),
-        )
-        .await?;
-        let stale_query = proto::QueryId::new();
-        let healthy_query = proto::QueryId::new();
-        let stale_entity = proto::EntityId::random();
-        let healthy_entity = proto::EntityId::random();
-        let mut delivery = Delivery::default();
-        let mut streams = Vec::new();
-        for (query, entity) in [(stale_query, stale_entity), (healthy_query, healthy_entity)] {
-            let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
-            let snapshot = crate::node::state_sync::QueryTree::default().refresh(spec, vec![]).await?;
-            let initial = crate::node::state_sync::start_comparison(
-                &node,
-                peer,
-                proto::RequestId::new(),
-                vec![],
-                vec![],
-                Some((query, 1)),
-                false,
-                snapshot,
-                None,
-            )
-            .await?;
-            delivery.begin(query, 1);
-            assert!(delivery.bind_route(query, 1, initial.frame.comparison, [entity]));
-            streams.push(initial.frame.comparison);
-        }
-        // Reproduce the cleanup window: comparison is gone, route is still bound.
-        crate::node::state_sync::close_state(&node, peer, streams[0], proto::ComparisonOutcome::Abandoned, vec![]).await?;
-        crate::node::state_sync::close_state(&node, peer, streams[1], proto::ComparisonOutcome::Applied { processed_through: 0 }, vec![])
-            .await?;
-        delivery.send(&node, peer, vec![item(stale_entity, vec![]), item(healthy_entity, vec![])])?;
-        assert!(node.peer_connections.get(&peer).is_some(), "retiring one stream must preserve the peer");
-        assert!(delivery.matches(stale_query, 1, streams[0]), "retain the binding for its owner's standing-query cleanup");
-        assert!(delivery.matches(healthy_query, 1, streams[1]));
-        crate::node::state_sync::pump_comparison(&node, peer, streams[1]).await?;
-        assert!(messages.lock().unwrap().iter().any(|message| matches!(
-            message,
-            proto::NodeMessage::Update(proto::NodeUpdate {
-                body: proto::NodeUpdateBody::StateFrame {
-                    frame: proto::StateFrame { comparison, body: proto::StateFrameBody::Live(items), .. }, ..
-                }, ..
-            }) if *comparison == streams[1] && items.iter().any(|item| item.delta.entity_id == healthy_entity)
-        )));
-        let replacement = proto::ComparisonId::new();
-        delivery.begin(stale_query, 2);
-        assert!(delivery.bind_route(stale_query, 2, replacement, []));
-        assert!(!delivery.matches(stale_query, 1, streams[0]), "old cleanup must not match the replacement");
-        assert!(delivery.matches(stale_query, 2, replacement));
-        Ok(())
-    }
-}
+mod tests;

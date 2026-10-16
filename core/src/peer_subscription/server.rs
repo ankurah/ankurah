@@ -1,112 +1,67 @@
-use ankql::ast::Resolved;
-use ankurah_proto::{self as proto, Attested};
-use tracing::warn;
-
 use crate::{
-    entity::Entity,
     error::SubscriptionError,
-    node::Node,
-    policy::{ContextPolicy, PolicyAgent},
-    reactor::{
-        fetch_gap::{GapFetcher, QueryGapFetcher},
-        ReactorSubscription, ReactorUpdate,
-    },
-    session::{ContextData, SessionSet},
+    node::{source_publications::SourceError, state_sync::QueryTree, Node},
+    policy::PolicyAgent,
+    session::ContextData,
     storage::StorageEngine,
 };
-use ankurah_signals::{Subscribe, SubscriptionGuard};
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use ankql::ast::Resolved;
+use ankurah_proto as proto;
+use ankurah_signals::Wait;
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 mod delivery;
-use delivery::Delivery;
+pub(crate) use delivery::{capture_query, CapturedQuery};
 
-/// Owns one peer's reactor subscription and per-query credential sources.
+/// Owns one immutable source projection per query generation for this peer.
 pub struct SubscriptionHandler<CD: ContextData> {
     peer_id: proto::EntityId,
-    subscription: ReactorSubscription,
-    delivery: Arc<Mutex<Delivery>>,
-    _guard: SubscriptionGuard,
-    /// Tracks each standing query's version and the credential source shared with its gap fetcher.
-    /// Held through async installation and failure cleanup so removal cannot race an
-    /// installation that would leave a reactor query without its credential source.
-    queries: tokio::sync::Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
+    queries: Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
 }
 
 struct StandingQuery<CD: ContextData> {
-    /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
-    sessions: SessionSet<CD>,
+    credentials: Vec<CD>,
     version: u32,
-    tree: Arc<crate::node::state_sync::QueryTree>,
+    comparison: proto::ComparisonId,
+    tree: Arc<QueryTree>,
+    commands: mpsc::Sender<delivery::Refresh>,
+    stop: Option<oneshot::Sender<()>>,
+    stopped: oneshot::Receiver<()>,
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub fn new<SE, PA>(peer_id: proto::EntityId, node: &Node<SE, PA>) -> Self
+    pub fn new<SE, PA>(peer_id: proto::EntityId, _node: &Node<SE, PA>) -> Self
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let subscription = node.reactor.subscribe();
-        let weak_node = node.weak();
-        let delivery = Arc::new(Mutex::new(Delivery::default()));
-        let updates = delivery.clone();
-
-        let guard = subscription.subscribe(move |update: ReactorUpdate| {
-            tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
-
-            if let Some(node) = weak_node.upgrade() {
-                let items = update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect();
-                let result = updates.lock().unwrap().send(&node, peer_id, items);
-                if let Err(error) = result {
-                    if error.downcast_ref::<delivery::LiveStreamFailure>().is_some() {
-                        // Queue failure schedules this stream's restart. It may
-                        // already have retired while the callback was routing.
-                        warn!(%peer_id, %error, "subscription stream rejected an update; awaiting its explicit restart or cleanup");
-                    } else {
-                        warn!(%peer_id, %error, "subscription delivery failed; disconnecting peer");
-                        node.deregister_peer(peer_id);
-                    }
-                }
-            }
-        });
-
-        Self { peer_id, subscription, delivery, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
+        Self { peer_id, queries: Mutex::new(HashMap::new()) }
     }
 
-    /// Get the subscription ID for this peer.
-    pub fn subscription_id(&self) -> crate::reactor::ReactorSubscriptionId { self.subscription.id() }
-
-    /// Get a reference to the subscription for adding/removing predicates.
-    pub fn subscription(&self) -> &ReactorSubscription { &self.subscription }
-
-    /// Remove a query and its credential source even if reactor cleanup fails.
-    pub async fn remove_predicate<SE, PA>(&self, node: &Node<SE, PA>, query_id: proto::QueryId) -> Result<(), SubscriptionError>
+    pub async fn remove_predicate<SE, PA>(&self, node: &Node<SE, PA>, query: proto::QueryId) -> Result<(), SubscriptionError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        // A selection update must not reinstall the query between reactor and credential removal.
-        // Reactor removal is synchronous and does not call back into this handler.
         let mut queries = self.queries.lock().await;
         if let Some(peer) = node.peer_connections.get(&self.peer_id) {
-            peer.comparisons.invalidate_query(query_id);
+            peer.comparisons.invalidate_query(query);
         }
-        let removed = self.subscription.remove_predicate(query_id);
-        queries.remove(&query_id);
-        self.delivery.lock().unwrap().remove(query_id);
-        removed
+        if let Some(mut standing) = queries.remove(&query) {
+            standing.stop.take();
+            let _ = standing.stopped.await;
+        }
+        Ok(())
     }
 
-    /// Handle a subscription request for this peer.
     pub async fn subscribe_query<SE, PA>(
         &self,
         node: &Node<SE, PA>,
         request: proto::RequestId,
         fingerprint: Vec<u8>,
         query_id: proto::QueryId,
-        mut selection: ankql::ast::Selection<Resolved>,
+        selection: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
         known_state: Option<proto::KnownState>,
@@ -116,148 +71,116 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let mut queries = self.queries.lock().await;
-        if version == 0 {
-            return Err(anyhow::anyhow!("Invalid version 0 for subscription"));
+        anyhow::ensure!(version != 0, "invalid subscription version 0");
+        if let Some(standing) = queries.get(&query_id) {
+            anyhow::ensure!(version >= standing.version, "stale subscription version {version}; current version is {}", standing.version);
         }
-        let spec = crate::node::state_sync::QueryTree::offered_spec(&selection, &node.catalog, &known_state)?;
+        let spec = QueryTree::offered_spec(&selection, &node.catalog, &known_state)?;
         let catalog = crate::schema::is_catalog_read(&selection.predicate);
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-        // Re-subscribes revalidate; #426 owns denied-update claw-back.
-        selection.predicate = policy.filter_predicate(selection.predicate)?;
-
-        use std::collections::hash_map::Entry;
-        let (sessions, tree) = match queries.entry(query_id) {
-            Entry::Occupied(mut o) => {
-                let standing = o.get_mut();
-                if version < standing.version {
-                    anyhow::bail!("stale subscription version {version} for query {query_id}; current version is {}", standing.version);
-                }
-                standing.version = version;
-                (standing.sessions.clone(), standing.tree.clone())
-            }
-            Entry::Vacant(v) => {
-                let sessions = match cdata {
-                    Some(cdata) => cdata.clone().into(),
-                    None => SessionSet::new(),
-                };
-                let tree = Arc::new(crate::node::state_sync::QueryTree::default());
-                v.insert(StandingQuery { sessions: sessions.clone(), version, tree: tree.clone() });
-                (sessions, tree)
-            }
-        };
-
         let peer = node.peer_connections.get(&self.peer_id).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+        let tree = if let Some(mut previous) = queries.remove(&query_id) {
+            previous.stop.take();
+            let _ = previous.stopped.await;
+            previous.tree
+        } else {
+            Arc::new(QueryTree::default())
+        };
         peer.comparisons.invalidate_query(query_id);
-        self.delivery.lock().unwrap().begin(query_id, version);
-        let response = async {
-            let context = crate::context::Context::new_weak(node, sessions);
-            let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(context.clone()));
-            let matching = self.subscription.upsert_query(query_id, selection, gap_fetcher, context.0, version).await?;
-            let paths = crate::node::state_sync::QueryTree::key_paths(&spec);
-            let mut states = Vec::new();
-            for entity in matching {
-                let (state, values) = entity.to_entity_state_with_values(&paths)?;
-                if policy.check_read(&state.entity_id, &state.state).is_err() {
-                    continue;
+        let captured = capture_query(node, selection, spec, credentials.clone(), tree.clone()).await?;
+        let CapturedQuery { revision, snapshot, projection, cursor } = captured;
+        let state = crate::node::state_sync::start_comparison(
+            node,
+            self.peer_id,
+            request,
+            fingerprint,
+            credentials.clone(),
+            Some((query_id, version)),
+            catalog,
+            revision,
+            snapshot,
+            known_state,
+        )
+        .await?;
+        let comparison = state.frame.comparison;
+        // Moving the snapshot into the round must not consume the independent
+        // cursor/projection that owns every later source publication.
+        let actor = delivery::Actor::new(self.peer_id, comparison, credentials.clone(), projection, cursor, revision);
+        let (commands, receiver) = mpsc::channel(8);
+        let (stop, canceled) = oneshot::channel();
+        let (stopped, done) = oneshot::channel();
+        let weak = node.weak();
+        let run = node.run.clone();
+        let peer_id = self.peer_id;
+        crate::task::spawn(async move {
+            let result = tokio::select! {
+                _ = canceled => Ok(()),
+                _ = run.wait_value(false) => Ok(()),
+                result = actor.run(weak.clone(), receiver) => result,
+            };
+            // Unblock replacement before failure cleanup takes the handler lock.
+            let _ = stopped.send(());
+            if let Err(error) = result {
+                tracing::warn!(%peer_id, %comparison, %error, "query source stopped");
+                if let Some(node) = weak.upgrade() {
+                    if matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Unavailable)) {
+                        let _ = crate::node::state_sync::source_unavailable(&node, peer_id, comparison).await;
+                    } else {
+                        let _ = crate::node::state_sync::expire_comparison(&node, peer_id, comparison).await;
+                    }
                 }
-                let attestation = node.policy_agent.attest_state(node, &state);
-                states.push((Attested::opt(state, attestation), values));
             }
-            let snapshot = tree.refresh_captured(spec, states).await?;
-            let members = snapshot.states.keys().copied().collect::<Vec<_>>();
-            let state = crate::node::state_sync::start_comparison(
-                node,
-                self.peer_id,
-                request,
-                fingerprint,
-                credentials.clone(),
-                Some((query_id, version)),
-                catalog,
-                snapshot,
-                known_state,
-            )
-            .await?;
-            let bound = self.delivery.lock().unwrap().bind(query_id, version, state.frame.comparison, members, node, self.peer_id)?;
-            if !bound {
-                peer.comparisons.remove(&state.frame.comparison);
-                return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: state.frame.comparison });
-            }
-            Ok(proto::NodeResponseBody::QuerySubscribed { query_id, state })
-        }
-        .await;
-        if response.is_err() {
-            queries.remove(&query_id);
-            let _ = self.subscription.remove_predicate(query_id);
-            self.delivery.lock().unwrap().remove(query_id);
-            peer.comparisons.invalidate_query(query_id);
-        }
-        response
+        });
+        queries.insert(query_id, StandingQuery { credentials, version, comparison, tree, commands, stop: Some(stop), stopped: done });
+        Ok(proto::NodeResponseBody::QuerySubscribed { query_id, state })
+    }
+
+    pub(crate) async fn refresh_query<SE, PA>(
+        &self,
+        node: &Node<SE, PA>,
+        comparison: proto::ComparisonId,
+        number: u64,
+        known: proto::KnownState,
+        credentials: &[CD],
+    ) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        let commands = {
+            let queries = self.queries.lock().await;
+            let standing = queries
+                .values()
+                .find(|standing| standing.comparison == comparison)
+                .ok_or_else(|| anyhow::anyhow!("query stream unavailable"))?;
+            anyhow::ensure!(same_credentials(&standing.credentials, credentials), "query stream credentials changed");
+            anyhow::ensure!(node.peer_connections.get(&self.peer_id).is_some(), "peer disconnected");
+            standing.commands.clone()
+        };
+        let (response, result) = oneshot::channel();
+        commands.send(delivery::Refresh { number, known, response }).await.map_err(|_| anyhow::anyhow!("query source stopped"))?;
+        result.await.map_err(|_| anyhow::anyhow!("query source stopped"))?
     }
 
     pub(crate) async fn abandon_comparison(&self, query: proto::QueryId, version: u32, comparison: proto::ComparisonId) {
         let mut queries = self.queries.lock().await;
-        let mut delivery = self.delivery.lock().unwrap();
-        if !delivery.matches(query, version, comparison) {
-            return;
+        if queries.get(&query).is_some_and(|standing| standing.version == version && standing.comparison == comparison) {
+            queries.remove(&query);
         }
-        queries.remove(&query);
-        let _ = self.subscription.remove_predicate(query);
-        delivery.remove(query);
     }
 }
 
-/// Convert a single ReactorUpdateItem to a SubscriptionUpdateItem.
-fn convert_item<SE, PA>(
-    node: &Node<SE, PA>,
-    peer_id: proto::EntityId,
-    item: crate::reactor::ReactorUpdateItem,
-) -> Option<proto::SubscriptionUpdateItem>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    // Convert entity to EntityState and attest it
-    let entity_state = match item.entity.to_entity_state() {
-        Ok(entity_state) => entity_state,
-        Err(e) => {
-            warn!("Failed to convert entity {} to EntityState for peer {}: {}", item.entity.id(), peer_id, e);
-            return None;
-        }
-    };
-
-    let attestation = node.policy_agent.attest_state(node, &entity_state);
-    let attested_state = Attested::opt(entity_state, attestation);
-
-    // Events should already be attested
-    let attested_events = item.events;
-
-    let content = proto::DeltaContent::StateAndEvents {
-        state: attested_state.into(),
-        events: attested_events.into_iter().map(|e| e.into()).collect(),
-    };
-
-    // Convert predicate relevance from reactor types to proto types
-    let predicate_relevance = item
-        .predicate_relevance
-        .into_iter()
-        .map(|(pred_id, membership)| {
-            let proto_membership = match membership {
-                crate::reactor::MembershipChange::Initial => proto::MembershipChange::Initial,
-                crate::reactor::MembershipChange::Add => proto::MembershipChange::Add,
-                crate::reactor::MembershipChange::Remove => proto::MembershipChange::Remove,
-            };
-            (pred_id, proto_membership)
-        })
-        .collect();
-
-    // Create subscription update item
-    Some(proto::SubscriptionUpdateItem { delta: proto::EntityDelta { entity_id: item.entity.id(), content }, predicate_relevance })
+fn same_credentials<CD: ContextData>(a: &[CD], b: &[CD]) -> bool {
+    a == b
+        || (a.len() == b.len()
+            && a.iter().all(|credential| {
+                a.iter().filter(|value| *value == credential).count() == b.iter().filter(|value| *value == credential).count()
+            }))
 }
 
 #[cfg(test)]
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<crate::node::state_sync::QueryTree>)> {
+    pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<QueryTree>)> {
         self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.tree.clone()))
     }
 }

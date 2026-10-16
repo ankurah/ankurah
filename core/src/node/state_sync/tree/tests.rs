@@ -709,3 +709,48 @@ async fn incomplete_initial_inventory_falls_back_for_count_or_total_bytes() -> a
     assert_eq!(offered_digest(&offer)?.count(), 64);
     Ok(())
 }
+
+#[tokio::test]
+async fn source_row_deltas_preserve_frozen_snapshots_across_sparse_and_dense_changes() -> anyhow::Result<()> {
+    let initial = (0..192).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
+    let tree = QueryTree::default();
+    let mut old = tree.refresh_captured(keyed_spec(), initial.clone()).await?;
+    let old_head = old.head(super::super::whole()).await?;
+    let old_members = old.members();
+    let removed = initial[11].0.payload.entity_id;
+    let sparse = keyed_state(10, 2, Some(Value::I64(-100)))?;
+    tree.apply_captured(vec![sparse.clone()], vec![removed]).await?;
+    let mut expected = initial
+        .into_iter()
+        .filter(|(state, _)| state.payload.entity_id != removed && state.payload.entity_id != sparse.0.payload.entity_id)
+        .collect::<Vec<_>>();
+    expected.push(sparse);
+    for dense in [false, true] {
+        if dense {
+            let changes = (0..128)
+                .filter(|id| *id != 11)
+                .map(|id| keyed_state(id, 3, Some(Value::I64(id as i64 + 1000))))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            expected.retain(|(state, _)| !changes.iter().any(|(after, _)| after.payload.entity_id == state.payload.entity_id));
+            expected.extend(changes.clone());
+            // Include one new source row so this really crosses the dense threshold.
+            let added = keyed_state(256, 3, Some(Value::I64(2000)))?;
+            expected.push(added.clone());
+            let mut changes = changes;
+            changes.push(added);
+            tree.apply_captured(changes, Vec::new()).await?;
+        }
+        let mut current = tree.current_snapshot().await?;
+        let oracle = QueryTree::default();
+        let mut rebuilt = oracle.refresh(keyed_spec(), expected.iter().map(|(state, _)| state.clone()).collect()).await?;
+        assert_eq!(current.members(), rebuilt.members());
+        assert_eq!(current.head(super::super::whole()).await?, rebuilt.head(super::super::whole()).await?);
+        assert_eq!(old.members(), old_members);
+        assert_eq!(old.head(super::super::whole()).await?, old_head);
+    }
+    let before = tree.current_snapshot().await?.members();
+    let invalid = keyed_state(10, 4, Some(Value::String("wrong type".into())))?;
+    assert!(tree.apply_captured(vec![invalid], vec![expected[0].0.payload.entity_id]).await.is_err());
+    assert_eq!(tree.current_snapshot().await?.members(), before, "failed encoding cannot apply even the removals");
+    Ok(())
+}

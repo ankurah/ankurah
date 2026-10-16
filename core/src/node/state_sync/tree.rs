@@ -174,6 +174,90 @@ impl QueryTree {
         self.refresh_keyed(spec, rows).await
     }
 
+    /// Apply immutable source rows without recapturing the rest of a standing query.
+    /// All encoding and tree work succeeds before the cached row set is replaced.
+    pub async fn apply_captured(
+        &self,
+        rows: Vec<(Attested<EntityState>, Vec<Option<Value>>)>,
+        removed: Vec<EntityId>,
+    ) -> anyhow::Result<()> {
+        let mut cache = self.0.lock().await;
+        let cached = cache.as_mut().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?;
+        let rows: BTreeMap<_, _> = rows
+            .into_iter()
+            .map(|(state, values)| {
+                let key = CanonicalCodec.encode_nullable(cached.spec.key_spec(), &values)?;
+                Ok((state.payload.entity_id, CapturedRow { key, state: Arc::new(state) }))
+            })
+            .collect::<anyhow::Result<_>>()?;
+        let mut changed = BTreeMap::new();
+        for id in removed {
+            if cached.rows.contains_key(&id) {
+                changed.insert(id, None);
+            }
+        }
+        for (id, after) in rows {
+            if cached
+                .rows
+                .get(&id)
+                .is_none_or(|before| before.key != after.key || before.state.payload.state.head != after.state.payload.state.head)
+            {
+                changed.insert(id, Some(after));
+            }
+        }
+        if changed.is_empty() {
+            return Ok(());
+        }
+        let bulk = changed.len() >= BULK_REFRESH_CHANGES && changed.len() >= cached.rows.len().div_ceil(4);
+        // Cancellation during an awaited tree mutation must leave a rebuildable
+        // cache, rather than a digest whose rows still describe the old version.
+        let prior_tree = cached.tree.take();
+        let mut tx = if bulk { None } else { prior_tree.as_ref().map(DigestTree::begin) };
+        if let Some(tx) = &mut tx {
+            for (id, after) in &changed {
+                tx.apply_change(LeafChange {
+                    before: cached.rows.get(id).map(CapturedRow::leaf),
+                    after: after.as_ref().map(CapturedRow::leaf),
+                })
+                .await?;
+            }
+        }
+        if let Some(tx) = tx {
+            tx.commit().await?;
+        }
+        let members = Arc::make_mut(&mut cached.members);
+        for (id, after) in changed {
+            if let Some(before) = cached.rows.remove(&id) {
+                members.remove(&before.member().0);
+            }
+            if let Some(after) = after {
+                let (address, id) = after.member();
+                members.insert(address, id);
+                cached.rows.insert(id, after);
+            }
+        }
+        cached.tree = if bulk { None } else { prior_tree };
+        cached.generation = Arc::new(());
+        Ok(())
+    }
+
+    pub async fn current_snapshot(&self) -> anyhow::Result<Snapshot> {
+        let cache = self.0.lock().await;
+        let cached = cache.as_ref().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?;
+        Ok(self.snapshot_cached(cached))
+    }
+
+    fn snapshot_cached(&self, cached: &Cached) -> Snapshot {
+        Snapshot {
+            spec: cached.spec.clone(),
+            tree: cached.tree.as_ref().map(DigestTree::begin),
+            states: cached.rows.iter().map(|(id, row)| (*id, row.state.clone())).collect(),
+            members: cached.members.clone(),
+            cache: Arc::downgrade(&self.0),
+            generation: cached.generation.clone(),
+        }
+    }
+
     async fn refresh_keyed(&self, spec: TreeSpec, rows: Vec<(Attested<EntityState>, Vec<u8>)>) -> anyhow::Result<Snapshot> {
         let rows: BTreeMap<_, _> =
             rows.into_iter().map(|(state, key)| (state.payload.entity_id, CapturedRow { key, state: Arc::new(state) })).collect();
@@ -192,7 +276,8 @@ impl QueryTree {
             // Individual topology maintenance wins for sparse changes. A
             // dense inventory fill is cheaper to construct once on demand.
             let bulk = changes >= BULK_REFRESH_CHANGES && changes >= cached.rows.len().div_ceil(4);
-            let mut tx = if bulk { None } else { cached.tree.as_ref().map(DigestTree::begin) };
+            let prior_tree = cached.tree.take();
+            let mut tx = if bulk { None } else { prior_tree.as_ref().map(DigestTree::begin) };
             let mut members = cached.members.clone();
             let mut changed = false;
             for (id, before) in &cached.rows {
@@ -223,9 +308,7 @@ impl QueryTree {
             if let Some(tx) = tx {
                 tx.commit().await?;
             }
-            if bulk {
-                cached.tree = None;
-            }
+            cached.tree = if bulk { None } else { prior_tree };
             cached.rows = rows;
             cached.members = members;
             if changed {
@@ -233,14 +316,7 @@ impl QueryTree {
             }
         }
         let cached = cache.as_ref().unwrap();
-        Ok(Snapshot {
-            spec,
-            tree: cached.tree.as_ref().map(DigestTree::begin),
-            states: cached.rows.iter().map(|(id, row)| (*id, row.state.clone())).collect(),
-            members: cached.members.clone(),
-            cache: Arc::downgrade(&self.0),
-            generation: cached.generation.clone(),
-        })
+        Ok(self.snapshot_cached(cached))
     }
 }
 

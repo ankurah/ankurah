@@ -12,8 +12,8 @@ use std::{
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 
-const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PENDING_BATCHES: usize = 1024;
+pub(crate) const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_PENDING_BATCHES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SourceRevision(pub(crate) u64);
@@ -40,6 +40,7 @@ pub(crate) struct SourceChange {
 pub(crate) struct SourceBatch {
     pub(crate) revision: SourceRevision,
     pub(crate) changes: Vec<SourceChange>,
+    pub(crate) bytes: usize,
 }
 
 pub(crate) struct SourceWindow {
@@ -181,7 +182,7 @@ impl SourceCommit {
             drop(source);
             return;
         };
-        let batch = Arc::new(SourceBatch { revision: SourceRevision(revision), changes });
+        let batch = Arc::new(SourceBatch { revision: SourceRevision(revision), changes, bytes });
         for reader in source.readers.iter().filter_map(Weak::upgrade) {
             let mut state = reader.state.lock().unwrap();
             if state.error.is_some() {
