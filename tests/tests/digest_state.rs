@@ -288,53 +288,88 @@ async fn large_snapshot_is_chunked_and_applied_before_fetch_returns() -> Result<
 }
 
 #[tokio::test]
-async fn live_catchup_holds_edits_until_activation_then_reconnects_from_retained_state() -> Result<()> {
+async fn live_edits_cross_unfinished_comparison_then_reconnect_from_retained_state() -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
-    let pet = trx.create(&Pet { name: "Rex".into(), age: "1".into() }).await?.read()?;
+    let mut pets = Vec::new();
+    for i in 0..64 {
+        // Wide canonical keys exceed the bounded initial inventory. The query
+        // must exchange refinement, which the gate can hold without leaving
+        // a hole in the ordered source-to-receiver frame sequence.
+        pets.push(trx.create(&Pet { name: format!("{i:03}-{}", "x".repeat(8192)), age: "1".into() }).await?.read()?);
+    }
     trx.commit().await?;
-    let held_query = Arc::new(Mutex::new(None));
-    let held = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let trace = Trace::default();
-    let (connection, gate) = GatedConnection::new(&server, &client, {
-        let query = held_query.clone(); let held = held.clone(); let trace = trace.clone();
+    let armed = Arc::new(AtomicBool::new(false));
+    let held = Arc::new(Mutex::new(None));
+    let (connection, gate) = GatedConnection::new(&client, &server, {
+        let armed = armed.clone();
+        let held = held.clone();
         move |message| {
-            trace.record(message);
-            let park = matches!(message, NodeMessage::Response(response)
-                if matches!(&response.body, NodeResponseBody::QuerySubscribed { query_id, .. } if Some(*query_id) == *query.lock().unwrap()));
-            if park { held.store(true, std::sync::atomic::Ordering::Release); }
-            park
+            if !armed.load(Ordering::Acquire) {
+                return false;
+            }
+            if let NodeMessage::Request {
+                request: proto::NodeRequest { body: proto::NodeRequestBody::ContinueState { comparison, round: Some(0), answers, .. }, .. },
+                ..
+            } = message
+            {
+                if !answers.is_empty() {
+                    *held.lock().unwrap() = Some(*comparison);
+                    return true;
+                }
+            }
+            false
         }
-    }).await;
+    })
+    .await;
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
-    reader.fetch::<PetView>("true").await?;
-    let query = reader.query::<PetView>(nocache("true")?)?;
-    *held_query.lock().unwrap() = Some(query.query_id());
-    wait_for(|| held.load(std::sync::atomic::Ordering::Acquire)).await;
+    let retained = reader.fetch::<PetView>("true").await?;
+    // Diverge from the offer before subscribing, so refinement cannot finish
+    // with an equal root digest.
+    let trx = writer.begin();
+    pets[0].edit(&trx)?.age()?.replace("2")?;
+    trx.commit().await?;
+    armed.store(true, Ordering::Release);
+    let query = reader.query::<PetView>(nocache("age != '0' ORDER BY name ASC")?)?;
+    wait_for(|| held.lock().unwrap().is_some()).await;
+    assert!(!query.loaded(), "the refinement answer is still held");
     let watcher = TestWatcher::changeset_with_event_ids();
     let _guard = query.subscribe(&watcher);
     let trx = writer.begin();
-    pet.edit(&trx)?.age()?.replace("2")?;
-    let new_id = trx.create(&Pet { name: "Nori".into(), age: "3".into() }).await?.id();
+    pets[1].edit(&trx)?.age()?.replace("3")?;
     trx.commit().await?;
-    assert!(!query.loaded(), "the held initial comparison is not applied");
-    assert_eq!(watcher.count(), 0);
-    *held_query.lock().unwrap() = None;
-    gate.release_held(&client).await;
-    query.wait_durable_answered().await?;
-    wait_for(|| {
-        query.peek().iter().any(|row| row.id() == new_id)
-            && query.peek().iter().any(|row| row.id() == pet.id() && row.age().unwrap() == "2")
-    })
-    .await;
+    wait_for(|| query.peek().iter().any(|row| row.id() == pets[1].id() && row.age().as_deref() == Ok("3"))).await;
+    assert!(!query.loaded(), "unrelated live application must not claim the unfinished round is ready");
+    assert_eq!(query.peek().iter().find(|row| row.id() == pets[1].id()).unwrap().entity().head(), pets[1].entity().head());
     let changes = watcher.quiesce_drain().await;
-    assert!(changes.iter().flatten().any(|(id, _, events)| *id == pet.id() && !events.is_empty()), "the held edit must retain its events");
+    assert!(
+        changes.iter().flatten().any(|(id, _, events)| *id == pets[1].id() && !events.is_empty()),
+        "the live edit must publish its events before comparison feedback is released"
+    );
+    // R includes this member. A later absolute Absent must survive the older
+    // baseline membership that will arrive after refinement resumes.
+    let trx = writer.begin();
+    pets[2].edit(&trx)?.age()?.replace("0")?;
+    trx.commit().await?;
+    let former = retained.iter().find(|row| row.id() == pets[2].id()).unwrap();
+    wait_for(|| former.age().as_deref() == Ok("0")).await;
+    assert!(!query.loaded());
+    armed.store(false, Ordering::Release);
+    gate.release_held(&server).await;
+    tokio::time::timeout(Duration::from_secs(10), query.wait_durable_answered()).await??;
+    let expected_ids = pets.iter().filter(|pet| pet.id() != pets[2].id()).map(|pet| pet.id()).collect::<Vec<_>>();
+    assert_eq!(query.ids(), expected_ids, "an older baseline must not resurrect a later absent member");
+    for (actual, expected) in query.peek().iter().zip(pets.iter().filter(|pet| pet.id() != pets[2].id())) {
+        assert_eq!(actual.age()?, expected.age()?);
+        assert_eq!(actual.entity().head(), expected.entity().head());
+    }
 
     drop(connection);
     server.deregister_peer(client.id);
     client.deregister_peer(server.id);
-    trace.clear();
+    let trace = Trace::default();
     let (_connection, _) = GatedConnection::new(&server, &client, {
         let trace = trace.clone();
         move |message| {
@@ -346,17 +381,84 @@ async fn live_catchup_holds_edits_until_activation_then_reconnects_from_retained
     wait_for(|| {
         trace.0.lock().unwrap().iter().any(|body| {
             matches!(body,
-            NodeResponseBody::QuerySubscribed { query_id, state }
-                if *query_id == query.query_id() && matches!(&state.frame.body,
-                    proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))
+        NodeResponseBody::QuerySubscribed { query_id, .. } if *query_id == query.query_id())
         })
     })
     .await;
-    assert!(trace.items(Some(query.query_id())).is_empty(), "retained equal clocks need no state items on reconnect");
     let trx = writer.begin();
-    pet.edit(&trx)?.age()?.replace("4")?;
+    pets[1].edit(&trx)?.age()?.replace("4")?;
     trx.commit().await?;
-    wait_for(|| query.peek().iter().any(|row| row.id() == pet.id() && row.age().unwrap() == "4")).await;
+    wait_for(|| query.peek().iter().any(|row| row.id() == pets[1].id() && row.age().as_deref() == Ok("4"))).await;
+    assert_eq!(query.ids(), expected_ids);
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_refresh_reuses_the_standing_stream_and_keeps_live_delivery() -> Result<()> {
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let pet = trx.create(&Pet { name: "Rex".into(), age: "0".into() }).await?.read()?;
+    trx.commit().await?;
+    let trace = Trace::default();
+    let (_connection, _) = GatedConnection::new(&server, &client, {
+        let trace = trace.clone();
+        move |message| {
+            trace.record(message);
+            false
+        }
+    })
+    .await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let query = reader.query_wait::<PetView>(nocache("true")?).await?;
+    query.wait_durable_answered().await?;
+    let initial = || {
+        trace
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|body| match body {
+                NodeResponseBody::QuerySubscribed { query_id, state } if *query_id == query.query_id() => Some(state.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let replies = initial();
+    assert_eq!(replies.len(), 1);
+    let stream = replies[0].frame.comparison;
+
+    for round in 1..=10 {
+        let age = round.to_string();
+        let trx = writer.begin();
+        pet.edit(&trx)?.age()?.replace(&age)?;
+        trx.commit().await?;
+        wait_for(|| query.peek().first().is_some_and(|row| row.age().as_deref() == Ok(age.as_str()))).await;
+        tokio::time::timeout(Duration::from_secs(10), query.refresh()).await??;
+        assert!(query.loaded(), "refresh keeps the established result usable");
+        assert_eq!(query.ids(), [pet.id()]);
+        assert_eq!(query.peek()[0].age()?, age);
+        assert_eq!(query.peek()[0].entity().head(), pet.entity().head());
+        let rounds: Vec<_> = trace
+            .1
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|frame| match frame.body {
+                proto::StateFrameBody::BeginRound(start) if frame.comparison == stream => Some(start.number),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rounds, (1..=round).collect::<Vec<_>>(), "each refresh starts exactly one round on the same stream");
+        assert_eq!(initial().len(), 1, "refresh must not replace the query subscription");
+    }
+
+    // The last Applied releases round resources, not the standing stream.
+    let trx = writer.begin();
+    pet.edit(&trx)?.age()?.replace("after-refresh")?;
+    trx.commit().await?;
+    wait_for(|| query.peek().first().is_some_and(|row| row.age().as_deref() == Ok("after-refresh"))).await;
+    assert_eq!(query.peek()[0].entity().head(), pet.entity().head());
     Ok(())
 }
 
@@ -448,7 +550,10 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied { processed_through: 1 } }
+                proto::NodeRequestBody::CloseComparison {
+                    comparison,
+                    outcome: proto::ComparisonOutcome::Applied { round: 0, processed_through: 1 }
+                }
             )
             .await?,
         NodeResponseBody::Error(_)
@@ -459,7 +564,13 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &no_credentials,
-                proto::NodeRequestBody::ContinueState { comparison, processed_through: 0, answers: vec![] }
+                proto::NodeRequestBody::ContinueState {
+                    comparison,
+                    round: None,
+                    processed_through: 0,
+                    applied_through: None,
+                    answers: vec![]
+                }
             )
             .await?,
         NodeResponseBody::Error(_)
@@ -471,6 +582,8 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::ContinueState {
                     comparison,
+                    round: Some(0),
+                    applied_through: None,
                     processed_through: 0,
                     answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
                         bounds: proto::AddressRange::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
@@ -496,7 +609,13 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::ContinueState { comparison, processed_through: 0, answers: vec![] }
+                proto::NodeRequestBody::ContinueState {
+                    comparison,
+                    round: None,
+                    processed_through: 0,
+                    applied_through: None,
+                    answers: vec![]
+                }
             )
             .await?,
         NodeResponseBody::Success
@@ -508,6 +627,8 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::ContinueState {
                     comparison,
+                    round: Some(0),
+                    applied_through: None,
                     processed_through: 0,
                     answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
                         bounds: proto::AddressRange::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
@@ -609,7 +730,8 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
     let initial = replies().remove(0);
     assert_eq!(bincode::serialize(&initial)?, bincode::serialize(&replies()[1])?);
     let comparison = initial.frame.comparison;
-    let feedback = proto::NodeRequestBody::ContinueState { comparison, processed_through: 0, answers: vec![] };
+    let feedback =
+        proto::NodeRequestBody::ContinueState { comparison, round: None, processed_through: 0, applied_through: None, answers: vec![] };
     let request = proto::RequestId::new();
     for _ in 0..2 {
         server
@@ -774,7 +896,7 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
         record.edit(&trx)?.title()?.set(&payload)?;
         trx.commit().await?;
     }
-    assert_eq!(retained.title()?, "old", "live output remains held until Applied");
+    assert_eq!(retained.title()?, "old", "the held stream metadata prevents receiver application");
     gate.release_held(&client).await;
     // Snapshot ancestry validation decodes eight 5 MiB updates plus genesis.
     // Allow debug builds to finish that work before checking durable recovery.
@@ -846,7 +968,10 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Applied { processed_through: 0 } }
+                proto::NodeRequestBody::CloseComparison {
+                    comparison,
+                    outcome: proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }
+                }
             )
             .await?,
         NodeResponseBody::ComparisonUnavailable { .. }
