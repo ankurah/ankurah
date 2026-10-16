@@ -284,6 +284,9 @@ fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
     assert!(
         matches!(wire(&restart), NodeUpdateBody::StateFrame { frame: StateFrame { comparison: id, sequence: 20, body: StateFrameBody::RestartRequired }, .. } if id == comparison)
     );
+    let unavailable = StateFrame { comparison, sequence: 20, body: StateFrameBody::SourceUnavailable };
+    assert!(matches!(wire(&unavailable).body, StateFrameBody::SourceUnavailable));
+    assert_ne!(bincode::serialize(&unavailable.body).unwrap(), bincode::serialize(&StateFrameBody::RestartRequired).unwrap());
 }
 
 #[test]
