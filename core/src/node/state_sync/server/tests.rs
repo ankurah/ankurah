@@ -1682,3 +1682,81 @@ fn comparison_credentials_require_the_same_order_independent_bag() {
     assert!(!same_credentials(&[reader.clone(), reader.clone()], &[reader.clone(), admin.clone()]));
     assert!(!same_credentials(&[reader.clone(), admin], &[reader.clone(), reader]));
 }
+
+#[tokio::test]
+async fn shared_live_target_survives_until_every_offering_publication_is_applied() -> anyhow::Result<()> {
+    let (node, peer, _) = node().await?;
+    let initial = start_comparison(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((proto::QueryId::new(), 0)),
+        false,
+        0,
+        snapshot(vec![]).await?,
+        None,
+    )
+    .await?;
+    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&initial.frame.comparison).unwrap();
+    let mut state = session.state.lock().await;
+    let item = live_item(1);
+    let head = item.member.as_ref().unwrap().head.clone();
+    let key = bincode::serialize(&(item.entity_id, &head))?;
+    state.offer_live_target(1, &item)?;
+    state.offer_live_target(1, &item)?;
+    state.offer_live_target(2, &item)?;
+    assert_eq!(state.live_targets.len(), 2, "duplicate targets within a publication share one reference");
+    assert_eq!(state.live_target_index.len(), 1);
+    for revision in 1..=2 {
+        state.retain(
+            StateFrame {
+                comparison: initial.frame.comparison,
+                sequence: revision,
+                body: StateFrameBody::Live { revision, items: vec![], complete: true },
+            },
+            false,
+        )?;
+    }
+    state.acknowledge(2)?;
+    state.acknowledge_live(1)?;
+    assert_eq!(state.live_target_index.get(key.as_slice()).unwrap().publications, 1);
+    state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: item.entity_id, target: head.clone() }])?;
+    state.acknowledge_live(2)?;
+    assert!(state.live_target_index.is_empty() && state.live_targets.is_empty());
+    assert_eq!(state.target_bytes, 0);
+    assert!(state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: item.entity_id, target: head }]).is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_live_frame_after_idle_starts_a_fresh_progress_timeout() -> anyhow::Result<()> {
+    let (node, peer, _) = node().await?;
+    let initial = start_comparison(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((proto::QueryId::new(), 0)),
+        false,
+        0,
+        snapshot(vec![]).await?,
+        None,
+    )
+    .await?;
+    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&initial.frame.comparison).unwrap();
+    let mut state = session.state.lock().await;
+    state.last_activity = Instant::now() - COMPARISON_TTL;
+    state.retain(
+        StateFrame {
+            comparison: initial.frame.comparison,
+            sequence: 1,
+            body: StateFrameBody::Live { revision: 1, items: vec![live_item(1)], complete: true },
+        },
+        false,
+    )?;
+    assert!(state.last_activity.elapsed() < COMPARISON_TTL, "ordinary idle time is not an unacknowledged-frame timeout");
+    Ok(())
+}

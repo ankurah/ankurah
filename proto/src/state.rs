@@ -149,7 +149,8 @@ pub enum ComparisonProgress {
     Continue,
     /// All offers for this finite round have been sent.
     /// This does not claim application: late NeedRepair is allowed. Readiness
-    /// requires actual target coverage, no pending repair, and local activation.
+    /// requires actual target coverage and local activation. Independently covered
+    /// targets no longer need their outstanding repair requests.
     Complete,
 }
 
@@ -171,8 +172,9 @@ pub enum StateItem {
     /// assembly. Complete cannot leave a partial repair; late requested repairs
     /// may span Continue frames, but every required assembly must finish before Applied.
     RepairChunk { target: Clock, chunk: EntityDeltaChunk },
-    /// Required causal repair cannot be supplied within policy/history/work limits.
-    /// Fail this Fetch or initialization; do not report ready with a known gap.
+    /// Causal repair cannot be supplied within policy/history/work limits.
+    /// Fail while this target remains required and uncovered. A retired round or
+    /// independently covered target does not become unavailable retroactively.
     RepairUnavailable { entity_id: EntityId, target: Clock },
     /// Exhaustive captured membership with inline snapshots, avoiding a separate
     /// leaf inventory and duplicate repair targets for a cold range.

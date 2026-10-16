@@ -104,11 +104,13 @@ struct PendingRound {
     comparison: Comparison,
 }
 struct LiveTarget {
-    revision: u64,
-    entity_id: proto::EntityId,
-    head: proto::Clock,
+    last_revision: u64,
+    publications: usize,
     attempts: usize,
-    bytes: usize,
+}
+struct LiveTargetRef {
+    revision: u64,
+    key: Arc<[u8]>,
 }
 struct Stream {
     comparison: Option<Comparison>,
@@ -127,7 +129,8 @@ struct Stream {
     feedback_bytes: usize,
     retired_feedback: HashSet<proto::RequestId>,
     live_chunk: Option<LiveAssembly>,
-    live_targets: VecDeque<LiveTarget>,
+    live_targets: VecDeque<LiveTargetRef>,
+    live_target_index: HashMap<Arc<[u8]>, LiveTarget>,
     target_bytes: usize,
     live_repairs: VecDeque<Work>,
     pending_live_repairs: HashSet<Vec<u8>>,
@@ -302,6 +305,7 @@ impl Stream {
             self.completed_live.push_back((*revision, frame.sequence));
         }
         self.last_sent = frame.sequence;
+        self.last_activity = Instant::now();
         self.bytes += bytes;
         self.retained.push_back(Retained { frame: Arc::new(frame), bytes });
         Ok(())
@@ -313,31 +317,29 @@ impl Stream {
         }
         // Absent can still carry readable state and events. Its data may need
         // connecting history even though it no longer belongs to the query.
-        if let Some(
-            proto::DeltaContent::StateSnapshot { state }
-            | proto::DeltaContent::StateAndEvents { state, .. }
-            | proto::DeltaContent::StateAndRelation { state, .. },
-        ) = &item.delta
-        {
+        if let Some(proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. }) = &item.delta {
             if !heads.contains(&&state.state.head) {
                 heads.push(&state.state.head);
             }
         }
         for head in heads {
-            if self
-                .live_targets
-                .iter()
-                .any(|offered| offered.revision == revision && offered.entity_id == item.entity_id && &offered.head == head)
-            {
+            let encoded = bincode::serialize(&(item.entity_id, head))?;
+            let existing = self.live_target_index.get_key_value(encoded.as_slice());
+            if existing.is_some_and(|(_, offered)| offered.last_revision == revision) {
                 continue;
             }
-            let bytes = bincode::serialized_size(&(item.entity_id, head))? as usize;
+            let key: Arc<[u8]> = existing.map(|(key, _)| key.clone()).unwrap_or_else(|| encoded.into());
+            let bytes = key.len();
             ensure!(
                 self.live_targets.len() < MAX_OFFERED_TARGETS && self.target_bytes + bytes <= WINDOW_BYTES,
                 "unapplied live target window exhausted"
             );
             self.target_bytes += bytes;
-            self.live_targets.push_back(LiveTarget { revision, entity_id: item.entity_id, head: head.clone(), attempts: 0, bytes });
+            let target =
+                self.live_target_index.entry(key.clone()).or_insert(LiveTarget { last_revision: revision, publications: 0, attempts: 0 });
+            target.last_revision = revision;
+            target.publications += 1;
+            self.live_targets.push_back(LiveTargetRef { revision, key });
         }
         Ok(())
     }
@@ -358,7 +360,13 @@ impl Stream {
         // Membership-only publications may have no target ledger entry. The
         // ordered complete boundary, rather than the presence of a target, is authoritative.
         while self.live_targets.front().is_some_and(|target| target.revision <= revision) {
-            self.target_bytes -= self.live_targets.pop_front().unwrap().bytes;
+            let target = self.live_targets.pop_front().unwrap();
+            self.target_bytes -= target.key.len();
+            let indexed = self.live_target_index.get_mut(&target.key).expect("retained target is indexed");
+            indexed.publications -= 1;
+            if indexed.publications == 0 {
+                self.live_target_index.remove(&target.key);
+            }
         }
         self.applied_through = Some(revision);
         Ok(())
@@ -446,15 +454,12 @@ impl Stream {
         for answer in answers {
             let StateAnswer::NeedRepair { entity_id, target } = answer else { bail!("live feedback cannot answer round questions") };
             let key = bincode::serialize(&(entity_id, &target))?;
-            ensure!(
-                self.live_targets.iter().any(|offered| offered.entity_id == entity_id && offered.head == target),
-                "unsolicited live repair target"
-            );
+            let offered =
+                self.live_target_index.get_mut(key.as_slice()).ok_or_else(|| anyhow::anyhow!("unsolicited live repair target"))?;
             if self.pending_live_repairs.contains(&key) {
                 continue;
             }
             ensure!(self.pending_live_repairs.len() < 128, "too many pending live repairs");
-            let offered = self.live_targets.iter_mut().find(|offered| offered.entity_id == entity_id && offered.head == target).unwrap();
             offered.attempts += 1;
             ensure!(offered.attempts <= 8, "live causal repair retry budget exhausted");
             self.pending_live_repairs.insert(key);
@@ -586,6 +591,7 @@ where
         retired_feedback: HashSet::new(),
         live_chunk: None,
         live_targets: VecDeque::new(),
+        live_target_index: HashMap::new(),
         target_bytes: 0,
         live_repairs: VecDeque::new(),
         pending_live_repairs: HashSet::new(),
@@ -862,6 +868,10 @@ where
     ensure!(session.query.is_some(), "Fetch has no live route");
     ensure!(revision > session.initial_round.revision, "live publication does not follow the initial cut");
     ensure!(
+        items.iter().all(|item| !matches!(item.delta, Some(proto::DeltaContent::StateAndRelation { .. }))),
+        "StateAndRelation is not supported"
+    );
+    ensure!(
         items.iter().all(|item| item.member.is_some() || !matches!(item.delta, Some(proto::DeltaContent::EventBridge { .. }))),
         "absent live bridge has no explicit causal target"
     );
@@ -1049,6 +1059,7 @@ where
     state.last_refresh = None;
     state.live_chunk = None;
     state.live_targets.clear();
+    state.live_target_index.clear();
     state.completed_live.clear();
     state.target_bytes = 0;
     state.live_repairs.clear();
