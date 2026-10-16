@@ -16,6 +16,7 @@ use tracing::debug;
 /// Collects query updates into a `Vec`, or discards them through `()`.
 pub(super) trait UpdateItemAccumulator<E> {
     fn push_initial(&mut self, entity: &E, query_id: proto::QueryId);
+    fn push_add(&mut self, entity: &E, query_id: proto::QueryId);
     fn push_remove(&mut self, entity: &E, query_id: proto::QueryId);
 }
 
@@ -24,6 +25,13 @@ impl<E: Clone, Ev> UpdateItemAccumulator<E> for Vec<ReactorUpdateItem<E, Ev>> {
         Vec::push(
             self,
             ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Initial)] },
+        );
+    }
+
+    fn push_add(&mut self, entity: &E, query_id: proto::QueryId) {
+        Vec::push(
+            self,
+            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Add)] },
         );
     }
 
@@ -37,6 +45,7 @@ impl<E: Clone, Ev> UpdateItemAccumulator<E> for Vec<ReactorUpdateItem<E, Ev>> {
 
 impl<E> UpdateItemAccumulator<E> for () {
     fn push_initial(&mut self, _entity: &E, _query_id: proto::QueryId) {}
+    fn push_add(&mut self, _entity: &E, _query_id: proto::QueryId) {}
     fn push_remove(&mut self, _entity: &E, _query_id: proto::QueryId) {}
 }
 
@@ -264,7 +273,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             for (id, entity) in rw_resultset.iter_entities() {
                 if !before.contains_key(&id) {
                     state.entities.insert(id, entity.clone());
-                    reactor_updates.push_initial(entity, query_id);
+                    if membership.is_some() && !is_first_update {
+                        reactor_updates.push_add(entity, query_id);
+                    } else {
+                        reactor_updates.push_initial(entity, query_id);
+                    }
                     newly_added.push(entity.clone());
                 }
             }
@@ -402,10 +415,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
                 let can_read = query_state.source.can_read(entity);
                 if can_read
-                    && change
-                        .query_origin()
-                        .is_some_and(|origin| origin.query == query_id && query_state.source.query_origin() == Some(origin))
-                    && !query_state.source.admits_query_entity(entity)
+                    && change.query_origin().is_some_and(|origin| {
+                        origin.query == query_id
+                            && (query_state.source.query_origin() != Some(origin) || !query_state.source.admits_query_entity(entity))
+                    })
                 {
                     // An old own-stream repair must neither restore a removed
                     // source member nor undo a later authorized local/Fetch view.

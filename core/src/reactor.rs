@@ -885,16 +885,37 @@ mod tests {
             .await;
         assert!(!resultset.contains_key(&own.id));
         // A completed old apply can reach the notification lock after replacement.
-        // It remains an independent authorized fact, never the new stream's decision.
+        // Its data remains valid for other queries, but cannot author this query's membership.
         reactor.notify_change(vec![OwnChange { change: TestChange { entity: same_version.clone(), events: vec![] }, origin: old }]).await;
-        assert!(resultset.contains_key(&same_version.id));
+        assert!(!resultset.contains_key(&same_version.id));
         reactor
             .notify_change(vec![OwnChange {
                 change: TestChange { entity: old_version.clone(), events: vec![] },
                 origin: QueryOrigin { version: 0, ..current },
             }])
             .await;
-        assert!(resultset.contains_key(&old_version.id));
+        assert!(!resultset.contains_key(&old_version.id));
+        // During disconnect/rebind the installed source can have no active
+        // stream. That must not turn a tagged old change into a local write.
+        reactor
+            .upsert_query_and_notify(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(MockNode { entities: vec![] }),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+            )
+            .await
+            .unwrap();
+        reactor
+            .notify_change(vec![OwnChange { change: TestChange { entity: same_version.clone(), events: vec![] }, origin: origin(query) }])
+            .await;
+        assert!(!resultset.contains_key(&same_version.id));
+        reactor.notify_change(vec![TestChange { entity: same_version.clone(), events: vec![] }]).await;
+        assert!(resultset.contains_key(&same_version.id), "untagged local/Fetch changes remain independent");
     }
 
     #[tokio::test]
@@ -920,11 +941,14 @@ mod tests {
             )
             .await
             .unwrap();
+        let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = subscription.subscribe(watch);
         // Freeze K before the local/Fetch changes. Full installation must not
         // take a second snapshot of public membership before awaiting its lock.
         let known = [stale.id].into_iter().collect();
         reactor.notify_change(vec![TestChange { entity: local.clone(), events: vec![] }]).await;
         let gate = Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect()));
+        updates();
         reactor
             .upsert_query_from_peer(
                 subscription.id(),
@@ -941,6 +965,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!resultset.contains_key(&stale.id), "captured known absence is authoritative");
+        assert!(
+            updates()
+                .iter()
+                .flat_map(|update| &update.items)
+                .any(|item| item.entity.id == source_row.id && item.predicate_relevance == vec![(query, MembershipChange::Add)]),
+            "arrival after local initialization is Add, not another Initial"
+        );
         assert!(resultset.contains_key(&local.id), "a new local ID outside K survives the full round");
         assert!(resultset.contains_key(&source_row.id));
         reactor.notify_change(vec![TestChange { entity: fetched.clone(), events: vec![] }]).await;
