@@ -10,13 +10,38 @@ fn target_key(id: proto::EntityId, target: &proto::Clock) -> TargetKey {
     bincode::serialize(&(id, target)).expect("causal target serializes")
 }
 
+struct RefreshRequest {
+    token: proto::RequestId,
+    reply: tokio::sync::oneshot::Sender<Result<(), RetrievalError>>,
+}
+enum Command {
+    Refresh(RefreshRequest),
+    Cancel(proto::RequestId),
+}
 #[derive(Clone)]
-pub(crate) struct RefreshHandle(tokio::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), RetrievalError>>>);
+pub(crate) struct RefreshHandle(tokio::sync::mpsc::Sender<Command>);
+struct CancelRefresh {
+    handle: RefreshHandle,
+    token: Option<proto::RequestId>,
+}
+impl Drop for CancelRefresh {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            let _ = self.handle.0.try_send(Command::Cancel(token));
+        }
+    }
+}
 impl RefreshHandle {
     pub async fn refresh(&self) -> Result<(), RetrievalError> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.0.try_send(tx).map_err(|_| RetrievalError::Other("a refresh is already pending or its stream has ended".into()))?;
-        rx.await.map_err(|_| RetrievalError::Other("state stream ended during refresh".into()))?
+        let token = proto::RequestId::new();
+        self.0
+            .try_send(Command::Refresh(RefreshRequest { token: token.clone(), reply: tx }))
+            .map_err(|_| RetrievalError::Other("a refresh is already pending or its stream has ended".into()))?;
+        let mut cancel = CancelRefresh { handle: self.clone(), token: Some(token) };
+        let result = rx.await.map_err(|_| RetrievalError::Other("state stream ended during refresh".into()))?;
+        cancel.token = None;
+        result
     }
 }
 
@@ -28,15 +53,30 @@ struct Goal {
     requested: bool,
 }
 #[derive(Default)]
-struct Goals(BTreeMap<TargetKey, Goal>);
+struct Goals {
+    rows: BTreeMap<proto::EntityId, BTreeMap<Vec<u8>, Goal>>,
+    bytes: usize,
+    count: usize,
+}
 impl Goals {
     fn add(&mut self, id: proto::EntityId, head: proto::Clock, covered: bool) -> anyhow::Result<()> {
-        let key = target_key(id, &head);
-        ensure!(self.0.contains_key(&key) || self.0.len() < 100_000, "too many causal targets");
-        self.0.entry(key).or_insert(Goal { id, head, covered, attempts: 0, requested: false });
+        let key = bincode::serialize(&head)?;
+        let rows = self.rows.entry(id).or_default();
+        if rows.contains_key(&key) {
+            return Ok(());
+        }
+        ensure!(self.count < 100_000, "too many causal targets");
+        self.bytes += key.len() + proto::EntityId::BYTE_LEN;
+        self.count += 1;
+        rows.insert(key, Goal { id, head, covered, attempts: 0, requested: false });
         Ok(())
     }
-    fn covered(&self) -> bool { self.0.values().all(|goal| goal.covered) }
+    fn values(&self) -> impl Iterator<Item = &Goal> { self.rows.values().flat_map(|rows| rows.values()) }
+    fn values_mut(&mut self) -> impl Iterator<Item = &mut Goal> { self.rows.values_mut().flat_map(|rows| rows.values_mut()) }
+    fn for_id_mut(&mut self, id: &proto::EntityId) -> impl Iterator<Item = &mut Goal> {
+        self.rows.get_mut(id).into_iter().flat_map(|rows| rows.values_mut())
+    }
+    fn covered(&self) -> bool { self.values().all(|goal| goal.covered) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,7 +95,8 @@ struct Applied {
 }
 struct Publication {
     revision: u64,
-    changes: Vec<(proto::EntityId, Option<proto::QueryMember>)>,
+    changes: BTreeMap<proto::EntityId, Option<proto::QueryMember>>,
+    change_bytes: usize,
     goals: Goals,
     jobs: usize,
     complete: bool,
@@ -69,7 +110,7 @@ struct Assembly {
 struct PendingRound {
     number: u64,
     snapshot: Snapshot,
-    reply: tokio::sync::oneshot::Sender<Result<(), RetrievalError>>,
+    request: RefreshRequest,
 }
 
 pub(super) struct Driver {
@@ -91,11 +132,11 @@ pub(super) struct Driver {
     round_number: u64,
     waiting_applied: bool,
     controls: FuturesUnordered<BoxFuture<'static, anyhow::Result<()>>>,
-    refresh_rx: tokio::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), RetrievalError>>>,
+    refresh_rx: tokio::sync::mpsc::Receiver<Command>,
     refresh: RefreshHandle,
     pending_round: Option<PendingRound>,
-    round_waiter: Option<tokio::sync::oneshot::Sender<Result<(), RetrievalError>>>,
-    queued_refresh: Option<tokio::sync::oneshot::Sender<Result<(), RetrievalError>>>,
+    round_waiter: Option<RefreshRequest>,
+    queued_refresh: Option<RefreshRequest>,
     pub terminal: bool,
     application_bytes: usize,
     applying_repairs: HashSet<TargetKey>,
@@ -113,7 +154,7 @@ impl Driver {
         ensure!(round.number == 0, "initial round number is not zero");
         let spec = snapshot.spec.clone();
         let observed = snapshot.states.iter().map(|(id, state)| (*id, state.payload.state.head.clone())).collect();
-        let (tx, refresh_rx) = tokio::sync::mpsc::channel(1);
+        let (tx, refresh_rx) = tokio::sync::mpsc::channel(2);
         Ok(Self {
             projection: Projection::new(Round::new(round, snapshot)),
             spec,
@@ -153,6 +194,7 @@ impl Driver {
     {
         if let Some((id, version)) = query {
             let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
+            query.set_refresh(version, &self.stream.request, self.refresh_handle());
             self.eligible = query.resultset().read().iter_entities().map(|(id, _)| id).collect();
             self.install(node, Some((id, version)), false).await?;
         }
@@ -194,7 +236,14 @@ impl Driver {
             );
             ensure!(revision > self.projection.revision, "stale source publication");
             ensure!(self.publications.len() < super::super::MAX_INFLIGHT_FRAMES, "too many pending source publications");
-            self.publications.push_back(Publication { revision, changes: Vec::new(), goals: Goals::default(), jobs: 0, complete: false });
+            self.publications.push_back(Publication {
+                revision,
+                changes: BTreeMap::new(),
+                change_bytes: 0,
+                goals: Goals::default(),
+                jobs: 0,
+                complete: false,
+            });
         }
         let publication = self.publications.back_mut().unwrap();
         ensure!(!publication.complete, "publication continued after its boundary");
@@ -262,7 +311,7 @@ impl Driver {
             self.applying_repairs.remove(key);
         }
         match applied.owner {
-            Owner::Round(number) if number == self.round_number => self.round_jobs -= 1,
+            Owner::Round(number) if number == self.round_number && self.projection.round.is_some() => self.round_jobs -= 1,
             Owner::Live(revision) => {
                 if let Some(publication) = self.publications.iter_mut().find(|publication| publication.revision == revision) {
                     publication.jobs -= 1;
@@ -271,8 +320,10 @@ impl Driver {
             _ => {}
         }
         if let Some(head) = applied.head {
-            for goal in
-                self.goals.0.values_mut().chain(self.publications.iter_mut().flat_map(|publication| publication.goals.0.values_mut()))
+            for goal in self
+                .goals
+                .for_id_mut(&applied.id)
+                .chain(self.publications.iter_mut().flat_map(|publication| publication.goals.for_id_mut(&applied.id)))
             {
                 if goal.id == applied.id && !goal.covered && covers_target(node, &head, &goal.head).await? {
                     goal.covered = true;
@@ -285,7 +336,12 @@ impl Driver {
                     self.membership_dirty |= self.eligible.insert(applied.id);
                 }
             }
-            self.observed.insert(applied.id, head);
+            if self.projection.members.contains_key(&applied.id)
+                || self.goals.rows.contains_key(&applied.id)
+                || self.publications.iter().any(|publication| publication.goals.rows.contains_key(&applied.id))
+            {
+                self.observed.insert(applied.id, head);
+            }
         }
         Ok(applied.change)
     }
@@ -458,11 +514,10 @@ impl Driver {
                 self.enqueue(node, peer, credentials, Owner::Live(revision), proto::EntityDelta { entity_id: id, content }, None)?;
             }
             let publication = self.publication(revision)?;
-            if let Some(change) = publication.changes.iter_mut().find(|(previous, _)| *previous == id) {
-                change.1 = item.member;
-            } else {
-                publication.changes.push((id, item.member));
+            if let Some(previous) = publication.changes.insert(id, item.member.clone()) {
+                publication.change_bytes -= bincode::serialized_size(&(id, previous))? as usize;
             }
+            publication.change_bytes += bincode::serialized_size(&(id, item.member))? as usize;
         }
         if complete {
             ensure!(
@@ -471,14 +526,16 @@ impl Driver {
             );
             let publication = self.publication(revision)?;
             publication.complete = true;
-            let changes = std::mem::take(&mut publication.changes);
-            self.projection.publish(revision, changes)?;
-            let previous = self.eligible.len();
-            self.eligible.retain(|id| self.projection.members.contains_key(id));
-            self.membership_dirty |= previous != self.eligible.len();
-            for (id, member) in &self.projection.members {
-                if self.observed.get(id) == Some(&member.head) {
-                    self.membership_dirty |= self.eligible.insert(*id);
+            let changes: Vec<_> = std::mem::take(&mut publication.changes).into_iter().collect();
+            publication.change_bytes = 0;
+            self.projection.publish(revision, changes.clone())?;
+            for (id, member) in changes {
+                if let Some(member) = member {
+                    if self.observed.get(&id) == Some(&member.head) {
+                        self.membership_dirty |= self.eligible.insert(id);
+                    }
+                } else {
+                    self.membership_dirty |= self.eligible.remove(&id);
                 }
             }
         }
@@ -507,7 +564,7 @@ impl Driver {
                 ensure!(pending.number == descriptor.number && descriptor.number == self.round_number + 1, "wrong round number");
                 self.projection.begin(Round::new(descriptor, pending.snapshot))?;
                 self.round_number = descriptor.number;
-                self.round_waiter = Some(pending.reply);
+                self.round_waiter = Some(pending.request);
                 self.goals = Goals::default();
                 self.round_jobs = 0;
             }
@@ -567,40 +624,29 @@ impl Driver {
     }
 
     fn repair_arrived(&mut self, id: proto::EntityId, target: &proto::Clock) {
-        let key = target_key(id, target);
-        if let Some(goal) = self.goals.0.get_mut(&key) {
-            goal.requested = false;
-        }
-        for publication in &mut self.publications {
-            if let Some(goal) = publication.goals.0.get_mut(&key) {
+        for goal in self.goals.for_id_mut(&id).chain(self.publications.iter_mut().flat_map(|publication| publication.goals.for_id_mut(&id)))
+        {
+            if &goal.head == target {
                 goal.requested = false;
             }
         }
     }
 
     fn check_retained(&self) -> anyhow::Result<()> {
-        let mut bytes = self.projection.retained_bytes()?;
-        let mut ids = 0;
-        for publication in &self.publications {
-            bytes += bincode::serialized_size(&publication.changes)? as usize;
-            for (key, _) in &publication.goals.0 {
-                bytes += key.len();
-                ids += 1;
-            }
-        }
-        ensure!(bytes <= super::super::WINDOW_BYTES && ids <= 100_000, "unapplied live metadata window exhausted");
+        let targets: usize = self.publications.iter().map(|publication| publication.goals.bytes).sum();
+        let ids: usize = self.publications.iter().map(|publication| publication.goals.count).sum();
+        let changes: usize = self.publications.iter().map(|publication| publication.change_bytes).sum();
+        ensure!(targets <= super::super::WINDOW_BYTES && ids <= 100_000, "unapplied live target window exhausted");
+        ensure!(changes + self.projection.retained_bytes() <= super::super::WINDOW_BYTES, "live membership window exhausted");
         Ok(())
     }
 
     fn prune_observed(&mut self) {
-        let pending: HashSet<_> = self
-            .goals
-            .0
-            .values()
-            .map(|goal| goal.id)
-            .chain(self.publications.iter().flat_map(|publication| publication.goals.0.values().map(|goal| goal.id)))
-            .collect();
-        self.observed.retain(|id, _| self.projection.members.contains_key(id) || pending.contains(id));
+        self.observed.retain(|id, _| {
+            self.projection.members.contains_key(id)
+                || self.goals.rows.contains_key(id)
+                || self.publications.iter().any(|publication| publication.goals.rows.contains_key(id))
+        });
     }
 
     async fn repairs<SE, PA>(&mut self, node: &Node<SE, PA>, peer: proto::EntityId, credentials: &[PA::ContextData]) -> anyhow::Result<()>
@@ -624,7 +670,7 @@ impl Driver {
         }
         for (round, goals) in groups {
             let mut answers = Vec::new();
-            for goal in goals.0.values_mut().filter(|goal| !goal.covered) {
+            for goal in goals.values_mut().filter(|goal| !goal.covered) {
                 if !self.observed.contains_key(&goal.id) {
                     let actual = match node.entities.get(&goal.id) {
                         Some(entity) => Some(entity.head()),
@@ -687,6 +733,7 @@ impl Driver {
         {
             return Ok(false);
         }
+        self.feedback.cancel_round(self.round_number);
         let baseline = self.projection.finish(self.round_number)?;
         for id in baseline.keys() {
             if self.projection.members.contains_key(id) {
@@ -700,9 +747,42 @@ impl Driver {
         self.membership_dirty = false;
         self.goals = Goals::default();
         if let Some(reply) = self.round_waiter.take() {
-            let _ = reply.send(Ok(()));
+            let _ = reply.reply.send(Ok(()));
         }
         Ok(true)
+    }
+
+    fn cancel_round<SE, PA>(&mut self, node: &Node<SE, PA>, peer: proto::EntityId, credentials: &[PA::ContextData]) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let number = self.round_number;
+        self.projection.cancel(number)?;
+        self.round_waiter = None;
+        self.goals = Goals::default();
+        self.round_jobs = 0;
+        self.assemblies.retain(|_, assembly| {
+            if assembly.owner == Owner::Round(number) {
+                self.assembly_bytes -= assembly.bytes.len();
+                false
+            } else {
+                true
+            }
+        });
+        self.feedback.cancel_round(number);
+        self.waiting_applied = true;
+        let node = node.weak();
+        let credentials = credentials.to_vec();
+        let comparison = self.comparison;
+        self.controls.push(Box::pin(async move {
+            if let Some(node) = node.upgrade() {
+                close_comparison(&node, peer, comparison, &credentials, proto::ComparisonOutcome::Cancelled { round: number }).await?;
+            }
+            Ok(())
+        }));
+        self.prune_observed();
+        Ok(())
     }
 
     pub fn acknowledge_round<SE, PA>(&mut self, node: &Node<SE, PA>, peer: proto::EntityId, credentials: &[PA::ContextData])
@@ -738,8 +818,11 @@ impl Driver {
             return Ok(());
         }
         let Some(reply) = self.queued_refresh.take() else { return Ok(()) };
+        if reply.reply.is_closed() {
+            return Ok(());
+        }
         let Some((id, version)) = query else {
-            let _ = reply.send(Err(RetrievalError::Other("Fetch cannot refresh".into())));
+            let _ = reply.reply.send(Err(RetrievalError::Other("Fetch cannot refresh".into())));
             return Ok(());
         };
         let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
@@ -749,7 +832,7 @@ impl Driver {
         let mut snapshot = query.digest_tree().snapshot(&selection, &node.catalog, entities).await?;
         let known_state = snapshot.offer().await?;
         let number = self.round_number.checked_add(1).ok_or_else(|| anyhow::anyhow!("round number exhausted"))?;
-        self.pending_round = Some(PendingRound { number, snapshot, reply });
+        self.pending_round = Some(PendingRound { number, snapshot, request: reply });
         let node = node.weak();
         let credentials = credentials.to_vec();
         let comparison = self.comparison;
@@ -769,7 +852,7 @@ impl Driver {
 
     pub async fn drive<SE, PA>(
         &mut self,
-        node: &Node<SE, PA>,
+        weak: crate::node::WeakNode<SE, PA>,
         peer: proto::EntityId,
         credentials: &[PA::ContextData],
         query: Option<(proto::QueryId, u32)>,
@@ -780,17 +863,21 @@ impl Driver {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         loop {
-            ensure!(owns_state_stream(node, peer, &self.stream), "state stream superseded");
-            self.repairs(node, peer, credentials).await?;
+            let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
+            ensure!(owns_state_stream(&node, peer, &self.stream), "state stream superseded");
+            if self.round_waiter.as_ref().is_some_and(|request| request.reply.is_closed()) {
+                self.cancel_round(&node, peer, credentials)?;
+            }
+            self.repairs(&node, peer, credentials).await?;
             if self.membership_dirty {
-                self.install(node, query, false).await?;
+                self.install(&node, query, false).await?;
                 self.membership_dirty = false;
             }
-            if self.complete_round(node, query).await? {
+            if self.complete_round(&node, query).await? {
                 if initial {
                     return Ok(());
                 }
-                self.acknowledge_round(node, peer, credentials);
+                self.acknowledge_round(&node, peer, credentials);
             }
             let mut advanced = false;
             while self
@@ -804,7 +891,7 @@ impl Driver {
             if advanced {
                 self.prune_observed();
                 self.feedback.queue(
-                    node,
+                    &node,
                     peer,
                     credentials,
                     self.comparison,
@@ -815,12 +902,13 @@ impl Driver {
                     &self.stream.inbox,
                 )?;
             }
-            self.start_refresh(node, peer, credentials, query).await?;
+            self.start_refresh(&node, peer, credentials, query).await?;
+            drop(node);
             enum Event {
                 Frame(anyhow::Result<proto::StateFrame>),
                 Job(anyhow::Result<Applied>),
                 Control(anyhow::Result<()>),
-                Refresh(tokio::sync::oneshot::Sender<Result<(), RetrievalError>>),
+                Command(Command),
             }
             let event = {
                 let inbox = self.stream.inbox.clone();
@@ -854,31 +942,33 @@ impl Driver {
                 futures::pin_mut!(frame, job, control, refresh);
                 futures::select! {
                     frame = frame => Event::Frame(frame), job = job => Event::Job(job), control = control => Event::Control(control),
-                    refresh = refresh => match refresh { Some(refresh) => Event::Refresh(refresh), None => bail!("refresh control closed") },
+                    refresh = refresh => match refresh { Some(refresh) => Event::Command(refresh), None => bail!("refresh control closed") },
                 }
             };
+            let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
             match event {
                 Event::Frame(frame) => {
-                    self.frame(node, peer, credentials, frame?).await?;
+                    self.frame(&node, peer, credentials, frame?).await?;
                     if self.membership_dirty {
-                        self.install(node, query, false).await?;
+                        self.install(&node, query, false).await?;
                         self.membership_dirty = false;
                     }
                 }
                 Event::Job(job) => {
                     let mut changes = Vec::new();
-                    if let Some(change) = self.observe(node, job?).await? {
+                    if let Some(change) = self.observe(&node, job?).await? {
                         changes.push(change);
                     }
-                    while let Some(Some(job)) = self.jobs.next().now_or_never() {
-                        if let Some(change) = self.observe(node, job?).await? {
+                    for _ in 1..128 {
+                        let Some(Some(job)) = self.jobs.next().now_or_never() else { break };
+                        if let Some(change) = self.observe(&node, job?).await? {
                             changes.push(change);
                         }
                     }
                     // Only live admission changes need a partial installation. Initial
                     // rows join as one finite baseline when the round completes.
                     if self.membership_dirty {
-                        self.install(node, query, false).await?;
+                        self.install(&node, query, false).await?;
                         self.membership_dirty = false;
                     }
                     if !changes.is_empty() {
@@ -891,11 +981,21 @@ impl Driver {
                         self.waiting_applied = false;
                     }
                 }
-                Event::Refresh(reply) => {
+                Event::Command(Command::Refresh(reply)) => {
                     if self.queued_refresh.is_some() || self.pending_round.is_some() || self.projection.round.is_some() {
-                        let _ = reply.send(Err(RetrievalError::Other("another round is active".into())));
-                    } else {
+                        let _ = reply.reply.send(Err(RetrievalError::Other("another round is active".into())));
+                    } else if !reply.reply.is_closed() {
                         self.queued_refresh = Some(reply);
+                    }
+                }
+                Event::Command(Command::Cancel(token)) => {
+                    if self.queued_refresh.as_ref().is_some_and(|request| request.token == token) {
+                        self.queued_refresh = None;
+                    }
+                    // A pending request remains registered until BeginRound. The
+                    // origin token prevents a dropped old waiter canceling a new round.
+                    if self.round_waiter.as_ref().is_some_and(|request| request.token == token) {
+                        self.cancel_round(&node, peer, credentials)?;
                     }
                 }
             }

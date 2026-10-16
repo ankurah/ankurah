@@ -48,6 +48,7 @@ struct RemoteStream {
     origin: proto::RequestId,
     activated: bool,
     installed: bool,
+    admission: Arc<std::sync::atomic::AtomicBool>,
     candidates: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
     refresh: Option<crate::node::state_sync::RefreshHandle>,
 }
@@ -157,11 +158,15 @@ impl LiveQueryInner {
                 results.set_loaded(false);
             }
             self.durable_version.store(version.saturating_sub(1), Ordering::Release);
+            if let Some(previous) = stream.as_ref() {
+                previous.admission.store(false, Ordering::Release);
+            }
             *stream = Some(RemoteStream {
                 version,
                 origin,
                 activated: false,
                 installed: false,
+                admission: Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 candidates: Arc::new(std::sync::RwLock::new(results.iter_entities().map(|(id, _)| id).collect())),
                 refresh: None,
             });
@@ -207,6 +212,9 @@ impl LiveQueryInner {
             return;
         }
         stream.activated = false;
+        stream.installed = false;
+        stream.refresh = None;
+        stream.admission.store(false, Ordering::Release);
         self.remote_activated_version.store(0, Ordering::Release);
         self.initialized_version.store(version.saturating_sub(1), Ordering::Release);
         self.durable_version.store(version.saturating_sub(1), Ordering::Release);
@@ -230,6 +238,9 @@ impl LiveQueryInner {
         if !self.is_current(version) {
             return;
         }
+        if let Some(stream) = self.remote_stream.lock().unwrap().as_ref().filter(|stream| stream.version == version) {
+            stream.admission.store(false, Ordering::Release);
+        }
         self.error.set_before_notify(Some(Arc::new(error)), || drop(state));
         self.initialized_notify.notify_waiters();
         self.durable_notify.notify_waiters();
@@ -243,6 +254,9 @@ impl LiveQueryInner {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |version| version.checked_add(1))
             .expect("live-query version exhausted");
         let version = previous + 1;
+        if let Some(stream) = self.remote_stream.lock().unwrap().as_ref() {
+            stream.admission.store(false, Ordering::Release);
+        }
         self.resolution_task.lock().unwrap().take();
         self.error.set_before_notify(None, || drop(state));
         version
@@ -297,7 +311,11 @@ impl LiveQueryInner {
             let Some(stream) = stream.as_ref().filter(|stream| stream.version == version && &stream.origin == origin) else {
                 return Ok(false);
             };
-            Arc::new(PeerQuerySource { context: self.context.clone(), candidates: stream.candidates.clone() })
+            Arc::new(PeerQuerySource {
+                context: self.context.clone(),
+                candidates: stream.candidates.clone(),
+                admission: stream.admission.clone(),
+            })
         };
         self.context
             .node()?
@@ -344,11 +362,14 @@ impl LiveQueryInner {
 struct PeerQuerySource {
     context: Arc<dyn DynContextInner>,
     candidates: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
+    admission: Arc<std::sync::atomic::AtomicBool>,
 }
 #[async_trait::async_trait]
 impl crate::reactor::LocalEntitySource for PeerQuerySource {
     fn can_read(&self, entity: &Entity) -> bool { self.context.can_read(entity) }
-    fn admits_query_entity(&self, entity: &Entity) -> bool { self.candidates.read().unwrap().contains(&entity.id()) }
+    fn admits_query_entity(&self, entity: &Entity) -> bool {
+        !self.admission.load(Ordering::Acquire) || self.candidates.read().unwrap().contains(&entity.id())
+    }
     async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         Ok(self.context.fetch_entities_from_local(selection).await?.into_iter().filter(|entity| self.admits_query_entity(entity)).collect())
     }
@@ -357,10 +378,13 @@ impl crate::reactor::LocalEntitySource for PeerQuerySource {
 impl GapFetcher<Entity> for PeerQuerySource {
     async fn fetch_gap(
         &self,
-        _selection: &ankql::ast::Selection<Resolved>,
-        _last: Option<&Entity>,
-        _size: usize,
+        selection: &ankql::ast::Selection<Resolved>,
+        last: Option<&Entity>,
+        size: usize,
     ) -> Result<Vec<Entity>, RetrievalError> {
+        if !self.admission.load(Ordering::Acquire) {
+            return QueryGapFetcher::new(Context(self.context.clone())).fetch_gap(selection, last, size).await;
+        }
         // A remote LIMIT window is refilled by coherent source publications.
         // Local storage can contain predicate matches outside that window.
         Ok(Vec::new())

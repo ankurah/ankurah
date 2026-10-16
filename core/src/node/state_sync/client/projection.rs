@@ -22,6 +22,7 @@ pub(super) struct Round {
     pub members: Members,
     addresses: BTreeMap<Vec<u8>, EntityId>,
     overlay: BTreeMap<EntityId, Option<QueryMember>>,
+    overlay_bytes: usize,
     pub complete: bool,
 }
 
@@ -40,7 +41,7 @@ impl Round {
                 )
             })
             .collect();
-        Self { descriptor, snapshot, members, addresses, overlay: BTreeMap::new(), complete: false }
+        Self { descriptor, snapshot, members, addresses, overlay: BTreeMap::new(), overlay_bytes: 0, complete: false }
     }
 
     /// Validation belongs at the wire boundary. Here pages replace only staging
@@ -93,7 +94,10 @@ impl Projection {
                 }
             }
             if let Some(round) = &mut self.round {
-                round.overlay.insert(id, member);
+                if let Some(previous) = round.overlay.insert(id, member.clone()) {
+                    round.overlay_bytes -= bincode::serialized_size(&(id, previous))? as usize;
+                }
+                round.overlay_bytes += bincode::serialized_size(&(id, member))? as usize;
             }
         }
         self.revision = revision;
@@ -102,9 +106,7 @@ impl Projection {
 
     pub fn has_live_decision(&self, id: &EntityId) -> bool { self.round.as_ref().is_some_and(|round| round.overlay.contains_key(id)) }
 
-    pub fn retained_bytes(&self) -> anyhow::Result<usize> {
-        Ok(self.round.as_ref().map(|round| bincode::serialized_size(&round.overlay)).transpose()?.unwrap_or(0) as usize)
-    }
+    pub fn retained_bytes(&self) -> usize { self.round.as_ref().map_or(0, |round| round.overlay_bytes) }
 
     /// Fold the overlay now, not at a future round. No causal completion writes
     /// membership, so removing a tombstone cannot let an old repair resurrect it.

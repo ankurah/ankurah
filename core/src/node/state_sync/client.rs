@@ -85,14 +85,18 @@ where
     let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
     stream.bind(comparison, catalog, connection.outgoing_comparisons.clone());
     drop(connection);
-    if initial.spec != snapshot.spec || initial.frame.sequence != 0 {
+    if initial.spec != snapshot.spec || initial.frame.sequence != 0 || initial.round.number != 0 {
+        let _ = abandon_current_state(node, peer, comparison, credentials, &stream).await;
         return Err(RetrievalError::Other("invalid initial comparison metadata".into()));
     }
-    stream.inbox.insert(initial.frame)?;
+    if let Err(error) = stream.inbox.insert(initial.frame) {
+        let _ = abandon_current_state(node, peer, comparison, credentials, &stream).await;
+        return Err(error.into());
+    }
     let mut driver = driver::Driver::new(snapshot, initial.round, stream, comparison)?;
     let result = async {
         driver.prepare(node, query).await?;
-        driver.drive(node, peer, credentials, query, true).await
+        driver.drive(node.weak(), peer, credentials, query, true).await
     }
     .await;
     if let Err(error) = result {
@@ -148,10 +152,12 @@ pub(crate) fn finish_state<SE, PA>(
                 query.set_refresh(version, &driver.stream.request, driver.refresh_handle());
             }
         }
+        drop(node);
         let result =
-            if query.is_some() { driver.drive(&node, peer, &credentials, query, false).await } else { driver.finish_fetch().await };
+            if query.is_some() { driver.drive(weak.clone(), peer, &credentials, query, false).await } else { driver.finish_fetch().await };
         if let Err(error) = result {
             tracing::warn!(%error, "state stream failed");
+            let Some(node) = weak.upgrade() else { return };
             if !owns_state_stream(&node, peer, &driver.stream) {
                 return;
             }
