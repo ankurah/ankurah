@@ -272,7 +272,11 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_preparing_i
             to: client.id,
             body: proto::NodeUpdateBody::StateFrame {
                 request_id: origin,
-                frame: proto::StateFrame { comparison, sequence: 1, body: proto::StateFrameBody::Live(vec![]) },
+                frame: proto::StateFrame {
+                    comparison,
+                    sequence: 1,
+                    body: proto::StateFrameBody::Live { revision: 1, items: vec![], complete: true },
+                },
             },
         }))
         .await?;

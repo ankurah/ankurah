@@ -286,7 +286,7 @@ mod tests {
         StateFrame {
             comparison,
             sequence,
-            body: proto::StateFrameBody::State { items: Vec::new(), progress: proto::ComparisonProgress::Continue },
+            body: proto::StateFrameBody::State { round: 0, items: Vec::new(), progress: proto::ComparisonProgress::Continue },
         }
     }
 
