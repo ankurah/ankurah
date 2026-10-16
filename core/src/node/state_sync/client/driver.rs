@@ -147,6 +147,7 @@ pub(super) struct Driver {
     application_bytes: usize,
     applying_repairs: HashSet<TargetKey>,
     membership_dirty: bool,
+    partial_removals: HashSet<proto::EntityId>,
     baseline_installed: bool,
 }
 
@@ -193,6 +194,7 @@ impl Driver {
             application_bytes: 0,
             applying_repairs: HashSet::new(),
             membership_dirty: false,
+            partial_removals: HashSet::new(),
             baseline_installed: false,
         })
     }
@@ -206,12 +208,18 @@ impl Driver {
             let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
             query.set_refresh(version, &self.stream.request, self.refresh_handle());
             self.eligible = query.resultset().read().iter_entities().map(|(id, _)| id).collect();
-            self.install(node, Some((id, version)), false).await?;
+            self.install(node, Some((id, version)), false, HashSet::new()).await?;
         }
         Ok(())
     }
 
-    async fn install<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>, complete: bool) -> anyhow::Result<()>
+    async fn install<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        query: Option<(proto::QueryId, u32)>,
+        complete: bool,
+        replace: HashSet<proto::EntityId>,
+    ) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -229,12 +237,14 @@ impl Driver {
         }
         let origin = &self.stream.request;
         let canceled = || !query.is_current(version);
+        let membership = crate::reactor::PeerQueryMembership { replace, remove: self.partial_removals.clone() };
         let installed = if complete {
-            query.activate_remote(version, entities, origin, &canceled).await?
+            query.activate_remote(version, entities, membership, origin, &canceled).await?
         } else {
-            query.install_remote_partial(version, entities, origin, &canceled).await?
+            query.install_remote_partial(version, entities, membership, origin, &canceled).await?
         };
         ensure!(installed, "query stream superseded during installation");
+        self.partial_removals.clear();
         Ok(())
     }
 
@@ -675,11 +685,14 @@ impl Driver {
             self.projection.publish(revision, changes.clone())?;
             for (id, member) in changes {
                 if let Some(member) = member {
+                    self.partial_removals.remove(&id);
                     if self.observed.get(&id) == Some(&member.head) {
                         self.membership_dirty |= self.eligible.insert(id);
                     }
                 } else {
-                    self.membership_dirty |= self.eligible.remove(&id);
+                    self.eligible.remove(&id);
+                    self.partial_removals.insert(id);
+                    self.membership_dirty = true;
                 }
             }
         }
@@ -900,6 +913,9 @@ impl Driver {
         }
         self.feedback.cancel_round(self.round_number);
         self.discarded_chunks.clear();
+        let round = self.projection.round.as_ref().unwrap();
+        let replace = round.snapshot.states.keys().copied().collect();
+        self.partial_removals.extend(round.absent_ids());
         let baseline = self.projection.finish(self.round_number)?;
         for id in baseline.keys() {
             if self.projection.members.contains_key(id) {
@@ -907,7 +923,7 @@ impl Driver {
             }
         }
         self.eligible.retain(|id| self.projection.members.contains_key(id));
-        self.install(node, query, true).await?;
+        self.install(node, query, true, replace).await?;
         self.prune_observed();
         self.baseline_installed = true;
         self.membership_dirty = false;
@@ -1037,7 +1053,7 @@ impl Driver {
             self.repairs(&node, peer, credentials).await?;
             self.discard_covered_round_chunks();
             if self.membership_dirty {
-                self.install(&node, query, false).await?;
+                self.install(&node, query, false, HashSet::new()).await?;
                 self.membership_dirty = false;
             }
             if self.complete_round(&node, query).await? {
@@ -1117,7 +1133,7 @@ impl Driver {
                 Event::Frame(frame) => {
                     self.frame(&node, peer, credentials, frame?).await?;
                     if self.membership_dirty {
-                        self.install(&node, query, false).await?;
+                        self.install(&node, query, false, HashSet::new()).await?;
                         self.membership_dirty = false;
                     }
                 }
@@ -1135,7 +1151,7 @@ impl Driver {
                     // Only live admission changes need a partial installation. Initial
                     // rows join as one finite baseline when the round completes.
                     if self.membership_dirty {
-                        self.install(&node, query, false).await?;
+                        self.install(&node, query, false, HashSet::new()).await?;
                         self.membership_dirty = false;
                     }
                     notify_changes(&node, query.map(|(query, _)| query), changes).await;

@@ -242,6 +242,7 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
             1,
             (),
             vec![entity.clone()],
+            crate::reactor::PeerQueryMembership::default(),
         )
         .await?;
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));

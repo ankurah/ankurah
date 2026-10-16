@@ -303,6 +303,7 @@ impl LiveQueryInner {
         &self,
         version: u32,
         entities: Vec<Entity>,
+        membership: crate::reactor::PeerQueryMembership,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
         complete: bool,
@@ -335,6 +336,7 @@ impl LiveQueryInner {
                 version,
                 RemoteActivation { query: self, origin, canceled, complete },
                 entities,
+                membership,
             )
             .await?;
         if canceled() || !self.remote_stream_current(version, origin) {

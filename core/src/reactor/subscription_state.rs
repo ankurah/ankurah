@@ -213,6 +213,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         version: u32,
         reactor_updates: &mut A,
         authoritative: bool,
+        membership: Option<&crate::reactor::PeerQueryMembership>,
     ) -> anyhow::Result<Vec<E>> {
         let mut state_guard = self.state.lock().unwrap();
         let state = &mut *state_guard;
@@ -239,13 +240,23 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let mut removed_entities = Vec::new();
         if authoritative {
             let before: IndexMap<_, _> = rw_resultset.iter_entities().map(|(id, entity)| (id, entity.clone())).collect();
-            let included = included_entities
-                .into_iter()
-                .filter(|entity| {
-                    query_state.source.can_read(entity)
-                        && query_state.source.admits_query_entity(entity)
-                        && evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
-                })
+            // Read the current public set while holding the notification lock,
+            // after any local/other-query notifications that raced capture.
+            let mut included: IndexMap<_, _> = before
+                .iter()
+                .filter(|(id, _)| membership.is_some_and(|membership| !membership.replace.contains(id) && !membership.remove.contains(id)))
+                .map(|(id, entity)| (*id, entity.clone()))
+                .collect();
+            for entity in included_entities {
+                if membership.is_none_or(|membership| !membership.remove.contains(&entity.id()))
+                    && query_state.source.admits_query_entity(&entity)
+                {
+                    included.insert(entity.id(), entity);
+                }
+            }
+            let included = included
+                .into_values()
+                .filter(|entity| query_state.source.can_read(entity) && evaluate_predicate(entity, &selection.predicate).unwrap_or(false))
                 .collect();
             // Replace as a set before applying its order/limit. Adding to the
             // old limited set first could evict an authoritative new member.

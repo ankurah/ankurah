@@ -59,6 +59,10 @@ impl Round {
         }
     }
 
+    pub fn absent_ids(&self) -> impl Iterator<Item = EntityId> + '_ {
+        self.overlay.iter().filter_map(|(id, member)| member.is_none().then_some(*id))
+    }
+
     fn remove(&mut self, id: EntityId) {
         if let Some(member) = self.members.remove(&id) {
             self.addresses.remove(&leaf_address(&member.key, id));

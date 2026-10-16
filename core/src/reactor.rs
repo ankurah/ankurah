@@ -29,9 +29,17 @@ use ankql::ast::Resolved;
 use ankurah_proto::{self as proto};
 use ankurah_signals::Wait;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
+
+/// Reconcile the source's captured identities while retaining independent local
+/// additions. Explicit live absences also remove identities outside that capture.
+#[derive(Default)]
+pub(crate) struct PeerQueryMembership {
+    pub replace: HashSet<proto::EntityId>,
+    pub remove: HashSet<proto::EntityId>,
+}
 
 /// Trait for entities that can be used in reactor notifications
 pub trait AbstractEntity: Clone + std::fmt::Debug {
@@ -290,7 +298,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
-        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None).await
+        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None, None).await
     }
 
     pub(crate) async fn upsert_query_from_peer<H: PreNotifyHook>(
@@ -304,9 +312,21 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         version: u32,
         pre_notify_hook: H,
         entities: Vec<E>,
+        membership: PeerQueryMembership,
     ) -> anyhow::Result<()> {
-        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, Some(entities))
-            .await
+        self.install_query(
+            subscription_id,
+            query_id,
+            selection,
+            node,
+            resultset,
+            gap_fetcher,
+            version,
+            pre_notify_hook,
+            Some(entities),
+            Some(membership),
+        )
+        .await
     }
 
     async fn install_query<H: PreNotifyHook>(
@@ -320,6 +340,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         version: u32,
         pre_notify_hook: H,
         entities: Option<Vec<E>>,
+        membership: Option<PeerQueryMembership>,
     ) -> anyhow::Result<()> {
         let authoritative = entities.is_some();
         let included_entities = match entities {
@@ -343,7 +364,15 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node);
 
         let mut reactor_update_items = Vec::new();
-        subscription.update_query(query_id, selection.clone(), included_entities, version, &mut reactor_update_items, authoritative)?;
+        subscription.update_query(
+            query_id,
+            selection.clone(),
+            included_entities,
+            version,
+            &mut reactor_update_items,
+            authoritative,
+            membership.as_ref(),
+        )?;
 
         let _notify = if authoritative {
             resultset.clear_gap_dirty();
@@ -766,6 +795,7 @@ mod tests {
                 1,
                 (),
                 vec![entity.clone()],
+                PeerQueryMembership::default(),
             )
             .await
             .unwrap();
@@ -785,6 +815,7 @@ mod tests {
                 1,
                 (),
                 vec![],
+                PeerQueryMembership { replace: [entity.id].into_iter().collect(), remove: HashSet::new() },
             )
             .await
             .unwrap();
@@ -812,6 +843,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_round_reconciles_frozen_known_rows_and_partial_updates_preserve_independent_additions() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let stale = TestEntity::new("captured former member", "pending");
+        let local = TestEntity::new("inserted after requester capture", "pending");
+        let fetched = TestEntity::new("fetched by another operation", "pending");
+        let source_row = TestEntity::new("new source member", "pending");
+        let resultset = EntityResultSet::empty();
+        reactor
+            .upsert_query_and_notify(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(MockNode { entities: vec![stale.clone()] }),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+            )
+            .await
+            .unwrap();
+        // Freeze K before the local/Fetch changes. Full installation must not
+        // take a second snapshot of public membership before awaiting its lock.
+        let known = [stale.id].into_iter().collect();
+        reactor.notify_change(vec![TestChange { entity: local.clone(), events: vec![] }]).await;
+        let gate = Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect()));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(gate.clone())),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![source_row.clone()],
+                PeerQueryMembership { replace: known, remove: HashSet::new() },
+            )
+            .await
+            .unwrap();
+        assert!(!resultset.contains_key(&stale.id), "captured known absence is authoritative");
+        assert!(resultset.contains_key(&local.id), "a new local ID outside K survives the full round");
+        assert!(resultset.contains_key(&source_row.id));
+        reactor.notify_change(vec![TestChange { entity: fetched.clone(), events: vec![] }]).await;
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(gate.clone())),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![source_row.clone()],
+                PeerQueryMembership::default(),
+            )
+            .await
+            .unwrap();
+        assert!(resultset.contains_key(&local.id));
+        assert!(resultset.contains_key(&fetched.id), "unrelated partial Y cannot erase independently fetched X");
+        // Explicit Absent wins even for an ID the source never admitted.
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(gate.clone())),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![source_row.clone()],
+                PeerQueryMembership { replace: HashSet::new(), remove: [local.id].into_iter().collect() },
+            )
+            .await
+            .unwrap();
+        assert!(!resultset.contains_key(&local.id));
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, query }]).await;
+        assert!(!resultset.contains_key(&local.id), "late own data cannot reverse explicit source absence");
+        assert!(resultset.contains_key(&fetched.id));
+        // A newer absence also overrides a new outside-K addition at full commit.
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(gate)),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![source_row.clone()],
+                PeerQueryMembership { replace: HashSet::new(), remove: [fetched.id].into_iter().collect() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(resultset.len(), 1);
+        assert!(resultset.contains_key(&source_row.id));
+    }
+
+    #[tokio::test]
     async fn local_optimistic_member_can_enter_a_remote_sorted_limit() {
         let reactor = Reactor::<TestEntity, TestEvent>::new_test();
         let subscription = reactor.subscribe();
@@ -831,6 +966,7 @@ mod tests {
                 1,
                 (),
                 vec![source_row.clone()],
+                PeerQueryMembership::default(),
             )
             .await
             .unwrap();
@@ -841,6 +977,24 @@ mod tests {
         assert!(resultset.contains_key(&local.id), "normal local notifications still participate in predicate/sort/LIMIT");
         reactor.notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, query }]).await;
         assert!(resultset.contains_key(&local.id), "an excluded own-stream job must not remove the legitimate optimistic row");
+        let source = Arc::new(CandidateWindow(Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect()))));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' ORDER BY name ASC LIMIT 1"),
+                source,
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![source_row.clone()],
+                PeerQueryMembership::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resultset.len(), 1);
+        assert!(resultset.contains_key(&local.id), "partial source merge sorts and limits the combined set");
     }
 
     #[tokio::test]

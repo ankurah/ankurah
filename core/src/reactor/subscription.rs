@@ -100,7 +100,7 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         let included_entities = source.fetch_entities_from_local(&selection).await?;
         let resultset = subscription.register_or_get_query(query_id, gap_fetcher, source);
 
-        let mut all_entities = subscription.update_query(query_id, selection.clone(), included_entities, version, &mut (), true)?;
+        let mut all_entities = subscription.update_query(query_id, selection.clone(), included_entities, version, &mut (), true, None)?;
 
         drop(notify);
         subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;

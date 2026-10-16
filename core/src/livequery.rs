@@ -154,19 +154,21 @@ impl EntityLiveQuery {
         &self,
         version: u32,
         entities: Vec<Entity>,
+        membership: crate::reactor::PeerQueryMembership,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<bool, RetrievalError> {
-        self.0.install_remote(version, entities, origin, canceled, true).await
+        self.0.install_remote(version, entities, membership, origin, canceled, true).await
     }
     pub(crate) async fn install_remote_partial(
         &self,
         version: u32,
         entities: Vec<Entity>,
+        membership: crate::reactor::PeerQueryMembership,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<bool, RetrievalError> {
-        self.0.install_remote(version, entities, origin, canceled, false).await
+        self.0.install_remote(version, entities, membership, origin, canceled, false).await
     }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
     /// The latest installed selection and version; `None` until initial resolution.
