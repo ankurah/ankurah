@@ -1,0 +1,42 @@
+{
+  "id": "38866102295-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "02af6d6f",
+      "url": "https://github.com/ankurah/ankurah/commit/02af6d6f4e831fadcf8614ac231556a60d00823c"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-signals-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.6.0"
+    },
+    {
+      "kind": "pr",
+      "label": "#154",
+      "url": "https://github.com/ankurah/ankurah/pull/154"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38866102295-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-10-11T08:22:56-07:00",
+    "label": "02af6d6f4e831fadcf8614ac231556a60d00823c",
+    "ref": "02af6d6f4e831fadcf8614ac231556a60d00823c",
+    "repository": "ankurah/ankurah",
+    "sha": "02af6d6f4e831fadcf8614ac231556a60d00823c"
+  },
+  "status": "unsupported"
+}
