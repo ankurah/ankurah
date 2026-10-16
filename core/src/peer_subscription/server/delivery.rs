@@ -55,7 +55,7 @@ pub(super) struct Refresh {
 /// whole limited selection. No scan holds the source commit gate.
 pub(crate) async fn capture_query<SE, PA>(
     node: &Node<SE, PA>,
-    selection: Selection<Resolved>,
+    mut selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     credentials: Vec<PA::ContextData>,
     tree: Arc<QueryTree>,
@@ -64,6 +64,9 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    node.system.require_system_ready()?;
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
+    selection.predicate = policy.filter_predicate(selection.predicate)?;
     let (mut start, mut cursor) = node.source_publications.subscribe().await?;
     let mut projection = Projection { selection, spec, rows: Rows::new(), tree };
     let mut attempts = 0;
@@ -131,14 +134,11 @@ impl Projection {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-        let mut selection = self.selection.clone();
-        selection.predicate = policy.filter_predicate(selection.predicate)?;
-        let entities = node.fetch_entities_from_local(&selection).await?;
+        node.system.check_not_halted()?;
+        let states = node.storage.fetch_states(&self.selection).await?;
         let mut rows = Rows::new();
-        for entity in entities {
-            let state = Arc::new(entity.to_entity_state()?);
-            if let Some(row) = self.evaluate(node, credentials, state)? {
+        for state in states {
+            if let Some(row) = self.evaluate(node, credentials, Arc::new(state.payload))? {
                 rows.insert(row.state.entity_id, row);
             }
         }

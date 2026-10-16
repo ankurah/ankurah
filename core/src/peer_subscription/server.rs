@@ -2,7 +2,7 @@ use crate::{
     error::SubscriptionError,
     node::{source_publications::SourceError, state_sync::QueryTree, Node},
     policy::PolicyAgent,
-    session::ContextData,
+    session::{ContextData, SessionSet},
     storage::StorageEngine,
 };
 use ankql::ast::Resolved;
@@ -21,7 +21,8 @@ pub struct SubscriptionHandler<CD: ContextData> {
 }
 
 struct StandingQuery<CD: ContextData> {
-    credentials: Vec<CD>,
+    // Keep the standing credentials registered with the node policy service.
+    _sessions: SessionSet<CD>,
     version: u32,
     comparison: proto::ComparisonId,
     tree: Arc<QueryTree>,
@@ -78,6 +79,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let spec = QueryTree::offered_spec(&selection, &node.catalog, &known_state)?;
         let catalog = crate::schema::is_catalog_read(&selection.predicate);
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
+        let sessions = cdata.cloned().map(SessionSet::from).unwrap_or_else(SessionSet::new);
+        node.sessions.attach(&sessions);
         let peer = node.peer_connections.get(&self.peer_id).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
         let tree = if let Some(mut previous) = queries.remove(&query_id) {
             previous.stop.take();
@@ -131,7 +134,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 }
             }
         });
-        queries.insert(query_id, StandingQuery { credentials, version, comparison, tree, commands, stop: Some(stop), stopped: done });
+        queries
+            .insert(query_id, StandingQuery { _sessions: sessions, version, comparison, tree, commands, stop: Some(stop), stopped: done });
         Ok(proto::NodeResponseBody::QuerySubscribed { query_id, state })
     }
 
@@ -153,8 +157,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 .values()
                 .find(|standing| standing.comparison == comparison)
                 .ok_or_else(|| anyhow::anyhow!("query stream unavailable"))?;
-            anyhow::ensure!(same_credentials(&standing.credentials, credentials), "query stream credentials changed");
-            anyhow::ensure!(node.peer_connections.get(&self.peer_id).is_some(), "peer disconnected");
+            let peer = node.peer_connections.get(&self.peer_id).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+            let session = peer.comparisons.get(&comparison).ok_or_else(|| anyhow::anyhow!("query stream unavailable"))?;
+            anyhow::ensure!(session.permits(credentials), "query stream credentials changed");
             standing.commands.clone()
         };
         let (response, result) = oneshot::channel();
@@ -168,14 +173,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             queries.remove(&query);
         }
     }
-}
-
-fn same_credentials<CD: ContextData>(a: &[CD], b: &[CD]) -> bool {
-    a == b
-        || (a.len() == b.len()
-            && a.iter().all(|credential| {
-                a.iter().filter(|value| *value == credential).count() == b.iter().filter(|value| *value == credential).count()
-            }))
 }
 
 #[cfg(test)]

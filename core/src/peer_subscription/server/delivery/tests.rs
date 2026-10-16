@@ -98,7 +98,10 @@ async fn node() -> anyhow::Result<TestNode> {
     node.wait_ready().await?;
     Ok(node)
 }
-async fn apply(node: &TestNode, event: &proto::Event) -> anyhow::Result<()> {
+async fn apply<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
+    node: &Node<OrderedStorage, PA>,
+    event: &proto::Event,
+) -> anyhow::Result<()> {
     let events = LocalEventGetter::new(node.storage.clone(), true);
     events.stage_event(event.clone());
     NodeApplier::apply_delta(
@@ -231,5 +234,105 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
     let current = tree.current_snapshot().await?;
     assert_ne!(current.members(), old_members, "the moved source key must be replaced, not left stale");
     node.deregister_peer(peer);
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RestrictedDiscovery;
+#[async_trait::async_trait]
+impl PolicyAgent for RestrictedDiscovery {
+    type ContextData = &'static crate::policy::DefaultContext;
+    fn sign_request<SE: StorageEngine, C: crate::util::Iterable<Self::ContextData>>(
+        &self,
+        _: &crate::node::NodeInner<SE, Self>,
+        _: &C,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, crate::policy::AccessDenied> {
+        Ok(Vec::new())
+    }
+    async fn check_request<SE: StorageEngine, C: crate::util::Iterable<proto::AuthData> + Send + Sync>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &C,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, crate::error::ValidationError> {
+        Ok(vec![DEFAULT_CONTEXT])
+    }
+    fn query_predicate<C: crate::util::Iterable<Self::ContextData>>(
+        &self,
+        _: &C,
+    ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
+        Ok(Predicate::Comparison {
+            left: Box::new(ankql::ast::Expr::Path(PropertyPath::from(property()))),
+            operator: ankql::ast::ComparisonOperator::LessThan,
+            right: Box::new(ankql::ast::Expr::Literal(Value::String("05".into()))),
+        })
+    }
+    fn retrieval_predicate<C: crate::util::Iterable<Self::ContextData>>(
+        &self,
+        _: &C,
+    ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
+        Ok(Predicate::True)
+    }
+    fn check_write(
+        &self,
+        _: &Self::ContextData,
+        _: &crate::entity::Entity,
+        _: Option<&proto::Event>,
+    ) -> Result<(), crate::policy::AccessDenied> {
+        Ok(())
+    }
+    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &proto::EntityId,
+        _: &Attested<proto::Event>,
+    ) -> Result<(), crate::policy::AccessDenied> {
+        Ok(())
+    }
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &proto::EntityId,
+        _: &Attested<proto::EntityState>,
+    ) -> Result<(), crate::policy::AccessDenied> {
+        Ok(())
+    }
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &proto::EntityId,
+        _: &proto::CausalAssertion,
+    ) -> Result<(), crate::policy::AccessDenied> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_broader() -> anyhow::Result<()> {
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery);
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let inside = genesis("01")?;
+    let outside = genesis("09")?;
+    apply(&node, &inside).await?;
+    apply(&node, &outside).await?;
+    let selection = selection(None);
+    let spec = QueryTree::spec(&selection, &node.catalog);
+    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    assert_eq!(captured.projection.rows.len(), 1);
+    assert!(captured.projection.rows.contains_key(&inside.entity_id));
+    apply(&node, &update(&outside, "08")?).await?;
+    let batch = captured.cursor.next().await?;
+    assert!(captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch).await?.is_empty());
+    assert!(!captured.projection.rows.contains_key(&outside.entity_id));
+    apply(&node, &update(&inside, "09")?).await?;
+    let batch = captured.cursor.next().await?;
+    let changes = captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch).await?;
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].member.is_none());
+    assert!(changes[0].delta.is_some(), "readable former matches still carry causal data");
+    assert!(captured.projection.rows.is_empty());
     Ok(())
 }
