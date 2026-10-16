@@ -228,8 +228,10 @@ pub struct KnownLeaf {
 pub enum ComparisonOutcome {
     /// After Complete, the round's offered targets are covered and local result
     /// installation succeeded. Release only that round's snapshot.
-    /// processed_through covers every initial/repair frame, including late repairs
-    /// after Complete. It returns frame credit (including frame 0) as well.
+    /// processed_through covers enumeration through Complete and returns frame
+    /// credit (including frame 0). Independent live application may already cover
+    /// a target whose requested history is still in flight; that work can retire.
+    /// Later frames still receive credit but cannot change a retired round.
     /// The requester need not await the reply before reporting readiness.
     Applied { round: u64, processed_through: u64 },
     /// Discard only this round, preserving the standing stream and its live

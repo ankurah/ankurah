@@ -768,7 +768,7 @@ where
                 comparison.complete && comparison.summaries.is_empty() && comparison.leaves.is_empty(),
                 "comparison enumeration is not complete"
             );
-            ensure!(processed_through >= state.required_through, "Applied does not cover all round frames");
+            ensure!(processed_through >= state.required_through, "Applied does not cover the completed enumeration");
             state.acknowledge(processed_through)?;
             session.initial.lock().unwrap().take();
             state.comparison = None;
@@ -998,7 +998,10 @@ where
         if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
             break;
         }
-        if matches!(frame.body, StateFrameBody::State { .. } | StateFrameBody::BeginRound(_)) {
+        if matches!(frame.body, StateFrameBody::BeginRound(_) | StateFrameBody::State { progress: ComparisonProgress::Complete, .. }) {
+            // Applied covers the finite enumeration. Later requested history may
+            // become unnecessary because another live update covers the target;
+            // those frames still need wire credit, not another readiness fence.
             state.required_through = sequence;
         }
         state.retain(frame.clone(), priority)?;
