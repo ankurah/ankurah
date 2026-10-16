@@ -298,7 +298,7 @@ async fn interleaved(db_prefix: &str) -> anyhow::Result<()> {
     rows[0].edit(&trx)?.status()?.replace("2")?;
     trx.commit().await?;
     gate.armed.store(true, Ordering::Release);
-    let query = reader.query::<DigestRowView>(ankurah::core::node::nocache("status != '0' ORDER BY name ASC")?)?;
+    let query = reader.query::<DigestRowView>(ankurah::core::node::nocache("name >= '' AND status >= '1' ORDER BY name ASC")?)?;
     wait_until(|| !gate.held.lock().unwrap().is_empty(), "held round feedback").await?;
     anyhow::ensure!(!query.loaded(), "held comparison must remain unfinished");
     let trx = writer.begin();
