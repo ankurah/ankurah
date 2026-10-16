@@ -16,6 +16,7 @@ type Pause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<(
 pub(crate) struct TestStorage {
     data: Mutex<TestData>,
     pub hold_fetch: Mutex<BTreeMap<ModelId, Pause>>,
+    pub hold_state_reads: Mutex<BTreeMap<EntityId, Pause>>,
     pub hold_set_state: Mutex<Option<Pause>>,
     pub hold_commit: Mutex<Option<Pause>>,
     pub hold_after_commit: Mutex<Option<Pause>>,
@@ -128,6 +129,11 @@ impl StorageEngine for TestStorage {
     fn transaction(&self) -> Self::Transaction<'_> { TestStorageTransaction { storage: self, states: Vec::new(), events: Vec::new() } }
 
     async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+        let hold = self.hold_state_reads.lock().unwrap().remove(&id);
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            release.await.unwrap();
+        }
         if *self.reject_state_read.lock().unwrap() == Some(id) {
             return Err(RetrievalError::Other("unexpected state reload".into()));
         }

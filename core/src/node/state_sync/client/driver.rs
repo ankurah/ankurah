@@ -6,6 +6,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use indexmap::IndexMap;
 use projection::{Projection, Round};
 
+// Keep finite storage work bounded without letting its backlog consume the
+// admission reserved for ongoing publications and data-only causal repairs.
+const MAX_ACTIVE_ROUND_APPLICATIONS: usize = 128;
+const MAX_ACTIVE_LIVE_APPLICATIONS: usize = 16;
+
 type TargetKey = Vec<u8>;
 fn target_key(id: proto::EntityId, target: &proto::Clock) -> TargetKey {
     bincode::serialize(&(id, target)).expect("causal target serializes")
@@ -133,6 +138,8 @@ pub(super) struct Driver {
     queued_jobs: BTreeMap<proto::EntityId, VecDeque<BoxFuture<'static, anyhow::Result<Applied>>>>,
     active_entities: HashSet<proto::EntityId>,
     application_jobs: usize,
+    round_application_slots: Arc<tokio::sync::Semaphore>,
+    live_application_slots: Arc<tokio::sync::Semaphore>,
     assemblies: BTreeMap<TargetKey, Assembly>,
     discarded_chunks: HashSet<TargetKey>,
     assembly_bytes: usize,
@@ -184,6 +191,8 @@ impl Driver {
             queued_jobs: BTreeMap::new(),
             active_entities: HashSet::new(),
             application_jobs: 0,
+            round_application_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_ROUND_APPLICATIONS)),
+            live_application_slots: Arc::new(tokio::sync::Semaphore::new(MAX_ACTIVE_LIVE_APPLICATIONS)),
             assemblies: BTreeMap::new(),
             discarded_chunks: HashSet::new(),
             assembly_bytes: 0,
@@ -346,11 +355,18 @@ impl Driver {
         }
         let node = node.weak();
         let credentials = credentials.to_vec();
+        let application_slots = match owner {
+            Owner::Round(_) => self.round_application_slots.clone(),
+            Owner::Live(_) | Owner::Repair => self.live_application_slots.clone(),
+        };
         let job = Box::pin(async move {
             // Dropping a cancelled round's partial assembly releases its reserved
             // slot without applying or announcing membership.
             let Some(delta) = input.await else { return Ok(Applied { owner, id, head: None, change: None, bytes: 0, repair }) };
             let bytes = bincode::serialized_size(&delta)? as usize;
+            // Bound active storage work separately from queued bytes. Partial
+            // chunk inputs reserve entity order without occupying a slot.
+            let _slot = application_slots.acquire_owned().await?;
             let node = node.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
             let events = CachedEventGetter::new(&node, &credentials);
             let states = LocalStateGetter::new(node.storage.clone());

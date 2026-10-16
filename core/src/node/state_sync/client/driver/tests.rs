@@ -18,6 +18,221 @@ async fn fixture(
     Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::ComparisonId::new())?, registry))
 }
 
+fn application_genesis(seed: u8) -> proto::Event {
+    proto::Event::genesis(
+        Some(id(seed)),
+        proto::AuthorId::Unknown,
+        proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(proto::ModelId::EntityId(id(91))))]),
+    )
+}
+
+fn pause_state_read(node: &TestNode, id: proto::EntityId) -> (tokio::sync::oneshot::Receiver<()>, tokio::sync::oneshot::Sender<()>) {
+    let (entered, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = tokio::sync::oneshot::channel();
+    node.storage.hold_state_reads.lock().unwrap().insert(id, (entered, release_rx));
+    (entered_rx, release)
+}
+
+async fn wait_for_paused_reads(driver: &mut Driver, entered: &mut FuturesUnordered<tokio::sync::oneshot::Receiver<()>>, count: usize) {
+    let all_entered = async {
+        for _ in 0..count {
+            entered.next().await.unwrap().expect("state read barrier remains registered");
+        }
+    };
+    tokio::select! {
+        _ = driver.jobs.next() => panic!("an application passed its held read"),
+        reached = tokio::time::timeout(std::time::Duration::from_secs(2), all_entered) => {
+            reached.expect("active applications reach their pre-commit read barriers");
+        }
+    }
+    // Give every remaining runnable future an opportunity to attempt admission;
+    // assertions below count actual paused reads, independent of which IDs won.
+    assert!(driver.jobs.next().now_or_never().is_none());
+}
+
+#[tokio::test]
+async fn active_application_window_does_not_start_the_next_storage_read_until_a_slot_releases() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    node.system.wait_loaded().await?;
+    let mut entered = FuturesUnordered::new();
+    let mut releases = Vec::new();
+    for seed in 0..=128 {
+        let event = application_genesis(seed);
+        let (reached, release) = pause_state_read(&node, event.entity_id);
+        entered.push(reached);
+        releases.push(release);
+        driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(event), None)?;
+    }
+    wait_for_paused_reads(&mut driver, &mut entered, 128).await;
+    assert_eq!(node.storage.hold_state_reads.lock().unwrap().len(), 1, "exactly128 of129 round applications may start reads");
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    let mut completed = 0;
+    while let Some(applied) = driver.jobs.next().await {
+        let applied = applied?;
+        assert!(applied.change.is_some());
+        drop(driver.observe(&node, applied).await?);
+        completed += 1;
+    }
+    assert_eq!(completed, 129);
+    assert_eq!(driver.application_jobs, 0);
+    assert_eq!(driver.application_bytes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn incomplete_chunk_inputs_do_not_occupy_live_application_slots() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    node.system.wait_loaded().await?;
+    let mut partial_ids = HashSet::new();
+    for seed in 0..128 {
+        let event = application_genesis(seed);
+        assert!(partial_ids.insert(event.entity_id));
+        driver.chunk(
+            &node,
+            id(90),
+            &[crate::policy::DEFAULT_CONTEXT],
+            Owner::Round(0),
+            proto::Clock::singleton(&event),
+            None,
+            proto::EntityDeltaChunk { entity_id: event.entity_id, offset: 0, bytes: vec![1].into(), last: false },
+        )?;
+    }
+    let ready_round = application_genesis(128);
+    let ready_round_id = ready_round.entity_id;
+    let live = application_genesis(129);
+    let live_id = live.entity_id;
+    assert!(!partial_ids.contains(&ready_round_id));
+    assert!(!partial_ids.contains(&live_id));
+    assert_ne!(ready_round_id, live_id);
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(ready_round), None)?;
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Live(11), bridge(live), None)?;
+    let mut finished = HashSet::new();
+    for _ in 0..2 {
+        let applied = tokio::time::timeout(std::time::Duration::from_secs(2), driver.jobs.next()).await?.unwrap()?;
+        assert!(applied.head.is_some() && applied.change.is_some(), "both ready payloads actually apply");
+        assert!(applied.id == ready_round_id || applied.id == live_id);
+        finished.insert(applied.id);
+        drop(driver.observe(&node, applied).await?);
+    }
+    assert_eq!(
+        finished,
+        [ready_round_id, live_id].into_iter().collect(),
+        "incomplete round input cannot occupy either a ready round's slot or live admission"
+    );
+    assert_eq!(driver.assemblies.len(), 128);
+    driver.cancel_round(&node, id(90), &[])?;
+    while let Some(applied) = driver.jobs.next().await {
+        let applied = applied?;
+        assert!(applied.head.is_none(), "cancelled incomplete input never applies");
+        drop(driver.observe(&node, applied).await?);
+    }
+    assert_eq!(driver.application_jobs, 0);
+    assert_eq!(driver.application_bytes, 0);
+    assert!(driver.assemblies.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn application_lanes_reserve_live_and_repair_progress_while_round_reads_are_stalled() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    node.system.wait_loaded().await?;
+    let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+    let repair_entity = NodeApplier::apply_delta(
+        &node,
+        &id(90),
+        bridge(application_genesis(201)),
+        Delivery::Initial,
+        &CachedEventGetter::new(&node, &credentials),
+        &LocalStateGetter::new(node.storage.clone()),
+    )
+    .await?
+    .entity
+    .unwrap();
+    let repair = edit(repair_entity.id(), repair_entity.head(), 92);
+    let repair_id = repair.entity_id;
+    let repair_head = proto::Clock::singleton(&repair);
+    let mut holds = Vec::new();
+    let mut entered_reads = FuturesUnordered::new();
+    let mut round_ids = HashSet::new();
+    for seed in 0..=128 {
+        let event = application_genesis(seed);
+        assert_ne!(event.entity_id, repair_id);
+        assert!(round_ids.insert(event.entity_id));
+        let (entered, release) = pause_state_read(&node, event.entity_id);
+        entered_reads.push(entered);
+        holds.push(release);
+        driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(event), None)?;
+    }
+    wait_for_paused_reads(&mut driver, &mut entered_reads, 128).await;
+    assert_eq!(node.storage.hold_state_reads.lock().unwrap().len(), 1, "one of129 round inputs remains queued");
+    let live = application_genesis(200);
+    let live_id = live.entity_id;
+    assert!(!round_ids.contains(&live_id));
+    assert_ne!(live_id, repair_id);
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Live(11), bridge(live), None)?;
+    driver.publication(11)?.goals.add(repair_id, repair_head.clone(), false)?;
+    driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Repair, bridge(repair), None)?;
+    let mut finished = HashSet::new();
+    for _ in 0..2 {
+        let applied = tokio::time::timeout(std::time::Duration::from_secs(2), driver.jobs.next())
+            .await
+            .expect("round read stalls must not exhaust unrelated live/repair admission")
+            .unwrap()?;
+        assert!(applied.id == live_id || applied.id == repair_id);
+        if applied.id == repair_id {
+            assert_eq!(applied.head, Some(repair_head.clone()));
+        }
+        finished.insert(applied.id);
+        drop(driver.observe(&node, applied).await?);
+    }
+    assert_eq!(finished, [live_id, repair_id].into_iter().collect());
+    assert!(driver.publication(11)?.goals.covered(), "the repair actually covers its waiting target");
+    assert_eq!(driver.round_jobs, 129, "no blocked round application completed to make this progress possible");
+    for release in holds {
+        release.send(()).unwrap();
+    }
+    while let Some(applied) = driver.jobs.next().await {
+        drop(driver.observe(&node, applied?).await?);
+    }
+    assert_eq!(driver.application_jobs, 0);
+    assert_eq!(driver.application_bytes, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn application_lanes_limit_live_and_repair_to_sixteen_active_reads() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    node.system.wait_loaded().await?;
+    let mut entered = FuturesUnordered::new();
+    let mut releases = Vec::new();
+    for seed in 0..=16 {
+        let event = application_genesis(seed);
+        let (reached, release) = pause_state_read(&node, event.entity_id);
+        entered.push(reached);
+        releases.push(release);
+        let owner = if seed % 2 == 0 { Owner::Live(11) } else { Owner::Repair };
+        driver.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], owner, bridge(event), None)?;
+    }
+    wait_for_paused_reads(&mut driver, &mut entered, 16).await;
+    assert_eq!(node.storage.hold_state_reads.lock().unwrap().len(), 1, "exactly16 of17 live/repair applications may start reads");
+    for release in releases {
+        release.send(()).unwrap();
+    }
+    let mut completed = 0;
+    while let Some(applied) = driver.jobs.next().await {
+        let applied = applied?;
+        assert!(applied.change.is_some());
+        drop(driver.observe(&node, applied).await?);
+        completed += 1;
+    }
+    assert_eq!(completed, 17);
+    assert_eq!(driver.application_jobs, 0);
+    assert_eq!(driver.application_bytes, 0);
+    Ok(())
+}
+
 #[tokio::test]
 async fn finite_round_finishes_while_newer_publication_target_remains_uncovered() -> anyhow::Result<()> {
     let (node, mut driver, _registry) = fixture(vec![state(1)]).await?;
