@@ -495,27 +495,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         }
     }
 
-    /// A catch-up repair can apply a live Add's state before its membership
-    /// notification arrives. Re-evaluate only that query, without publishing a
-    /// duplicate entity update to every other query holding the same state.
-    pub(crate) async fn refresh_membership<C: ChangeNotification<Entity = E, Event = Ev>>(
-        &self,
-        subscription_id: ReactorSubscriptionId,
-        query: proto::QueryId,
-        change: C,
-    ) {
-        let _notify = self.0.notify_lock.lock().await;
-        let subscription = self.0.subscriptions.lock().unwrap().get(&subscription_id).cloned();
-        let Some(subscription) = subscription else { return };
-        let mut candidates = CandidateChanges::new(Arc::new(vec![change]));
-        candidates.add_query(query, 0);
-        let changes = subscription.evaluate_membership(candidates);
-        let mut watchers = self.0.watcher_set.lock().unwrap();
-        for change in changes {
-            watchers.apply_watcher_change(change);
-        }
-    }
-
     /// Clear current subscription results and watchers when the owner stops running.
     pub(crate) async fn close(&self) {
         let _notify = self.0.notify_lock.lock().await;

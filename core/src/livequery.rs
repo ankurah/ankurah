@@ -123,15 +123,6 @@ impl EntityLiveQuery {
     /// The current version's initialization error, cleared when a new version starts.
     pub fn error(&self) -> Read<Option<Arc<RetrievalError>>> { self.0.error.read() }
     pub(crate) fn is_current(&self, version: u32) -> bool { self.0.current_version.load(Ordering::Acquire) == version }
-    pub(crate) async fn refresh_membership(&self, entity: Entity) -> Result<(), RetrievalError> {
-        self.0
-            .context
-            .node()?
-            .reactor()
-            .refresh_membership(self.0.subscription.id(), self.query_id(), EntityChange::new(entity, vec![]))
-            .await;
-        Ok(())
-    }
     /// Recompare this query on its current standing stream. Completion covers the
     /// captured source round; later live publications do not move that goal.
     pub async fn refresh(&self) -> Result<(), RetrievalError> {

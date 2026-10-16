@@ -383,11 +383,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Evaluate candidate changes for this subscription and spawn gap filling/notification task
     /// Returns watcher changes that need to be applied to the global WatcherSet
     pub fn evaluate_changes<C: ChangeNotification<Entity = E, Event = Ev>>(self, candidates: CandidateChanges<C>) -> Vec<WatcherChange> {
-        self.evaluate_candidates(candidates, false, None)
-    }
-
-    pub fn evaluate_membership<C: ChangeNotification<Entity = E, Event = Ev>>(self, candidates: CandidateChanges<C>) -> Vec<WatcherChange> {
-        self.evaluate_candidates(candidates, true, None)
+        self.evaluate_candidates(candidates, None)
     }
 
     pub(super) fn evaluate_publication<C: ChangeNotification<Entity = E, Event = Ev>>(
@@ -395,13 +391,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         candidates: CandidateChanges<C>,
         preserve: &HashSet<proto::EntityId>,
     ) -> Vec<WatcherChange> {
-        self.evaluate_candidates(candidates, false, Some(preserve))
+        self.evaluate_candidates(candidates, Some(preserve))
     }
 
     fn evaluate_candidates<C: ChangeNotification<Entity = E, Event = Ev>>(
         self,
         candidates: CandidateChanges<C>,
-        membership_only: bool,
         preserve: Option<&HashSet<proto::EntityId>>,
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
@@ -451,9 +446,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                     } else {
                         evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
                     };
-                if membership_only && matches == did_match {
-                    continue;
-                }
 
                 // Process membership change in one match
                 let membership_change = match (did_match, matches) {
