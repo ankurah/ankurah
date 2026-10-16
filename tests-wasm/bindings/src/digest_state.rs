@@ -4,6 +4,7 @@ use ankurah::{
     core::connector::{PeerSender, SendError},
     proto, Mutable,
 };
+use ankurah_signals::Peek;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Mutex,
