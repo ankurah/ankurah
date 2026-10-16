@@ -304,6 +304,7 @@ impl LiveQueryInner {
         version: u32,
         entities: Vec<Entity>,
         membership: crate::reactor::PeerQueryMembership,
+        changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
         complete: bool,
@@ -338,6 +339,13 @@ impl LiveQueryInner {
                 RemoteActivation { query: self, origin, canceled, complete },
                 entities,
                 membership,
+                changes
+                    .into_iter()
+                    .map(|change| {
+                        let (entity, events) = change.into_parts();
+                        crate::reactor::ReactorUpdateItem { entity, events, predicate_relevance: vec![] }
+                    })
+                    .collect(),
             )
             .await?;
         if canceled() || !self.remote_stream_current(version, origin) {

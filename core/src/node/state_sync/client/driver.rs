@@ -3,6 +3,7 @@ use crate::{changes::EntityChange, node::applier::Delivery, reactor::ChangeNotif
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use indexmap::IndexMap;
 use projection::{Projection, Round};
 
 type TargetKey = Vec<u8>;
@@ -95,7 +96,9 @@ struct Applied {
 }
 struct Publication {
     revision: u64,
-    changes: BTreeMap<proto::EntityId, Option<proto::QueryMember>>,
+    changes: IndexMap<proto::EntityId, Option<proto::QueryMember>>,
+    applied: BTreeMap<proto::EntityId, Vec<proto::Attested<proto::Event>>>,
+    retained_bytes: usize,
     change_bytes: usize,
     goals: Goals,
     jobs: usize,
@@ -136,6 +139,7 @@ pub(super) struct Driver {
     pub stream: IncomingStream,
     pub comparison: proto::ComparisonId,
     round_number: u64,
+    received_revision: u64,
     waiting_applied: bool,
     controls: FuturesUnordered<BoxFuture<'static, anyhow::Result<()>>>,
     refresh_rx: tokio::sync::mpsc::Receiver<Command>,
@@ -183,6 +187,7 @@ impl Driver {
             stream,
             comparison,
             round_number: 0,
+            received_revision: round.revision,
             waiting_applied: false,
             controls: FuturesUnordered::new(),
             refresh_rx,
@@ -208,7 +213,7 @@ impl Driver {
             let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
             query.set_refresh(version, &self.stream.request, self.refresh_handle());
             self.eligible = query.resultset().read().iter_entities().map(|(id, _)| id).collect();
-            self.install(node, Some((id, version)), false, HashSet::new()).await?;
+            self.install(node, Some((id, version)), false, HashSet::new(), vec![]).await?;
         }
         Ok(())
     }
@@ -219,6 +224,7 @@ impl Driver {
         query: Option<(proto::QueryId, u32)>,
         complete: bool,
         replace: HashSet<proto::EntityId>,
+        changes: Vec<EntityChange>,
     ) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -237,11 +243,18 @@ impl Driver {
         }
         let origin = &self.stream.request;
         let canceled = || !query.is_current(version);
-        let membership = crate::reactor::PeerQueryMembership { replace, remove: self.partial_removals.clone() };
+        let preserve = self
+            .publications
+            .iter()
+            .flat_map(|publication| publication.changes.keys())
+            .filter(|id| self.projection.members.contains_key(id) || !replace.contains(id))
+            .copied()
+            .collect();
+        let membership = crate::reactor::PeerQueryMembership { replace, remove: self.partial_removals.clone(), preserve };
         let installed = if complete {
-            query.activate_remote(version, entities, membership, origin, &canceled).await?
+            query.activate_remote(version, entities, membership, changes, origin, &canceled).await?
         } else {
-            query.install_remote_partial(version, entities, membership, origin, &canceled).await?
+            query.install_remote_partial(version, entities, membership, changes, origin, &canceled).await?
         };
         ensure!(installed, "query stream superseded during installation");
         self.partial_removals.clear();
@@ -254,11 +267,13 @@ impl Driver {
                 self.publications.back().is_none_or(|publication| publication.complete && publication.revision < revision),
                 "interleaved source publications"
             );
-            ensure!(revision > self.projection.revision, "stale source publication");
+            ensure!(revision > self.received_revision, "stale source publication");
             ensure!(self.publications.len() < super::super::MAX_INFLIGHT_FRAMES, "too many pending source publications");
             self.publications.push_back(Publication {
                 revision,
-                changes: BTreeMap::new(),
+                changes: IndexMap::new(),
+                applied: BTreeMap::new(),
+                retained_bytes: 0,
                 change_bytes: 0,
                 goals: Goals::default(),
                 jobs: 0,
@@ -379,6 +394,13 @@ impl Driver {
             Owner::Live(revision) => {
                 if let Some(publication) = self.publications.iter_mut().find(|publication| publication.revision == revision) {
                     publication.jobs -= 1;
+                    if let Some(change) = &applied.change {
+                        // Retain only accepted events, not a resident entity whose
+                        // state may be far larger than this publication's delta.
+                        let bytes = bincode::serialized_size(change.events())? as usize;
+                        publication.retained_bytes += bytes + proto::EntityId::BYTE_LEN;
+                        publication.applied.entry(applied.id).or_default().extend_from_slice(change.events());
+                    }
                 }
             }
             _ => {}
@@ -678,23 +700,8 @@ impl Driver {
                 !self.assemblies.values().any(|assembly| assembly.owner == Owner::Live(revision)),
                 "publication completed inside a chunk"
             );
-            let publication = self.publication(revision)?;
-            publication.complete = true;
-            let changes: Vec<_> = std::mem::take(&mut publication.changes).into_iter().collect();
-            publication.change_bytes = 0;
-            self.projection.publish(revision, changes.clone())?;
-            for (id, member) in changes {
-                if let Some(member) = member {
-                    self.partial_removals.remove(&id);
-                    if self.observed.get(&id) == Some(&member.head) {
-                        self.membership_dirty |= self.eligible.insert(id);
-                    }
-                } else {
-                    self.eligible.remove(&id);
-                    self.partial_removals.insert(id);
-                    self.membership_dirty = true;
-                }
-            }
+            self.publication(revision)?.complete = true;
+            self.received_revision = revision;
         }
         Ok(())
     }
@@ -719,6 +726,8 @@ impl Driver {
                 ensure!(!self.publications.back().is_some_and(|publication| !publication.complete), "round split a publication");
                 let pending = self.pending_round.take().ok_or_else(|| anyhow::anyhow!("unsolicited round"))?;
                 ensure!(pending.number == descriptor.number && descriptor.number == self.round_number + 1, "wrong round number");
+                ensure!(descriptor.revision >= self.received_revision, "round cut precedes received source publications");
+                self.received_revision = descriptor.revision;
                 self.projection.begin(Round::new(descriptor, pending.snapshot))?;
                 self.round_number = descriptor.number;
                 self.round_waiter = Some(pending.request);
@@ -788,6 +797,11 @@ impl Driver {
         let changes: usize = self.publications.iter().map(|publication| publication.change_bytes).sum();
         ensure!(targets <= super::super::WINDOW_BYTES && ids <= 100_000, "unapplied live target window exhausted");
         ensure!(changes + self.projection.retained_bytes() <= super::super::WINDOW_BYTES, "live membership window exhausted");
+        let retained: usize = self.publications.iter().map(|publication| publication.retained_bytes).sum();
+        ensure!(
+            retained + self.application_bytes + self.assembly_bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
+            "pending publication data exceeded byte limit"
+        );
         Ok(())
     }
 
@@ -899,6 +913,67 @@ impl Driver {
 
     fn can_receive(&self) -> bool { self.application_bytes < super::super::WINDOW_BYTES || !self.assemblies.is_empty() }
 
+    async fn commit_publications<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let mut advanced = false;
+        while self
+            .publications
+            .front()
+            .is_some_and(|publication| publication.complete && publication.jobs == 0 && publication.goals.covered())
+        {
+            let mut publication = self.publications.pop_front().unwrap();
+            let mut changes = Vec::new();
+            for (id, member) in &publication.changes {
+                let previous = self.projection.members.get(id);
+                self.membership_dirty |= match (previous, member.as_ref()) {
+                    (Some(previous), Some(member)) => previous.key != member.key,
+                    (None, None) => false,
+                    _ => true,
+                };
+                if member.is_some() {
+                    self.eligible.insert(*id);
+                    self.partial_removals.remove(id);
+                } else {
+                    self.eligible.remove(id);
+                    self.partial_removals.insert(*id);
+                    // An independently admitted ID may not be source-eligible.
+                    self.membership_dirty = true;
+                }
+                if let Some(events) = publication.applied.remove(id) {
+                    let states = LocalStateGetter::new(node.storage.clone());
+                    let history = LocalEventGetter::new(node.storage.clone(), node.durable);
+                    if let Some(entity) = node.entities.get_or_retrieve(&states, &history, id).await? {
+                        changes.push(EntityChange::new(entity, events));
+                    } else {
+                        bail!("applied publication entity disappeared");
+                    }
+                }
+            }
+            self.projection.publish(publication.revision, publication.changes.into_iter().collect())?;
+            if self.membership_dirty {
+                self.install(node, query, false, HashSet::new(), changes).await?;
+                self.membership_dirty = false;
+            } else if let Some((id, version)) = query {
+                if let Some(query) = node.live_queries.get(id) {
+                    let origin = crate::reactor::QueryOrigin { query: id, version, request: self.stream.request.clone() };
+                    let changes =
+                        changes.into_iter().map(|change| StreamChange { change, origin: Some(origin.clone()), deferred: false }).collect();
+                    node.reactor.notify_query_changes(query.subscription_id(), id, changes).await;
+                }
+            }
+            self.applied_through = Some(publication.revision);
+            advanced = true;
+        }
+        if advanced {
+            self.prune_observed();
+        }
+        self.check_retained()?;
+        Ok(())
+    }
+
     async fn complete_round<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<bool>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -908,6 +983,11 @@ impl Driver {
             || !self.goals.covered()
             || !self.projection.round.as_ref().is_some_and(|round| round.complete)
             || self.assemblies.values().any(|assembly| matches!(assembly.owner, Owner::Round(_)))
+            || self
+                .projection
+                .round
+                .as_ref()
+                .is_some_and(|round| self.publications.iter().any(|publication| publication.revision <= round.descriptor.revision))
         {
             return Ok(false);
         }
@@ -923,7 +1003,7 @@ impl Driver {
             }
         }
         self.eligible.retain(|id| self.projection.members.contains_key(id));
-        self.install(node, query, true, replace).await?;
+        self.install(node, query, true, replace, vec![]).await?;
         self.prune_observed();
         self.baseline_installed = true;
         self.membership_dirty = false;
@@ -1052,27 +1132,9 @@ impl Driver {
             }
             self.repairs(&node, peer, credentials).await?;
             self.discard_covered_round_chunks();
-            if self.membership_dirty {
-                self.install(&node, query, false, HashSet::new()).await?;
-                self.membership_dirty = false;
-            }
-            if self.complete_round(&node, query).await? {
-                if initial {
-                    return Ok(());
-                }
-                self.acknowledge_round(&node, peer, credentials);
-            }
-            let mut advanced = false;
-            while self
-                .publications
-                .front()
-                .is_some_and(|publication| publication.complete && publication.jobs == 0 && publication.goals.covered())
-            {
-                self.applied_through = Some(self.publications.pop_front().unwrap().revision);
-                advanced = true;
-            }
-            if advanced {
-                self.prune_observed();
+            let previous_applied = self.applied_through;
+            self.commit_publications(&node, query).await?;
+            if self.applied_through != previous_applied {
                 self.feedback.queue(
                     &node,
                     peer,
@@ -1084,6 +1146,12 @@ impl Driver {
                     vec![],
                     &self.stream.inbox,
                 )?;
+            }
+            if self.complete_round(&node, query).await? {
+                if initial {
+                    return Ok(());
+                }
+                self.acknowledge_round(&node, peer, credentials);
             }
             self.start_refresh(&node, peer, credentials, query).await?;
             drop(node);
@@ -1132,10 +1200,6 @@ impl Driver {
             match event {
                 Event::Frame(frame) => {
                     self.frame(&node, peer, credentials, frame?).await?;
-                    if self.membership_dirty {
-                        self.install(&node, query, false, HashSet::new()).await?;
-                        self.membership_dirty = false;
-                    }
                 }
                 Event::Job(job) => {
                     let mut changes = Vec::new();
@@ -1147,12 +1211,6 @@ impl Driver {
                         if let Some(change) = self.observe(&node, job?).await? {
                             changes.push(change);
                         }
-                    }
-                    // Only live admission changes need a partial installation. Initial
-                    // rows join as one finite baseline when the round completes.
-                    if self.membership_dirty {
-                        self.install(&node, query, false, HashSet::new()).await?;
-                        self.membership_dirty = false;
                     }
                     notify_changes(
                         &node,
@@ -1202,6 +1260,7 @@ impl Driver {
 struct StreamChange {
     change: EntityChange,
     origin: Option<crate::reactor::QueryOrigin>,
+    deferred: bool,
 }
 impl std::fmt::Display for StreamChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.change.fmt(f) }
@@ -1213,6 +1272,7 @@ impl ChangeNotification for StreamChange {
     fn entity(&self) -> &Self::Entity { self.change.entity() }
     fn events(&self) -> &[Self::Event] { self.change.events() }
     fn query_origin(&self) -> Option<&crate::reactor::QueryOrigin> { self.origin.as_ref() }
+    fn defers_query_membership(&self) -> bool { self.deferred }
 }
 
 /// Reactor batches must contain each identity at most once; it coalesces
@@ -1230,7 +1290,7 @@ where
             ids.clear();
             ids.insert(change.entity().id());
         }
-        batch.push(StreamChange { change, origin: origin.clone() });
+        batch.push(StreamChange { change, origin: origin.clone(), deferred: true });
     }
     if !batch.is_empty() {
         node.reactor.notify_change(batch).await;

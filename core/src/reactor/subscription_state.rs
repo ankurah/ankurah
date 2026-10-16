@@ -265,11 +265,20 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             }
             let included = included
                 .into_values()
-                .filter(|entity| query_state.source.can_read(entity) && evaluate_predicate(entity, &selection.predicate).unwrap_or(false))
+                .filter(|entity| {
+                    query_state.source.can_read(entity)
+                        && (membership
+                            .is_some_and(|membership| membership.preserve.contains(&entity.id()) && before.contains_key(&entity.id()))
+                            || evaluate_predicate(entity, &selection.predicate).unwrap_or(false))
+                })
                 .collect();
             // Replace as a set before applying its order/limit. Adding to the
             // old limited set first could evict an authoritative new member.
-            rw_resultset.replace_all(included);
+            if let Some(membership) = membership {
+                rw_resultset.replace_all_preserving_keys(included, &membership.preserve);
+            } else {
+                rw_resultset.replace_all(included);
+            }
             for (id, entity) in rw_resultset.iter_entities() {
                 if !before.contains_key(&id) {
                     state.entities.insert(id, entity.clone());
@@ -417,7 +426,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 if can_read
                     && change.query_origin().is_some_and(|origin| {
                         origin.query == query_id
-                            && (query_state.source.query_origin() != Some(origin) || !query_state.source.admits_query_entity(entity))
+                            && (query_state.source.query_origin() != Some(origin)
+                                || change.defers_query_membership()
+                                || !query_state.source.admits_query_entity(entity))
                     })
                 {
                     // An old own-stream repair must neither restore a removed

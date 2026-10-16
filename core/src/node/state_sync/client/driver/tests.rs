@@ -26,7 +26,16 @@ async fn finite_round_finishes_while_newer_publication_target_remains_uncovered(
     driver.projection.publish(11, vec![(id(1), Some(member(2)))])?;
     let mut goals = Goals::default();
     goals.add(id(1), head(2), false)?;
-    driver.publications.push_back(Publication { revision: 11, changes: BTreeMap::new(), change_bytes: 0, goals, jobs: 0, complete: true });
+    driver.publications.push_back(Publication {
+        revision: 11,
+        changes: IndexMap::new(),
+        applied: BTreeMap::new(),
+        retained_bytes: 0,
+        change_bytes: 0,
+        goals,
+        jobs: 0,
+        complete: true,
+    });
     assert!(driver.complete_round(&node, None).await?, "a later hot target must not move the captured round goal");
     assert!(driver.projection.round.is_none());
     assert_eq!(driver.projection.members[&id(1)].head, head(2), "closing a round retains the newer source decision");
@@ -112,7 +121,9 @@ async fn live_coverage_can_finish_round_with_queued_repair_and_ignore_late_unava
     required.add(id(2), head(2), false)?;
     driver.publications.push_back(Publication {
         revision: 12,
-        changes: BTreeMap::new(),
+        changes: IndexMap::new(),
+        applied: BTreeMap::new(),
+        retained_bytes: 0,
         change_bytes: 0,
         goals: required,
         jobs: 0,
@@ -243,6 +254,7 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
             (),
             vec![entity.clone()],
             crate::reactor::PeerQueryMembership::default(),
+            vec![],
         )
         .await?;
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));

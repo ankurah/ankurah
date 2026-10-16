@@ -155,21 +155,24 @@ impl EntityLiveQuery {
         version: u32,
         entities: Vec<Entity>,
         membership: crate::reactor::PeerQueryMembership,
+        changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<bool, RetrievalError> {
-        self.0.install_remote(version, entities, membership, origin, canceled, true).await
+        self.0.install_remote(version, entities, membership, changes, origin, canceled, true).await
     }
     pub(crate) async fn install_remote_partial(
         &self,
         version: u32,
         entities: Vec<Entity>,
         membership: crate::reactor::PeerQueryMembership,
+        changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
     ) -> Result<bool, RetrievalError> {
-        self.0.install_remote(version, entities, membership, origin, canceled, false).await
+        self.0.install_remote(version, entities, membership, changes, origin, canceled, false).await
     }
+    pub(crate) fn subscription_id(&self) -> crate::reactor::ReactorSubscriptionId { self.0.subscription.id() }
     pub fn query_id(&self) -> proto::QueryId { self.0.query_id }
     /// The latest installed selection and version; `None` until initial resolution.
     pub fn selection(&self) -> Read<Option<(ankql::ast::Selection<Resolved>, u32)>> { self.0.selection.read() }

@@ -47,6 +47,7 @@ pub struct QueryOrigin {
 pub(crate) struct PeerQueryMembership {
     pub replace: HashSet<proto::EntityId>,
     pub remove: HashSet<proto::EntityId>,
+    pub preserve: HashSet<proto::EntityId>,
 }
 
 /// Trait for entities that can be used in reactor notifications
@@ -84,6 +85,8 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
     /// Only notifications authored by this query's stream use its source
     /// candidate restriction. Local writes and other retrievals remain local facts.
     fn query_origin(&self) -> Option<&QueryOrigin> { None }
+    /// Applied stream data is visible to other queries before its source's publication commits.
+    fn defers_query_membership(&self) -> bool { false }
 }
 
 /// Hook trait for performing actions before notification is sent
@@ -308,7 +311,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
-        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None, None).await
+        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None, None, vec![])
+            .await
     }
 
     pub(crate) async fn upsert_query_from_peer<H: PreNotifyHook>(
@@ -323,6 +327,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         pre_notify_hook: H,
         entities: Vec<E>,
         membership: PeerQueryMembership,
+        changes: Vec<ReactorUpdateItem<E, Ev>>,
     ) -> anyhow::Result<()> {
         self.install_query(
             subscription_id,
@@ -335,6 +340,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             pre_notify_hook,
             Some(entities),
             Some(membership),
+            changes,
         )
         .await
     }
@@ -351,6 +357,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         pre_notify_hook: H,
         entities: Option<Vec<E>>,
         membership: Option<PeerQueryMembership>,
+        changes: Vec<ReactorUpdateItem<E, Ev>>,
     ) -> anyhow::Result<()> {
         let authoritative = entities.is_some();
         let included_entities = match entities {
@@ -371,7 +378,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             return Ok(());
         }
 
-        let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node);
+        let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node.clone());
 
         let mut reactor_update_items = Vec::new();
         subscription.update_query(
@@ -383,6 +390,28 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             authoritative,
             membership.as_ref(),
         )?;
+
+        // Merge source events with the same membership transition, rather than
+        // removing first and later misreporting its causing events as an Update.
+        let positions: HashMap<_, _> = reactor_update_items.iter().enumerate().map(|(offset, item)| (item.entity.id(), offset)).collect();
+        let mut membership_items: Vec<_> = reactor_update_items.into_iter().map(Some).collect();
+        let mut ordered = Vec::with_capacity(membership_items.len() + changes.len());
+        for mut change in changes {
+            if !node.can_read(&change.entity) {
+                continue;
+            }
+            if let Some(offset) = positions.get(&change.entity.id()) {
+                if let Some(mut item) = membership_items[*offset].take() {
+                    item.entity = change.entity;
+                    item.events.append(&mut change.events);
+                    ordered.push(item);
+                }
+            } else if resultset.contains_key(&change.entity.id()) {
+                ordered.push(change);
+            }
+        }
+        ordered.extend(membership_items.into_iter().flatten());
+        let mut reactor_update_items = ordered;
 
         let _notify = if authoritative {
             resultset.clear_gap_dirty();
@@ -439,6 +468,29 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
         for change in all_watcher_changes {
             watcher_set.apply_watcher_change(change);
+        }
+    }
+
+    /// Publish an already applied source publication to its owning query only.
+    /// Other queries and direct entity subscribers received the application once.
+    pub(crate) async fn notify_query_changes<C: ChangeNotification<Entity = E, Event = Ev>>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query: proto::QueryId,
+        changes: Vec<C>,
+    ) {
+        let _notify = self.0.notify_lock.lock().await;
+        let subscription = self.0.subscriptions.lock().unwrap().get(&subscription_id).cloned();
+        let Some(subscription) = subscription else { return };
+        let changes = Arc::new(changes);
+        let mut candidates = CandidateChanges::new(changes.clone());
+        for offset in 0..changes.len() {
+            candidates.add_query(query, offset);
+        }
+        let changes = subscription.evaluate_changes(candidates);
+        let mut watchers = self.0.watcher_set.lock().unwrap();
+        for change in changes {
+            watchers.apply_watcher_change(change);
         }
     }
 
@@ -808,6 +860,7 @@ mod tests {
                 (),
                 vec![entity.clone()],
                 PeerQueryMembership::default(),
+                vec![],
             )
             .await
             .unwrap();
@@ -827,7 +880,8 @@ mod tests {
                 1,
                 (),
                 vec![],
-                PeerQueryMembership { replace: [entity.id].into_iter().collect(), remove: HashSet::new() },
+                PeerQueryMembership { replace: [entity.id].into_iter().collect(), remove: HashSet::new(), preserve: HashSet::new() },
+                vec![],
             )
             .await
             .unwrap();
@@ -874,6 +928,7 @@ mod tests {
                 (),
                 vec![],
                 PeerQueryMembership::default(),
+                vec![],
             )
             .await
             .unwrap();
@@ -960,7 +1015,8 @@ mod tests {
                 1,
                 (),
                 vec![source_row.clone()],
-                PeerQueryMembership { replace: known, remove: HashSet::new() },
+                PeerQueryMembership { replace: known, remove: HashSet::new(), preserve: HashSet::new() },
+                vec![],
             )
             .await
             .unwrap();
@@ -987,6 +1043,7 @@ mod tests {
                 (),
                 vec![source_row.clone()],
                 PeerQueryMembership::default(),
+                vec![],
             )
             .await
             .unwrap();
@@ -1004,7 +1061,8 @@ mod tests {
                 1,
                 (),
                 vec![source_row.clone()],
-                PeerQueryMembership { replace: HashSet::new(), remove: [local.id].into_iter().collect() },
+                PeerQueryMembership { replace: HashSet::new(), remove: [local.id].into_iter().collect(), preserve: HashSet::new() },
+                vec![],
             )
             .await
             .unwrap();
@@ -1026,7 +1084,8 @@ mod tests {
                 1,
                 (),
                 vec![source_row.clone()],
-                PeerQueryMembership { replace: HashSet::new(), remove: [fetched.id].into_iter().collect() },
+                PeerQueryMembership { replace: HashSet::new(), remove: [fetched.id].into_iter().collect(), preserve: HashSet::new() },
+                vec![],
             )
             .await
             .unwrap();
@@ -1055,6 +1114,7 @@ mod tests {
                 (),
                 vec![source_row.clone()],
                 PeerQueryMembership::default(),
+                vec![],
             )
             .await
             .unwrap();
@@ -1082,6 +1142,7 @@ mod tests {
                 (),
                 vec![source_row.clone()],
                 PeerQueryMembership::default(),
+                vec![],
             )
             .await
             .unwrap();

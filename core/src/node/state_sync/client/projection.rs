@@ -76,7 +76,6 @@ impl Projection {
     pub fn begin(&mut self, round: Round) -> anyhow::Result<()> {
         ensure!(self.round.is_none(), "another comparison round is active");
         ensure!(round.descriptor.revision >= self.revision, "round precedes installed source publications");
-        self.revision = round.descriptor.revision;
         self.round = Some(round);
         Ok(())
     }
@@ -85,9 +84,6 @@ impl Projection {
     /// fragments. One publication may change several identities at one revision.
     pub fn publish(&mut self, revision: u64, changes: Vec<(EntityId, Option<QueryMember>)>) -> anyhow::Result<()> {
         ensure!(revision > self.revision, "source publication revision did not advance");
-        if let Some(round) = &self.round {
-            ensure!(revision > round.descriptor.revision, "live publication precedes round cut");
-        }
         for (id, member) in changes {
             match &member {
                 Some(member) => {
@@ -97,7 +93,7 @@ impl Projection {
                     self.members.remove(&id);
                 }
             }
-            if let Some(round) = &mut self.round {
+            if let Some(round) = self.round.as_mut().filter(|round| revision > round.descriptor.revision) {
                 if let Some(previous) = round.overlay.insert(id, member.clone()) {
                     round.overlay_bytes -= bincode::serialized_size(&(id, previous))? as usize;
                 }
