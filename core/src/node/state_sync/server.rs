@@ -65,6 +65,7 @@ pub(crate) struct Session<CD: ContextData> {
     pub query: Option<(proto::QueryId, u32)>,
     initial_request: proto::RequestId,
     initial: Mutex<Option<Arc<StateFrame>>>,
+    initial_round: proto::StateRound,
     sent: AtomicU64,
     spec: proto::TreeSpec,
     fingerprint: Vec<u8>,
@@ -76,34 +77,63 @@ pub(crate) struct Session<CD: ContextData> {
 }
 #[derive(Default)]
 struct LiveQueue {
-    items: VecDeque<proto::SubscriptionUpdateItem>,
+    publications: VecDeque<LivePublication>,
+    items: usize,
     bytes: usize,
+    last_revision: Option<u64>,
     stopped: bool,
+}
+struct LivePublication {
+    revision: u64,
+    items: VecDeque<proto::QueryChange>,
 }
 struct Retained {
     frame: Arc<StateFrame>,
     bytes: usize,
 }
 struct LiveAssembly {
+    revision: u64,
     entity_id: proto::EntityId,
     bytes: Vec<u8>,
     offset: usize,
-    relevance: Vec<(proto::QueryId, proto::MembershipChange)>,
+    member: Option<proto::QueryMember>,
+    complete: bool,
+}
+struct PendingRound {
+    round: proto::StateRound,
+    comparison: Comparison,
+}
+struct LiveTarget {
+    revision: u64,
+    entity_id: proto::EntityId,
+    head: proto::Clock,
+    attempts: usize,
+    bytes: usize,
 }
 struct Stream {
     comparison: Option<Comparison>,
+    round: proto::StateRound,
+    pending_round: Option<PendingRound>,
+    last_refresh: Option<(u64, Vec<u8>)>,
+    retired_round: Option<proto::ComparisonOutcome>,
     retained: VecDeque<Retained>,
     bytes: usize,
     last_sent: u64,
     processed: Option<u64>,
     required_through: u64,
-    applied: bool,
     failed: bool,
     last_activity: Instant,
     feedback: VecDeque<(proto::RequestId, Vec<u8>)>,
     feedback_bytes: usize,
     retired_feedback: HashSet<proto::RequestId>,
     live_chunk: Option<LiveAssembly>,
+    live_targets: VecDeque<LiveTarget>,
+    target_bytes: usize,
+    live_repairs: VecDeque<Work>,
+    pending_live_repairs: HashSet<Vec<u8>>,
+    last_live_complete: Option<u64>,
+    applied_through: Option<u64>,
+    next_lane: usize,
 }
 impl<CD: ContextData> Comparisons<CD> {
     pub fn get(&self, id: &ComparisonId) -> Option<Arc<Session<CD>>> { self.sessions.lock().unwrap().get(id).cloned() }
@@ -172,7 +202,7 @@ impl<CD: ContextData> Comparisons<CD> {
             let Some(initial) = initial.as_ref() else {
                 return Ok(Some(proto::NodeResponseBody::ComparisonUnavailable { comparison: id }));
             };
-            let reply = proto::StateReply { spec: session.spec.clone(), frame: (**initial).clone() };
+            let reply = proto::StateReply { spec: session.spec.clone(), round: session.initial_round, frame: (**initial).clone() };
             return Ok(Some(match session.query {
                 Some((query_id, _)) => proto::NodeResponseBody::QuerySubscribed { query_id, state: reply },
                 None => proto::NodeResponseBody::Fetch(reply),
@@ -268,59 +298,214 @@ impl Stream {
         self.retained.push_back(Retained { frame: Arc::new(frame), bytes });
         Ok(())
     }
+    fn offer_live_target(&mut self, revision: u64, item: &proto::QueryChange) -> anyhow::Result<()> {
+        let mut heads = Vec::new();
+        if let Some(member) = &item.member {
+            heads.push(&member.head);
+        }
+        // Absent can still carry readable state and events. Its data may need
+        // connecting history even though it no longer belongs to the query.
+        if let Some(
+            proto::DeltaContent::StateSnapshot { state }
+            | proto::DeltaContent::StateAndEvents { state, .. }
+            | proto::DeltaContent::StateAndRelation { state, .. },
+        ) = &item.delta
+        {
+            if !heads.contains(&&state.state.head) {
+                heads.push(&state.state.head);
+            }
+        }
+        for head in heads {
+            if self
+                .live_targets
+                .iter()
+                .any(|offered| offered.revision == revision && offered.entity_id == item.entity_id && &offered.head == head)
+            {
+                continue;
+            }
+            let bytes = bincode::serialized_size(&(item.entity_id, head))? as usize;
+            ensure!(
+                self.live_targets.len() < MAX_OFFERED_TARGETS && self.target_bytes + bytes <= WINDOW_BYTES,
+                "unapplied live target window exhausted"
+            );
+            self.target_bytes += bytes;
+            self.live_targets.push_back(LiveTarget { revision, entity_id: item.entity_id, head: head.clone(), attempts: 0, bytes });
+        }
+        Ok(())
+    }
+
+    fn acknowledge_live(&mut self, revision: u64) -> anyhow::Result<()> {
+        ensure!(self.last_live_complete.is_some_and(|last| revision <= last), "application exceeds completed live publications");
+        if self.applied_through.is_some_and(|previous| revision <= previous) {
+            return Ok(());
+        }
+        // Membership-only publications may have no target ledger entry. The
+        // ordered complete boundary, rather than the presence of a target, is authoritative.
+        while self.live_targets.front().is_some_and(|target| target.revision <= revision) {
+            self.target_bytes -= self.live_targets.pop_front().unwrap().bytes;
+        }
+        self.applied_through = Some(revision);
+        Ok(())
+    }
+
     fn next_live(&mut self, live: &Mutex<LiveQueue>) -> anyhow::Result<Option<StateFrameBody>> {
         if let Some(assembly) = self.live_chunk.as_mut() {
             let end = (assembly.offset + PAGE_BYTES / 2).min(assembly.bytes.len());
+            let last = end == assembly.bytes.len();
+            let complete = last && assembly.complete;
             let body = StateFrameBody::LiveChunk {
+                revision: assembly.revision,
+                member: assembly.member.clone(),
                 chunk: proto::EntityDeltaChunk {
                     entity_id: assembly.entity_id,
                     offset: assembly.offset as u64,
                     bytes: assembly.bytes[assembly.offset..end].to_vec().into(),
-                    last: end == assembly.bytes.len(),
+                    last,
                 },
-                predicate_relevance: assembly.relevance.clone(),
+                complete,
             };
             assembly.offset = end;
-            if end == assembly.bytes.len() {
+            if complete {
+                self.last_live_complete = Some(assembly.revision);
+            }
+            if last {
                 self.live_chunk = None;
             }
             return Ok(Some(body));
         }
         let mut queue = live.lock().unwrap();
+        let Some(publication) = queue.publications.front() else { return Ok(None) };
+        let revision = publication.revision;
         let mut items = Vec::new();
         let mut bytes = 0;
         let mut entities = HashSet::new();
-        while let Some(item) = queue.items.front() {
-            // Reactor publication treats one entity change as one notification.
-            // Preserve connecting events by publishing each queued change before
-            // another change for the same entity enters the next frame.
-            if entities.contains(&item.delta.entity_id) {
+        while let Some(item) = queue.publications.front().unwrap().items.front() {
+            // Keep individual event batches for an entity separate, even when
+            // a validated refill publishes several at one final membership cut.
+            if entities.contains(&item.entity_id) {
                 break;
             }
             let size = bincode::serialized_size(item)? as usize;
-            ensure!(item.predicate_relevance.len() <= 128, "live relevance exceeds limit");
             if size > PAGE_BYTES / 2 {
                 if !items.is_empty() {
                     break;
                 }
-                let item = queue.items.pop_front().unwrap();
+                let item = queue.publications.front_mut().unwrap().items.pop_front().unwrap();
+                queue.items -= 1;
                 queue.bytes -= size;
-                let bytes = bincode::serialize(&item.delta.content)?;
+                self.offer_live_target(revision, &item)?;
+                let content = item.delta.ok_or_else(|| anyhow::anyhow!("oversized live membership metadata"))?;
+                let bytes = bincode::serialize(&content)?;
                 ensure!(bytes.len() <= MAX_REPAIR_BYTES, "live delta exceeds assembly limit");
+                let complete = queue.publications.front().unwrap().items.is_empty();
+                if complete {
+                    queue.publications.pop_front();
+                }
                 self.live_chunk =
-                    Some(LiveAssembly { entity_id: item.delta.entity_id, bytes, offset: 0, relevance: item.predicate_relevance });
+                    Some(LiveAssembly { revision, entity_id: item.entity_id, bytes, offset: 0, member: item.member, complete });
                 drop(queue);
                 return self.next_live(live);
             }
             if bytes + size > PAGE_BYTES || items.len() == PAGE_STEPS {
                 break;
             }
+            let item = queue.publications.front_mut().unwrap().items.pop_front().unwrap();
+            self.offer_live_target(revision, &item)?;
             bytes += size;
-            entities.insert(item.delta.entity_id);
+            entities.insert(item.entity_id);
             queue.bytes -= size;
-            items.push(queue.items.pop_front().unwrap());
+            queue.items -= 1;
+            items.push(item);
         }
-        Ok((!items.is_empty()).then_some(StateFrameBody::Live(items)))
+        let complete = queue.publications.front().unwrap().items.is_empty();
+        if complete {
+            queue.publications.pop_front();
+            self.last_live_complete = Some(revision);
+        }
+        Ok(Some(StateFrameBody::Live { revision, items, complete }))
+    }
+
+    fn live_before(&self, live: &Mutex<LiveQueue>, revision: u64) -> bool {
+        self.live_chunk.as_ref().is_some_and(|chunk| chunk.revision <= revision)
+            || live.lock().unwrap().publications.front().is_some_and(|publication| publication.revision <= revision)
+    }
+
+    fn request_live_repairs(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
+        for answer in answers {
+            let StateAnswer::NeedRepair { entity_id, target } = answer else { bail!("live feedback cannot answer round questions") };
+            let key = bincode::serialize(&(entity_id, &target))?;
+            ensure!(
+                self.live_targets.iter().any(|offered| offered.entity_id == entity_id && offered.head == target),
+                "unsolicited live repair target"
+            );
+            if self.pending_live_repairs.contains(&key) {
+                continue;
+            }
+            ensure!(self.pending_live_repairs.len() < 128, "too many pending live repairs");
+            let offered = self.live_targets.iter_mut().find(|offered| offered.entity_id == entity_id && offered.head == target).unwrap();
+            offered.attempts += 1;
+            ensure!(offered.attempts <= 8, "live causal repair retry budget exhausted");
+            self.pending_live_repairs.insert(key);
+            self.live_repairs.push_back(Work::History { entity_id, target });
+        }
+        Ok(())
+    }
+
+    async fn next_live_repair<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        credentials: &Vec<PA::ContextData>,
+        catalog: bool,
+    ) -> anyhow::Result<Option<StateFrameBody>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let Some(work) = self.live_repairs.pop_front() else { return Ok(None) };
+        let item = match work {
+            Work::History { entity_id, target } => match target_history(node, entity_id, &target, None, credentials, catalog).await {
+                Ok(events) => {
+                    let content = proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() };
+                    let bytes = bincode::serialize(&content)?;
+                    if bytes.len() > PAGE_BYTES / 2 {
+                        self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
+                        return Box::pin(self.next_live_repair(node, credentials, catalog)).await;
+                    }
+                    StateItem::Repair { target, delta: proto::EntityDelta { entity_id, content } }
+                }
+                Err(error) => {
+                    tracing::debug!(%entity_id, %error, "live causal repair unavailable");
+                    StateItem::RepairUnavailable { entity_id, target }
+                }
+            },
+            Work::Chunks { entity_id, target, bytes, offset } => {
+                let end = (offset + PAGE_BYTES / 2).min(bytes.len());
+                let item = StateItem::RepairChunk {
+                    target: target.clone(),
+                    chunk: proto::EntityDeltaChunk {
+                        entity_id,
+                        offset: offset as u64,
+                        bytes: bytes[offset..end].to_vec().into(),
+                        last: end == bytes.len(),
+                    },
+                };
+                if end < bytes.len() {
+                    self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: end });
+                }
+                item
+            }
+            _ => unreachable!("only causal repair work enters the live repair queue"),
+        };
+        let finished = match &item {
+            StateItem::Repair { target, delta } => Some((delta.entity_id, target)),
+            StateItem::RepairChunk { target, chunk } if chunk.last => Some((chunk.entity_id, target)),
+            StateItem::RepairUnavailable { entity_id, target } => Some((*entity_id, target)),
+            _ => None,
+        };
+        if let Some((id, target)) = finished {
+            self.pending_live_repairs.remove(&bincode::serialize(&(id, target))?);
+        }
+        Ok(Some(StateFrameBody::LiveRepair { items: vec![item] }))
     }
 }
 
@@ -335,7 +520,9 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let id = match body {
-        proto::NodeRequestBody::ContinueState { comparison, .. } | proto::NodeRequestBody::CloseComparison { comparison, .. } => comparison,
+        proto::NodeRequestBody::ContinueState { comparison, .. }
+        | proto::NodeRequestBody::CloseComparison { comparison, .. }
+        | proto::NodeRequestBody::RefreshState { comparison, .. } => comparison,
         _ => return crate::schema::request_bypasses_policy(body),
     };
     let Some(connection) = node.peer_connections.get(&peer) else { return false };
@@ -354,6 +541,7 @@ pub(crate) async fn start_comparison<SE, PA>(
     credentials: Vec<PA::ContextData>,
     query: Option<(proto::QueryId, u32)>,
     catalog: bool,
+    revision: u64,
     snapshot: Snapshot,
     known: Option<proto::KnownState>,
 ) -> anyhow::Result<proto::StateReply>
@@ -364,23 +552,34 @@ where
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
     let mut comparison = Comparison::new(snapshot, known)?;
     let id = ComparisonId::new();
-    let body = comparison.reply(node, &credentials, catalog, query.is_some()).await?;
+    let round = proto::StateRound { number: 0, revision };
+    let body = comparison.reply(node, &credentials, catalog, query.is_some(), round.number).await?;
     let frame = StateFrame { comparison: id, sequence: 0, body };
-    let initial = proto::StateReply { spec: comparison.snapshot.spec.clone(), frame: frame.clone() };
+    let initial = proto::StateReply { spec: comparison.snapshot.spec.clone(), round, frame: frame.clone() };
     let mut state = Stream {
         comparison: Some(comparison),
+        round,
+        pending_round: None,
+        last_refresh: None,
+        retired_round: None,
         retained: VecDeque::new(),
         bytes: 0,
         last_sent: 0,
         processed: None,
         required_through: 0,
-        applied: false,
         failed: false,
         last_activity: Instant::now(),
         feedback: VecDeque::new(),
         feedback_bytes: 0,
         retired_feedback: HashSet::new(),
         live_chunk: None,
+        live_targets: VecDeque::new(),
+        target_bytes: 0,
+        live_repairs: VecDeque::new(),
+        pending_live_repairs: HashSet::new(),
+        last_live_complete: None,
+        applied_through: None,
+        next_lane: 0,
     };
     state.retain(frame, false)?;
     let (cancel_expiry, mut cancelled) = futures::channel::oneshot::channel();
@@ -390,6 +589,7 @@ where
         query,
         initial_request: request,
         initial: Mutex::new(Some(state.retained.front().unwrap().frame.clone())),
+        initial_round: round,
         sent: AtomicU64::new(0),
         spec: initial.spec.clone(),
         fingerprint,
@@ -421,7 +621,11 @@ where
             let Some(session) = connection.comparisons.get(&id) else { break };
             let state = session.state.lock().await;
             let idle = state.last_activity.elapsed() >= COMPARISON_TTL
-                && (!state.applied || !state.retained.is_empty() || session.live.lock().unwrap().bytes > 0);
+                && (state.comparison.is_some()
+                    || state.pending_round.is_some()
+                    || !state.retained.is_empty()
+                    || !state.live_targets.is_empty()
+                    || !session.live.lock().unwrap().publications.is_empty());
             drop(state);
             if idle {
                 let _ = expire_comparison(&node, peer, id).await;
@@ -437,7 +641,9 @@ pub(crate) async fn continue_state<SE, PA>(
     peer: proto::EntityId,
     request: proto::RequestId,
     id: ComparisonId,
+    round: Option<u64>,
     processed_through: u64,
+    applied_through: Option<u64>,
     answers: Vec<StateAnswer>,
     credentials: Vec<PA::ContextData>,
 ) -> anyhow::Result<proto::NodeResponseBody>
@@ -455,7 +661,7 @@ where
     };
     ensure!(session.permits(&credentials), "comparison credentials changed");
     ensure!(answers.len() <= 128, "too many comparison answers");
-    let encoded = bincode::serialize(&(processed_through, &answers))?;
+    let encoded = bincode::serialize(&(round, processed_through, applied_through, &answers))?;
     ensure!(encoded.len() <= FRAME_BYTES, "comparison feedback exceeds limit");
     let mut state = session.state.lock().await;
     if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
@@ -481,10 +687,16 @@ where
     ensure!(state.retired_feedback.len() < MAX_FEEDBACK_IDS, "stream exhausted control replay history");
     state.acknowledge(processed_through)?;
     session.initial.lock().unwrap().take();
-    if let Some(comparison) = state.comparison.as_mut() {
-        comparison.answer(answers)?;
-    } else {
-        ensure!(answers.is_empty(), "live stream cannot answer snapshot questions");
+    match round {
+        Some(number) => {
+            ensure!(state.round.number == number, "feedback names a retired or future round");
+            let comparison = state.comparison.as_mut().ok_or_else(|| anyhow::anyhow!("round is retired"))?;
+            comparison.answer(answers)?;
+        }
+        None => state.request_live_repairs(answers)?,
+    }
+    if let Some(revision) = applied_through {
+        state.acknowledge_live(revision)?;
     }
     state.feedback_bytes += encoded.len();
     state.feedback.push_back((request, encoded));
@@ -526,15 +738,12 @@ where
         return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
     }
     match outcome {
-        proto::ComparisonOutcome::Applied { processed_through } => {
-            if state.applied {
-                ensure!(
-                    processed_through >= state.required_through && processed_through <= state.last_sent,
-                    "invalid repeated Applied prefix"
-                );
+        proto::ComparisonOutcome::Applied { round, processed_through } => {
+            if state.retired_round == Some(outcome) {
                 return Ok(proto::NodeResponseBody::Success);
             }
-            let comparison = state.comparison.as_ref().expect("a valid unapplied stream owns its comparison");
+            ensure!(round == state.round.number, "Applied names a retired or future round");
+            let comparison = state.comparison.as_ref().ok_or_else(|| anyhow::anyhow!("round is already retired"))?;
             ensure!(
                 !comparison.unavailable
                     && comparison.complete
@@ -544,11 +753,23 @@ where
                     && comparison.pending_repairs.is_empty(),
                 "comparison still has outstanding or unavailable work"
             );
-            ensure!(processed_through >= state.required_through, "Applied does not cover all repair frames");
+            ensure!(processed_through >= state.required_through, "Applied does not cover all round frames");
             state.acknowledge(processed_through)?;
             session.initial.lock().unwrap().take();
-            state.applied = true;
             state.comparison = None;
+            state.retired_round = Some(outcome);
+            if session.query.is_none() {
+                connection.comparisons.finish(id);
+            }
+        }
+        proto::ComparisonOutcome::Cancelled { round } => {
+            if state.retired_round == Some(outcome) {
+                return Ok(proto::NodeResponseBody::Success);
+            }
+            ensure!(round == state.round.number && state.comparison.is_some(), "Cancelled names an inactive round");
+            state.comparison = None;
+            state.retired_round = Some(outcome);
+            session.initial.lock().unwrap().take();
             if session.query.is_none() {
                 connection.comparisons.finish(id);
             }
@@ -568,11 +789,54 @@ where
     Ok(proto::NodeResponseBody::Success)
 }
 
+/// The source actor calls this after queueing all publications through revision,
+/// and before queueing any later publication. The marker shares the live ordering
+/// boundary, while the round's pages remain independently schedulable.
+pub(crate) async fn schedule_round<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: ComparisonId,
+    number: u64,
+    revision: u64,
+    snapshot: Snapshot,
+    known: proto::KnownState,
+) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let session = connection.comparisons.get(&id).ok_or_else(|| anyhow::anyhow!("state stream unavailable"))?;
+    ensure!(session.query.is_some(), "Fetch cannot refresh a standing query");
+    ensure!(snapshot.spec == session.spec && known.spec == session.spec, "refresh changed tree specification");
+    let encoded = bincode::serialize(&known)?;
+    ensure!(encoded.len() <= INITIAL_INVENTORY_BYTES + FRAME_BYTES, "refresh offer exceeds limit");
+    let mut state = session.state.lock().await;
+    if let Some((previous, offer)) = &state.last_refresh {
+        if *previous == number {
+            ensure!(*offer == encoded, "refresh retry changed frozen offer");
+            return Ok(());
+        }
+    }
+    ensure!(!state.failed && state.comparison.is_none() && state.pending_round.is_none(), "a comparison round is already active");
+    ensure!(state.round.number.checked_add(1) == Some(number) && revision >= state.round.revision, "invalid next round");
+    ensure!(state.last_live_complete.is_none_or(|sent| sent <= revision), "round cut precedes delivered live state");
+    ensure!(session.live.lock().unwrap().last_revision.is_none_or(|queued| queued <= revision), "round cut precedes queued live state");
+    let comparison = Comparison::new(snapshot, Some(known))?;
+    state.pending_round = Some(PendingRound { round: proto::StateRound { number, revision }, comparison });
+    state.last_refresh = Some((number, encoded));
+    state.last_activity = Instant::now();
+    drop(state);
+    kick_comparison(node, peer, id);
+    Ok(())
+}
+
 pub(crate) fn queue_live<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     id: ComparisonId,
-    items: Vec<proto::SubscriptionUpdateItem>,
+    revision: u64,
+    items: Vec<proto::QueryChange>,
 ) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -581,21 +845,26 @@ where
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
     let session = connection.comparisons.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
     ensure!(session.query.is_some(), "Fetch has no live route");
+    ensure!(revision > session.initial_round.revision, "live publication does not follow the initial cut");
     let sizes = items.iter().map(|item| bincode::serialized_size(item).map(|size| size as usize)).collect::<Result<Vec<_>, _>>()?;
     let bytes = sizes.iter().sum::<usize>();
     let mut queue = session.live.lock().unwrap();
     if queue.stopped
         || sizes.iter().any(|size| *size > MAX_REPAIR_BYTES)
-        || queue.items.len() + items.len() > MAX_LIVE_ITEMS
+        || queue.items + items.len() > MAX_LIVE_ITEMS
+        || queue.publications.len() >= MAX_LIVE_ITEMS
         || queue.bytes.saturating_add(bytes) > MAX_LIVE_BYTES
+        || queue.last_revision.is_some_and(|previous| revision <= previous)
     {
         queue.stopped = true;
         drop(queue);
         kick_comparison(node, peer, id);
-        bail!("live queue stopped or exhausted");
+        bail!("live queue stopped, out of order, or exhausted");
     }
     queue.bytes += bytes;
-    queue.items.extend(items);
+    queue.items += items.len();
+    queue.last_revision = Some(revision);
+    queue.publications.push_back(LivePublication { revision, items: items.into() });
     drop(queue);
     kick_comparison(node, peer, id);
     Ok(())
@@ -655,27 +924,62 @@ where
         {
             break;
         }
-        let priority = state.comparison.as_ref().is_some_and(|comparison| !comparison.pending_repairs.is_empty());
-        if !state.room(priority) {
-            break;
-        }
-        let body = if let Some(comparison) = state.comparison.as_mut() {
-            if comparison.work.is_empty() || comparison.waiting_for_capacity() {
-                break;
+        // Round markers cannot split a source publication. Before activating
+        // the next cut, drain every queued publication included in that cut.
+        let mut chosen = None;
+        if let Some(pending) = &state.pending_round {
+            if state.live_before(&session.live, pending.round.revision) {
+                if state.room(false) {
+                    chosen = state.next_live(&session.live)?.map(|body| (body, false));
+                }
+            } else if state.room(false) {
+                let pending = state.pending_round.take().unwrap();
+                state.round = pending.round;
+                state.comparison = Some(pending.comparison);
+                chosen = Some((StateFrameBody::BeginRound(state.round), false));
             }
-            comparison.reply(node, &session.credentials, session.catalog, session.query.is_some()).await?
-        } else if state.applied {
-            let Some(body) = state.next_live(&session.live)? else { break };
-            body
         } else {
-            break;
-        };
+            // Rotate among baseline, live publication, and connecting repair.
+            // A blocked baseline never prevents another lane from using credit.
+            for _ in 0..3 {
+                let lane = state.next_lane;
+                state.next_lane = (lane + 1) % 3;
+                match lane {
+                    0 => {
+                        let priority = state.comparison.as_ref().is_some_and(|c| !c.pending_repairs.is_empty());
+                        if !state.room(priority) {
+                            continue;
+                        }
+                        let round = state.round.number;
+                        if let Some(comparison) = state.comparison.as_mut() {
+                            if !comparison.work.is_empty() && !comparison.waiting_for_capacity() {
+                                let body =
+                                    comparison.reply(node, &session.credentials, session.catalog, session.query.is_some(), round).await?;
+                                chosen = Some((body, priority));
+                            }
+                        }
+                    }
+                    1 if state.room(false) => chosen = state.next_live(&session.live)?.map(|body| (body, false)),
+                    2 if state.room(true) => {
+                        chosen = state.next_live_repair(node, &session.credentials, session.catalog).await?.map(|body| (body, true))
+                    }
+                    _ => {}
+                }
+                if chosen.is_some() {
+                    break;
+                }
+            }
+        }
+        if chosen.is_none() && state.room(true) {
+            chosen = state.next_live_repair(node, &session.credentials, session.catalog).await?.map(|body| (body, true));
+        }
+        let Some((body, priority)) = chosen else { break };
         let sequence = state.last_sent.checked_add(1).ok_or_else(|| anyhow::anyhow!("state sequence exhausted"))?;
         let frame = StateFrame { comparison: id, sequence, body };
         if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
             break;
         }
-        if matches!(frame.body, StateFrameBody::State { .. }) {
+        if matches!(frame.body, StateFrameBody::State { .. } | StateFrameBody::BeginRound(_)) {
             state.required_through = sequence;
         }
         state.retain(frame.clone(), priority)?;
@@ -695,6 +999,22 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    fail_stream(node, peer, id, StateFrameBody::RestartRequired).await
+}
+
+pub(crate) async fn source_unavailable<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fail_stream(node, peer, id, StateFrameBody::SourceUnavailable).await
+}
+
+async fn fail_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId, body: StateFrameBody) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     let Some(connection) = node.peer_connections.get(&peer) else { return Ok(()) };
     let Some(session) = connection.comparisons.get(&id) else { return Ok(()) };
     let mut state = session.state.lock().await;
@@ -703,15 +1023,22 @@ where
     }
     state.failed = true;
     state.comparison = None;
+    state.pending_round = None;
+    state.last_refresh = None;
     state.live_chunk = None;
+    state.live_targets.clear();
+    state.target_bytes = 0;
+    state.live_repairs.clear();
+    state.pending_live_repairs.clear();
     session.initial.lock().unwrap().take();
     {
         let mut live = session.live.lock().unwrap();
         live.stopped = true;
-        live.items.clear();
+        live.publications.clear();
+        live.items = 0;
         live.bytes = 0;
     }
-    let frame = StateFrame { comparison: id, sequence: state.last_sent.saturating_add(1), body: StateFrameBody::RestartRequired };
+    let frame = StateFrame { comparison: id, sequence: state.last_sent.saturating_add(1), body };
     let retained = state.room(true) && state.retain(frame.clone(), true).is_ok();
     session.sent.store(state.last_sent, Ordering::Release);
     drop(state);
@@ -774,7 +1101,7 @@ async fn target_history<SE, PA>(
     node: &Node<SE, PA>,
     entity_id: proto::EntityId,
     target: &proto::Clock,
-    snapshot: &Snapshot,
+    snapshot: Option<&Snapshot>,
     credentials: &Vec<PA::ContextData>,
     catalog: bool,
 ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
@@ -783,7 +1110,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-    let state = match snapshot.states.get(&entity_id) {
+    let state = match snapshot.and_then(|snapshot| snapshot.states.get(&entity_id)) {
         Some(state) => (**state).clone(),
         None => node_state(node, entity_id, &policy).await?.ok_or_else(|| anyhow::anyhow!("repair state unavailable"))?,
     };
@@ -1205,6 +1532,7 @@ impl Comparison {
         credentials: &Vec<PA::ContextData>,
         catalog: bool,
         standing_query: bool,
+        round: u64,
     ) -> anyhow::Result<StateFrameBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -1245,7 +1573,7 @@ impl Comparison {
             }
             let item = match work {
                 Work::History { entity_id, target } => {
-                    match target_history(node, entity_id, &target, &self.snapshot, credentials, catalog).await {
+                    match target_history(node, entity_id, &target, Some(&self.snapshot), credentials, catalog).await {
                         Ok(events) => {
                             let delta = proto::EntityDelta {
                                 entity_id,
@@ -1452,6 +1780,7 @@ impl Comparison {
         }
         self.complete |= finished;
         Ok(StateFrameBody::State {
+            round,
             items,
             progress: if first_complete { ComparisonProgress::Complete } else { ComparisonProgress::Continue },
         })

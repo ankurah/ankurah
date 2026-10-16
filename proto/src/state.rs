@@ -111,9 +111,15 @@ pub enum StateFrameBody {
     },
     /// Connecting data for previously offered live targets. Only Repair,
     /// RepairChunk and RepairUnavailable items are permitted; none authors membership.
-    LiveRepair { items: Vec<StateItem> },
+    LiveRepair {
+        items: Vec<StateItem>,
+    },
     /// Mark this generation unavailable and restart; never claim completion.
     RestartRequired,
+    /// The source cannot prove a gap-free publication history after an uncertain
+    /// commit outcome. Recreating this stream cannot repair it; the source node
+    /// must be reconstructed before it can serve query state again.
+    SourceUnavailable,
 }
 
 /// The sender's captured key and target. Keep these separate from the key/head

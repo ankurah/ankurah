@@ -9,12 +9,12 @@ mod tree;
 
 pub(crate) use client::{abandon_current_state, finish_state, receive_state, request_state};
 pub(crate) use incoming::{Inbox, IncomingStates, IncomingStream};
-#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) use server::expire_comparison;
 #[cfg(test)]
 pub(crate) use server::pump_comparison;
 pub(crate) use server::{
-    close_state, comparison_bypasses_policy, continue_state, kick_comparison, queue_live, start_comparison, Comparisons,
+    close_state, comparison_bypasses_policy, continue_state, kick_comparison, queue_live, schedule_round, source_unavailable,
+    start_comparison, Comparisons,
 };
 pub(crate) use tree::{QueryTree, Snapshot};
 

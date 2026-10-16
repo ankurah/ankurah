@@ -48,6 +48,7 @@ pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) 
             is_catalog_read(&selection.predicate)
         }
         NodeRequestBody::ContinueState { .. }
+        | NodeRequestBody::RefreshState { .. }
         | NodeRequestBody::CloseComparison { .. }
         | NodeRequestBody::Get { .. }
         | NodeRequestBody::GetEvents { .. }

@@ -545,19 +545,17 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::Fetch { mut selection, known_state } => {
+            proto::NodeRequestBody::Fetch { selection, known_state } => {
                 let spec = state_sync::QueryTree::offered_spec(&selection, &self.catalog, &known_state)?;
                 let catalog = crate::schema::is_catalog_read(&selection.predicate);
-                let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
-                selection.predicate = policy.filter_predicate(selection.predicate)?;
-                let states = self
-                    .storage
-                    .fetch_states(&selection)
-                    .await?
-                    .into_iter()
-                    .filter(|state| policy.check_read(&state.payload.entity_id, &state.payload.state).is_ok())
-                    .collect();
-                let snapshot = state_sync::QueryTree::default().refresh(spec, states).await?;
+                let captured = crate::peer_subscription::capture_query(
+                    self,
+                    selection,
+                    spec,
+                    credentials.clone(),
+                    Arc::new(state_sync::QueryTree::default()),
+                )
+                .await?;
                 let state = state_sync::start_comparison(
                     self,
                     request.from,
@@ -566,7 +564,8 @@ where
                     credentials,
                     None,
                     catalog,
-                    snapshot,
+                    captured.revision,
+                    captured.snapshot,
                     known_state,
                 )
                 .await?;
@@ -596,8 +595,23 @@ where
                     .subscribe_query(self, request.id, fingerprint, query_id, selection, cdata, version, known_state)
                     .await
             }
-            proto::NodeRequestBody::ContinueState { comparison, processed_through, answers } => {
-                state_sync::continue_state(self, request.from, request.id, comparison, processed_through, answers, credentials).await
+            proto::NodeRequestBody::ContinueState { comparison, round, processed_through, applied_through, answers } => {
+                state_sync::continue_state(
+                    self,
+                    request.from,
+                    request.id,
+                    comparison,
+                    round,
+                    processed_through,
+                    applied_through,
+                    answers,
+                    credentials,
+                )
+                .await
+            }
+            proto::NodeRequestBody::RefreshState { comparison, round, known_state } => {
+                peer.subscription_handler.refresh_query(self, comparison, round, known_state, &credentials).await?;
+                Ok(proto::NodeResponseBody::Success)
             }
             proto::NodeRequestBody::CloseComparison { comparison, outcome } => {
                 state_sync::close_state(self, request.from, comparison, outcome, credentials).await
