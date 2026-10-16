@@ -403,6 +403,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 continue;
             }
             if let Some(offset) = positions.get(&change.entity.id()) {
+                // Finite state-only advances need no second notification for
+                // rows already gaining/losing membership. Keep those generated
+                // transitions in query order; live publications retain change order.
+                if pre_notify_hook.marks_loaded() && change.events.is_empty() {
+                    continue;
+                }
                 if let Some(mut item) = membership_items[*offset].take() {
                     item.entity = change.entity;
                     item.events.append(&mut change.events);
@@ -1076,6 +1082,138 @@ mod tests {
             .unwrap();
         assert_eq!(resultset.len(), 1);
         assert!(resultset.contains_key(&source_row.id));
+    }
+
+    #[tokio::test]
+    async fn finite_baseline_state_changes_preserve_sorted_initial_and_add_notifications() {
+        for descending in [false, true] {
+            for cached in [false, true] {
+                let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+                let subscription = reactor.subscribe();
+                let query = QueryId::new();
+                let rows = [TestEntity::new("alpha", "pending"), TestEntity::new("beta", "pending"), TestEntity::new("gamma", "pending")];
+                let resultset = EntityResultSet::empty();
+                let selection = sel(if descending {
+                    "status = 'pending' ORDER BY name DESC LIMIT 2"
+                } else {
+                    "status = 'pending' ORDER BY name ASC LIMIT 2"
+                });
+                if cached {
+                    reactor
+                        .upsert_query_and_notify(
+                            subscription.id(),
+                            query,
+                            selection.clone(),
+                            Arc::new(MockNode { entities: vec![] }),
+                            resultset.clone(),
+                            Arc::new(MockGapFetcher::new()),
+                            1,
+                            (),
+                        )
+                        .await
+                        .unwrap();
+                }
+                let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+                let _guard = subscription.subscribe(watch);
+                let expected = if descending { vec![rows[2].id, rows[1].id] } else { vec![rows[0].id, rows[1].id] };
+                // Deliberately oppose result order rather than depending on a
+                // HashSet's random iteration to expose finite-round reordering.
+                let mut changes: Vec<_> = expected
+                    .iter()
+                    .rev()
+                    .map(|id| ReactorUpdateItem {
+                        entity: rows.iter().find(|entity| entity.id == *id).unwrap().clone(),
+                        events: vec![],
+                        predicate_relevance: vec![],
+                    })
+                    .collect();
+                changes.push(ReactorUpdateItem {
+                    entity: if descending { rows[0].clone() } else { rows[2].clone() },
+                    events: vec![],
+                    predicate_relevance: vec![],
+                });
+                let gate = Arc::new(std::sync::RwLock::new(rows.iter().map(|entity| entity.id).collect()));
+                let notified = reactor
+                    .upsert_query_from_peer(
+                        subscription.id(),
+                        query,
+                        selection,
+                        Arc::new(CandidateWindow(gate, origin(query))),
+                        resultset.clone(),
+                        Arc::new(MockGapFetcher::new()),
+                        1,
+                        (),
+                        rows.to_vec(),
+                        PeerQueryMembership::default(),
+                        changes,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resultset.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>(), expected);
+                let updates = updates();
+                assert_eq!(updates.len(), 1);
+                assert_eq!(
+                    updates[0].items.iter().map(|item| item.entity.id).collect::<Vec<_>>(),
+                    expected,
+                    "finite state-only changes cannot reorder the generated query membership notification"
+                );
+                let kind = if cached { MembershipChange::Add } else { MembershipChange::Initial };
+                for item in &updates[0].items {
+                    assert_eq!(item.predicate_relevance, vec![(query, kind.clone())]);
+                    assert!(item.events.is_empty(), "baseline does not replay historical events");
+                }
+                assert_eq!(notified, expected.into_iter().collect());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_live_publication_preserves_change_order_and_causing_events() {
+        struct Partial;
+        impl PreNotifyHook for Partial {
+            fn marks_loaded(&self) -> bool { false }
+            fn pre_notify(&self, _: u32) {}
+        }
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let first = TestEntity::new("alpha", "pending");
+        let second = TestEntity::new("beta", "pending");
+        let resultset = EntityResultSet::empty();
+        let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = subscription.subscribe(watch);
+        let event = TestEvent { id: proto::EventId::from_bytes([45; 32]), changes: HashMap::new() };
+        let gate = Arc::new(std::sync::RwLock::new([first.id, second.id].into_iter().collect()));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' ORDER BY name ASC LIMIT 2"),
+                Arc::new(CandidateWindow(gate, origin(query))),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                Partial,
+                vec![first.clone(), second.clone()],
+                PeerQueryMembership::default(),
+                vec![
+                    ReactorUpdateItem { entity: second.clone(), events: vec![event.clone()], predicate_relevance: vec![] },
+                    ReactorUpdateItem { entity: first.clone(), events: vec![], predicate_relevance: vec![] },
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(resultset.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>(), [first.id, second.id]);
+        let updates = updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].items.iter().map(|item| item.entity.id).collect::<Vec<_>>(),
+            [second.id, first.id],
+            "explicit live transaction order remains independent of final result ordering"
+        );
+        assert_eq!(updates[0].items[0].events, [event]);
+        assert!(updates[0].items[1].events.is_empty());
+        assert!(updates[0].items.iter().all(|item| item.predicate_relevance == [(query, MembershipChange::Add)]));
     }
 
     #[tokio::test]
