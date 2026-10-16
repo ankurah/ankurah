@@ -1,0 +1,32 @@
+{
+  "id": "38866100277-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "4f8dbe74",
+      "url": "https://github.com/ankurah/ankurah/commit/4f8dbe747192c15c78f4764e98f0e0c17608e04c"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.6.0"
+    },
+    {
+      "kind": "pr",
+      "label": "#153",
+      "url": "https://github.com/ankurah/ankurah/pull/153"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38866100277-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-10-11T08:04:18-07:00",
+    "label": "4f8dbe747192c15c78f4764e98f0e0c17608e04c",
+    "ref": "4f8dbe747192c15c78f4764e98f0e0c17608e04c",
+    "repository": "ankurah/ankurah",
+    "sha": "4f8dbe747192c15c78f4764e98f0e0c17608e04c"
+  },
+  "status": "unsupported"
+}
