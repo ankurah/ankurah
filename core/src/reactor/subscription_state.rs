@@ -401,7 +401,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 debug!("Subscription {} evaluating entity {} for query {}", self.id(), entity_id, query_id);
 
                 let can_read = query_state.source.can_read(entity);
-                if can_read && change.origin_query() == Some(query_id) && !query_state.source.admits_query_entity(entity) {
+                if can_read
+                    && change
+                        .query_origin()
+                        .is_some_and(|origin| origin.query == query_id && query_state.source.query_origin() == Some(origin))
+                    && !query_state.source.admits_query_entity(entity)
+                {
                     // An old own-stream repair must neither restore a removed
                     // source member nor undo a later authorized local/Fetch view.
                     continue;

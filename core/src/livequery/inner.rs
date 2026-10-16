@@ -318,6 +318,7 @@ impl LiveQueryInner {
                 return Ok(false);
             };
             Arc::new(PeerQuerySource {
+                origin: crate::reactor::QueryOrigin { query: self.query_id, version, request: origin.clone() },
                 context: self.context.clone(),
                 candidates: stream.candidates.clone(),
                 admission: stream.admission.clone(),
@@ -367,12 +368,14 @@ impl LiveQueryInner {
 /// The source owns the remote candidate window. Local merge/policy evaluation
 /// may remove candidates, but a local cache scan cannot invent a source winner.
 struct PeerQuerySource {
+    origin: crate::reactor::QueryOrigin,
     context: Arc<dyn DynContextInner>,
     candidates: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
     admission: Arc<std::sync::atomic::AtomicBool>,
 }
 #[async_trait::async_trait]
 impl crate::reactor::LocalEntitySource for PeerQuerySource {
+    fn query_origin(&self) -> Option<&crate::reactor::QueryOrigin> { self.admission.load(Ordering::Acquire).then_some(&self.origin) }
     fn can_read(&self, entity: &Entity) -> bool { self.context.can_read(entity) }
     fn admits_query_entity(&self, entity: &Entity) -> bool {
         !self.admission.load(Ordering::Acquire) || self.candidates.read().unwrap().contains(&entity.id())

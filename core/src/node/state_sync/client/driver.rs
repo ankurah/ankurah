@@ -1154,7 +1154,12 @@ impl Driver {
                         self.install(&node, query, false, HashSet::new()).await?;
                         self.membership_dirty = false;
                     }
-                    notify_changes(&node, query.map(|(query, _)| query), changes).await;
+                    notify_changes(
+                        &node,
+                        query.map(|(query, version)| crate::reactor::QueryOrigin { query, version, request: self.stream.request.clone() }),
+                        changes,
+                    )
+                    .await;
                 }
                 Event::Control(control) => {
                     control?;
@@ -1196,7 +1201,7 @@ impl Driver {
 #[derive(Debug)]
 struct StreamChange {
     change: EntityChange,
-    query: Option<proto::QueryId>,
+    origin: Option<crate::reactor::QueryOrigin>,
 }
 impl std::fmt::Display for StreamChange {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.change.fmt(f) }
@@ -1207,12 +1212,12 @@ impl ChangeNotification for StreamChange {
     fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { self.change.into_parts() }
     fn entity(&self) -> &Self::Entity { self.change.entity() }
     fn events(&self) -> &[Self::Event] { self.change.events() }
-    fn origin_query(&self) -> Option<proto::QueryId> { self.query }
+    fn query_origin(&self) -> Option<&crate::reactor::QueryOrigin> { self.origin.as_ref() }
 }
 
 /// Reactor batches must contain each identity at most once; it coalesces
 /// repeated identities and therefore cannot represent two event batches for one ID.
-async fn notify_changes<SE, PA>(node: &Node<SE, PA>, query: Option<proto::QueryId>, changes: Vec<EntityChange>)
+async fn notify_changes<SE, PA>(node: &Node<SE, PA>, origin: Option<crate::reactor::QueryOrigin>, changes: Vec<EntityChange>)
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1225,7 +1230,7 @@ where
             ids.clear();
             ids.insert(change.entity().id());
         }
-        batch.push(StreamChange { change, query });
+        batch.push(StreamChange { change, origin: origin.clone() });
     }
     if !batch.is_empty() {
         node.reactor.notify_change(batch).await;

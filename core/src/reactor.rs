@@ -33,6 +33,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+/// A query stream's notification authority, including same-version retries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryOrigin {
+    pub query: proto::QueryId,
+    pub version: u32,
+    pub request: proto::RequestId,
+}
+
 /// Reconcile the source's captured identities while retaining independent local
 /// additions. Explicit live absences also remove identities outside that capture.
 #[derive(Default)]
@@ -56,6 +64,8 @@ pub trait LocalEntitySource<E: AbstractEntity + Filterable + Send + 'static = En
     /// Recheck an entity before publishing it, including changes arriving after the initial fetch.
     fn can_read(&self, _entity: &E) -> bool { true }
 
+    fn query_origin(&self) -> Option<&QueryOrigin> { None }
+
     /// Membership authority is separate from readability: a readable removal still notifies.
     fn admits_query_entity(&self, _entity: &E) -> bool { true }
 
@@ -73,7 +83,7 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
 
     /// Only notifications authored by this query's stream use its source
     /// candidate restriction. Local writes and other retrievals remain local facts.
-    fn origin_query(&self) -> Option<proto::QueryId> { None }
+    fn query_origin(&self) -> Option<&QueryOrigin> { None }
 }
 
 /// Hook trait for performing actions before notification is sent
@@ -644,9 +654,11 @@ mod tests {
         }
     }
 
-    struct CandidateWindow(Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>);
+    struct CandidateWindow(Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>, QueryOrigin);
+    fn origin(query: QueryId) -> QueryOrigin { QueryOrigin { query, version: 1, request: proto::RequestId::default() } }
     #[async_trait::async_trait]
     impl LocalEntitySource<TestEntity> for CandidateWindow {
+        fn query_origin(&self) -> Option<&QueryOrigin> { Some(&self.1) }
         fn admits_query_entity(&self, entity: &TestEntity) -> bool { self.0.read().unwrap().contains(&entity.id) }
         async fn fetch_entities_from_local(&self, _: &ankql::ast::Selection<Resolved>) -> Result<Vec<TestEntity>, RetrievalError> {
             Ok(vec![])
@@ -654,7 +666,7 @@ mod tests {
     }
     struct OwnChange {
         change: TestChange,
-        query: QueryId,
+        origin: QueryOrigin,
     }
     impl std::fmt::Display for OwnChange {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.change.fmt(f) }
@@ -668,7 +680,7 @@ mod tests {
         fn into_parts(self) -> (TestEntity, Vec<TestEvent>) { self.change.into_parts() }
         fn entity(&self) -> &TestEntity { self.change.entity() }
         fn events(&self) -> &[TestEvent] { self.change.events() }
-        fn origin_query(&self) -> Option<QueryId> { Some(self.query) }
+        fn query_origin(&self) -> Option<&QueryOrigin> { Some(&self.origin) }
     }
 
     /// Mock node for testing
@@ -789,7 +801,7 @@ mod tests {
                 subscription.id(),
                 id,
                 sel("status = 'pending'"),
-                Arc::new(CandidateWindow(gate.clone())),
+                Arc::new(CandidateWindow(gate.clone(), origin(id))),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 1,
@@ -809,7 +821,7 @@ mod tests {
                 subscription.id(),
                 id,
                 sel("status = 'pending'"),
-                Arc::new(CandidateWindow(gate.clone())),
+                Arc::new(CandidateWindow(gate.clone(), origin(id))),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 1,
@@ -825,21 +837,64 @@ mod tests {
             removal.iter().flat_map(|update| &update.items).any(|item| item.predicate_relevance.contains(&(id, MembershipChange::Remove))),
             "the readable explicit removal still notifies"
         );
-        reactor.notify_change(vec![OwnChange { change: TestChange { entity: entity.clone(), events: vec![] }, query: id }]).await;
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: entity.clone(), events: vec![] }, origin: origin(id) }]).await;
         assert_eq!(resultset.len(), 0, "an own-stream repair cannot re-admit the source outsider");
         assert!(changes().is_empty());
         // Other Fetch/local application retains the pre-stream predicate semantics.
         reactor.notify_change(vec![TestChange { entity: entity.clone(), events: vec![] }]).await;
         assert!(resultset.contains_key(&entity.id));
         let _ = changes();
-        reactor.notify_change(vec![OwnChange { change: TestChange { entity: entity.clone(), events: vec![] }, query: id }]).await;
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: entity.clone(), events: vec![] }, origin: origin(id) }]).await;
         assert!(resultset.contains_key(&entity.id), "a late own repair cannot undo that independent authorized admission");
         assert!(changes().is_empty());
         let other = TestEntity::new("another query's row", "pending");
         reactor
-            .notify_change(vec![OwnChange { change: TestChange { entity: other.clone(), events: vec![] }, query: QueryId::new() }])
+            .notify_change(vec![OwnChange { change: TestChange { entity: other.clone(), events: vec![] }, origin: origin(QueryId::new()) }])
             .await;
         assert!(resultset.contains_key(&other.id), "another query stream is independent of this source candidate window");
+    }
+
+    #[tokio::test]
+    async fn replaced_stream_notifications_do_not_borrow_the_replacement_authority() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let resultset = EntityResultSet::empty();
+        let old = origin(query);
+        let current = QueryOrigin { request: proto::RequestId::new(), ..old.clone() };
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(Arc::new(std::sync::RwLock::new(HashSet::new())), current.clone())),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![],
+                PeerQueryMembership::default(),
+            )
+            .await
+            .unwrap();
+        let same_version = TestEntity::new("old same-version request", "pending");
+        let old_version = TestEntity::new("old selection version", "pending");
+        let own = TestEntity::new("current source outsider", "pending");
+        reactor
+            .notify_change(vec![OwnChange { change: TestChange { entity: own.clone(), events: vec![] }, origin: current.clone() }])
+            .await;
+        assert!(!resultset.contains_key(&own.id));
+        // A completed old apply can reach the notification lock after replacement.
+        // It remains an independent authorized fact, never the new stream's decision.
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: same_version.clone(), events: vec![] }, origin: old }]).await;
+        assert!(resultset.contains_key(&same_version.id));
+        reactor
+            .notify_change(vec![OwnChange {
+                change: TestChange { entity: old_version.clone(), events: vec![] },
+                origin: QueryOrigin { version: 0, ..current },
+            }])
+            .await;
+        assert!(resultset.contains_key(&old_version.id));
     }
 
     #[tokio::test]
@@ -875,7 +930,7 @@ mod tests {
                 subscription.id(),
                 query,
                 sel("status = 'pending'"),
-                Arc::new(CandidateWindow(gate.clone())),
+                Arc::new(CandidateWindow(gate.clone(), origin(query))),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 1,
@@ -894,7 +949,7 @@ mod tests {
                 subscription.id(),
                 query,
                 sel("status = 'pending'"),
-                Arc::new(CandidateWindow(gate.clone())),
+                Arc::new(CandidateWindow(gate.clone(), origin(query))),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 1,
@@ -912,7 +967,7 @@ mod tests {
                 subscription.id(),
                 query,
                 sel("status = 'pending'"),
-                Arc::new(CandidateWindow(gate.clone())),
+                Arc::new(CandidateWindow(gate.clone(), origin(query))),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 1,
@@ -923,7 +978,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!resultset.contains_key(&local.id));
-        reactor.notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, query }]).await;
+        reactor
+            .notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, origin: origin(query) }])
+            .await;
         assert!(!resultset.contains_key(&local.id), "late own data cannot reverse explicit source absence");
         assert!(resultset.contains_key(&fetched.id));
         // A newer absence also overrides a new outside-K addition at full commit.
@@ -932,7 +989,7 @@ mod tests {
                 subscription.id(),
                 query,
                 sel("status = 'pending'"),
-                Arc::new(CandidateWindow(gate)),
+                Arc::new(CandidateWindow(gate, origin(query))),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 1,
@@ -954,7 +1011,7 @@ mod tests {
         let source_row = TestEntity::new("ZZZ source", "pending");
         let local = TestEntity::new("AAA local", "pending");
         let resultset = EntityResultSet::empty();
-        let source = Arc::new(CandidateWindow(Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect()))));
+        let source = Arc::new(CandidateWindow(Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect())), origin(query)));
         reactor
             .upsert_query_from_peer(
                 subscription.id(),
@@ -970,14 +1027,18 @@ mod tests {
             )
             .await
             .unwrap();
-        reactor.notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, query }]).await;
+        reactor
+            .notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, origin: origin(query) }])
+            .await;
         assert!(resultset.contains_key(&source_row.id));
         reactor.notify_change(vec![TestChange { entity: local.clone(), events: vec![] }]).await;
         assert_eq!(resultset.len(), 1);
         assert!(resultset.contains_key(&local.id), "normal local notifications still participate in predicate/sort/LIMIT");
-        reactor.notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, query }]).await;
+        reactor
+            .notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, origin: origin(query) }])
+            .await;
         assert!(resultset.contains_key(&local.id), "an excluded own-stream job must not remove the legitimate optimistic row");
-        let source = Arc::new(CandidateWindow(Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect()))));
+        let source = Arc::new(CandidateWindow(Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect())), origin(query)));
         reactor
             .upsert_query_from_peer(
                 subscription.id(),
