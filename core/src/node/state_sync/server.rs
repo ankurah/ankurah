@@ -702,9 +702,16 @@ where
     session.initial.lock().unwrap().take();
     match round {
         Some(number) => {
-            ensure!(state.round.number == number, "feedback names a retired or future round");
-            let comparison = state.comparison.as_mut().ok_or_else(|| anyhow::anyhow!("round is retired"))?;
-            comparison.answer(answers)?;
+            ensure!(number <= state.round.number, "feedback names a future round");
+            // A delayed repair question may arrive after live application covered
+            // its target and Applied retired the round. It cannot author current
+            // membership, and retaining the old snapshot merely to reject it
+            // would make round retirement race normal application progress.
+            if number == state.round.number {
+                if let Some(comparison) = state.comparison.as_mut() {
+                    comparison.answer(answers)?;
+                }
+            }
         }
         None => state.request_live_repairs(answers)?,
     }
@@ -758,13 +765,8 @@ where
             ensure!(round == state.round.number, "Applied names a retired or future round");
             let comparison = state.comparison.as_ref().ok_or_else(|| anyhow::anyhow!("round is already retired"))?;
             ensure!(
-                !comparison.unavailable
-                    && comparison.complete
-                    && comparison.work.is_empty()
-                    && comparison.summaries.is_empty()
-                    && comparison.leaves.is_empty()
-                    && comparison.pending_repairs.is_empty(),
-                "comparison still has outstanding or unavailable work"
+                comparison.complete && comparison.summaries.is_empty() && comparison.leaves.is_empty(),
+                "comparison enumeration is not complete"
             );
             ensure!(processed_through >= state.required_through, "Applied does not cover all round frames");
             state.acknowledge(processed_through)?;

@@ -2,7 +2,7 @@
 use super::*;
 use ankurah::{
     core::connector::{PeerSender, SendError},
-    proto, Mutable,
+    proto, Mutable, View,
 };
 use ankurah_signals::Peek;
 use std::sync::{
