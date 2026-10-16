@@ -59,14 +59,15 @@ async fn nodes() -> Result<(TestNode, TestNode)> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     Ok((server, client))
 }
-async fn wait_for(mut condition: impl FnMut() -> bool) {
+async fn wait_for(mut condition: impl FnMut() -> bool) { wait_for_named("condition", &mut condition).await; }
+async fn wait_for_named(description: &str, mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(10), async {
         while !condition() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("condition did not become true");
+    .unwrap_or_else(|_| panic!("{description} did not become true"));
 }
 fn bridge_for(items: &[StateItem], id: EntityId) -> bool {
     items.iter().any(|item| {
@@ -332,15 +333,18 @@ async fn live_edits_cross_unfinished_comparison_then_reconnect_from_retained_sta
     pets[0].edit(&trx)?.age()?.replace("2")?;
     trx.commit().await?;
     armed.store(true, Ordering::Release);
-    let query = reader.query::<PetView>(nocache("age != '0' ORDER BY name ASC")?)?;
-    wait_for(|| held.lock().unwrap().is_some()).await;
+    let query = reader.query::<PetView>(nocache("name >= '' AND age >= '1' ORDER BY name ASC")?)?;
+    wait_for_named("round feedback held", || held.lock().unwrap().is_some()).await;
     assert!(!query.loaded(), "the refinement answer is still held");
     let watcher = TestWatcher::changeset_with_event_ids();
     let _guard = query.subscribe(&watcher);
     let trx = writer.begin();
     pets[1].edit(&trx)?.age()?.replace("3")?;
     trx.commit().await?;
-    wait_for(|| query.peek().iter().any(|row| row.id() == pets[1].id() && row.age().as_deref() == Ok("3"))).await;
+    wait_for_named("live edit applied before feedback release", || {
+        query.peek().iter().any(|row| row.id() == pets[1].id() && row.age().as_deref() == Ok("3"))
+    })
+    .await;
     assert!(!query.loaded(), "unrelated live application must not claim the unfinished round is ready");
     assert_eq!(query.peek().iter().find(|row| row.id() == pets[1].id()).unwrap().entity().head(), pets[1].entity().head());
     let changes = watcher.quiesce_drain().await;
@@ -354,7 +358,7 @@ async fn live_edits_cross_unfinished_comparison_then_reconnect_from_retained_sta
     pets[2].edit(&trx)?.age()?.replace("0")?;
     trx.commit().await?;
     let former = retained.iter().find(|row| row.id() == pets[2].id()).unwrap();
-    wait_for(|| former.age().as_deref() == Ok("0")).await;
+    wait_for_named("former member state applied before feedback release", || former.age().as_deref() == Ok("0")).await;
     assert!(!query.loaded());
     armed.store(false, Ordering::Release);
     gate.release_held(&server).await;
@@ -925,7 +929,7 @@ async fn oversized_source_publication_restarts_and_recovers_after_writes_settle(
         while !query.peek().first().is_some_and(|row| row.title().as_deref() == Ok(payload.as_str())) {
             tokio::task::yield_now().await;
         }
-        query.wait_durable_answered().await?;
+        query.refresh().await?;
         Ok::<_, anyhow::Error>(())
     })
     .await??;
