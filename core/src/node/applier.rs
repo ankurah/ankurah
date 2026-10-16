@@ -5,10 +5,8 @@ use crate::reactor::ChangeNotification;
 use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
 use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
-use crate::util::Iterable;
 use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
-use std::collections::{HashMap, HashSet};
 
 /// Applies entity deltas received from a peer, whether they arrive as initial
 /// transfer (Fetch, QuerySubscribed, repair) or as live subscription updates.
@@ -52,21 +50,6 @@ pub(crate) struct DeltaOutcome {
     pub divergence: Option<Divergence>,
 }
 
-/// Heads observed after successful application, with any divergences.
-/// These heads are coverage evidence at observation time, without retaining entities.
-#[derive(Debug, Default)]
-pub(crate) struct AppliedDeltas {
-    heads: HashMap<proto::EntityId, proto::Clock>,
-    divergent: HashSet<proto::EntityId>,
-}
-
-impl AppliedDeltas {
-    /// The committed head observed while collecting a successful outcome.
-    pub(crate) fn observed_head(&self, entity_id: &proto::EntityId) -> Option<proto::Clock> { self.heads.get(entity_id).cloned() }
-
-    pub(crate) fn diverged(&self, entity_id: &proto::EntityId) -> bool { self.divergent.contains(entity_id) }
-}
-
 impl DeltaOutcome {
     fn unchanged(entity: Option<Entity>) -> Self { Self { entity, change: None, divergence: None } }
 }
@@ -75,7 +58,8 @@ impl NodeApplier {
     /// Apply a batch of live updates pushed outside any sequenced stream, from a
     /// peer we hold a standing query with. Such a push names no single query,
     /// so it runs under the union of every standing query's credentials with
-    /// that peer.
+    /// that peer. Every item is attempted; successful changes are notified before
+    /// aggregated failures are returned.
     pub(crate) async fn apply_updates<SE, PA>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
@@ -94,29 +78,8 @@ impl NodeApplier {
             return Err(MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription with").into());
         }
         let credentials = relay.get_contexts_for_peer(from_peer_id);
-        Self::apply_stream_updates(node, from_peer_id, &credentials, items).await
-    }
-
-    /// Apply a batch of live updates from one query's sequenced state stream,
-    /// under the credentials captured when that query was opened with the peer.
-    /// The stream owner has already checked that the query is current, so the
-    /// stream is its own authorization and no standing-subscription gate runs.
-    /// One bad item does not poison the batch: every item is attempted, the
-    /// reactor is notified for the applied subset, and the failures are
-    /// returned together.
-    pub(crate) async fn apply_stream_updates<SE, PA, C>(
-        node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
-        credentials: &C,
-        items: Vec<proto::SubscriptionUpdateItem>,
-    ) -> Result<(), ApplyError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-        C: Iterable<PA::ContextData> + Send + Sync,
-    {
         tracing::debug!("received subscription update for {} items", items.len());
-        let event_getter = CachedEventGetter::new(node, credentials);
+        let event_getter = CachedEventGetter::new(node, &credentials);
         let state_getter = LocalStateGetter::new(node.storage.clone());
 
         let mut changes = Vec::new();
@@ -172,16 +135,16 @@ impl NodeApplier {
     }
 
     /// Apply initial-transfer deltas concurrently, notifying the reactor for each
-    /// batch that completes together. Snapshots the local entity could not
-    /// incorporate are returned as divergences for the caller to repair; they are
-    /// not errors, and they are never reported as applied.
+    /// batch that completes together. A concurrent bare snapshot may leave the
+    /// local entity unchanged; callers needing causal coverage use apply_delta
+    /// and inspect its outcome, as the state-stream owner does.
     pub(crate) async fn apply_deltas<SE, PA, E, S>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
         deltas: Vec<proto::EntityDelta>,
         event_getter: &E,
         state_getter: &S,
-    ) -> Result<AppliedDeltas, ApplyError>
+    ) -> Result<(), ApplyError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -195,7 +158,6 @@ impl NodeApplier {
             (entity_id, Self::apply_delta(node, from_peer_id, delta, Delivery::Initial, event_getter, state_getter).await)
         }));
 
-        let mut applied = AppliedDeltas::default();
         let mut errors = Vec::new();
         while let Some(results) = ready_chunks.next().await {
             let mut batch = Vec::new();
@@ -203,12 +165,6 @@ impl NodeApplier {
                 match result {
                     Ok(outcome) => {
                         batch.extend(outcome.change);
-                        if let Some(divergence) = outcome.divergence {
-                            applied.divergent.insert(divergence.entity_id);
-                        }
-                        if let Some(entity) = outcome.entity {
-                            applied.heads.insert(entity_id, entity.head());
-                        }
                     }
                     Err(cause) => errors.push(ApplyErrorItem { entity_id, cause }),
                 }
@@ -221,7 +177,7 @@ impl NodeApplier {
         if !errors.is_empty() {
             return Err(ApplyError::Items(errors));
         }
-        Ok(applied)
+        Ok(())
     }
 
     /// Apply one delta of any content. Errors before anything is persisted are
