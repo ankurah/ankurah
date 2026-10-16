@@ -858,7 +858,7 @@ async fn catchup_batches_many_edits_with_their_connecting_events() -> Result<()>
 }
 
 #[tokio::test]
-async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent() -> Result<()> {
+async fn oversized_source_publication_restarts_and_recovers_after_writes_settle() -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
@@ -889,17 +889,37 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
         trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Leaves(_))),
         "cached initialization supplies membership without repair"
     );
-    let mut payload = String::new();
-    for edit in 0..8 {
-        payload = format!("{}-{edit}", "x".repeat(5 * 1024 * 1024));
-        let trx = writer.begin();
-        record.edit(&trx)?.title()?.set(&payload)?;
-        trx.commit().await?;
-    }
+    let initial = trace
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|body| match body {
+            NodeResponseBody::QuerySubscribed { query_id, state } if *query_id == query.query_id() => Some(state.frame.comparison),
+            _ => None,
+        })
+        .unwrap();
+    let payload = "x".repeat(9 * 1024 * 1024);
+    let trx = writer.begin();
+    record.edit(&trx)?.title()?.set(&payload)?;
+    trx.commit().await?;
+    assert!(
+        bincode::serialized_size(&record.entity().to_entity_state()?)? > 8 * 1024 * 1024,
+        "one captured state must exceed the source reader's 8 MiB state-plus-events budget"
+    );
+    wait_for(|| {
+        trace
+            .1
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.comparison == initial && matches!(frame.body, proto::StateFrameBody::RestartRequired))
+    })
+    .await;
     assert_eq!(retained.title()?, "old", "the held stream metadata prevents receiver application");
     gate.release_held(&client).await;
-    // Snapshot ancestry validation decodes eight 5 MiB updates plus genesis.
-    // Allow debug builds to finish that work before checking durable recovery.
+    // Writes have stopped. A fresh source capture can transfer this state
+    // within the independent 64 MiB assembly limit, without replaying live backlog.
     tokio::time::timeout(Duration::from_secs(120), async {
         query.wait_durable_answered().await?;
         while !query.peek().first().is_some_and(|row| row.title().as_deref() == Ok(payload.as_str())) {
@@ -910,8 +930,14 @@ async fn catchup_buffer_overflow_restarts_even_after_a_complete_reply_was_sent()
     })
     .await??;
     assert_eq!(query.peek()[0].entity().head(), record.entity().head(), "recovery must incorporate the final target");
-    assert!(trace.1.lock().unwrap().iter().any(|frame| matches!(frame.body, proto::StateFrameBody::RestartRequired)));
-    assert!(trace.items(Some(query.query_id())).len() >= 2, "the query must obtain a fresh comparison");
+    assert_eq!(query.ids(), [record.id()]);
+    assert_eq!(query.peek()[0].artist()?, "artist");
+    assert!(
+        trace.0.lock().unwrap().iter().any(|body| matches!(body,
+        NodeResponseBody::QuerySubscribed { query_id, state }
+            if *query_id == query.query_id() && state.frame.comparison != initial)),
+        "recovery must establish a new stream after the explicit restart"
+    );
     Ok(())
 }
 
