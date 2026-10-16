@@ -1128,6 +1128,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_publication_reports_callback_before_return_without_local_gap_work() {
+        struct CountGaps(Arc<std::sync::atomic::AtomicUsize>);
+        #[async_trait::async_trait]
+        impl GapFetcher<TestEntity> for CountGaps {
+            async fn fetch_gap(
+                &self,
+                _: &ankql::ast::Selection<Resolved>,
+                _: Option<&TestEntity>,
+                _: usize,
+            ) -> Result<Vec<TestEntity>, RetrievalError> {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(vec![])
+            }
+        }
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let first = TestEntity::new("first", "pending");
+        let replacement = TestEntity::new("replacement", "pending");
+        let resultset = EntityResultSet::empty();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let gap = Arc::new(CountGaps(calls.clone()));
+        let gate = Arc::new(std::sync::RwLock::new([first.id, replacement.id].into_iter().collect()));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' LIMIT 1"),
+                Arc::new(CandidateWindow(gate.clone(), origin(query))),
+                resultset.clone(),
+                gap.clone(),
+                1,
+                (),
+                vec![first.clone()],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _guard = subscription.subscribe(watch);
+        first.state.lock().unwrap().insert(prop("status"), "done".into());
+        let event = TestEvent { id: proto::EventId::from_bytes([43; 32]), changes: HashMap::new() };
+        let notified = reactor
+            .notify_query_changes(
+                subscription.id(),
+                query,
+                vec![OwnChange { change: TestChange { entity: first.clone(), events: vec![event.clone()] }, origin: origin(query) }],
+                HashSet::new(),
+            )
+            .await;
+        assert_eq!(notified, [first.id].into_iter().collect());
+        let first_callback = updates();
+        assert_eq!(first_callback.len(), 1, "reported IDs must already have completed their synchronous publication callback");
+        assert_eq!(first_callback[0].items[0].predicate_relevance, vec![(query, MembershipChange::Remove)]);
+        assert_eq!(first_callback[0].items[0].events, vec![event]);
+        assert!(!resultset.is_gap_dirty(), "the source owns this publication's replacement window");
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' LIMIT 1"),
+                Arc::new(CandidateWindow(gate, origin(query))),
+                resultset.clone(),
+                gap,
+                1,
+                (),
+                vec![replacement.clone()],
+                PeerQueryMembership::default(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let next_callback = updates();
+        assert_eq!(next_callback.len(), 1);
+        assert_eq!(next_callback[0].items[0].predicate_relevance, vec![(query, MembershipChange::Add)]);
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0, "no delayed generic gap worker can reorder owner callbacks");
+        // Ordinary local notifications retain their existing asynchronous gap path.
+        replacement.state.lock().unwrap().insert(prop("status"), "done".into());
+        reactor.notify_change(vec![TestChange { entity: replacement, events: vec![] }]).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn pending_publication_preserves_visible_predicate_and_sort_until_joint_commit() {
         let reactor = Reactor::<TestEntity, TestEvent>::new_test();
         let subscription = reactor.subscribe();

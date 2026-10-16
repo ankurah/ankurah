@@ -422,8 +422,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
             let selection = query_state.selection.as_ref().expect("evaluate_changes called before update_query");
             debug!("\tevaluate_changes query: {} {:?}", query_id, selection);
 
+            // Explicit publications own their refill and callback boundary.
+            let mut current_publication = false;
             // Process all candidate changes for this query
             for change in query_candidate.iter() {
+                current_publication |= preserve.is_some()
+                    && change
+                        .query_origin()
+                        .is_some_and(|origin| origin.query == query_id && query_state.source.query_origin() == Some(origin));
                 let entity = change.entity();
                 let entity_id = AbstractEntity::id(entity);
 
@@ -492,6 +498,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                     }
                 }
             }
+            if current_publication {
+                query_state.resultset.clear_gap_dirty();
+            }
         }
 
         // Process entity-level subscriptions not covered by query processing
@@ -509,7 +518,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         }
 
         // Collect gap fill data while we have the state lock
-        let gaps_to_fill = self.collect_gaps_to_fill_internal(&state);
+        let gaps_to_fill = if preserve.is_some() { Vec::new() } else { self.collect_gaps_to_fill_internal(&state) };
         let broadcast = state.broadcast.clone();
 
         // Drop the state lock before spawning
