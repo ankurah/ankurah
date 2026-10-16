@@ -14827,6 +14827,154 @@
         "sha": "193f8a77e49540b8411da2f8724a07cbed3a765a"
       },
       "status": "unsupported"
+    },
+    {
+      "compiler": {
+        "target": "x86_64-unknown-linux-gnu",
+        "version": "rustc 1.97.0-nightly (ca9a134e0 2026-04-26)"
+      },
+      "harness": {
+        "description": "Historical DAG harness; end-to-end lanes excluded.",
+        "id": "dag-cloned-drain-v1",
+        "series_generation": "1",
+        "sha256": "a60713d60f81991645b79552031240abf80c5b41815e86cc42209bea1c62e750",
+        "source_url": "https://github.com/ankurah/ankurah/tree/893721a97551e379b2db6c45de472cfa0b99b04f/core/benches",
+        "workload_semantics": {
+          "compare/diamond_chain/16": "dag-cloned-compare-assert-v1",
+          "compare/diamond_chain/4": "dag-cloned-compare-assert-v1",
+          "compare/diamond_chain/64": "dag-cloned-compare-assert-v1",
+          "compare/disjoint/10": "dag-cloned-compare-assert-v1",
+          "compare/disjoint/100": "dag-cloned-compare-assert-v1",
+          "compare/linear_deep/10": "dag-cloned-compare-assert-v1",
+          "compare/linear_deep/100": "dag-cloned-compare-assert-v1",
+          "compare/linear_deep/1000": "dag-cloned-compare-assert-v1",
+          "compare/wide_antichain/16": "dag-cloned-compare-assert-v1",
+          "compare/wide_antichain/4": "dag-cloned-compare-assert-v1",
+          "compare/wide_antichain/64": "dag-cloned-compare-assert-v1",
+          "layers/diamond_chain_drain/16": "dag-cloned-diamond-drain-assert-v1",
+          "layers/diamond_chain_drain/4": "dag-cloned-diamond-drain-assert-v1",
+          "layers/diamond_chain_drain/64": "dag-cloned-diamond-drain-assert-v1"
+        }
+      },
+      "id": "38982801418-1",
+      "kind": "hosted",
+      "markers": [
+        {
+          "kind": "main",
+          "label": "81082afd",
+          "url": "https://github.com/ankurah/ankurah/commit/81082afdbaf25c334df1fea084db9e0bcbd00727"
+        },
+        {
+          "kind": "release",
+          "label": "ankql-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-connector-local-process-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-core-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-derive-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-jwt-auth-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-jwt-auth-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-proto-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-signals-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-signals-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-storage-common-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-common-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-storage-indexeddb-wasm-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-storage-postgres-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-storage-sled-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-storage-sqlite-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sqlite-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-websocket-client-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-websocket-client-wasm-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.8.1"
+        },
+        {
+          "kind": "release",
+          "label": "ankurah-websocket-server-v0.8.1",
+          "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.8.1"
+        },
+        {
+          "kind": "pr",
+          "label": "#263",
+          "url": "https://github.com/ankurah/ankurah/pull/263"
+        }
+      ],
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "profile": "release",
+      "raw_url": "https://raw.githubusercontent.com/ankurah/ankurah/benchmark-data/runs/38982801418-1/raw.json",
+      "reason": "No audited adapter: the event_dag comparison primitive does not exist in this source; earlier algorithms require a separate workload contract",
+      "recorded_at": "2026-10-16T23:42:31.898210+00:00",
+      "run_url": "https://github.com/ankurah/ankurah/actions/runs/38982801418/attempts/1",
+      "runner": {
+        "hardware": "AMD EPYC 9V74 80-Core Processor; 4 logical CPUs",
+        "id": "github-ubuntu-24.04",
+        "label": "github-ubuntu-24.04",
+        "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39"
+      },
+      "source": {
+        "committed_at": "2026-07-02T18:16:34-07:00",
+        "label": "81082afdbaf25c334df1fea084db9e0bcbd00727",
+        "ref": "81082afdbaf25c334df1fea084db9e0bcbd00727",
+        "repository": "ankurah/ankurah",
+        "sha": "81082afdbaf25c334df1fea084db9e0bcbd00727"
+      },
+      "status": "unsupported"
     }
   ],
   "benchmarks": [
@@ -47312,13 +47460,14 @@
           "published_at": "2026-07-03T01:19:01.731403Z"
         }
       ],
+      "reason": "No audited adapter: the event_dag comparison primitive does not exist in this source; earlier algorithms require a separate workload contract",
       "source": {
         "committed_at": "2026-07-02T18:16:34-07:00",
         "label": "ankql-v0.8.1",
         "repository": "ankurah/ankurah",
         "sha": "81082afdbaf25c334df1fea084db9e0bcbd00727"
       },
-      "status": "pending"
+      "status": "unsupported"
     },
     {
       "harness_ref": "893721a97551e379b2db6c45de472cfa0b99b04f",
