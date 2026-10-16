@@ -1128,29 +1128,46 @@ async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_cha
         expected.insert(trx.create(&Record { title: format!("a-{i:03}"), artist: "remote".into() }).await?.id());
     }
     trx.commit().await?;
+    let (connection, _) = GatedConnection::new(&server, &client, |_| false).await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let retained = reader.get::<RecordView>(record.id()).await?;
+    let local = reader.begin();
+    retained.edit(&local)?.title()?.set(&"zz-local".to_owned())?;
+    // Commit offline so a legitimate merged Live echo cannot substitute for
+    // the connecting-history repair this fixture specifically exercises.
+    drop(connection);
+    server.deregister_peer(client.id);
+    client.deregister_peer(server.id);
+    let remote = writer.begin();
+    record.edit(&remote)?.artist()?.set(&"remote".to_owned())?;
+    remote.commit().await?;
+    let captured = record.entity().head();
+    local.commit().await?;
+    let local_head = retained.entity().head();
     let target = Arc::new(Mutex::new(None));
     let parked = Arc::new(AtomicBool::new(false));
+    let repair_parked = Arc::new(AtomicBool::new(false));
     let trace = Trace::default();
     let (_connection, gate) = GatedConnection::new(&server, &client, {
         let target = target.clone();
         let parked = parked.clone();
         let trace = trace.clone();
+        let repair_parked = repair_parked.clone();
+        let record_id = record.id();
         move |message| {
             trace.record(message);
+            if let NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+                if matches!(&frame.body, proto::StateFrameBody::State { items, .. } if bridge_for(items, record_id)) {
+                    repair_parked.store(true, Ordering::Release);
+                    return true;
+                }
+            }
             matches!(message, NodeMessage::Response(response)
                 if matches!(&response.body, NodeResponseBody::QuerySubscribed { query_id, .. }
                     if Some(*query_id) == *target.lock().unwrap() && !parked.swap(true, Ordering::AcqRel)))
         }
     })
     .await;
-    let reader = client.context_async(DEFAULT_CONTEXT).await?;
-    let retained = reader.get::<RecordView>(record.id()).await?;
-    let local = reader.begin();
-    retained.edit(&local)?.title()?.set(&"zz-local".to_owned())?;
-    let remote = writer.begin();
-    record.edit(&remote)?.artist()?.set(&"remote".to_owned())?;
-    remote.commit().await?;
-    let captured = record.entity().head();
     let query = reader.query::<RecordView>(nocache("artist = 'remote' ORDER BY title ASC LIMIT 200")?)?;
     *target.lock().unwrap() = Some(query.query_id());
     wait_for(|| parked.load(Ordering::Acquire)).await;
@@ -1165,8 +1182,11 @@ async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_cha
     assert!(matches!(page.bounds.end, std::ops::Bound::Included(_)), "the first page must have a finite key boundary");
     assert_eq!(page.states[0].payload.entity_id, record.id());
     assert_eq!(page.states[0].payload.state.head, captured);
-    local.commit().await?;
-    let local_head = retained.entity().head();
+    {
+        use ankurah::core::{entity::TemporaryEntity, selection::filter::Filterable, value::Value};
+        let captured_entity = TemporaryEntity::new(record.id(), &page.states[0].payload.state)?;
+        assert_eq!(captured_entity.value(&resolved_prop(&client, Record::descriptor(), "title")), Some(Value::String("a-000".into())));
+    }
     assert_eq!(retained.title()?, "zz-local");
     assert_eq!(retained.artist()?, "outside", "the held sender branch has not reached the receiver");
     assert!(
@@ -1174,6 +1194,10 @@ async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_cha
         "the local branch must be concurrent with the offered target"
     );
     assert!(!query.loaded());
+    gate.release_held(&client).await;
+    wait_for(|| repair_parked.load(Ordering::Acquire)).await;
+    assert!(!query.loaded(), "the concurrent branch cannot become ready while its connecting history is withheld");
+    assert_eq!(retained.artist()?, "outside", "the snapshot alone did not incorporate the remote branch");
     gate.release_held(&client).await;
     query.wait_durable_answered().await?;
     assert_eq!(query.ids().into_iter().collect::<HashSet<_>>(), expected, "captured page keys must preserve every result identity");
