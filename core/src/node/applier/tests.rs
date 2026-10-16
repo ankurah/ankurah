@@ -58,14 +58,16 @@ impl Fixture {
             OperationSet(vec![Operation::Membership(Membership::Add(model_a())), value_operation("initial")?]),
         );
         events.stage_event(genesis.clone());
-        let (entity, _) =
-            NodeApplier::apply_and_commit_events(&node, &[Attested::opt(genesis.clone(), None)], &events).await?.unwrap().into_parts();
+        let (entity, _) = NodeApplier::apply_and_commit_events(&node, &[Attested::opt(genesis.clone(), None)], Delivery::Live, &events)
+            .await?
+            .unwrap()
+            .into_parts();
         Ok(Self { node, storage, events, genesis, entity })
     }
 
     async fn commit_event(&self, event: Event) -> anyhow::Result<()> {
         self.events.stage_event(event.clone());
-        NodeApplier::apply_and_commit_events(&self.node, &[Attested::opt(event, None)], &self.events).await?;
+        NodeApplier::apply_and_commit_events(&self.node, &[Attested::opt(event, None)], Delivery::Live, &self.events).await?;
         Ok(())
     }
 
@@ -289,6 +291,7 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
                 &node,
                 &proto::EntityState { entity_id: source.entity.id(), state: initial.clone() },
                 &[],
+                Delivery::Initial,
                 &events,
                 &states,
             )
@@ -1027,7 +1030,7 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     // The parent arrives before a fresh application attempt.
     cache(&storage, &[&parent]).await?;
     let before = entity.to_state()?;
-    let error = NodeApplier::apply_and_commit_events(&node, &[admitted], &events).await.unwrap_err();
+    let error = NodeApplier::apply_and_commit_events(&node, &[admitted], Delivery::Live, &events).await.unwrap_err();
     assert!(
         matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: 1, known: 2, .. })),
         "{error}"
@@ -1695,10 +1698,11 @@ async fn untrusted_attestations_are_refused_before_anything_is_stored() -> anyho
             let entity = if resident {
                 // Local history is trusted; only what the peer sends is refused.
                 events.stage_event(source.genesis.clone());
-                let (entity, _) = NodeApplier::apply_and_commit_events(&node, &[Attested::from(source.genesis.clone())], &events)
-                    .await?
-                    .expect("the genesis creates the entity")
-                    .into_parts();
+                let (entity, _) =
+                    NodeApplier::apply_and_commit_events(&node, &[Attested::from(source.genesis.clone())], Delivery::Live, &events)
+                        .await?
+                        .expect("the genesis creates the entity")
+                        .into_parts();
                 Some(entity)
             } else {
                 None

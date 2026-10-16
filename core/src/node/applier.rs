@@ -326,7 +326,7 @@ impl NodeApplier {
         node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
         let target = &state.payload.state;
 
-        if let Some(entity) = Self::save_new_entity(node, &state.payload, &events, event_getter, state_getter).await? {
+        if let Some(entity) = Self::save_new_entity(node, &state.payload, &events, delivery, event_getter, state_getter).await? {
             let change = Self::publish(entity.clone(), events, delivery);
             return Ok(DeltaOutcome { entity: Some(entity), change: Some(change), divergence: None });
         }
@@ -336,7 +336,7 @@ impl NodeApplier {
             .await?
             .ok_or(RetrievalError::EntityNotFound(entity_id))?;
 
-        let (change, covered) = Self::apply_and_commit_state(node, &entity, &state.payload, &events, event_getter).await?;
+        let (change, covered) = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?;
         let change = change.map(|change| {
             let (entity, events) = change.into_parts();
             Self::publish(entity, events, delivery)
@@ -366,7 +366,7 @@ impl NodeApplier {
         if events.is_empty() {
             return Ok(DeltaOutcome::unchanged(node.entities.get(&entity_id)));
         }
-        let change = Self::apply_and_commit_events(node, &events, event_getter).await?.map(|change| {
+        let change = Self::apply_and_commit_events(node, &events, delivery, event_getter).await?.map(|change| {
             let (entity, events) = change.into_parts();
             Self::publish(entity, events, delivery)
         });
@@ -434,6 +434,7 @@ impl NodeApplier {
         node: &Node<SE, PA>,
         state: &proto::EntityState,
         events: &[Attested<proto::Event>],
+        delivery: Delivery,
         event_getter: &E,
         state_getter: &S,
     ) -> Result<Option<Entity>, MutationError>
@@ -453,12 +454,13 @@ impl NodeApplier {
         let mut storage_trx = node.storage.transaction();
         storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
         storage_trx.add_events(events).await?;
-        let _publication = node.commit_publication_lock.lock().await;
-        match storage_trx.commit().await? {
+        let mut publication = node.source_publications.begin_commit().await;
+        match publication.storage_result(storage_trx.commit().await)? {
             crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
             crate::storage::StorageCommitOutcome::Committed(_) => {}
         }
         let (_, entity) = node.entities.with_state(state_getter, event_getter, state.entity_id, state.state.clone()).await?;
+        publication.publish(&[EntityChange::new(entity.clone(), events.to_vec())], delivery == Delivery::Live);
         Ok(Some(entity))
     }
 
@@ -470,6 +472,7 @@ impl NodeApplier {
         entity: &crate::entity::Entity,
         snapshot: &proto::EntityState,
         events: &[Attested<proto::Event>],
+        delivery: Delivery,
         event_getter: &E,
     ) -> Result<(Option<EntityChange>, bool), MutationError>
     where
@@ -509,16 +512,19 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
-            let _publication = node.commit_publication_lock.lock().await;
-            storage_trx.commit().await?.committed()?;
+            let mut publication = node.source_publications.begin_commit().await;
+            publication.storage_result(storage_trx.commit().await)?.committed()?;
             if adopted {
                 let (_, entity) = node
                     .entities
                     .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
                     .await?;
-                Ok((Some(EntityChange::new(entity, events)), covered))
+                let change = EntityChange::new(entity, events);
+                publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
+                Ok((Some(change), covered))
             } else {
                 let change = candidate.commit(&node.entities, event_getter).await?;
+                publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
                 Ok(((!change.events().is_empty()).then_some(change), covered))
             }
         })
@@ -529,6 +535,7 @@ impl NodeApplier {
     async fn apply_and_commit_events<SE, PA, E>(
         node: &Node<SE, PA>,
         events: &[Attested<proto::Event>],
+        delivery: Delivery,
         event_getter: &E,
     ) -> Result<Option<EntityChange>, MutationError>
     where
@@ -549,9 +556,10 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
             storage_trx.add_events(&events).await?;
-            let _publication = node.commit_publication_lock.lock().await;
-            storage_trx.commit().await?.committed()?;
+            let mut publication = node.source_publications.begin_commit().await;
+            publication.storage_result(storage_trx.commit().await)?.committed()?;
             let change = candidate.commit(&node.entities, event_getter).await?;
+            publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
             Ok((!change.events().is_empty()).then_some(change))
         })
     }

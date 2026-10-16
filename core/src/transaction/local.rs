@@ -229,17 +229,16 @@ impl Transaction {
                 }
                 relayed = true;
             }
-            let publication = node.commit_publication_lock.lock().await;
-            storage_trx.commit().await?.committed()?;
+            let mut publication = node.source_publications.begin_commit().await;
+            publication.storage_result(storage_trx.commit().await)?.committed()?;
             let mut changes = Vec::new();
             for (entity, fork) in forks {
                 let change = fork.commit(&node.entities, &event_getter).await?;
                 entity.committed(change.entity())?;
-                if !change.events().is_empty() {
-                    changes.push(change);
-                }
+                changes.push(change);
             }
-            drop(publication);
+            publication.publish(&changes, true);
+            changes.retain(|change| !change.events().is_empty());
             node.reactor.notify_change(changes).await;
             Ok(attested_events.into_iter().map(|event| event.payload).collect())
         })

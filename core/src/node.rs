@@ -42,6 +42,7 @@ pub mod handles;
 mod match_args;
 mod peer_state;
 mod schema_registration;
+pub(crate) mod source_publications;
 mod state;
 pub(crate) mod state_sync;
 #[cfg(test)]
@@ -100,10 +101,8 @@ where PA: PolicyAgent
     pub storage: Arc<SE>,
 
     pub(crate) entities: WeakEntitySet,
-    /// Hold across storage commit and WeakEntitySet publication: register a new resident entity
-    /// or update one already registered there. Otherwise a competing writer could retry
-    /// from stale in-memory state after storage advances. Reactor notification follows later.
-    pub(crate) commit_publication_lock: tokio::sync::Mutex<()>,
+    /// Serializes commit/resident publication and admits immutable source batches.
+    pub(crate) source_publications: source_publications::SourcePublications,
     pub(crate) peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -218,7 +217,7 @@ where
             id,
             storage: engine,
             entities: entityset,
-            commit_publication_lock: tokio::sync::Mutex::new(()),
+            source_publications: source_publications::SourcePublications::default(),
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
             rng: Mutex::new(rng),
