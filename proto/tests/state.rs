@@ -95,22 +95,30 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
     let bounds = AddressRange::new(Included(vec![0]), Excluded(vec![3]));
     let req = request(NodeRequestBody::ContinueState {
         comparison,
+        round: Some(2),
         processed_through: 17,
+        applied_through: Some(41),
         answers: vec![
             StateAnswer::Summary(first.clone()),
             StateAnswer::Summary(second.clone()),
             StateAnswer::Leaves(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![], entity: known(2) }] }),
         ],
     });
-    let NodeRequestBody::ContinueState { comparison: received, processed_through, answers } = wire(&req).body else { panic!("comparison") };
+    let NodeRequestBody::ContinueState { comparison: received, round, processed_through, applied_through, answers } = wire(&req).body
+    else {
+        panic!("comparison")
+    };
     assert_eq!(received, comparison);
     assert_eq!(processed_through, 17);
+    assert_eq!(round, Some(2));
+    assert_eq!(applied_through, Some(41));
     assert!(matches!(&answers[0], StateAnswer::Summary(head) if head == &first));
     assert!(matches!(&answers[1], StateAnswer::Summary(head) if head == &second));
     let StateAnswer::Leaves(page) = &answers[2] else { panic!("leaves") };
     assert_eq!(page.bounds, bounds);
     assert_eq!(page.leaves[0].entity, known(2));
-    let receipt = request(NodeRequestBody::ContinueState { comparison, processed_through: 18, answers: vec![] });
+    let receipt =
+        request(NodeRequestBody::ContinueState { comparison, round: None, processed_through: 18, applied_through: None, answers: vec![] });
     assert!(matches!(wire(&receipt).body, NodeRequestBody::ContinueState { processed_through: 18, answers, .. } if answers.is_empty()));
 }
 
@@ -120,10 +128,12 @@ fn initial_replies_continue_with_mixed_work() {
     let bounds = AddressRange::new(Excluded(vec![0]), Included(vec![9]));
     let state = StateReply {
         spec: spec(),
+        round: StateRound { number: 0, revision: 40 },
         frame: StateFrame {
             comparison,
             sequence: 0,
             body: StateFrameBody::State {
+                round: 0,
                 items: vec![
                     StateItem::Summary(head(NodePrefix::root(), bounds.clone(), &known(2))),
                     StateItem::Leaves(LeafPage { bounds: AddressRange::new(Included(vec![3]), Included(vec![9])), leaves: vec![] }),
@@ -142,10 +152,12 @@ fn initial_replies_continue_with_mixed_work() {
             _ => panic!("initial state"),
         };
         assert_eq!(state.spec, spec());
+        assert_eq!(state.round, StateRound { number: 0, revision: 40 });
         assert_eq!(state.frame.comparison, comparison);
         assert_eq!(state.frame.sequence, 0);
-        let StateFrameBody::State { items, progress } = state.frame.body else { panic!("initial state") };
+        let StateFrameBody::State { items, progress, round } = state.frame.body else { panic!("initial state") };
         assert_eq!(progress, ComparisonProgress::Continue);
+        assert_eq!(round, 0);
         assert_eq!(items.len(), 3);
         assert!(matches!(&items[1], StateItem::Leaves(page) if page.leaves.is_empty()));
     }
@@ -164,6 +176,7 @@ fn event_bridge_repairs_preserve_the_captured_target_clock() {
             comparison,
             sequence: 1,
             body: StateFrameBody::State {
+                round: 0,
                 items: vec![StateItem::Repair {
                     target: target.clone(),
                     delta: EntityDelta {
@@ -179,8 +192,9 @@ fn event_bridge_repairs_preserve_the_captured_target_clock() {
     assert_eq!(request_id, origin);
     assert_eq!(frame.comparison, comparison);
     assert_eq!(frame.sequence, 1);
-    let StateFrameBody::State { items, progress } = frame.body else { panic!("state") };
+    let StateFrameBody::State { items, progress, round } = frame.body else { panic!("state") };
     assert_eq!(progress, ComparisonProgress::Complete);
+    assert_eq!(round, 0);
     let StateItem::Repair { target: received, delta } = &items[0] else { panic!("repair") };
     let DeltaContent::EventBridge { events } = &delta.content else { panic!("bridge") };
     assert_eq!(received, &target);
@@ -198,8 +212,7 @@ fn repair_and_live_chunks_share_content_without_losing_typed_metadata() {
     let encoded = bincode::serialize(&content).unwrap();
     let comparison = ComparisonId::new();
     let origin = RequestId::new();
-    let query = QueryId::new();
-    let relevance = vec![(query, MembershipChange::Add), (QueryId::new(), MembershipChange::Remove)];
+    let member = QueryMember { key: vec![1, 2, 3], head: entity.head.clone() };
     let mut assembled = Vec::new();
     for (i, part) in encoded.chunks(13).enumerate() {
         let last = (i + 1) * 13 >= encoded.len();
@@ -210,6 +223,7 @@ fn repair_and_live_chunks_share_content_without_losing_typed_metadata() {
                 comparison,
                 sequence: i as u64 + 1,
                 body: StateFrameBody::State {
+                    round: 0,
                     items: vec![StateItem::RepairChunk { target: entity.head.clone(), chunk: chunk.clone() }],
                     progress: if last { ComparisonProgress::Complete } else { ComparisonProgress::Continue },
                 },
@@ -219,15 +233,20 @@ fn repair_and_live_chunks_share_content_without_losing_typed_metadata() {
         assert_eq!(request_id, origin);
         assert_eq!(frame.comparison, comparison);
         assert_eq!(frame.sequence, i as u64 + 1);
-        let StateFrameBody::State { items, progress } = frame.body else { panic!("state") };
+        let StateFrameBody::State { items, progress, round } = frame.body else { panic!("state") };
         let StateItem::RepairChunk { target, chunk: repair } = &items[0] else { panic!("repair chunk") };
         assert_eq!(target, &entity.head);
         assert_eq!(repair.entity_id, entity.entity_id);
         assert_eq!(repair.offset as usize, assembled.len());
         assert_eq!(repair.last, progress == ComparisonProgress::Complete);
-        let live = StateFrameBody::LiveChunk { chunk, predicate_relevance: relevance.clone() };
-        let StateFrameBody::LiveChunk { chunk: live, predicate_relevance } = wire(&live) else { panic!("live chunk") };
-        assert_eq!(predicate_relevance, relevance);
+        let live = StateFrameBody::LiveChunk { revision: 41, chunk, member: Some(member.clone()), complete: last };
+        let StateFrameBody::LiveChunk { revision, chunk: live, member: received_member, complete } = wire(&live) else {
+            panic!("live chunk")
+        };
+        assert_eq!(revision, 41);
+        assert_eq!(received_member, Some(member.clone()));
+        assert_eq!(complete, last);
+        assert_eq!(round, 0);
         assert_eq!(bincode::serialize(&live).unwrap(), bincode::serialize(repair).unwrap());
         assembled.extend_from_slice(&repair.bytes);
     }
@@ -238,7 +257,11 @@ fn repair_and_live_chunks_share_content_without_losing_typed_metadata() {
 #[test]
 fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
     let comparison = ComparisonId::new();
-    for outcome in [ComparisonOutcome::Applied { processed_through: 19 }, ComparisonOutcome::Abandoned] {
+    for outcome in [
+        ComparisonOutcome::Applied { round: 2, processed_through: 19 },
+        ComparisonOutcome::Cancelled { round: 2 },
+        ComparisonOutcome::Abandoned,
+    ] {
         let req = request(NodeRequestBody::CloseComparison { comparison, outcome });
         let NodeRequestBody::CloseComparison { comparison: received, outcome: received_outcome } = wire(&req).body else {
             panic!("close comparison")
@@ -248,8 +271,11 @@ fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
     }
     let expired = NodeResponseBody::ComparisonUnavailable { comparison };
     assert!(matches!(wire(&expired), NodeResponseBody::ComparisonUnavailable { comparison: id } if id == comparison));
-    let complete =
-        StateFrame { comparison, sequence: 18, body: StateFrameBody::State { items: vec![], progress: ComparisonProgress::Complete } };
+    let complete = StateFrame {
+        comparison,
+        sequence: 18,
+        body: StateFrameBody::State { round: 2, items: vec![], progress: ComparisonProgress::Complete },
+    };
     assert!(matches!(wire(&complete).body, StateFrameBody::State { progress: ComparisonProgress::Complete, .. }));
     let restart = NodeUpdateBody::StateFrame {
         request_id: RequestId::new(),
@@ -261,12 +287,135 @@ fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
 }
 
 #[test]
+fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
+    let comparison = ComparisonId::new();
+    let bounds = AddressRange::under(&NodePrefix::root());
+    let offer = KnownState {
+        spec: spec(),
+        regions: vec![KnownRegion::Leaves(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![7], entity: known(7) }] })],
+    };
+    let refresh = request(NodeRequestBody::RefreshState { comparison, round: 3, known_state: offer });
+    let NodeRequestBody::RefreshState { comparison: received, round, known_state } = wire(&refresh).body else { panic!("refresh") };
+    assert_eq!(received, comparison);
+    assert_eq!(round, 3);
+    assert_eq!(known_state.spec, spec());
+    let KnownRegion::Leaves(page) = &known_state.regions[0] else { panic!("frozen offer") };
+    assert_eq!(page.bounds, bounds);
+    assert_eq!(page.leaves[0].key, [7]);
+    assert_eq!(page.leaves[0].entity, known(7));
+
+    let begin = StateFrame { comparison, sequence: 25, body: StateFrameBody::BeginRound(StateRound { number: 3, revision: 90 }) };
+    let StateFrame { comparison: received, sequence, body: StateFrameBody::BeginRound(round) } = wire(&begin) else {
+        panic!("begin round")
+    };
+    assert_eq!(received, comparison);
+    assert_eq!(sequence, 25);
+    assert_eq!(round, StateRound { number: 3, revision: 90 });
+}
+
+#[test]
+fn absolute_membership_preserves_absence_and_targets_without_entity_data() {
+    let present = QueryMember { key: vec![0, 255, 7], head: known(2).head };
+    let frame = StateFrameBody::Live {
+        revision: 91,
+        items: vec![
+            QueryChange { entity_id: known(2).entity_id, member: Some(present.clone()), delta: None },
+            QueryChange { entity_id: known(3).entity_id, member: None, delta: None },
+        ],
+        complete: true,
+    };
+    let StateFrameBody::Live { revision, items, complete } = wire(&frame) else { panic!("live publication") };
+    assert_eq!(revision, 91);
+    assert!(complete);
+    assert_eq!(items[0].entity_id, known(2).entity_id);
+    assert_eq!(items[0].member, Some(present));
+    assert!(items[0].delta.is_none());
+    assert_eq!(items[1].entity_id, known(3).entity_id);
+    assert!(items[1].member.is_none());
+    assert!(items[1].delta.is_none());
+}
+
+#[test]
+fn split_publication_and_interleaved_comparison_keep_independent_boundaries() {
+    let comparison = ComparisonId::new();
+    let frames = vec![
+        StateFrame {
+            comparison,
+            sequence: 10,
+            body: StateFrameBody::Live {
+                revision: 91,
+                items: vec![QueryChange { entity_id: known(3).entity_id, member: None, delta: None }],
+                complete: false,
+            },
+        },
+        StateFrame {
+            comparison,
+            sequence: 11,
+            body: StateFrameBody::State { round: 3, items: vec![], progress: ComparisonProgress::Complete },
+        },
+        StateFrame {
+            comparison,
+            sequence: 12,
+            body: StateFrameBody::Live {
+                revision: 91,
+                items: vec![QueryChange {
+                    entity_id: known(4).entity_id,
+                    member: Some(QueryMember { key: vec![4], head: known(4).head }),
+                    delta: None,
+                }],
+                complete: true,
+            },
+        },
+    ];
+    let received = wire(&frames);
+    assert!(received.iter().all(|frame| frame.comparison == comparison));
+    assert_eq!(received.iter().map(|frame| frame.sequence).collect::<Vec<_>>(), [10, 11, 12]);
+    assert!(matches!(received[0].body, StateFrameBody::Live { revision: 91, complete: false, .. }));
+    assert!(matches!(received[1].body, StateFrameBody::State { round: 3, progress: ComparisonProgress::Complete, .. }));
+    assert!(matches!(received[2].body, StateFrameBody::Live { revision: 91, complete: true, .. }));
+}
+
+#[test]
+fn frame_credit_live_coverage_and_round_application_have_separate_wire_markers() {
+    let comparison = ComparisonId::new();
+    for (round, applied_through) in [(Some(3), None), (None, Some(91)), (None, None)] {
+        let feedback =
+            request(NodeRequestBody::ContinueState { comparison, round, processed_through: 25, applied_through, answers: vec![] });
+        let NodeRequestBody::ContinueState {
+            comparison: received,
+            round: received_round,
+            processed_through,
+            applied_through: received_applied,
+            answers,
+        } = wire(&feedback).body
+        else {
+            panic!("credit and coverage")
+        };
+        assert_eq!(received, comparison);
+        assert_eq!(received_round, round);
+        assert_eq!(processed_through, 25);
+        assert_eq!(received_applied, applied_through);
+        assert!(answers.is_empty());
+    }
+    let repair = StateFrameBody::LiveRepair {
+        items: vec![StateItem::RepairUnavailable { entity_id: known(3).entity_id, target: known(3).head.clone() }],
+    };
+    let StateFrameBody::LiveRepair { items } = wire(&repair) else { panic!("live repair") };
+    assert!(matches!(&items[0], StateItem::RepairUnavailable { entity_id, target }
+        if *entity_id == known(3).entity_id && *target == known(3).head));
+    // Wire round trips preserve these independent markers; scheduling and
+    // rejection of invalid marker order belong to the node's behavioral tests.
+}
+
+#[test]
 fn late_repair_feedback_and_failure_have_distinct_wire_fixtures() {
     // Independent tooling fixtures pin the public shape, including the fact that
     // a processed receipt can still report an uncovered causal target.
     let feedback = serde_json::json!({ "ContinueState": {
         "comparison": "00000000000000000000000001",
+        "round": 2,
         "processed_through": 7,
+        "applied_through": 40,
         "answers": [{ "NeedRepair": {
             "entity_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
             "target": [[3, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]]
@@ -274,8 +423,12 @@ fn late_repair_feedback_and_failure_have_distinct_wire_fixtures() {
     }});
     let request: NodeRequestBody = serde_json::from_value(feedback.clone()).unwrap();
     assert_eq!(serde_json::to_value(wire(&request)).unwrap(), feedback);
-    let NodeRequestBody::ContinueState { comparison, processed_through, answers } = request else { panic!("feedback") };
+    let NodeRequestBody::ContinueState { comparison, round, processed_through, applied_through, answers } = request else {
+        panic!("feedback")
+    };
     assert_eq!(processed_through, 7);
+    assert_eq!(round, Some(2));
+    assert_eq!(applied_through, Some(40));
     let StateAnswer::NeedRepair { entity_id, target } = &answers[0] else { panic!("repair request") };
     assert_eq!(*entity_id, EntityId::from_bytes([0; 32]));
     assert_eq!(*target, Clock::new(vec![(3, EventId::from_bytes([0; 32]))]).unwrap());
@@ -284,7 +437,7 @@ fn late_repair_feedback_and_failure_have_distinct_wire_fixtures() {
         "request_id": "00000000000000000000000002",
         "frame": {
             "comparison": "00000000000000000000000001", "sequence": 8,
-            "body": { "State": { "items": [{ "RepairUnavailable": {
+            "body": { "State": { "round": 2, "items": [{ "RepairUnavailable": {
                 "entity_id": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
                 "target": [[3, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"]]
             }}], "progress": "Continue" }}
@@ -299,12 +452,12 @@ fn late_repair_feedback_and_failure_have_distinct_wire_fixtures() {
     let StateFrameBody::State { items, .. } = frame.body else { panic!("repair failure") };
     assert!(matches!(&items[0], StateItem::RepairUnavailable { entity_id: id, target: clock } if id == entity_id && clock == target));
     let applied: NodeRequestBody = serde_json::from_value(serde_json::json!({ "CloseComparison": {
-        "comparison": "00000000000000000000000001", "outcome": { "Applied": { "processed_through": 9 }}
+        "comparison": "00000000000000000000000001", "outcome": { "Applied": { "round": 2, "processed_through": 9 }}
     }}))
     .unwrap();
     assert!(matches!(
         wire(&applied),
-        NodeRequestBody::CloseComparison { outcome: ComparisonOutcome::Applied { processed_through: 9 }, .. }
+        NodeRequestBody::CloseComparison { outcome: ComparisonOutcome::Applied { round: 2, processed_through: 9 }, .. }
     ));
     assert!(matches!(wire(&NodeResponseBody::Success), NodeResponseBody::Success));
 }
@@ -323,7 +476,7 @@ fn shared_state_and_events_preserve_history_and_attestations_in_repair_and_live_
         entity_id: genesis.entity_id,
         content: DeltaContent::StateAndEvents { state: state.clone(), events: events.clone() },
     };
-    let query = QueryId::new();
+    let member = QueryMember { key: vec![3, 4], head: target.clone() };
     let origin = RequestId::new();
     let comparison = ComparisonId::new();
     let repair = StateItem::Repair { target: target.clone(), delta: delta.clone() };
@@ -336,10 +489,11 @@ fn shared_state_and_events_preserve_history_and_attestations_in_repair_and_live_
             frame: StateFrame {
                 comparison,
                 sequence: 4,
-                body: StateFrameBody::Live(vec![SubscriptionUpdateItem {
-                    delta,
-                    predicate_relevance: vec![(query, MembershipChange::Add)],
-                }]),
+                body: StateFrameBody::Live {
+                    revision: 41,
+                    items: vec![QueryChange { entity_id: delta.entity_id, member: Some(member.clone()), delta: Some(delta.content) }],
+                    complete: true,
+                },
             },
         },
     }));
@@ -350,18 +504,21 @@ fn shared_state_and_events_preserve_history_and_attestations_in_repair_and_live_
     assert_eq!(request_id, origin);
     assert_eq!(frame.comparison, comparison);
     assert_eq!(frame.sequence, 4);
-    let StateFrameBody::Live(items) = frame.body else { panic!("live items") };
-    assert_eq!(items[0].predicate_relevance, [(query, MembershipChange::Add)]);
-    assert_eq!(bincode::serialize(&items[0].delta).unwrap(), bincode::serialize(&repair_delta).unwrap());
-    let DeltaContent::StateAndEvents { state: received_state, events: received_events } = &items[0].delta.content else {
+    let StateFrameBody::Live { revision, items, complete } = frame.body else { panic!("live items") };
+    assert_eq!(revision, 41);
+    assert!(complete);
+    assert_eq!(items[0].entity_id, genesis.entity_id);
+    assert_eq!(items[0].member, Some(member));
+    assert_eq!(bincode::serialize(items[0].delta.as_ref().unwrap()).unwrap(), bincode::serialize(&repair_delta.content).unwrap());
+    let DeltaContent::StateAndEvents { state: received_state, events: received_events } = items[0].delta.as_ref().unwrap() else {
         panic!("shared content")
     };
     assert_eq!(received_state, &state);
     assert_eq!(received_events, &events);
-    let restored: Attested<Event> = (items[0].delta.entity_id, received_events[0].clone()).into();
+    let restored: Attested<Event> = (items[0].entity_id, received_events[0].clone()).into();
     assert_eq!(restored.payload, update);
     assert_eq!(restored.attestations, AttestationSet(vec![Attestation(vec![21, 22])]));
-    let snapshot = Attested::<EntityState>::try_from(items[0].clone()).unwrap();
+    let snapshot: Attested<EntityState> = (items[0].entity_id, received_state.clone()).into();
     assert_eq!(snapshot.payload.entity_id, genesis.entity_id);
     assert_eq!(snapshot.payload.state, state.state);
     assert_eq!(snapshot.attestations, state.attestations);
