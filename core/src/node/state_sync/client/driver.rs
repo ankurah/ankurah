@@ -1138,7 +1138,7 @@ impl Driver {
                         self.install(&node, query, false).await?;
                         self.membership_dirty = false;
                     }
-                    notify_changes(&node, changes).await;
+                    notify_changes(&node, query.map(|(query, _)| query), changes).await;
                 }
                 Event::Control(control) => {
                     control?;
@@ -1177,9 +1177,26 @@ impl Driver {
     pub fn refresh_handle(&self) -> RefreshHandle { self.refresh.clone() }
 }
 
+#[derive(Debug)]
+struct StreamChange {
+    change: EntityChange,
+    query: Option<proto::QueryId>,
+}
+impl std::fmt::Display for StreamChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.change.fmt(f) }
+}
+impl ChangeNotification for StreamChange {
+    type Entity = crate::entity::Entity;
+    type Event = proto::Attested<proto::Event>;
+    fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { self.change.into_parts() }
+    fn entity(&self) -> &Self::Entity { self.change.entity() }
+    fn events(&self) -> &[Self::Event] { self.change.events() }
+    fn origin_query(&self) -> Option<proto::QueryId> { self.query }
+}
+
 /// Reactor batches must contain each identity at most once; it coalesces
 /// repeated identities and therefore cannot represent two event batches for one ID.
-async fn notify_changes<SE, PA>(node: &Node<SE, PA>, changes: Vec<EntityChange>)
+async fn notify_changes<SE, PA>(node: &Node<SE, PA>, query: Option<proto::QueryId>, changes: Vec<EntityChange>)
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1192,7 +1209,7 @@ where
             ids.clear();
             ids.insert(change.entity().id());
         }
-        batch.push(change);
+        batch.push(StreamChange { change, query });
     }
     if !batch.is_empty() {
         node.reactor.notify_change(batch).await;

@@ -260,7 +260,7 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
         changes.extend(outcome.change);
     }
     assert_eq!(changes.len(), 2);
-    notify_changes(&node, changes).await;
+    notify_changes(&node, None, changes).await;
     assert_eq!(*received.lock().unwrap(), [first.id(), second.id()], "a ready batch cannot coalesce away the second event vector");
     Ok(())
 }

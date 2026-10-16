@@ -390,9 +390,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 debug!("Subscription {} evaluating entity {} for query {}", self.id(), entity_id, query_id);
 
                 let can_read = query_state.source.can_read(entity);
-                let matches = can_read
-                    && query_state.source.admits_query_entity(entity)
-                    && evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
+                if can_read && change.origin_query() == Some(query_id) && !query_state.source.admits_query_entity(entity) {
+                    // An old own-stream repair must neither restore a removed
+                    // source member nor undo a later authorized local/Fetch view.
+                    continue;
+                }
+                let matches = can_read && evaluate_predicate(entity, &selection.predicate).unwrap_or(false);
                 let did_match = query_state.resultset.contains_key(&entity_id);
                 if membership_only && matches == did_match {
                     continue;

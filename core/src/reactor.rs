@@ -62,6 +62,10 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
     fn into_parts(self) -> (Self::Entity, Vec<Self::Event>);
     fn entity(&self) -> &Self::Entity;
     fn events(&self) -> &[Self::Event];
+
+    /// Only notifications authored by this query's stream use its source
+    /// candidate restriction. Local writes and other retrievals remain local facts.
+    fn origin_query(&self) -> Option<proto::QueryId> { None }
 }
 
 /// Hook trait for performing actions before notification is sent
@@ -611,6 +615,33 @@ mod tests {
         }
     }
 
+    struct CandidateWindow(Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>);
+    #[async_trait::async_trait]
+    impl LocalEntitySource<TestEntity> for CandidateWindow {
+        fn admits_query_entity(&self, entity: &TestEntity) -> bool { self.0.read().unwrap().contains(&entity.id) }
+        async fn fetch_entities_from_local(&self, _: &ankql::ast::Selection<Resolved>) -> Result<Vec<TestEntity>, RetrievalError> {
+            Ok(vec![])
+        }
+    }
+    struct OwnChange {
+        change: TestChange,
+        query: QueryId,
+    }
+    impl std::fmt::Display for OwnChange {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.change.fmt(f) }
+    }
+    impl std::fmt::Debug for OwnChange {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.change.fmt(f) }
+    }
+    impl ChangeNotification for OwnChange {
+        type Entity = TestEntity;
+        type Event = TestEvent;
+        fn into_parts(self) -> (TestEntity, Vec<TestEvent>) { self.change.into_parts() }
+        fn entity(&self) -> &TestEntity { self.change.entity() }
+        fn events(&self) -> &[TestEvent] { self.change.events() }
+        fn origin_query(&self) -> Option<QueryId> { Some(self.query) }
+    }
+
     /// Mock node for testing
     struct MockNode {
         entities: Vec<TestEntity>,
@@ -704,14 +735,6 @@ mod tests {
 
     #[tokio::test]
     async fn source_admission_survives_late_data_and_preserves_readable_removals() {
-        struct Window(Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>);
-        #[async_trait::async_trait]
-        impl LocalEntitySource<TestEntity> for Window {
-            fn admits_query_entity(&self, entity: &TestEntity) -> bool { self.0.read().unwrap().contains(&entity.id) }
-            async fn fetch_entities_from_local(&self, _: &ankql::ast::Selection<Resolved>) -> Result<Vec<TestEntity>, RetrievalError> {
-                Ok(vec![])
-            }
-        }
         let reactor = Reactor::<TestEntity, TestEvent>::new_test();
         let subscription = reactor.subscribe();
         let id = QueryId::new();
@@ -737,7 +760,7 @@ mod tests {
                 subscription.id(),
                 id,
                 sel("status = 'pending'"),
-                Arc::new(Window(gate.clone())),
+                Arc::new(CandidateWindow(gate.clone())),
                 resultset.clone(),
                 Arc::new(MockGapFetcher::new()),
                 1,
@@ -749,16 +772,75 @@ mod tests {
         let (watch, changes) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
         let _listener = subscription.subscribe(watch);
         gate.write().unwrap().clear();
-        reactor.notify_change(vec![TestChange { entity: entity.clone(), events: vec![] }]).await;
+        // Explicit source membership removes the row. The later data job does
+        // not itself author an absence or membership resurrection.
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                id,
+                sel("status = 'pending'"),
+                Arc::new(CandidateWindow(gate.clone())),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![],
+            )
+            .await
+            .unwrap();
         assert_eq!(resultset.len(), 0);
         let removal = changes();
         assert!(
             removal.iter().flat_map(|update| &update.items).any(|item| item.predicate_relevance.contains(&(id, MembershipChange::Remove))),
-            "admission is not a read denial: the removal still notifies"
+            "the readable explicit removal still notifies"
         );
-        reactor.notify_change(vec![TestChange { entity, events: vec![] }]).await;
-        assert_eq!(resultset.len(), 0, "a delayed causal application cannot re-admit an outsider");
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: entity.clone(), events: vec![] }, query: id }]).await;
+        assert_eq!(resultset.len(), 0, "an own-stream repair cannot re-admit the source outsider");
         assert!(changes().is_empty());
+        // Other Fetch/local application retains the pre-stream predicate semantics.
+        reactor.notify_change(vec![TestChange { entity: entity.clone(), events: vec![] }]).await;
+        assert!(resultset.contains_key(&entity.id));
+        let _ = changes();
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: entity.clone(), events: vec![] }, query: id }]).await;
+        assert!(resultset.contains_key(&entity.id), "a late own repair cannot undo that independent authorized admission");
+        assert!(changes().is_empty());
+        let other = TestEntity::new("another query's row", "pending");
+        reactor
+            .notify_change(vec![OwnChange { change: TestChange { entity: other.clone(), events: vec![] }, query: QueryId::new() }])
+            .await;
+        assert!(resultset.contains_key(&other.id), "another query stream is independent of this source candidate window");
+    }
+
+    #[tokio::test]
+    async fn local_optimistic_member_can_enter_a_remote_sorted_limit() {
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let query = QueryId::new();
+        let source_row = TestEntity::new("ZZZ source", "pending");
+        let local = TestEntity::new("AAA local", "pending");
+        let resultset = EntityResultSet::empty();
+        let source = Arc::new(CandidateWindow(Arc::new(std::sync::RwLock::new([source_row.id].into_iter().collect()))));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                query,
+                sel("status = 'pending' ORDER BY name ASC LIMIT 1"),
+                source,
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![source_row.clone()],
+            )
+            .await
+            .unwrap();
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, query }]).await;
+        assert!(resultset.contains_key(&source_row.id));
+        reactor.notify_change(vec![TestChange { entity: local.clone(), events: vec![] }]).await;
+        assert_eq!(resultset.len(), 1);
+        assert!(resultset.contains_key(&local.id), "normal local notifications still participate in predicate/sort/LIMIT");
+        reactor.notify_change(vec![OwnChange { change: TestChange { entity: local.clone(), events: vec![] }, query }]).await;
+        assert!(resultset.contains_key(&local.id), "an excluded own-stream job must not remove the legitimate optimistic row");
     }
 
     #[tokio::test]
