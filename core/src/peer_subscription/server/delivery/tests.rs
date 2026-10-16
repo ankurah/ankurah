@@ -246,8 +246,10 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
     Ok(())
 }
 
-#[derive(Clone)]
-struct RestrictedDiscovery;
+#[derive(Clone, Default)]
+struct RestrictedDiscovery {
+    denied_event: Option<proto::EventId>,
+}
 #[async_trait::async_trait]
 impl PolicyAgent for RestrictedDiscovery {
     type ContextData = &'static crate::policy::DefaultContext;
@@ -282,6 +284,17 @@ impl PolicyAgent for RestrictedDiscovery {
         _: &C,
     ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
         Ok(Predicate::True)
+    }
+    fn check_read_event<C: crate::util::Iterable<Self::ContextData>>(
+        &self,
+        _: &C,
+        event: &Attested<proto::Event>,
+    ) -> Result<(), crate::policy::AccessDenied> {
+        if self.denied_event.as_ref() == Some(&event.payload.id()) {
+            Err(crate::policy::AccessDenied::ByPolicy("fixture refuses this event"))
+        } else {
+            Ok(())
+        }
     }
     fn check_write_event<SE: StorageEngine>(
         &self,
@@ -330,7 +343,7 @@ impl PolicyAgent for RestrictedDiscovery {
 
 #[tokio::test]
 async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_broader() -> anyhow::Result<()> {
-    let node = Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery);
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery::default());
     node.system.create().await?;
     node.wait_ready().await?;
     let inside = genesis("01")?;
@@ -425,5 +438,28 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
     assert_eq!(captured.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&second));
     let row = &captured.snapshot.states[&initial.entity_id].payload;
     assert_eq!(TemporaryEntity::new(row.entity_id, &row.state)?.value(&property()), Some(Value::String("03".into())));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<()> {
+    let initial = genesis("01")?;
+    let denied = update(&initial, "02")?;
+    let policy = RestrictedDiscovery { denied_event: Some(denied.id()) };
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
+    node.system.create().await?;
+    node.wait_ready().await?;
+    apply(&node, &initial).await?;
+    let selection = selection(None);
+    let spec = QueryTree::spec(&selection, &node.catalog);
+    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    apply(&node, &denied).await?;
+    let batch = captured.cursor.next().await?;
+    let credentials = vec![DEFAULT_CONTEXT];
+    let read_policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
+    read_policy.check_read(&initial.entity_id, &batch.changes[0].state.state)?;
+    assert_eq!(batch.changes[0].events[0].payload.id(), denied.id());
+    let error = captured.projection.apply(&node, &credentials, &batch).await.expect_err("denied event must fail the publication");
+    assert!(matches!(error.downcast_ref::<crate::policy::AccessDenied>(), Some(crate::policy::AccessDenied::ByPolicy(_))));
     Ok(())
 }

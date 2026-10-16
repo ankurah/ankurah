@@ -162,18 +162,25 @@ impl QueryProjection {
         self.rows.values().map(|row| Self::attested(node, row)).collect()
     }
 
-    fn change<SE, PA>(&self, node: &Node<SE, PA>, policy: &ReadPolicy<'_, PA>, change: &SourceChange) -> proto::QueryChange
+    fn change<SE, PA>(&self, node: &Node<SE, PA>, policy: &ReadPolicy<'_, PA>, change: &SourceChange) -> anyhow::Result<proto::QueryChange>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let entity_id = change.state.entity_id;
         let member = self.rows.get(&entity_id).map(|row| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() });
-        let delta = policy.check_read(&entity_id, &change.state.state).is_ok().then(|| proto::DeltaContent::StateAndEvents {
-            state: Attested::opt((*change.state).clone(), node.policy_agent.attest_state(node, &change.state)).into(),
-            events: change.events.iter().cloned().map(Into::into).collect(),
-        });
-        proto::QueryChange { entity_id, member, delta }
+        let delta = if policy.check_read(&entity_id, &change.state.state).is_ok() {
+            for event in &change.events {
+                policy.check_read_event(event, &change.state.state)?;
+            }
+            Some(proto::DeltaContent::StateAndEvents {
+                state: Attested::opt((*change.state).clone(), node.policy_agent.attest_state(node, &change.state)).into(),
+                events: change.events.iter().cloned().map(Into::into).collect(),
+            })
+        } else {
+            None
+        };
+        Ok(proto::QueryChange { entity_id, member, delta })
     }
 
     async fn apply<SE, PA>(
@@ -200,7 +207,7 @@ impl QueryProjection {
                 removed.push(id);
             }
             if was_member || self.rows.contains_key(&id) {
-                changed.push(self.change(node, &policy, change));
+                changed.push(self.change(node, &policy, change)?);
             }
         }
         self.tree.apply_captured(rows, removed).await?;
@@ -327,7 +334,7 @@ impl<CD: ContextData> QuerySource<CD> {
             for source in &batch.changes {
                 let id = source.state.entity_id;
                 if previous.contains_key(&id) || self.projection.rows.contains_key(&id) {
-                    changed.push(self.projection.change(node, &policy, source));
+                    changed.push(self.projection.change(node, &policy, source)?);
                     included.insert(id);
                 }
             }
@@ -336,7 +343,7 @@ impl<CD: ContextData> QuerySource<CD> {
             if !included.contains(id)
                 && previous.get(id).is_none_or(|before| before.key != row.key || before.state.state.head != row.state.state.head)
             {
-                changed.push(self.projection.change(node, &policy, &SourceChange { state: row.state.clone(), events: Vec::new() }));
+                changed.push(self.projection.change(node, &policy, &SourceChange { state: row.state.clone(), events: Vec::new() })?);
             }
         }
         for id in previous.keys() {
