@@ -1,12 +1,14 @@
 # Cold and retained-query performance
 
 `live_query_startup` exercises two real nodes, Sled, two Tokio workers and
-serialized protocol messages. The current qualification compares identical public-API
-fixtures against main `ae8962798085dbf6d717429e4b6566940f0051e1`, after PR #526.
-The earlier `ebdb1727254c675a4d37236ecf23c16c06c4df12` comparison remains
-historical in `LIVE_QUERY_STARTUP_RESULTS_PRE_526.md`; its source pins and
-measurements have not been relabelled. See `LIVE_QUERY_STARTUP_RESULTS.md`
-for the measured candidate and immutable artifact pins.
+serialized protocol messages. The current qualification compares candidate
+`81299f2185fa89918c79decbe02106e4ed66a82f` with main after #526,
+`ae8962798085dbf6d717429e4b6566940f0051e1`, and the previous digest branch,
+`6ef6f35e08064d2ae0d1c299d02a6acf1bee5eb1`, using identical public-API fixtures.
+See [the current report](LIVE_QUERY_STARTUP_RESULTS.md) for measurements and
+immutable artifact pins. The [post-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_ONGOING.md)
+and [pre-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) reports remain historical;
+their source pins and measurements have not been relabelled.
 
 ```sh
 STARTUP_LABEL=candidate cargo bench -p ankurah-tests --bench live_query_startup
@@ -47,7 +49,8 @@ transfer inside the measured refresh rather than warming it up with an earlier
 refresh. `warm_refresh` keeps
 the connection and calls `update_selection_wait` with the same selection, then
 `wait_durable_answered`; the new version gives a portable applied `ready_us`.
-Query identity is retained; actual internal tree reuse must also be checked
+This does not measure the new same-stream `refresh()` API. Query identity is
+retained; actual internal tree reuse must also be checked
 in implementation/work counters. The other warm cases disconnect/reconnect.
 `warm_equal` has no offline change. `warm_edit` edits one body while offline.
 `warm_membership` additionally moves one entity out of the predicate and adds
@@ -157,8 +160,9 @@ samples remain failures; replay does not retroactively give them timing values.
 
 A warm reconnect win does not compensate for a cold startup regression. Small
 query latency and bulk throughput both matter. Daniel has not accepted a numerical
-slowdown allowance. The baseline can send an entire result in one message; report
-its largest-message cost alongside latency. Its performance does not justify
+slowdown allowance. The main reference can send an entire result in one message;
+the previous digest reference already uses bounded frames. Report the largest
+message alongside latency. Main's performance does not justify
 removing bounds from the new protocol. These native fixtures do not qualify
 million-row scaling, concurrent writes, browser storage or retained allocation
 bounds; those need separate evidence.

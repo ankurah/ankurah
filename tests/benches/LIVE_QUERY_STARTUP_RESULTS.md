@@ -1,83 +1,119 @@
-# Memory-first query qualification after #526 — 2026-10-13
+# Ongoing query synchronization qualification — 2026-10-16
 
-Candidate `7c2e64bca5ededea92466f6e12c20607893f3d71` was rebased onto merged main `ae8962798085dbf6d717429e4b6566940f0051e1` and compared again with that main baseline. All **364 final timing samples passed exact-state checks**, and **80 functional fixtures passed their own assertions**. The [pre-#526 report](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) remains historical; its measurements have not been relabelled.
+Candidate `81299f2185fa89918c79decbe02106e4ed66a82f` passes all **532 planned timing samples** across 38 cases, with exact-state verification, zero runner failures and stable source/artifact pins. The same optimized artifacts pass **40 native and 41 browser functional checks**. References are main after #526, `ae8962798085dbf6d717429e4b6566940f0051e1`, and the previous digest implementation, `6ef6f35e08064d2ae0d1c299d02a6acf1bee5eb1`.
 
-The measured cold and warm readiness results support proceeding to Daniel's in-depth review. Large cases improve, and the small-case paired median readiness costs are at most about 1.2 ms in this matrix. CPU and memory costs remain. These results do not establish universal zero-regression parity, a numerical slowdown allowance, or human acceptance.
+The engineering recommendation is to proceed to Daniel's in-depth review. The large cold-start blocker is resolved: 4,096 uncached rows improve by paired medians of 110 ms natively and 2,284 ms in the browser versus main. There are measured exceptions: native 256-row half-cache startup costs 7.4 ms, browser eight-row first refresh costs 2.6 ms, and native edited reconnect costs 4.0 ms versus main. Compared with the previous digest implementation, large browser first refresh costs 47.2/13.0/10.6 ms for empty/half/all initial caches. Native setup CPU and process memory also remain higher. These are disclosed tradeoffs, not a claim of universal zero regression or a numerical allowance.
 
-## Readiness measurements
+Root and independent Codex review found no further concrete production correction warranted by the completed results. No PR or human acceptance is implied. Claude/Fable was not called during this pass, as requested. The [post-#526 report](LIVE_QUERY_STARTUP_RESULTS_PRE_ONGOING.md) and [pre-#526 report](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) retain their original measurements and source pins.
 
-Each row has seven alternating baseline/candidate pairs at simulated 50 ms RTT. Values are milliseconds. Paired change is the median of the seven candidate-minus-main differences, which need not equal the difference of the two medians. Initial cache describes entity coverage before the first query; reconnects retain that query. Bandwidth is per direction, and unlimited still includes propagation delay.
+## What changed
 
-| Platform | Rows | Operation | Initial cache | Bandwidth | Main median | Candidate median | Paired change |
-|---|---:|---|---|---|---:|---:|---:|
-| Native | 256 | Cold | all | Unlimited | 60.5 | 61.0 | +0.6 |
-| Native | 256 | Cold | empty | Unlimited | 75.2 | 74.7 | -0.9 |
-| Native | 256 | Cold | half | Unlimited | 67.3 | 68.0 | +1.1 |
-| Native | 4,096 | Cold | all | Unlimited | 246.1 | 196.6 | -51.2 |
-| Native | 4,096 | Cold | empty | Unlimited | 480.7 | 385.9 | -92.3 |
-| Native | 8 | Cold | empty | Unlimited | 54.6 | 55.1 | +0.3 |
-| Native | 256 | Reconnect, edit | all | 1.25 MB/s | 72.3 | 72.4 | +0.1 |
-| Native | 4,096 | Reconnect, edit | all | Unlimited | 180.7 | 166.7 | -12.4 |
-| Native | 4,096 | First refresh | all | Unlimited | 145.6 | 98.3 | -46.5 |
-| Native | 4,096 | First refresh | empty | Unlimited | 147.7 | 122.8 | -22.9 |
-| Native | 256 | Reconnect, membership | all | 1.25 MB/s | 73.1 | 72.8 | -0.4 |
-| Native | 2,048 | Reconnect, equal | all | 125 kB/s | 1348.2 | 1340.6 | -7.6 |
-| Browser | 256 | Cold | empty | Unlimited | 231.4 | 206.9 | -22.8 |
-| Browser | 256 | Cold | half | Unlimited | 149.8 | 140.3 | -9.5 |
-| Browser | 4,096 | Cold | empty | Unlimited | 4572.8 | 2302.1 | -2260.2 |
-| Browser | 4,096 | Cold | all | Unlimited | 1266.5 | 1062.9 | -209.0 |
-| Browser | 256 | Reconnect, edit | all | 125 kB/s | 260.4 | 254.7 | -6.2 |
-| Browser | 256 | Reconnect, membership | all | 125 kB/s | 269.4 | 265.0 | -4.4 |
-| Browser | 8 | Reconnect, edit | all | Unlimited | 59.3 | 59.4 | +0.1 |
-| Browser | 8 | Reconnect, membership | all | Unlimited | 60.1 | 60.6 | +0.6 |
-| Browser | 4,096 | Reconnect, edit | all | Unlimited | 799.1 | 657.5 | -142.7 |
-| Browser | 4,096 | Reconnect, membership | all | Unlimited | 792.4 | 666.2 | -125.0 |
-| Browser | 4,096 | First refresh | empty | Unlimited | 890.5 | 692.0 | -212.0 |
-| Browser | 4,096 | First refresh | half | Unlimited | 854.8 | 548.3 | -303.4 |
-| Browser | 4,096 | First refresh | all | Unlimited | 869.8 | 487.4 | -373.8 |
-| Browser | 8 | First refresh | empty | Unlimited | 55.8 | 56.4 | +0.5 |
+Fetch uses a finite captured comparison. A live query keeps one standing stream that can carry finite comparison rounds and live publications concurrently. Acknowledging an applied round releases its captured state; it does not unlock live delivery. Frame receipts release transport capacity separately from acknowledgments of applied causal targets. A publication's source membership and applied events become visible together to its owning query, and finishing an older baseline preserves newer committed membership.
 
-All large browser pairs improve. The eight-row browser refresh/edit/membership paired changes are +0.5/+0.1/+0.6 ms, with mixed signs and individual differences ranging from -1.3 to +1.5 ms across those cells. Native 256-row cold empty/half/all paired changes are -0.876/+1.143/+0.565 ms; the empty-cache cell retains a +8.903 ms individual difference. No final outlier was removed or rerun for its sign.
+The receiver bounds concurrent application to 128 finite-round jobs plus 16 Live/Repair jobs per stream. It acquires those slots after chunk assembly, preserves per-entity order and retains the existing commit/publication gate. This correction removed a large browser scheduling regression without combining transactions or weakening causal checks. Optional round residency avoids reloading just-applied entities before finite installation. Pins are admitted against full encoded-state bytes; canonical entities can grow after admission, so that charge is not a hard heap bound. These policies do not bound total node memory.
 
-## Resource costs and limits
+## Readiness versus main
 
-- Native 2,048-row slow-link equal reconnect has setup CPU medians of 543.809/566.210 ms (main/candidate), paired change **+30.154 ms**, range -53.414 to +117.218 ms, six positive pairs. Whole-process paired CPU increases by 15.784 ms, while local-installation CPU improves by 19.398 ms. This is much smaller than the historical +272.301 ms setup gap, but separate runs on a busy shared host do not isolate the cause. Overlapping CPU intervals must not be added.
-- Native 256-row fully cached cold setup/whole-process CPU rises by paired medians of 4.138/5.856 ms; the whole-process increase appears in all seven pairs. Eight-row cold whole-process CPU rises by 0.728 ms, also in all seven pairs. The 256-row half-cached cold and edit-reconnect whole-process medians rise by 5.744/4.147 ms. The 4,096-row fully cached cold case is faster to readiness while whole-process CPU rises by 47.420 ms, with a wide -42.006 to +486.422 ms paired range. These are resource costs even when readiness improves.
-- Browser eight-row whole-fixture main-thread CPU rises by paired medians of 11.410–13.287 ms, with all seven pairs positive in each of the three cells. This includes module initialization, setup, prefetch/initial query, verification and cleanup; it is not query-phase attribution and excludes off-thread IndexedDB work. Large browser cases improve this whole-fixture measure. The 256-row cold and slow-link edit cases retain increases of about 3–12 ms; slow-link membership improves by about 1 ms.
-- Native eight/256-row peak process memory increases by roughly 1–3 MiB in paired medians, and the 2,048-row slow-link fixture by 3.5 MiB. The eight-row cold and 256-row fully cached cold memory increases appear in all seven pairs. Large native memory results are mixed. Process peaks are not per-tree retained memory.
-- Native 4,096-row fully cached request bytes fall from 311,598 to 6,678. Small native cells add 373–1,046 requester bytes, and the 2,048-row cell adds 2,446 bytes. For cold empty transfer, maximum serialized envelope size falls from 1,437,713 to 65,834 bytes. Counters exclude transport framing; pushed message counts do not establish dependent round trips.
-- The original wide-key first-refresh diagnostic and private coalescing experiment remain in the historical report with their original pins. Neither was rerun here. No unbounded coalescing variant entered production, and the former CPU magnitude is not the current-baseline result.
+Each case has seven alternating reference/candidate pairs at simulated 50 ms RTT. Times are milliseconds; differences are candidate minus reference. The paired median need not equal the difference of the two arm medians. Ranges include every pair, including unfavorable observations. References and platforms are not pooled.
 
-## Rebase correctness and verification
+| Platform | Rows | Operation | Initial cache | Bandwidth | Reference median | Candidate median | Paired change [range] | Slower pairs |
+|---|---:|---|---|---|---:|---:|---:|---:|
+| Native | 8 | Cold | empty | Unlimited | 57.2 | 57.6 | -0.1 [-2.6, +2.4] | 3/7 |
+| Native | 256 | Cold | half | Unlimited | 71.7 | 79.8 | +7.4 [-4.3, +9.7] | 6/7 |
+| Native | 4,096 | Cold | empty | Unlimited | 442.2 | 327.3 | -110.4 [-121.6, -105.0] | 0/7 |
+| Native | 4,096 | First refresh | empty | Unlimited | 140.3 | 131.8 | -9.1 [-20.3, -5.4] | 0/7 |
+| Native | 4,096 | Reconnect, edit | all | Unlimited | 170.3 | 173.9 | +4.0 [-0.1, +5.8] | 6/7 |
+| Native | 2,048 | Reconnect, equal | all | 125 kB/s | 1369.5 | 1368.1 | -1.4 [-4.4, +1.5] | 1/7 |
+| Browser | 256 | Cold | empty | Unlimited | 225.9 | 199.6 | -25.3 [-32.2, -23.6] | 0/7 |
+| Browser | 4,096 | Cold | empty | Unlimited | 4378.1 | 2095.0 | -2284.1 [-2357.4, -2245.4] | 0/7 |
+| Browser | 8 | First refresh | empty | Unlimited | 58.0 | 60.4 | +2.6 [+0.3, +3.1] | 7/7 |
+| Browser | 4,096 | First refresh | empty | Unlimited | 840.6 | 689.9 | -150.7 [-189.0, -128.8] | 0/7 |
+| Browser | 4,096 | Reconnect, edit | all | Unlimited | 755.4 | 644.7 | -111.2 [-114.8, -98.5] | 0/7 |
+| Browser | 256 | Reconnect, membership | all | 125 kB/s | 291.5 | 275.7 | -10.1 [-23.7, +15.3] | 3/7 |
 
-The rebase preserves #526's atomic event-batch application and fresh forks on storage-conflict retries, while retaining truthful digest target coverage. Fable found one conflict-resolution error: the adopted-snapshot path suppressed its reactor change when a reader hydrated the committed state before publication. A deterministic regression for both Initial and Live delivery failed before the correction and passed after restoring upstream's unconditional notification following successful adoption. Existing competing-commit tests still prevent duplicate publication. The same persistent Fable session reviewed and approved that correction.
+Large cold/refresh browser cases and large native cold startup improve in every pair against main. Small-case costs remain visible above; faster large cases do not erase them. The slow-link membership result has mixed signs.
 
-On the corrected source, **390 core tests pass** (one existing ignored), plus **21 digest-state, nine inter-node and three stream-credential tests**. Immediately before the two-line notification correction, 54 targeted integration and 125 auth tests passed, with existing ignores unchanged. The initial removed-backend-API fixture compile failures and the notification regression's red run are preserved. The browser functional set includes 17 ordinary unit tests, 18 standard query fixtures, four gapped-cache fixtures, and a 4,098-row/2,049-interleaved-cache Summary-frontier case. The native functional set has 36 standard and four gapped-cache fixtures.
+## Readiness versus the previous digest implementation
 
-Cold/first refresh measure public versioned durable readiness. Reconnect measures the first fresh local installation after reset, with its own query response as a later validity gate. Immutable full states, heads and membership are captured at that boundary before asynchronous persistence verification or transport drain. Capture is atomic per entity; these static fixtures do not claim a global concurrent snapshot.
+This compares the ongoing implementation with the previous digest candidate under the same fixtures; it does not attribute costs to individual changes. It is a separate comparison, not a substitute for main.
 
-Native and browser final timing ran sequentially without our builds, tests or profilers overlapping. Source, dependency, public v8 harness and immutable artifact hashes match before/after; production-only targets and marker scans exclude private diagnostics. The shared 16-logical-CPU host had high load and unrelated applications running. Seven pairs do not establish p95/p99 or eliminate host variability.
+| Platform | Rows | Operation | Initial cache | Bandwidth | Reference median | Candidate median | Paired change [range] | Slower pairs |
+|---|---:|---|---|---|---:|---:|---:|---:|
+| Browser | 4,096 | Cold | empty | Unlimited | 2245.9 | 2128.1 | -74.3 [-246.3, -8.4] | 0/7 |
+| Browser | 4,096 | Cold | all | Unlimited | 1029.1 | 1041.2 | +17.9 [-8.0, +32.8] | 5/7 |
+| Native | 2,048 | Reconnect, equal | all | 125 kB/s | 1361.5 | 1358.8 | -1.0 [-13.0, +17.3] | 3/7 |
+| Native | 256 | Cold | empty | Unlimited | 80.5 | 84.1 | +2.7 [-0.6, +12.7] | 6/7 |
+| Native | 256 | Cold | half | Unlimited | 74.2 | 75.4 | +1.1 [-7.2, +4.7] | 4/7 |
+| Native | 256 | Cold | all | Unlimited | 62.0 | 64.4 | +3.1 [-1.8, +4.1] | 5/7 |
+| Native | 4,096 | Cold | empty | Unlimited | 363.3 | 328.7 | -34.7 [-95.8, -20.8] | 0/7 |
+| Native | 256 | Reconnect, edit | all | 1.25 MB/s | 75.9 | 75.1 | +1.0 [-7.4, +7.6] | 4/7 |
+| Native | 256 | Reconnect, membership | all | 1.25 MB/s | 77.3 | 80.5 | +1.7 [-9.2, +6.2] | 5/7 |
+| Native | 8 | Cold | empty | Unlimited | 57.7 | 57.6 | -0.0 [-1.7, +2.1] | 3/7 |
+| Native | 4,096 | Cold | all | Unlimited | 189.5 | 190.9 | +1.8 [-4.9, +3.7] | 5/7 |
+| Native | 4,096 | First refresh | empty | Unlimited | 123.8 | 130.9 | +8.2 [+6.6, +10.1] | 7/7 |
+| Native | 4,096 | First refresh | all | Unlimited | 105.9 | 108.2 | +2.4 [-4.9, +5.6] | 6/7 |
+| Native | 4,096 | Reconnect, edit | all | Unlimited | 171.5 | 172.9 | +2.1 [-7.3, +7.0] | 5/7 |
+| Browser | 256 | Cold | empty | Unlimited | 207.5 | 201.9 | -3.5 [-11.3, -0.5] | 0/7 |
+| Browser | 256 | Cold | half | Unlimited | 139.5 | 140.4 | +0.4 [-5.7, +3.5] | 5/7 |
+| Browser | 4,096 | First refresh | empty | Unlimited | 669.7 | 718.8 | +47.2 [-16.2, +127.1] | 6/7 |
+| Browser | 4,096 | First refresh | half | Unlimited | 516.8 | 526.8 | +13.0 [-0.3, +17.0] | 6/7 |
+| Browser | 4,096 | First refresh | all | Unlimited | 466.6 | 478.8 | +10.6 [-0.8, +29.4] | 6/7 |
+| Browser | 8 | First refresh | empty | Unlimited | 59.2 | 60.9 | +1.6 [-1.7, +5.3] | 6/7 |
+| Browser | 8 | Reconnect, edit | all | Unlimited | 61.4 | 63.0 | +1.7 [-0.1, +4.0] | 6/7 |
+| Browser | 8 | Reconnect, membership | all | Unlimited | 62.4 | 64.0 | +1.6 [-1.4, +3.6] | 6/7 |
+| Browser | 4,096 | Reconnect, edit | all | Unlimited | 639.7 | 642.2 | +1.3 [-7.2, +13.9] | 4/7 |
+| Browser | 4,096 | Reconnect, membership | all | Unlimited | 643.1 | 645.8 | +2.7 [-1.8, +29.9] | 6/7 |
+| Browser | 256 | Reconnect, edit | all | 125 kB/s | 267.5 | 277.9 | +9.2 [-8.2, +28.0] | 5/7 |
+| Browser | 256 | Reconnect, membership | all | 125 kB/s | 281.0 | 280.4 | +0.9 [-15.0, +18.6] | 4/7 |
 
-One browser attempt was mistakenly started before a failed compiler inventory check was examined. Its 42 completed samples and one sample interrupted by our cleanup are preserved separately and excluded for that known overlap, independently of their signs. The qualification controller (`orchestrate.py` in the local evidence ledger) stops before launch when the compiler check fails; a fresh complete 196-sample browser attempt passed. The 40 browser functional checks remained valid. Unrelated user processes were left untouched.
+The first-refresh residual is systematic: all three large browser cache cases are slower in six of seven pairs, and native first refresh after an empty initial cache is slower in all seven. Large browser edited/membership reconnect is close in readiness, while its whole-fixture CPU is higher. No case was repeated or excluded for its sign.
 
-## Review and follow-up
+## Resource costs and wire work
 
-Storage/native transaction integration, durable replication, idle LRU and million-row readiness remain later work. Both peers still materialize results, and retained trees refresh before comparison. Bounded application batching (`xL8b6_sJ`), wide-key construction policy (`PMPS6R1y`) and retained-tree lifetime (`YC_KEwJL`) remain proposals; batching now explicitly requires reassessment against the smaller post-#526 CPU gap. Prebranch ORDER BY and IndexedDB teardown issues remain separate. The upstream events-path reader/publication race is recorded on the existing task `djIq9rF8` and is not repaired by the adopted-snapshot correction.
+- Native slow-link 2,048-row equal reconnect has setup CPU medians of 533.1/795.0 ms (main/candidate), paired change **+259.189 ms**, range +247.644 to +292.879 ms, all seven positive. Whole-process CPU rises by 256.938 ms. Versus the previous digest branch, setup CPU rises by 16.230 ms with mixed signs. Setup includes population, prefetch and initial query; counters from the later timed operation do not quantify that work.
+- Native 4,096-row edited reconnect adds **102.122 ms setup CPU** versus main, range +78.753 to +118.820 ms, all seven positive; whole-process CPU adds 90.922 ms. Endpoint CPU is lower. These overlapping intervals must not be summed. The browser admission diagnostic does not quantitatively attribute these native setup costs.
+- Native large-case peak process memory rises by paired medians of about **21–28 MiB versus main** and **28–35 MiB versus the previous digest branch**. For context, main/candidate peak medians are 211.3/234.4 MiB for cold 4,096 and 213.6/243.1 MiB for edited reconnect. These cover both peers and the entire fixture, not retained per-tree allocation or evidence of a leak.
+- Browser whole-fixture main-thread CPU versus main falls by paired medians of 486.072/586.384/378.362 ms for large cold/first-refresh/edited-reconnect cases, every pair lower. The eight-row first-refresh fixture instead adds **18.314 ms**, range +14.991 to +18.832 ms, every pair positive. Slow membership adds 11.702 ms in every pair; 256-row cold adds 5.432 ms with mixed signs.
+- Versus the previous digest branch, browser eight-row fixtures add about 6–7 ms whole-fixture CPU. Large cached cold/refresh/edit/membership fixtures add about 52–83 ms in paired medians. Empty/half first-refresh fixtures use less whole-fixture CPU despite slower readiness; this does not identify the cause of that latency difference.
+- Browser final wasm capacity rises about 3.1–5.3 MiB in the large main-relative cases and 2.4–4.1 MiB versus the previous digest branch. JS heap varies. These final capacities are not peak RSS, and they must not be summed with one another or described as query-phase memory.
+- Native 4,096-row first-refresh requester bytes fall from 311,598 to 6,860 versus main. Cold empty's largest serialized envelope falls from about 1.44 MB to 65,834 bytes. Versus the previous digest browser reference, large cold uses 19 fewer messages in each direction and 3,256 fewer requester bytes. Other cells have small control-byte increases. Serialized bytes exclude transport framing; pushed message counts are not dependent round-trip counts.
 
-Root and the same persistent Fable session find no concrete correctness or material cold/warm readiness blocker in this requalification and recommend returning to Daniel's in-depth review. Fable's remaining requests were report-level disclosure of the consistent small-cell CPU/memory costs and updating attribution to lead with the new baseline. The requalification task `OPI6g2Zr` gates first landing. No PR or human acceptance is implied.
+## Correctness and review
+
+On the final production source, 449 core tests pass with one existing ignore; the final 95 state-sync checks also pass after strengthening the incomplete-chunk admission test. These cover separate bulk/live admission, actual repair progress while bulk reads are stalled, per-entity ordering, cancellation, publication/event ordering, finite readiness, refresh, policy checks and stale-generation rejection. Source and receiver reviews led to removal of the obsolete unsequenced update path and unused helpers.
+
+The broad native integration run at production-identical `e56efea5` passed 372 tests and failed one repair-path assertion, with 24 existing ignores; JWT passed 125 tests. The failing fixture had already passed its final membership, merged-value, both-head and persisted-coverage assertions. A concurrent live echo could legitimately satisfy the target without the separate EventBridge that its final assertion demanded.
+
+Test-only `81299f21` creates divergence offline before reconnecting, preserves all original assertions, checks the captured key explicitly, and withholds the actual required repair to prove readiness waits. That focused test passes on a Git tree identical to the measured candidate. The original broad failure is retained; it is not relabelled as a new 373-pass suite. Exact optimized native40/browser41 checks and all timing-state checks are additional evidence.
+
+The browser functional set includes ordinary tests, two real IndexedDB-backed nodes, standard query cases, gapped caches and an interleaved-cache summary-frontier case. Earlier unchanged standalone/protocol checks retain their own pins. Existing ignores are not silently converted into coverage.
+
+## Measurement boundaries and preserved attempts
+
+Cold and first refresh measure the current version's public durable readiness. Reconnect measures the first fresh loaded result after resetting loading metadata, with the query's own response required afterward as a validity check. Immutable full states, causal heads and membership are captured at the endpoint before asynchronous persistence verification or transport drain. Capture is atomic per entity; these fixtures perform no concurrent writes during timing.
+
+`warm_refresh` calls the portable same-selection `update_selection_wait`; it does **not** measure the new same-stream `refresh()` API. Same-stream rounds and ongoing interleaving have directed correctness coverage. These reconnect timings also do not establish sustained live-update throughput, million-row behavior or tail latency.
+
+Native process CPU covers both nodes and all threads; setup/through-ready/verification intervals overlap. Browser CDP CPU covers the entire main-thread fixture, including initialization, setup, prefetch, verification and cleanup; it excludes off-thread IndexedDB and later context teardown. It is not endpoint CPU.
+
+Every final sample uses unchanged public v8 fixtures, fresh production-only artifacts and alternating pair order. Builds, tests, profilers and timing stages were sequential for this task. Compiler checks, before/after source and artifact checks, raw records and failures are retained. The shared host had unrelated work; seven pairs do not establish p95/p99 or eliminate variability.
+
+Earlier candidates remain historical. The `92bf6ac2` pilot exposed extra cold reloads, corrected by bounded optional round residency. The `f1735cbe` browser run exposed a 1.5–1.8-second cold regression and stopped after 63 verified samples plus one recorded shutdown interruption. A separate six-sample private active-application diagnostic demonstrated the scheduling improvement; it is not pooled with final qualification. Its initial zero-sample launch failure is also preserved. The production two-lane correction then received fresh correctness/build/functional checks and this complete 532-sample matrix, without extra pilots or sign-based reruns.
+
+## Scope and follow-up
+
+Both peers still materialize query results. Native transaction/storage adapters, durable replication, idle-tree retention, million-row reads and broader hardening remain later work. Source queues and receiver work are bounded and may require stream restart; sustained churn can exhaust limited-query refill attempts. An uncertain interrupted commit makes source publication unavailable until node reconstruction.
+
+The existing CPU-attribution task (`AcnKJDI9`) now leads with these current costs. Bounded transactional application batching (`xL8b6_sJ`) and retained-tree lifetime (`YC_KEwJL`) remain proposals; limiting active jobs does not implement batching. Prebranch ORDER BY, IndexedDB teardown and reader-adoption event-notification issues remain separate. There is no promise of exactly-once notification for every committed event.
+
+The [benchmark history proposal](DIGEST_BENCHMARK_PLAN.md) remains suitable for the separate website/dashboard work; no publication pipeline is enabled here. Fwd implementation/validation tasks are submitted for review with this evidence, while landing still awaits Daniel's review.
 
 ## Reproduction and evidence
 
-See [LIVE_QUERY_STARTUP.md](LIVE_QUERY_STARTUP.md) for fixture, runner and endpoint definitions. The candidate native binary SHA-256 is `ac9685224e51e3bde833c77d01e8ea6755cf3c500724c5e75f5f92d36f8a7eb0`; candidate browser wasm is `bb6c5995ffab65397d95690f103b523372a6189e85b9ee83556f389303d215b4`.
+[LIVE_QUERY_STARTUP.md](LIVE_QUERY_STARTUP.md) defines fixtures, runner settings, reference overlays and endpoints. Native uses pinned Rust 1.97 nightly; browser uses pinned Rust 1.101 nightly, identical within each platform/reference comparison.
 
-The local evidence root is `~/ak/research_notes/ankurah-replication/reviews/2026-10-13-rebase-526/`. `native-7c2e64bca5ed-report.md` and `browser-7c2e64bca5ed-report.md`, their JSON assessments, and `root-{native,browser}-7c2e64bca5ed-recomputed.json` retain every final pair, range, CPU/resource result and raw-log reference. Accepted raw files are under `{native,browser}/7c2e64bca5ed/`. Build manifests, before/after pins, the original pristine-main overlay manifest and `correctness-summary.json` bind them to the sources. The compiler-overlap attempt remains under `excluded/browser-7c2e64bca5ed-compiler-overlap-attempt1/`. Persistent Fable session `8545fb99-2d53-4961-982c-802ff54c57f5` has its rebase finding, correction review and final assessment preserved alongside them.
+Candidate native binary SHA-256: `4836670e2ff5e3b16740865b75709c8c0682a762e0046523a1532be507c58b45`. Candidate wasm SHA-256: `8b8a8f9ebb837acd2215c85f282a94f7d3693466846bff8b6957708c19aca657`.
 
-## Subsequent code-quality cleanup — 2026-10-13
+Local evidence root: `~/ak/research_notes/ankurah-replication/reviews/2026-10-15-ongoing-sync-performance/`. The frozen plan is `qualification-plan-81299f2185fa-frozen.json`, SHA-256 `60f103d9327e701e73b679111374f0c83dfdb67ce98324b95179684da0dbca6c`. `final-81299f2185fa-recomputed.{json,md}` contains all 38 cases, every arm/pair value, resource/work counters and evidence hashes. The five stage reports retain separate references. `root-final-81299f2185fa-audit.json` independently checks all 532 raw samples, 38 endpoint vectors and 629 evidence-file hashes, including paired standard deviation and median absolute deviation.
 
-Cleanup `6fc1273b62dce6014caf55da23f3ce06ddc89bec` removes unused protocol variants/fields and internal extension points, places transfer operations in their owning module, preserves duplicate counts in immutable stream credentials, and drops late notifications after their last route is removed. The credential regression now exercises a real concurrent snapshot repair. Root, three existing review agents and the same persistent Fable session reviewed the relevant changes; Fable confirmed closure of its production findings. Daniel's review is pending.
-
-Fresh correctness checks pass: 145 standalone digest tests plus two doc tests, 392 core tests, 125 auth tests, 39 protocol tests, 369 native integration tests, 40 browser checks and 18 native public-query fixtures. Existing ignored tests remain ignored; the core/auth doc commands complete with their 19 existing ignored examples. The browser checks rebuild the release wasm and include a 4,098-row/2,049-interleaved-cache summary-frontier case. The native public fixture was compiled and run in the dev profile for correctness only. Formatting and diff checks pass. Earlier fixture compile mistakes and the obsolete enum-tag expectation were corrected; their failed attempts remain in the evidence ledger.
-
-These are new correctness results, **not new paired timing measurements**. The performance tables above remain pinned to `7c2e64bc` versus `ae896279`; their CPU/memory costs and statistical limits still apply to that measurement. Public benchmark output keys and measurement boundaries are preserved through the cleanup. Local review and verification evidence is under `~/ak/research_notes/ankurah-replication/reviews/2026-10-13-extra-diligence/`.
-
-[DIGEST_BENCHMARK_PLAN.md](DIGEST_BENCHMARK_PLAN.md) proposes six public-query before/after cases and independently discovered digest primitives for the shared benchmark dashboard. Fwd `xO5AXAqI` depends on digest landing and dashboard task `gaysyhvR`; no publication pipeline is enabled here.
+Build/functional manifests and `correctness-applicability-81299f2185fa.json` retain actual source pins and the original fixture failure. The private design review and correction evidence are under the sibling `2026-10-15-ongoing-sync-stress/` directory. Historical samples and failed/interrupted attempts remain intact.
