@@ -264,3 +264,108 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
     assert_eq!(*received.lock().unwrap(), [first.id(), second.id()], "a ready batch cannot coalesce away the second event vector");
     Ok(())
 }
+
+#[tokio::test]
+async fn first_chunk_reservation_can_receive_rest_after_later_live_fills_window() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let target = entity.head();
+    let earlier =
+        proto::DeltaContent::StateSnapshot { state: proto::StateFragment { state: entity.to_state()?, attestations: Default::default() } };
+    let bytes = bincode::serialize(&earlier)?;
+    driver.chunk(
+        &node,
+        id(90),
+        &[crate::policy::DEFAULT_CONTEXT],
+        Owner::Round(0),
+        target.clone(),
+        None,
+        proto::EntityDeltaChunk { entity_id: entity.id(), offset: 0, bytes: bytes[..1].to_vec().into(), last: false },
+    )?;
+    let later = proto::DeltaContent::StateSnapshot {
+        state: proto::StateFragment {
+            state: entity.to_state()?,
+            attestations: proto::AttestationSet(vec![proto::Attestation(vec![7; super::super::super::WINDOW_BYTES])]),
+        },
+    };
+    let later = bincode::serialize(&later)?;
+    for (index, part) in later.chunks(super::super::super::PAGE_BYTES / 2).enumerate() {
+        let offset = index * (super::super::super::PAGE_BYTES / 2);
+        driver.chunk(
+            &node,
+            id(90),
+            &[crate::policy::DEFAULT_CONTEXT],
+            Owner::Live(11),
+            proto::Clock::default(),
+            Some(proto::QueryMember { key: vec![], head: target.clone() }),
+            proto::EntityDeltaChunk {
+                entity_id: entity.id(),
+                offset: offset as u64,
+                bytes: part.to_vec().into(),
+                last: offset + part.len() == later.len(),
+            },
+        )?;
+    }
+    assert!(driver.application_bytes >= super::super::super::WINDOW_BYTES);
+    assert_eq!(driver.application_jobs, 2);
+    assert_eq!(driver.queued_jobs[&entity.id()].len(), 1);
+    assert!(driver.can_receive(), "the earlier reserved job requires more bytes: application pressure cannot stop that reception");
+    driver.chunk(
+        &node,
+        id(90),
+        &[crate::policy::DEFAULT_CONTEXT],
+        Owner::Round(0),
+        target,
+        None,
+        proto::EntityDeltaChunk { entity_id: entity.id(), offset: 1, bytes: bytes[1..].to_vec().into(), last: true },
+    )?;
+    assert!(driver.assemblies.is_empty());
+    for _ in 0..2 {
+        let applied = tokio::time::timeout(std::time::Duration::from_secs(5), driver.jobs.next()).await?.unwrap()?;
+        driver.observe(&node, applied).await?;
+    }
+    assert_eq!(driver.application_bytes, 0);
+    assert_eq!(driver.application_jobs, 0);
+    assert!(driver.can_receive());
+    Ok(())
+}
+
+#[tokio::test]
+async fn independently_covered_round_chunk_releases_reservation_without_waiting_for_its_rest() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let target = entity.head();
+    driver.goals.add(entity.id(), target.clone(), true)?;
+    let content =
+        proto::DeltaContent::StateSnapshot { state: proto::StateFragment { state: entity.to_state()?, attestations: Default::default() } };
+    let bytes = bincode::serialize(&content)?;
+    driver.chunk(
+        &node,
+        id(90),
+        &[crate::policy::DEFAULT_CONTEXT],
+        Owner::Round(0),
+        target.clone(),
+        None,
+        proto::EntityDeltaChunk { entity_id: entity.id(), offset: 0, bytes: bytes[..1].to_vec().into(), last: false },
+    )?;
+    driver.projection.round.as_mut().unwrap().complete = true;
+    driver.discard_covered_round_chunks();
+    let released = driver.jobs.next().await.unwrap()?;
+    assert!(released.head.is_none());
+    driver.observe(&node, released).await?;
+    // Late bytes can arrive before Applied, without recreating an assembly.
+    driver.chunk(
+        &node,
+        id(90),
+        &[crate::policy::DEFAULT_CONTEXT],
+        Owner::Round(0),
+        target,
+        None,
+        proto::EntityDeltaChunk { entity_id: entity.id(), offset: 1, bytes: bytes[1..].to_vec().into(), last: true },
+    )?;
+    assert!(driver.assemblies.is_empty());
+    assert!(driver.complete_round(&node, None).await?);
+    assert_eq!(driver.assembly_bytes, 0);
+    assert_eq!(driver.application_jobs, 0);
+    Ok(())
+}

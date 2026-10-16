@@ -103,6 +103,7 @@ struct Publication {
 }
 struct Assembly {
     owner: Owner,
+    id: proto::EntityId,
     target: proto::Clock,
     bytes: Vec<u8>,
     member: Option<proto::QueryMember>,
@@ -124,6 +125,7 @@ pub(super) struct Driver {
     active_entities: HashSet<proto::EntityId>,
     application_jobs: usize,
     assemblies: BTreeMap<TargetKey, Assembly>,
+    discarded_chunks: HashSet<TargetKey>,
     assembly_bytes: usize,
     observed: HashMap<proto::EntityId, proto::Clock>,
     eligible: HashSet<proto::EntityId>,
@@ -169,6 +171,7 @@ impl Driver {
             active_entities: HashSet::new(),
             application_jobs: 0,
             assemblies: BTreeMap::new(),
+            discarded_chunks: HashSet::new(),
             assembly_bytes: 0,
             observed,
             eligible: HashSet::new(),
@@ -434,6 +437,9 @@ impl Driver {
             chunk.entity_id,
             &target,
         ))?;
+        if self.discarded_chunks.contains(&key) {
+            return Ok(());
+        }
         if !self.assemblies.contains_key(&key) {
             ensure!(
                 self.assemblies.len() < super::super::MAX_INFLIGHT_FRAMES && chunk.offset == 0,
@@ -449,8 +455,10 @@ impl Driver {
                 (!matches!(owner, Owner::Live(_))).then(|| target.clone()),
                 Box::pin(async move { receive.await.ok() }),
             )?;
-            self.assemblies
-                .insert(key.clone(), Assembly { owner, target: target.clone(), bytes: Vec::new(), member: member.clone(), sender });
+            self.assemblies.insert(
+                key.clone(),
+                Assembly { owner, id: chunk.entity_id, target: target.clone(), bytes: Vec::new(), member: member.clone(), sender },
+            );
         }
         let assembly = self.assemblies.get_mut(&key).unwrap();
         ensure!(
@@ -850,6 +858,34 @@ impl Driver {
         Ok(())
     }
 
+    fn discard_covered_round_chunks(&mut self) {
+        if !self.projection.round.as_ref().is_some_and(|round| round.complete) {
+            return;
+        }
+        let covered = self
+            .assemblies
+            .iter()
+            .filter_map(|(key, assembly)| {
+                (assembly.owner == Owner::Round(self.round_number)
+                    && self
+                        .goals
+                        .rows
+                        .get(&assembly.id)
+                        .is_some_and(|rows| rows.values().any(|goal| goal.head == assembly.target && goal.covered)))
+                .then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        for key in covered {
+            let assembly = self.assemblies.remove(&key).unwrap();
+            self.assembly_bytes -= assembly.bytes.len();
+            // Dropping sender resolves the reserved job. Ignore the remaining
+            // bytes until this round retires; they no longer prove anything needed.
+            self.discarded_chunks.insert(key);
+        }
+    }
+
+    fn can_receive(&self) -> bool { self.application_bytes < super::super::WINDOW_BYTES || !self.assemblies.is_empty() }
+
     async fn complete_round<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<bool>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -863,6 +899,7 @@ impl Driver {
             return Ok(false);
         }
         self.feedback.cancel_round(self.round_number);
+        self.discarded_chunks.clear();
         let baseline = self.projection.finish(self.round_number)?;
         for id in baseline.keys() {
             if self.projection.members.contains_key(id) {
@@ -998,6 +1035,7 @@ impl Driver {
                 self.cancel_round(&node, peer, credentials)?;
             }
             self.repairs(&node, peer, credentials).await?;
+            self.discard_covered_round_chunks();
             if self.membership_dirty {
                 self.install(&node, query, false).await?;
                 self.membership_dirty = false;
@@ -1041,7 +1079,7 @@ impl Driver {
             }
             let event = {
                 let inbox = self.stream.inbox.clone();
-                let can_receive = self.application_bytes < super::super::WINDOW_BYTES || !self.assemblies.is_empty();
+                let can_receive = self.can_receive();
                 let idle = self.projection.round.is_none() && self.jobs.is_empty();
                 let frame = async {
                     if can_receive {
