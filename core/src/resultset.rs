@@ -10,7 +10,7 @@ use ankurah_signals::{
     CurrentObserver, Get, Peek, Signal, Subscribe, SubscriptionGuard,
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ops::Deref,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -258,9 +258,17 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
         removed_ids
     }
 
-    /// Replace all entities in the result set with proper sorting
-    pub fn replace_all(&mut self, entities: Vec<E>) {
+    /// Replace all entities in the result set with proper sorting.
+    pub fn replace_all(&mut self, entities: Vec<E>) { self.replace_all_preserving_keys(entities, &HashSet::new()); }
+
+    /// Keep selected visible rows at their last published sort keys while a
+    /// pending publication's entity data is already applied. Omitted entities
+    /// still leave the set; newly included identities use their current keys.
+    pub(crate) fn replace_all_preserving_keys(&mut self, entities: Vec<E>, preserve: &HashSet<proto::EntityId>) {
         let guard = self.guard.as_mut().expect("write guard already dropped");
+        let mut preserved_keys: Option<HashMap<_, _>> = (!preserve.is_empty()).then(|| {
+            preserve.iter().filter_map(|id| guard.index.get(id).map(|index| (*id, guard.order[*index].sort_key.clone()))).collect()
+        });
 
         // Clear existing data
         guard.order.clear();
@@ -268,8 +276,10 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
 
         // Add all entities with proper sorting
         for entity in entities {
-            // Compute sort key if ordering is configured
-            let sort_key = guard.key_spec.as_ref().map(|key_spec| Self::compute_sort_key(&entity, key_spec));
+            let sort_key = preserved_keys
+                .as_mut()
+                .and_then(|keys| keys.remove(&entity.id()))
+                .unwrap_or_else(|| guard.key_spec.as_ref().map(|key_spec| Self::compute_sort_key(&entity, key_spec)));
 
             let entry = EntityEntry { entity, sort_key, dirty: false };
             guard.order.push(entry);
@@ -677,6 +687,72 @@ mod tests {
         assert_eq!(entities[0].0, entity1.id); // Alice (earlier ID)
         assert_eq!(entities[1].0, entity2.id); // Alice (later ID)
         assert_eq!(entities[2].0, entity3.id); // Bob
+    }
+
+    #[test]
+    fn preserved_cached_keys_hold_a_pending_row_until_publication() {
+        #[derive(Debug, Clone)]
+        struct MutableEntity(Arc<std::sync::Mutex<TestEntity>>);
+        impl AbstractEntity for MutableEntity {
+            fn memberships(&self) -> std::collections::BTreeSet<proto::ModelId> { Default::default() }
+            fn id(&self) -> proto::EntityId { self.0.lock().unwrap().id }
+            fn value(&self, property: &PropertyId) -> Option<Value> { self.0.lock().unwrap().value(property) }
+        }
+        let pending = MutableEntity(Arc::new(std::sync::Mutex::new(TestEntity::new(1, HashMap::from([(prop("rank"), Value::I32(1))])))));
+        let other = MutableEntity(Arc::new(std::sync::Mutex::new(TestEntity::new(2, HashMap::from([(prop("rank"), Value::I32(2))])))));
+        let key_spec = KeySpec {
+            keyparts: vec![IndexKeyPart {
+                key: prop("rank"),
+                sub_path: None,
+                direction: IndexDirection::Asc,
+                nulls: Some(NullsOrder::Last),
+                collation: None,
+                value_type: ValueType::I32,
+            }],
+        };
+        let resultset = EntityResultSet::empty();
+        resultset.order_by(Some(key_spec.clone()));
+        resultset.limit(Some(1));
+        resultset.write().replace_all(vec![pending.clone(), other.clone()]);
+        assert!(resultset.contains_key(&pending.id()));
+
+        // Applying a later entity state precedes publication of its membership.
+        pending.0.lock().unwrap().properties.insert(prop("rank"), Value::I32(9));
+        assert_eq!(resultset.by_id(&pending.id()).unwrap().value(&prop("rank")), Some(Value::I32(9)));
+        resultset.order_by(Some(key_spec)); // An unchanged layout must not refresh the pending key.
+        resultset.write().replace_all_preserving_keys(vec![pending.clone(), other.clone()], &HashSet::from([pending.id()]));
+        assert_eq!(resultset.len(), 1);
+        assert!(resultset.contains_key(&pending.id()), "an unrelated install must not expose the pending rank change");
+
+        // The publication commits: ordinary replacement now uses the applied key.
+        resultset.write().replace_all(vec![pending.clone(), other.clone()]);
+        assert!(!resultset.contains_key(&pending.id()));
+        assert!(resultset.contains_key(&other.id()));
+    }
+
+    #[test]
+    fn preserving_keys_does_not_retain_omitted_rows_or_invent_new_keys() {
+        let row = |id, rank| TestEntity::new(id, HashMap::from([(prop("rank"), Value::I32(rank))]));
+        let old = row(1, 1);
+        let other = row(2, 2);
+        let new = row(3, 0);
+        let resultset = EntityResultSet::empty();
+        resultset.order_by(Some(KeySpec {
+            keyparts: vec![IndexKeyPart {
+                key: prop("rank"),
+                sub_path: None,
+                direction: IndexDirection::Asc,
+                nulls: Some(NullsOrder::Last),
+                collation: None,
+                value_type: ValueType::I32,
+            }],
+        }));
+        resultset.limit(Some(1));
+        resultset.write().replace_all(vec![old.clone()]);
+        resultset.write().replace_all_preserving_keys(vec![other, new.clone()], &HashSet::from([old.id, new.id]));
+        assert_eq!(resultset.len(), 1);
+        assert!(!resultset.contains_key(&old.id), "key preservation never restores an omitted entity");
+        assert!(resultset.contains_key(&new.id), "a selected ID without a cached entry must use its actual key");
     }
 
     #[test]
