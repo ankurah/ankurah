@@ -1,0 +1,67 @@
+{
+  "id": "38866109454-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "ad557070",
+      "url": "https://github.com/ankurah/ankurah/commit/ad557070af00491c2b8b89b5670a4579d2543a98"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-common-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-common-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.6.0"
+    },
+    {
+      "kind": "pr",
+      "label": "#157",
+      "url": "https://github.com/ankurah/ankurah/pull/157"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38866109454-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-10-11T09:02:52-07:00",
+    "label": "ad557070af00491c2b8b89b5670a4579d2543a98",
+    "ref": "ad557070af00491c2b8b89b5670a4579d2543a98",
+    "repository": "ankurah/ankurah",
+    "sha": "ad557070af00491c2b8b89b5670a4579d2543a98"
+  },
+  "status": "unsupported"
+}
