@@ -533,16 +533,29 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         }
     }
 
-    // A local gap request may finish after a peer installs its candidate window.
-    // Recheck the current source rather than the one that started that request.
-    fn admits_gap_entity(&self, query_id: proto::QueryId, selection: &ankql::ast::Selection<Resolved>, entity: &E) -> bool {
+    // Keep the current source check and result mutation together: an old local
+    // gap fetch must not append outsiders after a peer installs its window.
+    fn insert_gap_entities(
+        &self,
+        query_id: proto::QueryId,
+        selection: &ankql::ast::Selection<Resolved>,
+        resultset: &EntityResultSet<E>,
+        entities: Vec<E>,
+    ) -> Vec<E> {
         let state = self.state.lock().unwrap();
-        state.queries.get(&query_id).is_some_and(|query| {
-            query.selection.as_ref() == Some(selection)
-                && query.source.can_read(entity)
-                && query.source.admits_query_entity(entity)
-                && evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
-        })
+        let Some(query) = state.queries.get(&query_id).filter(|query| query.selection.as_ref() == Some(selection)) else {
+            return Vec::new();
+        };
+        let mut write = resultset.write();
+        entities
+            .into_iter()
+            .filter(|entity| {
+                query.source.can_read(entity)
+                    && query.source.admits_query_entity(entity)
+                    && evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
+                    && write.add(entity.clone())
+            })
+            .collect()
     }
 
     async fn process_gap_fill_entities(
@@ -561,18 +574,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 if !gap_entities.is_empty() {
                     tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
 
-                    let gap_entities: Vec<_> =
-                        gap_entities.into_iter().filter(|entity| self.admits_gap_entity(query_id, &selection, entity)).collect();
-                    let mut write = resultset.write();
-                    let mut added_entities = Vec::new();
-
-                    for entity in gap_entities {
-                        if write.add(entity.clone()) {
-                            added_entities.push(entity);
-                        }
-                    }
-
-                    added_entities
+                    self.insert_gap_entities(query_id, &selection, &resultset, gap_entities)
                 } else {
                     tracing::debug!("Gap filling found no entities for query {}", query_id);
                     Vec::new()
@@ -661,22 +663,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 if !gap_entities.is_empty() {
                     tracing::debug!("Gap filling fetched {} entities for query {}", gap_entities.len(), query_id);
 
-                    let gap_entities: Vec<_> =
-                        gap_entities.into_iter().filter(|entity| self.admits_gap_entity(query_id, &selection, entity)).collect();
-                    let mut write = resultset.write();
-                    let mut gap_items = Vec::new();
-
-                    for entity in gap_entities {
-                        if write.add(entity.clone()) {
-                            gap_items.push(ReactorUpdateItem {
-                                entity,
-                                events: vec![],
-                                predicate_relevance: vec![(query_id, MembershipChange::Add)],
-                            });
-                        }
-                    }
-
-                    gap_items
+                    self.insert_gap_entities(query_id, &selection, &resultset, gap_entities)
+                        .into_iter()
+                        .map(|entity| ReactorUpdateItem {
+                            entity,
+                            events: vec![],
+                            predicate_relevance: vec![(query_id, MembershipChange::Add)],
+                        })
+                        .collect()
                 } else {
                     tracing::debug!("Gap filling found no entities for query {}", query_id);
                     Vec::new()

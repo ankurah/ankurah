@@ -200,7 +200,12 @@ impl LiveQueryInner {
 
     fn remote_stream_current(&self, version: u32, origin: &proto::RequestId) -> bool {
         self.is_current(version)
-            && self.remote_stream.lock().unwrap().as_ref().is_some_and(|stream| stream.version == version && &stream.origin == origin)
+            && self
+                .remote_stream
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|stream| stream.version == version && &stream.origin == origin && stream.admission.load(Ordering::Acquire))
     }
 
     pub(super) fn lose_remote_stream(&self, version: u32, origin: &proto::RequestId) {
@@ -407,7 +412,7 @@ impl crate::reactor::PreNotifyHook for RemoteActivation<'_> {
         let state = self.query.version_lock.lock().unwrap_or_else(|error| error.into_inner());
         let mut stream = self.query.remote_stream.lock().unwrap();
         let Some(current) = stream.as_mut().filter(|stream| stream.version == version && &stream.origin == self.origin) else { return };
-        if (self.canceled)() || !self.query.is_current(version) {
+        if (self.canceled)() || !self.query.is_current(version) || !current.admission.load(Ordering::Acquire) {
             return;
         }
         current.installed = true;
@@ -459,6 +464,50 @@ mod tests {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let context = Context::new(node.clone(), DEFAULT_CONTEXT);
         crate::livequery::EntityLiveQuery(Arc::new(LiveQueryInner::new(context.0, node.reactor.subscribe(), CachePolicy::Durable)))
+    }
+
+    #[tokio::test]
+    async fn partial_install_blocks_stale_local_activation_without_marking_ready() {
+        let query = query();
+        let origin = proto::RequestId::new();
+        let canceled = || false;
+        query.0.bind_remote_stream(1, origin.clone(), &canceled);
+        let partial = RemoteActivation { query: &query.0, origin: &origin, canceled: &canceled, complete: false };
+        assert!(!partial.marks_loaded());
+        partial.pre_notify(1);
+        assert!(!LocalActivation(&query.0).is_current(1));
+        assert!(query.0.remote_stream_pending(1));
+        assert!(!query.resultset().is_loaded());
+        let ready = query.wait_initialized();
+        tokio::pin!(ready);
+        assert!(futures::poll!(&mut ready).is_pending());
+        RemoteActivation { query: &query.0, origin: &origin, canceled: &canceled, complete: true }.pre_notify(1);
+        ready.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_is_released_only_for_the_current_lost_failed_or_replaced_stream() {
+        let query = query();
+        let origin = proto::RequestId::new();
+        let replacement = proto::RequestId::new();
+        query.0.bind_remote_stream(1, origin.clone(), &|| false);
+        let old_gate = query.0.remote_stream.lock().unwrap().as_ref().unwrap().admission.clone();
+        assert!(old_gate.load(Ordering::Acquire));
+        query.0.bind_remote_stream(1, replacement.clone(), &|| false);
+        assert!(!old_gate.load(Ordering::Acquire));
+        let current_gate = query.0.remote_stream.lock().unwrap().as_ref().unwrap().admission.clone();
+        query.0.lose_remote_stream(1, &origin);
+        assert!(current_gate.load(Ordering::Acquire), "old cleanup cannot release the replacement's restriction");
+        query.0.lose_remote_stream(1, &replacement);
+        assert!(!current_gate.load(Ordering::Acquire));
+        let late = RemoteActivation { query: &query.0, origin: &replacement, canceled: &|| false, complete: true };
+        assert!(!late.is_current(1));
+        late.pre_notify(1);
+        assert!(query.0.remote_stream_pending(1), "a late completion cannot restore lost readiness");
+        query.0.bind_remote_stream(1, replacement, &|| false);
+        let failed_gate = query.0.remote_stream.lock().unwrap().as_ref().unwrap().admission.clone();
+        query.0.fail_initialization(1, RetrievalError::Other("unavailable".into()));
+        assert!(!failed_gate.load(Ordering::Acquire));
     }
 
     #[tokio::test]

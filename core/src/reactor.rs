@@ -703,6 +703,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn source_admission_survives_late_data_and_preserves_readable_removals() {
+        struct Window(Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>);
+        #[async_trait::async_trait]
+        impl LocalEntitySource<TestEntity> for Window {
+            fn admits_query_entity(&self, entity: &TestEntity) -> bool { self.0.read().unwrap().contains(&entity.id) }
+            async fn fetch_entities_from_local(&self, _: &ankql::ast::Selection<Resolved>) -> Result<Vec<TestEntity>, RetrievalError> {
+                Ok(vec![])
+            }
+        }
+        let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+        let subscription = reactor.subscribe();
+        let id = QueryId::new();
+        let entity = TestEntity::new("formerly selected", "pending");
+        let resultset = EntityResultSet::empty();
+        // Start as a local query; remote installation must replace its source too.
+        reactor
+            .upsert_query_and_notify(
+                subscription.id(),
+                id,
+                sel("status = 'pending'"),
+                Arc::new(MockNode { entities: vec![entity.clone()] }),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+            )
+            .await
+            .unwrap();
+        let gate = Arc::new(std::sync::RwLock::new([entity.id].into_iter().collect()));
+        reactor
+            .upsert_query_from_peer(
+                subscription.id(),
+                id,
+                sel("status = 'pending'"),
+                Arc::new(Window(gate.clone())),
+                resultset.clone(),
+                Arc::new(MockGapFetcher::new()),
+                1,
+                (),
+                vec![entity.clone()],
+            )
+            .await
+            .unwrap();
+        let (watch, changes) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+        let _listener = subscription.subscribe(watch);
+        gate.write().unwrap().clear();
+        reactor.notify_change(vec![TestChange { entity: entity.clone(), events: vec![] }]).await;
+        assert_eq!(resultset.len(), 0);
+        let removal = changes();
+        assert!(
+            removal.iter().flat_map(|update| &update.items).any(|item| item.predicate_relevance.contains(&(id, MembershipChange::Remove))),
+            "admission is not a read denial: the removal still notifies"
+        );
+        reactor.notify_change(vec![TestChange { entity, events: vec![] }]).await;
+        assert_eq!(resultset.len(), 0, "a delayed causal application cannot re-admit an outsider");
+        assert!(changes().is_empty());
+    }
+
+    #[tokio::test]
     async fn gap_fetch_can_reenter_the_reactor() {
         let reactor = Reactor::<TestEntity, TestEvent>::new_test();
         let subscription = reactor.subscribe();
