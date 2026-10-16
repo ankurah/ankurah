@@ -16,7 +16,7 @@ use ankurah_core_types::PropertyPath;
 /// exactly the ordered bounded read exercised here, leaving its real commit and
 /// pause seams intact.
 #[derive(Default)]
-struct OrderedStorage(TestStorage);
+struct OrderedStorage(TestStorage, std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
 
 #[async_trait::async_trait]
 impl StorageEngine for OrderedStorage {
@@ -25,6 +25,11 @@ impl StorageEngine for OrderedStorage {
     fn transaction(&self) -> Self::Transaction<'_> { self.0.transaction() }
     async fn get_state(&self, id: proto::EntityId) -> Result<Attested<proto::EntityState>, RetrievalError> { self.0.get_state(id).await }
     async fn fetch_states(&self, selection: &Selection<Resolved>) -> Result<Vec<Attested<proto::EntityState>>, RetrievalError> {
+        let pause = self.1.lock().unwrap().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
         let mut scan = selection.clone();
         scan.order_by = None;
         scan.limit = None;
@@ -125,12 +130,15 @@ fn hold_fetch(node: &TestNode) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
 }
 
 #[tokio::test]
-async fn unlimited_capture_folds_an_entrant_and_an_ahead_resident_without_replaying_old_state() -> anyhow::Result<()> {
+async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read() -> anyhow::Result<()> {
     let node = node().await?;
     let a = genesis("01")?;
     apply(&node, &a).await?;
     let selection = selection(None);
-    let spec = QueryTree::spec(&selection, &node.catalog);
+    let spec = proto::TreeSpec::new(
+        ankurah_core_types::KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(property(), crate::value::ValueType::String)]),
+        selection.predicate.clone(),
+    );
     let tree = Arc::new(QueryTree::default());
     let (entered, release) = hold_fetch(&node);
     let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], tree);
@@ -379,5 +387,43 @@ async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree(
     assert_eq!(snapshot.states.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
     handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window_record() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let selection = selection(None);
+    let spec = QueryTree::spec(&selection, &node.catalog);
+    let (entered, observed) = oneshot::channel();
+    let (read, resume) = oneshot::channel();
+    *node.storage.1.lock().unwrap() = Some((entered, resume));
+    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()));
+    tokio::pin!(capture);
+    assert!(futures::poll!(&mut capture).is_pending());
+    observed.await?;
+    let first = update(&initial, "02")?;
+    apply(&node, &first).await?;
+    let second = update(&first, "03")?;
+    let (committed, stored) = oneshot::channel();
+    let (admit, admission) = oneshot::channel();
+    *node.storage.0.hold_after_commit.lock().unwrap() = Some((committed, admission));
+    let publishing = apply(&node, &second);
+    tokio::pin!(publishing);
+    assert!(futures::poll!(&mut publishing).is_pending());
+    stored.await?;
+    read.send(()).unwrap();
+    // The raw storage read now sees "03" while the window still contains
+    // only "02". Its closing fence must wait for the second admission.
+    assert!(futures::poll!(&mut capture).is_pending());
+    admit.send(()).unwrap();
+    let (published, captured) = tokio::join!(publishing, capture);
+    published?;
+    let captured = captured?;
+    assert_eq!(captured.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&second));
+    let row = &captured.snapshot.states[&initial.entity_id].payload;
+    assert_eq!(TemporaryEntity::new(row.entity_id, &row.state)?.value(&property()), Some(Value::String("03".into())));
     Ok(())
 }
