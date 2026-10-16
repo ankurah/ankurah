@@ -298,7 +298,7 @@ where
                 return Err(PeerConnectionError::SystemMismatch { current, offered: offered.payload.entity_id });
             }
         }
-        let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
+        let subscription_handler = SubscriptionHandler::new(presence.node_id);
         self.peer_connections.insert(presence.node_id, Arc::new(PeerState::new(sender, presence.durable, subscription_handler)));
         if presence.durable {
             self.durable_peers.insert(presence.node_id);

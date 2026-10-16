@@ -11,8 +11,8 @@ use ankurah_signals::Wait;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{mpsc, oneshot, Mutex};
 
-mod delivery;
-pub(crate) use delivery::{capture_query, CapturedQuery};
+mod source;
+pub(crate) use source::{capture_query, CapturedQuery};
 
 /// Owns one immutable source projection per query generation for this peer.
 pub struct SubscriptionHandler<CD: ContextData> {
@@ -26,19 +26,13 @@ struct StandingQuery<CD: ContextData> {
     version: u32,
     comparison: proto::ComparisonId,
     tree: Arc<QueryTree>,
-    commands: mpsc::Sender<delivery::Refresh>,
+    commands: mpsc::Sender<source::Refresh>,
     stop: Option<oneshot::Sender<()>>,
     stopped: oneshot::Receiver<()>,
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub fn new<SE, PA>(peer_id: proto::EntityId, _node: &Node<SE, PA>) -> Self
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
-    {
-        Self { peer_id, queries: Mutex::new(HashMap::new()) }
-    }
+    pub fn new(peer_id: proto::EntityId) -> Self { Self { peer_id, queries: Mutex::new(HashMap::new()) } }
 
     pub async fn remove_predicate<SE, PA>(&self, node: &Node<SE, PA>, query: proto::QueryId) -> Result<(), SubscriptionError>
     where
@@ -108,7 +102,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let comparison = state.frame.comparison;
         // Moving the snapshot into the round must not consume the independent
         // cursor/projection that owns every later source publication.
-        let actor = delivery::QuerySource::new(self.peer_id, comparison, credentials.clone(), projection, cursor, revision);
+        let actor = source::QuerySource::new(self.peer_id, comparison, credentials.clone(), projection, cursor, revision);
         let (commands, receiver) = mpsc::channel(8);
         let (stop, canceled) = oneshot::channel();
         let (stopped, done) = oneshot::channel();
@@ -163,7 +157,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             standing.commands.clone()
         };
         let (response, result) = oneshot::channel();
-        commands.send(delivery::Refresh { number, known, response }).await.map_err(|_| anyhow::anyhow!("query source stopped"))?;
+        commands.send(source::Refresh { number, known, response }).await.map_err(|_| anyhow::anyhow!("query source stopped"))?;
         result.await.map_err(|_| anyhow::anyhow!("query source stopped"))?
     }
 

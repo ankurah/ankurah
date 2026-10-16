@@ -384,7 +384,7 @@ async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree(
         Box::new(Sender(peer)),
     )
     .await?;
-    let handler = crate::peer_subscription::SubscriptionHandler::new(peer, &node);
+    let handler = crate::peer_subscription::SubscriptionHandler::new(peer);
     let query = proto::QueryId::new();
     handler.subscribe_query(&node, proto::RequestId::new(), Vec::new(), query, selection(Some(2)), Some(&DEFAULT_CONTEXT), 1, None).await?;
     let (_, original_tree) = handler.query_tree_for_test(query).await.unwrap();
