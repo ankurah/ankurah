@@ -1,0 +1,12 @@
+{
+  "observed": [],
+  "registered": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "status": "registered",
+      "target": "event_dag",
+      "workloads": []
+    }
+  ]
+}
