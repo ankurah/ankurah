@@ -1,0 +1,37 @@
+{
+  "id": "38866095415-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "7095ac8d",
+      "url": "https://github.com/ankurah/ankurah/commit/7095ac8dbb0a9d95a0f99890e8829a01e2197003"
+    },
+    {
+      "kind": "release",
+      "label": "ankql-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.6.0"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.6.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.6.0"
+    },
+    {
+      "kind": "pr",
+      "label": "#151",
+      "url": "https://github.com/ankurah/ankurah/pull/151"
+    }
+  ],
+  "repeat": false,
+  "run_id": "38866095415-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2025-10-10T19:58:02-07:00",
+    "label": "7095ac8dbb0a9d95a0f99890e8829a01e2197003",
+    "ref": "7095ac8dbb0a9d95a0f99890e8829a01e2197003",
+    "repository": "ankurah/ankurah",
+    "sha": "7095ac8dbb0a9d95a0f99890e8829a01e2197003"
+  },
+  "status": "unsupported"
+}
