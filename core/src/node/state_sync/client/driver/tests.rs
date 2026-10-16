@@ -369,3 +369,18 @@ async fn independently_covered_round_chunk_releases_reservation_without_waiting_
     assert_eq!(driver.application_jobs, 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn older_actual_head_does_not_fail_when_later_target_history_is_not_local_yet() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let later = edit(entity.id(), entity.head(), 92);
+    let target = proto::Clock::singleton(&later);
+    assert!(node.storage.get_events(vec![later.id()]).await?.is_empty());
+    assert!(!covers_target(&node, &entity.head(), &target).await?, "missing future history is uncovered, not a stream application failure");
+    driver.goals.add(entity.id(), target, false)?;
+    driver.observe_head(&node, entity.id(), entity.head()).await?;
+    assert!(!driver.goals.covered(), "an older successful application must not certify that later target");
+    assert_eq!(entity.head().entries().len(), 1);
+    Ok(())
+}

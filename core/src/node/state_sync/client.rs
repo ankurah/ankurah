@@ -124,7 +124,13 @@ where
     if actual == target || target.entries().iter().all(|entry| actual.entries().contains(entry)) {
         return Ok(true);
     }
-    let relation = crate::event_dag::compare(LocalEventGetter::new(node.storage.clone(), node.durable), actual, target, 256).await?;
+    let relation = match crate::event_dag::compare(LocalEventGetter::new(node.storage.clone(), node.durable), actual, target, 256).await {
+        Ok(relation) => relation,
+        // A later target can be registered before its data/history applies.
+        // Missing local history proves neither coverage nor an invalid stream.
+        Err(RetrievalError::EventNotFound(_)) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     Ok(matches!(
         relation.relation,
         crate::event_dag::AbstractCausalRelation::Equal | crate::event_dag::AbstractCausalRelation::StrictDescends { .. }
