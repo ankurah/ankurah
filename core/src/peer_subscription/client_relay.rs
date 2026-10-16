@@ -445,40 +445,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         subscriber.set_last_error(version, error);
     }
 
-    /// Whether a query is established with, or being sent to, this peer.
-    pub(crate) fn has_subscription_with_peer(&self, peer_id: &proto::EntityId) -> bool {
-        self.inner
-            .subscriptions
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .values()
-            .any(|state| matches!(&state.status, Status::Established(peer, _) | Status::Requested(peer, _) if peer == peer_id))
-    }
-
     /// Get the current state of a predicate registration
     pub fn get_status(&self, query_id: proto::QueryId) -> Option<Status> {
         let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
         subscriptions.get(&query_id).map(|info| info.status.clone())
-    }
-
-    /// Get all unique contexts for predicates established or requested with a specific peer
-    /// TODO: update the data structure to do this via a direct lookup rather than having to scan the entire map
-    pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {
-        let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
-        let mut contexts = std::collections::HashSet::new();
-
-        for (_, state) in subscriptions.iter() {
-            match &state.status {
-                Status::Established(established_peer, _) | Status::Requested(established_peer, _) => {
-                    if established_peer == peer_id {
-                        contexts.extend(state.content.sessions.current());
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        contexts
     }
 
     /// Register predicates on available durable peer subscriptions
