@@ -465,6 +465,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let comparison = state.frame.comparison;
     let peer = server.peer_connections.get(&client.id).unwrap();
     let (_, original_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
+    crate::peer_subscription::RemoteQuerySubscriber::stream_bound(&query.weak(), 1, stream.request.clone(), Arc::new(|| false));
     let receive = receive_state(&client, server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream);
     tokio::pin!(receive);
     assert!(futures::poll!(&mut receive).is_pending());

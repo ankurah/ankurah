@@ -474,7 +474,27 @@ impl Driver {
                         self.enqueue(node, peer, credentials, owner, delta, Some(repair_target))?;
                     }
                 }
-                StateItem::RepairUnavailable { entity_id, .. } => bail!("peer cannot repair required state for {entity_id}"),
+                StateItem::RepairUnavailable { entity_id, target } => {
+                    let required = |goals: &Goals| {
+                        goals.rows.get(&entity_id).is_some_and(|rows| rows.values().any(|goal| goal.head == target && !goal.covered))
+                    };
+                    if !required(&self.goals) && !self.publications.iter().any(|publication| required(&publication.goals)) {
+                        continue;
+                    }
+                    let actual =
+                        self.observed.get(&entity_id).cloned().or_else(|| node.entities.get(&entity_id).map(|entity| entity.head()));
+                    if let Some(head) = actual {
+                        if covers_target(node, &head, &target).await? {
+                            self.observe(
+                                node,
+                                Applied { owner: Owner::Repair, id: entity_id, head: Some(head), change: None, bytes: 0, repair: None },
+                            )
+                            .await?;
+                            continue;
+                        }
+                    }
+                    bail!("peer cannot repair required state for {entity_id}");
+                }
             }
         }
         Ok(answers)
@@ -1011,3 +1031,6 @@ impl Driver {
     pub fn ids(&self) -> Vec<proto::EntityId> { self.projection.members.keys().copied().collect() }
     pub fn refresh_handle(&self) -> RefreshHandle { self.refresh.clone() }
 }
+
+#[cfg(test)]
+mod tests;
