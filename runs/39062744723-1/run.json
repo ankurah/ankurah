@@ -1,0 +1,319 @@
+{
+  "build_sha256": "30f231ae37ab9a5529f6556f59302e32bf36ca9b1500bf68b5782a09ee832d79",
+  "comparison_key": "864cf7f9f19cdd04da6231672b207d243fe966e68ef5c034cd387a4f4c018cbf",
+  "compiler": {
+    "target": "x86_64-unknown-linux-gnu",
+    "version": "rustc 1.97.0-nightly (ca9a134e0 2026-04-26)"
+  },
+  "harness": {
+    "description": "Historical DAG harness; end-to-end lanes excluded.",
+    "id": "dag-cloned-drain-v1",
+    "series_generation": "1",
+    "sha256": "b03583f7dc075e2de6b2d00b228fc39ac7fabad732639ccafadb4d3083f1e206",
+    "source_url": "https://github.com/ankurah/ankurah/tree/045ffb3652e6c78f88e955e18c3a577d7920e456/core/benches",
+    "workload_semantics": {
+      "compare/diamond_chain/16": "dag-cloned-compare-assert-v1",
+      "compare/diamond_chain/4": "dag-cloned-compare-assert-v1",
+      "compare/diamond_chain/64": "dag-cloned-compare-assert-v1",
+      "compare/disjoint/10": "dag-cloned-compare-assert-v1",
+      "compare/disjoint/100": "dag-cloned-compare-assert-v1",
+      "compare/linear_deep/10": "dag-cloned-compare-assert-v1",
+      "compare/linear_deep/100": "dag-cloned-compare-assert-v1",
+      "compare/linear_deep/1000": "dag-cloned-compare-assert-v1",
+      "compare/wide_antichain/16": "dag-cloned-compare-assert-v1",
+      "compare/wide_antichain/4": "dag-cloned-compare-assert-v1",
+      "compare/wide_antichain/64": "dag-cloned-compare-assert-v1",
+      "layers/diamond_chain_drain/16": "dag-cloned-diamond-drain-assert-v1",
+      "layers/diamond_chain_drain/4": "dag-cloned-diamond-drain-assert-v1",
+      "layers/diamond_chain_drain/64": "dag-cloned-diamond-drain-assert-v1"
+    }
+  },
+  "id": "39062744723-1",
+  "kind": "hosted",
+  "lockfile_sha256": "a2bf0efebf4eafb308f4a43a6ac3f0c3ff35059127f865de5894ad073947e296",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "045ffb36",
+      "url": "https://github.com/ankurah/ankurah/commit/045ffb3652e6c78f88e955e18c3a577d7920e456"
+    },
+    {
+      "kind": "pr",
+      "label": "#457",
+      "url": "https://github.com/ankurah/ankurah/pull/457"
+    }
+  ],
+  "measurements": [
+    {
+      "confidence_level": 0.95,
+      "lower": 73550.13902173913,
+      "median": 73825.48062745098,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/diamond_chain/16:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 74311.56793103449,
+      "workload": "compare/diamond_chain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 16876.60132004146,
+      "median": 16922.009083795703,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/diamond_chain/4:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 16993.184111357106,
+      "workload": "compare/diamond_chain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 314005.6621204538,
+      "median": 316264.41191067,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/diamond_chain/64:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 316718.6584390097,
+      "workload": "compare/diamond_chain/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 24315.178790937076,
+      "median": 24382.572483221476,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/disjoint/10:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 24434.69385408899,
+      "workload": "compare/disjoint/10"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 261230.19623233908,
+      "median": 261768.42857142858,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/disjoint/100:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 263484.3229166667,
+      "workload": "compare/disjoint/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 13303.211653393839,
+      "median": 13332.324521774523,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/linear_deep/10:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 13366.483745421247,
+      "workload": "compare/linear_deep/10"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 131889.62053571426,
+      "median": 132293.23043592437,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/linear_deep/100:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 133273.15784438775,
+      "workload": "compare/linear_deep/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 2588653.0086206896,
+      "median": 2597220.421875,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/linear_deep/1000:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 2609927.3725490198,
+      "workload": "compare/linear_deep/1000"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 25682.000856921717,
+      "median": 25777.963176406927,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/wide_antichain/16:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 25820.729493087558,
+      "workload": "compare/wide_antichain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 8626.310256410256,
+      "median": 8644.365720827715,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/wide_antichain/4:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 8689.998934609474,
+      "workload": "compare/wide_antichain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 97800.26114766081,
+      "median": 98105.24906015038,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-compare-assert-v1:compare/wide_antichain/64:14317db8fe7eec903a92d4b690a35798cb1222d3f58c1a93b24807c75e8eed1a",
+      "unit": "ns",
+      "upper": 98566.03233082706,
+      "workload": "compare/wide_antichain/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 87511.04682539683,
+      "median": 87613.07738095238,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-diamond-drain-assert-v1:layers/diamond_chain_drain/16:9e5b14cef926377dd87f8d7796ce6f46f81bce5b6bbf127457eadb1338f56c01",
+      "unit": "ns",
+      "upper": 87828.89007936508,
+      "workload": "layers/diamond_chain_drain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 19802.459280936455,
+      "median": 19869.835339026915,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-diamond-drain-assert-v1:layers/diamond_chain_drain/4:9e5b14cef926377dd87f8d7796ce6f46f81bce5b6bbf127457eadb1338f56c01",
+      "unit": "ns",
+      "upper": 19960.95981396321,
+      "workload": "layers/diamond_chain_drain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 439171.85465768795,
+      "median": 441628.9592999593,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-cloned-diamond-drain-assert-v1:layers/diamond_chain_drain/64:9e5b14cef926377dd87f8d7796ce6f46f81bce5b6bbf127457eadb1338f56c01",
+      "unit": "ns",
+      "upper": 445778.5720611916,
+      "workload": "layers/diamond_chain_drain/64"
+    }
+  ],
+  "parameters": {
+    "confidence_level": 0.95,
+    "measurement_seconds": 3,
+    "sample_size": 40,
+    "warm_up_seconds": 1
+  },
+  "profile": "release",
+  "profile_sha256": "37ce2f5418fe38c3a4c335ae06ef433aba8e57d322020730ce3f391d9cc351e5",
+  "raw_url": "https://raw.githubusercontent.com/ankurah/ankurah/benchmark-data/runs/39062744723-1/raw.json",
+  "recorded_at": "2026-10-17T19:30:45.940180+00:00",
+  "run_url": "https://github.com/ankurah/ankurah/actions/runs/39062744723/attempts/1",
+  "runner": {
+    "hardware": "AMD EPYC 9V45 96-Core Processor; 4 logical CPUs",
+    "id": "github-ubuntu-24.04",
+    "label": "github-ubuntu-24.04",
+    "os": "Linux-6.17.0-1022-azure-x86_64-with-glibc2.39"
+  },
+  "source": {
+    "committed_at": "2026-10-04T17:02:16-07:00",
+    "label": "045ffb3652e6c78f88e955e18c3a577d7920e456",
+    "ref": "045ffb3652e6c78f88e955e18c3a577d7920e456",
+    "repository": "ankurah/ankurah",
+    "sha": "045ffb3652e6c78f88e955e18c3a577d7920e456"
+  },
+  "status": "ok",
+  "target_results": [
+    {
+      "id": "ankurah-core/event_dag",
+      "original_workloads": [
+        "compare/linear_deep/10",
+        "compare/linear_deep/100",
+        "compare/linear_deep/1000",
+        "compare/diamond_chain/4",
+        "compare/diamond_chain/16",
+        "compare/diamond_chain/64",
+        "compare/wide_antichain/4",
+        "compare/wide_antichain/16",
+        "compare/wide_antichain/64",
+        "compare/disjoint/10",
+        "compare/disjoint/100",
+        "layers/diamond_chain_drain/4",
+        "layers/diamond_chain_drain/16",
+        "layers/diamond_chain_drain/64"
+      ],
+      "status": "ok"
+    }
+  ]
+}
