@@ -1,0 +1,33 @@
+{
+  "comparison_key": "e5cb8c432d7b39aaeba54d681a3297d5ed5c40450e1749162c18961956a9873a",
+  "id": "39021153189-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "9f2afc35",
+      "url": "https://github.com/ankurah/ankurah/commit/9f2afc358499e45020de5b44ce21df2b7adefb57"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-types-v0.9.0",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-types-v0.9.0"
+    },
+    {
+      "kind": "pr",
+      "label": "#420",
+      "url": "https://github.com/ankurah/ankurah/pull/420"
+    }
+  ],
+  "repeat": false,
+  "run_id": "39021153189-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2026-07-25T19:55:12-07:00",
+    "label": "9f2afc358499e45020de5b44ce21df2b7adefb57",
+    "ref": "9f2afc358499e45020de5b44ce21df2b7adefb57",
+    "repository": "ankurah/ankurah",
+    "sha": "9f2afc358499e45020de5b44ce21df2b7adefb57"
+  },
+  "status": "ok"
+}
