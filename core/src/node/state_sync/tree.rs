@@ -433,7 +433,7 @@ impl Snapshot {
         for (index, (address, id)) in rows.iter().take(super::LEAF_PAGE).enumerate() {
             let leaf = proto::KnownLeaf {
                 key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
-                entity: proto::KnownEntity { entity_id: **id, head: self.states[*id].payload.state.head.clone() },
+                entity: proto::EntityHead { entity_id: **id, head: self.states[*id].payload.state.head.clone() },
             };
             let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
             let overhead = bincode::serialized_size(&proto::StateAnswer::Leaves(proto::LeafPage {

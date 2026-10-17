@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 mod compact_initial_page;
 
-use crate::{Attested, Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId, EntityState, KnownEntity};
+use crate::{Attested, Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityHead, EntityId, EntityState};
 
 /// A responder-issued state stream handle, scoped to one peer connection/query generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -223,9 +223,11 @@ pub struct SnapshotPage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownLeaf {
+    /// Canonical property values selected by the TreeSpec's KeySpec. The full
+    /// address appends the entity ID; this key is empty for entity-ID-only trees.
     pub key: Vec<u8>,
     /// The actual clock avoids another round trip when constructing an EventBridge.
-    pub entity: KnownEntity,
+    pub entity: EntityHead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

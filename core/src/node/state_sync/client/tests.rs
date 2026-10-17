@@ -7,7 +7,7 @@ fn id(n: u8) -> proto::EntityId { proto::EntityId::from_bytes([n; 32]) }
 fn address(n: u8) -> Vec<u8> { leaf_address(&[], id(n)) }
 fn spec() -> proto::TreeSpec { proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True) }
 fn leaf(n: u8) -> proto::KnownLeaf {
-    proto::KnownLeaf { key: vec![], entity: proto::KnownEntity { entity_id: id(n), head: proto::Clock::default() } }
+    proto::KnownLeaf { key: vec![], entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() } }
 }
 
 #[test]

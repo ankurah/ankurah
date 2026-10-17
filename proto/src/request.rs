@@ -31,9 +31,9 @@ pub struct NodeRequest {
     pub body: NodeRequestBody,
 }
 
-/// Entity with an actual known clock, supplied selectively during state comparison.
+/// An entity's identity and causal frontier.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub struct KnownEntity {
+pub struct EntityHead {
     pub entity_id: EntityId,
     pub head: Clock,
 }

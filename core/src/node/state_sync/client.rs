@@ -276,7 +276,7 @@ fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow
             ensure!(ids.insert(entity_id), "duplicate entity in snapshot page");
             Ok(proto::KnownLeaf {
                 key: super::tree::key(spec, state)?,
-                entity: proto::KnownEntity { entity_id, head: state.payload.state.head.clone() },
+                entity: proto::EntityHead { entity_id, head: state.payload.state.head.clone() },
             })
         })
         .collect::<anyhow::Result<_>>()?;

@@ -1538,7 +1538,7 @@ impl Comparison {
                     bounds: page_bounds,
                     leaves: vec![proto::KnownLeaf {
                         key: address[..address.len() - proto::EntityId::BYTE_LEN].to_vec(),
-                        entity: proto::KnownEntity { entity_id: id, head: state.payload.state.head.clone() },
+                        entity: proto::EntityHead { entity_id: id, head: state.payload.state.head.clone() },
                     }],
                 }));
             }

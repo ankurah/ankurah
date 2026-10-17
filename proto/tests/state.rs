@@ -16,10 +16,10 @@ fn wire<T: Serialize + DeserializeOwned>(value: &T) -> T {
 
 fn selection() -> Selection<ankql::ast::Resolved> { Selection::from(Predicate::True) }
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![]), Predicate::True) }
-fn known(n: u8) -> KnownEntity {
-    KnownEntity { entity_id: EntityId::from_bytes([n; 32]), head: Clock::new(vec![(3, EventId::from_bytes([n; 32]))]).unwrap() }
+fn known(n: u8) -> EntityHead {
+    EntityHead { entity_id: EntityId::from_bytes([n; 32]), head: Clock::new(vec![(3, EventId::from_bytes([n; 32]))]).unwrap() }
 }
-fn head(prefix: NodePrefix, bounds: AddressRange, entity: &KnownEntity) -> TreeHead {
+fn head(prefix: NodePrefix, bounds: AddressRange, entity: &EntityHead) -> TreeHead {
     let hash = HeadHash::of(entity.head.ids().map(|id| id.clone().to_bytes()));
     TreeHead { prefix, bounds, digest: Leaf::new(&[], entity.entity_id, hash).element().into() }
 }

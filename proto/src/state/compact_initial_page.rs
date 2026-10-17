@@ -55,7 +55,7 @@ impl<'de> Visitor<'de> for PageVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AddressRange, Clock, EntityId, EventId, KnownEntity, KnownLeaf, KnownRegion, StateAnswer, StateItem};
+    use crate::{AddressRange, Clock, EntityHead, EntityId, EventId, KnownLeaf, KnownRegion, StateAnswer, StateItem};
     use std::ops::Bound;
 
     fn event(index: u32) -> EventId {
@@ -72,7 +72,7 @@ mod tests {
                 .enumerate()
                 .map(|(index, key)| KnownLeaf {
                     key,
-                    entity: KnownEntity {
+                    entity: EntityHead {
                         entity_id: EntityId::from_bytes([index as u8; 32]),
                         head: Clock::new((0..tips).map(|tip| (generation, event(tip as u32))).collect::<Vec<_>>()).unwrap(),
                     },

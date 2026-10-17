@@ -1596,7 +1596,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
         bounds: AddressRange::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
         leaves: vec![proto::KnownLeaf {
             key: vec![],
-            entity: proto::KnownEntity { entity_id: last.payload.entity_id, head: last.payload.state.head },
+            entity: proto::EntityHead { entity_id: last.payload.entity_id, head: last.payload.state.head },
         }],
     }));
     assert!(Comparison::new(snapshot(before).await?, oversized).is_err(), "total leaf cap spans all pages");
