@@ -1,0 +1,28 @@
+{
+  "comparison_key": "ecf430c80d2557adc23ce0a295dc98f8fa845c6fc0f573a3cb666946330a5880",
+  "id": "39062750317-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "ae896279",
+      "url": "https://github.com/ankurah/ankurah/commit/ae8962798085dbf6d717429e4b6566940f0051e1"
+    },
+    {
+      "kind": "pr",
+      "label": "#526",
+      "url": "https://github.com/ankurah/ankurah/pull/526"
+    }
+  ],
+  "repeat": false,
+  "run_id": "39062750317-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2026-10-13T13:36:22-07:00",
+    "label": "ae8962798085dbf6d717429e4b6566940f0051e1",
+    "ref": "ae8962798085dbf6d717429e4b6566940f0051e1",
+    "repository": "ankurah/ankurah",
+    "sha": "ae8962798085dbf6d717429e4b6566940f0051e1"
+  },
+  "status": "ok"
+}
