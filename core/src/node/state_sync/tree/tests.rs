@@ -217,9 +217,9 @@ async fn initial_complete_keeps_complete_inventory_digests_lazy() -> anyhow::Res
         assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
         let known = if count > 64 {
             let mut requester = QueryTree::default().refresh(spec(), (0..count).map(|id| numbered_state(id as u32, 1)).collect()).await?;
-            Some(requester.offer().await?)
+            requester.offer().await?
         } else {
-            None
+            proto::KnownState { spec: spec(), regions: vec![] }
         };
         let reply = crate::node::state_sync::start_comparison(
             &node,
@@ -260,7 +260,7 @@ async fn a_moderate_first_refresh_repairs_changed_heads_without_building_a_diges
         false,
         0,
         query.refresh(spec(), rows.clone()).await?,
-        None,
+        proto::KnownState { spec: spec(), regions: vec![] },
     )
     .await?;
     assert!(matches!(reply.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
@@ -282,7 +282,7 @@ async fn a_moderate_first_refresh_repairs_changed_heads_without_building_a_diges
         false,
         0,
         captured,
-        Some(known),
+        known,
     )
     .await?;
     let proto::StateFrameBody::State { items, progress, .. } = reply.frame.body else { panic!("state") };
@@ -317,7 +317,7 @@ async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_t
         false,
         0,
         query.refresh(spec(), rows.clone()).await?,
-        Some(known.clone()),
+        known.clone(),
     )
     .await?;
     assert!(matches!(initial.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
@@ -335,7 +335,7 @@ async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_t
         false,
         0,
         query.refresh(spec(), larger.clone()).await?,
-        Some(known.clone()),
+        known.clone(),
     )
     .await?;
     assert!(matches!(crossing.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
@@ -356,7 +356,7 @@ async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_t
         false,
         0,
         shrunk,
-        Some(known),
+        known,
     )
     .await?;
     assert!(matches!(final_reply.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
@@ -430,7 +430,7 @@ async fn small_inventory_exceeding_the_byte_budget_falls_back_to_a_summary() -> 
         false,
         0,
         captured,
-        Some(inventory),
+        inventory,
     )
     .await?;
     let proto::StateFrameBody::State { items, progress, .. } = reply.frame.body else { panic!("state") };

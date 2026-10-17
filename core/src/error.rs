@@ -166,6 +166,8 @@ pub enum RequestError {
     SystemNotReady,
     #[error("Server error: {0}")]
     ServerError(String),
+    #[error("source changed too quickly to capture the query; retry later")]
+    StateCaptureBusy,
     #[error("Send error: {0}")]
     SendError(SendError),
     #[error("Internal channel closed")]

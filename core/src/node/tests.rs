@@ -31,7 +31,10 @@ async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> a
                 query_id,
                 version: 1,
                 selection: ankql::ast::Predicate::MemberOf(model).into(),
-                known_state: None,
+                known_state: proto::KnownState {
+                    spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
+                    regions: vec![],
+                },
             },
         },
     );
@@ -348,7 +351,13 @@ async fn canceled_state_requests_release_waiters_and_disconnect_wakes_remaining_
             &node,
             peer,
             &credentials,
-            proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::True.into(), known_state: None },
+            proto::NodeRequestBody::Fetch {
+                selection: ankql::ast::Predicate::True.into(),
+                known_state: proto::KnownState {
+                    spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True),
+                    regions: vec![],
+                },
+            },
         );
         tokio::pin!(request);
         assert!(futures::poll!(&mut request).is_pending());

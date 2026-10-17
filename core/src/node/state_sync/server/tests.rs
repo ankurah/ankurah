@@ -32,6 +32,7 @@ async fn node() -> anyhow::Result<(TestNode, proto::EntityId, Arc<Mutex<Vec<prot
     Ok((node, peer, messages))
 }
 fn spec() -> proto::TreeSpec { proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True) }
+fn unknown() -> proto::KnownState { proto::KnownState { spec: spec(), regions: vec![] } }
 async fn snapshot(states: Vec<proto::Attested<proto::EntityState>>) -> anyhow::Result<Snapshot> {
     super::super::QueryTree::default().refresh(spec(), states).await
 }
@@ -76,7 +77,7 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
     let mut requester = snapshot(source.clone()).await?;
     let known = requester.offer().await?;
     assert!(known.regions.len() > 1);
-    let mut equal = Comparison::new(snapshot(source.clone()).await?, Some(known.clone()))?;
+    let mut equal = Comparison::new(snapshot(source.clone()).await?, known.clone())?;
     assert!(matches!(equal.work.front(), Some(Work::CompareFrontier(_))));
     let StateFrameBody::State { items, progress, .. } = equal.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
     assert_eq!(progress, ComparisonProgress::Complete);
@@ -86,18 +87,18 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
         known.regions.iter().position(|region| matches!(region, proto::KnownRegion::Summary(head) if head.digest.count() == 0)).unwrap();
     let mut withheld = known.clone();
     withheld.regions.remove(empty);
-    let partial = Comparison::new(snapshot(source.clone()).await?, Some(withheld))?;
+    let partial = Comparison::new(snapshot(source.clone()).await?, withheld)?;
     assert!(!partial.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))), "a withheld gap cannot claim aggregate equality");
 
     let mut mixed = known.clone();
     let proto::KnownRegion::Summary(head) = &mixed.regions[empty] else { unreachable!() };
     mixed.regions[empty] = proto::KnownRegion::Leaves(requester.page(head.bounds.clone())?);
-    let mixed = Comparison::new(snapshot(source.clone()).await?, Some(mixed))?;
+    let mixed = Comparison::new(snapshot(source.clone()).await?, mixed)?;
     assert!(!mixed.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))));
 
     let mut overlap = known;
     overlap.regions.push(overlap.regions[0].clone());
-    assert!(Comparison::new(snapshot(source).await?, Some(overlap)).is_err());
+    assert!(Comparison::new(snapshot(source).await?, overlap).is_err());
     Ok(())
 }
 
@@ -115,7 +116,7 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     let added = states(1, 8).pop().unwrap();
     let new_id = added.payload.entity_id;
     current.push(added);
-    let mut comparison = Comparison::new(snapshot(current).await?, Some(known))?;
+    let mut comparison = Comparison::new(snapshot(current).await?, known)?;
     let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
     assert!(matches!(items.as_slice(), [StateItem::NeedLeaves(bounds)] if *bounds == super::super::whole()));
     comparison.answer(vec![StateAnswer::Leaves(requester.page(super::super::whole())?)])?;
@@ -150,7 +151,7 @@ async fn wider_responder_clocks_split_outbound_inventory_without_repairing_share
                 .collect::<Vec<_>>(),
         )?;
     }
-    let mut comparison = Comparison::new(snapshot(current).await?, None)?;
+    let mut comparison = Comparison::new(snapshot(current).await?, unknown())?;
     comparison.work.clear();
     comparison.leaves.push(super::super::whole());
     comparison.answer(vec![StateAnswer::Leaves(request)])?;
@@ -217,7 +218,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
         start = opposite(&bounds.end);
         regions.push(proto::KnownRegion::Summary(requester.head(bounds).await?));
     }
-    let mut comparison = Comparison::new(snapshot(current).await?, Some(proto::KnownState { spec: spec(), regions }))?;
+    let mut comparison = Comparison::new(snapshot(current).await?, proto::KnownState { spec: spec(), regions })?;
     let mut answers = Vec::new();
     while !comparison.work.is_empty() {
         let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
@@ -277,7 +278,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
         regions.push(proto::KnownRegion::Summary(requester.head(head.bounds).await?));
     }
     let known = proto::KnownState { spec: spec(), regions };
-    let mut comparison = Comparison::new(responder, Some(known))?;
+    let mut comparison = Comparison::new(responder, known)?;
     let mut repairs = Vec::new();
     let mut narrower_questions = 0;
     let mut leaf_pages = 0;
@@ -318,12 +319,13 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
 }
 
 #[tokio::test]
-async fn small_cold_and_inline_partial_inventories_complete_in_frame_zero() -> anyhow::Result<()> {
+async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let source = states(8, 16);
     let mut cached = snapshot(source[..4].to_vec()).await?;
     let known = cached.offer().await?;
-    for (known, repairs) in [(None, 8), (Some(known), 4)] {
+    let empty = snapshot(vec![]).await?.offer().await?;
+    for (known, repairs) in [(unknown(), 8), (empty, 8), (known, 4)] {
         let initial =
             start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(source.clone()).await?, known)
                 .await?;
@@ -353,7 +355,7 @@ async fn snapshot_pages_tile_gaps_split_by_bytes_and_resume_after_an_oversized_r
     }
     source[2].payload.state.state_buffers.0.insert("lww".into(), vec![9; PAGE_BYTES * 2]);
     let large = source[2].clone();
-    let mut comparison = Comparison::new(snapshot(source.clone()).await?, None)?;
+    let mut comparison = Comparison::new(snapshot(source.clone()).await?, unknown())?;
     let mut start = super::super::whole().start;
     let mut received = Vec::new();
     let mut chunks = Vec::new();
@@ -413,7 +415,7 @@ async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_anoth
     let (node, _, _) = node().await?;
     let source = states(1, 10);
     let id = source[0].payload.entity_id;
-    let mut comparison = Comparison::new(snapshot(source.clone()).await?, None)?;
+    let mut comparison = Comparison::new(snapshot(source.clone()).await?, unknown())?;
     comparison.known_clocks.insert(id, source[0].payload.state.head.clone());
     let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else {
         panic!("state frame")
@@ -421,7 +423,7 @@ async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_anoth
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items.as_slice(), [StateItem::Leaves(page)] if page.leaves[0].entity.entity_id == id));
     assert!(comparison.offered.is_empty(), "equal supplied state must not be sent again");
-    let mut comparison = Comparison::new(snapshot(source).await?, None)?;
+    let mut comparison = Comparison::new(snapshot(source).await?, unknown())?;
     assert!(comparison.reply(&node, &vec![], true, false, 0).await.is_err(), "an exhaustive catalog page cannot skip an inadmissible row");
     Ok(())
 }
@@ -430,7 +432,7 @@ async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_anoth
 async fn empty_inventory_is_complete_without_questions() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, None).await?;
+        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
     let (items, progress) = state_items(&initial.frame);
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items, [StateItem::Snapshots(page)] if page.states.is_empty()));
@@ -443,7 +445,8 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
     let origin = proto::RequestId::new();
     let query = proto::QueryId::new();
     let initial =
-        start_comparison(&node, peer, origin.clone(), vec![11], vec![], Some((query, 7)), false, 0, snapshot(vec![]).await?, None).await?;
+        start_comparison(&node, peer, origin.clone(), vec![11], vec![], Some((query, 7)), false, 0, snapshot(vec![]).await?, unknown())
+            .await?;
     let connection = node.peer_connections.get(&peer).unwrap();
     let session = connection.comparisons.get(&initial.frame.comparison).unwrap();
     let guard = session.state.lock().await;
@@ -470,7 +473,7 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
 async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, None).await?;
+        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
     let id = initial.frame.comparison;
     let request = proto::RequestId::new();
     continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
@@ -513,7 +516,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         false,
         0,
         snapshot(states(200, PAGE_BYTES / 2)).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -563,7 +566,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
     let mut first_id = None;
     for index in 0..MAX_COMPARISONS + 2 {
         let request = if index == 0 { first.clone() } else { proto::RequestId::new() };
-        let initial = start_comparison(&node, peer, request, vec![], vec![], None, false, 0, snapshot(vec![]).await?, None).await?;
+        let initial = start_comparison(&node, peer, request, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
         first_id.get_or_insert(initial.frame.comparison);
         close_state(&node, peer, initial.frame.comparison, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, vec![])
             .await?;
@@ -572,7 +575,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
     assert!(
         matches!(connection.comparisons.replay_initial(&first, &[], &[])?, Some(proto::NodeResponseBody::ComparisonUnavailable { comparison }) if Some(comparison) == first_id)
     );
-    assert!(start_comparison(&node, peer, first, vec![], vec![], None, false, 0, snapshot(vec![]).await?, None).await.is_err());
+    assert!(start_comparison(&node, peer, first, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await.is_err());
     Ok(())
 }
 
@@ -590,7 +593,7 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -655,7 +658,7 @@ async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyho
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -706,7 +709,7 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
         false,
         0,
         snapshot(source).await?,
-        Some(known),
+        known,
     )
     .await?;
     let id = initial.frame.comparison;
@@ -754,7 +757,7 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
         false,
         0,
         snapshot(states(200, PAGE_BYTES / 2)).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -796,9 +799,19 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let first = snapshot(states(1, 8)).await?;
     let captured = Arc::downgrade(first.states.values().next().unwrap());
     let old = first.states.values().next().unwrap().payload.clone();
-    let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], Some((proto::QueryId::new(), 1)), false, 0, first, None)
-            .await?;
+    let initial = start_comparison(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((proto::QueryId::new(), 1)),
+        false,
+        0,
+        first,
+        unknown(),
+    )
+    .await?;
     let id = initial.frame.comparison;
     let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
@@ -880,7 +893,7 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -933,7 +946,7 @@ async fn membership_only_publications_have_bounded_application_receipts() -> any
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -992,7 +1005,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -1061,7 +1074,7 @@ async fn absent_event_bridge_is_rejected_before_it_can_create_an_unrepairable_ta
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let id = initial.frame.comparison;
@@ -1096,7 +1109,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
         false,
         0,
         snapshot(source.clone()).await?,
-        None,
+        unknown(),
     )
     .await?;
     assert_eq!(state_items(&initial.frame).1, ComparisonProgress::Complete);
@@ -1191,7 +1204,8 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
         None,
     );
     let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![source]).await?, None).await?;
+        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![source]).await?, unknown())
+            .await?;
     continue_state(
         &node,
         peer,
@@ -1224,9 +1238,19 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
 async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_output() -> anyhow::Result<()> {
     let (node, peer, messages) = node().await?;
     let query = proto::QueryId::new();
-    let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], Some((query, 1)), false, 0, snapshot(vec![]).await?, None)
-            .await?;
+    let initial = start_comparison(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((query, 1)),
+        false,
+        0,
+        snapshot(vec![]).await?,
+        unknown(),
+    )
+    .await?;
     let id = initial.frame.comparison;
     let item = live_item(1);
     assert!(queue_live(&node, peer, id, 1, vec![item; MAX_LIVE_ITEMS + 1]).is_err());
@@ -1264,7 +1288,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
             catalog,
             0,
             snapshot(vec![]).await?,
-            None,
+            unknown(),
         )
         .await?;
         let id = initial.frame.comparison;
@@ -1349,7 +1373,7 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
         let source = ordered_states(count, 2);
         let mut requester = snapshot(source.clone()).await?;
         let known = requester.offer().await?;
-        let mut comparison = Comparison::new(snapshot(source).await?, Some(known))?;
+        let mut comparison = Comparison::new(snapshot(source).await?, known)?;
         assert_eq!(comparison.known_clocks.len(), count);
         assert!(comparison.work.iter().all(|work| matches!(work, Work::InitialLeaves(_))));
         let items = initial_items(&node, &mut comparison).await?;
@@ -1360,7 +1384,7 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
     let mut after = before.clone();
     after[17].payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([2; 32]));
     let mut requester = snapshot(before).await?;
-    let mut comparison = Comparison::new(snapshot(after.clone()).await?, Some(requester.offer().await?))?;
+    let mut comparison = Comparison::new(snapshot(after.clone()).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert!(
         matches!(items.as_slice(), [StateItem::Repair { target, delta }] if delta.entity_id == after[17].payload.entity_id && *target == after[17].payload.state.head)
@@ -1422,7 +1446,7 @@ async fn initial_diff_keeps_cross_page_moves_and_readable_former_member_repairs(
     tx.commit().await?;
     let captured = query.refresh(position_spec(), current.clone()).await?;
     let expected = captured.members();
-    let mut comparison = Comparison::new(captured, Some(known))?;
+    let mut comparison = Comparison::new(captured, known)?;
     assert_eq!(comparison.known_clocks.len(), 256, "later pages are loaded before the first moved key is visited");
     let items = initial_items(&node, &mut comparison).await?;
     let mut repairs = HashMap::new();
@@ -1465,7 +1489,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     let mut current = ordered_states(1024, 1);
     current.extend(old);
     let expected = current.iter().take(1024).map(|state| state.payload.entity_id).collect::<HashSet<_>>();
-    let mut comparison = Comparison::new(snapshot(current).await?, Some(requester.offer().await?))?;
+    let mut comparison = Comparison::new(snapshot(current).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     let mut incoming = HashSet::new();
     for item in items {
@@ -1485,7 +1509,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     }
     tx.commit().await?;
     let mut requester = snapshot(source).await?;
-    let mut comparison = Comparison::new(snapshot(vec![]).await?, Some(requester.offer().await?))?;
+    let mut comparison = Comparison::new(snapshot(vec![]).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Leaves(page) if page.leaves.is_empty())).count(), 16);
     assert_eq!(
@@ -1508,7 +1532,7 @@ async fn alternating_initial_points_expand_one_bounded_page_at_a_time() -> anyho
         state.payload.entity_id = proto::EntityId::from_bytes(id);
     }
     let mut requester = snapshot(before).await?;
-    let mut comparison = Comparison::new(snapshot(current).await?, Some(requester.offer().await?))?;
+    let mut comparison = Comparison::new(snapshot(current).await?, requester.offer().await?)?;
     assert_eq!(comparison.work.len(), 16);
     let Some(Work::InitialLeaves(page)) = comparison.work.pop_front() else { panic!("initial page") };
     comparison.expand_initial_leaves(page)?;
@@ -1533,7 +1557,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let page = requester.page(AddressRange::new(std::ops::Bound::Included(point.clone()), std::ops::Bound::Included(point)))?;
     let mut exact = Comparison::new(
         snapshot(before.clone()).await?,
-        Some(proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Leaves(page.clone())] }),
+        proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Leaves(page.clone())] },
     )?;
     let point_work = exact.work.iter().position(|work| matches!(work, Work::InitialLeaves(_))).unwrap();
     let Some(Work::InitialLeaves(validated)) = exact.work.remove(point_work) else { panic!("validated exact point") };
@@ -1548,7 +1572,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     assert!(items.iter().all(|item| matches!(item, StateItem::Snapshots(_))), "unknown gaps still require membership output");
     assert_eq!(items.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 2047);
     known.regions.push(known.regions[0].clone());
-    assert!(Comparison::new(snapshot(before.clone()).await?, Some(known)).is_err(), "overlapping pages must fail before comparison");
+    assert!(Comparison::new(snapshot(before.clone()).await?, known).is_err(), "overlapping pages must fail before comparison");
     let extra = positioned_state(3, 10000, 1)?;
     let mut keyed = super::super::QueryTree::default().refresh(position_spec(), vec![extra]).await?;
     let mut duplicate = keyed.offer().await?;
@@ -1561,7 +1585,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     second.bounds.start = std::ops::Bound::Included(addr);
     duplicate.regions.push(proto::KnownRegion::Leaves(second));
     assert!(
-        Comparison::new(super::super::QueryTree::default().refresh(position_spec(), vec![]).await?, Some(duplicate)).is_err(),
+        Comparison::new(super::super::QueryTree::default().refresh(position_spec(), vec![]).await?, duplicate).is_err(),
         "global duplicate IDs must fail even at distinct keys/pages"
     );
     let mut oversized = requester.offer().await?;
@@ -1575,7 +1599,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
             entity: proto::KnownEntity { entity_id: last.payload.entity_id, head: last.payload.state.head },
         }],
     }));
-    assert!(Comparison::new(snapshot(before).await?, Some(oversized)).is_err(), "total leaf cap spans all pages");
+    assert!(Comparison::new(snapshot(before).await?, oversized).is_err(), "total leaf cap spans all pages");
     Ok(())
 }
 
@@ -1613,7 +1637,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     tx.set_state(&Default::default(), &former).await?;
     tx.commit().await?;
     let empty = super::super::QueryTree::default().refresh(spec.clone(), vec![]).await?;
-    let mut comparison = Comparison::new(empty, Some(known.clone()))?;
+    let mut comparison = Comparison::new(empty, known.clone())?;
     let Some(Work::InitialLeaves(page)) = comparison.work.pop_front() else { panic!("initial region") };
     comparison.expand_initial_leaves(page)?;
     assert!(comparison.work.iter().any(|work| matches!(work, Work::SendLeaves(bounds) if *bounds == super::super::whole())));
@@ -1628,7 +1652,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     assert_eq!(comparison.offered.get(&former.payload.entity_id), Some(&former.payload.state.head));
     let moved = text_state("a".into(), 2)?;
     let captured = super::super::QueryTree::default().refresh(spec, vec![moved.clone()]).await?;
-    let mut comparison = Comparison::new(captured, Some(known))?;
+    let mut comparison = Comparison::new(captured, known)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert!(items.iter().any(|item| matches!(item, StateItem::Leaves(page) if page.leaves.len() == 1 && page.leaves[0].entity.entity_id == moved.payload.entity_id)));
     assert_eq!(comparison.offered.get(&moved.payload.entity_id), Some(&moved.payload.state.head));
@@ -1666,7 +1690,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
     }
     let known = proto::KnownState { spec: spec(), regions };
     assert!(bincode::serialized_size(&known)? > INITIAL_INVENTORY_BYTES as u64);
-    assert!(Comparison::new(snapshot(vec![]).await?, Some(known)).is_err());
+    assert!(Comparison::new(snapshot(vec![]).await?, known).is_err());
     Ok(())
 }
 
@@ -1696,7 +1720,7 @@ async fn shared_live_target_survives_until_every_offering_publication_is_applied
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&initial.frame.comparison).unwrap();
@@ -1743,7 +1767,7 @@ async fn first_live_frame_after_idle_starts_a_fresh_progress_timeout() -> anyhow
         false,
         0,
         snapshot(vec![]).await?,
-        None,
+        unknown(),
     )
     .await?;
     let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&initial.frame.comparison).unwrap();

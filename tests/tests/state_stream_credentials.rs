@@ -12,7 +12,7 @@ use ankurah::{
     proto::{self, Attested},
     Mutable, Node, View,
 };
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use common::{GatedConnection, Peek, Record, RecordView, SledStorageEngine, StorageEngine, Subscribe, TestWatcher};
 use std::{
     sync::{Arc, Mutex},
@@ -372,5 +372,222 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
         assert_eq!(*credentials, [Credential(1)], "initial repair and Applied must retain alpha authority despite the beta standing query: {request:?}");
     }
     assert!(agent.subscriptions.lock().unwrap().iter().any(|(credential, query, _)| credential.0 == 2 && *query == broader.query_id()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_fetch_abandons_with_its_credential_and_preserves_another_query() -> Result<()> {
+    let agent = CredentialAgent::default();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    server.system.create().await?;
+    let writer = server.context_async(Credential(0)).await?;
+    let trx = writer.begin();
+    let fetched_id = trx.create(&Record { title: "fetch-only".into(), artist: "initial".into() }).await?.id();
+    let standing = trx.create(&Record { title: "standing".into(), artist: "initial".into() }).await?.read()?;
+    trx.commit().await?;
+
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let metadata = Arc::new(Mutex::new(None::<proto::NodeResponse>));
+    let responses = Arc::new(Mutex::new(Vec::<(proto::RequestId, proto::NodeResponseBody)>::new()));
+    let response_arrived = Arc::new(tokio::sync::Notify::new());
+    let (_connection, gate) = GatedConnection::new(&server, &client, {
+        let metadata = metadata.clone();
+        let responses = responses.clone();
+        let response_arrived = response_arrived.clone();
+        move |message| {
+            if let proto::NodeMessage::Response(response) = message {
+                responses.lock().unwrap().push((response.request_id.clone(), response.body.clone()));
+                let hold = matches!(&response.body, proto::NodeResponseBody::Fetch(_));
+                if hold {
+                    *metadata.lock().unwrap() = Some(bincode::deserialize(&bincode::serialize(response).unwrap()).unwrap());
+                }
+                response_arrived.notify_one();
+                return hold;
+            }
+            false
+        }
+    })
+    .await;
+    client.wait_ready().await?;
+    let beta = client.context_async(Credential(2)).await?;
+    let query = beta.query_wait::<RecordView>(common::nocache("title = 'standing'")?).await?;
+    query.wait_durable_answered().await?;
+    assert_eq!(query.ids(), [standing.id()]);
+    let subscription_requests = agent.subscriptions.lock().unwrap().iter().filter(|(_, id, _)| *id == query.query_id()).count();
+    assert_eq!(subscription_requests, 1, "the other credential must own an established standing stream");
+
+    let alpha = client.context_async(Credential(1)).await?;
+    let mut fetch = Box::pin(alpha.fetch::<RecordView>("title = 'fetch-only'"));
+    let response = tokio::select! {
+        result = &mut fetch => panic!("Fetch completed before its held metadata arrived: {result:?}"),
+        response = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = response_arrived.notified();
+                if let Some(response) = metadata.lock().unwrap().take() {
+                    break response;
+                }
+                notified.await;
+            }
+        }) => response?,
+    };
+    let proto::NodeResponseBody::Fetch(state) = &response.body else { unreachable!() };
+    let comparison = state.frame.comparison;
+    drop(fetch);
+    drop(alpha);
+    assert!(client.storage.get_state(fetched_id).await.is_err(), "the cancelled Fetch must not have installed its held result");
+
+    // The late response reveals the responder-issued handle only after the
+    // requesting context is gone. Cleanup still owns its original authority.
+    gate.release_held(&client).await;
+    let close_request = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = agent.feedback_arrived.notified();
+            if let Some((credentials, request)) = agent.feedback.lock().unwrap().iter().find(|(_, request)| {
+                matches!(request.body, proto::NodeRequestBody::CloseComparison {
+                    comparison: found, outcome: proto::ComparisonOutcome::Abandoned
+                } if found == comparison)
+            }) {
+                assert_eq!(*credentials, [Credential(1)], "abandonment must retain the Fetch credential, not the peer credential union");
+                break request.id.clone();
+            }
+            notified.await;
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = response_arrived.notified();
+            if let Some((_, body)) = responses.lock().unwrap().iter().find(|(request, _)| *request == close_request) {
+                assert!(matches!(body, proto::NodeResponseBody::Success), "the responder must accept abandonment: {body:?}");
+                break;
+            }
+            notified.await;
+        }
+    })
+    .await?;
+
+    // A duplicate of the genuine initial metadata must neither resurrect the
+    // cancelled Fetch nor abandon a different stream on this connection.
+    client.handle_message(proto::NodeMessage::Response(response)).await?;
+    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
+    let watcher = TestWatcher::changeset();
+    let _guard = query.subscribe(&watcher);
+    let trx = writer.begin();
+    standing.edit(&trx)?.artist()?.set(&"still live".into())?;
+    trx.commit().await?;
+    tokio::time::timeout(Duration::from_secs(5), watcher.take(1)).await??;
+    assert_eq!(query.ids(), [standing.id()]);
+    assert_eq!(query.peek()[0].artist()?, "still live");
+    assert_eq!(client.storage.get_state(standing.id()).await?.payload.state.head, standing.entity().head());
+    assert!(client.storage.get_state(fetched_id).await.is_err(), "delayed duplicate metadata must not install cancelled Fetch state");
+    assert_eq!(
+        agent.subscriptions.lock().unwrap().iter().filter(|(_, id, _)| *id == query.query_id()).count(),
+        subscription_requests,
+        "the unrelated stream must keep flowing without resubscription"
+    );
+    assert_eq!(
+        agent
+            .feedback
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, request)| matches!(request.body,
+            proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Abandoned }
+            if found == comparison))
+            .count(),
+        1,
+        "duplicate metadata must not launch duplicate cleanup"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
+    use ankurah::core::schema::catalog::SysModelRowView;
+
+    let agent = CredentialAgent::default();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    server.system.create().await?;
+    server.context_async(Credential(0)).await?.resolve_model_id::<Record>().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
+    let origin = Arc::new(Mutex::new(None::<proto::RequestId>));
+    let abandonment = Arc::new(Mutex::new(None::<(Vec<proto::AuthData>, proto::ComparisonId)>));
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let (_connection, gate) = GatedConnection::new(&client, &server, {
+        let origin = origin.clone();
+        let abandonment = abandonment.clone();
+        let arrived = arrived.clone();
+        move |message| {
+            if let proto::NodeMessage::Request { auth, request } = message {
+                match request.body {
+                    proto::NodeRequestBody::Fetch { .. } => {
+                        *origin.lock().unwrap() = Some(request.id.clone());
+                        arrived.notify_one();
+                        return true;
+                    }
+                    proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned } => {
+                        *abandonment.lock().unwrap() = Some((auth.clone(), comparison));
+                        arrived.notify_one();
+                    }
+                    _ => {}
+                }
+            }
+            false
+        }
+    })
+    .await;
+    client.wait_ready().await?;
+    let context = client.context_async(Credential(1)).await?;
+    let mut fetch = Box::pin(context.fetch::<SysModelRowView>("true"));
+    tokio::select! {
+        result = &mut fetch => panic!("catalog Fetch completed while its request was held: {result:?}"),
+        result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = arrived.notified();
+                if origin.lock().unwrap().is_some() { break; }
+                notified.await;
+            }
+        }) => result.context("catalog Fetch request was not observed")?,
+    }
+    drop(fetch);
+    // The response and stream identity arrive only after the caller is gone.
+    gate.release_held(&server).await;
+    let comparison = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let notified = arrived.notified();
+            if let Some((auth, comparison)) = abandonment.lock().unwrap().take() {
+                assert!(auth.is_empty(), "catalog cleanup must bypass signing even when the requesting context has a credential");
+                break comparison;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .context("catalog abandonment was not observed")?;
+    // Retired streams still accept valid duplicate receipts. An impossible
+    // receipt instead distinguishes the retired handle from an active stream.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let response = client
+                .request(
+                    server.id,
+                    &vec![Credential(1)],
+                    proto::NodeRequestBody::ContinueState {
+                        comparison,
+                        round: Some(0),
+                        processed_through: u64::MAX,
+                        applied_through: None,
+                        answers: vec![],
+                    },
+                )
+                .await?;
+            if matches!(response, proto::NodeResponseBody::ComparisonUnavailable { comparison: found } if found == comparison) {
+                break Ok::<_, anyhow::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .context("catalog comparison did not retire")??;
     Ok(())
 }

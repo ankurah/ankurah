@@ -116,12 +116,21 @@ mod request_policy_tests {
             (ModelId::EntityId(ankurah_proto::EntityId::random()), false),
         ] {
             let requests = [
-                NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: None },
+                NodeRequestBody::Fetch {
+                    selection: Predicate::MemberOf(model).into(),
+                    known_state: ankurah_proto::KnownState {
+                        spec: ankurah_proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
+                        regions: vec![],
+                    },
+                },
                 NodeRequestBody::SubscribeQuery {
                     query_id: QueryId::new(),
                     selection: Predicate::MemberOf(model).into(),
                     version: 1,
-                    known_state: None,
+                    known_state: ankurah_proto::KnownState {
+                        spec: ankurah_proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
+                        regions: vec![],
+                    },
                 },
             ];
             for request in requests {

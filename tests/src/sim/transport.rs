@@ -267,6 +267,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { state, .. } => format!("subscribed {}", state_descriptor(state)),
         proto::NodeResponseBody::ComparisonUnavailable { .. } => "comparison unavailable".into(),
+        proto::NodeResponseBody::StateCaptureBusy => "state capture busy".into(),
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).

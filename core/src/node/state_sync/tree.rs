@@ -95,19 +95,11 @@ impl QueryTree {
         })
     }
 
-    pub fn offered_spec(
-        selection: &Selection<Resolved>,
-        catalog: &CatalogManager,
-        known: &Option<proto::KnownState>,
-    ) -> anyhow::Result<TreeSpec> {
+    pub fn offered_spec(selection: &Selection<Resolved>, catalog: &CatalogManager, known: &proto::KnownState) -> anyhow::Result<TreeSpec> {
         let default = Self::spec(selection, catalog);
-        if let Some(known) = known {
-            let by_id = TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone());
-            anyhow::ensure!(known.spec == default || known.spec == by_id, "unsupported comparison tree spec");
-            Ok(known.spec.clone())
-        } else {
-            Ok(default)
-        }
+        let by_id = TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone());
+        anyhow::ensure!(known.spec == default || known.spec == by_id, "unsupported comparison tree spec");
+        Ok(known.spec.clone())
     }
 
     pub async fn snapshot(

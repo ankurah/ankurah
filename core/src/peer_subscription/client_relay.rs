@@ -572,6 +572,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 RequestError::PeerNotConnected => true,
                 RequestError::ConnectionLost => true,
                 RequestError::SystemNotReady => true,
+                RequestError::StateCaptureBusy => true,
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
                 RequestError::ServerError(_) => false,
@@ -655,7 +656,7 @@ where
         let tree = node.live_queries.get(query_id).ok_or(NodeDropped)?.digest_tree();
         let entities = node.fetch_entities_from_local(&selection).await?;
         let mut snapshot = tree.snapshot(&selection, &node.catalog, entities).await?;
-        let known_state = Some(snapshot.offer().await?);
+        let known_state = snapshot.offer().await?;
         if canceled() {
             return Err(RequestError::ConnectionLost.into());
         }
@@ -669,6 +670,7 @@ where
         let state = match response {
             proto::NodeResponseBody::QuerySubscribed { query_id: response_query, state } if response_query == query_id => state,
             proto::NodeResponseBody::ComparisonUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
+            proto::NodeResponseBody::StateCaptureBusy => return Err(RequestError::StateCaptureBusy.into()),
             proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
             other => return Err(RequestError::UnexpectedResponse(other).into()),
         };
@@ -1219,11 +1221,32 @@ mod tests {
         assert!(matches!(relay.get_status(query_id), None));
     }
 
+    #[tokio::test]
+    async fn capture_busy_is_retryable_but_policy_and_generic_server_errors_are_terminal() {
+        for (error, retryable) in [
+            (RequestError::StateCaptureBusy, true),
+            (RequestError::AccessDenied(crate::policy::AccessDenied::ByPolicy("fixture denies query")), false),
+            (RequestError::ServerError("invalid tree specification".into()), false),
+        ] {
+            let (relay, sender, _) = connected_relay();
+            sender.set_fail_next(error);
+            let query = proto::QueryId::new();
+            subscribe(&relay, query);
+            settle().await;
+            assert_eq!(matches!(relay.get_status(query), Some(Status::PendingRemote)), retryable);
+            assert_eq!(matches!(relay.get_status(query), Some(Status::Failed)), !retryable);
+            relay.setup_remote_subscriptions();
+            settle().await;
+            assert_eq!(sender.get_sent_requests().len(), if retryable { 2 } else { 1 });
+            assert_eq!(matches!(relay.get_status(query), Some(Status::Established(_, 1))), retryable);
+        }
+    }
+
     /// A version-1 reply that arrives after version 2 was requested must not overwrite version 2's state,
     /// whether the late reply is a success or a permanent failure.
     #[tokio::test]
     async fn stale_reply_does_not_overwrite_newer_version() {
-        for stale_reply in [Ok(()), Err(RequestError::ServerError("rejected".into()))] {
+        for stale_reply in [Ok(()), Err(RequestError::ServerError("rejected".into())), Err(RequestError::StateCaptureBusy)] {
             let (relay, mock_sender, peer_id) = connected_relay();
             let query_id = proto::QueryId::new();
             let stale = mock_sender.hold_next_reply();

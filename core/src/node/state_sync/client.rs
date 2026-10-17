@@ -48,20 +48,24 @@ where
         _ => false,
     };
     let weak = node.weak();
+    let original_connection = Arc::downgrade(&connection);
     let cleanup_credentials = credentials.clone();
-    let late_reply = Arc::new(move |comparison| {
+    let abandon = Arc::new(move |comparison| {
         let weak = weak.clone();
+        let original_connection = original_connection.clone();
         let credentials = cleanup_credentials.clone();
         crate::task::spawn(async move {
             if let Some(node) = weak.upgrade() {
-                if let Some(connection) = node.peer_connections.get(&peer) {
-                    connection.outgoing_comparisons.insert(comparison, catalog);
+                let Some(connection) = original_connection.upgrade() else { return };
+                if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection)) {
+                    return;
                 }
+                connection.outgoing_comparisons.insert(comparison, catalog);
                 let _ = close_comparison(&node, peer, comparison, &credentials, proto::ComparisonOutcome::Abandoned).await;
             }
         });
     });
-    let stream = connection.incoming_states.register(proto::RequestId::new(), query, Some(late_reply))?;
+    let stream = connection.incoming_states.register(proto::RequestId::new(), query, Some(abandon))?;
     drop(connection);
     let response = state_deadline(node.request_with_id(peer, credentials, stream.request.clone(), body)).await??;
     Ok((stream, response))
@@ -205,6 +209,7 @@ where
 {
     if owns_state_stream(node, peer, stream) {
         close_comparison(node, peer, comparison, credentials, proto::ComparisonOutcome::Abandoned).await?;
+        stream.remote_closed();
     }
     Ok(())
 }

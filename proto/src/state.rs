@@ -41,7 +41,8 @@ impl std::fmt::Display for ComparisonId {
 }
 
 /// Bounded knowledge of the requester's materialized query result.
-/// Regions are disjoint and exact. Omitted regions are unknown, not empty.
+/// Regions are disjoint and exact. Omitted regions are unknown, not empty;
+/// an empty region list supplies no result knowledge but still specifies the tree.
 /// No region asserts absence of entity state held outside this query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownState {

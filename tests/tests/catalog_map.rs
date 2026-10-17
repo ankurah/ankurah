@@ -159,11 +159,13 @@ async fn standing_query_membership_can_change_but_version_cannot_regress() -> an
     let (server, client, _connection) = connected_pair().await?;
     let query_id = proto::QueryId::new();
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    let subscribe = |model: proto::SystemModel, version| proto::NodeRequestBody::SubscribeQuery {
-        query_id,
-        selection: selection.clone().and_member_of(proto::ModelId::System(model)),
-        version,
-        known_state: None,
+    let subscribe = |model: proto::SystemModel, version| {
+        let selection = selection.clone().and_member_of(proto::ModelId::System(model));
+        let known_state = proto::KnownState {
+            spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone()),
+            regions: vec![],
+        };
+        proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_state }
     };
 
     assert!(matches!(

@@ -560,7 +560,7 @@ pub(crate) async fn start_comparison<SE, PA>(
     catalog: bool,
     revision: u64,
     snapshot: Snapshot,
-    known: Option<proto::KnownState>,
+    known: proto::KnownState,
 ) -> anyhow::Result<proto::StateReply>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -843,7 +843,7 @@ where
     ensure!(state.round.number.checked_add(1) == Some(number) && revision >= state.round.revision, "invalid next round");
     ensure!(state.last_live_complete.is_none_or(|sent| sent <= revision), "round cut precedes delivered live state");
     ensure!(session.live.lock().unwrap().last_revision.is_none_or(|queued| queued <= revision), "round cut precedes queued live state");
-    let comparison = Comparison::new(snapshot, Some(known))?;
+    let comparison = Comparison::new(snapshot, known)?;
     state.pending_round = Some(PendingRound { round: proto::StateRound { number, revision }, comparison });
     state.last_refresh = Some((number, encoded));
     state.last_activity = Instant::now();
@@ -1220,7 +1220,7 @@ impl Comparison {
             _ => false,
         }
     }
-    fn new(snapshot: Snapshot, known: Option<proto::KnownState>) -> anyhow::Result<Self> {
+    fn new(snapshot: Snapshot, known: proto::KnownState) -> anyhow::Result<Self> {
         let mut comparison = Self {
             snapshot,
             work: VecDeque::new(),
@@ -1234,16 +1234,12 @@ impl Comparison {
             complete: false,
             unavailable: false,
         };
-        let mut regions = if let Some(known) = known {
-            ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
-            ensure!(
-                known.regions.len() <= 128 && bincode::serialized_size(&known)? as usize <= INITIAL_INVENTORY_BYTES,
-                "initial inventory exceeds limit"
-            );
-            known.regions
-        } else {
-            Vec::new()
-        };
+        ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
+        ensure!(
+            known.regions.len() <= 128 && bincode::serialized_size(&known)? as usize <= INITIAL_INVENTORY_BYTES,
+            "initial inventory exceeds limit"
+        );
+        let mut regions = known.regions;
         regions.sort_by(|a, b| {
             let start = |region: &proto::KnownRegion| match region {
                 proto::KnownRegion::Summary(head) => head.bounds.start.clone(),

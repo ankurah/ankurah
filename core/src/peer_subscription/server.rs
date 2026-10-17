@@ -59,7 +59,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         selection: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
-        known_state: Option<proto::KnownState>,
+        known_state: proto::KnownState,
     ) -> anyhow::Result<proto::NodeResponseBody>
     where
         SE: StorageEngine + Send + Sync + 'static,

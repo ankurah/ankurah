@@ -92,15 +92,18 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
     agent.set_policy(&node, &agent.config()).await?;
 
     let garbage_auth = vec![ankurah_proto::AuthData(b"NOT_A_JWT_TOKEN".to_vec())];
+    let selection: ankql::ast::Selection<ankql::ast::Resolved> =
+        ankql::ast::Predicate::MemberOf(ankurah::ModelId::EntityId(ankurah::EntityId::random())).into();
+    let known_state = ankurah_proto::KnownState {
+        spec: ankurah_proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone()),
+        regions: vec![],
+    };
 
     let request = ankurah_proto::NodeRequest {
         id: ankurah_proto::RequestId::new(),
         to: ankurah_proto::EntityId::random(),
         from: ankurah_proto::EntityId::random(),
-        body: ankurah_proto::NodeRequestBody::Fetch {
-            selection: ankql::ast::Predicate::MemberOf(ankurah::ModelId::EntityId(ankurah::EntityId::random())).into(),
-            known_state: None,
-        },
+        body: ankurah_proto::NodeRequestBody::Fetch { selection, known_state },
     };
 
     let result = agent.check_request(&node, &garbage_auth, &request).await;

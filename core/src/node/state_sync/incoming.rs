@@ -11,31 +11,30 @@ use futures::FutureExt;
 
 use super::{CONTROL_BYTES, FRAME_BYTES, MAX_INFLIGHT_FRAMES, WINDOW_BYTES};
 
-type LateReply = Arc<dyn Fn(proto::ComparisonId) + Send + Sync>;
+type AbandonStream = Arc<dyn Fn(proto::ComparisonId) + Send + Sync>;
 
 #[derive(Default)]
 pub(crate) struct IncomingStates(Mutex<Registry>);
 #[derive(Default)]
 struct Registry {
     streams: HashMap<RequestId, Registered>,
-    retired: VecDeque<(RequestId, LateReply)>,
+    retired: VecDeque<(RequestId, AbandonStream)>,
 }
 struct Registered {
     query: Option<(proto::QueryId, u32)>,
     inbox: Arc<Inbox>,
-    late_reply: Option<LateReply>,
+    abandon: Option<AbandonStream>,
     comparison: Option<proto::ComparisonId>,
     deferred_comparison: Option<proto::ComparisonId>,
 }
 impl Registry {
-    fn remove(&mut self, request: &RequestId) -> Option<(LateReply, proto::ComparisonId)> {
+    fn remove(&mut self, request: &RequestId) -> Option<(AbandonStream, proto::ComparisonId)> {
         if let Some(stream) = self.streams.remove(request) {
             stream.inbox.close();
-            // Once metadata was bound, replacement/unsubscribe owns remote
-            // cleanup. Only an unbound request needs to abandon an orphan id
-            // learned after its receiver has gone away.
-            if let Some(handler) = stream.late_reply.filter(|_| stream.comparison.is_none()) {
-                if let Some(comparison) = stream.deferred_comparison {
+            // Bound queries belong to replacement/unsubscribe. A finite Fetch
+            // has no such owner: dropping it must abandon its remote stream too.
+            if let Some(handler) = stream.abandon.filter(|_| stream.query.is_none() || stream.comparison.is_none()) {
+                if let Some(comparison) = stream.comparison.or(stream.deferred_comparison) {
                     return Some((handler, comparison));
                 }
                 self.retired.push_back((request.clone(), handler));
@@ -46,7 +45,7 @@ impl Registry {
         }
         None
     }
-    fn cancel_query(&mut self, query: proto::QueryId) -> Vec<(LateReply, proto::ComparisonId)> {
+    fn cancel_query(&mut self, query: proto::QueryId) -> Vec<(AbandonStream, proto::ComparisonId)> {
         let origins: Vec<_> =
             self.streams.iter().filter(|(_, stream)| stream.query.is_some_and(|(id, _)| id == query)).map(|(id, _)| id.clone()).collect();
         origins.into_iter().filter_map(|origin| self.remove(&origin)).collect()
@@ -62,6 +61,15 @@ pub(crate) struct IncomingStream {
 }
 
 impl IncomingStream {
+    /// The peer confirmed closure; dropping this owner no longer needs to abandon it.
+    pub fn remote_closed(&self) {
+        if let Some(owner) = self.owner.upgrade() {
+            if let Some(stream) = owner.0.lock().unwrap().streams.get_mut(&self.request) {
+                stream.abandon = None;
+            }
+        }
+    }
+
     pub fn bind(
         &mut self,
         id: proto::ComparisonId,
@@ -117,7 +125,7 @@ impl IncomingStates {
         self: &Arc<Self>,
         request: RequestId,
         query: Option<(proto::QueryId, u32)>,
-        late_reply: Option<LateReply>,
+        abandon: Option<AbandonStream>,
     ) -> anyhow::Result<IncomingStream> {
         let mut registry = self.0.lock().unwrap();
         ensure!(!registry.streams.contains_key(&request), "state request already registered");
@@ -126,7 +134,7 @@ impl IncomingStates {
         let inbox = Arc::new(Inbox::default());
         registry
             .streams
-            .insert(request.clone(), Registered { query, inbox: inbox.clone(), late_reply, comparison: None, deferred_comparison: None });
+            .insert(request.clone(), Registered { query, inbox: inbox.clone(), abandon, comparison: None, deferred_comparison: None });
         drop(registry);
         for (handler, comparison) in cleanup {
             handler(comparison);
@@ -137,7 +145,7 @@ impl IncomingStates {
     pub fn route(&self, request: &RequestId, frame: StateFrame) -> anyhow::Result<()> {
         let inbox = self.0.lock().unwrap().streams.get(request).map(|stream| stream.inbox.clone());
         let Some(inbox) = inbox else {
-            self.late_response(request, frame.comparison);
+            self.observe_comparison(request, frame.comparison);
             return Ok(());
         };
         if frame.sequence == 0 {
@@ -151,8 +159,8 @@ impl IncomingStates {
         result
     }
 
-    /// A canceled request can still reveal its responder-issued id later.
-    pub fn late_response(&self, request: &RequestId, comparison: proto::ComparisonId) {
+    /// Remember the remote handle even when cancellation races with its delivery.
+    pub fn observe_comparison(&self, request: &RequestId, comparison: proto::ComparisonId) {
         let handler = {
             let mut registry = self.0.lock().unwrap();
             if let Some(stream) = registry.streams.get_mut(request) {
@@ -163,7 +171,7 @@ impl IncomingStates {
                     }
                     None
                 } else if closed {
-                    stream.late_reply.take()
+                    stream.abandon.take()
                 } else {
                     // The first response may have reached its waiter without
                     // being consumed yet. Bind disarms a duplicate; drop
@@ -354,7 +362,7 @@ mod tests {
     fn late_metadata_and_frames_cancel_only_bounded_known_origins() -> anyhow::Result<()> {
         let registry = Arc::new(IncomingStates::default());
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let handler: LateReply = {
+        let handler: AbandonStream = {
             let cancelled = cancelled.clone();
             Arc::new(move |id| cancelled.lock().unwrap().push(id))
         };
@@ -363,8 +371,8 @@ mod tests {
         drop(stream);
         let comparison = proto::ComparisonId::new();
         registry.route(&request, frame(comparison, 1))?;
-        registry.late_response(&request, comparison);
-        registry.late_response(&RequestId::new(), proto::ComparisonId::new());
+        registry.observe_comparison(&request, comparison);
+        registry.observe_comparison(&RequestId::new(), proto::ComparisonId::new());
         assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
         for _ in 0..256 {
             drop(registry.register(RequestId::new(), None, Some(handler.clone()))?);
@@ -378,7 +386,7 @@ mod tests {
         let registry = Arc::new(IncomingStates::default());
         let query = proto::QueryId::new();
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let handler: LateReply = {
+        let handler: AbandonStream = {
             let cancelled = cancelled.clone();
             Arc::new(move |id| cancelled.lock().unwrap().push(id))
         };
@@ -391,7 +399,7 @@ mod tests {
         assert!(!registry.is_current(&request));
         assert!(stream.inbox.state.lock().unwrap().closed);
         registry.route(&request, frame(comparison, 1))?;
-        registry.late_response(&request, comparison);
+        registry.observe_comparison(&request, comparison);
         assert!(cancelled.lock().unwrap().is_empty(), "late traffic from a replaced bound stream cannot abandon the standing query");
         drop(stream);
         assert!(comparisons.get(&comparison).is_none());
@@ -404,7 +412,7 @@ mod tests {
         let registry = Arc::new(IncomingStates::default());
         let query = proto::QueryId::new();
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let handler: LateReply = {
+        let handler: AbandonStream = {
             let cancelled = cancelled.clone();
             Arc::new(move |id| cancelled.lock().unwrap().push(id))
         };
@@ -414,7 +422,7 @@ mod tests {
         let comparison = proto::ComparisonId::new();
         stream.bind(comparison, false, Arc::new(crate::util::safemap::SafeMap::new()));
         registry.route(&stream.request, frame(comparison, 1))?;
-        registry.late_response(&stream.request, comparison);
+        registry.observe_comparison(&stream.request, comparison);
         assert!(cancelled.lock().unwrap().is_empty(), "consumed metadata belongs to the superseding subscription's cleanup");
         assert!(registry.0.lock().unwrap().retired.is_empty());
         Ok(())
@@ -424,20 +432,20 @@ mod tests {
     fn duplicate_active_metadata_before_or_after_bind_does_not_abandon_the_stream() -> anyhow::Result<()> {
         let registry = Arc::new(IncomingStates::default());
         let cancelled = Arc::new(Mutex::new(Vec::new()));
-        let handler: LateReply = {
+        let handler: AbandonStream = {
             let cancelled = cancelled.clone();
             Arc::new(move |id| cancelled.lock().unwrap().push(id))
         };
         let mut stream = registry.register(RequestId::new(), None, Some(handler))?;
         let comparison = proto::ComparisonId::new();
-        registry.late_response(&stream.request, comparison);
+        registry.observe_comparison(&stream.request, comparison);
         assert!(cancelled.lock().unwrap().is_empty());
         stream.bind(comparison, false, Arc::new(crate::util::safemap::SafeMap::new()));
-        registry.late_response(&stream.request, comparison);
+        registry.observe_comparison(&stream.request, comparison);
         assert!(cancelled.lock().unwrap().is_empty());
         assert!(!stream.inbox.state.lock().unwrap().closed);
         assert!(registry.is_current(&stream.request));
-        registry.late_response(&stream.request, proto::ComparisonId::new());
+        registry.observe_comparison(&stream.request, proto::ComparisonId::new());
         assert!(stream.inbox.state.lock().unwrap().closed, "changed comparison must fail the active stream");
         assert!(cancelled.lock().unwrap().is_empty(), "a conflicting duplicate cannot abandon an unrelated comparison");
         Ok(())
@@ -448,7 +456,7 @@ mod tests {
         let registry = Arc::new(IncomingStates::default());
         let cancelled = Arc::new(Mutex::new(Vec::new()));
         let request = RequestId::new();
-        let handler: LateReply = {
+        let handler: AbandonStream = {
             let registry = Arc::downgrade(&registry);
             let cancelled = cancelled.clone();
             let request = request.clone();
@@ -459,11 +467,11 @@ mod tests {
         };
         let stream = registry.register(request.clone(), None, Some(handler))?;
         let comparison = proto::ComparisonId::new();
-        registry.late_response(&request, comparison);
+        registry.observe_comparison(&request, comparison);
         assert!(cancelled.lock().unwrap().is_empty());
         drop(stream);
         assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
-        registry.late_response(&request, comparison);
+        registry.observe_comparison(&request, comparison);
         assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
         Ok(())
     }
@@ -474,7 +482,7 @@ mod tests {
         let query = proto::QueryId::new();
         let cancelled = Arc::new(Mutex::new(Vec::new()));
         let replacement = RequestId::new();
-        let handler: LateReply = {
+        let handler: AbandonStream = {
             let registry = Arc::downgrade(&registry);
             let cancelled = cancelled.clone();
             let replacement = replacement.clone();
@@ -485,7 +493,7 @@ mod tests {
         };
         let first = registry.register(RequestId::new(), Some((query, 1)), Some(handler))?;
         let comparison = proto::ComparisonId::new();
-        registry.late_response(&first.request, comparison);
+        registry.observe_comparison(&first.request, comparison);
         let next = registry.register(replacement, Some((query, 2)), None)?;
         assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
         drop(first);

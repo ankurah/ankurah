@@ -148,14 +148,13 @@ pub enum NodeRequestBody {
     },
     Fetch {
         selection: ast::Selection<ast::Resolved>,
-        /// None means no result knowledge was supplied, not an empty entity store.
-        known_state: Option<KnownState>,
+        known_state: KnownState,
     },
     SubscribeQuery {
         query_id: QueryId,
         selection: ast::Selection<ast::Resolved>,
         version: u32,
-        known_state: Option<KnownState>,
+        known_state: KnownState,
     },
     /// Register one model's schema: an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
@@ -233,6 +232,9 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
+    /// The initial Fetch or SubscribeQuery capture could not keep up with
+    /// concurrent source changes. No stream was created; retry after backoff.
+    StateCaptureBusy,
     /// The snapshot expired or was invalidated. Restart the original Fetch or
     /// SubscribeQuery; previously received pages cannot complete a new comparison.
     ComparisonUnavailable {
@@ -313,10 +315,10 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
             NodeRequestBody::Fetch { selection: query, known_state } => {
-                write!(f, "Fetch {query} regions:{}", known_state.as_ref().map_or(0, |state| state.regions.len()))
+                write!(f, "Fetch {query} regions:{}", known_state.regions.len())
             }
             NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_state } => {
-                write!(f, "Subscribe {query_id} {query} v{version} regions:{}", known_state.as_ref().map_or(0, |state| state.regions.len()))
+                write!(f, "Subscribe {query_id} {query} v{version} regions:{}", known_state.regions.len())
             }
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
@@ -352,6 +354,7 @@ impl std::fmt::Display for NodeResponseBody {
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
+            NodeResponseBody::StateCaptureBusy => write!(f, "StateCaptureBusy"),
             NodeResponseBody::ComparisonUnavailable { comparison } => write!(f, "ComparisonUnavailable {comparison}"),
         }
     }

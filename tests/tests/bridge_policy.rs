@@ -376,12 +376,12 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let requests = [
             proto::NodeRequestBody::Get { ids: vec![entity_id] },
             proto::NodeRequestBody::GetEvents { event_ids: events.iter().map(|event| event.payload.id()).collect() },
-            proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: Some(known_state.clone()) },
+            proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: known_state.clone() },
             proto::NodeRequestBody::SubscribeQuery {
                 query_id: proto::QueryId::new(),
                 selection: Predicate::MemberOf(model).into(),
                 version: 1,
-                known_state: Some(known_state.clone()),
+                known_state: known_state.clone(),
             },
         ];
         for request in requests {
@@ -467,7 +467,13 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: None },
+                proto::NodeRequestBody::Fetch {
+                    selection: Predicate::MemberOf(model).into(),
+                    known_state: proto::KnownState {
+                        spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
+                        regions: vec![],
+                    },
+                },
             )
             .await?;
         assert!(matches!(response, proto::NodeResponseBody::Error(message) if message.contains("all reads denied")));

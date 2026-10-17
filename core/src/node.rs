@@ -461,9 +461,20 @@ where
                     } else {
                         self.policy_agent.check_request(self, &auth, &request).await
                     };
+                    let initial_state =
+                        matches!(&request.body, proto::NodeRequestBody::Fetch { .. } | proto::NodeRequestBody::SubscribeQuery { .. });
                     let body = match cdata {
                         Ok(cdata) => match self.handle_request(&cdata, request).await {
                             Ok(result) => result,
+                            Err(e)
+                                if initial_state
+                                    && matches!(
+                                        e.downcast_ref::<source_publications::SourceError>(),
+                                        Some(source_publications::SourceError::Changed | source_publications::SourceError::Lagged)
+                                    ) =>
+                            {
+                                proto::NodeResponseBody::StateCaptureBusy
+                            }
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                         },
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
@@ -496,12 +507,13 @@ where
                     }
                     _ => None,
                 };
-                let delivered =
-                    connection.pending_requests.remove(&response.request_id).is_some_and(|tx| tx.send(Ok(response.body)).is_ok());
-                if !delivered {
-                    if let Some(comparison) = comparison {
-                        connection.incoming_states.late_response(&response.request_id, comparison);
-                    }
+                // Remember the handle before waking the waiter: it may be
+                // cancelled with this response still queued in its channel.
+                if let Some(comparison) = comparison {
+                    connection.incoming_states.observe_comparison(&response.request_id, comparison);
+                }
+                if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
+                    let _ = tx.send(Ok(response.body));
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
@@ -843,6 +855,8 @@ where
     }
 
     /// Compare a temporary result tree with a durable peer and apply its repairs before returning.
+    /// Retry once if the stream is lost or capture is busy; sustained capture
+    /// churn returns StateCaptureBusy so this finite call cannot retry forever.
     pub(crate) async fn fetch_from_peer(
         &self,
         selection: ankql::ast::Selection<Resolved>,
@@ -855,7 +869,7 @@ where
         for attempt in 0..2 {
             let entities = self.fetch_entities_from_local(&selection).await?;
             let mut snapshot = tree.snapshot(&selection, &self.catalog, entities).await?;
-            let known_state = Some(snapshot.offer().await?);
+            let known_state = snapshot.offer().await?;
             let (stream, response) = state_sync::request_state(
                 self,
                 peer_id,
@@ -865,6 +879,12 @@ where
             .await?;
             let state = match response {
                 proto::NodeResponseBody::Fetch(state) => state,
+                proto::NodeResponseBody::StateCaptureBusy if attempt == 0 => {
+                    drop(stream);
+                    futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                proto::NodeResponseBody::StateCaptureBusy => return Err(RequestError::StateCaptureBusy.into()),
                 proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
                 other => return Err(RequestError::UnexpectedResponse(other).into()),
             };

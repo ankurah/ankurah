@@ -36,21 +36,16 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
     };
     let inventory = KnownState { spec: spec(), regions: vec![KnownRegion::Summary(summary.clone()), KnownRegion::Leaves(leaves.clone())] };
     for body in [
-        NodeRequestBody::Fetch { selection: selection(), known_state: Some(inventory.clone()) },
-        NodeRequestBody::SubscribeQuery {
-            query_id: QueryId::new(),
-            selection: selection(),
-            version: 7,
-            known_state: Some(inventory.clone()),
-        },
+        NodeRequestBody::Fetch { selection: selection(), known_state: inventory.clone() },
+        NodeRequestBody::SubscribeQuery { query_id: QueryId::new(), selection: selection(), version: 7, known_state: inventory.clone() },
     ] {
         let message = Message::PeerMessage(NodeMessage::Request { auth: vec![], request: request(body) });
         let Message::PeerMessage(NodeMessage::Request { request, .. }) = wire(&message) else { panic!("request") };
         let state = match request.body {
-            NodeRequestBody::Fetch { known_state, .. } => known_state.unwrap(),
+            NodeRequestBody::Fetch { known_state, .. } => known_state,
             NodeRequestBody::SubscribeQuery { version, known_state, .. } => {
                 assert_eq!(version, 7);
-                known_state.unwrap()
+                known_state
             }
             _ => panic!("query request"),
         };
@@ -66,24 +61,24 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
 
 #[test]
 fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
-    let absent = request(NodeRequestBody::Fetch { selection: selection(), known_state: None });
+    let unknown = request(NodeRequestBody::Fetch { selection: selection(), known_state: KnownState { spec: spec(), regions: vec![] } });
     let empty = request(NodeRequestBody::Fetch {
         selection: selection(),
-        known_state: Some(KnownState {
+        known_state: KnownState {
             spec: spec(),
             regions: vec![KnownRegion::Leaves(LeafPage { bounds: AddressRange::under(&NodePrefix::root()), leaves: vec![] })],
-        }),
+        },
     });
-    assert!(matches!(wire(&absent).body, NodeRequestBody::Fetch { known_state: None, .. }));
-    let NodeRequestBody::Fetch { known_state: Some(state), .. } = wire(&empty).body else { panic!("known empty") };
+    let NodeRequestBody::Fetch { known_state: state, .. } = wire(&unknown).body else { panic!("unknown inventory") };
+    assert_eq!(state.spec, spec());
+    assert!(state.regions.is_empty());
+    let NodeRequestBody::Fetch { known_state: state, .. } = wire(&empty).body else { panic!("known empty") };
     let KnownRegion::Leaves(page) = &state.regions[0] else { panic!("empty leaves") };
     assert!(page.leaves.is_empty());
     assert_eq!(page.bounds, AddressRange::under(&NodePrefix::root()));
-    let unknown = KnownState { spec: spec(), regions: vec![] };
-    assert!(wire(&unknown).regions.is_empty());
     let empty_summary = KnownRegion::Summary(TreeHead { prefix: NodePrefix::root(), bounds: page.bounds.clone(), digest: Digest::empty() });
     assert!(matches!(wire(&empty_summary), KnownRegion::Summary(summary) if summary.digest.count() == 0));
-    assert_ne!(bincode::serialize(&absent).unwrap(), bincode::serialize(&empty).unwrap());
+    assert_ne!(bincode::serialize(&unknown.body).unwrap(), bincode::serialize(&empty.body).unwrap());
 }
 
 #[test]

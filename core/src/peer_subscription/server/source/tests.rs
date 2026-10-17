@@ -12,6 +12,8 @@ use crate::{
 use ankql::ast::{OrderByItem, OrderDirection, Predicate};
 use ankurah_core_types::PropertyPath;
 
+mod capture_retry;
+
 /// The core test engine deliberately rejects ORDER BY/LIMIT. This fixture adds
 /// exactly the ordered bounded read exercised here, leaving its real commit and
 /// pause seams intact.
@@ -236,6 +238,7 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
         Box::new(Sender(peer)),
     )
     .await?;
+    let known = proto::KnownState { spec: snapshot.spec.clone(), regions: vec![] };
     let state = crate::node::state_sync::start_comparison(
         &node,
         peer,
@@ -246,7 +249,7 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
         false,
         revision,
         snapshot,
-        None,
+        known,
     )
     .await?;
     let mut actor = QuerySource::new(peer, state.frame.comparison, vec![DEFAULT_CONTEXT], projection, cursor, revision);
@@ -413,12 +416,34 @@ async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree(
     .await?;
     let handler = crate::peer_subscription::SubscriptionHandler::new(peer);
     let query = proto::QueryId::new();
-    handler.subscribe_query(&node, proto::RequestId::new(), Vec::new(), query, selection(Some(2)), Some(&DEFAULT_CONTEXT), 1, None).await?;
+    handler
+        .subscribe_query(
+            &node,
+            proto::RequestId::new(),
+            Vec::new(),
+            query,
+            selection(Some(2)),
+            Some(&DEFAULT_CONTEXT),
+            1,
+            proto::KnownState { spec: QueryTree::spec(&selection(Some(2)), &node.catalog), regions: vec![] },
+        )
+        .await?;
     let (_, original_tree) = handler.query_tree_for_test(query).await.unwrap();
     let (entered, release) = hold_fetch(&node);
     apply(&node, &update(&initial[0], "09")?).await?;
     entered.await?;
-    handler.subscribe_query(&node, proto::RequestId::new(), Vec::new(), query, selection(Some(1)), Some(&DEFAULT_CONTEXT), 2, None).await?;
+    handler
+        .subscribe_query(
+            &node,
+            proto::RequestId::new(),
+            Vec::new(),
+            query,
+            selection(Some(1)),
+            Some(&DEFAULT_CONTEXT),
+            2,
+            proto::KnownState { spec: QueryTree::spec(&selection(Some(1)), &node.catalog), regions: vec![] },
+        )
+        .await?;
     assert!(release.send(()).is_err(), "the old generation's pending read must be dropped before replacement installs");
     let (version, reused) = handler.query_tree_for_test(query).await.unwrap();
     assert_eq!(version, 2);

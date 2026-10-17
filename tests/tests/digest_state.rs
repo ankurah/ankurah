@@ -544,7 +544,13 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
         .request(
             server.id,
             &DEFAULT_CONTEXT,
-            proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::MemberOf(model).into(), known_state: None },
+            proto::NodeRequestBody::Fetch {
+                selection: ankql::ast::Predicate::MemberOf(model).into(),
+                known_state: proto::KnownState {
+                    spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
+                    regions: vec![],
+                },
+            },
         )
         .await?;
     let NodeResponseBody::Fetch(state) = response else { panic!("{response:?}") };
@@ -703,7 +709,13 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
     .await;
     client.wait_ready().await?;
     let model = writer.resolve_model_id::<Pet>().await?;
-    let body = proto::NodeRequestBody::Fetch { selection: ankql::ast::Predicate::MemberOf(model).into(), known_state: None };
+    let body = proto::NodeRequestBody::Fetch {
+        selection: ankql::ast::Predicate::MemberOf(model).into(),
+        known_state: proto::KnownState {
+            spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
+            regions: vec![],
+        },
+    };
     let origin = proto::RequestId::new();
     for _ in 0..2 {
         server
@@ -973,7 +985,10 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
                 query_id: proto::QueryId::new(),
                 version: 1,
                 selection: ankql::ast::Predicate::MemberOf(model).into(),
-                known_state: None,
+                known_state: proto::KnownState {
+                    spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
+                    regions: vec![],
+                },
             },
         )
         .await?;
@@ -1418,7 +1433,7 @@ async fn cold_query_with_2049_interleaved_cached_rows_uses_a_summary_frontier() 
         let offers = offers.clone();
         move |message| {
             if let NodeMessage::Request { request, .. } = message {
-                if let proto::NodeRequestBody::SubscribeQuery { query_id, known_state: Some(known), .. } = &request.body {
+                if let proto::NodeRequestBody::SubscribeQuery { query_id, known_state: known, .. } = &request.body {
                     offers.lock().unwrap().push((*query_id, known.clone()));
                 }
             }

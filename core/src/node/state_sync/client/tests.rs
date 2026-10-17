@@ -1,6 +1,8 @@
 use super::*;
 use std::ops::Bound::*;
 
+mod cancellation;
+
 fn id(n: u8) -> proto::EntityId { proto::EntityId::from_bytes([n; 32]) }
 fn address(n: u8) -> Vec<u8> { leaf_address(&[], id(n)) }
 fn spec() -> proto::TreeSpec { proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True) }
@@ -456,7 +458,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
             query_id,
             selection,
             version: 1,
-            known_state: Some(proto::KnownState { spec: snapshot.spec.clone(), regions }),
+            known_state: proto::KnownState { spec: snapshot.spec.clone(), regions },
         },
     )
     .await?;
@@ -507,7 +509,7 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
         &client,
         server.id,
         &credentials,
-        proto::NodeRequestBody::SubscribeQuery { query_id, selection, version: 1, known_state: Some(snapshot.offer().await?) },
+        proto::NodeRequestBody::SubscribeQuery { query_id, selection, version: 1, known_state: snapshot.offer().await? },
     )
     .await?;
     let proto::NodeResponseBody::QuerySubscribed { mut state, .. } = response else { panic!("expected query metadata") };
