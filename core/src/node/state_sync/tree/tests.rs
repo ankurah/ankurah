@@ -126,7 +126,7 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
     let query = QueryTree::default();
     let initial = (0..256).map(|id| numbered_state(id, 1)).collect::<Vec<_>>();
     let mut old = query.refresh(spec(), initial).await?;
-    assert!(old.offer().await?.regions.len() > 1, "the complete inventory spans bounded pages");
+    assert_eq!(old.offer().await?.regions.len(), 1, "the complete inventory is one region");
     let original = old.head(super::super::whole()).await?;
 
     // Addition, replacement, and removal each cross the measured dense threshold.
@@ -142,8 +142,8 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
         let mut recomputed = recomputed_query.refresh(spec(), states).await?;
         assert_eq!(refreshed.members(), recomputed.members());
         let offer = refreshed.offer().await?;
-        assert!(offer.regions.len() > 1, "a retained bulk rebuild must still offer bounded regions");
-        assert!(offer.regions.iter().all(|region| matches!(region, proto::KnownRegion::Leaves(_))));
+        assert_eq!(offer.regions.len(), 1, "a retained bulk rebuild offers one complete inventory");
+        assert!(offer.regions.iter().all(|region| matches!(region, proto::KnownRegion::Heads(_))));
         assert!(refreshed.tree.is_none(), "offering a complete inventory stays lazy");
         assert_eq!(refreshed.head(super::super::whole()).await?, recomputed.head(super::super::whole()).await?);
         assert_eq!(old.head(super::super::whole()).await?, original);
@@ -163,17 +163,17 @@ async fn dense_refresh_rebuilds_lazily_and_preserves_captured_snapshots() -> any
 async fn retained_unbuilt_cache_offers_a_complete_inventory_after_initial_membership_fill() -> anyhow::Result<()> {
     let query = QueryTree::default();
     let mut initial = query.refresh(spec(), vec![]).await?;
-    assert!(matches!(initial.offer().await?.regions.as_slice(), [proto::KnownRegion::Leaves(_)]));
+    assert!(matches!(initial.offer().await?.regions.as_slice(), [proto::KnownRegion::Heads(_)]));
     let mut refreshed = query.refresh(spec(), (0..256).map(|id| numbered_state(id, 1)).collect()).await?;
     assert!(refreshed.tree.is_none());
     let offer = refreshed.offer().await?;
-    assert!(offer.regions.len() > 1);
+    assert_eq!(offer.regions.len(), 1);
     assert_eq!(
         offer
             .regions
             .iter()
             .map(|region| match region {
-                proto::KnownRegion::Leaves(page) => page.leaves.len(),
+                proto::KnownRegion::Heads(page) => page.leaves.len(),
                 _ => panic!("complete leaves"),
             })
             .sum::<usize>(),
@@ -376,7 +376,7 @@ async fn small_and_empty_inventories_offer_exact_leaves_without_building_a_tree(
         let states = (0..count).rev().map(|id| state(id as u8, 1)).collect();
         let mut snapshot = query.refresh(spec(), states).await?;
         let inventory = snapshot.offer().await?;
-        let [proto::KnownRegion::Leaves(page)] = inventory.regions.as_slice() else { panic!("expected one exact inventory") };
+        let [proto::KnownRegion::Heads(page)] = inventory.regions.as_slice() else { panic!("expected one exact inventory") };
         assert_eq!(page.bounds, super::super::whole());
         assert_eq!(page.leaves.len(), count);
         assert_eq!(snapshot.members().len(), count);
@@ -392,16 +392,27 @@ async fn small_and_empty_inventories_offer_exact_leaves_without_building_a_tree(
 
 #[tokio::test]
 async fn small_inventory_exceeding_the_byte_budget_falls_back_to_a_summary() -> anyhow::Result<()> {
+    let wide_clock = |count: u32| {
+        proto::Clock::new(
+            (0..count)
+                .map(|id| {
+                    let mut bytes = [0; 32];
+                    bytes[..4].copy_from_slice(&id.to_be_bytes());
+                    (1, proto::EventId::from_bytes(bytes))
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
     let mut state = state(1, 1);
-    state.payload.state.head = proto::Clock::new(
-        (0..3000u32)
-            .map(|id| {
-                let mut bytes = [0; 32];
-                bytes[..4].copy_from_slice(&id.to_be_bytes());
-                (1, proto::EventId::from_bytes(bytes))
-            })
-            .collect::<Vec<_>>(),
-    )?;
+    state.payload.state.head = wide_clock(3000)?;
+    let mut within_request = QueryTree::default().refresh(spec(), vec![state.clone()]).await?;
+    let offer = within_request.offer().await?;
+    assert!(matches!(offer.regions.as_slice(), [proto::KnownRegion::Heads(_)]));
+    assert!(bincode::serialized_size(&offer)? > super::super::PAGE_BYTES as u64);
+    assert!(within_request.page(super::super::whole()).is_err(), "follow-up pages retain their smaller limit");
+    assert!(within_request.tree.is_none());
+
+    state.payload.state.head = wide_clock(10000)?;
     let query = QueryTree::default();
     let mut snapshot = query.refresh(spec(), vec![state.clone()]).await?;
     assert!(snapshot.page(super::super::whole()).is_err(), "an oversized single leaf must fail explicitly");
@@ -490,8 +501,8 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
     assert!(old.tree.is_none());
     let offer = old.offer().await?;
     assert!(
-        offer.regions.iter().all(|region| matches!(region, proto::KnownRegion::Leaves(_))),
-        "multiple bounded pages may form one complete initial inventory"
+        matches!(offer.regions.as_slice(), [proto::KnownRegion::Heads(_)]),
+        "one initial inventory has its own budget, independent of follow-up pagination"
     );
 
     let changed = (0..32).map(|id| keyed_state(id as u32, 2, Some(Value::String("changed".into())))).collect::<anyhow::Result<Vec<_>>>()?;
@@ -561,7 +572,7 @@ async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() 
     let initial = (0..70).map(|id| state(id, 1)).collect::<Vec<_>>();
     let mut old = query.refresh(spec(), initial.clone()).await?;
     let inventory = old.offer().await?;
-    assert!(inventory.regions.iter().all(|region| matches!(region, proto::KnownRegion::Leaves(_))));
+    assert!(inventory.regions.iter().all(|region| matches!(region, proto::KnownRegion::Heads(_))));
     assert!(old.tree.is_none());
     let original = old.head(super::super::whole()).await?;
     let generation = query.0.lock().await.as_ref().unwrap().generation.clone();
@@ -641,21 +652,16 @@ async fn complete_initial_inventories_are_bounded_lazy_and_immutable() -> anyhow
         let mut old = query.refresh(spec(), (0..count as u32).map(|id| numbered_state(id, 1)).collect()).await?;
         let offer = old.offer().await?;
         assert!(bincode::serialized_size(&offer)? <= super::super::INITIAL_INVENTORY_BYTES as u64);
-        let mut start = super::super::whole().start;
-        let mut received = Vec::new();
-        for region in &offer.regions {
-            let proto::KnownRegion::Leaves(page) = region else { panic!("complete bounded leaf inventory") };
-            assert_eq!(page.bounds.start, start);
-            assert!(page.leaves.len() <= super::super::LEAF_PAGE);
-            assert!(bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::super::PAGE_BYTES as u64);
-            received.extend(page.leaves.iter().map(|leaf| leaf.entity.entity_id));
-            start = match &page.bounds.end {
-                Bound::Included(end) => Bound::Excluded(end.clone()),
-                Bound::Unbounded => Bound::Unbounded,
-                _ => panic!("exhaustive page advances at its last point"),
-            };
+        let [proto::KnownRegion::Heads(inventory)] = offer.regions.as_slice() else { panic!("one complete initial inventory") };
+        assert_eq!(inventory.bounds, super::super::whole());
+        assert_eq!(inventory.leaves.len(), count);
+        let received = inventory.leaves.iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>();
+        let wire = bincode::serialize(&offer)?;
+        if count == super::super::INITIAL_INVENTORY_LEAVES {
+            assert!(wire.len() > super::super::PAGE_BYTES, "the request has a separate byte budget");
         }
-        assert_eq!(start, super::super::whole().end);
+        let decoded: proto::KnownState = bincode::deserialize(&wire)?;
+        assert_eq!(bincode::serialize(&decoded)?, wire);
         assert_eq!(received, old.members().values().copied().collect::<Vec<_>>());
         assert!(old.tree.is_none());
         assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
@@ -699,7 +705,7 @@ async fn incomplete_initial_inventory_falls_back_for_count_or_total_bytes() -> a
     loop {
         let page = wide.page(remaining)?;
         let end = page.bounds.end.clone();
-        pages.push(proto::KnownRegion::Leaves(page));
+        pages.push(proto::KnownRegion::Heads(page));
         if end == super::super::whole().end {
             break;
         }

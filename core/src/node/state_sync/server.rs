@@ -250,7 +250,7 @@ enum Work {
     Offer(proto::TreeHead),
     Expand { local: proto::TreeHead, known: proto::TreeHead },
     AskLeaves(AddressRange),
-    InitialLeaves(proto::LeafPage),
+    InitialHeads(proto::LeafPage),
     AnswerLeaves { page: proto::LeafPage, rest: Option<AddressRange> },
     SendLeaves(AddressRange),
     SendSnapshots(AddressRange),
@@ -1243,7 +1243,7 @@ impl Comparison {
         regions.sort_by(|a, b| {
             let start = |region: &proto::KnownRegion| match region {
                 proto::KnownRegion::Summary(head) => head.bounds.start.clone(),
-                proto::KnownRegion::Leaves(page) => page.bounds.start.clone(),
+                proto::KnownRegion::Heads(page) => page.bounds.start.clone(),
             };
             let a = start(a);
             let b = start(b);
@@ -1262,7 +1262,7 @@ impl Comparison {
             ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
             let bounds = match &region {
                 proto::KnownRegion::Summary(head) => &head.bounds,
-                proto::KnownRegion::Leaves(page) => &page.bounds,
+                proto::KnownRegion::Heads(page) => &page.bounds,
             };
             ensure!(
                 valid_range(bounds) && start_le(&start, &bounds.start) && end_le(&bounds.end, &super::whole().end),
@@ -1284,18 +1284,18 @@ impl Comparison {
                     }
                     comparison.work.push_back(Work::Compare { prefix: NodePrefix::root(), head });
                 }
-                proto::KnownRegion::Leaves(page) => {
+                proto::KnownRegion::Heads(page) => {
                     frontier = None;
-                    comparison.validate_leaves(&page)?;
                     leaf_count += page.leaves.len();
                     ensure!(leaf_count <= INITIAL_INVENTORY_LEAVES, "initial inventory exceeds leaf limit");
+                    comparison.validate_initial_heads(&page)?;
                     for leaf in &page.leaves {
                         ensure!(
                             comparison.known_clocks.insert(leaf.entity.entity_id, leaf.entity.head.clone()).is_none(),
                             "duplicate entity in initial inventory"
                         );
                     }
-                    comparison.work.push_back(Work::InitialLeaves(page));
+                    comparison.work.push_back(Work::InitialHeads(page));
                 }
             }
         }
@@ -1311,9 +1311,8 @@ impl Comparison {
         Ok(comparison)
     }
 
-    fn validate_leaves(&self, page: &proto::LeafPage) -> anyhow::Result<()> {
-        ensure!(valid_range(&page.bounds) && page.leaves.len() <= LEAF_PAGE, "invalid leaf inventory size or bounds");
-        ensure!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64, "initial leaf page exceeds byte limit");
+    fn validate_initial_heads(&self, page: &proto::LeafPage) -> anyhow::Result<()> {
+        ensure!(valid_range(&page.bounds), "invalid initial inventory bounds");
         let mut previous = None;
         for leaf in &page.leaves {
             CanonicalCodec.split(self.snapshot.spec.key_spec(), &leaf.key)?;
@@ -1384,9 +1383,19 @@ impl Comparison {
         Ok(())
     }
 
-    fn expand_initial_leaves(&mut self, page: proto::LeafPage) -> anyhow::Result<()> {
+    fn expand_initial_heads(&mut self, mut page: proto::LeafPage) -> anyhow::Result<()> {
         use std::ops::Bound::{Excluded, Included};
 
+        // The request carries one inventory. Process it in bounded batches so
+        // alternating gaps/removals cannot expand the whole work queue at once.
+        if page.leaves.len() > LEAF_PAGE {
+            let rest = page.leaves.split_off(LEAF_PAGE);
+            let last = page.leaves.last().unwrap();
+            let end = leaf_address(&last.key, last.entity.entity_id);
+            let bounds = AddressRange::new(Excluded(end.clone()), page.bounds.end);
+            page.bounds.end = Included(end);
+            self.work.push_front(Work::InitialHeads(proto::LeafPage { bounds, leaves: rest }));
+        }
         let mut work = Vec::new();
         let former = page
             .leaves
@@ -1583,7 +1592,7 @@ impl Comparison {
             let Some(work) = self.work.pop_front() else { break };
             // Keep this in step with tree/storage/history access in the arms below.
             let expensive = match &work {
-                Work::InitialLeaves(_)
+                Work::InitialHeads(_)
                 | Work::AnswerLeaves { .. }
                 | Work::CompareFrontier(_)
                 | Work::Compare { .. }
@@ -1685,8 +1694,8 @@ impl Comparison {
                     }
                     None
                 }
-                Work::InitialLeaves(page) => {
-                    self.expand_initial_leaves(page)?;
+                Work::InitialHeads(page) => {
+                    self.expand_initial_heads(page)?;
                     None
                 }
                 Work::AnswerLeaves { page, rest } => {

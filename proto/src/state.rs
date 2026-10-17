@@ -53,9 +53,11 @@ pub struct KnownState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KnownRegion {
     Summary(TreeHead),
-    /// Exhaustive for its bounds; an empty page explicitly describes an empty range.
-    /// Replies need only describe changes; Complete confirms unchanged members too.
-    Leaves(#[serde(with = "compact_initial_page")] LeafPage),
+    /// All entity heads within these bounds; empty means the range is empty.
+    /// An initial inventory uses the request budget, independently of follow-up
+    /// page limits. Replies need only describe changes; Complete confirms
+    /// unchanged members too.
+    Heads(#[serde(with = "compact_initial_page")] LeafPage),
 }
 
 /// One captured query version. Revisions order publications in this stream,

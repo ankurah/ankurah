@@ -34,7 +34,7 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
         bounds: AddressRange::new(Included(vec![1]), Excluded(vec![2])),
         leaves: vec![KnownLeaf { key: vec![1], entity: known(2) }],
     };
-    let inventory = KnownState { spec: spec(), regions: vec![KnownRegion::Summary(summary.clone()), KnownRegion::Leaves(leaves.clone())] };
+    let inventory = KnownState { spec: spec(), regions: vec![KnownRegion::Summary(summary.clone()), KnownRegion::Heads(leaves.clone())] };
     for body in [
         NodeRequestBody::Fetch { selection: selection(), known_state: inventory.clone() },
         NodeRequestBody::SubscribeQuery { query_id: QueryId::new(), selection: selection(), version: 7, known_state: inventory.clone() },
@@ -52,7 +52,7 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
         assert_eq!(state.spec, spec());
         assert_eq!(state.regions.len(), 2);
         assert!(matches!(&state.regions[0], KnownRegion::Summary(received) if received == &summary));
-        let KnownRegion::Leaves(received) = &state.regions[1] else { panic!("inline leaves") };
+        let KnownRegion::Heads(received) = &state.regions[1] else { panic!("inline leaves") };
         assert_eq!(received.bounds, leaves.bounds);
         assert_eq!(received.leaves[0].key, [1]);
         assert_eq!(received.leaves[0].entity, known(2));
@@ -66,14 +66,14 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
         selection: selection(),
         known_state: KnownState {
             spec: spec(),
-            regions: vec![KnownRegion::Leaves(LeafPage { bounds: AddressRange::under(&NodePrefix::root()), leaves: vec![] })],
+            regions: vec![KnownRegion::Heads(LeafPage { bounds: AddressRange::under(&NodePrefix::root()), leaves: vec![] })],
         },
     });
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&unknown).body else { panic!("unknown inventory") };
     assert_eq!(state.spec, spec());
     assert!(state.regions.is_empty());
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&empty).body else { panic!("known empty") };
-    let KnownRegion::Leaves(page) = &state.regions[0] else { panic!("empty leaves") };
+    let KnownRegion::Heads(page) = &state.regions[0] else { panic!("empty leaves") };
     assert!(page.leaves.is_empty());
     assert_eq!(page.bounds, AddressRange::under(&NodePrefix::root()));
     let empty_summary = KnownRegion::Summary(TreeHead { prefix: NodePrefix::root(), bounds: page.bounds.clone(), digest: Digest::empty() });
@@ -290,14 +290,14 @@ fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
     let bounds = AddressRange::under(&NodePrefix::root());
     let offer = KnownState {
         spec: spec(),
-        regions: vec![KnownRegion::Leaves(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![7], entity: known(7) }] })],
+        regions: vec![KnownRegion::Heads(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![7], entity: known(7) }] })],
     };
     let refresh = request(NodeRequestBody::RefreshState { comparison, round: 3, known_state: offer });
     let NodeRequestBody::RefreshState { comparison: received, round, known_state } = wire(&refresh).body else { panic!("refresh") };
     assert_eq!(received, comparison);
     assert_eq!(round, 3);
     assert_eq!(known_state.spec, spec());
-    let KnownRegion::Leaves(page) = &known_state.regions[0] else { panic!("frozen offer") };
+    let KnownRegion::Heads(page) = &known_state.regions[0] else { panic!("frozen offer") };
     assert_eq!(page.bounds, bounds);
     assert_eq!(page.leaves[0].key, [7]);
     assert_eq!(page.leaves[0].entity, known(7));

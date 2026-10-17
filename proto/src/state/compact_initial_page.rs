@@ -7,8 +7,8 @@ use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 use super::LeafPage;
 
 const VERSION: u8 = 1;
-// A valid fixed 64 KiB page can grow when large generations use varints.
-const MAX_ENCODED_BYTES: usize = 68 * 1024;
+// The initial inventory has its own request budget, independent of follow-up pages.
+const MAX_ENCODED_BYTES: usize = 256 * 1024;
 
 fn options() -> impl Options {
     bincode::DefaultOptions::new().with_little_endian().with_varint_encoding().with_limit(MAX_ENCODED_BYTES as u64).reject_trailing_bytes()
@@ -35,18 +35,18 @@ impl<'de> Visitor<'de> for PageVisitor {
     type Value = LeafPage;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-        formatter.write_str("a versioned compact initial leaf page of at most 68 KiB")
+        formatter.write_str("a versioned compact initial head inventory of at most 256 KiB")
     }
 
     fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<LeafPage, E> {
         // Bincode's slice decoder does not enforce Options::with_limit. Check
         // the borrowed blob before any typed page decoding or allocation.
         if bytes.len() > MAX_ENCODED_BYTES {
-            return Err(E::custom("compact initial leaf page exceeds 68 KiB"));
+            return Err(E::custom("compact initial head inventory exceeds 256 KiB"));
         }
-        let (version, payload) = bytes.split_first().ok_or_else(|| E::custom("missing compact initial leaf page version"))?;
+        let (version, payload) = bytes.split_first().ok_or_else(|| E::custom("missing compact initial head inventory version"))?;
         if *version != VERSION {
-            return Err(E::custom("unsupported compact initial leaf page version"));
+            return Err(E::custom("unsupported compact initial head inventory version"));
         }
         options().deserialize(payload).map_err(E::custom)
     }
@@ -83,24 +83,24 @@ mod tests {
 
     fn decoded(encoded: &[u8]) -> bincode::Result<LeafPage> {
         match bincode::deserialize::<KnownRegion>(encoded)? {
-            KnownRegion::Leaves(page) => Ok(page),
+            KnownRegion::Heads(page) => Ok(page),
             _ => panic!("expected leaves"),
         }
     }
 
     fn wrap_blob(blob: &[u8]) -> Vec<u8> {
-        let mut bytes = 1u32.to_le_bytes().to_vec(); // KnownRegion::Leaves
+        let mut bytes = 1u32.to_le_bytes().to_vec(); // KnownRegion::Heads
         bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
         bytes.extend_from_slice(blob);
         bytes
     }
 
     fn round_trip(page: LeafPage) {
-        let region = KnownRegion::Leaves(page.clone());
+        let region = KnownRegion::Heads(page.clone());
         let encoded = bincode::serialize(&region).unwrap();
         assert_eq!(bincode::serialized_size(&region).unwrap() as usize, encoded.len());
         assert_eq!(bincode::serialize(&decoded(&encoded).unwrap()).unwrap(), bincode::serialize(&page).unwrap());
-        let expected_json = serde_json::json!({ "Leaves": serde_json::to_value(&page).unwrap() });
+        let expected_json = serde_json::json!({ "Heads": serde_json::to_value(&page).unwrap() });
         assert_eq!(serde_json::to_value(&region).unwrap(), expected_json);
         let from_json: KnownRegion = serde_json::from_value(expected_json).unwrap();
         assert_eq!(bincode::serialize(&from_json).unwrap(), encoded);
@@ -130,7 +130,7 @@ mod tests {
     fn numeric_initial_inventory_has_the_expected_versioned_size() {
         let page = page((0..128u64).map(|n| [&[1][..], &n.to_be_bytes()].concat()).collect(), 1, 1);
         let fixed = bincode::serialize(&page).unwrap();
-        let compact = bincode::serialize(&KnownRegion::Leaves(page.clone())).unwrap();
+        let compact = bincode::serialize(&KnownRegion::Heads(page.clone())).unwrap();
         assert_eq!(compact, wrap_blob(&options().serialize(&(VERSION, &page)).unwrap()));
         assert_eq!(fixed.len(), 11920);
         assert_eq!(compact.len(), 9744);
@@ -139,29 +139,18 @@ mod tests {
 
     #[test]
     fn complete_initial_envelope_size_matches_its_encoding() {
-        let mut previous = None;
+        let mut heads = page((0..2048u64).map(|n| [&[1][..], &n.to_be_bytes()].concat()).collect(), 1, 1);
+        for (n, leaf) in heads.leaves.iter_mut().enumerate() {
+            let mut id = [0; 32];
+            id[..4].copy_from_slice(&(n as u32).to_be_bytes());
+            leaf.entity.entity_id = EntityId::from_bytes(id);
+        }
         let inventory = crate::KnownState {
             spec: crate::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True),
-            regions: (0..16)
-                .map(|index| {
-                    let mut page = page((0..128u64).map(|n| [&[1][..], &(index * 128 + n).to_be_bytes()].concat()).collect(), 1, 1);
-                    for (n, leaf) in page.leaves.iter_mut().enumerate() {
-                        let mut id = [0; 32];
-                        id[..4].copy_from_slice(&(index as u32 * 128 + n as u32).to_be_bytes());
-                        leaf.entity.entity_id = EntityId::from_bytes(id);
-                    }
-                    let last = page.leaves.last().unwrap();
-                    let end = ankurah_digest_tree::leaf_address(&last.key, last.entity.entity_id);
-                    page.bounds = AddressRange::new(
-                        previous.take().map_or(Bound::Unbounded, Bound::Excluded),
-                        if index == 15 { Bound::Unbounded } else { Bound::Included(end.clone()) },
-                    );
-                    previous = Some(end);
-                    KnownRegion::Leaves(page)
-                })
-                .collect(),
+            regions: vec![KnownRegion::Heads(heads)],
         };
         let encoded = bincode::serialize(&inventory).unwrap();
+        assert!(encoded.len() > 64 * 1024 && encoded.len() <= MAX_ENCODED_BYTES);
         assert_eq!(bincode::serialized_size(&inventory).unwrap() as usize, encoded.len());
         let decoded: crate::KnownState = bincode::deserialize(&encoded).unwrap();
         assert_eq!(bincode::serialize(&decoded).unwrap(), encoded);
@@ -218,9 +207,9 @@ mod tests {
         for blob in [vec![], wrong_version, valid[..valid.len() - 1].to_vec(), trailing, vec![VERSION; MAX_ENCODED_BYTES + 1]] {
             assert!(decoded(&wrap_blob(&blob)).is_err());
         }
-        assert!(decoded(&wrap_blob(&vec![VERSION; MAX_ENCODED_BYTES + 1])).unwrap_err().to_string().contains("exceeds 68 KiB"));
+        assert!(decoded(&wrap_blob(&vec![VERSION; MAX_ENCODED_BYTES + 1])).unwrap_err().to_string().contains("exceeds 256 KiB"));
         let oversized = page(vec![vec![0; MAX_ENCODED_BYTES]], 1, 1);
-        assert!(bincode::serialize(&KnownRegion::Leaves(oversized)).is_err());
+        assert!(bincode::serialize(&KnownRegion::Heads(oversized)).is_err());
         let mut impossible_length = 1u32.to_le_bytes().to_vec();
         impossible_length.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decoded(&impossible_length).is_err());

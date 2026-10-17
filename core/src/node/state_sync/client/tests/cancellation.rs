@@ -140,7 +140,7 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     for n in 1..=32 {
         let bounds = proto::AddressRange::new(start, Excluded(address(n)));
         regions.push(if n == 1 {
-            proto::KnownRegion::Leaves(snapshot.page(bounds)?)
+            proto::KnownRegion::Heads(snapshot.page(bounds)?)
         } else {
             proto::KnownRegion::Summary(snapshot.head(bounds).await?)
         });

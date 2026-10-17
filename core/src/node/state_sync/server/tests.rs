@@ -92,7 +92,7 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
 
     let mut mixed = known.clone();
     let proto::KnownRegion::Summary(head) = &mixed.regions[empty] else { unreachable!() };
-    mixed.regions[empty] = proto::KnownRegion::Leaves(requester.page(head.bounds.clone())?);
+    mixed.regions[empty] = proto::KnownRegion::Heads(requester.page(head.bounds.clone())?);
     let mixed = Comparison::new(snapshot(source.clone()).await?, mixed)?;
     assert!(!mixed.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))));
 
@@ -1375,7 +1375,7 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
         let known = requester.offer().await?;
         let mut comparison = Comparison::new(snapshot(source).await?, known)?;
         assert_eq!(comparison.known_clocks.len(), count);
-        assert!(comparison.work.iter().all(|work| matches!(work, Work::InitialLeaves(_))));
+        assert!(comparison.work.iter().all(|work| matches!(work, Work::InitialHeads(_))));
         let items = initial_items(&node, &mut comparison).await?;
         assert!(items.is_empty(), "equal initial pages need no response items");
         assert!(comparison.complete, "the full captured inventory was compared before Complete");
@@ -1416,13 +1416,13 @@ fn positioned_state(id: u32, position: i64, head: u8) -> anyhow::Result<proto::A
 }
 
 #[tokio::test]
-async fn initial_diff_keeps_cross_page_moves_and_readable_former_member_repairs() -> anyhow::Result<()> {
+async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
     let query = super::super::QueryTree::default();
     let before = (0..256).map(|id| positioned_state(id, id as i64, 1)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut old = query.refresh(position_spec(), before).await?;
     let known = old.offer().await?;
-    assert_eq!(known.regions.len(), 2);
+    assert_eq!(known.regions.len(), 1);
     let saved_offer = bincode::serialize(&known)?;
     let mut members = old.members();
     let mut current = (0..256)
@@ -1447,7 +1447,7 @@ async fn initial_diff_keeps_cross_page_moves_and_readable_former_member_repairs(
     let captured = query.refresh(position_spec(), current.clone()).await?;
     let expected = captured.members();
     let mut comparison = Comparison::new(captured, known)?;
-    assert_eq!(comparison.known_clocks.len(), 256, "later pages are loaded before the first moved key is visited");
+    assert_eq!(comparison.known_clocks.len(), 256, "all clocks are loaded before the first moved key is visited");
     let items = initial_items(&node, &mut comparison).await?;
     let mut repairs = HashMap::new();
     for item in items {
@@ -1521,7 +1521,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
 }
 
 #[tokio::test]
-async fn alternating_initial_points_expand_one_bounded_page_at_a_time() -> anyhow::Result<()> {
+async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
     let before = ordered_states(2048, 2);
     let mut current = before.clone();
@@ -1533,12 +1533,14 @@ async fn alternating_initial_points_expand_one_bounded_page_at_a_time() -> anyho
     }
     let mut requester = snapshot(before).await?;
     let mut comparison = Comparison::new(snapshot(current).await?, requester.offer().await?)?;
-    assert_eq!(comparison.work.len(), 16);
-    let Some(Work::InitialLeaves(page)) = comparison.work.pop_front() else { panic!("initial page") };
-    comparison.expand_initial_leaves(page)?;
-    // One page can add 128 point removals, 128 repairs, and 129 gaps;
-    // the other 15 of the 16 initial pages remain deferred.
-    assert!(comparison.work.len() <= 385 + 15);
+    assert_eq!(comparison.work.len(), 1);
+    let Some(Work::InitialHeads(page)) = comparison.work.pop_front() else { panic!("initial page") };
+    comparison.expand_initial_heads(page)?;
+    // One batch can add 128 point removals, 128 repairs, and 129 gaps;
+    // the rest of the single request inventory remains deferred.
+    assert!(comparison.work.len() <= 385 + 1);
+    assert!(comparison.work.iter().any(|work| matches!(work,
+        Work::InitialHeads(rest) if rest.leaves.len() == 2048 - LEAF_PAGE)));
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Leaves(page) if page.leaves.is_empty())).count(), 2048);
     assert_eq!(
@@ -1557,13 +1559,13 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let page = requester.page(AddressRange::new(std::ops::Bound::Included(point.clone()), std::ops::Bound::Included(point)))?;
     let mut exact = Comparison::new(
         snapshot(before.clone()).await?,
-        proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Leaves(page.clone())] },
+        proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Heads(page.clone())] },
     )?;
-    let point_work = exact.work.iter().position(|work| matches!(work, Work::InitialLeaves(_))).unwrap();
-    let Some(Work::InitialLeaves(validated)) = exact.work.remove(point_work) else { panic!("validated exact point") };
+    let point_work = exact.work.iter().position(|work| matches!(work, Work::InitialHeads(_))).unwrap();
+    let Some(Work::InitialHeads(validated)) = exact.work.remove(point_work) else { panic!("validated exact point") };
     assert_eq!(validated.bounds, page.bounds);
     let unknown_gaps = exact.work.len();
-    exact.expand_initial_leaves(validated)?;
+    exact.expand_initial_heads(validated)?;
     assert_eq!(exact.work.len(), unknown_gaps, "a validated equal point adds no equality echo");
     assert_eq!(exact.known_clocks.len(), 1);
     let (node, _, _) = node().await?;
@@ -1576,23 +1578,23 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let extra = positioned_state(3, 10000, 1)?;
     let mut keyed = super::super::QueryTree::default().refresh(position_spec(), vec![extra]).await?;
     let mut duplicate = keyed.offer().await?;
-    let proto::KnownRegion::Leaves(first) = &mut duplicate.regions[0] else { unreachable!() };
+    let proto::KnownRegion::Heads(first) = &mut duplicate.regions[0] else { unreachable!() };
     let mut second = first.clone();
     let key = CanonicalCodec.encode_prefix(position_spec().key_spec(), &[ankurah_core_types::Value::I64(10001)])?;
     second.leaves[0].key = key;
     let addr = leaf_address(&second.leaves[0].key, second.leaves[0].entity.entity_id);
     first.bounds.end = std::ops::Bound::Excluded(addr.clone());
     second.bounds.start = std::ops::Bound::Included(addr);
-    duplicate.regions.push(proto::KnownRegion::Leaves(second));
+    duplicate.regions.push(proto::KnownRegion::Heads(second));
     assert!(
         Comparison::new(super::super::QueryTree::default().refresh(position_spec(), vec![]).await?, duplicate).is_err(),
         "global duplicate IDs must fail even at distinct keys/pages"
     );
     let mut oversized = requester.offer().await?;
     let last = ordered_states(2049, 2).pop().unwrap();
-    let proto::KnownRegion::Leaves(page) = oversized.regions.last_mut().unwrap() else { unreachable!() };
+    let proto::KnownRegion::Heads(page) = oversized.regions.last_mut().unwrap() else { unreachable!() };
     page.bounds.end = std::ops::Bound::Excluded(last.payload.entity_id.to_bytes().to_vec());
-    oversized.regions.push(proto::KnownRegion::Leaves(proto::LeafPage {
+    oversized.regions.push(proto::KnownRegion::Heads(proto::LeafPage {
         bounds: AddressRange::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
         leaves: vec![proto::KnownLeaf {
             key: vec![],
@@ -1623,7 +1625,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let former = text_state("z".repeat(40 * 1024), 2)?;
     let mut requester = super::super::QueryTree::default().refresh(spec.clone(), vec![before]).await?;
     let known = requester.offer().await?;
-    let [proto::KnownRegion::Leaves(page)] = known.regions.as_slice() else { panic!("one valid complete initial inventory") };
+    let [proto::KnownRegion::Heads(page)] = known.regions.as_slice() else { panic!("one valid complete initial inventory") };
     assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
     let supplied_clock = page.leaves[0].entity.head.clone();
     let address = leaf_address(&page.leaves[0].key, page.leaves[0].entity.entity_id);
@@ -1638,8 +1640,8 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     tx.commit().await?;
     let empty = super::super::QueryTree::default().refresh(spec.clone(), vec![]).await?;
     let mut comparison = Comparison::new(empty, known.clone())?;
-    let Some(Work::InitialLeaves(page)) = comparison.work.pop_front() else { panic!("initial region") };
-    comparison.expand_initial_leaves(page)?;
+    let Some(Work::InitialHeads(page)) = comparison.work.pop_front() else { panic!("initial region") };
+    comparison.expand_initial_heads(page)?;
     assert!(comparison.work.iter().any(|work| matches!(work, Work::SendLeaves(bounds) if *bounds == super::super::whole())));
     assert!(comparison
         .work
@@ -1681,7 +1683,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
         let page = requester.page(remaining)?;
         assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
         let end = page.bounds.end.clone();
-        regions.push(proto::KnownRegion::Leaves(page));
+        regions.push(proto::KnownRegion::Heads(page));
         if end == super::super::whole().end {
             break;
         }

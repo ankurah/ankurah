@@ -84,6 +84,44 @@ fn offers_target(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool
 }
 
 #[tokio::test]
+async fn fetch_and_subscription_send_one_complete_initial_head_inventory() -> Result<()> {
+    let (server, client) = nodes().await?;
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    for i in 0..256 {
+        trx.create(&Pet { name: format!("pet-{i:03}"), age: "1".into() }).await?;
+    }
+    trx.commit().await?;
+    let offers = Arc::new(Mutex::new(Vec::new()));
+    let (_connection, _) = GatedConnection::new(&client, &server, {
+        let offers = offers.clone();
+        move |message| {
+            if let NodeMessage::Request { request, .. } = message {
+                let (subscribe, known) = match &request.body {
+                    proto::NodeRequestBody::Fetch { known_state, .. } => (false, known_state),
+                    proto::NodeRequestBody::SubscribeQuery { known_state, .. } => (true, known_state),
+                    _ => return false,
+                };
+                if let [proto::KnownRegion::Heads(inventory)] = known.regions.as_slice() {
+                    offers.lock().unwrap().push((subscribe, inventory.leaves.len()));
+                }
+            }
+            false
+        }
+    })
+    .await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    assert_eq!(reader.fetch::<PetView>("true").await?.len(), 256);
+    assert_eq!(reader.fetch::<PetView>("true").await?.len(), 256);
+    let query = reader.query_wait::<PetView>("true").await?;
+    query.wait_durable_answered().await?;
+    let offers = offers.lock().unwrap();
+    assert!(offers.contains(&(false, 256)), "Fetch sends all heads in one region");
+    assert!(offers.contains(&(true, 256)), "SubscribeQuery sends all heads in one region");
+    Ok(())
+}
+
+#[tokio::test]
 async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;

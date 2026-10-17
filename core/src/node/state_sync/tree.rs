@@ -361,22 +361,8 @@ impl Snapshot {
     }
 
     pub async fn offer(&mut self) -> anyhow::Result<proto::KnownState> {
-        if self.members.len() <= super::INITIAL_INVENTORY_LEAVES {
-            let mut inventory = proto::KnownState { spec: self.spec.clone(), regions: Vec::new() };
-            let mut remaining = super::whole();
-            while inventory.regions.len() < OFFER_REGIONS {
-                let Ok(page) = self.page(remaining) else { break };
-                let end = page.bounds.end.clone();
-                inventory.regions.push(proto::KnownRegion::Leaves(page));
-                if bincode::serialized_size(&inventory)? > super::INITIAL_INVENTORY_BYTES as u64 {
-                    break;
-                }
-                if end == super::whole().end {
-                    return Ok(inventory);
-                }
-                let std::ops::Bound::Included(last) = end else { break };
-                remaining = super::whole().after(&last);
-            }
+        if let Some(inventory) = self.initial_inventory() {
+            return Ok(inventory);
         }
         // A bounded disjoint frontier recognizes both equal inventories and
         // small changed regions without serial refinement exchanges.
@@ -414,6 +400,33 @@ impl Snapshot {
             spec: self.spec.clone(),
             regions: frontier.into_iter().map(|(head, _)| proto::KnownRegion::Summary(head)).collect(),
         })
+    }
+
+    fn initial_inventory(&self) -> Option<proto::KnownState> {
+        if self.members.len() > super::INITIAL_INVENTORY_LEAVES {
+            return None;
+        }
+        let mut leaves = Vec::with_capacity(self.members.len());
+        let mut minimum_bytes = 0usize;
+        for (address, id) in self.members.iter() {
+            let head = &self.states[id].payload.state.head;
+            // Bound cloning before encoding: keys, entity IDs and event IDs
+            // alone cannot exceed the request budget. The exact check below
+            // also includes clock generations, lengths, bounds and TreeSpec.
+            minimum_bytes = minimum_bytes.saturating_add(address.len()).saturating_add(head.len().saturating_mul(32));
+            if minimum_bytes > super::INITIAL_INVENTORY_BYTES {
+                return None;
+            }
+            leaves.push(proto::KnownLeaf {
+                key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
+                entity: proto::EntityHead { entity_id: *id, head: head.clone() },
+            });
+        }
+        let inventory = proto::KnownState {
+            spec: self.spec.clone(),
+            regions: vec![proto::KnownRegion::Heads(proto::LeafPage { bounds: super::whole(), leaves })],
+        };
+        bincode::serialized_size(&inventory).ok().filter(|size| *size <= super::INITIAL_INVENTORY_BYTES as u64).map(|_| inventory)
     }
 
     pub fn page(&self, bounds: proto::AddressRange) -> anyhow::Result<proto::LeafPage> {

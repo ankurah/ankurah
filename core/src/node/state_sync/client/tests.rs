@@ -441,7 +441,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     for n in 1..=32 {
         let bounds = proto::AddressRange::new(start, Excluded(address(n)));
         regions.push(if n == 1 {
-            proto::KnownRegion::Leaves(snapshot.page(bounds)?)
+            proto::KnownRegion::Heads(snapshot.page(bounds)?)
         } else {
             proto::KnownRegion::Summary(snapshot.head(bounds).await?)
         });
