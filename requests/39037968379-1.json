@@ -1,0 +1,117 @@
+{
+  "comparison_key": "fc8cad1813918c8619f4d72a7dba5a2a0fb1e77f09fbea6b75a9a9992479e9ea",
+  "id": "39037968379-1",
+  "kind": "hosted",
+  "markers": [
+    {
+      "kind": "release",
+      "label": "ankql-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankql-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-cli-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-cli-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-connector-local-process-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-connector-local-process-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-core-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-core-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-derive-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-derive-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-jwt-auth-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-jwt-auth-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-proto-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-proto-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-signals-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-signals-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-common-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-common-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-indexeddb-wasm-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-indexeddb-wasm-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-postgres-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-postgres-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sled-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sled-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-storage-sqlite-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-storage-sqlite-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-client-wasm-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-client-wasm-v0.9.1"
+    },
+    {
+      "kind": "release",
+      "label": "ankurah-websocket-server-v0.9.1",
+      "url": "https://github.com/ankurah/ankurah/releases/tag/ankurah-websocket-server-v0.9.1"
+    }
+  ],
+  "repeat": false,
+  "run_id": "39037968379-1",
+  "schema_version": 1,
+  "source": {
+    "committed_at": "2026-08-06T18:36:06-07:00",
+    "label": "aa75219cf9224882e8fb2895392f00b528ccf830",
+    "publication_verification": {
+      "crate": "ankql",
+      "published_at": "2026-08-07T01:36:36.424293Z",
+      "sha": "aa75219cf9224882e8fb2895392f00b528ccf830",
+      "tag": "ankql-v0.9.1",
+      "url": "https://crates.io/crates/ankql/0.9.1",
+      "vcs": {
+        "git": {
+          "sha1": "aa75219cf9224882e8fb2895392f00b528ccf830"
+        },
+        "path_in_vcs": "ankql"
+      },
+      "version": "0.9.1"
+    },
+    "ref": "aa75219cf9224882e8fb2895392f00b528ccf830",
+    "repository": "ankurah/ankurah",
+    "sha": "aa75219cf9224882e8fb2895392f00b528ccf830"
+  },
+  "status": "ok"
+}
