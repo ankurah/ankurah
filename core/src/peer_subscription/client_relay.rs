@@ -681,11 +681,10 @@ where
             || !node.subscription_relay.as_ref().is_some_and(|relay| relay.bind_stream(peer_id, query_id, version, stream.request.clone()))
         {
             let weak = node.weak();
-            let credentials = context_data.clone();
             let comparison = state.frame.comparison;
             crate::task::spawn(async move {
                 if let Some(node) = weak.upgrade() {
-                    let _ = state_sync::abandon_current_state(&node, peer_id, comparison, &credentials, &stream).await;
+                    let _ = state_sync::abandon_current_state(&node, peer_id, comparison, &stream);
                 }
             });
             return Err(RequestError::ConnectionLost.into());

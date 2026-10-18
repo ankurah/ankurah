@@ -7,6 +7,7 @@ use crate::{
     request::{NodeRequest, NodeResponse},
     subscription::QueryId,
     update::{NodeUpdate, NodeUpdateAck},
+    StateStreamId,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -21,11 +22,24 @@ pub enum Message {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum NodeMessage {
-    Request { auth: Vec<AuthData>, request: NodeRequest },
+    Request {
+        auth: Vec<AuthData>,
+        request: NodeRequest,
+    },
     Response(NodeResponse),
     Update(NodeUpdate),
     UpdateAck(NodeUpdateAck),
-    UnsubscribeQuery { from: EntityId, query_id: QueryId },
+    UnsubscribeQuery {
+        from: EntityId,
+        query_id: QueryId,
+    },
+    /// One-way cleanup of a stream owned by `from` on `to`. No response is sent.
+    /// Ends its active round and live delivery; a replacement stream is unaffected.
+    AbandonStateStream {
+        from: EntityId,
+        to: EntityId,
+        stream: StateStreamId,
+    },
 }
 
 impl std::fmt::Display for Message {
@@ -46,6 +60,7 @@ impl std::fmt::Display for NodeMessage {
             NodeMessage::Update(update) => write!(f, "Update: {}", update),
             NodeMessage::UpdateAck(update_ack) => write!(f, "UpdateAck: {}", update_ack),
             NodeMessage::UnsubscribeQuery { from, query_id } => write!(f, "Unsubscribe: {} {}", from, query_id),
+            NodeMessage::AbandonStateStream { from, to, stream } => write!(f, "AbandonStateStream {from}->{to}: {stream}"),
         }
     }
 }

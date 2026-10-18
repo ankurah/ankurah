@@ -161,8 +161,7 @@ impl Scheduler {
                     }
                     proto::NodeRequestBody::SubscribeQuery { .. } => true,
                     proto::NodeRequestBody::ContinueState { comparison, .. }
-                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
-                    | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => self.catalog_comparisons.contains(comparison),
+                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => self.catalog_comparisons.contains(comparison),
                     _ => return false,
                 };
                 if !protected {
@@ -183,6 +182,7 @@ impl Scheduler {
                 }
                 protected
             }
+            proto::NodeMessage::AbandonStateStream { stream, .. } => self.catalog_comparisons.contains(stream),
             proto::NodeMessage::Update(update) => matches!(&update.body, proto::NodeUpdateBody::StateFrame { request_id, frame }
                 if matches!(frame.body, proto::StateFrameBody::State { .. })
                     && (self.catalog_requests.contains(request_id) || self.catalog_comparisons.contains(&frame.comparison))),
@@ -353,6 +353,7 @@ fn recipient_id(message: &proto::NodeMessage) -> Option<proto::EntityId> {
         proto::NodeMessage::Update(update) => Some(update.to),
         proto::NodeMessage::UpdateAck(ack) => Some(ack.to),
         proto::NodeMessage::UnsubscribeQuery { .. } => None,
+        proto::NodeMessage::AbandonStateStream { to, .. } => Some(*to),
     }
 }
 

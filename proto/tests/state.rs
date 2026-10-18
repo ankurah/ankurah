@@ -268,10 +268,13 @@ fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
         assert_eq!(round, 2);
         assert_eq!(received_outcome, outcome);
     }
-    let abandon = request(NodeRequestBody::AbandonStateStream { stream: comparison });
-    assert!(matches!(wire(&abandon).body, NodeRequestBody::AbandonStateStream { stream } if stream == comparison));
-    let json = serde_json::to_value(&abandon.body).unwrap();
-    assert_eq!(json, serde_json::json!({ "AbandonStateStream": { "stream": comparison } }));
+    let from = EntityId::random();
+    let to = EntityId::random();
+    let abandon = NodeMessage::AbandonStateStream { from, to, stream: comparison };
+    assert!(matches!(wire(&abandon), NodeMessage::AbandonStateStream { stream, from: sender, to: recipient }
+        if stream == comparison && sender == from && recipient == to));
+    let json = serde_json::to_value(&abandon).unwrap();
+    assert_eq!(json, serde_json::json!({ "AbandonStateStream": { "from": from, "to": to, "stream": comparison } }));
     // Finishing needs a round; abandoning a stream does not imply Applied.
     assert!(serde_json::from_value::<NodeRequestBody>(serde_json::json!({ "FinishStateRound": {
         "stream": comparison, "outcome": "Cancelled"

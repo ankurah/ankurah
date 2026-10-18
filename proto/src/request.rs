@@ -158,11 +158,6 @@ pub enum NodeRequestBody {
         round: u64,
         outcome: StateRoundOutcome,
     },
-    /// Cancel this exact stream/query generation, including its active round
-    /// and live delivery. Never remove a replacement stream. Repeats are safe.
-    AbandonStateStream {
-        stream: StateStreamId,
-    },
 }
 
 /// A response from one node to another
@@ -285,7 +280,6 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "RefreshState {comparison} round:{round} spans:{}", known_state.spans.len())
             }
             NodeRequestBody::FinishStateRound { stream, round, outcome } => write!(f, "FinishStateRound {stream}/{round} {outcome:?}"),
-            NodeRequestBody::AbandonStateStream { stream } => write!(f, "AbandonStateStream {stream}"),
         }
     }
 }

@@ -643,10 +643,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .await?,
         NodeResponseBody::Error(_)
     ));
-    assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::AbandonStateStream { stream: comparison }).await?,
-        NodeResponseBody::Success
-    ));
+    server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     assert!(matches!(
         client
             .request(
@@ -811,10 +808,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
             .any(|body| matches!(body, NodeResponseBody::ComparisonUnavailable { comparison: id } if *id == comparison))
     })
     .await;
-    assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::AbandonStateStream { stream: comparison }).await?,
-        NodeResponseBody::Success
-    ));
+    server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     Ok(())
 }
 
@@ -1049,10 +1043,7 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
             .await?,
         NodeResponseBody::ComparisonUnavailable { .. }
     ));
-    assert!(matches!(
-        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::AbandonStateStream { stream: comparison }).await?,
-        NodeResponseBody::Success
-    ));
+    server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("3")?;
     trx.commit().await?;

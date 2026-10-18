@@ -61,8 +61,8 @@ pub(crate) struct IncomingStream {
 }
 
 impl IncomingStream {
-    /// The peer confirmed closure; dropping this owner no longer needs to abandon it.
-    pub fn remote_closed(&self) {
+    /// Cleanup was sent or completion confirmed; dropping this owner needs no further abandonment.
+    pub fn disarm_abandonment(&self) {
         if let Some(owner) = self.owner.upgrade() {
             if let Some(stream) = owner.0.lock().unwrap().streams.get_mut(&self.request) {
                 stream.abandon = None;

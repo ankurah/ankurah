@@ -1386,7 +1386,7 @@ impl Driver {
         while let Some(result) = self.controls.next().await {
             result?;
         }
-        self.stream.remote_closed();
+        self.stream.disarm_abandonment();
         Ok(())
     }
     pub fn ids(&self) -> Vec<proto::EntityId> { self.projection.members.keys().copied().collect() }

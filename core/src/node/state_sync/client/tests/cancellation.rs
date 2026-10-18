@@ -16,9 +16,7 @@ fn abandoned(messages: &[proto::NodeMessage], comparison: proto::StateStreamId) 
         .iter()
         .filter(|message| {
             matches!(message,
-                proto::NodeMessage::Request { request: proto::NodeRequest {
-                    body: proto::NodeRequestBody::AbandonStateStream { stream: id }, ..
-                }, .. } if *id == comparison
+                proto::NodeMessage::AbandonStateStream { stream: id, .. } if *id == comparison
             )
         })
         .count()

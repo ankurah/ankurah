@@ -110,8 +110,7 @@ impl Meter {
                         self.model.is_some_and(|model| selection.predicate.referenced_models().contains(&model))
                     }
                     proto::NodeRequestBody::ContinueState { comparison, .. }
-                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
-                    | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => self.comparisons.contains(comparison),
+                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => self.comparisons.contains(comparison),
                     _ => false,
                 };
                 if include {
@@ -148,6 +147,9 @@ impl Meter {
                         self.observe_frame(frame);
                     }
                 }
+            }
+            proto::NodeMessage::AbandonStateStream { stream, .. } if self.comparisons.contains(stream) => {
+                self.traffic.request_bytes += bincode::serialized_size(message).unwrap() as usize;
             }
             proto::NodeMessage::UpdateAck(ack) if self.updates.contains(&ack.id) => {
                 let bytes = bincode::serialized_size(message).unwrap() as usize;

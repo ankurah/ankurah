@@ -67,9 +67,7 @@ impl PolicyAgent for CredentialAgent {
             proto::NodeRequestBody::GetEvents { event_ids } => {
                 self.event_requests.lock().unwrap().push((event_ids.clone(), credentials.clone()));
             }
-            proto::NodeRequestBody::ContinueState { .. }
-            | proto::NodeRequestBody::FinishStateRound { .. }
-            | proto::NodeRequestBody::AbandonStateStream { .. } => {
+            proto::NodeRequestBody::ContinueState { .. } | proto::NodeRequestBody::FinishStateRound { .. } => {
                 let request = bincode::deserialize(&bincode::serialize(request).unwrap()).unwrap();
                 self.feedback.lock().unwrap().push((credentials.clone(), request));
                 self.feedback_arrived.notify_one();
@@ -371,8 +369,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     );
     for (credentials, request) in feedback.iter().filter(|(_, request)| {
         matches!(request.body,
-        proto::NodeRequestBody::ContinueState { comparison: found, .. } | proto::NodeRequestBody::FinishStateRound { stream: found, .. }
-                    | proto::NodeRequestBody::AbandonStateStream { stream: found } if found == comparison)
+        proto::NodeRequestBody::ContinueState { comparison: found, .. } | proto::NodeRequestBody::FinishStateRound { stream: found, .. } if found == comparison)
     }) {
         assert_eq!(
             *credentials,
@@ -385,7 +382,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
 }
 
 #[tokio::test]
-async fn cancelled_fetch_abandons_with_its_credential_and_preserves_another_query() -> Result<()> {
+async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_another_query() -> Result<()> {
     let agent = CredentialAgent::default();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     server.system.create().await?;
@@ -397,15 +394,12 @@ async fn cancelled_fetch_abandons_with_its_credential_and_preserves_another_quer
 
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let metadata = Arc::new(Mutex::new(None::<proto::NodeResponse>));
-    let responses = Arc::new(Mutex::new(Vec::<(proto::RequestId, proto::NodeResponseBody)>::new()));
     let response_arrived = Arc::new(tokio::sync::Notify::new());
     let (_connection, gate) = GatedConnection::new(&server, &client, {
         let metadata = metadata.clone();
-        let responses = responses.clone();
         let response_arrived = response_arrived.clone();
         move |message| {
             if let proto::NodeMessage::Response(response) = message {
-                responses.lock().unwrap().push((response.request_id.clone(), response.body.clone()));
                 let hold = matches!(&response.body, proto::NodeResponseBody::Fetch(_));
                 if hold {
                     *metadata.lock().unwrap() = Some(bincode::deserialize(&bincode::serialize(response).unwrap()).unwrap());
@@ -446,32 +440,32 @@ async fn cancelled_fetch_abandons_with_its_credential_and_preserves_another_quer
     assert!(client.storage.get_state(fetched_id).await.is_err(), "the cancelled Fetch must not have installed its held result");
 
     // The late response reveals the responder-issued handle only after the
-    // requesting context is gone. Cleanup still owns its original authority.
+    // requesting context is gone. Cleanup needs only this peer and stream.
     gate.release_held(&client).await;
-    let close_request = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let notified = agent.feedback_arrived.notified();
-            if let Some((credentials, request)) = agent.feedback.lock().unwrap().iter().find(
-                |(_, request)| matches!(request.body, proto::NodeRequestBody::AbandonStateStream { stream: found } if found == comparison),
-            ) {
-                assert_eq!(*credentials, [Credential(1)], "abandonment must retain the Fetch credential, not the peer credential union");
-                break request.id.clone();
-            }
-            notified.await;
-        }
-    })
-    .await?;
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let notified = response_arrived.notified();
-            if let Some((_, body)) = responses.lock().unwrap().iter().find(|(request, _)| *request == close_request) {
-                assert!(matches!(body, proto::NodeResponseBody::Success), "the responder must accept abandonment: {body:?}");
-                break;
+            // A deliberately invalid receipt distinguishes active from retired;
+            // abandonment itself is one-way and has no response to await.
+            let result = client
+                .request(
+                    server.id,
+                    &vec![Credential(1)],
+                    proto::NodeRequestBody::ContinueState {
+                        comparison,
+                        round: Some(0),
+                        processed_through: u64::MAX,
+                        applied_through: None,
+                        answers: vec![],
+                    },
+                )
+                .await?;
+            if matches!(result, proto::NodeResponseBody::ComparisonUnavailable { comparison: found } if found == comparison) {
+                break Ok::<_, anyhow::Error>(());
             }
-            notified.await;
+            tokio::task::yield_now().await;
         }
     })
-    .await?;
+    .await??;
 
     // A duplicate of the genuine initial metadata must neither resurrect the
     // cancelled Fetch nor abandon a different stream on this connection.
@@ -492,19 +486,6 @@ async fn cancelled_fetch_abandons_with_its_credential_and_preserves_another_quer
         subscription_requests,
         "the unrelated stream must keep flowing without resubscription"
     );
-    assert_eq!(
-        agent
-            .feedback
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(_, request)| matches!(request.body,
-            proto::NodeRequestBody::AbandonStateStream { stream: found }
-            if found == comparison))
-            .count(),
-        1,
-        "duplicate metadata must not launch duplicate cleanup"
-    );
     Ok(())
 }
 
@@ -518,23 +499,25 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
     server.context_async(Credential(0)).await?.resolve_model_id::<Record>().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
     let origin = Arc::new(Mutex::new(None::<proto::RequestId>));
-    let abandonment = Arc::new(Mutex::new(None::<(Vec<proto::AuthData>, proto::StateStreamId)>));
+    let abandonment = Arc::new(Mutex::new(None::<proto::StateStreamId>));
     let arrived = Arc::new(tokio::sync::Notify::new());
+    let (client_id, server_id) = (client.id, server.id);
     let (_connection, gate) = GatedConnection::new(&client, &server, {
         let origin = origin.clone();
         let abandonment = abandonment.clone();
         let arrived = arrived.clone();
         move |message| {
-            if let proto::NodeMessage::Request { auth, request } = message {
+            if let proto::NodeMessage::AbandonStateStream { from, to, stream } = message {
+                assert_eq!((*from, *to), (client_id, server_id));
+                *abandonment.lock().unwrap() = Some(*stream);
+                arrived.notify_one();
+            }
+            if let proto::NodeMessage::Request { request, .. } = message {
                 match request.body {
                     proto::NodeRequestBody::Fetch { .. } => {
                         *origin.lock().unwrap() = Some(request.id.clone());
                         arrived.notify_one();
                         return true;
-                    }
-                    proto::NodeRequestBody::AbandonStateStream { stream: comparison } => {
-                        *abandonment.lock().unwrap() = Some((auth.clone(), comparison));
-                        arrived.notify_one();
                     }
                     _ => {}
                 }
@@ -562,8 +545,7 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
     let comparison = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let notified = arrived.notified();
-            if let Some((auth, comparison)) = abandonment.lock().unwrap().take() {
-                assert!(auth.is_empty(), "catalog cleanup must bypass signing even when the requesting context has a credential");
+            if let Some(comparison) = abandonment.lock().unwrap().take() {
                 break comparison;
             }
             notified.await;

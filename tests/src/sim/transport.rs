@@ -79,17 +79,19 @@ impl Captured {
                     }
                 }
             }
+            proto::NodeMessage::AbandonStateStream { stream, .. } => {
+                if let Some(route) = streams.get_mut(stream).filter(|route| route.scripted) {
+                    route.abandoned = true;
+                    return; // One-way control: the scripted peer sends no response.
+                }
+            }
             proto::NodeMessage::Request { request, .. } => {
                 let comparison = match request.body {
                     proto::NodeRequestBody::ContinueState { comparison, .. }
-                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
-                    | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => Some(comparison),
+                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => Some(comparison),
                     _ => None,
                 };
                 if let Some(stream) = comparison.and_then(|id| streams.get_mut(&id)).filter(|stream| stream.scripted) {
-                    if matches!(request.body, proto::NodeRequestBody::AbandonStateStream { .. }) {
-                        stream.abandoned = true;
-                    }
                     // This scenario has become a malicious source. Its control
                     // responses still cross the same seeded transport scheduler.
                     self.queue.lock().unwrap().push(Outbound {
@@ -210,6 +212,7 @@ fn semantic_descriptor(message: &proto::NodeMessage) -> String {
         },
         proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
         proto::NodeMessage::UnsubscribeQuery { .. } => "UNSUB".to_string(),
+        proto::NodeMessage::AbandonStateStream { .. } => "ABANDON".to_string(),
     }
 }
 
@@ -239,7 +242,6 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::RefreshState { round, known_state, .. } => format!("refresh {}", payload_digest(&(round, known_state))),
         proto::NodeRequestBody::FinishStateRound { round, outcome, .. } => format!("finish round {round} {outcome:?}"),
-        proto::NodeRequestBody::AbandonStateStream { .. } => "abandon stream".into(),
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
         }

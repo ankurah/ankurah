@@ -313,9 +313,7 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_preparing_i
         peer.subscription_handler.query_tree_for_test(query_id).await.expect("replacement preparation cannot remove the standing query");
     assert!(Arc::ptr_eq(&original_tree, &retained));
     assert!(!messages.lock().unwrap().iter().any(|message| matches!(message,
-        proto::NodeMessage::Request { request: proto::NodeRequest {
-            body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
-        }, .. } if *found == comparison
+        proto::NodeMessage::AbandonStateStream { stream: found, .. } if *found == comparison
     )));
     release.send(()).unwrap();
     query.wait_durable_answered().await?;
@@ -381,9 +379,7 @@ async fn a_current_live_stream_failure_still_abandons_its_responder_query() -> a
     until(|| {
         messages.lock().unwrap().iter().any(|message| {
             matches!(message,
-                proto::NodeMessage::Request { request: proto::NodeRequest {
-                    body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
-                }, .. } if *found == comparison
+                proto::NodeMessage::AbandonStateStream { stream: found, .. } if *found == comparison
             )
         })
     })
@@ -507,9 +503,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
         peer.subscription_handler.query_tree_for_test(query_id).await.expect("superseded initial cleanup cannot erase the tree");
     assert!(Arc::ptr_eq(&original_tree, &retained));
     assert!(!messages.lock().unwrap().iter().any(|message| matches!(message,
-        proto::NodeMessage::Request { request: proto::NodeRequest {
-            body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
-        }, .. } if *found == comparison
+        proto::NodeMessage::AbandonStateStream { stream: found, .. } if *found == comparison
     )));
     gate.store(false, std::sync::atomic::Ordering::SeqCst);
     release.send(()).unwrap();
@@ -543,11 +537,15 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
     state.frame.sequence = 1;
     assert!(receive_state(&client, server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream).await.is_err());
     assert!(messages.lock().unwrap().iter().any(|message| matches!(message,
-        proto::NodeMessage::Request { request: proto::NodeRequest {
-            body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
-        }, .. } if *found == comparison
+        proto::NodeMessage::AbandonStateStream { stream: found, .. } if *found == comparison
     )));
-    assert!(server.peer_connections.get(&client.id).unwrap().subscription_handler.query_tree_for_test(query_id).await.is_none());
+    // One-way cleanup returns after sending, independently of remote teardown.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while server.peer_connections.get(&client.id).unwrap().subscription_handler.query_tree_for_test(query_id).await.is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await?;
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
     Ok(())

@@ -462,7 +462,7 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
         connection.comparisons.replay_initial(&origin, &[11], &[])?,
         Some(proto::NodeResponseBody::ComparisonUnavailable { .. })
     ));
-    abandon_state_stream(&node, peer, initial.frame.comparison, vec![]).await?;
+    abandon_state_stream(&node, peer, initial.frame.comparison).await;
     assert!(matches!(
         connection.comparisons.replay_initial(&origin, &[11], &[])?,
         Some(proto::NodeResponseBody::ComparisonUnavailable { .. })
@@ -794,6 +794,45 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
 }
 
 #[tokio::test]
+async fn abandonment_is_one_way_and_scoped_to_the_peer_and_recipient() -> anyhow::Result<()> {
+    let (node, peer, messages) = node().await?;
+    let other_peer = proto::EntityId::random();
+    node.register_peer(
+        proto::Presence { node_id: other_peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+        Box::new(CaptureSender { peer: other_peer, messages: messages.clone() }),
+    )
+    .await?;
+    let initial = start_comparison(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![crate::policy::DEFAULT_CONTEXT],
+        Some((proto::QueryId::new(), 1)),
+        false,
+        0,
+        snapshot(vec![]).await?,
+        unknown(),
+    )
+    .await?;
+    let stream = initial.frame.comparison;
+    let connection = node.peer_connections.get(&peer).unwrap();
+    connection.comparisons.get(&stream).unwrap().pumping.store(true, Ordering::Release);
+    messages.lock().unwrap().clear();
+    for (from, to, id) in [(other_peer, node.id, stream), (peer, other_peer, stream), (peer, node.id, StateStreamId::new())] {
+        node.handle_message(proto::NodeMessage::AbandonStateStream { from, to, stream: id }).await?;
+        assert!(connection.comparisons.get(&stream).is_some(), "unrelated peer, recipient or handle cannot abandon this stream");
+    }
+    for _ in 0..2 {
+        node.handle_message(proto::NodeMessage::AbandonStateStream { from: peer, to: node.id, stream }).await?;
+        assert!(connection.comparisons.get(&stream).is_none());
+    }
+    assert!(connection.comparisons.was_closed(&stream));
+    assert!(messages.lock().unwrap().is_empty(), "one-way cleanup must send no response or acknowledgment");
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -> anyhow::Result<()> {
     for query in [None, Some((proto::QueryId::new(), 1))] {
         let (node, peer, messages) = node().await?;
@@ -822,7 +861,6 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
         let cancelled = proto::StateRoundOutcome::Cancelled;
         let credentials = vec![crate::policy::DEFAULT_CONTEXT];
         assert!(finish_state_round(&node, peer, id, 0, cancelled, vec![]).await.is_err());
-        assert!(abandon_state_stream(&node, peer, id, vec![]).await.is_err());
         assert!(finish_state_round(&node, peer, id, 1, cancelled, credentials.clone()).await.is_err());
         finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
         finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
@@ -850,8 +888,8 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
             assert_eq!(state.round.number, 1);
             assert!(state.comparison.is_some(), "a duplicate old cancellation cannot retire the new round");
         }
-        abandon_state_stream(&node, peer, id, credentials.clone()).await?;
-        abandon_state_stream(&node, peer, id, credentials).await?;
+        abandon_state_stream(&node, peer, id).await;
+        abandon_state_stream(&node, peer, id).await;
         assert!(connection.comparisons.get(&id).is_none());
         assert!(queue_live(&node, peer, id, 2, vec![live_item(1)]).is_err());
     }
@@ -1333,7 +1371,7 @@ async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_outpu
         })
     )));
     drop(messages);
-    assert!(matches!(abandon_state_stream(&node, peer, id, vec![]).await?, proto::NodeResponseBody::Success));
+    abandon_state_stream(&node, peer, id).await;
     assert!(node.peer_connections.get(&peer).is_some(), "successful restart control preserves other streams on this connection");
     Ok(())
 }

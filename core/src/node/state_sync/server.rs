@@ -544,7 +544,6 @@ where
     let id = match body {
         proto::NodeRequestBody::ContinueState { comparison, .. }
         | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
-        | proto::NodeRequestBody::AbandonStateStream { stream: comparison }
         | proto::NodeRequestBody::RefreshState { comparison, .. } => comparison,
         _ => return crate::schema::request_bypasses_policy(body),
     };
@@ -795,28 +794,20 @@ where
     Ok(proto::NodeResponseBody::Success)
 }
 
-pub(crate) async fn abandon_state_stream<SE, PA>(
-    node: &Node<SE, PA>,
-    peer: proto::EntityId,
-    id: StateStreamId,
-    credentials: Vec<PA::ContextData>,
-) -> anyhow::Result<proto::NodeResponseBody>
+pub(crate) async fn abandon_state_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId)
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-    let Some(session) = connection.comparisons.get(&id) else {
-        return Ok(if connection.comparisons.was_closed(&id) {
-            proto::NodeResponseBody::Success
-        } else {
-            proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
-        });
-    };
-    ensure!(session.permits(&credentials), "comparison credentials changed");
+    // Cleanup grants no data access. Like unsubscribe, ownership is the peer's
+    // connection plus its responder-issued handle, not a fresh credential check.
+    let Some(connection) = node.peer_connections.get(&peer) else { return };
+    let Some(session) = connection.comparisons.get(&id) else { return };
     let state = session.state.lock().await;
-    if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
-        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+    if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
+        || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
+    {
+        return;
     }
     // Failed streams must remain abandonable, without asserting round coverage.
     connection.comparisons.finish(id);
@@ -824,7 +815,6 @@ where
     if let Some((query, version)) = session.query {
         connection.subscription_handler.abandon_comparison(query, version, id).await;
     }
-    Ok(proto::NodeResponseBody::Success)
 }
 
 /// The source actor calls this after queueing all publications through revision,

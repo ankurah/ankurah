@@ -41,27 +41,18 @@ where
         _ => None,
     };
     let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
-    let catalog = match &body {
-        proto::NodeRequestBody::SubscribeQuery { selection, .. } | proto::NodeRequestBody::Fetch { selection, .. } => {
-            crate::schema::is_catalog_read(&selection.predicate)
-        }
-        _ => false,
-    };
     let weak = node.weak();
     let original_connection = Arc::downgrade(&connection);
-    let cleanup_credentials = credentials.clone();
     let abandon = Arc::new(move |comparison| {
         let weak = weak.clone();
         let original_connection = original_connection.clone();
-        let credentials = cleanup_credentials.clone();
         crate::task::spawn(async move {
             if let Some(node) = weak.upgrade() {
                 let Some(connection) = original_connection.upgrade() else { return };
                 if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection)) {
                     return;
                 }
-                connection.outgoing_comparisons.insert(comparison, catalog);
-                let _ = abandon_state_stream(&node, peer, comparison, &credentials).await;
+                let _ = send_abandonment(&connection, node.id, peer, comparison);
             }
         });
     });
@@ -90,11 +81,11 @@ where
     stream.bind(comparison, catalog, connection.outgoing_comparisons.clone());
     drop(connection);
     if initial.spec != snapshot.spec || initial.frame.sequence != 0 || initial.round.number != 0 {
-        let _ = abandon_current_state(node, peer, comparison, credentials, &stream).await;
+        let _ = abandon_current_state(node, peer, comparison, &stream);
         return Err(RetrievalError::Other("invalid initial comparison metadata".into()));
     }
     if let Err(error) = stream.inbox.insert(initial.frame) {
-        let _ = abandon_current_state(node, peer, comparison, credentials, &stream).await;
+        let _ = abandon_current_state(node, peer, comparison, &stream);
         return Err(error.into());
     }
     let mut driver = driver::Driver::new(snapshot, initial.round, stream, comparison)?;
@@ -104,7 +95,7 @@ where
     }
     .await;
     if let Err(error) = result {
-        let _ = abandon_current_state(node, peer, comparison, credentials, &driver.stream).await;
+        let _ = abandon_current_state(node, peer, comparison, &driver.stream);
         return Err(stream_error(error));
     }
     Ok(RemoteState { comparison, ids: driver.ids(), driver })
@@ -180,7 +171,7 @@ pub(crate) fn finish_state<SE, PA>(
                     }
                 }
             }
-            let _ = abandon_current_state(&node, peer, remote.comparison, &credentials, &driver.stream).await;
+            let _ = abandon_current_state(&node, peer, remote.comparison, &driver.stream);
         }
     });
 }
@@ -196,20 +187,22 @@ where
 
 /// Superseded bound streams belong to replacement/unsubscribe cleanup;
 /// abandoning them here can erase the tree before replacement is prepared.
-pub(crate) async fn abandon_current_state<SE, PA>(
+pub(crate) fn abandon_current_state<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     comparison: proto::StateStreamId,
-    credentials: &Vec<PA::ContextData>,
     stream: &IncomingStream,
 ) -> Result<(), RetrievalError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    if owns_state_stream(node, peer, stream) {
-        abandon_state_stream(node, peer, comparison, credentials).await?;
-        stream.remote_closed();
+    let Some(connection) = node.peer_connections.get(&peer) else { return Ok(()) };
+    if connection.incoming_states.is_current(&stream.request)
+        && stream.query.is_none_or(|(query, version)| node.live_queries.get(query).is_some_and(|query| query.is_current(version)))
+    {
+        send_abandonment(&connection, node.id, peer, comparison)?;
+        stream.disarm_abandonment();
     }
     Ok(())
 }
@@ -235,26 +228,15 @@ where
     }
 }
 
-async fn abandon_state_stream<SE, PA>(
-    node: &Node<SE, PA>,
-    peer: proto::EntityId,
+fn send_abandonment<CD: crate::session::ContextData>(
+    connection: &crate::node::peer_state::PeerState<CD>,
+    from: proto::EntityId,
+    to: proto::EntityId,
     stream: proto::StateStreamId,
-    credentials: &Vec<PA::ContextData>,
-) -> Result<(), RetrievalError>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    let result = state_deadline(node.request(peer, credentials, proto::NodeRequestBody::AbandonStateStream { stream })).await;
-    if let Some(connection) = node.peer_connections.get(&peer) {
-        connection.outgoing_comparisons.remove(&stream);
-    }
-    match result?? {
-        proto::NodeResponseBody::Success => Ok(()),
-        proto::NodeResponseBody::ComparisonUnavailable { .. } => Err(RequestError::ConnectionLost.into()),
-        proto::NodeResponseBody::Error(error) => Err(RequestError::ServerError(error).into()),
-        other => Err(RequestError::UnexpectedResponse(other).into()),
-    }
+) -> Result<(), RequestError> {
+    let result = connection.send_message(proto::NodeMessage::AbandonStateStream { from, to, stream });
+    connection.outgoing_comparisons.remove(&stream);
+    result.map_err(RequestError::from)
 }
 
 async fn state_deadline<T>(future: impl std::future::Future<Output = T>) -> Result<T, RetrievalError> {

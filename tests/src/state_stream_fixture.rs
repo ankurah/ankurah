@@ -53,18 +53,21 @@ impl ScriptedConnection {
         let (server, receiver, routes) = (source.clone(), client.clone(), streams.clone());
         let source_task = tokio::spawn(async move {
             while let Some(message) = source_rx.recv().await {
+                if let proto::NodeMessage::AbandonStateStream { stream, .. } = &message {
+                    let mut routes = routes.lock().unwrap();
+                    if let Some(route) = routes.get_mut(stream).filter(|route| route.scripted) {
+                        route.abandoned = true;
+                        continue; // No reply to this one-way message.
+                    }
+                }
                 let response = if let proto::NodeMessage::Request { request, .. } = &message {
                     let comparison = match &request.body {
                         proto::NodeRequestBody::ContinueState { comparison, .. }
-                        | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
-                        | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => Some(*comparison),
+                        | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => Some(*comparison),
                         _ => None,
                     };
                     let mut routes = routes.lock().unwrap();
                     comparison.and_then(|id| routes.get_mut(&id)).filter(|stream| stream.scripted).map(|stream| {
-                        if matches!(request.body, proto::NodeRequestBody::AbandonStateStream { .. }) {
-                            stream.abandoned = true;
-                        }
                         if let proto::NodeRequestBody::ContinueState { applied_through: Some(revision), .. } = request.body {
                             stream.applied = Some(revision);
                         }

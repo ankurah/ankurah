@@ -522,6 +522,11 @@ where
                     peer_state.subscription_handler.remove_predicate(self, query_id).await?;
                 }
             }
+            proto::NodeMessage::AbandonStateStream { from, to, stream } => {
+                if to == self.id {
+                    state_sync::abandon_state_stream(self, from, stream).await;
+                }
+            }
         }
         Ok(())
     }
@@ -626,9 +631,6 @@ where
             }
             proto::NodeRequestBody::FinishStateRound { stream, round, outcome } => {
                 state_sync::finish_state_round(self, request.from, stream, round, outcome, credentials).await
-            }
-            proto::NodeRequestBody::AbandonStateStream { stream } => {
-                state_sync::abandon_state_stream(self, request.from, stream, credentials).await
             }
         }
     }
