@@ -28,7 +28,7 @@ pub struct Workload<'a> {
     rng: &'a mut SimRng,
     trace: &'a mut Trace,
     next_entity: u64,
-    scripted_origins: std::collections::HashMap<(usize, usize), proto::ComparisonId>,
+    scripted_origins: std::collections::HashMap<(usize, usize), proto::StateStreamId>,
     /// How many update events this workload has forged. Folded into each one's
     /// nonce, so two edits the schedule asked for separately stay two events
     /// even when their content and parent are identical.
@@ -151,7 +151,7 @@ impl<'a> Workload<'a> {
 
     /// Freeze the existing route before source-only adversarial changes, so
     /// ordinary source frames cannot pre-apply the payload under test.
-    pub fn begin_scripted_stream(&mut self, origin: usize, dst: usize) -> proto::ComparisonId {
+    pub fn begin_scripted_stream(&mut self, origin: usize, dst: usize) -> proto::StateStreamId {
         if let Some(comparison) = self.scripted_origins.get(&(origin, dst)) {
             return *comparison;
         }

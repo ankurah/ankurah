@@ -21,24 +21,26 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 mod inventory;
-pub use inventory::{ClockRef, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHeadRef, PackedHeads};
+pub use inventory::{
+    ClockRef, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
+};
 
-use crate::{Attested, Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityHead, EntityId, EntityState};
+use crate::{Attested, Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId, EntityState};
 
 /// A responder-issued state stream handle, scoped to one peer connection/query generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ComparisonId(Ulid);
+pub struct StateStreamId(Ulid);
 
-impl ComparisonId {
+impl StateStreamId {
     pub fn new() -> Self { Self(Ulid::new()) }
 }
 
-impl Default for ComparisonId {
+impl Default for StateStreamId {
     fn default() -> Self { Self::new() }
 }
 
-impl std::fmt::Display for ComparisonId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "C-{}", self.0) }
+impl std::fmt::Display for StateStreamId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "S-{}", self.0) }
 }
 
 /// Bounded knowledge of the requester's materialized query result.
@@ -82,7 +84,7 @@ pub struct StateReply {
 /// Frame zero is in StateReply; subsequent frames arrive only as NodeUpdate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFrame {
-    pub comparison: ComparisonId,
+    pub comparison: StateStreamId,
     pub sequence: u64,
     pub body: StateFrameBody,
 }
@@ -162,13 +164,13 @@ pub enum ComparisonProgress {
 /// A reply may mix refinement, inventory questions and entity repairs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateItem {
-    /// Compare this region locally and answer with a digest for the same span.
+    /// Compare this span locally and answer with a digest for the same span.
     /// The responder may offer several depths; overlap must not be counted twice.
     Digest(TreeSpanDigest),
-    /// The responder's complete leaf inventory within this page's bounds.
-    Leaves(TreeSpanInventory),
-    /// Enumerate the requester's leaves within these bounds, in bounded pages.
-    NeedLeaves(TreeSpan),
+    /// The responder's complete head inventory within this page's bounds.
+    Heads(TreeSpanInventory),
+    /// Enumerate the requester's heads within these bounds, in bounded pages.
+    NeedHeads(TreeSpan),
     /// Apply through the normal attestation and causal validation path.
     /// `target` is the captured sender head covered by this delta. Application
     /// may retain newer or concurrent local state; sending is not acknowledgment.
@@ -182,7 +184,7 @@ pub enum StateItem {
     /// independently covered target does not become unavailable retroactively.
     RepairUnavailable { entity_id: EntityId, target: Clock },
     /// Exhaustive captured membership with inline snapshots, avoiding a separate
-    /// leaf inventory and duplicate repair targets for a cold range.
+    /// head inventory and duplicate repair targets for a cold range.
     Snapshots(SnapshotPage),
 }
 
@@ -191,7 +193,7 @@ pub enum StateItem {
 pub enum StateAnswer {
     /// The requester's digest over the exact span offered by the responder.
     Digest(TreeSpanDigest),
-    Leaves(TreeSpanInventory),
+    Heads(TreeSpanInventory),
     /// An already offered snapshot did not incorporate target into local state.
     /// Only the exact offered entity/target is admissible, including after Complete.
     /// Answer with bounded connecting events or RepairUnavailable, never the same snapshot.
@@ -201,44 +203,15 @@ pub enum StateAnswer {
     },
 }
 
-/// All keyed entity heads within exactly `bounds`, including empty gaps.
-///
-/// A large requested span can be split into disjoint inventories in address order.
-/// Each inventory completely describes its bounds; the remaining bounds stay pending.
-/// This is a wire inventory, separate from the tree crate's local scan page and cursor.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TreeSpanInventory {
-    pub bounds: TreeSpan,
-    /// Strictly increasing by canonical key bytes followed by entity ID.
-    pub leaves: PackedHeads,
-}
-
-impl TreeSpanInventory {
-    /// Uncompressed logical size, including fixed-width lengths and generations.
-    /// Compression must not bypass the comparison's decoded-work budget.
-    pub fn expanded_size(&self) -> u64 { bincode::serialized_size(&self.bounds).expect("bounds serialize") + self.leaves.expanded_size() }
-}
-
 /// An exhaustive range page in canonical address order, including empty gaps.
 /// Derive keys and target clocks from these captured snapshots before applying
 /// them: a newer or concurrent local state may have a different key or head.
 /// Normal attestation, causal validation and target coverage still apply.
-/// Oversized snapshots use Leaves plus RepairChunk instead of a partial page.
+/// Oversized snapshots use Heads plus RepairChunk instead of a partial page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotPage {
     pub bounds: TreeSpan,
     pub states: Vec<Attested<EntityState>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeyedEntityHead {
-    /// Canonical property values selected by the TreeSpec's KeySpec. The full
-    /// address appends the entity ID; this key is empty for entity-ID-only trees.
-    /// It belongs to this tree: another KeySpec can place the same EntityHead
-    /// under a different key.
-    pub key: Vec<u8>,
-    /// The actual clock avoids another round trip when constructing an EventBridge.
-    pub entity: EntityHead,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

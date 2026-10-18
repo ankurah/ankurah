@@ -168,7 +168,7 @@ impl Mode {
             Self::PackedProduction => {
                 let ankurah_proto::SpanContent::Heads(page) = bincode::deserialize(input).unwrap() else { panic!("inventory") };
                 let mut hash = DefaultHasher::new();
-                let mut cursor = page.leaves.cursor();
+                let mut cursor = page.heads.cursor();
                 while let Some(leaf) = cursor.next() {
                     hash.write(leaf.key);
                     hash.write(&leaf.entity.entity_id.to_bytes());
@@ -247,12 +247,12 @@ fn main() {
         let prefix = codec::encode(&fixture.page, true);
         let packed = bincode::serialize(&ankurah_proto::SpanContent::Heads(ankurah_proto::TreeSpanInventory {
             bounds: fixture.page.bounds.clone(),
-            leaves: fixture.page.leaves.clone().into(),
+            heads: fixture.page.leaves.clone().into(),
         }))
         .unwrap();
         let ankurah_proto::SpanContent::Heads(decoded) = bincode::deserialize(&packed).unwrap() else { panic!("inventory") };
         assert_eq!(decoded.bounds, fixture.page.bounds);
-        assert_eq!(serde_json::to_value(decoded.leaves).unwrap(), serde_json::to_value(&fixture.page.leaves).unwrap());
+        assert_eq!(serde_json::to_value(decoded.heads).unwrap(), serde_json::to_value(&fixture.page.leaves).unwrap());
         codec::verify(&fixture.page, &current);
         codec::verify(&fixture.page, &prefix);
         let expected = consume_owned(&fixture.page);

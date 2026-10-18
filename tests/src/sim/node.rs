@@ -54,12 +54,12 @@ impl SimNode {
             .expect("sim peers share this build's protocol version");
     }
 
-    pub fn captured_origin(&self, query: proto::QueryId, to: proto::EntityId) -> proto::ComparisonId {
+    pub fn captured_origin(&self, query: proto::QueryId, to: proto::EntityId) -> proto::StateStreamId {
         self.captured.captured_origin(query, to)
     }
-    pub fn origin_failed(&self, comparison: proto::ComparisonId) -> bool { self.captured.origin_failed(comparison) }
-    pub fn begin_scripted(&self, comparison: proto::ComparisonId) { self.captured.begin_scripted(comparison); }
-    pub fn scripted_publication(&self, comparison: proto::ComparisonId, delta: proto::EntityDelta) -> proto::NodeMessage {
+    pub fn origin_failed(&self, comparison: proto::StateStreamId) -> bool { self.captured.origin_failed(comparison) }
+    pub fn begin_scripted(&self, comparison: proto::StateStreamId) { self.captured.begin_scripted(comparison); }
+    pub fn scripted_publication(&self, comparison: proto::StateStreamId, delta: proto::EntityDelta) -> proto::NodeMessage {
         self.captured.scripted_publication(comparison, delta)
     }
 

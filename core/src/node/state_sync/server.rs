@@ -1,5 +1,5 @@
 use super::{
-    Snapshot, CONTROL_BYTES, FRAME_BYTES, INITIAL_INVENTORY_BYTES, INITIAL_INVENTORY_LEAVES, LEAF_PAGE, MAX_INFLIGHT_FRAMES,
+    Snapshot, CONTROL_BYTES, FRAME_BYTES, HEAD_PAGE, INITIAL_INVENTORY_BYTES, INITIAL_INVENTORY_HEADS, MAX_INFLIGHT_FRAMES,
     MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS, PAGE_WORK, WINDOW_BYTES,
 };
 use crate::{
@@ -9,7 +9,7 @@ use crate::{
     storage::StorageEngine,
 };
 use ankurah_digest_tree::{leaf_address, CanonicalCodec, NodePrefix};
-use ankurah_proto::{self as proto, ComparisonId, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem, TreeSpan};
+use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan};
 use anyhow::{bail, ensure};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -36,14 +36,14 @@ const MAX_LIVE_ITEMS: usize = 4096;
 mod tests;
 
 pub(crate) struct Comparisons<CD: ContextData> {
-    sessions: Mutex<HashMap<ComparisonId, Arc<Session<CD>>>>,
-    closed: Mutex<VecDeque<ComparisonId>>,
+    sessions: Mutex<HashMap<StateStreamId, Arc<Session<CD>>>>,
+    closed: Mutex<VecDeque<StateStreamId>>,
     retired: Mutex<VecDeque<RetiredOrigin<CD>>>,
-    origins: Mutex<HashMap<proto::RequestId, ComparisonId>>,
+    origins: Mutex<HashMap<proto::RequestId, StateStreamId>>,
 }
 struct RetiredOrigin<CD> {
     request: proto::RequestId,
-    id: ComparisonId,
+    id: StateStreamId,
     fingerprint: Vec<u8>,
     credentials: Vec<CD>,
     last_sent: u64,
@@ -140,8 +140,8 @@ struct Stream {
     next_lane: usize,
 }
 impl<CD: ContextData> Comparisons<CD> {
-    pub fn get(&self, id: &ComparisonId) -> Option<Arc<Session<CD>>> { self.sessions.lock().unwrap().get(id).cloned() }
-    pub fn remove(&self, id: &ComparisonId) -> Option<Arc<Session<CD>>> {
+    pub fn get(&self, id: &StateStreamId) -> Option<Arc<Session<CD>>> { self.sessions.lock().unwrap().get(id).cloned() }
+    pub fn remove(&self, id: &StateStreamId) -> Option<Arc<Session<CD>>> {
         let session = self.sessions.lock().unwrap().remove(id)?;
         session.live.lock().unwrap().stopped = true;
         session.initial.lock().unwrap().take();
@@ -159,14 +159,14 @@ impl<CD: ContextData> Comparisons<CD> {
         }
         Some(session)
     }
-    pub fn was_closed(&self, id: &ComparisonId) -> bool { self.closed.lock().unwrap().contains(id) }
-    fn bypasses_policy(&self, id: &ComparisonId) -> bool {
+    pub fn was_closed(&self, id: &StateStreamId) -> bool { self.closed.lock().unwrap().contains(id) }
+    fn bypasses_policy(&self, id: &StateStreamId) -> bool {
         if let Some(session) = self.get(id) {
             return session.catalog;
         }
         self.retired.lock().unwrap().iter().find(|origin| &origin.id == id).is_some_and(|origin| origin.catalog)
     }
-    pub fn finish(&self, id: ComparisonId) {
+    pub fn finish(&self, id: StateStreamId) {
         self.remove(&id);
         let mut closed = self.closed.lock().unwrap();
         if !closed.contains(&id) {
@@ -224,7 +224,7 @@ impl<CD: ContextData> Comparisons<CD> {
         }
         Ok(None)
     }
-    fn permits_retired_receipt(&self, id: ComparisonId, processed: u64, credentials: &[CD]) -> bool {
+    fn permits_retired_receipt(&self, id: StateStreamId, processed: u64, credentials: &[CD]) -> bool {
         self.was_closed(&id)
             && self
                 .retired
@@ -249,10 +249,10 @@ enum Work {
     Compare { head: proto::TreeSpanDigest, prefix: NodePrefix },
     Offer(proto::TreeSpanDigest),
     Expand { local: proto::TreeSpanDigest, known: proto::TreeSpanDigest },
-    AskLeaves(TreeSpan),
+    AskHeads(TreeSpan),
     InitialHeads(InitialHeads),
-    AnswerLeaves { page: proto::TreeSpanInventory, rest: Option<TreeSpan> },
-    SendLeaves(TreeSpan),
+    AnswerHeads { page: proto::TreeSpanInventory, rest: Option<TreeSpan> },
+    SendHeads(TreeSpan),
     SendSnapshots(TreeSpan),
     Item(StateItem),
     Repair(proto::EntityId, Option<proto::Clock>),
@@ -262,13 +262,13 @@ enum Work {
 
 struct InitialHeads {
     bounds: TreeSpan,
-    leaves: proto::HeadCursor,
+    heads: proto::HeadCursor,
 }
 struct Comparison {
     snapshot: Snapshot,
     work: VecDeque<Work>,
     summaries: HashMap<Vec<u8>, NodePrefix>,
-    leaves: Vec<TreeSpan>,
+    head_requests: Vec<TreeSpan>,
     repaired: HashSet<proto::EntityId>,
     known_clocks: HashMap<proto::EntityId, proto::InventoryClock>,
     offered: HashMap<proto::EntityId, proto::Clock>,
@@ -573,7 +573,7 @@ where
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
     let mut comparison = Comparison::new(snapshot, known)?;
-    let id = ComparisonId::new();
+    let id = StateStreamId::new();
     let round = proto::StateRound { number: 0, revision };
     let body = comparison.reply(node, &credentials, catalog, query.is_some(), round.number).await?;
     let frame = StateFrame { comparison: id, sequence: 0, body };
@@ -664,7 +664,7 @@ pub(crate) async fn continue_state<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     request: proto::RequestId,
-    id: ComparisonId,
+    id: StateStreamId,
     round: Option<u64>,
     processed_through: u64,
     applied_through: Option<u64>,
@@ -748,7 +748,7 @@ where
 pub(crate) async fn close_state<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
-    id: ComparisonId,
+    id: StateStreamId,
     outcome: proto::ComparisonOutcome,
     credentials: Vec<PA::ContextData>,
 ) -> anyhow::Result<proto::NodeResponseBody>
@@ -780,7 +780,7 @@ where
             ensure!(round == state.round.number, "Applied names a retired or future round");
             let comparison = state.comparison.as_ref().ok_or_else(|| anyhow::anyhow!("round is already retired"))?;
             ensure!(
-                comparison.complete && comparison.summaries.is_empty() && comparison.leaves.is_empty(),
+                comparison.complete && comparison.summaries.is_empty() && comparison.head_requests.is_empty(),
                 "comparison enumeration is not complete"
             );
             ensure!(processed_through >= state.required_through, "Applied does not cover the completed enumeration");
@@ -825,7 +825,7 @@ where
 pub(crate) async fn schedule_round<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
-    id: ComparisonId,
+    id: StateStreamId,
     number: u64,
     revision: u64,
     snapshot: Snapshot,
@@ -864,7 +864,7 @@ where
 pub(crate) fn queue_live<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
-    id: ComparisonId,
+    id: StateStreamId,
     revision: u64,
     items: Vec<proto::QueryChange>,
 ) -> anyhow::Result<()>
@@ -908,7 +908,7 @@ where
     Ok(())
 }
 
-pub(crate) fn kick_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId)
+pub(crate) fn kick_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId)
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -944,7 +944,7 @@ where
     });
 }
 
-pub(crate) async fn pump_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()>
+pub(crate) async fn pump_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1035,7 +1035,7 @@ where
     Ok(())
 }
 
-pub(crate) async fn expire_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()>
+pub(crate) async fn expire_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1043,7 +1043,7 @@ where
     fail_stream(node, peer, id, StateFrameBody::RestartRequired).await
 }
 
-pub(crate) async fn source_unavailable<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId) -> anyhow::Result<()>
+pub(crate) async fn source_unavailable<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1051,7 +1051,7 @@ where
     fail_stream(node, peer, id, StateFrameBody::SourceUnavailable).await
 }
 
-async fn fail_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: ComparisonId, body: StateFrameBody) -> anyhow::Result<()>
+async fn fail_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId, body: StateFrameBody) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1225,7 +1225,7 @@ impl Comparison {
     fn waiting_for_capacity(&self) -> bool {
         match self.work.front() {
             Some(Work::Offer(_)) => self.summaries.len() >= 128,
-            Some(Work::AskLeaves(_)) => self.leaves.len() >= 128,
+            Some(Work::AskHeads(_)) => self.head_requests.len() >= 128,
             _ => false,
         }
     }
@@ -1234,7 +1234,7 @@ impl Comparison {
             snapshot,
             work: VecDeque::new(),
             summaries: HashMap::new(),
-            leaves: Vec::new(),
+            head_requests: Vec::new(),
             repaired: HashSet::new(),
             known_clocks: HashMap::new(),
             offered: HashMap::new(),
@@ -1266,7 +1266,7 @@ impl Comparison {
         });
         let mut start = super::whole().start;
         let mut frontier = Some(Vec::new());
-        let mut leaf_count = 0;
+        let mut head_count = 0;
         for region in spans {
             ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
             let bounds = match &region {
@@ -1295,14 +1295,14 @@ impl Comparison {
                 }
                 proto::SpanContent::Heads(page) => {
                     frontier = None;
-                    leaf_count += page.leaves.len();
-                    ensure!(leaf_count <= INITIAL_INVENTORY_LEAVES, "initial inventory exceeds leaf limit");
+                    head_count += page.heads.len();
+                    ensure!(head_count <= INITIAL_INVENTORY_HEADS, "initial inventory exceeds head limit");
                     comparison.validate_initial_heads(&page)?;
-                    let mut cursor = page.leaves.cursor();
+                    let mut cursor = page.heads.cursor();
                     while let Some((id, clock)) = cursor.next_clock() {
                         ensure!(comparison.known_clocks.insert(id, clock).is_none(), "duplicate entity in initial inventory");
                     }
-                    comparison.work.push_back(Work::InitialHeads(InitialHeads { bounds: page.bounds, leaves: page.leaves.cursor() }));
+                    comparison.work.push_back(Work::InitialHeads(InitialHeads { bounds: page.bounds, heads: page.heads.cursor() }));
                 }
             }
         }
@@ -1321,11 +1321,11 @@ impl Comparison {
     fn validate_initial_heads(&self, page: &proto::TreeSpanInventory) -> anyhow::Result<()> {
         ensure!(valid_range(&page.bounds), "invalid initial inventory bounds");
         let mut previous = None;
-        let mut cursor = page.leaves.cursor();
+        let mut cursor = page.heads.cursor();
         while let Some(leaf) = cursor.next() {
             CanonicalCodec.split(self.snapshot.spec.key_spec(), leaf.key)?;
             let address = leaf_address(leaf.key, leaf.entity.entity_id);
-            ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid leaf order or bounds");
+            ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid head order or bounds");
             previous = Some(address);
         }
         Ok(())
@@ -1353,27 +1353,27 @@ impl Comparison {
                         self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
                     self.work.push_back(Work::Compare { head, prefix });
                 }
-                StateAnswer::Leaves(page) => {
-                    ensure!(page.leaves.len() <= LEAF_PAGE, "too many leaves in one page");
-                    ensure!(4 + page.expanded_size() <= PAGE_BYTES as u64, "leaf page exceeds decoded-work budget");
+                StateAnswer::Heads(page) => {
+                    ensure!(page.heads.len() <= HEAD_PAGE, "too many heads in one page");
+                    ensure!(4 + page.expanded_size() <= PAGE_BYTES as u64, "head inventory exceeds decoded-work budget");
                     let index = self
-                        .leaves
+                        .head_requests
                         .iter()
                         .position(|bounds| bounds.start == page.bounds.start)
-                        .ok_or_else(|| anyhow::anyhow!("unsolicited leaf page"))?;
-                    let requested = self.leaves[index].clone();
-                    ensure!(end_le(&page.bounds.end, &requested.end), "leaf page exceeds requested bounds");
+                        .ok_or_else(|| anyhow::anyhow!("unsolicited head inventory"))?;
+                    let requested = self.head_requests[index].clone();
+                    ensure!(end_le(&page.bounds.end, &requested.end), "head inventory exceeds requested bounds");
                     let mut previous = None;
                     let mut ids = HashSet::new();
-                    let mut cursor = page.leaves.cursor();
+                    let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         CanonicalCodec.split(self.snapshot.spec.key_spec(), leaf.key)?;
                         let address = leaf_address(leaf.key, leaf.entity.entity_id);
                         ensure!(
                             page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address),
-                            "invalid leaf order or bounds"
+                            "invalid head order or bounds"
                         );
-                        ensure!(ids.insert(leaf.entity.entity_id), "duplicate entity in leaf page");
+                        ensure!(ids.insert(leaf.entity.entity_id), "duplicate entity in head inventory");
                         previous = Some(address);
                     }
                     let rest = if page.bounds.end != requested.end {
@@ -1383,10 +1383,10 @@ impl Comparison {
                     } else {
                         None
                     };
-                    self.leaves.remove(index);
+                    self.head_requests.remove(index);
                     // Accept each validated answer once, but expand only one
                     // region at a time while the producer drains its repairs.
-                    self.work.push_back(Work::AnswerLeaves { page, rest });
+                    self.work.push_back(Work::AnswerHeads { page, rest });
                 }
             }
         }
@@ -1404,12 +1404,12 @@ impl Comparison {
         let mut removal: Option<TreeSpan> = None;
         let flush_removal = |removal: &mut Option<TreeSpan>, work: &mut Vec<Work>| {
             if let Some(bounds) = removal.take() {
-                work.push(Work::Item(StateItem::Leaves(proto::TreeSpanInventory { bounds, leaves: Default::default() })));
+                work.push(Work::Item(StateItem::Heads(proto::TreeSpanInventory { bounds, heads: Default::default() })));
             }
         };
-        let count = page.leaves.len().min(LEAF_PAGE);
+        let count = page.heads.len().min(HEAD_PAGE);
         for _ in 0..count {
-            let leaf = page.leaves.next().expect("bounded by remaining rows");
+            let leaf = page.heads.next().expect("bounded by remaining rows");
             if !self.snapshot.states.contains_key(&leaf.entity.entity_id) {
                 former.push(leaf.entity.entity_id);
             }
@@ -1438,7 +1438,7 @@ impl Comparison {
             start = Excluded(address);
         }
         flush_removal(&mut removal, &mut work);
-        let processed_bounds = if page.leaves.is_empty() {
+        let processed_bounds = if page.heads.is_empty() {
             page.bounds.clone()
         } else {
             let Excluded(last) = &start else { unreachable!("nonempty batch") };
@@ -1463,9 +1463,9 @@ impl Comparison {
         }
         if !fits {
             work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].to_owned()))).collect();
-            work.push(Work::SendLeaves(processed_bounds));
+            work.push(Work::SendHeads(processed_bounds));
         }
-        if !page.leaves.is_empty() {
+        if !page.heads.is_empty() {
             page.bounds.start = start;
             self.work.push_front(Work::InitialHeads(page));
         }
@@ -1475,9 +1475,9 @@ impl Comparison {
         Ok(())
     }
 
-    fn expand_leaf_answer(&mut self, page: proto::TreeSpanInventory, rest: Option<TreeSpan>) -> anyhow::Result<()> {
+    fn expand_head_answer(&mut self, page: proto::TreeSpanInventory, rest: Option<TreeSpan>) -> anyhow::Result<()> {
         let mut clocks = std::collections::BTreeMap::new();
-        let mut cursor = page.leaves.cursor();
+        let mut cursor = page.heads.cursor();
         while let Some(leaf) = cursor.next() {
             clocks.insert(leaf.entity.entity_id, leaf.entity.head.to_owned());
         }
@@ -1487,9 +1487,9 @@ impl Comparison {
         let mut count = 0;
         loop {
             let remote = self.snapshot.page(remaining.clone())?;
-            count += remote.leaves.len();
-            ensure!(count <= LEAF_PAGE, "leaf region was not fully refined");
-            let mut cursor = remote.leaves.cursor();
+            count += remote.heads.len();
+            ensure!(count <= HEAD_PAGE, "head span was not fully refined");
+            let mut cursor = remote.heads.cursor();
             while let Some(leaf) = cursor.next() {
                 let id = leaf.entity.entity_id;
                 repairs.push(Work::Repair(id, clocks.remove(&id)));
@@ -1499,7 +1499,7 @@ impl Comparison {
                 let std::ops::Bound::Included(last) = &remote.bounds.end else { bail!("partial page must make progress") };
                 remaining = page.bounds.after(last);
             }
-            pages.push(Work::Item(StateItem::Leaves(remote)));
+            pages.push(Work::Item(StateItem::Heads(remote)));
             if complete {
                 break;
             }
@@ -1507,7 +1507,7 @@ impl Comparison {
         repairs.extend(clocks.into_iter().map(|(id, clock)| Work::Repair(id, Some(clock))));
         pages.extend(repairs);
         if let Some(rest) = rest {
-            pages.push(Work::AskLeaves(rest));
+            pages.push(Work::AskHeads(rest));
         }
         // Keep this bounded region's pages and repairs ahead of later answers,
         // rather than multiplying all pending answers into thousands of items.
@@ -1559,9 +1559,9 @@ impl Comparison {
                     self.work.push_front(Work::SendSnapshots(bounds.after(address)));
                 }
                 self.work.push_front(Work::Repair(id, known));
-                return Ok(StateItem::Leaves(proto::TreeSpanInventory {
+                return Ok(StateItem::Heads(proto::TreeSpanInventory {
                     bounds: page_bounds,
-                    leaves: vec![proto::KeyedEntityHead {
+                    heads: vec![proto::KeyedEntityHead {
                         key: address[..address.len() - proto::EntityId::BYTE_LEN].to_vec(),
                         entity: proto::EntityHead { entity_id: id, head: state.payload.state.head.clone() },
                     }]
@@ -1610,11 +1610,11 @@ impl Comparison {
             // Keep this in step with tree/storage/history access in the arms below.
             let expensive = match &work {
                 Work::InitialHeads(_)
-                | Work::AnswerLeaves { .. }
+                | Work::AnswerHeads { .. }
                 | Work::CompareFrontier(_)
                 | Work::Compare { .. }
                 | Work::Expand { .. }
-                | Work::SendLeaves(_)
+                | Work::SendHeads(_)
                 | Work::SendSnapshots(_) => true,
                 Work::Repair(id, known) => known.is_some() || !self.snapshot.states.contains_key(id),
                 Work::History { .. } => true,
@@ -1675,8 +1675,8 @@ impl Comparison {
                         local.prefix = prefix;
                         if local.digest == known.digest {
                             None
-                        } else if local.digest.count() <= LEAF_PAGE as i64 {
-                            self.work.push_front(Work::AskLeaves(known.bounds));
+                        } else if local.digest.count() <= HEAD_PAGE as i64 {
+                            self.work.push_front(Work::AskHeads(known.bounds));
                             None
                         } else {
                             self.work.push_front(Work::Expand { local, known });
@@ -1715,26 +1715,26 @@ impl Comparison {
                     self.expand_initial_heads(page)?;
                     None
                 }
-                Work::AnswerLeaves { page, rest } => {
-                    self.expand_leaf_answer(page, rest)?;
+                Work::AnswerHeads { page, rest } => {
+                    self.expand_head_answer(page, rest)?;
                     None
                 }
-                Work::AskLeaves(bounds) => {
-                    self.leaves.push(bounds.clone());
-                    Some(StateItem::NeedLeaves(bounds))
+                Work::AskHeads(bounds) => {
+                    self.head_requests.push(bounds.clone());
+                    Some(StateItem::NeedHeads(bounds))
                 }
-                Work::SendLeaves(bounds) => {
+                Work::SendHeads(bounds) => {
                     let page = self.snapshot.page(bounds.clone())?;
                     if page.bounds.end != bounds.end {
-                        let std::ops::Bound::Included(last) = &page.bounds.end else { unreachable!("partial leaf page") };
-                        self.work.push_back(Work::SendLeaves(bounds.after(last)));
+                        let std::ops::Bound::Included(last) = &page.bounds.end else { unreachable!("partial head inventory") };
+                        self.work.push_back(Work::SendHeads(bounds.after(last)));
                     }
-                    let mut cursor = page.leaves.cursor();
+                    let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         let id = leaf.entity.entity_id;
                         self.work.push_front(Work::Repair(id, self.known_clocks.get(&id).map(proto::InventoryClock::to_owned)));
                     }
-                    Some(StateItem::Leaves(page))
+                    Some(StateItem::Heads(page))
                 }
                 Work::SendSnapshots(bounds) => Some(self.snapshot_page(node, credentials, catalog, bounds)?),
                 Work::Item(item) => Some(item),
@@ -1828,9 +1828,9 @@ impl Comparison {
                 items.push(item);
             }
         }
-        let finished = self.work.is_empty() && self.summaries.is_empty() && self.leaves.is_empty();
+        let finished = self.work.is_empty() && self.summaries.is_empty() && self.head_requests.is_empty();
         let first_complete = finished && !self.complete;
-        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INITIAL_INVENTORY_LEAVES {
+        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INITIAL_INVENTORY_HEADS {
             // Build before handoff above the initial inventory count limit.
             // Smaller inventories and Fetch keep construction on demand.
             self.snapshot.head(super::whole()).await?;

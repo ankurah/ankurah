@@ -4,10 +4,39 @@
 use bytes::Bytes;
 use serde::{de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead};
+use crate::{Clock, EntityHead, EntityId, EventId, TreeSpan};
 
 mod codec;
 use codec::{Reader, PLAIN, PLAIN_FIXED, PREFIX, PREFIX_FIXED};
+
+/// All keyed entity heads within exactly `bounds`, including empty gaps.
+///
+/// A large requested span can be split into disjoint inventories in address order.
+/// Each inventory completely describes its bounds; the remaining bounds stay pending.
+/// This is a wire inventory, separate from the tree crate's local scan page and cursor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeSpanInventory {
+    pub bounds: TreeSpan,
+    /// Strictly increasing by canonical key bytes followed by entity ID.
+    pub heads: PackedHeads,
+}
+
+impl TreeSpanInventory {
+    /// Uncompressed logical size, including fixed-width lengths and generations.
+    /// Compression must not bypass the comparison's decoded-work budget.
+    pub fn expanded_size(&self) -> u64 { bincode::serialized_size(&self.bounds).expect("bounds serialize") + self.heads.expanded_size() }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyedEntityHead {
+    /// Canonical property values selected by the TreeSpec's KeySpec. The full
+    /// address appends the entity ID; this key is empty for entity-ID-only trees.
+    /// It belongs to this tree: another KeySpec can place the same EntityHead
+    /// under a different key.
+    pub key: Vec<u8>,
+    /// The actual clock avoids another round trip when constructing an EventBridge.
+    pub entity: EntityHead,
+}
 
 // A smaller message budget and row count still apply to follow-up pages in core.
 const MAX_BYTES: usize = 256 * 1024;

@@ -150,7 +150,7 @@ pub(super) struct Driver {
     pub through: u64,
     pub feedback: Arc<Feedback>,
     pub stream: IncomingStream,
-    pub comparison: proto::ComparisonId,
+    pub comparison: proto::StateStreamId,
     round_number: u64,
     received_revision: u64,
     waiting_applied: bool,
@@ -173,7 +173,7 @@ impl Driver {
         snapshot: Snapshot,
         round: proto::StateRound,
         stream: IncomingStream,
-        comparison: proto::ComparisonId,
+        comparison: proto::StateStreamId,
     ) -> anyhow::Result<Self> {
         ensure!(round.number == 0, "initial round number is not zero");
         let spec = snapshot.spec.clone();
@@ -660,16 +660,16 @@ impl Driver {
                     let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
                     answers.push(StateAnswer::Digest(self.projection.round.as_mut().unwrap().snapshot.head(head.bounds).await?));
                 }
-                StateItem::NeedLeaves(bounds) => {
+                StateItem::NeedHeads(bounds) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
-                    answers.push(StateAnswer::Leaves(self.projection.round.as_ref().unwrap().snapshot.page(bounds)?));
+                    answers.push(StateAnswer::Heads(self.projection.round.as_ref().unwrap().snapshot.page(bounds)?));
                 }
-                StateItem::Leaves(page) => {
+                StateItem::Heads(page) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
-                    ensure!(4 + page.expanded_size() <= super::super::PAGE_BYTES as u64, "peer leaf page exceeds decoded-work budget");
+                    ensure!(4 + page.expanded_size() <= super::super::PAGE_BYTES as u64, "peer head inventory exceeds decoded-work budget");
                     let mut validation = BTreeMap::new();
-                    replace_members(&mut validation, &self.spec, page.clone(), super::super::LEAF_PAGE)?;
-                    let mut cursor = page.leaves.cursor();
+                    replace_members(&mut validation, &self.spec, page.clone(), super::super::HEAD_PAGE)?;
+                    let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         self.add_goal(owner, leaf.entity.entity_id, leaf.entity.head.to_owned())?;
                     }
@@ -677,10 +677,10 @@ impl Driver {
                 }
                 StateItem::Snapshots(page) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
-                    let leaves = snapshot_leaves(&self.spec, &page)?;
+                    let inventory = snapshot_inventory(&self.spec, &page)?;
                     let mut validation = BTreeMap::new();
-                    replace_members(&mut validation, &self.spec, leaves.clone(), super::super::MAX_SNAPSHOT_ROWS)?;
-                    self.projection.round.as_mut().unwrap().replace(leaves);
+                    replace_members(&mut validation, &self.spec, inventory.clone(), super::super::MAX_SNAPSHOT_ROWS)?;
+                    self.projection.round.as_mut().unwrap().replace(inventory);
                     for state in page.states {
                         let id = state.payload.entity_id;
                         let target = state.payload.state.head.clone();

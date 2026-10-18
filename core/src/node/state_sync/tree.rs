@@ -22,7 +22,7 @@ type Members = BTreeMap<Vec<u8>, EntityId>;
 type Cache = tokio::sync::Mutex<Option<Cached>>;
 
 const OFFER_BYTES: u64 = 16 * 1024;
-const OFFER_REGIONS: usize = 128;
+const OFFER_SPANS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
 
@@ -372,7 +372,7 @@ impl Snapshot {
             let Some(index) = frontier
                 .iter()
                 .enumerate()
-                .filter(|(_, (head, expandable))| *expandable && head.digest.count() > super::LEAF_PAGE as i64)
+                .filter(|(_, (head, expandable))| *expandable && head.digest.count() > super::HEAD_PAGE as i64)
                 .max_by_key(|(_, (head, _))| head.digest.count())
                 .map(|(index, _)| index)
             else {
@@ -385,7 +385,7 @@ impl Snapshot {
             }
             let mut candidate = frontier.clone();
             candidate.splice(index..=index, children.into_iter().map(|head| (head, true)));
-            if candidate.len() > OFFER_REGIONS {
+            if candidate.len() > OFFER_SPANS {
                 continue;
             }
             let inventory = proto::KnownState {
@@ -403,7 +403,7 @@ impl Snapshot {
     }
 
     fn initial_inventory(&self) -> Option<proto::KnownState> {
-        if self.members.len() > super::INITIAL_INVENTORY_LEAVES {
+        if self.members.len() > super::INITIAL_INVENTORY_HEADS {
             return None;
         }
         let mut minimum_bytes = 0usize;
@@ -414,14 +414,14 @@ impl Snapshot {
                 return None;
             }
         }
-        let leaves = proto::PackedHeads::from_rows(
+        let heads = proto::PackedHeads::from_rows(
             self.members
                 .iter()
                 .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), *id, &self.states[id].payload.state.head)),
         );
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
-            spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), leaves })],
+            spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), heads })],
         };
         super::budget::offer_bytes(&inventory).ok().filter(|size| *size <= super::INITIAL_INVENTORY_BYTES as u64).map(|_| inventory)
     }
@@ -436,33 +436,33 @@ impl Snapshot {
         let rows = if empty {
             Vec::new()
         } else {
-            self.members.range((bounds.start.clone(), bounds.end.clone())).take(super::LEAF_PAGE + 1).collect::<Vec<_>>()
+            self.members.range((bounds.start.clone(), bounds.end.clone())).take(super::HEAD_PAGE + 1).collect::<Vec<_>>()
         };
         let mut count = 0;
         let mut bytes = 0;
-        for (index, (address, id)) in rows.iter().take(super::LEAF_PAGE).enumerate() {
+        for (index, (address, id)) in rows.iter().take(super::HEAD_PAGE).enumerate() {
             let head = &self.states[*id].payload.state.head;
             let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
             // Preserve the decoded-work budget even when repeated keys compress well.
             let overhead = 4 + bincode::serialized_size(&proto::TreeSpan::new(bounds.start.clone(), end))? + 8;
             let size = 8 + address.len() as u64 + 8 + 36 * head.len() as u64;
             if overhead + bytes + size > super::PAGE_BYTES as u64 {
-                anyhow::ensure!(count > 0, "single leaf inventory exceeds byte limit");
+                anyhow::ensure!(count > 0, "single head inventory exceeds byte limit");
                 break;
             }
             bytes += size;
             count += 1;
         }
         let end = if count == rows.len() { bounds.end } else { Bound::Included(rows[count - 1].0.clone()) };
-        let leaves = proto::PackedHeads::from_rows(
+        let heads = proto::PackedHeads::from_rows(
             rows.iter()
                 .take(count)
                 .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), **id, &self.states[*id].payload.state.head)),
         );
-        let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), leaves };
+        let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), heads };
         anyhow::ensure!(
-            bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::PAGE_BYTES as u64,
-            "leaf inventory bounds exceed byte limit"
+            bincode::serialized_size(&proto::StateAnswer::Heads(page.clone()))? <= super::PAGE_BYTES as u64,
+            "head inventory bounds exceed byte limit"
         );
         Ok(page)
     }

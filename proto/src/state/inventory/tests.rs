@@ -74,13 +74,13 @@ fn plain_fallback_and_prefix_choice_use_actual_encoded_size() {
 fn initial_and_followup_inventories_use_the_same_encoding_and_absolute_bounds() {
     for start in [Bound::Unbounded, Bound::Included(vec![]), Bound::Excluded(vec![0; 251])] {
         for end in [Bound::Unbounded, Bound::Included(vec![255]), Bound::Excluded(vec![255; 251])] {
-            let page = TreeSpanInventory { bounds: TreeSpan::new(start.clone(), end), leaves: rows(&[vec![1], vec![2]], 6).into() };
+            let page = TreeSpanInventory { bounds: TreeSpan::new(start.clone(), end), heads: rows(&[vec![1], vec![2]], 6).into() };
             let initial = bincode::serialize(&SpanContent::Heads(page.clone())).unwrap();
-            assert_eq!(initial, bincode::serialize(&StateItem::Leaves(page.clone())).unwrap());
-            assert_eq!(initial, bincode::serialize(&StateAnswer::Leaves(page.clone())).unwrap());
+            assert_eq!(initial, bincode::serialize(&StateItem::Heads(page.clone())).unwrap());
+            assert_eq!(initial, bincode::serialize(&StateAnswer::Heads(page.clone())).unwrap());
             let SpanContent::Heads(decoded) = bincode::deserialize(&initial).unwrap() else { panic!("heads") };
             assert_eq!(decoded.bounds, page.bounds);
-            assert_eq!(serde_json::to_value(decoded.leaves).unwrap(), serde_json::to_value(page.leaves).unwrap());
+            assert_eq!(serde_json::to_value(decoded.heads).unwrap(), serde_json::to_value(page.heads).unwrap());
         }
     }
 }
@@ -174,10 +174,10 @@ fn retained_clocks_share_the_inventory_and_survive_cursor_drop() {
 fn fixed_generations_keep_previously_valid_large_clock_pages_within_budget() {
     let mut source = rows(&[vec![]], 1818);
     source[0].entity.head = Clock::new(source[0].entity.head.ids().map(|id| (u32::MAX, id.clone())).collect::<Vec<_>>()).unwrap();
-    let page = TreeSpanInventory { bounds: TreeSpan::all(), leaves: source.clone().into() };
-    assert_eq!(page.leaves.bytes[0], PLAIN_FIXED);
+    let page = TreeSpanInventory { bounds: TreeSpan::all(), heads: source.clone().into() };
+    assert_eq!(page.heads.bytes[0], PLAIN_FIXED);
     assert!(4 + page.expanded_size() <= 64 * 1024);
-    assert!(bincode::serialized_size(&StateItem::Leaves(page)).unwrap() <= 64 * 1024);
+    assert!(bincode::serialized_size(&StateItem::Heads(page)).unwrap() <= 64 * 1024);
     verify(source);
     let mut source = rows(&vec![b"shared-prefix-and-key".to_vec(); 8], 6);
     for row in &mut source {

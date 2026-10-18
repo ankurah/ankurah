@@ -6,7 +6,7 @@ pub(super) fn offer_bytes(known: &KnownState) -> bincode::Result<u64> {
         .spans
         .iter()
         .map(|span| match span {
-            SpanContent::Heads(page) => page.leaves.prefix_savings(),
+            SpanContent::Heads(page) => page.heads.prefix_savings(),
             SpanContent::Digest(_) => 0,
         })
         .sum();
@@ -16,7 +16,7 @@ pub(super) fn offer_bytes(known: &KnownState) -> bincode::Result<u64> {
 pub(super) fn item_bytes(item: &StateItem) -> bincode::Result<u64> {
     let encoded = bincode::serialized_size(item)?;
     Ok(match item {
-        StateItem::Leaves(page) => encoded.max(4 + page.expanded_size()),
+        StateItem::Heads(page) => encoded.max(4 + page.expanded_size()),
         _ => encoded,
     })
 }
@@ -24,7 +24,7 @@ pub(super) fn item_bytes(item: &StateItem) -> bincode::Result<u64> {
 pub(super) fn answer_bytes(answer: &StateAnswer) -> bincode::Result<u64> {
     let encoded = bincode::serialized_size(answer)?;
     Ok(match answer {
-        StateAnswer::Leaves(page) => encoded.max(4 + page.expanded_size()),
+        StateAnswer::Heads(page) => encoded.max(4 + page.expanded_size()),
         _ => encoded,
     })
 }
@@ -43,7 +43,7 @@ pub(super) fn frame_expansion(frame: &StateFrame) -> bincode::Result<u64> {
     items.iter().try_fold(0, |size, item| {
         Ok(size
             + match item {
-                StateItem::Leaves(page) => (4 + page.expanded_size()).saturating_sub(bincode::serialized_size(item)?),
+                StateItem::Heads(page) => (4 + page.expanded_size()).saturating_sub(bincode::serialized_size(item)?),
                 _ => 0,
             })
     })

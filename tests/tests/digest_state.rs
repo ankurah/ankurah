@@ -103,7 +103,7 @@ async fn fetch_and_subscription_send_one_complete_initial_head_inventory() -> Re
                     _ => return false,
                 };
                 if let [proto::SpanContent::Heads(inventory)] = known.spans.as_slice() {
-                    offers.lock().unwrap().push((subscribe, inventory.leaves.len()));
+                    offers.lock().unwrap().push((subscribe, inventory.heads.len()));
                 }
             }
             false
@@ -146,7 +146,7 @@ async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo(
     assert!(cold.iter().filter(|item| matches!(item, StateItem::Snapshots(_))).count() > 1, "cold fetch must page its snapshots");
     assert_eq!(cold.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 256);
     assert!(
-        !cold.iter().any(|item| matches!(item, StateItem::Leaves(_) | StateItem::Repair { .. })),
+        !cold.iter().any(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
         "cold inline snapshots also carry membership and targets"
     );
     trace.clear();
@@ -173,8 +173,8 @@ async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo(
     assert!(offers_target(&items, pets[117].id(), &pets[117].entity().head()), "the one repair must cover the captured target");
     // The request carries a complete initial inventory; the response must
     // repair only the changed head rather than echoing unchanged identities.
-    let leaves: usize = items.iter().map(|item| if let StateItem::Leaves(page) = item { page.leaves.len() } else { 0 }).sum();
-    assert_eq!(leaves, 0, "a changed head with unchanged membership needs no response identity echo");
+    let heads: usize = items.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum();
+    assert_eq!(heads, 0, "a changed head with unchanged membership needs no response identity echo");
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 1);
     assert!(items.iter().all(|item| matches!(item, StateItem::Repair { .. })), "only the changed target needs output: {items:?}");
     Ok(())
@@ -251,7 +251,7 @@ async fn empty_query_inventory_sends_snapshots_without_asserting_global_entity_a
     trace.clear();
     assert_eq!(reader.fetch::<PetView>("age = '2'").await?.len(), 192);
     let items = trace.items(None);
-    assert!(items.iter().all(|item| !matches!(item, StateItem::Digest(_) | StateItem::NeedLeaves(_))));
+    assert!(items.iter().all(|item| !matches!(item, StateItem::Digest(_) | StateItem::NeedHeads(_))));
     assert!(known.iter().all(|pet| offers_target(&items, pet.id(), &pet.entity().head())));
     assert_eq!(items.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 192);
     Ok(())
@@ -633,9 +633,9 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                     round: Some(0),
                     applied_through: None,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Leaves(proto::TreeSpanInventory {
+                    answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
                         bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-                        leaves: vec![].into()
+                        heads: vec![].into()
                     })],
                 }
             )
@@ -678,9 +678,9 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                     round: Some(0),
                     applied_through: None,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Leaves(proto::TreeSpanInventory {
+                    answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
                         bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-                        leaves: vec![].into()
+                        heads: vec![].into()
                     })],
                 }
             )
@@ -940,7 +940,7 @@ async fn oversized_source_publication_restarts_and_recovers_after_writes_settle(
     *target.lock().unwrap() = Some(query.query_id());
     wait_for(|| parked.load(Ordering::Acquire)).await;
     assert!(
-        trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Leaves(_))),
+        trace.items(Some(query.query_id())).iter().all(|item| matches!(item, StateItem::Heads(_))),
         "cached initialization supplies membership without repair"
     );
     let initial = trace
@@ -1416,7 +1416,7 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
     // The gate observes inbound responses, not the outgoing KnownState. A
     // frontier necessarily asks for refinement/leaves here; the complete
     // initial inventory handles these sparse changes without that feedback.
-    let asks_for_inventory = offered.iter().any(|item| matches!(item, StateItem::Digest(_) | StateItem::NeedLeaves(_)));
+    let asks_for_inventory = offered.iter().any(|item| matches!(item, StateItem::Digest(_) | StateItem::NeedHeads(_)));
     assert_eq!(asks_for_inventory, !initial_inventory, "fixture must exercise the intended initial knowledge path");
     assert!(!query.loaded(), "Complete cannot activate membership while a snapshot target remains uncovered");
     assert!(query.wait_durable_answered().now_or_never().is_none(), "uncovered causal repair must block readiness");

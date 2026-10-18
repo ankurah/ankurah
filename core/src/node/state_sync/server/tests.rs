@@ -117,10 +117,10 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     current.push(added);
     let mut comparison = Comparison::new(snapshot(current).await?, known)?;
     let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
-    assert!(matches!(items.as_slice(), [StateItem::NeedLeaves(bounds)] if *bounds == super::super::whole()));
-    comparison.answer(vec![StateAnswer::Leaves(requester.page(super::super::whole())?)])?;
-    let Some(Work::AnswerLeaves { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
-    comparison.expand_leaf_answer(page, rest)?;
+    assert!(matches!(items.as_slice(), [StateItem::NeedHeads(bounds)] if *bounds == super::super::whole()));
+    comparison.answer(vec![StateAnswer::Heads(requester.page(super::super::whole())?)])?;
+    let Some(Work::AnswerHeads { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
+    comparison.expand_head_answer(page, rest)?;
     assert!(comparison.work.iter().any(|work| matches!(work, Work::Repair(id, None) if *id == new_id)));
     assert!(comparison.work.iter().any(|work| matches!(work, Work::Repair(id, Some(clock)) if *id == former && *clock == former_clock)));
     for state in &source[1..] {
@@ -137,7 +137,7 @@ async fn wider_responder_clocks_split_outbound_inventory_without_repairing_share
     source.sort_by_key(|state| state.payload.entity_id);
     let requester = snapshot(source.clone()).await?;
     let request = requester.page(super::super::whole())?;
-    assert_eq!(request.leaves.len(), 128);
+    assert_eq!(request.heads.len(), 128);
     let mut current = source.clone();
     for state in &mut current {
         state.payload.state.head = proto::Clock::new(
@@ -152,15 +152,15 @@ async fn wider_responder_clocks_split_outbound_inventory_without_repairing_share
     }
     let mut comparison = Comparison::new(snapshot(current).await?, unknown())?;
     comparison.work.clear();
-    comparison.leaves.push(super::super::whole());
-    comparison.answer(vec![StateAnswer::Leaves(request)])?;
-    let Some(Work::AnswerLeaves { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
-    comparison.expand_leaf_answer(page, rest)?;
+    comparison.head_requests.push(super::super::whole());
+    comparison.answer(vec![StateAnswer::Heads(request)])?;
+    let Some(Work::AnswerHeads { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
+    comparison.expand_head_answer(page, rest)?;
     let pages = comparison
         .work
         .iter()
         .filter_map(|work| match work {
-            Work::Item(StateItem::Leaves(page)) => Some(page),
+            Work::Item(StateItem::Heads(page)) => Some(page),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -169,8 +169,8 @@ async fn wider_responder_clocks_split_outbound_inventory_without_repairing_share
     let mut ids = Vec::new();
     for page in pages {
         assert_eq!(page.bounds.start, start);
-        assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
-        ids.extend(page.leaves.to_vec().iter().map(|leaf| leaf.entity.entity_id));
+        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+        ids.extend(page.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id));
         start = opposite(&page.bounds.end);
     }
     assert_eq!(start, super::super::whole().end);
@@ -207,8 +207,8 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     let mut requester = snapshot(before).await?;
     let mut spans = Vec::new();
     let mut start = super::super::whole().start;
-    for (index, chunk) in current.chunks(LEAF_PAGE).enumerate() {
-        let end = if (index + 1) * LEAF_PAGE == current.len() {
+    for (index, chunk) in current.chunks(HEAD_PAGE).enumerate() {
+        let end = if (index + 1) * HEAD_PAGE == current.len() {
             super::super::whole().end
         } else {
             std::ops::Bound::Included(chunk.last().unwrap().payload.entity_id.to_bytes().to_vec())
@@ -222,8 +222,8 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     while !comparison.work.is_empty() {
         let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
         for item in items {
-            let StateItem::NeedLeaves(bounds) = item else { panic!("each changed supplied region must ask for leaves directly") };
-            answers.push(StateAnswer::Leaves(requester.page(bounds)?));
+            let StateItem::NeedHeads(bounds) = item else { panic!("each changed supplied region must ask for leaves directly") };
+            answers.push(StateAnswer::Heads(requester.page(bounds)?));
         }
     }
     assert_eq!(answers.len(), 32, "all questions are legitimate bounded mismatch spans");
@@ -262,7 +262,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let root = responder.head(super::super::whole()).await?;
     let frontier = responder.refine(&root).await?;
     let original =
-        frontier.iter().find(|head| head.digest.count() > LEAF_PAGE as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
+        frontier.iter().find(|head| head.digest.count() > HEAD_PAGE as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
     let bounds = original.bounds.clone();
     let clipped = responder.head(bounds.clone()).await?;
     let refined = responder.refine(&clipped).await?;
@@ -294,12 +294,12 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
                     narrower_questions += 1;
                     answers.push(StateAnswer::Digest(requester.head(head.bounds).await?));
                 }
-                StateItem::NeedLeaves(bounds) => {
+                StateItem::NeedHeads(bounds) => {
                     leaf_pages += 1;
-                    answers.push(StateAnswer::Leaves(requester.page(bounds)?));
+                    answers.push(StateAnswer::Heads(requester.page(bounds)?));
                 }
                 StateItem::Repair { delta, .. } => repairs.push(delta.entity_id),
-                StateItem::Leaves(_) => {}
+                StateItem::Heads(_) => {}
                 other => panic!("unexpected frontier comparison item: {other:?}"),
             }
         }
@@ -340,7 +340,7 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
             })
             .sum::<usize>();
         assert_eq!(transferred, repairs);
-        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedLeaves(_) | StateItem::Digest(_))));
+        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedHeads(_) | StateItem::Digest(_))));
     }
     Ok(())
 }
@@ -373,10 +373,10 @@ async fn snapshot_pages_tile_gaps_split_by_bytes_and_resume_after_an_oversized_r
                     received.extend(page.states.iter().map(|state| state.payload.entity_id));
                     Some(page.bounds)
                 }
-                StateItem::Leaves(page) => {
-                    assert_eq!(page.leaves.len(), 1);
-                    assert_eq!(page.leaves.to_vec()[0].entity.entity_id, large.payload.entity_id);
-                    received.push(page.leaves.to_vec()[0].entity.entity_id);
+                StateItem::Heads(page) => {
+                    assert_eq!(page.heads.len(), 1);
+                    assert_eq!(page.heads.to_vec()[0].entity.entity_id, large.payload.entity_id);
+                    received.push(page.heads.to_vec()[0].entity.entity_id);
                     Some(page.bounds)
                 }
                 StateItem::RepairChunk { target, chunk } => {
@@ -422,7 +422,7 @@ async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_anoth
         panic!("state frame")
     };
     assert_eq!(progress, ComparisonProgress::Complete);
-    assert!(matches!(items.as_slice(), [StateItem::Leaves(page)] if page.leaves.to_vec()[0].entity.entity_id == id));
+    assert!(matches!(items.as_slice(), [StateItem::Heads(page)] if page.heads.to_vec()[0].entity.entity_id == id));
     assert!(comparison.offered.is_empty(), "equal supplied state must not be sent again");
     let mut comparison = Comparison::new(snapshot(source).await?, unknown())?;
     assert!(comparison.reply(&node, &vec![], true, false, 0).await.is_err(), "an exhaustive catalog page cannot skip an inadmissible row");
@@ -495,7 +495,7 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             Some(0),
             0,
             None,
-            vec![StateAnswer::Leaves(proto::TreeSpanInventory { bounds: super::super::whole(), leaves: vec![].into() })],
+            vec![StateAnswer::Heads(proto::TreeSpanInventory { bounds: super::super::whole(), heads: vec![].into() })],
             vec![]
         )
         .await?,
@@ -713,7 +713,7 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
     )
     .await?;
     let id = initial.frame.comparison;
-    assert!(state_items(&initial.frame).0.iter().any(|item| matches!(item, StateItem::NeedLeaves(_))));
+    assert!(state_items(&initial.frame).0.iter().any(|item| matches!(item, StateItem::NeedHeads(_))));
     let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     for revision in 1..=8 {
@@ -722,7 +722,7 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
     pump_comparison(&node, peer, id).await?;
     let state = session.state.lock().await;
     let comparison = state.comparison.as_ref().unwrap();
-    assert!(!comparison.leaves.is_empty(), "the unanswered baseline question must remain pending");
+    assert!(!comparison.head_requests.is_empty(), "the unanswered baseline question must remain pending");
     assert!(!comparison.complete);
     let revisions = messages
         .lock()
@@ -1332,7 +1332,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
         }
     }
     let unknown = proto::NodeRequestBody::ContinueState {
-        comparison: proto::ComparisonId::new(),
+        comparison: proto::StateStreamId::new(),
         round: None,
         applied_through: None,
         processed_through: 0,
@@ -1360,7 +1360,7 @@ async fn initial_items(node: &TestNode, comparison: &mut Comparison) -> anyhow::
         let StateFrameBody::State { items, .. } = comparison.reply(node, &vec![], false, false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         assert!(bincode::serialized_size(&items)? <= PAGE_BYTES as u64);
-        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedLeaves(_) | StateItem::Digest(_))));
+        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedHeads(_) | StateItem::Digest(_))));
         all.extend(items);
     }
     anyhow::bail!("initial inventory did not complete")
@@ -1452,9 +1452,9 @@ async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs
     let mut repairs = HashMap::new();
     for item in items {
         match item {
-            StateItem::Leaves(page) => {
+            StateItem::Heads(page) => {
                 members.retain(|address, _| !page.bounds.contains(address));
-                for leaf in page.leaves.to_vec() {
+                for leaf in page.heads.to_vec() {
                     members.insert(leaf_address(&leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
                 }
             }
@@ -1511,7 +1511,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     let mut requester = snapshot(source).await?;
     let mut comparison = Comparison::new(snapshot(vec![]).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Leaves(page) if page.leaves.is_empty())).count(), 16);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 16);
     assert_eq!(
         items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(),
         2048,
@@ -1540,9 +1540,9 @@ async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::
     // the rest of the single request inventory remains deferred.
     assert!(comparison.work.len() <= 385 + 1);
     assert!(comparison.work.iter().any(|work| matches!(work,
-        Work::InitialHeads(rest) if rest.leaves.len() == 2048 - LEAF_PAGE)));
+        Work::InitialHeads(rest) if rest.heads.len() == 2048 - HEAD_PAGE)));
     let items = initial_items(&node, &mut comparison).await?;
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Leaves(page) if page.leaves.is_empty())).count(), 2048);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 2048);
     assert_eq!(
         items.iter().filter_map(|item| if let StateItem::Snapshots(page) = item { Some(page.states.len()) } else { None }).sum::<usize>(),
         2048
@@ -1561,9 +1561,9 @@ async fn prefix_encoded_initial_inventory_keeps_its_cursor_across_work_batches()
     let mut start = super::super::whole().start;
     while let Some(Work::InitialHeads(page)) = comparison.work.pop_front() {
         assert_eq!(page.bounds.start, start);
-        assert_eq!(page.leaves.len(), remaining);
+        assert_eq!(page.heads.len(), remaining);
         comparison.expand_initial_heads(page)?;
-        remaining -= LEAF_PAGE;
+        remaining -= HEAD_PAGE;
         if remaining > 0 {
             let Some(Work::InitialHeads(next)) = comparison.work.front() else { panic!("only the deferred equal batch remains") };
             assert_ne!(next.bounds.start, start);
@@ -1606,10 +1606,10 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let proto::SpanContent::Heads(first) = &mut duplicate.spans[0] else { unreachable!() };
     let mut second = first.clone();
     let key = CanonicalCodec.encode_prefix(position_spec().key_spec(), &[ankurah_core_types::Value::I64(10001)])?;
-    let mut rows = second.leaves.to_vec();
+    let mut rows = second.heads.to_vec();
     rows[0].key = key;
     let addr = leaf_address(&rows[0].key, rows[0].entity.entity_id);
-    second.leaves = rows.into();
+    second.heads = rows.into();
     first.bounds.end = std::ops::Bound::Excluded(addr.clone());
     second.bounds.start = std::ops::Bound::Included(addr);
     duplicate.spans.push(proto::SpanContent::Heads(second));
@@ -1623,7 +1623,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     page.bounds.end = std::ops::Bound::Excluded(last.payload.entity_id.to_bytes().to_vec());
     oversized.spans.push(proto::SpanContent::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
-        leaves: vec![proto::KeyedEntityHead {
+        heads: vec![proto::KeyedEntityHead {
             key: vec![],
             entity: proto::EntityHead { entity_id: last.payload.entity_id, head: last.payload.state.head },
         }]
@@ -1637,7 +1637,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
 async fn compressed_initial_spans_share_one_uncompressed_work_budget() -> anyhow::Result<()> {
     let page = proto::TreeSpanInventory {
         bounds: super::super::whole(),
-        leaves: (0..128)
+        heads: (0..128)
             .map(|n| proto::KeyedEntityHead {
                 key: vec![42; 256],
                 entity: proto::EntityHead { entity_id: proto::EntityId::from_bytes([n; 32]), head: proto::Clock::default() },
@@ -1673,12 +1673,12 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let mut requester = super::super::QueryTree::default().refresh(spec.clone(), vec![before]).await?;
     let known = requester.offer().await?;
     let [proto::SpanContent::Heads(page)] = known.spans.as_slice() else { panic!("one valid complete initial inventory") };
-    assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
-    let supplied_clock = page.leaves.to_vec()[0].entity.head.clone();
-    let address = leaf_address(&page.leaves.to_vec()[0].key, page.leaves.to_vec()[0].entity.entity_id);
-    let removal = StateItem::Leaves(proto::TreeSpanInventory {
+    assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+    let supplied_clock = page.heads.to_vec()[0].entity.head.clone();
+    let address = leaf_address(&page.heads.to_vec()[0].key, page.heads.to_vec()[0].entity.entity_id);
+    let removal = StateItem::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(address.clone()), std::ops::Bound::Included(address)),
-        leaves: vec![].into(),
+        heads: vec![].into(),
     });
     assert!(bincode::serialized_size(&removal)? > PAGE_BYTES as u64);
     let (node, _, _) = node().await?;
@@ -1689,7 +1689,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let mut comparison = Comparison::new(empty, known.clone())?;
     let Some(Work::InitialHeads(page)) = comparison.work.pop_front() else { panic!("initial region") };
     comparison.expand_initial_heads(page)?;
-    assert!(comparison.work.iter().any(|work| matches!(work, Work::SendLeaves(bounds) if *bounds == super::super::whole())));
+    assert!(comparison.work.iter().any(|work| matches!(work, Work::SendHeads(bounds) if *bounds == super::super::whole())));
     assert!(comparison
         .work
         .iter()
@@ -1697,13 +1697,13 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let items = initial_items(&node, &mut comparison).await?;
     assert!(items
         .iter()
-        .any(|item| matches!(item, StateItem::Leaves(page) if page.bounds == super::super::whole() && page.leaves.is_empty())));
+        .any(|item| matches!(item, StateItem::Heads(page) if page.bounds == super::super::whole() && page.heads.is_empty())));
     assert_eq!(comparison.offered.get(&former.payload.entity_id), Some(&former.payload.state.head));
     let moved = text_state("a".into(), 2)?;
     let captured = super::super::QueryTree::default().refresh(spec, vec![moved.clone()]).await?;
     let mut comparison = Comparison::new(captured, known)?;
     let items = initial_items(&node, &mut comparison).await?;
-    assert!(items.iter().any(|item| matches!(item, StateItem::Leaves(page) if page.leaves.len() == 1 && page.leaves.to_vec()[0].entity.entity_id == moved.payload.entity_id)));
+    assert!(items.iter().any(|item| matches!(item, StateItem::Heads(page) if page.heads.len() == 1 && page.heads.to_vec()[0].entity.entity_id == moved.payload.entity_id)));
     assert_eq!(comparison.offered.get(&moved.payload.entity_id), Some(&moved.payload.state.head));
     Ok(())
 }
@@ -1728,7 +1728,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
     let mut spans = Vec::new();
     loop {
         let page = requester.page(remaining)?;
-        assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
+        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
         let end = page.bounds.end.clone();
         spans.push(proto::SpanContent::Heads(page));
         if end == super::super::whole().end {

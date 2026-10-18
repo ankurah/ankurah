@@ -20,7 +20,7 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
         body: proto::NodeUpdateBody::StateFrame {
             request_id: proto::RequestId::new(),
             frame: proto::StateFrame {
-                comparison: proto::ComparisonId::new(),
+                comparison: proto::StateStreamId::new(),
                 sequence: 1,
                 body: proto::StateFrameBody::Live {
                     revision: 1,
@@ -65,7 +65,7 @@ fn comparison_digest_tracks_repair_content_but_not_session_ids() {
             body: proto::NodeUpdateBody::StateFrame {
                 request_id: proto::RequestId::new(),
                 frame: proto::StateFrame {
-                    comparison: proto::ComparisonId::new(),
+                    comparison: proto::StateStreamId::new(),
                     sequence: 1,
                     body: proto::StateFrameBody::State {
                         round: 0,
@@ -96,7 +96,7 @@ fn frame_message(sequence: u64, body: proto::StateFrameBody) -> proto::NodeMessa
         to: proto::EntityId::from_bytes([2; 32]),
         body: proto::NodeUpdateBody::StateFrame {
             request_id: proto::RequestId::new(),
-            frame: proto::StateFrame { comparison: proto::ComparisonId::new(), sequence, body },
+            frame: proto::StateFrame { comparison: proto::StateStreamId::new(), sequence, body },
         },
     })
 }

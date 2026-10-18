@@ -173,7 +173,7 @@ async fn retained_unbuilt_cache_offers_a_complete_inventory_after_initial_member
             .spans
             .iter()
             .map(|region| match region {
-                proto::SpanContent::Heads(page) => page.leaves.len(),
+                proto::SpanContent::Heads(page) => page.heads.len(),
                 _ => panic!("complete leaves"),
             })
             .sum::<usize>(),
@@ -291,7 +291,7 @@ async fn a_moderate_first_refresh_repairs_changed_heads_without_building_a_diges
         if delta.entity_id == changed[17].payload.entity_id && *target == changed[17].payload.state.head)));
     assert!(items.iter().any(|item| matches!(item, proto::StateItem::Snapshots(page)
         if page.states.iter().any(|state| state.payload.entity_id == changed[64].payload.entity_id))));
-    assert!(!items.iter().any(|item| matches!(item, proto::StateItem::Digest(_) | proto::StateItem::NeedLeaves(_))));
+    assert!(!items.iter().any(|item| matches!(item, proto::StateItem::Digest(_) | proto::StateItem::NeedHeads(_))));
     assert!(query.0.lock().await.as_ref().unwrap().tree.is_none(), "the first refresh stays on the inventory diff path");
     assert_eq!(bincode::serialize(&old.offer().await?)?, original);
     node.deregister_peer(peer);
@@ -302,7 +302,7 @@ async fn a_moderate_first_refresh_repairs_changed_heads_without_building_a_diges
 async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_tree() -> anyhow::Result<()> {
     let (node, peer) = comparison_node().await?;
     let query = QueryTree::default();
-    let rows = (0..super::super::INITIAL_INVENTORY_LEAVES as u32).map(|id| numbered_state(id, 1)).collect::<Vec<_>>();
+    let rows = (0..super::super::INITIAL_INVENTORY_HEADS as u32).map(|id| numbered_state(id, 1)).collect::<Vec<_>>();
     let mut old = query.refresh(spec(), rows.clone()).await?;
     let known = old.offer().await?;
     let saved = bincode::serialize(&known)?;
@@ -324,7 +324,7 @@ async fn crossing_the_inventory_count_limit_builds_and_shrinking_preserves_the_t
     assert!(query.0.lock().await.as_ref().unwrap().tree.is_none());
 
     let mut larger = rows.clone();
-    larger.push(numbered_state(super::super::INITIAL_INVENTORY_LEAVES as u32, 1));
+    larger.push(numbered_state(super::super::INITIAL_INVENTORY_HEADS as u32, 1));
     let crossing = crate::node::state_sync::start_comparison(
         &node,
         peer,
@@ -378,9 +378,9 @@ async fn small_and_empty_inventories_offer_exact_leaves_without_building_a_tree(
         let inventory = snapshot.offer().await?;
         let [proto::SpanContent::Heads(page)] = inventory.spans.as_slice() else { panic!("expected one exact inventory") };
         assert_eq!(page.bounds, super::super::whole());
-        assert_eq!(page.leaves.len(), count);
+        assert_eq!(page.heads.len(), count);
         assert_eq!(snapshot.members().len(), count);
-        for (id, leaf) in page.leaves.to_vec().iter().enumerate() {
+        for (id, leaf) in page.heads.to_vec().iter().enumerate() {
             assert!(leaf.key.is_empty());
             assert_eq!(leaf.entity.entity_id, EntityId::from_bytes([id as u8; EntityId::BYTE_LEN]));
         }
@@ -484,8 +484,8 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
     loop {
         let page = old.page(remaining.clone())?;
         assert_eq!(page.bounds.start, remaining.start);
-        assert!(bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::super::PAGE_BYTES as u64);
-        ids.extend(page.leaves.to_vec().iter().map(|leaf| leaf.entity.entity_id));
+        assert!(bincode::serialized_size(&proto::StateAnswer::Heads(page.clone()))? <= super::super::PAGE_BYTES as u64);
+        ids.extend(page.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id));
         let complete = page.bounds.end == super::super::whole().end;
         if !complete {
             let Bound::Included(last) = &page.bounds.end else { panic!("a byte-bounded page must advance") };
@@ -527,8 +527,8 @@ async fn canonical_pages_cover_requested_bounds_without_building_a_tree() -> any
     loop {
         let page = snapshot.page(remaining.clone())?;
         assert_eq!(page.bounds.start, remaining.start);
-        assert!(page.leaves.len() <= super::super::LEAF_PAGE);
-        for leaf in page.leaves.to_vec() {
+        assert!(page.heads.len() <= super::super::HEAD_PAGE);
+        for leaf in page.heads.to_vec() {
             let address = leaf_address(&leaf.key, leaf.entity.entity_id);
             assert!(requested.contains(&address));
             assert!(page.bounds.contains(&address));
@@ -558,7 +558,7 @@ async fn an_unbuilt_snapshot_stays_stable_after_refresh() -> anyhow::Result<()> 
     assert!(query.0.lock().await.as_ref().unwrap().tree.is_none(), "building an old snapshot cannot populate the current cache");
     let page = old.page(super::super::whole())?;
     assert_eq!(
-        page.leaves.to_vec().iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>(),
+        page.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>(),
         old.members().values().copied().collect::<Vec<_>>()
     );
     assert_ne!(old.head(super::super::whole()).await?, current.head(super::super::whole()).await?);
@@ -610,7 +610,7 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
     let mut snapshot = query.refresh(spec(), states.clone()).await?;
     let inventory = snapshot.offer().await?;
     assert!(inventory.spans.len() > 1, "a new large tree must offer its bounded cached descendants");
-    assert!(inventory.spans.len() <= OFFER_REGIONS);
+    assert!(inventory.spans.len() <= OFFER_SPANS);
     assert!(bincode::serialized_size(&inventory)? <= OFFER_BYTES);
     let mut next = super::super::whole().start;
     let mut digests = Vec::new();
@@ -635,29 +635,29 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
     let mut warm = query.refresh(spec(), states).await?;
     let retained = warm.offer().await?;
     assert!(retained.spans.len() > 1, "retained offers must also identify bounded changed spans");
-    assert!(retained.spans.len() <= OFFER_REGIONS);
+    assert!(retained.spans.len() <= OFFER_SPANS);
     assert!(bincode::serialized_size(&retained)? <= OFFER_BYTES);
     assert!(retained
         .spans
         .iter()
-        .all(|region| matches!(region, proto::SpanContent::Digest(head) if head.digest.count() <= super::super::LEAF_PAGE as i64)));
+        .all(|region| matches!(region, proto::SpanContent::Digest(head) if head.digest.count() <= super::super::HEAD_PAGE as i64)));
     assert_eq!(offered_digest(&retained)?, root.digest);
     Ok(())
 }
 
 #[tokio::test]
 async fn complete_initial_inventories_are_bounded_lazy_and_immutable() -> anyhow::Result<()> {
-    for count in [256, super::super::INITIAL_INVENTORY_LEAVES] {
+    for count in [256, super::super::INITIAL_INVENTORY_HEADS] {
         let query = QueryTree::default();
         let mut old = query.refresh(spec(), (0..count as u32).map(|id| numbered_state(id, 1)).collect()).await?;
         let offer = old.offer().await?;
         assert!(bincode::serialized_size(&offer)? <= super::super::INITIAL_INVENTORY_BYTES as u64);
         let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("one complete initial inventory") };
         assert_eq!(inventory.bounds, super::super::whole());
-        assert_eq!(inventory.leaves.len(), count);
-        let received = inventory.leaves.to_vec().iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>();
+        assert_eq!(inventory.heads.len(), count);
+        let received = inventory.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>();
         let wire = bincode::serialize(&offer)?;
-        if count == super::super::INITIAL_INVENTORY_LEAVES {
+        if count == super::super::INITIAL_INVENTORY_HEADS {
             assert!(wire.len() > super::super::PAGE_BYTES, "the request has a separate byte budget");
         }
         let decoded: proto::KnownState = bincode::deserialize(&wire)?;

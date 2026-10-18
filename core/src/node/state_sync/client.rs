@@ -20,7 +20,7 @@ mod projection;
 pub(crate) use driver::RefreshHandle;
 
 pub(crate) struct RemoteState {
-    pub comparison: proto::ComparisonId,
+    pub comparison: proto::StateStreamId,
     pub ids: Vec<proto::EntityId>,
     driver: driver::Driver,
 }
@@ -199,7 +199,7 @@ where
 pub(crate) async fn abandon_current_state<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
-    comparison: proto::ComparisonId,
+    comparison: proto::StateStreamId,
     credentials: &Vec<PA::ContextData>,
     stream: &IncomingStream,
 ) -> Result<(), RetrievalError>
@@ -217,7 +217,7 @@ where
 pub(crate) async fn close_comparison<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
-    comparison: proto::ComparisonId,
+    comparison: proto::StateStreamId,
     credentials: &Vec<PA::ContextData>,
     outcome: proto::ComparisonOutcome,
 ) -> Result<(), RetrievalError>
@@ -265,7 +265,7 @@ fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow:
     Ok(())
 }
 
-fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow::Result<proto::TreeSpanInventory> {
+fn snapshot_inventory(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow::Result<proto::TreeSpanInventory> {
     ensure!(page.states.len() <= super::MAX_SNAPSHOT_ROWS, "peer sent too many snapshots");
     let mut ids = std::collections::HashSet::new();
     let rows = page
@@ -277,8 +277,8 @@ fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow
             Ok((super::tree::key(spec, state)?, entity_id, &state.payload.state.head))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let leaves = proto::PackedHeads::from_rows(rows.iter().map(|(key, id, head)| (key.as_slice(), *id, *head)));
-    Ok(proto::TreeSpanInventory { bounds: page.bounds.clone(), leaves })
+    let heads = proto::PackedHeads::from_rows(rows.iter().map(|(key, id, head)| (key.as_slice(), *id, *head)));
+    Ok(proto::TreeSpanInventory { bounds: page.bounds.clone(), heads })
 }
 
 fn replace_members(
@@ -288,26 +288,26 @@ fn replace_members(
     max_rows: usize,
 ) -> anyhow::Result<()> {
     use std::ops::Bound::*;
-    ensure!(page.leaves.len() <= max_rows, "peer sent too many leaves");
+    ensure!(page.heads.len() <= max_rows, "peer sent too many heads");
     let nonempty = match (&page.bounds.start, &page.bounds.end) {
         (Unbounded, _) | (_, Unbounded) => true,
         (Included(a), Included(b)) => a <= b,
         (Included(a) | Excluded(a), Included(b) | Excluded(b)) => a < b,
     };
-    ensure!(nonempty, "invalid peer leaf bounds");
+    ensure!(nonempty, "invalid peer inventory bounds");
     let mut previous = None;
-    let mut cursor = page.leaves.cursor();
+    let mut cursor = page.heads.cursor();
     while let Some(leaf) = cursor.next() {
         CanonicalCodec.split(spec.key_spec(), leaf.key)?;
         let address = leaf_address(leaf.key, leaf.entity.entity_id);
-        ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid peer leaf page");
+        ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid peer head inventory");
         previous = Some(address);
     }
     let removed: Vec<_> = members.range((page.bounds.start.clone(), page.bounds.end.clone())).map(|(key, _)| key.clone()).collect();
     for key in removed {
         members.remove(&key);
     }
-    let mut cursor = page.leaves.cursor();
+    let mut cursor = page.heads.cursor();
     while let Some(leaf) = cursor.next() {
         members.insert(leaf_address(leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
     }

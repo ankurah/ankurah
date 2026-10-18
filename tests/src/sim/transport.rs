@@ -30,7 +30,7 @@ pub struct Outbound {
 #[derive(Clone, Default)]
 pub struct Captured {
     queue: Arc<Mutex<Vec<Outbound>>>,
-    streams: Arc<Mutex<std::collections::HashMap<proto::ComparisonId, ScriptedRoute>>>,
+    streams: Arc<Mutex<std::collections::HashMap<proto::StateStreamId, ScriptedRoute>>>,
 }
 struct ScriptedRoute {
     request: proto::RequestId,
@@ -38,7 +38,7 @@ struct ScriptedRoute {
     from: proto::EntityId,
     to: proto::EntityId,
     source_index: usize,
-    comparison: proto::ComparisonId,
+    comparison: proto::StateStreamId,
     next_sequence: u64,
     next_revision: u64,
     scripted: bool,
@@ -112,19 +112,19 @@ impl Captured {
     pub fn is_empty(&self) -> bool { self.queue.lock().unwrap().is_empty() }
     /// Select an actual captured origin once; callers retain this comparison
     /// across failure, never selecting a replacement query generation.
-    pub fn captured_origin(&self, query: proto::QueryId, to: proto::EntityId) -> proto::ComparisonId {
+    pub fn captured_origin(&self, query: proto::QueryId, to: proto::EntityId) -> proto::StateStreamId {
         let streams = self.streams.lock().unwrap();
         let found: Vec<_> = streams.values().filter(|stream| stream.query == query && stream.to == to).collect();
         assert_eq!(found.len(), 1, "one unambiguous standing query origin");
         found[0].comparison
     }
-    pub fn origin_failed(&self, comparison: proto::ComparisonId) -> bool {
+    pub fn origin_failed(&self, comparison: proto::StateStreamId) -> bool {
         self.streams.lock().unwrap().get(&comparison).is_some_and(|stream| stream.abandoned)
     }
-    pub fn begin_scripted(&self, comparison: proto::ComparisonId) {
+    pub fn begin_scripted(&self, comparison: proto::StateStreamId) {
         self.streams.lock().unwrap().get_mut(&comparison).expect("captured origin").scripted = true;
     }
-    pub fn scripted_publication(&self, comparison: proto::ComparisonId, delta: proto::EntityDelta) -> proto::NodeMessage {
+    pub fn scripted_publication(&self, comparison: proto::StateStreamId, delta: proto::EntityDelta) -> proto::NodeMessage {
         let mut streams = self.streams.lock().unwrap();
         let stream = streams.get_mut(&comparison).expect("captured standing origin");
         stream.scripted = true;

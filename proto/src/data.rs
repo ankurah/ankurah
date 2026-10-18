@@ -458,6 +458,13 @@ pub struct BackendOperation {
     pub diff: Vec<u8>,
 }
 
+/// An entity's identity and causal frontier.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct EntityHead {
+    pub entity_id: EntityId,
+    pub head: Clock,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
     pub entity_id: EntityId,

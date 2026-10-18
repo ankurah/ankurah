@@ -91,7 +91,7 @@ pub struct Scheduler {
     /// Load-bearing request ids whose responses carry no collection.
     catalog_requests: std::collections::BTreeSet<proto::RequestId>,
     /// Comparisons continuing a protected catalog or subscription handshake.
-    catalog_comparisons: std::collections::HashSet<proto::ComparisonId>,
+    catalog_comparisons: std::collections::HashSet<proto::StateStreamId>,
 }
 
 impl Scheduler {

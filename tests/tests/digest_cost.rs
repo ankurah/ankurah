@@ -93,7 +93,7 @@ struct Traffic {
 struct Meter {
     model: Option<proto::ModelId>,
     requests: HashSet<proto::RequestId>,
-    comparisons: HashSet<proto::ComparisonId>,
+    comparisons: HashSet<proto::StateStreamId>,
     updates: HashSet<proto::UpdateId>,
     traffic: Traffic,
     started: Option<Instant>,
@@ -163,11 +163,11 @@ impl Meter {
             self.traffic.max_reply_item_bytes = self.traffic.max_reply_item_bytes.max(bytes);
             for item in items {
                 match item {
-                    proto::StateItem::Leaves(page) => self.traffic.leaves += page.leaves.len(),
+                    proto::StateItem::Heads(page) => self.traffic.leaves += page.heads.len(),
                     proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
                     proto::StateItem::Snapshots(page) => self.traffic.snapshots += page.states.len(),
                     proto::StateItem::Digest(_) => self.traffic.summaries += 1,
-                    proto::StateItem::NeedLeaves(_) => self.traffic.leaf_questions += 1,
+                    proto::StateItem::NeedHeads(_) => self.traffic.leaf_questions += 1,
                     _ => {}
                 }
             }

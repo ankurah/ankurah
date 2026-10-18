@@ -51,7 +51,7 @@ impl Round {
         for id in removed {
             self.remove(id);
         }
-        let mut cursor = page.leaves.cursor();
+        let mut cursor = page.heads.cursor();
         while let Some(leaf) = cursor.next() {
             let id = leaf.entity.entity_id;
             self.remove(id);

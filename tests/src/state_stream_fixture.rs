@@ -27,7 +27,7 @@ impl PeerSender for Sender {
 #[derive(Clone)]
 struct Stream {
     request: proto::RequestId,
-    comparison: proto::ComparisonId,
+    comparison: proto::StateStreamId,
     query: proto::QueryId,
     next_sequence: u64,
     next_revision: u64,
@@ -35,7 +35,7 @@ struct Stream {
     scripted: bool,
     abandoned: bool,
 }
-type Streams = Arc<Mutex<HashMap<proto::ComparisonId, Stream>>>;
+type Streams = Arc<Mutex<HashMap<proto::StateStreamId, Stream>>>;
 
 pub struct ScriptedConnection {
     source: TestNode,

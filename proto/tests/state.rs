@@ -32,7 +32,7 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
     let summary = head(NodePrefix::root(), TreeSpan::new(Included(vec![]), Excluded(vec![1])), &known(1));
     let leaves = TreeSpanInventory {
         bounds: TreeSpan::new(Included(vec![1]), Excluded(vec![2])),
-        leaves: vec![KeyedEntityHead { key: vec![1], entity: known(2) }].into(),
+        heads: vec![KeyedEntityHead { key: vec![1], entity: known(2) }].into(),
     };
     let inventory = KnownState { spec: spec(), spans: vec![SpanContent::Digest(summary.clone()), SpanContent::Heads(leaves.clone())] };
     for body in [
@@ -54,8 +54,8 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
         assert!(matches!(&state.spans[0], SpanContent::Digest(received) if received == &summary));
         let SpanContent::Heads(received) = &state.spans[1] else { panic!("inline leaves") };
         assert_eq!(received.bounds, leaves.bounds);
-        assert_eq!(received.leaves.to_vec()[0].key, [1]);
-        assert_eq!(received.leaves.to_vec()[0].entity, known(2));
+        assert_eq!(received.heads.to_vec()[0].key, [1]);
+        assert_eq!(received.heads.to_vec()[0].entity, known(2));
     }
 }
 
@@ -66,7 +66,7 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
         selection: selection(),
         known_state: KnownState {
             spec: spec(),
-            spans: vec![SpanContent::Heads(TreeSpanInventory { bounds: TreeSpan::under(&NodePrefix::root()), leaves: vec![].into() })],
+            spans: vec![SpanContent::Heads(TreeSpanInventory { bounds: TreeSpan::under(&NodePrefix::root()), heads: vec![].into() })],
         },
     });
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&unknown).body else { panic!("unknown inventory") };
@@ -74,7 +74,7 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
     assert!(state.spans.is_empty());
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&empty).body else { panic!("known empty") };
     let SpanContent::Heads(page) = &state.spans[0] else { panic!("empty leaves") };
-    assert!(page.leaves.is_empty());
+    assert!(page.heads.is_empty());
     assert_eq!(page.bounds, TreeSpan::under(&NodePrefix::root()));
     let empty_summary =
         SpanContent::Digest(TreeSpanDigest { prefix: NodePrefix::root(), bounds: page.bounds.clone(), digest: Digest::empty() });
@@ -84,7 +84,7 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
 
 #[test]
 fn followup_batches_mixed_depths_and_leaf_pages() {
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     let first = head(NodePrefix::root(), TreeSpan::under(&NodePrefix::root()), &known(1));
     let prefix = NodePrefix::of(&[0], 3);
     let second = head(prefix.clone(), TreeSpan::under(&prefix), &known(2));
@@ -97,9 +97,9 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
         answers: vec![
             StateAnswer::Digest(first.clone()),
             StateAnswer::Digest(second.clone()),
-            StateAnswer::Leaves(TreeSpanInventory {
+            StateAnswer::Heads(TreeSpanInventory {
                 bounds: bounds.clone(),
-                leaves: vec![KeyedEntityHead { key: vec![], entity: known(2) }].into(),
+                heads: vec![KeyedEntityHead { key: vec![], entity: known(2) }].into(),
             }),
         ],
     });
@@ -113,9 +113,9 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
     assert_eq!(applied_through, Some(41));
     assert!(matches!(&answers[0], StateAnswer::Digest(head) if head == &first));
     assert!(matches!(&answers[1], StateAnswer::Digest(head) if head == &second));
-    let StateAnswer::Leaves(page) = &answers[2] else { panic!("leaves") };
+    let StateAnswer::Heads(page) = &answers[2] else { panic!("leaves") };
     assert_eq!(page.bounds, bounds);
-    assert_eq!(page.leaves.to_vec()[0].entity, known(2));
+    assert_eq!(page.heads.to_vec()[0].entity, known(2));
     let receipt =
         request(NodeRequestBody::ContinueState { comparison, round: None, processed_through: 18, applied_through: None, answers: vec![] });
     assert!(matches!(wire(&receipt).body, NodeRequestBody::ContinueState { processed_through: 18, answers, .. } if answers.is_empty()));
@@ -123,7 +123,7 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
 
 #[test]
 fn initial_replies_continue_with_mixed_work() {
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     let bounds = TreeSpan::new(Excluded(vec![0]), Included(vec![9]));
     let state = StateReply {
         spec: spec(),
@@ -135,11 +135,11 @@ fn initial_replies_continue_with_mixed_work() {
                 round: 0,
                 items: vec![
                     StateItem::Digest(head(NodePrefix::root(), bounds.clone(), &known(2))),
-                    StateItem::Leaves(TreeSpanInventory {
+                    StateItem::Heads(TreeSpanInventory {
                         bounds: TreeSpan::new(Included(vec![3]), Included(vec![9])),
-                        leaves: vec![].into(),
+                        heads: vec![].into(),
                     }),
-                    StateItem::NeedLeaves(bounds.clone()),
+                    StateItem::NeedHeads(bounds.clone()),
                 ],
                 progress: ComparisonProgress::Continue,
             },
@@ -161,7 +161,7 @@ fn initial_replies_continue_with_mixed_work() {
         assert_eq!(progress, ComparisonProgress::Continue);
         assert_eq!(round, 0);
         assert_eq!(items.len(), 3);
-        assert!(matches!(&items[1], StateItem::Leaves(page) if page.leaves.is_empty()));
+        assert!(matches!(&items[1], StateItem::Heads(page) if page.heads.is_empty()));
     }
 }
 
@@ -171,7 +171,7 @@ fn event_bridge_repairs_preserve_the_captured_target_clock() {
     let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
     let target = Clock::singleton(&update);
     let origin = RequestId::new();
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     let response = NodeUpdateBody::StateFrame {
         request_id: origin.clone(),
         frame: StateFrame {
@@ -212,7 +212,7 @@ fn repair_and_live_chunks_share_content_without_losing_typed_metadata() {
     let state = State { head: entity.head.clone(), ..Default::default() };
     let content = DeltaContent::StateSnapshot { state: StateFragment { state: state.clone(), attestations: Default::default() } };
     let encoded = bincode::serialize(&content).unwrap();
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     let origin = RequestId::new();
     let member = QueryMember { key: vec![1, 2, 3], head: entity.head.clone() };
     let mut assembled = Vec::new();
@@ -258,7 +258,7 @@ fn repair_and_live_chunks_share_content_without_losing_typed_metadata() {
 
 #[test]
 fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     for outcome in [
         ComparisonOutcome::Applied { round: 2, processed_through: 19 },
         ComparisonOutcome::Cancelled { round: 2 },
@@ -293,13 +293,13 @@ fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
 
 #[test]
 fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     let bounds = TreeSpan::under(&NodePrefix::root());
     let offer = KnownState {
         spec: spec(),
         spans: vec![SpanContent::Heads(TreeSpanInventory {
             bounds: bounds.clone(),
-            leaves: vec![KeyedEntityHead { key: vec![7], entity: known(7) }].into(),
+            heads: vec![KeyedEntityHead { key: vec![7], entity: known(7) }].into(),
         })],
     };
     let refresh = request(NodeRequestBody::RefreshState { comparison, round: 3, known_state: offer });
@@ -309,8 +309,8 @@ fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
     assert_eq!(known_state.spec, spec());
     let SpanContent::Heads(page) = &known_state.spans[0] else { panic!("frozen offer") };
     assert_eq!(page.bounds, bounds);
-    assert_eq!(page.leaves.to_vec()[0].key, [7]);
-    assert_eq!(page.leaves.to_vec()[0].entity, known(7));
+    assert_eq!(page.heads.to_vec()[0].key, [7]);
+    assert_eq!(page.heads.to_vec()[0].entity, known(7));
 
     let begin = StateFrame { comparison, sequence: 25, body: StateFrameBody::BeginRound(StateRound { number: 3, revision: 90 }) };
     let StateFrame { comparison: received, sequence, body: StateFrameBody::BeginRound(round) } = wire(&begin) else {
@@ -345,7 +345,7 @@ fn absolute_membership_preserves_absence_and_targets_without_entity_data() {
 
 #[test]
 fn split_publication_and_interleaved_comparison_keep_independent_boundaries() {
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     let frames = vec![
         StateFrame {
             comparison,
@@ -385,7 +385,7 @@ fn split_publication_and_interleaved_comparison_keep_independent_boundaries() {
 
 #[test]
 fn frame_credit_live_coverage_and_round_application_have_separate_wire_markers() {
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     for (round, applied_through) in [(Some(3), None), (None, Some(91)), (None, None)] {
         let feedback =
             request(NodeRequestBody::ContinueState { comparison, round, processed_through: 25, applied_through, answers: vec![] });
@@ -486,7 +486,7 @@ fn shared_state_and_events_preserve_history_and_attestations_in_repair_and_live_
     };
     let member = QueryMember { key: vec![3, 4], head: target.clone() };
     let origin = RequestId::new();
-    let comparison = ComparisonId::new();
+    let comparison = StateStreamId::new();
     let repair = StateItem::Repair { target: target.clone(), delta: delta.clone() };
     let live = Message::PeerMessage(NodeMessage::Update(NodeUpdate {
         id: UpdateId::new(),
@@ -546,7 +546,7 @@ fn snapshot_pages_preserve_attestations_and_omit_duplicate_leaf_and_target_data(
     assert_eq!(received.states[0].payload, state.payload);
     assert_eq!(received.states[0].attestations, state.attestations);
     let separate = vec![
-        StateItem::Leaves(TreeSpanInventory { bounds, leaves: vec![KeyedEntityHead { key: vec![], entity: entity.clone() }].into() }),
+        StateItem::Heads(TreeSpanInventory { bounds, heads: vec![KeyedEntityHead { key: vec![], entity: entity.clone() }].into() }),
         StateItem::Repair {
             target: entity.head,
             delta: EntityDelta { entity_id: entity.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } },

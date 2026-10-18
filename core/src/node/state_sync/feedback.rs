@@ -40,7 +40,7 @@ impl Feedback {
         node: &Node<SE, PA>,
         peer: proto::EntityId,
         credentials: &[PA::ContextData],
-        comparison: proto::ComparisonId,
+        comparison: proto::StateStreamId,
         through: u64,
         round: Option<u64>,
         applied_through: Option<u64>,

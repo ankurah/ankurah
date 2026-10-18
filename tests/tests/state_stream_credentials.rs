@@ -511,7 +511,7 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
     server.context_async(Credential(0)).await?.resolve_model_id::<Record>().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
     let origin = Arc::new(Mutex::new(None::<proto::RequestId>));
-    let abandonment = Arc::new(Mutex::new(None::<(Vec<proto::AuthData>, proto::ComparisonId)>));
+    let abandonment = Arc::new(Mutex::new(None::<(Vec<proto::AuthData>, proto::StateStreamId)>));
     let arrived = Arc::new(tokio::sync::Notify::new());
     let (_connection, gate) = GatedConnection::new(&client, &server, {
         let origin = origin.clone();

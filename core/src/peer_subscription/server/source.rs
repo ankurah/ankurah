@@ -216,7 +216,7 @@ impl QueryProjection {
 
 pub(super) struct QuerySource<CD: ContextData> {
     peer: proto::EntityId,
-    comparison: proto::ComparisonId,
+    comparison: proto::StateStreamId,
     credentials: Vec<CD>,
     projection: QueryProjection,
     cursor: SourceCursor,
@@ -226,7 +226,7 @@ pub(super) struct QuerySource<CD: ContextData> {
 impl<CD: ContextData> QuerySource<CD> {
     pub(super) fn new(
         peer: proto::EntityId,
-        comparison: proto::ComparisonId,
+        comparison: proto::StateStreamId,
         credentials: Vec<CD>,
         projection: QueryProjection,
         cursor: SourceCursor,

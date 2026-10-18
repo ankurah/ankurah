@@ -11,7 +11,7 @@ fn fetch_reply(messages: &[proto::NodeMessage]) -> Option<(proto::RequestId, pro
     })
 }
 
-fn abandoned(messages: &[proto::NodeMessage], comparison: proto::ComparisonId) -> usize {
+fn abandoned(messages: &[proto::NodeMessage], comparison: proto::StateStreamId) -> usize {
     messages
         .iter()
         .filter(|message| {

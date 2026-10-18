@@ -16,7 +16,7 @@ pub struct PeerState<CD: ContextData> {
     pub(super) pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pub(crate) initial_comparison: tokio::sync::Mutex<()>,
     pub(crate) comparisons: super::state_sync::Comparisons<CD>,
-    pub(crate) outgoing_comparisons: std::sync::Arc<SafeMap<proto::ComparisonId, bool>>,
+    pub(crate) outgoing_comparisons: std::sync::Arc<SafeMap<proto::StateStreamId, bool>>,
     pub(crate) incoming_states: std::sync::Arc<super::state_sync::IncomingStates>,
 }
 

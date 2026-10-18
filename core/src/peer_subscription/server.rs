@@ -24,7 +24,7 @@ struct StandingQuery<CD: ContextData> {
     // Keep the standing credentials registered with the node policy service.
     _sessions: SessionSet<CD>,
     version: u32,
-    comparison: proto::ComparisonId,
+    comparison: proto::StateStreamId,
     tree: Arc<QueryTree>,
     commands: mpsc::Sender<source::Refresh>,
     stop: Option<oneshot::Sender<()>>,
@@ -136,7 +136,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
     pub(crate) async fn refresh_query<SE, PA>(
         &self,
         node: &Node<SE, PA>,
-        comparison: proto::ComparisonId,
+        comparison: proto::StateStreamId,
         number: u64,
         known: proto::KnownState,
         credentials: &[CD],
@@ -161,7 +161,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         result.await.map_err(|_| anyhow::anyhow!("query source stopped"))?
     }
 
-    pub(crate) async fn abandon_comparison(&self, query: proto::QueryId, version: u32, comparison: proto::ComparisonId) {
+    pub(crate) async fn abandon_comparison(&self, query: proto::QueryId, version: u32, comparison: proto::StateStreamId) {
         let mut queries = self.queries.lock().await;
         if queries.get(&query).is_some_and(|standing| standing.version == version && standing.comparison == comparison) {
             queries.remove(&query);
