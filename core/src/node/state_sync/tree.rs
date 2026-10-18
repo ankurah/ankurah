@@ -365,7 +365,7 @@ impl Snapshot {
             return Ok(inventory);
         }
         // A bounded disjoint frontier recognizes both equal inventories and
-        // small changed regions without serial refinement exchanges.
+        // small changed spans without serial refinement exchanges.
         let root = self.head(super::whole()).await?;
         let mut frontier = vec![(root, true)];
         for _ in 0..OFFER_REFINEMENTS {
@@ -390,7 +390,7 @@ impl Snapshot {
             }
             let inventory = proto::KnownState {
                 spec: self.spec.clone(),
-                regions: candidate.iter().map(|(head, _)| proto::SpanContent::Digest(head.clone())).collect(),
+                spans: candidate.iter().map(|(head, _)| proto::SpanContent::Digest(head.clone())).collect(),
             };
             if bincode::serialized_size(&inventory)? <= OFFER_BYTES {
                 frontier = candidate;
@@ -398,7 +398,7 @@ impl Snapshot {
         }
         Ok(proto::KnownState {
             spec: self.spec.clone(),
-            regions: frontier.into_iter().map(|(head, _)| proto::SpanContent::Digest(head)).collect(),
+            spans: frontier.into_iter().map(|(head, _)| proto::SpanContent::Digest(head)).collect(),
         })
     }
 
@@ -424,7 +424,7 @@ impl Snapshot {
         }
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
-            regions: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), leaves })],
+            spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), leaves })],
         };
         bincode::serialized_size(&inventory).ok().filter(|size| *size <= super::INITIAL_INVENTORY_BYTES as u64).map(|_| inventory)
     }

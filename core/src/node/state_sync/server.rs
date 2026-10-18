@@ -1236,11 +1236,11 @@ impl Comparison {
         };
         ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
         ensure!(
-            known.regions.len() <= 128 && bincode::serialized_size(&known)? as usize <= INITIAL_INVENTORY_BYTES,
+            known.spans.len() <= 128 && bincode::serialized_size(&known)? as usize <= INITIAL_INVENTORY_BYTES,
             "initial inventory exceeds limit"
         );
-        let mut regions = known.regions;
-        regions.sort_by(|a, b| {
+        let mut spans = known.spans;
+        spans.sort_by(|a, b| {
             let start = |region: &proto::SpanContent| match region {
                 proto::SpanContent::Digest(head) => head.bounds.start.clone(),
                 proto::SpanContent::Heads(page) => page.bounds.start.clone(),
@@ -1258,7 +1258,7 @@ impl Comparison {
         let mut start = super::whole().start;
         let mut frontier = Some(Vec::new());
         let mut leaf_count = 0;
-        for region in regions {
+        for region in spans {
             ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
             let bounds = match &region {
                 proto::SpanContent::Digest(head) => &head.bounds,
@@ -1266,7 +1266,7 @@ impl Comparison {
             };
             ensure!(
                 valid_range(bounds) && start_le(&start, &bounds.start) && end_le(&bounds.end, &super::whole().end),
-                "initial regions overlap or exceed scope"
+                "initial spans overlap or exceed scope"
             );
             if start != bounds.start {
                 frontier = None;

@@ -33,7 +33,7 @@ async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> a
                 selection: ankql::ast::Predicate::MemberOf(model).into(),
                 known_state: proto::KnownState {
                     spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
-                    regions: vec![],
+                    spans: vec![],
                 },
             },
         },
@@ -355,7 +355,7 @@ async fn canceled_state_requests_release_waiters_and_disconnect_wakes_remaining_
                 selection: ankql::ast::Predicate::True.into(),
                 known_state: proto::KnownState {
                     spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True),
-                    regions: vec![],
+                    spans: vec![],
                 },
             },
         );

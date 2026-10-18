@@ -41,13 +41,13 @@ impl std::fmt::Display for ComparisonId {
 }
 
 /// Bounded knowledge of the requester's materialized query result.
-/// Regions are disjoint and exact. Omitted regions are unknown, not empty;
-/// an empty region list supplies no result knowledge but still specifies the tree.
-/// No region asserts absence of entity state held outside this query.
+/// Spans are disjoint and exact. Omitted spans are unknown, not empty;
+/// an empty span list supplies no result knowledge but still specifies the tree.
+/// No span asserts absence of entity state held outside this query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownState {
     pub spec: TreeSpec,
-    pub regions: Vec<SpanContent>,
+    pub spans: Vec<SpanContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,7 +185,7 @@ pub enum StateItem {
     Snapshots(SnapshotPage),
 }
 
-/// Answers for any subset of the outstanding regions/entities in a comparison.
+/// Answers for any subset of the outstanding spans/entities in a comparison.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateAnswer {
     /// The requester's digest over the exact span offered by the responder.

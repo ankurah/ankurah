@@ -147,7 +147,7 @@ mod tests {
         }
         let inventory = crate::KnownState {
             spec: crate::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True),
-            regions: vec![SpanContent::Heads(heads)],
+            spans: vec![SpanContent::Heads(heads)],
         };
         let encoded = bincode::serialize(&inventory).unwrap();
         assert!(encoded.len() > 64 * 1024 && encoded.len() <= MAX_ENCODED_BYTES);

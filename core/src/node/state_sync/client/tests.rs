@@ -437,19 +437,19 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let tree = super::super::QueryTree::default();
     let mut snapshot = tree.refresh(super::super::QueryTree::spec(&selection, &client.catalog), states).await?;
     // A mixed leaf/summary inventory requires per-region work. Thirty-three
-    // positive regions exceed that budget, leaving a continuation on wire.
+    // positive spans exceed that budget, leaving a continuation on wire.
     let mut start = super::super::whole().start;
-    let mut regions = Vec::new();
+    let mut spans = Vec::new();
     for n in 1..=32 {
         let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
-        regions.push(if n == 1 {
+        spans.push(if n == 1 {
             proto::SpanContent::Heads(snapshot.page(bounds)?)
         } else {
             proto::SpanContent::Digest(snapshot.head(bounds).await?)
         });
         start = Included(address(n));
     }
-    regions.push(proto::SpanContent::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::whole().end)).await?));
+    spans.push(proto::SpanContent::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::whole().end)).await?));
     gate.store(true, std::sync::atomic::Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
@@ -460,7 +460,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
             query_id,
             selection,
             version: 1,
-            known_state: proto::KnownState { spec: snapshot.spec.clone(), regions },
+            known_state: proto::KnownState { spec: snapshot.spec.clone(), spans },
         },
     )
     .await?;

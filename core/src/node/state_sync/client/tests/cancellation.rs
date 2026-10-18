@@ -136,24 +136,24 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
         .await?;
     // Force real refinement work beyond frame zero while holding its continuations.
     let mut start = super::super::super::whole().start;
-    let mut regions = Vec::new();
+    let mut spans = Vec::new();
     for n in 1..=32 {
         let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
-        regions.push(if n == 1 {
+        spans.push(if n == 1 {
             proto::SpanContent::Heads(snapshot.page(bounds)?)
         } else {
             proto::SpanContent::Digest(snapshot.head(bounds).await?)
         });
         start = Included(address(n));
     }
-    regions.push(proto::SpanContent::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
+    spans.push(proto::SpanContent::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
     gate.store(true, Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
         &client,
         server.id,
         &credentials,
-        proto::NodeRequestBody::Fetch { selection, known_state: proto::KnownState { spec: snapshot.spec.clone(), regions } },
+        proto::NodeRequestBody::Fetch { selection, known_state: proto::KnownState { spec: snapshot.spec.clone(), spans } },
     )
     .await?;
     let proto::NodeResponseBody::Fetch(state) = response else { panic!("Fetch metadata") };

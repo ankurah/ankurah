@@ -120,7 +120,7 @@ mod request_policy_tests {
                     selection: Predicate::MemberOf(model).into(),
                     known_state: ankurah_proto::KnownState {
                         spec: ankurah_proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
-                        regions: vec![],
+                        spans: vec![],
                     },
                 },
                 NodeRequestBody::SubscribeQuery {
@@ -129,7 +129,7 @@ mod request_policy_tests {
                     version: 1,
                     known_state: ankurah_proto::KnownState {
                         spec: ankurah_proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
-                        regions: vec![],
+                        spans: vec![],
                     },
                 },
             ];

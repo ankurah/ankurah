@@ -315,10 +315,10 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
             NodeRequestBody::Fetch { selection: query, known_state } => {
-                write!(f, "Fetch {query} regions:{}", known_state.regions.len())
+                write!(f, "Fetch {query} spans:{}", known_state.spans.len())
             }
             NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_state } => {
-                write!(f, "Subscribe {query_id} {query} v{version} regions:{}", known_state.regions.len())
+                write!(f, "Subscribe {query_id} {query} v{version} spans:{}", known_state.spans.len())
             }
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
@@ -327,7 +327,7 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "ContinueState {comparison} through:{processed_through} answers:{}", answers.len())
             }
             NodeRequestBody::RefreshState { comparison, round, known_state } => {
-                write!(f, "RefreshState {comparison} round:{round} regions:{}", known_state.regions.len())
+                write!(f, "RefreshState {comparison} round:{round} spans:{}", known_state.spans.len())
             }
             NodeRequestBody::CloseComparison { comparison, outcome } => write!(f, "CloseComparison {comparison} {outcome:?}"),
         }

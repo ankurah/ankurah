@@ -102,7 +102,7 @@ async fn fetch_and_subscription_send_one_complete_initial_head_inventory() -> Re
                     proto::NodeRequestBody::SubscribeQuery { known_state, .. } => (true, known_state),
                     _ => return false,
                 };
-                if let [proto::SpanContent::Heads(inventory)] = known.regions.as_slice() {
+                if let [proto::SpanContent::Heads(inventory)] = known.spans.as_slice() {
                     offers.lock().unwrap().push((subscribe, inventory.leaves.len()));
                 }
             }
@@ -586,7 +586,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 selection: ankql::ast::Predicate::MemberOf(model).into(),
                 known_state: proto::KnownState {
                     spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
-                    regions: vec![],
+                    spans: vec![],
                 },
             },
         )
@@ -751,7 +751,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
         selection: ankql::ast::Predicate::MemberOf(model).into(),
         known_state: proto::KnownState {
             spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
-            regions: vec![],
+            spans: vec![],
         },
     };
     let origin = proto::RequestId::new();
@@ -1025,7 +1025,7 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
                 selection: ankql::ast::Predicate::MemberOf(model).into(),
                 known_state: proto::KnownState {
                     spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::MemberOf(model)),
-                    regions: vec![],
+                    spans: vec![],
                 },
             },
         )
@@ -1510,9 +1510,9 @@ async fn cold_query_with_2049_interleaved_cached_rows_uses_a_summary_frontier() 
         offers.lock().unwrap().iter().filter(|(id, _)| *id == query.query_id()).map(|(_, known)| known.clone()).collect::<Vec<_>>();
     assert_eq!(own_offers.len(), 1, "the cold query must have one actual initial offer, excluding catalog requests");
     let known = &own_offers[0];
-    assert!(known.regions.iter().all(|region| matches!(region, proto::SpanContent::Digest(_))), "the partial cache must offer Digest-only");
+    assert!(known.spans.iter().all(|region| matches!(region, proto::SpanContent::Digest(_))), "the partial cache must offer Digest-only");
     let offered_count = known
-        .regions
+        .spans
         .iter()
         .map(|region| match region {
             proto::SpanContent::Digest(head) => head.digest.count(),

@@ -96,7 +96,7 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
         ankql::ast::Predicate::MemberOf(ankurah::ModelId::EntityId(ankurah::EntityId::random())).into();
     let known_state = ankurah_proto::KnownState {
         spec: ankurah_proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone()),
-        regions: vec![],
+        spans: vec![],
     };
 
     let request = ankurah_proto::NodeRequest {

@@ -163,7 +163,7 @@ async fn standing_query_membership_can_change_but_version_cannot_regress() -> an
         let selection = selection.clone().and_member_of(proto::ModelId::System(model));
         let known_state = proto::KnownState {
             spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone()),
-            regions: vec![],
+            spans: vec![],
         };
         proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_state }
     };

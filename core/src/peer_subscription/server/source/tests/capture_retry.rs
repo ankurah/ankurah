@@ -191,7 +191,7 @@ async fn unavailable_source_is_terminal_for_initial_query_and_fetch() -> anyhow:
 async fn malformed_initial_offer_is_not_a_busy_capture() -> anyhow::Result<()> {
     let (server, client, messages) = pair().await?;
     let known_state =
-        proto::KnownState { spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::False), regions: vec![] };
+        proto::KnownState { spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::False), spans: vec![] };
     for body in [
         proto::NodeRequestBody::Fetch { selection: selection(None), known_state: known_state.clone() },
         proto::NodeRequestBody::SubscribeQuery { query_id: proto::QueryId::new(), selection: selection(None), version: 1, known_state },
