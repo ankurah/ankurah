@@ -188,7 +188,7 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
     });
     let scope = tx.scope(&TreeRequest::for_selection(&query, &types()).unwrap()).await.unwrap();
     assert_eq!(tx.count(&scope).await.unwrap(), 20);
-    let scope = tx.scope_ranges([ankurah_digest_tree::AddressRange::all()]);
+    let scope = tx.scope_ranges([ankurah_digest_tree::TreeSpan::all()]);
     let root = tx.heads(&scope).await.unwrap().pop().unwrap();
     let children = tx.refine(&root).await.unwrap();
     assert_eq!(children.iter().map(|head| head.digest).sum::<Digest>(), root.digest);
@@ -197,6 +197,6 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
         assert_eq!(tx.digest(&subset).await.unwrap(), head.digest);
         let mut invalid = head.to_bytes();
         invalid.push(0);
-        assert!(ankurah_digest_tree::TreeHead::<ankurah_digest_tree::Ristretto255>::from_bytes(&invalid).is_err());
+        assert!(ankurah_digest_tree::TreeSpanDigest::<ankurah_digest_tree::Ristretto255>::from_bytes(&invalid).is_err());
     }
 }

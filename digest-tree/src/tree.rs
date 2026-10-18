@@ -24,7 +24,7 @@ use crate::layout;
 use crate::map::{MapAccess, MapName, MapTransaction};
 use crate::memory::{MemoryMaps, MemoryTransaction};
 use crate::prefix::NodePrefix;
-use crate::rows::{leaf_address, AddressRange, LeafRow, NodeRow};
+use crate::rows::{leaf_address, LeafRow, NodeRow, TreeSpan};
 use crate::spec::TreeSpec;
 
 // Its bytes can only be made from the row they accompany.
@@ -241,7 +241,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// The first `limit` leaf rows in `range`, in address order. Reading all
     /// of them from some address on, a page at a time, walks the leaves in
     /// order.
-    pub async fn leaves(&mut self, range: &AddressRange, limit: usize) -> Result<Vec<LeafRow<G>>, TreeError> {
+    pub async fn leaves(&mut self, range: &TreeSpan, limit: usize) -> Result<Vec<LeafRow<G>>, TreeError> {
         let rows = self.transaction.scan(MapName::Leaves, range.bounds(), limit).await?;
         rows.iter().map(|(address, value)| layout::leaf_row(address, value)).collect()
     }
@@ -665,7 +665,7 @@ mod tests {
         assert_eq!(*tree.spec(), spec);
         let mut maps = tree.begin();
         assert_eq!(maps.node(&NodePrefix::root()).await.unwrap(), None, "no root row until a leaf arrives");
-        assert_eq!(maps.leaves(&AddressRange::all(), usize::MAX).await.unwrap(), []);
+        assert_eq!(maps.leaves(&TreeSpan::all(), usize::MAX).await.unwrap(), []);
         assert_eq!(maps.entity_leaves(entity(1)).await.unwrap(), []);
         assert_eq!(maps.children(&NodePrefix::root()).await.unwrap(), []);
     }
@@ -689,7 +689,7 @@ mod tests {
         maps.commit().await.unwrap();
         let mut maps = tree.begin();
         assert_eq!(maps.leaf(b"blue\0", entity(1)).await.unwrap(), Some(later.clone()));
-        assert_eq!(maps.leaves(&AddressRange::all(), usize::MAX).await.unwrap(), std::slice::from_ref(&later));
+        assert_eq!(maps.leaves(&TreeSpan::all(), usize::MAX).await.unwrap(), std::slice::from_ref(&later));
         assert!(matches!(maps.put_leaf(changed(&later), Some(&first)).await, Err(TreeError::Conflict)), "stale");
 
         assert!(matches!(tree.begin().delete_leaf(&first).await, Err(TreeError::Conflict)), "stale");
@@ -775,14 +775,14 @@ mod tests {
         maps.commit().await.unwrap();
 
         let mut maps = tree.begin();
-        assert_eq!(maps.leaves(&AddressRange::all(), usize::MAX).await.unwrap(), rows, "address order, not arrival order");
-        let range = AddressRange::new(Bound::Included(vec![2]), Bound::Excluded(vec![6]));
+        assert_eq!(maps.leaves(&TreeSpan::all(), usize::MAX).await.unwrap(), rows, "address order, not arrival order");
+        let range = TreeSpan::new(Bound::Included(vec![2]), Bound::Excluded(vec![6]));
         let first_page = maps.leaves(&range, 2).await.unwrap();
         assert_eq!(first_page, rows[1..3]);
         let second_page = maps.leaves(&range.after(&first_page[1].address()), 2).await.unwrap();
         assert_eq!(second_page, rows[3..5]);
         assert_eq!(maps.leaves(&range.after(&second_page[1].address()), 2).await.unwrap(), []);
-        assert_eq!(maps.leaves(&AddressRange::all(), 0).await.unwrap(), []);
+        assert_eq!(maps.leaves(&TreeSpan::all(), 0).await.unwrap(), []);
     }
 
     /// The range under a prefix reads the leaves beneath that tree node.
@@ -796,10 +796,10 @@ mod tests {
 
         let mut maps = tree.begin();
         let keys = |rows: Vec<LeafRow<G>>| rows.into_iter().map(|row| row.key[0]).collect::<Vec<u8>>();
-        assert_eq!(keys(maps.leaves(&AddressRange::under(&prefix("0")), usize::MAX).await.unwrap()), [0x00, 0x3f, 0x40, 0x7f]);
-        assert_eq!(keys(maps.leaves(&AddressRange::under(&prefix("01")), usize::MAX).await.unwrap()), [0x40, 0x7f]);
-        assert_eq!(keys(maps.leaves(&AddressRange::under(&prefix("1")), usize::MAX).await.unwrap()), [0x80, 0xff]);
-        assert_eq!(keys(maps.leaves(&AddressRange::under(&NodePrefix::root()), usize::MAX).await.unwrap()).len(), 6);
+        assert_eq!(keys(maps.leaves(&TreeSpan::under(&prefix("0")), usize::MAX).await.unwrap()), [0x00, 0x3f, 0x40, 0x7f]);
+        assert_eq!(keys(maps.leaves(&TreeSpan::under(&prefix("01")), usize::MAX).await.unwrap()), [0x40, 0x7f]);
+        assert_eq!(keys(maps.leaves(&TreeSpan::under(&prefix("1")), usize::MAX).await.unwrap()), [0x80, 0xff]);
+        assert_eq!(keys(maps.leaves(&TreeSpan::under(&NodePrefix::root()), usize::MAX).await.unwrap()).len(), 6);
     }
 
     async fn a_node_is_its_base_plus_its_deltas<G: DigestGroup>() {
@@ -963,8 +963,7 @@ mod tests {
         deletion.commit().await.unwrap();
 
         let mut maps = tree.begin();
-        let leaves: Digest<G> =
-            maps.leaves(&AddressRange::under(&parent), 10).await.unwrap().iter().map(|row| Digest::from(row.element)).sum();
+        let leaves: Digest<G> = maps.leaves(&TreeSpan::under(&parent), 10).await.unwrap().iter().map(|row| Digest::from(row.element)).sum();
         assert_eq!(leaves.count(), 3);
         let children: Digest<G> = maps.children(&parent).await.unwrap().iter().map(|(_, row)| row.digest).sum();
         assert_eq!(children, leaves);

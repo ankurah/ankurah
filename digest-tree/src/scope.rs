@@ -1,13 +1,11 @@
-//! Snapshot-bound query scopes, tier-ordered traversal and clipped summaries.
+//! Snapshot-bound query scopes, tier-ordered traversal and span digests.
 
 use crate::bounds::{gaps, intersect, lower_cmp, normalize, subset};
 use crate::key::prefix_end;
 use crate::layout;
 use crate::map::{MapAccess, MapName};
 use crate::request::{prefix_range, ReusePlan};
-use crate::{
-    AddressRange, CanonicalCodec, Digest, DigestGroup, LeafRow, NodePrefix, Ristretto255, TreeError, TreeRequest, TreeTransaction,
-};
+use crate::{CanonicalCodec, Digest, DigestGroup, LeafRow, NodePrefix, Ristretto255, TreeError, TreeRequest, TreeSpan, TreeTransaction};
 use ankurah_core_types::{IndexDirection, KeySpec, PropertyId};
 use serde::{Deserialize, Serialize};
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -17,7 +15,7 @@ use std::sync::Arc;
 /// leaf state. A mutation invalidates the scope; another transaction cannot use it.
 #[derive(Debug, Clone)]
 pub struct TreeScope {
-    ranges: Vec<AddressRange>,
+    ranges: Vec<TreeSpan>,
     directions: Vec<IndexDirection>,
     id_direction: IndexDirection,
     snapshot: Arc<()>,
@@ -28,57 +26,58 @@ impl TreeScope {
     /// Constraints already guaranteed by the serving tree's admission may
     /// be absent here. Reusing these bounds on another tree requires proving
     /// that both trees describe the same admitted selection in these bounds.
-    pub fn ranges(&self) -> &[AddressRange] { &self.ranges }
+    pub fn ranges(&self) -> &[TreeSpan] { &self.ranges }
 }
 
-/// A cached or clipped subtree summary. Bounds are addresses, never offsets
-/// into a bucket, so another tree can compute the same region independently.
+/// A tree span and the digest of its leaves, cached or computed for clipped bounds.
+/// Bounds are complete addresses, so another tree can compute the same span independently.
 /// A peer must also establish compatible keys, digest groups and admitted
-/// membership; a head alone does not carry those proofs.
+/// membership; a span digest alone does not carry those proofs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TreeHead<G: DigestGroup = Ristretto255> {
-    /// The prefix containing this region. A clipped or empty region need not
-    /// have a stored node at this prefix on the answering peer.
+pub struct TreeSpanDigest<G: DigestGroup = Ristretto255> {
+    /// The containing subtree from which refinement continues. Bounds alone
+    /// do not identify this ancestor. A clipped or empty span need not have
+    /// a stored node at this prefix on the answering peer.
     pub prefix: NodePrefix,
-    /// Exact address bounds within that node.
-    pub bounds: AddressRange,
+    /// The exact span within that subtree, independent of the prefix encoding.
+    pub bounds: TreeSpan,
     /// Digest of precisely the leaves within these bounds.
     pub digest: Digest<G>,
 }
 
-impl<G: DigestGroup> Serialize for TreeHead<G> {
+impl<G: DigestGroup> Serialize for TreeSpanDigest<G> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> { self.to_bytes().serialize(serializer) }
 }
 
-impl<'de, G: DigestGroup> Deserialize<'de> for TreeHead<G> {
+impl<'de, G: DigestGroup> Deserialize<'de> for TreeSpanDigest<G> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let bytes = Vec::<u8>::deserialize(deserializer)?;
         Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
-impl<G: DigestGroup> TreeHead<G> {
-    /// Encode a versioned head for a peer, independent of a local snapshot.
+impl<G: DigestGroup> TreeSpanDigest<G> {
+    /// Encode a versioned span digest for a peer, independent of a local snapshot.
     pub fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(&(1u8, self.prefix.to_bytes(), &self.bounds.start, &self.bounds.end, self.digest.to_row_bytes())).unwrap()
     }
-    /// Decode a head and validate its prefix, bounds, count and group encoding.
+    /// Decode a span digest and validate its prefix, bounds, count and group encoding.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, TreeError> {
         use bincode::Options;
-        type EncodedHead = (u8, Vec<u8>, std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>, Vec<u8>);
-        let (version, prefix, start, end, digest): EncodedHead = bincode::DefaultOptions::new()
+        type EncodedSpanDigest = (u8, Vec<u8>, std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>, Vec<u8>);
+        let (version, prefix, start, end, digest): EncodedSpanDigest = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_limit(bytes.len() as u64)
             .reject_trailing_bytes()
             .deserialize(bytes)
-            .map_err(|e| TreeError::unreadable("tree head", e))?;
+            .map_err(|e| TreeError::unreadable("tree span digest", e))?;
         if version != 1 {
-            return Err(TreeError::InvalidKey("unknown tree head version"));
+            return Err(TreeError::InvalidKey("unknown tree span digest version"));
         }
-        let prefix = NodePrefix::from_bytes(&prefix).map_err(|e| TreeError::unreadable("head prefix", e))?;
-        let bounds = AddressRange::new(start, end);
-        let digest = Digest::from_row_bytes(&digest).map_err(|e| TreeError::unreadable("head digest", e))?;
-        if crate::bounds::empty(&bounds) || !subset(&bounds, &AddressRange::under(&prefix)) || digest.count() < 0 {
-            return Err(TreeError::InvalidKey("invalid tree head bounds or count"));
+        let prefix = NodePrefix::from_bytes(&prefix).map_err(|e| TreeError::unreadable("span digest prefix", e))?;
+        let bounds = TreeSpan::new(start, end);
+        let digest = Digest::from_row_bytes(&digest).map_err(|e| TreeError::unreadable("span digest", e))?;
+        if crate::bounds::empty(&bounds) || !subset(&bounds, &TreeSpan::under(&prefix)) || digest.count() < 0 {
+            return Err(TreeError::InvalidKey("invalid tree span digest bounds or count"));
         }
         Ok(Self { prefix, bounds, digest })
     }
@@ -87,7 +86,7 @@ impl<G: DigestGroup> TreeHead<G> {
 /// An opaque continuation within a scope's order and snapshot.
 #[derive(Debug, Clone)]
 pub struct LeafCursor {
-    remaining: Vec<AddressRange>,
+    remaining: Vec<TreeSpan>,
     scope: TreeScope,
 }
 /// One page of leaves and, when more remain, the continuation to use next.
@@ -101,9 +100,9 @@ pub struct LeafPage<G: DigestGroup = Ristretto255> {
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Read exact leaf-address ranges directly, including a subtree via
-    /// `AddressRange::under`. Unlike Selection scopes these count leaves,
+    /// `TreeSpan::under`. Unlike Selection scopes these count leaves,
     /// including multiple keys for one entity, and walk in address order.
-    pub fn scope_ranges(&self, ranges: impl IntoIterator<Item = AddressRange>) -> TreeScope {
+    pub fn scope_ranges(&self, ranges: impl IntoIterator<Item = TreeSpan>) -> TreeScope {
         TreeScope {
             ranges: normalize(ranges.into_iter().collect()),
             directions: vec![IndexDirection::Asc; self.spec.key_spec().keyparts.len()],
@@ -149,11 +148,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(())
     }
 
-    /// Summaries that tile the scope without overlap. Fully covered cached
+    /// Span digests that tile the scope without overlap. Fully covered cached
     /// nodes contribute their stored digest; boundary buckets are clipped by
     /// reading only their leaves inside the requested address bounds. Empty
     /// regions remain in the cover: a peer may have leaves there.
-    pub async fn heads(&mut self, scope: &TreeScope) -> Result<Vec<TreeHead<G>>, TreeError> {
+    pub async fn heads(&mut self, scope: &TreeScope) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         self.check_scope(scope)?;
         let mut heads = Vec::new();
         for range in &scope.ranges {
@@ -168,15 +167,15 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         u64::try_from(digest.count()).map_err(|_| TreeError::Audit("negative scoped count"))
     }
 
-    /// Sum the exact summaries of a scope.
+    /// Sum the exact span digests of a scope.
     pub async fn digest(&mut self, scope: &TreeScope) -> Result<Digest<G>, TreeError> {
         Digest::checked_sum(self.heads(scope).await?.iter().map(|head| head.digest)).map_err(Into::into)
     }
 
-    /// Refine a head into the nearest cached descendants, keeping its address
-    /// clip. At a terminal bucket, returns its exact clipped head again.
-    pub async fn refine(&mut self, head: &TreeHead<G>) -> Result<Vec<TreeHead<G>>, TreeError> {
-        let bounds = intersect(&AddressRange::under(&head.prefix), &head.bounds).ok_or(TreeError::InvalidKey("empty head"))?;
+    /// Refine a span digest into the nearest cached descendants, keeping its address
+    /// clip. At a terminal bucket, returns its exact clipped span digest again.
+    pub async fn refine(&mut self, head: &TreeSpanDigest<G>) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
+        let bounds = intersect(&TreeSpan::under(&head.prefix), &head.bounds).ok_or(TreeError::InvalidKey("empty tree span"))?;
         let children = self.child_prefixes(&head.prefix).await?;
         if children.is_empty() {
             return self.heads_in(&head.prefix, &bounds).await;
@@ -189,11 +188,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(heads)
     }
 
-    async fn heads_in(&mut self, prefix: &NodePrefix, range: &AddressRange) -> Result<Vec<TreeHead<G>>, TreeError> {
+    async fn heads_in(&mut self, prefix: &NodePrefix, range: &TreeSpan) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         let mut pending = vec![prefix.clone()];
         let mut heads = Vec::new();
         while let Some(prefix) = pending.pop() {
-            let entire = AddressRange::under(&prefix);
+            let entire = TreeSpan::under(&prefix);
             let Some(bounds) = intersect(&entire, range) else {
                 continue;
             };
@@ -202,14 +201,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                     if node.digest.count() < 0 {
                         return Err(TreeError::Audit("negative node count"));
                     }
-                    heads.push(TreeHead { prefix, bounds, digest: node.digest });
+                    heads.push(TreeSpanDigest { prefix, bounds, digest: node.digest });
                     continue;
                 }
             }
             let children = self.child_prefixes(&prefix).await?;
             if children.is_empty() {
                 let rows = self.all_leaves(&bounds).await?;
-                heads.push(TreeHead { prefix, bounds, digest: rows.iter().map(|row| Digest::from(row.element)).sum() });
+                heads.push(TreeSpanDigest { prefix, bounds, digest: rows.iter().map(|row| Digest::from(row.element)).sum() });
             } else {
                 heads.extend(empty_gaps(&prefix, &bounds, &children));
                 pending.extend(children.into_iter().rev());
@@ -253,7 +252,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     async fn walk(
         &mut self,
-        ranges: &[AddressRange],
+        ranges: &[TreeSpan],
         directions: &[IndexDirection],
         id_direction: IndexDirection,
         limit: usize,
@@ -267,9 +266,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
 /// Children cover the locally stored leaves, but compressed prefixes need
 /// not cover their parent's addresses. Represent the rest explicitly.
-fn empty_gaps<G: DigestGroup>(prefix: &NodePrefix, bounds: &AddressRange, children: &[NodePrefix]) -> Vec<TreeHead<G>> {
-    let covered: Vec<_> = children.iter().map(AddressRange::under).collect();
-    gaps(bounds, &covered).into_iter().map(|bounds| TreeHead { prefix: prefix.clone(), bounds, digest: Digest::empty() }).collect()
+fn empty_gaps<G: DigestGroup>(prefix: &NodePrefix, bounds: &TreeSpan, children: &[NodePrefix]) -> Vec<TreeSpanDigest<G>> {
+    let covered: Vec<_> = children.iter().map(TreeSpan::under).collect();
+    gaps(bounds, &covered).into_iter().map(|bounds| TreeSpanDigest { prefix: prefix.clone(), bounds, digest: Digest::empty() }).collect()
 }
 
 /// A walk's fixed order and accumulated page, shared by all tuple tiers.
@@ -285,7 +284,7 @@ impl<G: DigestGroup> LeafWalk<'_, G> {
     async fn read<T: MapAccess>(
         &mut self,
         transaction: &mut TreeTransaction<G, T>,
-        mut ranges: Vec<AddressRange>,
+        mut ranges: Vec<TreeSpan>,
         depth: usize,
     ) -> Result<(), TreeError> {
         let direction = self.directions.get(depth).copied().unwrap_or(self.id_direction);
@@ -323,10 +322,10 @@ impl<G: DigestGroup> LeafWalk<'_, G> {
             Box::pin(self.read(transaction, inside, depth + 1)).await?;
             let rest = match direction {
                 IndexDirection::Asc => match prefix_end(&prefix) {
-                    Some(end) => AddressRange::new(Included(end), Unbounded),
+                    Some(end) => TreeSpan::new(Included(end), Unbounded),
                     None => break,
                 },
-                IndexDirection::Desc => AddressRange::new(Unbounded, Excluded(prefix)),
+                IndexDirection::Desc => TreeSpan::new(Unbounded, Excluded(prefix)),
             };
             ranges = intersections(&ranges, &[rest]);
         }
@@ -334,7 +333,7 @@ impl<G: DigestGroup> LeafWalk<'_, G> {
     }
 }
 
-fn intersections(a: &[AddressRange], b: &[AddressRange]) -> Vec<AddressRange> {
+fn intersections(a: &[TreeSpan], b: &[TreeSpan]) -> Vec<TreeSpan> {
     normalize(a.iter().flat_map(|a| b.iter().filter_map(move |b| intersect(a, b))).collect())
 }
 
@@ -346,7 +345,7 @@ fn order_cut<G: DigestGroup>(
     id_direction: IndexDirection,
     pivot: &LeafRow<G>,
     before: bool,
-) -> Result<Vec<AddressRange>, TreeError> {
+) -> Result<Vec<TreeSpan>, TreeError> {
     let parts = CanonicalCodec.split(spec, &pivot.key)?;
     let mut prefix = Vec::new();
     let mut ranges = Vec::new();
@@ -355,9 +354,9 @@ fn order_cut<G: DigestGroup>(
         let tier = prefix_range(&prefix);
         let smaller = before == (*direction == IndexDirection::Asc);
         let range = if smaller {
-            Some(AddressRange::new(tier.start, Excluded(value.clone())))
+            Some(TreeSpan::new(tier.start, Excluded(value.clone())))
         } else {
-            prefix_end(&value).map(|start| AddressRange::new(Included(start), tier.end))
+            prefix_end(&value).map(|start| TreeSpan::new(Included(start), tier.end))
         };
         if let Some(range) = range {
             ranges.push(range);
@@ -368,9 +367,9 @@ fn order_cut<G: DigestGroup>(
     let address = pivot.address();
     let smaller = before == (id_direction == IndexDirection::Asc);
     let edge = if smaller {
-        AddressRange::new(tier.start, if before { Included(address) } else { Excluded(address) })
+        TreeSpan::new(tier.start, if before { Included(address) } else { Excluded(address) })
     } else {
-        AddressRange::new(if before { Included(address) } else { Excluded(address) }, tier.end)
+        TreeSpan::new(if before { Included(address) } else { Excluded(address) }, tier.end)
     };
     ranges.push(edge);
     Ok(normalize(ranges))

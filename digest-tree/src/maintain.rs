@@ -9,7 +9,7 @@ use crate::digest::{Digest, DigestGroup, HeadHash, Leaf};
 use crate::layout;
 use crate::map::{MapAccess, MapName};
 use crate::tree::PreparedLeaf;
-use crate::{AddressRange, CanonicalCodec, LeafRow, NodePrefix, NodeRow, TreeError, TreeTransaction};
+use crate::{CanonicalCodec, LeafRow, NodePrefix, NodeRow, TreeError, TreeSpan, TreeTransaction};
 
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_PREPARATION_MIN_LEAVES: usize = 1024;
@@ -132,7 +132,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let root = NodePrefix::root();
         if self.transaction.get(MapName::Nodes, &root.to_bytes()).await?.is_none() {
             self.transaction.change_structure();
-            if !self.leaves(&AddressRange::all(), 1).await?.is_empty()
+            if !self.leaves(&TreeSpan::all(), 1).await?.is_empty()
                 || !self.transaction.scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), 1).await?.is_empty()
             {
                 return Err(TreeError::Audit("tree rows exist without a root summary"));
@@ -194,12 +194,12 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             if uncovered {
                 self.insert_branch(&prefix, &children, after.as_ref().expect("the insertion is uncovered")).await?;
             } else if children.is_empty() && added && !removed {
-                let sample = self.leaves(&AddressRange::under(&prefix), BUCKET_CAPACITY + 1).await?;
+                let sample = self.leaves(&TreeSpan::under(&prefix), BUCKET_CAPACITY + 1).await?;
                 if sample.len() > BUCKET_CAPACITY {
                     self.rebuild_subtree(&prefix).await?;
                 }
             } else if !children.is_empty() && removed && !added {
-                let sample = self.leaves(&AddressRange::under(&prefix), BUCKET_CAPACITY / 2 + 1).await?;
+                let sample = self.leaves(&TreeSpan::under(&prefix), BUCKET_CAPACITY / 2 + 1).await?;
                 if sample.len() <= BUCKET_CAPACITY / 2 {
                     self.rebuild_subtree(&prefix).await?;
                 }
@@ -249,7 +249,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
     }
 
-    pub(crate) async fn all_leaves(&mut self, range: &AddressRange) -> Result<Vec<LeafRow<G>>, TreeError> {
+    pub(crate) async fn all_leaves(&mut self, range: &TreeSpan) -> Result<Vec<LeafRow<G>>, TreeError> {
         let mut rows = Vec::new();
         let mut remaining = range.clone();
         loop {
@@ -313,7 +313,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     }
 
     async fn rebuild_subtree(&mut self, prefix: &NodePrefix) -> Result<(), TreeError> {
-        let leaves = self.all_leaves(&AddressRange::under(prefix)).await?;
+        let leaves = self.all_leaves(&TreeSpan::under(prefix)).await?;
         self.write_subtree(prefix, &leaves).await
     }
 
@@ -379,7 +379,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// compare every stored summary against the leaves under its prefix.
     /// This checks the current snapshot without repairing or changing it.
     pub async fn audit(&mut self) -> Result<Audit, TreeError> {
-        let leaves = self.all_leaves(&AddressRange::all()).await?;
+        let leaves = self.all_leaves(&TreeSpan::all()).await?;
         let mut lookup: BTreeMap<EntityId, BTreeSet<Vec<u8>>> = BTreeMap::new();
         for row in &leaves {
             CanonicalCodec.split(self.spec.key_spec(), &row.key)?;
@@ -668,7 +668,7 @@ mod tests {
         assert!(result.is_err(), "the worker panic must propagate to the mutation owner");
         without_runtime(async {
             // The first batch was written before the later hash panicked.
-            assert_eq!(tx.leaves(&AddressRange::all(), usize::MAX).await.unwrap().len(), 1024);
+            assert_eq!(tx.leaves(&TreeSpan::all(), usize::MAX).await.unwrap().len(), 1024);
             tx.apply_change(LeafChange { before: None, after: None }).await.unwrap();
             assert!(matches!(tx.commit().await, Err(TreeError::Conflict)));
             assert_eq!(TreeTransaction::<LaterBatchPanic, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, 1);

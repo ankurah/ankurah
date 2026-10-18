@@ -36,8 +36,8 @@
 //! Callers evaluate admission against their entity state and supply canonical
 //! keys and head hashes. [`CanonicalCodec`] encodes those keys; [`TreeRequest`]
 //! and [`TreeSpec::serves`] prove supported predicate implications. A
-//! Selection compares a scope over its tree: a head array of tree node
-//! prefixes, with key bounds where the span cuts a tree node.
+//! Selection compares a scope over its tree using [`TreeSpanDigest`] values:
+//! each carries an exact [`TreeSpan`], its digest and a prefix for refinement.
 //!
 //! # Modules
 //!
@@ -60,7 +60,7 @@
 //! [`TreeTransaction::apply_change`] maintains leaves, entity lookups and
 //! ancestor summaries together, including bucket splits and merges. Build and
 //! audit operate on admitted leaves. Selection scopes resolve exact bounds and
-//! limits within one snapshot, and expose counts, digests, clipped heads and
+//! limits within one snapshot, and expose counts, digests, clipped span digests and
 //! paginated leaves. Direct address scopes also support multi-key leaf sets.
 //! This crate has no Ankurah node or storage-engine dependency.
 
@@ -91,7 +91,7 @@ pub use map::{ByteBounds, MapAccess, MapName, MapTransaction};
 pub use memory::{MemoryMaps, MemoryTransaction};
 pub use prefix::{NodePrefix, NodePrefixError};
 pub use request::{TreeMatch, TreeRequest};
-pub use rows::{leaf_address, AddressRange, LeafRow, NodeRow};
-pub use scope::{LeafCursor, LeafPage, TreeHead, TreeScope};
+pub use rows::{leaf_address, LeafRow, NodeRow, TreeSpan};
+pub use scope::{LeafCursor, LeafPage, TreeScope, TreeSpanDigest};
 pub use spec::TreeSpec;
 pub use tree::{DigestTree, TreeTransaction};

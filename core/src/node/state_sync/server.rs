@@ -9,7 +9,7 @@ use crate::{
     storage::StorageEngine,
 };
 use ankurah_digest_tree::{leaf_address, CanonicalCodec, NodePrefix};
-use ankurah_proto::{self as proto, AddressRange, ComparisonId, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem};
+use ankurah_proto::{self as proto, ComparisonId, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem, TreeSpan};
 use anyhow::{bail, ensure};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -245,15 +245,15 @@ impl<CD: ContextData> Session<CD> {
     pub fn permits(&self, credentials: &[CD]) -> bool { same_credentials(&self.credentials, credentials) }
 }
 enum Work {
-    CompareFrontier(Vec<proto::TreeHead>),
-    Compare { head: proto::TreeHead, prefix: NodePrefix },
-    Offer(proto::TreeHead),
-    Expand { local: proto::TreeHead, known: proto::TreeHead },
-    AskLeaves(AddressRange),
+    CompareFrontier(Vec<proto::TreeSpanDigest>),
+    Compare { head: proto::TreeSpanDigest, prefix: NodePrefix },
+    Offer(proto::TreeSpanDigest),
+    Expand { local: proto::TreeSpanDigest, known: proto::TreeSpanDigest },
+    AskLeaves(TreeSpan),
     InitialHeads(proto::LeafPage),
-    AnswerLeaves { page: proto::LeafPage, rest: Option<AddressRange> },
-    SendLeaves(AddressRange),
-    SendSnapshots(AddressRange),
+    AnswerLeaves { page: proto::LeafPage, rest: Option<TreeSpan> },
+    SendLeaves(TreeSpan),
+    SendSnapshots(TreeSpan),
     Item(StateItem),
     Repair(proto::EntityId, Option<proto::Clock>),
     History { entity_id: proto::EntityId, target: proto::Clock },
@@ -263,7 +263,7 @@ struct Comparison {
     snapshot: Snapshot,
     work: VecDeque<Work>,
     summaries: HashMap<Vec<u8>, NodePrefix>,
-    leaves: Vec<AddressRange>,
+    leaves: Vec<TreeSpan>,
     repaired: HashSet<proto::EntityId>,
     known_clocks: HashMap<proto::EntityId, proto::Clock>,
     offered: HashMap<proto::EntityId, proto::Clock>,
@@ -272,7 +272,7 @@ struct Comparison {
     complete: bool,
     unavailable: bool,
 }
-fn range_id(range: &AddressRange) -> Vec<u8> { bincode::serialize(range).expect("address bounds serialize") }
+fn range_id(range: &TreeSpan) -> Vec<u8> { bincode::serialize(range).expect("address bounds serialize") }
 impl Stream {
     fn acknowledge(&mut self, processed: u64) -> anyhow::Result<()> {
         ensure!(processed <= self.last_sent, "processed prefix exceeds sent frames");
@@ -1270,7 +1270,7 @@ impl Comparison {
             );
             if start != bounds.start {
                 frontier = None;
-                let gap = AddressRange::new(start.clone(), opposite(&bounds.start));
+                let gap = TreeSpan::new(start.clone(), opposite(&bounds.start));
                 if valid_range(&gap) {
                     comparison.work.push_back(Work::SendSnapshots(gap));
                 }
@@ -1278,7 +1278,7 @@ impl Comparison {
             start = opposite(&bounds.end);
             match region {
                 proto::KnownRegion::Summary(head) => {
-                    let _: proto::TreeHead = proto::TreeHead::from_bytes(&head.to_bytes())?;
+                    let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
                     if let Some(frontier) = &mut frontier {
                         frontier.push(head.clone());
                     }
@@ -1300,7 +1300,7 @@ impl Comparison {
             }
         }
         if !matches!(start, std::ops::Bound::Unbounded) {
-            let rest = AddressRange::new(start, super::whole().end);
+            let rest = TreeSpan::new(start, super::whole().end);
             if valid_range(&rest) {
                 comparison.work.push_back(Work::SendSnapshots(rest));
             }
@@ -1340,7 +1340,7 @@ impl Comparison {
                     self.work.push_front(Work::History { entity_id, target });
                 }
                 StateAnswer::Summary(head) => {
-                    let _: proto::TreeHead = proto::TreeHead::from_bytes(&head.to_bytes())?;
+                    let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
                     let prefix =
                         self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
                     self.work.push_back(Work::Compare { head, prefix });
@@ -1392,7 +1392,7 @@ impl Comparison {
             let rest = page.leaves.split_off(LEAF_PAGE);
             let last = page.leaves.last().unwrap();
             let end = leaf_address(&last.key, last.entity.entity_id);
-            let bounds = AddressRange::new(Excluded(end.clone()), page.bounds.end);
+            let bounds = TreeSpan::new(Excluded(end.clone()), page.bounds.end);
             page.bounds.end = Included(end);
             self.work.push_front(Work::InitialHeads(proto::LeafPage { bounds, leaves: rest }));
         }
@@ -1404,20 +1404,20 @@ impl Comparison {
             .map(|leaf| leaf.entity.entity_id)
             .collect::<Vec<_>>();
         let mut start = page.bounds.start.clone();
-        let mut removal: Option<AddressRange> = None;
-        let flush_removal = |removal: &mut Option<AddressRange>, work: &mut Vec<Work>| {
+        let mut removal: Option<TreeSpan> = None;
+        let flush_removal = |removal: &mut Option<TreeSpan>, work: &mut Vec<Work>| {
             if let Some(bounds) = removal.take() {
                 work.push(Work::Item(StateItem::Leaves(proto::LeafPage { bounds, leaves: Vec::new() })));
             }
         };
         for leaf in page.leaves {
             let address = leaf_address(&leaf.key, leaf.entity.entity_id);
-            let gap = AddressRange::new(start, Excluded(address.clone()));
+            let gap = TreeSpan::new(start, Excluded(address.clone()));
             if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
                 flush_removal(&mut removal, &mut work);
                 work.push(Work::SendSnapshots(gap));
             }
-            let point = AddressRange::new(Included(address.clone()), Included(address.clone()));
+            let point = TreeSpan::new(Included(address.clone()), Included(address.clone()));
             if let Some((_, state)) = self.snapshot.states_in(&point, 1).next() {
                 flush_removal(&mut removal, &mut work);
                 if state.payload.state.head != leaf.entity.head {
@@ -1436,7 +1436,7 @@ impl Comparison {
             start = Excluded(address);
         }
         flush_removal(&mut removal, &mut work);
-        let gap = AddressRange::new(start, page.bounds.end.clone());
+        let gap = TreeSpan::new(start, page.bounds.end.clone());
         if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
             work.push(Work::SendSnapshots(gap));
         }
@@ -1463,7 +1463,7 @@ impl Comparison {
         Ok(())
     }
 
-    fn expand_leaf_answer(&mut self, page: proto::LeafPage, rest: Option<AddressRange>) -> anyhow::Result<()> {
+    fn expand_leaf_answer(&mut self, page: proto::LeafPage, rest: Option<TreeSpan>) -> anyhow::Result<()> {
         let mut clocks =
             page.leaves.into_iter().map(|leaf| (leaf.entity.entity_id, leaf.entity.head)).collect::<std::collections::BTreeMap<_, _>>();
         let mut remaining = page.bounds.clone();
@@ -1506,7 +1506,7 @@ impl Comparison {
         node: &Node<SE, PA>,
         credentials: &Vec<PA::ContextData>,
         catalog: bool,
-        bounds: AddressRange,
+        bounds: TreeSpan,
     ) -> anyhow::Result<StateItem>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -1525,7 +1525,7 @@ impl Comparison {
                 !catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy),
                 "snapshot page is outside catalog scope"
             );
-            let clipped = AddressRange::new(bounds.start.clone(), Included(address.to_vec()));
+            let clipped = TreeSpan::new(bounds.start.clone(), Included(address.to_vec()));
             // Reserve the larger possible page end, plus the item tag and vector length.
             let overhead = 12 + bincode::serialized_size(&bounds)?.max(bincode::serialized_size(&clipped)?) as usize;
             let size = bincode::serialized_size(state)? as usize;
@@ -1538,7 +1538,7 @@ impl Comparison {
                 // Keep that bridge choice, and use the same fallback for a row
                 // too large to fit inline. Only this one row needs Leaves/Repair.
                 let end = if rows.len() == 1 { bounds.end.clone() } else { Included(address.to_vec()) };
-                let page_bounds = AddressRange::new(bounds.start.clone(), end);
+                let page_bounds = TreeSpan::new(bounds.start.clone(), end);
                 if page_bounds.end != bounds.end {
                     self.work.push_front(Work::SendSnapshots(bounds.after(address)));
                 }
@@ -1562,7 +1562,7 @@ impl Comparison {
             self.work.push_front(Work::SendSnapshots(bounds.after(&last)));
             Included(last)
         };
-        Ok(StateItem::Snapshots(proto::SnapshotPage { bounds: AddressRange::new(bounds.start, end), states }))
+        Ok(StateItem::Snapshots(proto::SnapshotPage { bounds: TreeSpan::new(bounds.start, end), states }))
     }
 
     async fn reply<SE, PA>(
@@ -1843,7 +1843,7 @@ fn start_le(a: &std::ops::Bound<Vec<u8>>, b: &std::ops::Bound<Vec<u8>>) -> bool 
         (Included(a), Included(b)) | (Excluded(a), Excluded(b)) => a <= b,
     }
 }
-fn valid_range(bounds: &AddressRange) -> bool {
+fn valid_range(bounds: &TreeSpan) -> bool {
     use std::ops::Bound::*;
     match (&bounds.start, &bounds.end) {
         (Included(a), Included(b)) => a <= b,

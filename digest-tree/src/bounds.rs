@@ -1,5 +1,5 @@
 //! Operations on exact leaf-address and encoded-value intervals.
-use crate::AddressRange;
+use crate::TreeSpan;
 use std::cmp::Ordering;
 use std::ops::Bound;
 
@@ -23,23 +23,23 @@ pub(crate) fn upper_cmp(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> Ordering {
         (Bound::Excluded(a), Bound::Included(b)) => a.cmp(b).then(Ordering::Less),
     }
 }
-pub(crate) fn empty(range: &AddressRange) -> bool {
+pub(crate) fn empty(range: &TreeSpan) -> bool {
     match (&range.start, &range.end) {
         (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
         (Bound::Included(a), Bound::Included(b)) => a > b,
         (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => a >= b,
     }
 }
-pub(crate) fn intersect(a: &AddressRange, b: &AddressRange) -> Option<AddressRange> {
+pub(crate) fn intersect(a: &TreeSpan, b: &TreeSpan) -> Option<TreeSpan> {
     let start = if lower_cmp(&a.start, &b.start).is_ge() { &a.start } else { &b.start };
     let end = if upper_cmp(&a.end, &b.end).is_le() { &a.end } else { &b.end };
-    let range = AddressRange::new(start.clone(), end.clone());
+    let range = TreeSpan::new(start.clone(), end.clone());
     (!empty(&range)).then_some(range)
 }
 
 /// The portions of `range` outside a sorted, disjoint set of covered ranges.
 /// Keeping these gaps matters when the other peer has leaves absent locally.
-pub(crate) fn gaps(range: &AddressRange, covered: &[AddressRange]) -> Vec<AddressRange> {
+pub(crate) fn gaps(range: &TreeSpan, covered: &[TreeSpan]) -> Vec<TreeSpan> {
     let mut start = range.start.clone();
     let mut gaps = Vec::new();
     for covered in covered {
@@ -56,7 +56,7 @@ pub(crate) fn gaps(range: &AddressRange, covered: &[AddressRange]) -> Vec<Addres
                 continue;
             }
         };
-        let gap = AddressRange::new(start, end);
+        let gap = TreeSpan::new(start, end);
         if !empty(&gap) {
             gaps.push(gap);
         }
@@ -66,25 +66,25 @@ pub(crate) fn gaps(range: &AddressRange, covered: &[AddressRange]) -> Vec<Addres
             Bound::Unbounded => return gaps,
         };
     }
-    let tail = AddressRange::new(start, range.end.clone());
+    let tail = TreeSpan::new(start, range.end.clone());
     if !empty(&tail) {
         gaps.push(tail);
     }
     gaps
 }
-pub(crate) fn subset(a: &AddressRange, b: &AddressRange) -> bool {
+pub(crate) fn subset(a: &TreeSpan, b: &TreeSpan) -> bool {
     empty(a) || (lower_cmp(&a.start, &b.start).is_ge() && upper_cmp(&a.end, &b.end).is_le())
 }
-pub(crate) fn singleton(range: &AddressRange) -> Option<&[u8]> {
+pub(crate) fn singleton(range: &TreeSpan) -> Option<&[u8]> {
     match (&range.start, &range.end) {
         (Bound::Included(a), Bound::Included(b)) if a == b => Some(a),
         _ => None,
     }
 }
-pub(crate) fn normalize(mut ranges: Vec<AddressRange>) -> Vec<AddressRange> {
+pub(crate) fn normalize(mut ranges: Vec<TreeSpan>) -> Vec<TreeSpan> {
     ranges.retain(|range| !empty(range));
     ranges.sort_by(|a, b| lower_cmp(&a.start, &b.start));
-    let mut out: Vec<AddressRange> = Vec::new();
+    let mut out: Vec<TreeSpan> = Vec::new();
     for range in ranges {
         if let Some(previous) = out.last_mut() {
             let touches = match (&previous.end, &range.start) {
@@ -117,7 +117,7 @@ mod tests {
         }
         let ranges: Vec<_> = endpoints
             .iter()
-            .flat_map(|start| endpoints.iter().map(move |end| AddressRange::new(start.clone(), end.clone())))
+            .flat_map(|start| endpoints.iter().map(move |end| TreeSpan::new(start.clone(), end.clone())))
             .filter(|range| !empty(range))
             .collect();
         let samples = [vec![], vec![0], vec![1], vec![1, 0], vec![1, 0, 0], vec![1, 1], vec![2], vec![2, 0], vec![255]];

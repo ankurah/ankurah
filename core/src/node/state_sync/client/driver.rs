@@ -657,7 +657,7 @@ impl Driver {
             match item {
                 StateItem::Summary(head) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
-                    let _: proto::TreeHead = proto::TreeHead::from_bytes(&head.to_bytes())?;
+                    let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
                     answers.push(StateAnswer::Summary(self.projection.round.as_mut().unwrap().snapshot.head(head.bounds).await?));
                 }
                 StateItem::NeedLeaves(bounds) => {

@@ -214,7 +214,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
         } else {
             std::ops::Bound::Included(chunk.last().unwrap().payload.entity_id.to_bytes().to_vec())
         };
-        let bounds = AddressRange::new(start, end);
+        let bounds = TreeSpan::new(start, end);
         start = opposite(&bounds.end);
         regions.push(proto::KnownRegion::Summary(requester.head(bounds).await?));
     }
@@ -1556,7 +1556,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let mut requester = snapshot(before.clone()).await?;
     let mut known = requester.offer().await?;
     let point = before[0].payload.entity_id.to_bytes().to_vec();
-    let page = requester.page(AddressRange::new(std::ops::Bound::Included(point.clone()), std::ops::Bound::Included(point)))?;
+    let page = requester.page(TreeSpan::new(std::ops::Bound::Included(point.clone()), std::ops::Bound::Included(point)))?;
     let mut exact = Comparison::new(
         snapshot(before.clone()).await?,
         proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Heads(page.clone())] },
@@ -1595,7 +1595,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let proto::KnownRegion::Heads(page) = oversized.regions.last_mut().unwrap() else { unreachable!() };
     page.bounds.end = std::ops::Bound::Excluded(last.payload.entity_id.to_bytes().to_vec());
     oversized.regions.push(proto::KnownRegion::Heads(proto::LeafPage {
-        bounds: AddressRange::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
+        bounds: TreeSpan::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
         leaves: vec![proto::KnownLeaf {
             key: vec![],
             entity: proto::EntityHead { entity_id: last.payload.entity_id, head: last.payload.state.head },
@@ -1630,7 +1630,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let supplied_clock = page.leaves[0].entity.head.clone();
     let address = leaf_address(&page.leaves[0].key, page.leaves[0].entity.entity_id);
     let removal = StateItem::Leaves(proto::LeafPage {
-        bounds: AddressRange::new(std::ops::Bound::Included(address.clone()), std::ops::Bound::Included(address)),
+        bounds: TreeSpan::new(std::ops::Bound::Included(address.clone()), std::ops::Bound::Included(address)),
         leaves: vec![],
     });
     assert!(bincode::serialized_size(&removal)? > PAGE_BYTES as u64);

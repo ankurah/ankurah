@@ -34,4 +34,4 @@ const WINDOW_BYTES: usize = 4 * 1024 * 1024;
 const CONTROL_BYTES: usize = 2 * FRAME_BYTES;
 const MAX_INFLIGHT_FRAMES: usize = 128;
 
-fn whole() -> ankurah_proto::AddressRange { ankurah_proto::AddressRange::under(&ankurah_digest_tree::NodePrefix::root()) }
+fn whole() -> ankurah_proto::TreeSpan { ankurah_proto::TreeSpan::under(&ankurah_digest_tree::NodePrefix::root()) }

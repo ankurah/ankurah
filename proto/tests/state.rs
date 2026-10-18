@@ -19,9 +19,9 @@ fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![]), Predicate::True) }
 fn known(n: u8) -> EntityHead {
     EntityHead { entity_id: EntityId::from_bytes([n; 32]), head: Clock::new(vec![(3, EventId::from_bytes([n; 32]))]).unwrap() }
 }
-fn head(prefix: NodePrefix, bounds: AddressRange, entity: &EntityHead) -> TreeHead {
+fn head(prefix: NodePrefix, bounds: TreeSpan, entity: &EntityHead) -> TreeSpanDigest {
     let hash = HeadHash::of(entity.head.ids().map(|id| id.clone().to_bytes()));
-    TreeHead { prefix, bounds, digest: Leaf::new(&[], entity.entity_id, hash).element().into() }
+    TreeSpanDigest { prefix, bounds, digest: Leaf::new(&[], entity.entity_id, hash).element().into() }
 }
 fn request(body: NodeRequestBody) -> NodeRequest {
     NodeRequest { id: RequestId::new(), from: known(1).entity_id, to: known(2).entity_id, body }
@@ -29,9 +29,9 @@ fn request(body: NodeRequestBody) -> NodeRequest {
 
 #[test]
 fn fetch_and_subscribe_carry_the_same_known_state() {
-    let summary = head(NodePrefix::root(), AddressRange::new(Included(vec![]), Excluded(vec![1])), &known(1));
+    let summary = head(NodePrefix::root(), TreeSpan::new(Included(vec![]), Excluded(vec![1])), &known(1));
     let leaves = LeafPage {
-        bounds: AddressRange::new(Included(vec![1]), Excluded(vec![2])),
+        bounds: TreeSpan::new(Included(vec![1]), Excluded(vec![2])),
         leaves: vec![KnownLeaf { key: vec![1], entity: known(2) }],
     };
     let inventory = KnownState { spec: spec(), regions: vec![KnownRegion::Summary(summary.clone()), KnownRegion::Heads(leaves.clone())] };
@@ -66,7 +66,7 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
         selection: selection(),
         known_state: KnownState {
             spec: spec(),
-            regions: vec![KnownRegion::Heads(LeafPage { bounds: AddressRange::under(&NodePrefix::root()), leaves: vec![] })],
+            regions: vec![KnownRegion::Heads(LeafPage { bounds: TreeSpan::under(&NodePrefix::root()), leaves: vec![] })],
         },
     });
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&unknown).body else { panic!("unknown inventory") };
@@ -75,8 +75,9 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&empty).body else { panic!("known empty") };
     let KnownRegion::Heads(page) = &state.regions[0] else { panic!("empty leaves") };
     assert!(page.leaves.is_empty());
-    assert_eq!(page.bounds, AddressRange::under(&NodePrefix::root()));
-    let empty_summary = KnownRegion::Summary(TreeHead { prefix: NodePrefix::root(), bounds: page.bounds.clone(), digest: Digest::empty() });
+    assert_eq!(page.bounds, TreeSpan::under(&NodePrefix::root()));
+    let empty_summary =
+        KnownRegion::Summary(TreeSpanDigest { prefix: NodePrefix::root(), bounds: page.bounds.clone(), digest: Digest::empty() });
     assert!(matches!(wire(&empty_summary), KnownRegion::Summary(summary) if summary.digest.count() == 0));
     assert_ne!(bincode::serialize(&unknown.body).unwrap(), bincode::serialize(&empty.body).unwrap());
 }
@@ -84,10 +85,10 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
 #[test]
 fn followup_batches_mixed_depths_and_leaf_pages() {
     let comparison = ComparisonId::new();
-    let first = head(NodePrefix::root(), AddressRange::under(&NodePrefix::root()), &known(1));
+    let first = head(NodePrefix::root(), TreeSpan::under(&NodePrefix::root()), &known(1));
     let prefix = NodePrefix::of(&[0], 3);
-    let second = head(prefix.clone(), AddressRange::under(&prefix), &known(2));
-    let bounds = AddressRange::new(Included(vec![0]), Excluded(vec![3]));
+    let second = head(prefix.clone(), TreeSpan::under(&prefix), &known(2));
+    let bounds = TreeSpan::new(Included(vec![0]), Excluded(vec![3]));
     let req = request(NodeRequestBody::ContinueState {
         comparison,
         round: Some(2),
@@ -120,7 +121,7 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
 #[test]
 fn initial_replies_continue_with_mixed_work() {
     let comparison = ComparisonId::new();
-    let bounds = AddressRange::new(Excluded(vec![0]), Included(vec![9]));
+    let bounds = TreeSpan::new(Excluded(vec![0]), Included(vec![9]));
     let state = StateReply {
         spec: spec(),
         round: StateRound { number: 0, revision: 40 },
@@ -131,7 +132,7 @@ fn initial_replies_continue_with_mixed_work() {
                 round: 0,
                 items: vec![
                     StateItem::Summary(head(NodePrefix::root(), bounds.clone(), &known(2))),
-                    StateItem::Leaves(LeafPage { bounds: AddressRange::new(Included(vec![3]), Included(vec![9])), leaves: vec![] }),
+                    StateItem::Leaves(LeafPage { bounds: TreeSpan::new(Included(vec![3]), Included(vec![9])), leaves: vec![] }),
                     StateItem::NeedLeaves(bounds.clone()),
                 ],
                 progress: ComparisonProgress::Continue,
@@ -287,7 +288,7 @@ fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
 #[test]
 fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
     let comparison = ComparisonId::new();
-    let bounds = AddressRange::under(&NodePrefix::root());
+    let bounds = TreeSpan::under(&NodePrefix::root());
     let offer = KnownState {
         spec: spec(),
         regions: vec![KnownRegion::Heads(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![7], entity: known(7) }] })],
@@ -529,7 +530,7 @@ fn snapshot_pages_preserve_attestations_and_omit_duplicate_leaf_and_target_data(
         payload: EntityState { entity_id: entity.entity_id, state: State { head: entity.head.clone(), ..Default::default() } },
         attestations: AttestationSet(vec![Attestation(vec![11, 12])]),
     };
-    let bounds = AddressRange::under(&NodePrefix::root());
+    let bounds = TreeSpan::under(&NodePrefix::root());
     let page = StateItem::Snapshots(SnapshotPage { bounds: bounds.clone(), states: vec![state.clone()] });
     let StateItem::Snapshots(received) = wire(&page) else { panic!("snapshot page") };
     assert_eq!(received.bounds, bounds);
@@ -546,13 +547,13 @@ fn snapshot_pages_preserve_attestations_and_omit_duplicate_leaf_and_target_data(
 }
 
 #[test]
-fn head_deserialization_preserves_the_tree_crates_validation() {
+fn span_digest_deserialization_preserves_the_tree_crates_validation() {
     let root = NodePrefix::root();
-    let bounds = AddressRange::under(&NodePrefix::root());
+    let bounds = TreeSpan::under(&NodePrefix::root());
     let mut negative = Digest::<ankurah_digest_tree::Ristretto255>::empty().to_row_bytes();
     let count_offset = negative.len() - 8;
     negative[count_offset..].copy_from_slice(&(-1i64).to_le_bytes());
-    let encode = |version, prefix: Vec<u8>, bounds: &AddressRange, digest| {
+    let encode = |version, prefix: Vec<u8>, bounds: &TreeSpan, digest| {
         bincode::serialize(&(version, prefix, &bounds.start, &bounds.end, digest)).unwrap()
     };
     let empty_digest = Digest::<ankurah_digest_tree::Ristretto255>::empty().to_row_bytes();
@@ -564,14 +565,14 @@ fn head_deserialization_preserves_the_tree_crates_validation() {
         encode(1u8, vec![255], &bounds, empty_digest.clone()),
         encode(1u8, root.to_bytes(), &bounds, negative),
         encode(1u8, root.to_bytes(), &bounds, Digest::<LtHash16>::empty().to_row_bytes()),
-        encode(1u8, root.to_bytes(), &AddressRange::new(Included(vec![2]), Excluded(vec![1])), empty_digest.clone()),
+        encode(1u8, root.to_bytes(), &TreeSpan::new(Included(vec![2]), Excluded(vec![1])), empty_digest.clone()),
         encode(1u8, NodePrefix::of(&[0], 1).to_bytes(), &bounds, empty_digest),
         trailing,
     ] {
         let framed = bincode::serialize(&bytes).unwrap();
-        assert!(bincode::deserialize::<TreeHead>(&framed).is_err());
+        assert!(bincode::deserialize::<TreeSpanDigest>(&framed).is_err());
     }
-    let decoded: TreeHead = bincode::deserialize(&bincode::serialize(&valid).unwrap()).unwrap();
+    let decoded: TreeSpanDigest = bincode::deserialize(&bincode::serialize(&valid).unwrap()).unwrap();
     assert_eq!(decoded.digest.count(), 0);
     assert_eq!(decoded.bounds, bounds);
 }
@@ -590,6 +591,6 @@ fn deserializing_a_spec_keeps_its_canonical_ascending_key_layout() {
     assert_eq!(decoded.key_spec().keyparts[0].direction, IndexDirection::Asc);
     assert_eq!(decoded.key_spec().keyparts[0].nulls, None);
     assert_eq!(wire(&decoded), decoded);
-    let bounds = AddressRange::new(Unbounded, Excluded(vec![8]));
+    let bounds = TreeSpan::new(Unbounded, Excluded(vec![8]));
     assert_eq!(wire(&bounds), bounds);
 }

@@ -6,8 +6,8 @@ use std::ops::Bound::{Excluded, Included};
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
 use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
 use ankurah_digest_tree::{
-    leaf_address, AddressRange, CanonicalCodec, DigestGroup, DigestTree, HeadHash, LeafChange, LeafData, LtHash16, Ristretto255, TreeHead,
-    TreeMatch, TreeRequest, TreeSpec, TreeTransaction,
+    leaf_address, CanonicalCodec, DigestGroup, DigestTree, HeadHash, LeafChange, LeafData, LtHash16, Ristretto255, TreeMatch, TreeRequest,
+    TreeSpan, TreeSpanDigest, TreeSpec, TreeTransaction,
 };
 
 fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([1; 32])) }
@@ -29,7 +29,7 @@ async fn build<G: DigestGroup>(leaves: impl IntoIterator<Item = LeafData>) -> Di
     tx.commit().await.unwrap();
     tree
 }
-async fn rows<G: DigestGroup>(tx: &mut TreeTransaction<G>, range: &AddressRange) -> BTreeMap<Vec<u8>, LeafData> {
+async fn rows<G: DigestGroup>(tx: &mut TreeTransaction<G>, range: &TreeSpan) -> BTreeMap<Vec<u8>, LeafData> {
     let scope = tx.scope_ranges([range.clone()]);
     let mut result = BTreeMap::new();
     let mut cursor = None;
@@ -46,7 +46,7 @@ async fn rows<G: DigestGroup>(tx: &mut TreeTransaction<G>, range: &AddressRange)
     }
 }
 
-fn same_region<G: DigestGroup>(heads: &[TreeHead<G>], parent: &TreeHead<G>) -> bool {
+fn same_region<G: DigestGroup>(heads: &[TreeSpanDigest<G>], parent: &TreeSpanDigest<G>) -> bool {
     heads.len() == 1 && heads[0].prefix == parent.prefix && heads[0].bounds == parent.bounds
 }
 
@@ -55,7 +55,7 @@ fn same_region<G: DigestGroup>(heads: &[TreeHead<G>], parent: &TreeHead<G>) -> b
 async fn differences<G: DigestGroup>(
     opener: &DigestTree<G>,
     responder: &DigestTree<G>,
-    ranges: &[AddressRange],
+    ranges: &[TreeSpan],
 ) -> BTreeMap<Vec<u8>, LeafChange> {
     let mut a = opener.begin();
     let mut b = responder.begin();
@@ -66,7 +66,7 @@ async fn differences<G: DigestGroup>(
     while let Some(head) = pending.pop() {
         comparisons += 1;
         assert!(comparisons < 10_000, "descent must make progress");
-        let head = TreeHead::<G>::from_bytes(&head.to_bytes()).unwrap();
+        let head = TreeSpanDigest::<G>::from_bytes(&head.to_bytes()).unwrap();
         let sa = a.scope_ranges([head.bounds.clone()]);
         let sb = b.scope_ranges([head.bounds.clone()]);
         if a.digest(&sa).await.unwrap() == b.digest(&sb).await.unwrap() {
@@ -94,7 +94,7 @@ async fn differences<G: DigestGroup>(
     changes
 }
 
-async fn reconcile<G: DigestGroup>(opener: &DigestTree<G>, responder: &DigestTree<G>, ranges: &[AddressRange]) -> usize {
+async fn reconcile<G: DigestGroup>(opener: &DigestTree<G>, responder: &DigestTree<G>, ranges: &[TreeSpan]) -> usize {
     let changes = differences(opener, responder, ranges).await;
     let count = changes.len();
     let mut tx = opener.begin();
@@ -120,11 +120,11 @@ async fn asymmetric_peers<G: DigestGroup>() {
         authoritative.insert(address(&leaf(value, 0)), leaf(value, 0));
     }
     let responder = build::<G>(authoritative.values().cloned()).await;
-    let range = AddressRange::new(Included(key(-50)), Excluded(key(300)));
+    let range = TreeSpan::new(Included(key(-50)), Excluded(key(300)));
     let expected: BTreeMap<_, _> = authoritative.into_iter().filter(|(address, _)| range.contains(address)).collect();
     assert_eq!(reconcile(&opener, &responder, &[range.clone()]).await, 7);
     assert_eq!(rows(&mut opener.begin(), &range).await, expected);
-    assert_eq!(rows(&mut opener.begin(), &AddressRange::all()).await.len(), expected.len(), "out-of-scope key 500 stays absent");
+    assert_eq!(rows(&mut opener.begin(), &TreeSpan::all()).await.len(), expected.len(), "out-of-scope key 500 stays absent");
 
     let empty = build::<G>([]).await;
     reconcile(&empty, &responder, &[range.clone()]).await;
@@ -140,7 +140,7 @@ async fn asymmetric_regions_reconcile_in_both_groups() {
 #[tokio::test]
 async fn head_and_refinement_bounds_cover_empty_gaps_exactly_once() {
     let tree = build::<Ristretto255>((64..192).map(|n| leaf(n, 0))).await;
-    let range = AddressRange::new(Excluded(key(10)), Included(key(250)));
+    let range = TreeSpan::new(Excluded(key(10)), Included(key(250)));
     let mut tx = tree.begin();
     let scope = tx.scope_ranges([range.clone()]);
     let heads = tx.heads(&scope).await.unwrap();
@@ -199,7 +199,7 @@ async fn equal_membership_with_different_local_shapes_compares_equal() {
     }
     tx.commit().await.unwrap();
     assert_ne!(compact.begin().audit().await.unwrap().nodes, expanded.begin().audit().await.unwrap().nodes);
-    for range in [AddressRange::all(), AddressRange::new(Included(key(-20)), Excluded(key(80)))] {
+    for range in [TreeSpan::all(), TreeSpan::new(Included(key(-20)), Excluded(key(80)))] {
         assert!(differences(&compact, &expanded, &[range.clone()]).await.is_empty());
         assert!(differences(&expanded, &compact, &[range]).await.is_empty());
     }

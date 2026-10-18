@@ -138,7 +138,7 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     let mut start = super::super::super::whole().start;
     let mut regions = Vec::new();
     for n in 1..=32 {
-        let bounds = proto::AddressRange::new(start, Excluded(address(n)));
+        let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
         regions.push(if n == 1 {
             proto::KnownRegion::Heads(snapshot.page(bounds)?)
         } else {
@@ -146,7 +146,7 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
         });
         start = Included(address(n));
     }
-    regions.push(proto::KnownRegion::Summary(snapshot.head(proto::AddressRange::new(start, super::super::super::whole().end)).await?));
+    regions.push(proto::KnownRegion::Summary(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
     gate.store(true, Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(

@@ -13,15 +13,14 @@ fn leaf(n: u8) -> proto::KnownLeaf {
 #[test]
 fn authoritative_range_updates_remove_only_the_exact_interval() -> anyhow::Result<()> {
     let mut members: BTreeMap<_, _> = (0..10).map(|n| (address(n), id(n))).collect();
-    let page =
-        proto::LeafPage { bounds: proto::AddressRange::new(Excluded(address(2)), Included(address(7))), leaves: vec![leaf(4), leaf(6)] };
+    let page = proto::LeafPage { bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(7))), leaves: vec![leaf(4), leaf(6)] };
     replace_members(&mut members, &spec(), page.clone(), super::super::LEAF_PAGE)?;
     replace_members(&mut members, &spec(), page, super::super::LEAF_PAGE)?;
     assert_eq!(members.values().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(4), id(6), id(8), id(9)]);
     replace_members(
         &mut members,
         &spec(),
-        proto::LeafPage { bounds: proto::AddressRange::new(Included(address(4)), Excluded(address(8))), leaves: vec![] },
+        proto::LeafPage { bounds: proto::TreeSpan::new(Included(address(4)), Excluded(address(8))), leaves: vec![] },
         super::super::LEAF_PAGE,
     )?;
     assert_eq!(members.values().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(8), id(9)]);
@@ -32,10 +31,10 @@ fn authoritative_range_updates_remove_only_the_exact_interval() -> anyhow::Resul
 fn malformed_pages_cannot_partly_replace_membership_or_panic() {
     let original: BTreeMap<_, _> = (0..10).map(|n| (address(n), id(n))).collect();
     let cases = [
-        proto::LeafPage { bounds: proto::AddressRange::new(Excluded(address(4)), Excluded(address(4))), leaves: vec![] },
-        proto::LeafPage { bounds: proto::AddressRange::new(Included(address(8)), Included(address(2))), leaves: vec![] },
+        proto::LeafPage { bounds: proto::TreeSpan::new(Excluded(address(4)), Excluded(address(4))), leaves: vec![] },
+        proto::LeafPage { bounds: proto::TreeSpan::new(Included(address(8)), Included(address(2))), leaves: vec![] },
         proto::LeafPage { bounds: super::super::whole(), leaves: vec![leaf(4), leaf(3)] },
-        proto::LeafPage { bounds: proto::AddressRange::new(Included(address(4)), Included(address(6))), leaves: vec![leaf(3)] },
+        proto::LeafPage { bounds: proto::TreeSpan::new(Included(address(4)), Included(address(6))), leaves: vec![leaf(3)] },
     ];
     for page in cases {
         let mut members = original.clone();
@@ -75,7 +74,7 @@ fn snapshot_pages_derive_sender_keys_targets_and_exact_membership() -> anyhow::R
     assert_eq!(members.values().copied().collect::<Vec<_>>(), [id(2), id(4)]);
     let start = members.first_key_value().unwrap().0.clone();
     let end = members.last_key_value().unwrap().0.clone();
-    let empty = proto::SnapshotPage { bounds: proto::AddressRange::new(Included(start), Excluded(end)), states: vec![] };
+    let empty = proto::SnapshotPage { bounds: proto::TreeSpan::new(Included(start), Excluded(end)), states: vec![] };
     replace_members(&mut members, &spec, snapshot_leaves(&spec, &empty)?, super::super::MAX_SNAPSHOT_ROWS)?;
     assert_eq!(members.values().copied().collect::<Vec<_>>(), [id(4)]);
     Ok(())
@@ -88,7 +87,7 @@ fn malformed_snapshot_pages_cannot_partly_change_membership() {
     let pages = [
         proto::SnapshotPage { bounds: super::super::whole(), states: vec![state(2), state(2)] },
         proto::SnapshotPage { bounds: super::super::whole(), states: vec![state(4), state(2)] },
-        proto::SnapshotPage { bounds: proto::AddressRange::new(Excluded(address(2)), Included(address(4))), states: vec![state(2)] },
+        proto::SnapshotPage { bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(4))), states: vec![state(2)] },
         proto::SnapshotPage {
             bounds: super::super::whole(),
             states: (0..=super::super::MAX_SNAPSHOT_ROWS).map(|n| state(n as u8)).collect(),
@@ -439,7 +438,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let mut start = super::super::whole().start;
     let mut regions = Vec::new();
     for n in 1..=32 {
-        let bounds = proto::AddressRange::new(start, Excluded(address(n)));
+        let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
         regions.push(if n == 1 {
             proto::KnownRegion::Heads(snapshot.page(bounds)?)
         } else {
@@ -447,7 +446,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
         });
         start = Included(address(n));
     }
-    regions.push(proto::KnownRegion::Summary(snapshot.head(proto::AddressRange::new(start, super::super::whole().end)).await?));
+    regions.push(proto::KnownRegion::Summary(snapshot.head(proto::TreeSpan::new(start, super::super::whole().end)).await?));
     gate.store(true, std::sync::atomic::Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(

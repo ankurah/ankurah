@@ -3,7 +3,7 @@
 
 use crate::bounds::{intersect, normalize, singleton, subset};
 use crate::key::{encode_part, prefix_end, validate_part};
-use crate::{AddressRange, PropertyTypes, TreeError, TreeSpec};
+use crate::{PropertyTypes, TreeError, TreeSpan, TreeSpec};
 use ankql::ast::{ComparisonOperator as Op, Expr, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core_types::{IndexDirection, IndexKeyPart, KeySpec, PropertyId, PropertyPath, ValueType};
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,13 +30,13 @@ pub enum TreeMatch {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Clause {
-    fields: BTreeMap<PropertyPath, AddressRange>,
+    fields: BTreeMap<PropertyPath, TreeSpan>,
     opaque: BTreeSet<Vec<u8>>,
 }
 
 pub(crate) struct ReusePlan {
     pub kind: TreeMatch,
-    pub ranges: Vec<AddressRange>,
+    pub ranges: Vec<TreeSpan>,
     pub directions: Vec<IndexDirection>,
     pub id_direction: IndexDirection,
 }
@@ -143,7 +143,7 @@ impl TreeSpec {
         let whole = implies(&admission, &request.clauses);
         let mut ranges = Vec::new();
         if whole {
-            ranges.push(AddressRange::all());
+            ranges.push(TreeSpan::all());
         } else {
             for clause in &request.clauses {
                 ranges.push(span(self.key_spec(), clause, &admission)?);
@@ -189,7 +189,7 @@ fn implies(left: &[Clause], right: &[Clause]) -> bool {
     })
 }
 
-fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Option<AddressRange> {
+fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Option<TreeSpan> {
     if query.opaque.iter().any(|term| !admission.iter().all(|c| c.opaque.contains(term))) {
         return None;
     }
@@ -200,7 +200,7 @@ fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Opti
         .map(|(path, _)| path.clone())
         .collect();
     let mut prefix = Vec::new();
-    let mut range = AddressRange::all();
+    let mut range = TreeSpan::all();
     let mut parts = key.keyparts.clone();
     parts.push(IndexKeyPart::asc(PropertyId::Id, ValueType::EntityId));
     for (index, keypart) in parts.into_iter().enumerate() {
@@ -222,13 +222,13 @@ fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Opti
 // Convert a value interval into the addresses of all tuples with this
 // leading prefix. An inclusive upper value ends after every suffix of it;
 // an exclusive lower value starts there instead.
-fn part_range(prefix: &[u8], domain: &AddressRange, implicit_id: bool) -> Option<AddressRange> {
+fn part_range(prefix: &[u8], domain: &TreeSpan, implicit_id: bool) -> Option<TreeSpan> {
     let address = |value: &[u8]| -> Option<Vec<u8>> {
         let value = if implicit_id { value.get(1..)? } else { value };
         Some([prefix, value].concat())
     };
     let whole = prefix_range(prefix);
-    let empty = || AddressRange::new(Included(vec![]), Excluded(vec![]));
+    let empty = || TreeSpan::new(Included(vec![]), Excluded(vec![]));
     let start = match &domain.start {
         Included(value) => Included(address(value)?),
         Excluded(value) => match prefix_end(&address(value)?) {
@@ -242,11 +242,11 @@ fn part_range(prefix: &[u8], domain: &AddressRange, implicit_id: bool) -> Option
         Excluded(value) => Excluded(address(value)?),
         Unbounded => whole.end.clone(),
     };
-    Some(intersect(&whole, &AddressRange::new(start, end)).unwrap_or_else(empty))
+    Some(intersect(&whole, &TreeSpan::new(start, end)).unwrap_or_else(empty))
 }
 
-pub(crate) fn prefix_range(prefix: &[u8]) -> AddressRange {
-    AddressRange::new(Included(prefix.to_vec()), prefix_end(prefix).map_or(Unbounded, Excluded))
+pub(crate) fn prefix_range(prefix: &[u8]) -> TreeSpan {
+    TreeSpan::new(Included(prefix.to_vec()), prefix_end(prefix).map_or(Unbounded, Excluded))
 }
 pub(crate) fn path(part: &IndexKeyPart<PropertyId>) -> PropertyPath {
     let mut path = PropertyPath::from(part.key);
@@ -341,19 +341,19 @@ fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<PropertyPath, Value
                     return Ok(out);
                 }
                 (Op::Between, Expr::ExprList(values)) if values.len() == 2 => {
-                    AddressRange::new(Included(encode(&values[0])?), Included(encode(&values[1])?))
+                    TreeSpan::new(Included(encode(&values[0])?), Included(encode(&values[1])?))
                 }
                 (_, Expr::Literal(_)) => {
                     let bytes = encode(value)?;
                     match op {
-                        Op::Equal => AddressRange::new(Included(bytes.clone()), Included(bytes)),
+                        Op::Equal => TreeSpan::new(Included(bytes.clone()), Included(bytes)),
                         Op::NotEqual => {
                             return Ok(vec![field(path, nonnull, Excluded(bytes.clone())), field(path, Excluded(bytes), Unbounded)])
                         }
-                        Op::GreaterThan => AddressRange::new(Excluded(bytes), Unbounded),
-                        Op::GreaterThanOrEqual => AddressRange::new(Included(bytes), Unbounded),
-                        Op::LessThan => AddressRange::new(nonnull, Excluded(bytes)),
-                        Op::LessThanOrEqual => AddressRange::new(nonnull, Included(bytes)),
+                        Op::GreaterThan => TreeSpan::new(Excluded(bytes), Unbounded),
+                        Op::GreaterThanOrEqual => TreeSpan::new(Included(bytes), Unbounded),
+                        Op::LessThan => TreeSpan::new(nonnull, Excluded(bytes)),
+                        Op::LessThanOrEqual => TreeSpan::new(nonnull, Included(bytes)),
                         _ => return Ok(opaque(predicate)),
                     }
                 }
@@ -374,7 +374,7 @@ fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<PropertyPath, Value
     }
 }
 fn field(path: &PropertyPath, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Clause {
-    Clause { fields: BTreeMap::from([(path.clone(), AddressRange::new(start, end))]), opaque: BTreeSet::new() }
+    Clause { fields: BTreeMap::from([(path.clone(), TreeSpan::new(start, end))]), opaque: BTreeSet::new() }
 }
 fn opaque(predicate: &Predicate<Resolved>) -> Vec<Clause> {
     let normalized = ankql::selection::map_references::<Resolved, Resolved>(

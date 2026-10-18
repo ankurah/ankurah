@@ -7,8 +7,8 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
 use ankurah_digest_tree::{
-    AddressRange, ByteBounds, HeadHash, LeafChange, LeafData, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction,
-    NodePrefix, Ristretto255, TreeError, TreeSpec, TreeTransaction, BUCKET_CAPACITY,
+    ByteBounds, HeadHash, LeafChange, LeafData, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodePrefix,
+    Ristretto255, TreeError, TreeSpan, TreeSpec, TreeTransaction, BUCKET_CAPACITY,
 };
 use async_trait::async_trait;
 
@@ -167,7 +167,7 @@ async fn populated(count: usize) -> (Store, TreeSpec) {
 
 async fn assert_tree(tx: &mut Transaction, id: u8, spec: &TreeSpec, expected: &[LeafData]) {
     let mut tree = tx.tree(id, spec);
-    let rows = tree.leaves(&AddressRange::all(), usize::MAX).await.unwrap();
+    let rows = tree.leaves(&TreeSpan::all(), usize::MAX).await.unwrap();
     let actual: Vec<_> = rows.into_iter().map(|row| LeafData { key: row.key, entity_id: row.entity_id, head: row.head }).collect();
     assert_eq!(actual, expected);
     assert_eq!(tree.audit().await.unwrap().leaves, expected.len());
@@ -217,11 +217,11 @@ async fn dropping_the_owner_rolls_back_successful_tree_and_entity_writes() {
 async fn scopes_cannot_cross_reopened_views_or_tree_namespaces() {
     let (store, spec) = populated(1).await;
     let mut tx = store.begin();
-    let old = tx.tree(FIRST, &spec).scope_ranges([AddressRange::all()]);
+    let old = tx.tree(FIRST, &spec).scope_ranges([TreeSpan::all()]);
     for id in [FIRST, SECOND] {
         let mut tree = tx.tree(id, &spec);
         assert!(matches!(tree.count(&old).await, Err(TreeError::StaleScope)));
-        let scope = tree.scope_ranges([AddressRange::all()]);
+        let scope = tree.scope_ranges([TreeSpan::all()]);
         assert_eq!(tree.count(&scope).await.unwrap(), 1);
     }
     tx.commit().await.unwrap();

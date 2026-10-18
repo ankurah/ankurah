@@ -55,7 +55,7 @@ impl<'de> Visitor<'de> for PageVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AddressRange, Clock, EntityHead, EntityId, EventId, KnownLeaf, KnownRegion, StateAnswer, StateItem};
+    use crate::{Clock, EntityHead, EntityId, EventId, KnownLeaf, KnownRegion, StateAnswer, StateItem, TreeSpan};
     use std::ops::Bound;
 
     fn event(index: u32) -> EventId {
@@ -66,7 +66,7 @@ mod tests {
 
     fn page(keys: Vec<Vec<u8>>, generation: u32, tips: usize) -> LeafPage {
         LeafPage {
-            bounds: AddressRange::all(),
+            bounds: TreeSpan::all(),
             leaves: keys
                 .into_iter()
                 .enumerate()
@@ -117,7 +117,7 @@ mod tests {
                     (Bound::Excluded(vec![0]), Bound::Included(vec![255])),
                 ] {
                     let mut page = page(keys.clone(), generation, tips);
-                    page.bounds = AddressRange::new(start, end);
+                    page.bounds = TreeSpan::new(start, end);
                     round_trip(page);
                 }
             }
@@ -162,11 +162,11 @@ mod tests {
         // without its constructor so deserialization owns validation.
         #[derive(Serialize)]
         struct RawPage {
-            bounds: AddressRange,
+            bounds: TreeSpan,
             leaves: Vec<(Vec<u8>, (EntityId, Vec<(u32, EventId)>))>,
         }
         let decode = |entries: Vec<(u32, EventId)>| {
-            let raw = RawPage { bounds: AddressRange::all(), leaves: vec![(vec![], (EntityId::from_bytes([0; 32]), entries))] };
+            let raw = RawPage { bounds: TreeSpan::all(), leaves: vec![(vec![], (EntityId::from_bytes([0; 32]), entries))] };
             decoded(&wrap_blob(&options().serialize(&(VERSION, raw)).unwrap()))
         };
         let normalized = decode(vec![(1000, event(2)), (1, event(1)), (1, event(1))]).unwrap();

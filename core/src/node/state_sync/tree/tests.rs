@@ -521,7 +521,7 @@ async fn canonical_pages_cover_requested_bounds_without_building_a_tree() -> any
     let snapshot = query.refresh(spec, (0..70).rev().map(|id| state(id, 1)).collect()).await?;
     let members = snapshot.members();
     let addresses = members.keys().cloned().collect::<Vec<_>>();
-    let requested = proto::AddressRange::new(Bound::Excluded(addresses[2].clone()), Bound::Included(addresses[67].clone()));
+    let requested = proto::TreeSpan::new(Bound::Excluded(addresses[2].clone()), Bound::Included(addresses[67].clone()));
     let mut remaining = requested.clone();
     let mut received = Vec::new();
     loop {

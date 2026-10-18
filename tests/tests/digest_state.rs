@@ -634,7 +634,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                     applied_through: None,
                     processed_through: 0,
                     answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
-                        bounds: proto::AddressRange::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                        bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
                         leaves: vec![]
                     })],
                 }
@@ -679,7 +679,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                     applied_through: None,
                     processed_through: 0,
                     answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
-                        bounds: proto::AddressRange::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                        bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
                         leaves: vec![]
                     })],
                 }

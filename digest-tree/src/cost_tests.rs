@@ -176,7 +176,7 @@ async fn changing_only_a_head_leaves_lookup_and_multiplicity_untouched() {
 #[tokio::test]
 async fn bounded_reads_do_not_load_delta_history_from_an_excluded_branch() {
     let (maps, counts) = populated(128).await;
-    let range = AddressRange::new(Included(leaf(0, 0).key), Excluded(leaf(2, 0).key));
+    let range = TreeSpan::new(Included(leaf(0, 0).key), Excluded(leaf(2, 0).key));
     let mut tx = begin(&maps, &counts);
     let scope = tx.scope_ranges([range.clone()]);
     assert_eq!(tx.count(&scope).await.unwrap(), 2);

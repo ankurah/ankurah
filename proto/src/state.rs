@@ -16,7 +16,7 @@
 //! Peers, connection generations, credentials, snapshots, spec and query version
 //! stay bound throughout. Unknown or superseded streams cannot be adopted.
 
-pub use ankurah_digest_tree::{AddressRange, TreeHead, TreeSpec};
+pub use ankurah_digest_tree::{TreeSpan, TreeSpanDigest, TreeSpec};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -52,7 +52,7 @@ pub struct KnownState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KnownRegion {
-    Summary(TreeHead),
+    Summary(TreeSpanDigest),
     /// All entity heads within these bounds; empty means the range is empty.
     /// An initial inventory uses the request budget, independently of follow-up
     /// page limits. Replies need only describe changes; Complete confirms
@@ -161,13 +161,13 @@ pub enum ComparisonProgress {
 /// A reply may mix refinement, inventory questions and entity repairs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateItem {
-    /// Compare this region locally and answer with a head for the same bounds.
+    /// Compare this region locally and answer with a digest for the same span.
     /// The responder may offer several depths; overlap must not be counted twice.
-    Summary(TreeHead),
+    Summary(TreeSpanDigest),
     /// The responder's complete leaf inventory within this page's bounds.
     Leaves(LeafPage),
     /// Enumerate the requester's leaves within these bounds, in bounded pages.
-    NeedLeaves(AddressRange),
+    NeedLeaves(TreeSpan),
     /// Apply through the normal attestation and causal validation path.
     /// `target` is the captured sender head covered by this delta. Application
     /// may retain newer or concurrent local state; sending is not acknowledgment.
@@ -188,8 +188,8 @@ pub enum StateItem {
 /// Answers for any subset of the outstanding regions/entities in a comparison.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateAnswer {
-    /// The requester's digest over the exact bounds named by the head.
-    Summary(TreeHead),
+    /// The requester's digest over the exact span offered by the responder.
+    Summary(TreeSpanDigest),
     Leaves(LeafPage),
     /// An already offered snapshot did not incorporate target into local state.
     /// Only the exact offered entity/target is admissible, including after Complete.
@@ -207,7 +207,7 @@ pub enum StateAnswer {
 /// This is a wire page, separate from the tree crate's local snapshot cursor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeafPage {
-    pub bounds: AddressRange,
+    pub bounds: TreeSpan,
     /// Strictly increasing by canonical key bytes followed by entity ID.
     pub leaves: Vec<KnownLeaf>,
 }
@@ -219,7 +219,7 @@ pub struct LeafPage {
 /// Oversized snapshots use Leaves plus RepairChunk instead of a partial page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotPage {
-    pub bounds: AddressRange,
+    pub bounds: TreeSpan,
     pub states: Vec<Attested<EntityState>>,
 }
 

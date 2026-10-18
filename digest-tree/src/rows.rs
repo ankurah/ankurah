@@ -67,16 +67,17 @@ pub fn leaf_address(key: &[u8], entity_id: EntityId) -> Vec<u8> {
     address
 }
 
-/// A range of leaf addresses: the rows a read asks for.
+/// A span of leaf addresses. Endpoints are complete addresses, not suffixes
+/// relative to a node prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AddressRange {
+pub struct TreeSpan {
     /// The lower bound.
     pub start: Bound<Vec<u8>>,
     /// The upper bound.
     pub end: Bound<Vec<u8>>,
 }
 
-impl AddressRange {
+impl TreeSpan {
     /// The range between two bounds.
     pub fn new(start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Self { Self { start, end } }
 
@@ -135,22 +136,22 @@ mod tests {
 
     #[test]
     fn contains_honours_each_kind_of_bound() {
-        let included = AddressRange::new(Bound::Included(vec![2]), Bound::Included(vec![4]));
-        let excluded = AddressRange::new(Bound::Excluded(vec![2]), Bound::Excluded(vec![4]));
+        let included = TreeSpan::new(Bound::Included(vec![2]), Bound::Included(vec![4]));
+        let excluded = TreeSpan::new(Bound::Excluded(vec![2]), Bound::Excluded(vec![4]));
         for address in [vec![1], vec![2], vec![3], vec![4], vec![4, 0], vec![5]] {
             let inside = address >= vec![2] && address <= vec![4];
             assert_eq!(included.contains(&address), inside, "{address:?} within the closed range");
             let inside = address > vec![2] && address < vec![4];
             assert_eq!(excluded.contains(&address), inside, "{address:?} within the open range");
-            assert!(AddressRange::all().contains(&address));
+            assert!(TreeSpan::all().contains(&address));
         }
     }
 
     #[test]
     fn the_next_page_starts_past_the_last_address_read_and_keeps_the_end() {
-        let range = AddressRange::new(Bound::Included(vec![1]), Bound::Excluded(vec![9]));
+        let range = TreeSpan::new(Bound::Included(vec![1]), Bound::Excluded(vec![9]));
         let next = range.after(&[3]);
-        assert_eq!(next, AddressRange::new(Bound::Excluded(vec![3]), Bound::Excluded(vec![9])));
+        assert_eq!(next, TreeSpan::new(Bound::Excluded(vec![3]), Bound::Excluded(vec![9])));
         assert_eq!(next.bounds(), (Bound::Excluded(&[3][..]), Bound::Excluded(&[9][..])));
         assert!(!next.contains(&[3]) && next.contains(&[3, 0]) && !next.contains(&[9]));
     }
@@ -164,12 +165,12 @@ mod tests {
             let len = rng.gen_range(0..=40);
             let from: Vec<u8> = (0..5).map(|_| rng.gen::<u8>() & 0xC3).collect();
             let prefix = NodePrefix::of(&from, len);
-            let range = AddressRange::under(&prefix);
+            let range = TreeSpan::under(&prefix);
             for _ in 0..50 {
                 let address: Vec<u8> = (0..rng.gen_range(0..=6)).map(|_| rng.gen::<u8>() & 0xC3).collect();
                 assert_eq!(range.contains(&address), prefix.contains_address(&address), "{prefix:?} against {address:?}");
             }
         }
-        assert_eq!(AddressRange::under(&NodePrefix::root()), AddressRange::new(Bound::Included(vec![]), Bound::Unbounded));
+        assert_eq!(TreeSpan::under(&NodePrefix::root()), TreeSpan::new(Bound::Included(vec![]), Bound::Unbounded));
     }
 }

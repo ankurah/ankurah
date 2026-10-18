@@ -8,7 +8,7 @@ use ankurah_core_types::{KeySpec, PropertyPath, ValueType};
 use ankurah_digest_tree::{
     leaf_address, CanonicalCodec, DigestTree, HeadHash, LeafChange, LeafData, NodePrefix, PropertyTypes, TreeTransaction,
 };
-use ankurah_proto::{self as proto, Attested, EntityId, EntityState, TreeHead, TreeSpec};
+use ankurah_proto::{self as proto, Attested, EntityId, EntityState, TreeSpanDigest, TreeSpec};
 
 use crate::{
     entity::{Entity, TemporaryEntity},
@@ -354,10 +354,10 @@ impl Snapshot {
         Ok(self.tree.as_mut().unwrap())
     }
 
-    pub async fn head(&mut self, bounds: proto::AddressRange) -> anyhow::Result<TreeHead> {
+    pub async fn head(&mut self, bounds: proto::TreeSpan) -> anyhow::Result<TreeSpanDigest> {
         let tree = self.tree().await?;
         let scope = tree.scope_ranges([bounds.clone()]);
-        Ok(TreeHead { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
+        Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
     }
 
     pub async fn offer(&mut self) -> anyhow::Result<proto::KnownState> {
@@ -429,7 +429,7 @@ impl Snapshot {
         bincode::serialized_size(&inventory).ok().filter(|size| *size <= super::INITIAL_INVENTORY_BYTES as u64).map(|_| inventory)
     }
 
-    pub fn page(&self, bounds: proto::AddressRange) -> anyhow::Result<proto::LeafPage> {
+    pub fn page(&self, bounds: proto::TreeSpan) -> anyhow::Result<proto::LeafPage> {
         use std::ops::Bound;
         let empty = match (&bounds.start, &bounds.end) {
             (Bound::Included(start), Bound::Included(end)) => start > end,
@@ -450,7 +450,7 @@ impl Snapshot {
             };
             let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
             let overhead = bincode::serialized_size(&proto::StateAnswer::Leaves(proto::LeafPage {
-                bounds: proto::AddressRange::new(bounds.start.clone(), end),
+                bounds: proto::TreeSpan::new(bounds.start.clone(), end),
                 leaves: Vec::new(),
             }))?;
             let size = bincode::serialized_size(&leaf)?;
@@ -466,7 +466,7 @@ impl Snapshot {
         } else {
             Bound::Included(leaf_address(&leaves.last().unwrap().key, leaves.last().unwrap().entity.entity_id))
         };
-        let page = proto::LeafPage { bounds: proto::AddressRange::new(bounds.start, end), leaves };
+        let page = proto::LeafPage { bounds: proto::TreeSpan::new(bounds.start, end), leaves };
         anyhow::ensure!(
             bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::PAGE_BYTES as u64,
             "leaf inventory bounds exceed byte limit"
@@ -474,11 +474,13 @@ impl Snapshot {
         Ok(page)
     }
 
-    pub async fn refine(&mut self, head: &TreeHead) -> anyhow::Result<Vec<TreeHead>> { Ok(self.tree().await?.refine(head).await?) }
+    pub async fn refine(&mut self, head: &TreeSpanDigest) -> anyhow::Result<Vec<TreeSpanDigest>> {
+        Ok(self.tree().await?.refine(head).await?)
+    }
 
     pub fn members(&self) -> Members { (*self.members).clone() }
 
-    pub fn states_in(&self, bounds: &proto::AddressRange, limit: usize) -> impl Iterator<Item = (&[u8], &Attested<EntityState>)> {
+    pub fn states_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (&[u8], &Attested<EntityState>)> {
         self.members
             .range((bounds.start.clone(), bounds.end.clone()))
             .take(limit)
