@@ -55,7 +55,7 @@ impl<'de> Visitor<'de> for PageVisitor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, KnownRegion, StateAnswer, StateItem, TreeSpan};
+    use crate::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, SpanContent, StateAnswer, StateItem, TreeSpan};
     use std::ops::Bound;
 
     fn event(index: u32) -> EventId {
@@ -82,27 +82,27 @@ mod tests {
     }
 
     fn decoded(encoded: &[u8]) -> bincode::Result<TreeSpanInventory> {
-        match bincode::deserialize::<KnownRegion>(encoded)? {
-            KnownRegion::Heads(page) => Ok(page),
+        match bincode::deserialize::<SpanContent>(encoded)? {
+            SpanContent::Heads(page) => Ok(page),
             _ => panic!("expected leaves"),
         }
     }
 
     fn wrap_blob(blob: &[u8]) -> Vec<u8> {
-        let mut bytes = 1u32.to_le_bytes().to_vec(); // KnownRegion::Heads
+        let mut bytes = 1u32.to_le_bytes().to_vec(); // SpanContent::Heads
         bytes.extend_from_slice(&(blob.len() as u64).to_le_bytes());
         bytes.extend_from_slice(blob);
         bytes
     }
 
     fn round_trip(page: TreeSpanInventory) {
-        let region = KnownRegion::Heads(page.clone());
+        let region = SpanContent::Heads(page.clone());
         let encoded = bincode::serialize(&region).unwrap();
         assert_eq!(bincode::serialized_size(&region).unwrap() as usize, encoded.len());
         assert_eq!(bincode::serialize(&decoded(&encoded).unwrap()).unwrap(), bincode::serialize(&page).unwrap());
         let expected_json = serde_json::json!({ "Heads": serde_json::to_value(&page).unwrap() });
         assert_eq!(serde_json::to_value(&region).unwrap(), expected_json);
-        let from_json: KnownRegion = serde_json::from_value(expected_json).unwrap();
+        let from_json: SpanContent = serde_json::from_value(expected_json).unwrap();
         assert_eq!(bincode::serialize(&from_json).unwrap(), encoded);
     }
 
@@ -130,7 +130,7 @@ mod tests {
     fn numeric_initial_inventory_has_the_expected_versioned_size() {
         let page = page((0..128u64).map(|n| [&[1][..], &n.to_be_bytes()].concat()).collect(), 1, 1);
         let fixed = bincode::serialize(&page).unwrap();
-        let compact = bincode::serialize(&KnownRegion::Heads(page.clone())).unwrap();
+        let compact = bincode::serialize(&SpanContent::Heads(page.clone())).unwrap();
         assert_eq!(compact, wrap_blob(&options().serialize(&(VERSION, &page)).unwrap()));
         assert_eq!(fixed.len(), 11920);
         assert_eq!(compact.len(), 9744);
@@ -147,7 +147,7 @@ mod tests {
         }
         let inventory = crate::KnownState {
             spec: crate::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True),
-            regions: vec![KnownRegion::Heads(heads)],
+            regions: vec![SpanContent::Heads(heads)],
         };
         let encoded = bincode::serialize(&inventory).unwrap();
         assert!(encoded.len() > 64 * 1024 && encoded.len() <= MAX_ENCODED_BYTES);
@@ -209,7 +209,7 @@ mod tests {
         }
         assert!(decoded(&wrap_blob(&vec![VERSION; MAX_ENCODED_BYTES + 1])).unwrap_err().to_string().contains("exceeds 256 KiB"));
         let oversized = page(vec![vec![0; MAX_ENCODED_BYTES]], 1, 1);
-        assert!(bincode::serialize(&KnownRegion::Heads(oversized)).is_err());
+        assert!(bincode::serialize(&SpanContent::Heads(oversized)).is_err());
         let mut impossible_length = 1u32.to_le_bytes().to_vec();
         impossible_length.extend_from_slice(&u64::MAX.to_le_bytes());
         assert!(decoded(&impossible_length).is_err());

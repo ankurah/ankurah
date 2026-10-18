@@ -1241,9 +1241,9 @@ impl Comparison {
         );
         let mut regions = known.regions;
         regions.sort_by(|a, b| {
-            let start = |region: &proto::KnownRegion| match region {
-                proto::KnownRegion::Digest(head) => head.bounds.start.clone(),
-                proto::KnownRegion::Heads(page) => page.bounds.start.clone(),
+            let start = |region: &proto::SpanContent| match region {
+                proto::SpanContent::Digest(head) => head.bounds.start.clone(),
+                proto::SpanContent::Heads(page) => page.bounds.start.clone(),
             };
             let a = start(a);
             let b = start(b);
@@ -1261,8 +1261,8 @@ impl Comparison {
         for region in regions {
             ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
             let bounds = match &region {
-                proto::KnownRegion::Digest(head) => &head.bounds,
-                proto::KnownRegion::Heads(page) => &page.bounds,
+                proto::SpanContent::Digest(head) => &head.bounds,
+                proto::SpanContent::Heads(page) => &page.bounds,
             };
             ensure!(
                 valid_range(bounds) && start_le(&start, &bounds.start) && end_le(&bounds.end, &super::whole().end),
@@ -1277,14 +1277,14 @@ impl Comparison {
             }
             start = opposite(&bounds.end);
             match region {
-                proto::KnownRegion::Digest(head) => {
+                proto::SpanContent::Digest(head) => {
                     let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
                     if let Some(frontier) = &mut frontier {
                         frontier.push(head.clone());
                     }
                     comparison.work.push_back(Work::Compare { prefix: NodePrefix::root(), head });
                 }
-                proto::KnownRegion::Heads(page) => {
+                proto::SpanContent::Heads(page) => {
                     frontier = None;
                     leaf_count += page.leaves.len();
                     ensure!(leaf_count <= INITIAL_INVENTORY_LEAVES, "initial inventory exceeds leaf limit");

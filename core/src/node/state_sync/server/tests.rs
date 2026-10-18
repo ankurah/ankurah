@@ -84,15 +84,15 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
     assert!(items.is_empty(), "equal captured results need no response items");
 
     let empty =
-        known.regions.iter().position(|region| matches!(region, proto::KnownRegion::Digest(head) if head.digest.count() == 0)).unwrap();
+        known.regions.iter().position(|region| matches!(region, proto::SpanContent::Digest(head) if head.digest.count() == 0)).unwrap();
     let mut withheld = known.clone();
     withheld.regions.remove(empty);
     let partial = Comparison::new(snapshot(source.clone()).await?, withheld)?;
     assert!(!partial.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))), "a withheld gap cannot claim aggregate equality");
 
     let mut mixed = known.clone();
-    let proto::KnownRegion::Digest(head) = &mixed.regions[empty] else { unreachable!() };
-    mixed.regions[empty] = proto::KnownRegion::Heads(requester.page(head.bounds.clone())?);
+    let proto::SpanContent::Digest(head) = &mixed.regions[empty] else { unreachable!() };
+    mixed.regions[empty] = proto::SpanContent::Heads(requester.page(head.bounds.clone())?);
     let mixed = Comparison::new(snapshot(source.clone()).await?, mixed)?;
     assert!(!mixed.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))));
 
@@ -110,7 +110,7 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     let former = source[0].payload.entity_id;
     let former_clock = source[0].payload.state.head.clone();
     let mut requester = snapshot(source.clone()).await?;
-    let known = proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Digest(requester.head(super::super::whole()).await?)] };
+    let known = proto::KnownState { spec: spec(), regions: vec![proto::SpanContent::Digest(requester.head(super::super::whole()).await?)] };
     let mut current = source[1..].to_vec();
     let added = states(1, 8).pop().unwrap();
     let new_id = added.payload.entity_id;
@@ -215,7 +215,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
         };
         let bounds = TreeSpan::new(start, end);
         start = opposite(&bounds.end);
-        regions.push(proto::KnownRegion::Digest(requester.head(bounds).await?));
+        regions.push(proto::SpanContent::Digest(requester.head(bounds).await?));
     }
     let mut comparison = Comparison::new(snapshot(current).await?, proto::KnownState { spec: spec(), regions })?;
     let mut answers = Vec::new();
@@ -274,7 +274,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let mut requester = snapshot(cached.clone()).await?;
     let mut regions = Vec::new();
     for head in frontier {
-        regions.push(proto::KnownRegion::Digest(requester.head(head.bounds).await?));
+        regions.push(proto::SpanContent::Digest(requester.head(head.bounds).await?));
     }
     let known = proto::KnownState { spec: spec(), regions };
     let mut comparison = Comparison::new(responder, known)?;
@@ -696,7 +696,7 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
     let (node, peer, messages) = node().await?;
     let source = states(128, 8);
     let mut requester = snapshot(source[..1].to_vec()).await?;
-    let known = proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Digest(requester.head(super::super::whole()).await?)] };
+    let known = proto::KnownState { spec: spec(), regions: vec![proto::SpanContent::Digest(requester.head(super::super::whole()).await?)] };
     let initial = start_comparison(
         &node,
         peer,
@@ -1557,7 +1557,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let page = requester.page(TreeSpan::new(std::ops::Bound::Included(point.clone()), std::ops::Bound::Included(point)))?;
     let mut exact = Comparison::new(
         snapshot(before.clone()).await?,
-        proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Heads(page.clone())] },
+        proto::KnownState { spec: spec(), regions: vec![proto::SpanContent::Heads(page.clone())] },
     )?;
     let point_work = exact.work.iter().position(|work| matches!(work, Work::InitialHeads(_))).unwrap();
     let Some(Work::InitialHeads(validated)) = exact.work.remove(point_work) else { panic!("validated exact point") };
@@ -1576,23 +1576,23 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let extra = positioned_state(3, 10000, 1)?;
     let mut keyed = super::super::QueryTree::default().refresh(position_spec(), vec![extra]).await?;
     let mut duplicate = keyed.offer().await?;
-    let proto::KnownRegion::Heads(first) = &mut duplicate.regions[0] else { unreachable!() };
+    let proto::SpanContent::Heads(first) = &mut duplicate.regions[0] else { unreachable!() };
     let mut second = first.clone();
     let key = CanonicalCodec.encode_prefix(position_spec().key_spec(), &[ankurah_core_types::Value::I64(10001)])?;
     second.leaves[0].key = key;
     let addr = leaf_address(&second.leaves[0].key, second.leaves[0].entity.entity_id);
     first.bounds.end = std::ops::Bound::Excluded(addr.clone());
     second.bounds.start = std::ops::Bound::Included(addr);
-    duplicate.regions.push(proto::KnownRegion::Heads(second));
+    duplicate.regions.push(proto::SpanContent::Heads(second));
     assert!(
         Comparison::new(super::super::QueryTree::default().refresh(position_spec(), vec![]).await?, duplicate).is_err(),
         "global duplicate IDs must fail even at distinct keys/pages"
     );
     let mut oversized = requester.offer().await?;
     let last = ordered_states(2049, 2).pop().unwrap();
-    let proto::KnownRegion::Heads(page) = oversized.regions.last_mut().unwrap() else { unreachable!() };
+    let proto::SpanContent::Heads(page) = oversized.regions.last_mut().unwrap() else { unreachable!() };
     page.bounds.end = std::ops::Bound::Excluded(last.payload.entity_id.to_bytes().to_vec());
-    oversized.regions.push(proto::KnownRegion::Heads(proto::TreeSpanInventory {
+    oversized.regions.push(proto::SpanContent::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
         leaves: vec![proto::KeyedEntityHead {
             key: vec![],
@@ -1623,7 +1623,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let former = text_state("z".repeat(40 * 1024), 2)?;
     let mut requester = super::super::QueryTree::default().refresh(spec.clone(), vec![before]).await?;
     let known = requester.offer().await?;
-    let [proto::KnownRegion::Heads(page)] = known.regions.as_slice() else { panic!("one valid complete initial inventory") };
+    let [proto::SpanContent::Heads(page)] = known.regions.as_slice() else { panic!("one valid complete initial inventory") };
     assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
     let supplied_clock = page.leaves[0].entity.head.clone();
     let address = leaf_address(&page.leaves[0].key, page.leaves[0].entity.entity_id);
@@ -1681,7 +1681,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
         let page = requester.page(remaining)?;
         assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
         let end = page.bounds.end.clone();
-        regions.push(proto::KnownRegion::Heads(page));
+        regions.push(proto::SpanContent::Heads(page));
         if end == super::super::whole().end {
             break;
         }

@@ -102,7 +102,7 @@ async fn fetch_and_subscription_send_one_complete_initial_head_inventory() -> Re
                     proto::NodeRequestBody::SubscribeQuery { known_state, .. } => (true, known_state),
                     _ => return false,
                 };
-                if let [proto::KnownRegion::Heads(inventory)] = known.regions.as_slice() {
+                if let [proto::SpanContent::Heads(inventory)] = known.regions.as_slice() {
                     offers.lock().unwrap().push((subscribe, inventory.leaves.len()));
                 }
             }
@@ -1510,12 +1510,12 @@ async fn cold_query_with_2049_interleaved_cached_rows_uses_a_summary_frontier() 
         offers.lock().unwrap().iter().filter(|(id, _)| *id == query.query_id()).map(|(_, known)| known.clone()).collect::<Vec<_>>();
     assert_eq!(own_offers.len(), 1, "the cold query must have one actual initial offer, excluding catalog requests");
     let known = &own_offers[0];
-    assert!(known.regions.iter().all(|region| matches!(region, proto::KnownRegion::Digest(_))), "the partial cache must offer Digest-only");
+    assert!(known.regions.iter().all(|region| matches!(region, proto::SpanContent::Digest(_))), "the partial cache must offer Digest-only");
     let offered_count = known
         .regions
         .iter()
         .map(|region| match region {
-            proto::KnownRegion::Digest(head) => head.digest.count(),
+            proto::SpanContent::Digest(head) => head.digest.count(),
             _ => unreachable!(),
         })
         .sum::<i64>();

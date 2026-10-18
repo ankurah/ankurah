@@ -443,13 +443,13 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     for n in 1..=32 {
         let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
         regions.push(if n == 1 {
-            proto::KnownRegion::Heads(snapshot.page(bounds)?)
+            proto::SpanContent::Heads(snapshot.page(bounds)?)
         } else {
-            proto::KnownRegion::Digest(snapshot.head(bounds).await?)
+            proto::SpanContent::Digest(snapshot.head(bounds).await?)
         });
         start = Included(address(n));
     }
-    regions.push(proto::KnownRegion::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::whole().end)).await?));
+    regions.push(proto::SpanContent::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::whole().end)).await?));
     gate.store(true, std::sync::atomic::Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(

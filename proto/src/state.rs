@@ -47,11 +47,11 @@ impl std::fmt::Display for ComparisonId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownState {
     pub spec: TreeSpec,
-    pub regions: Vec<KnownRegion>,
+    pub regions: Vec<SpanContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum KnownRegion {
+pub enum SpanContent {
     Digest(TreeSpanDigest),
     /// All entity heads within these bounds; empty means the range is empty.
     /// An initial inventory uses the request budget, independently of follow-up

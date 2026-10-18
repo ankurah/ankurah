@@ -390,7 +390,7 @@ impl Snapshot {
             }
             let inventory = proto::KnownState {
                 spec: self.spec.clone(),
-                regions: candidate.iter().map(|(head, _)| proto::KnownRegion::Digest(head.clone())).collect(),
+                regions: candidate.iter().map(|(head, _)| proto::SpanContent::Digest(head.clone())).collect(),
             };
             if bincode::serialized_size(&inventory)? <= OFFER_BYTES {
                 frontier = candidate;
@@ -398,7 +398,7 @@ impl Snapshot {
         }
         Ok(proto::KnownState {
             spec: self.spec.clone(),
-            regions: frontier.into_iter().map(|(head, _)| proto::KnownRegion::Digest(head)).collect(),
+            regions: frontier.into_iter().map(|(head, _)| proto::SpanContent::Digest(head)).collect(),
         })
     }
 
@@ -424,7 +424,7 @@ impl Snapshot {
         }
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
-            regions: vec![proto::KnownRegion::Heads(proto::TreeSpanInventory { bounds: super::whole(), leaves })],
+            regions: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), leaves })],
         };
         bincode::serialized_size(&inventory).ok().filter(|size| *size <= super::INITIAL_INVENTORY_BYTES as u64).map(|_| inventory)
     }

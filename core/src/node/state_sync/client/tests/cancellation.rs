@@ -140,13 +140,13 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     for n in 1..=32 {
         let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
         regions.push(if n == 1 {
-            proto::KnownRegion::Heads(snapshot.page(bounds)?)
+            proto::SpanContent::Heads(snapshot.page(bounds)?)
         } else {
-            proto::KnownRegion::Digest(snapshot.head(bounds).await?)
+            proto::SpanContent::Digest(snapshot.head(bounds).await?)
         });
         start = Included(address(n));
     }
-    regions.push(proto::KnownRegion::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
+    regions.push(proto::SpanContent::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
     gate.store(true, Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
