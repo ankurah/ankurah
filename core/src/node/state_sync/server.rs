@@ -687,6 +687,10 @@ where
     ensure!(answers.len() <= 128, "too many comparison answers");
     let encoded = bincode::serialize(&(round, processed_through, applied_through, &answers))?;
     ensure!(encoded.len() <= FRAME_BYTES, "comparison feedback exceeds limit");
+    ensure!(
+        encoded.len() as u64 + super::budget::answers_bytes(&answers)? - bincode::serialized_size(&answers)? <= FRAME_BYTES as u64,
+        "comparison feedback exceeds decoded-work limit"
+    );
     let mut state = session.state.lock().await;
     if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
@@ -1241,7 +1245,7 @@ impl Comparison {
         };
         ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
         ensure!(
-            known.spans.len() <= 128 && bincode::serialized_size(&known)? as usize <= INITIAL_INVENTORY_BYTES,
+            known.spans.len() <= 128 && super::budget::offer_bytes(&known)? as usize <= INITIAL_INVENTORY_BYTES,
             "initial inventory exceeds limit"
         );
         let mut spans = known.spans;
@@ -1790,7 +1794,7 @@ impl Comparison {
                 }
             };
             if let Some(item) = item {
-                let size = bincode::serialized_size(&item)? as usize;
+                let size = super::budget::item_bytes(&item)? as usize;
                 if !items.is_empty() && bytes + size > PAGE_BYTES {
                     self.work.push_front(Work::Item(item));
                     break;

@@ -1634,6 +1634,25 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
 }
 
 #[tokio::test]
+async fn compressed_initial_spans_share_one_uncompressed_work_budget() -> anyhow::Result<()> {
+    let page = proto::TreeSpanInventory {
+        bounds: super::super::whole(),
+        leaves: (0..128)
+            .map(|n| proto::KeyedEntityHead {
+                key: vec![42; 256],
+                entity: proto::EntityHead { entity_id: proto::EntityId::from_bytes([n; 32]), head: proto::Clock::default() },
+            })
+            .collect::<Vec<_>>()
+            .into(),
+    };
+    let known = proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Heads(page); 8] };
+    assert!(bincode::serialized_size(&known)? < INITIAL_INVENTORY_BYTES as u64);
+    let error = Comparison::new(snapshot(vec![]).await?, known).err().expect("aggregate work must be rejected before span validation");
+    assert!(error.to_string().contains("initial inventory exceeds limit"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame() -> anyhow::Result<()> {
     use crate::property::backend::{LWWBackend, PropertyBackend};
     let property = proto::PropertyId::EntityId(proto::EntityId::from_bytes([42; 32]));

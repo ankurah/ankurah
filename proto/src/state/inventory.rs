@@ -102,6 +102,9 @@ impl PackedHeads {
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
     pub fn expanded_size(&self) -> u64 { self.expanded_size }
+    /// Key bytes saved by prefix coding. Counting these again bounds traversal
+    /// work independently of the compressed wire size, including across pages.
+    pub fn prefix_savings(&self) -> usize { self.plain_size.saturating_sub(self.bytes.len()) }
 
     /// Explicitly materialize owned rows when a caller needs independent values.
     pub fn to_vec(&self) -> Vec<KeyedEntityHead> {

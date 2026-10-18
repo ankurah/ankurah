@@ -47,6 +47,30 @@ fn malformed_pages_cannot_partly_replace_membership_or_panic() {
 }
 
 #[test]
+fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
+    let rows = (0..128)
+        .map(|n| proto::KeyedEntityHead {
+            key: vec![42; 256],
+            entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() },
+        })
+        .collect::<Vec<_>>();
+    let page = proto::TreeSpanInventory { bounds: super::super::whole(), leaves: rows.into() };
+    assert!(page.expanded_size() < super::super::PAGE_BYTES as u64);
+    let frame = proto::StateFrame {
+        comparison: proto::ComparisonId::new(),
+        sequence: 0,
+        body: proto::StateFrameBody::State {
+            round: 0,
+            items: vec![proto::StateItem::Leaves(page.clone()), proto::StateItem::Leaves(page)],
+            progress: proto::ComparisonProgress::Continue,
+        },
+    };
+    assert!(bincode::serialized_size(&frame).unwrap() < super::super::FRAME_BYTES as u64);
+    let inbox = super::super::Inbox::default();
+    assert!(inbox.insert(frame).unwrap_err().to_string().contains("decoded-work limit"));
+}
+
+#[test]
 fn snapshot_pages_derive_sender_keys_targets_and_exact_membership() -> anyhow::Result<()> {
     let spec = proto::TreeSpec::new(
         ankurah_core_types::KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(

@@ -226,6 +226,10 @@ impl Inbox {
     pub fn insert(&self, frame: StateFrame) -> anyhow::Result<()> {
         let encoded = bincode::serialize(&frame)?;
         ensure!(encoded.len() <= FRAME_BYTES, "state frame exceeds limit");
+        ensure!(
+            encoded.len() as u64 + super::budget::frame_expansion(&frame)? <= FRAME_BYTES as u64,
+            "state frame exceeds decoded-work limit"
+        );
         let mut state = self.state.lock().unwrap();
         ensure!(!state.closed, "state stream closed");
         ensure!(state.comparison.is_none_or(|id| id == frame.comparison), "state stream changed its comparison");

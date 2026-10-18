@@ -28,7 +28,11 @@ impl Feedback {
     pub fn cancel_round(&self, round: u64) {
         let mut pending = self.0.lock().unwrap();
         pending.answers.retain(|(owner, _)| *owner != Some(round));
-        pending.bytes = pending.answers.iter().map(|(_, answer)| bincode::serialized_size(answer).expect("queued answer already serialized") as usize).sum();
+        pending.bytes = pending
+            .answers
+            .iter()
+            .map(|(_, answer)| super::budget::answer_bytes(answer).expect("queued answer already serialized") as usize)
+            .sum();
     }
 
     pub fn queue<SE, PA>(
@@ -49,7 +53,7 @@ impl Feedback {
     {
         {
             let mut pending = self.0.lock().unwrap();
-            let bytes = bincode::serialized_size(&answers)? as usize;
+            let bytes = super::budget::answers_bytes(&answers)? as usize;
             ensure!(pending.bytes + bytes <= super::WINDOW_BYTES, "state answer queue exceeded limit");
             pending.bytes += bytes;
             pending.answers.extend(answers.into_iter().map(|answer| (round, answer)));
@@ -81,7 +85,7 @@ impl Feedback {
                             if *answer_round != round {
                                 break;
                             }
-                            let size = bincode::serialized_size(answer)? as usize;
+                            let size = super::budget::answer_bytes(answer)? as usize;
                             ensure!(size <= super::PAGE_BYTES, "state answer exceeds limit");
                             if answers.len() == 128 || bytes + size > super::PAGE_BYTES {
                                 break;

@@ -1,6 +1,7 @@
 //! Memory-only comparison of materialized query results. Storage still owns
 //! entities and events; these trees and comparison snapshots are derived data.
 
+mod budget;
 mod client;
 mod feedback;
 mod incoming;
