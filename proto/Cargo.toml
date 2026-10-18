@@ -49,3 +49,8 @@ getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 serde_json = "1.0"
+
+# Experimental inventory encoding; no production codec depends on this benchmark.
+[[bench]]
+name = "prefix_inventory"
+harness = false
