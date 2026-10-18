@@ -6,8 +6,8 @@ mod cancellation;
 fn id(n: u8) -> proto::EntityId { proto::EntityId::from_bytes([n; 32]) }
 fn address(n: u8) -> Vec<u8> { leaf_address(&[], id(n)) }
 fn spec() -> proto::TreeSpec { proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True) }
-fn leaf(n: u8) -> proto::KnownLeaf {
-    proto::KnownLeaf { key: vec![], entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() } }
+fn leaf(n: u8) -> proto::KeyedEntityHead {
+    proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() } }
 }
 
 #[test]
@@ -445,11 +445,11 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
         regions.push(if n == 1 {
             proto::KnownRegion::Heads(snapshot.page(bounds)?)
         } else {
-            proto::KnownRegion::Summary(snapshot.head(bounds).await?)
+            proto::KnownRegion::Digest(snapshot.head(bounds).await?)
         });
         start = Included(address(n));
     }
-    regions.push(proto::KnownRegion::Summary(snapshot.head(proto::TreeSpan::new(start, super::super::whole().end)).await?));
+    regions.push(proto::KnownRegion::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::whole().end)).await?));
     gate.store(true, std::sync::atomic::Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(

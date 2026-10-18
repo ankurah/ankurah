@@ -142,11 +142,11 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
         regions.push(if n == 1 {
             proto::KnownRegion::Heads(snapshot.page(bounds)?)
         } else {
-            proto::KnownRegion::Summary(snapshot.head(bounds).await?)
+            proto::KnownRegion::Digest(snapshot.head(bounds).await?)
         });
         start = Included(address(n));
     }
-    regions.push(proto::KnownRegion::Summary(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
+    regions.push(proto::KnownRegion::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
     gate.store(true, Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(

@@ -251,7 +251,7 @@ async fn empty_query_inventory_sends_snapshots_without_asserting_global_entity_a
     trace.clear();
     assert_eq!(reader.fetch::<PetView>("age = '2'").await?.len(), 192);
     let items = trace.items(None);
-    assert!(items.iter().all(|item| !matches!(item, StateItem::Summary(_) | StateItem::NeedLeaves(_))));
+    assert!(items.iter().all(|item| !matches!(item, StateItem::Digest(_) | StateItem::NeedLeaves(_))));
     assert!(known.iter().all(|pet| offers_target(&items, pet.id(), &pet.entity().head())));
     assert_eq!(items.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 192);
     Ok(())
@@ -1298,7 +1298,7 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
     // Moderate results offer complete initial Leaves; above 2048 rows uses
-    // a bounded retained Summary frontier. Padded keys preserve lexical order
+    // a bounded retained Digest frontier. Padded keys preserve lexical order
     // in both cases; unchanged payload favors the former match's event bridge.
     let unchanged = "unchanged-".to_owned() + &"p".repeat(1024);
     let mut rows = Vec::new();
@@ -1416,7 +1416,7 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
     // The gate observes inbound responses, not the outgoing KnownState. A
     // frontier necessarily asks for refinement/leaves here; the complete
     // initial inventory handles these sparse changes without that feedback.
-    let asks_for_inventory = offered.iter().any(|item| matches!(item, StateItem::Summary(_) | StateItem::NeedLeaves(_)));
+    let asks_for_inventory = offered.iter().any(|item| matches!(item, StateItem::Digest(_) | StateItem::NeedLeaves(_)));
     assert_eq!(asks_for_inventory, !initial_inventory, "fixture must exercise the intended initial knowledge path");
     assert!(!query.loaded(), "Complete cannot activate membership while a snapshot target remains uncovered");
     assert!(query.wait_durable_answered().now_or_never().is_none(), "uncovered causal repair must block readiness");
@@ -1451,7 +1451,7 @@ async fn cold_query_with_2049_interleaved_cached_rows_uses_a_summary_frontier() 
     use std::collections::{BTreeMap, BTreeSet};
 
     // 4096 half-cache is exactly the 2048-leaf inventory cap. This extra
-    // pair makes the genuinely partial requester offer a Summary frontier.
+    // pair makes the genuinely partial requester offer a Digest frontier.
     const COUNT: usize = 4098;
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
@@ -1510,15 +1510,12 @@ async fn cold_query_with_2049_interleaved_cached_rows_uses_a_summary_frontier() 
         offers.lock().unwrap().iter().filter(|(id, _)| *id == query.query_id()).map(|(_, known)| known.clone()).collect::<Vec<_>>();
     assert_eq!(own_offers.len(), 1, "the cold query must have one actual initial offer, excluding catalog requests");
     let known = &own_offers[0];
-    assert!(
-        known.regions.iter().all(|region| matches!(region, proto::KnownRegion::Summary(_))),
-        "the partial cache must offer Summary-only"
-    );
+    assert!(known.regions.iter().all(|region| matches!(region, proto::KnownRegion::Digest(_))), "the partial cache must offer Digest-only");
     let offered_count = known
         .regions
         .iter()
         .map(|region| match region {
-            proto::KnownRegion::Summary(head) => head.digest.count(),
+            proto::KnownRegion::Digest(head) => head.digest.count(),
             _ => unreachable!(),
         })
         .sum::<i64>();

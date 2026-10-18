@@ -52,7 +52,7 @@ pub struct KnownState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum KnownRegion {
-    Summary(TreeSpanDigest),
+    Digest(TreeSpanDigest),
     /// All entity heads within these bounds; empty means the range is empty.
     /// An initial inventory uses the request budget, independently of follow-up
     /// page limits. Replies need only describe changes; Complete confirms
@@ -163,7 +163,7 @@ pub enum ComparisonProgress {
 pub enum StateItem {
     /// Compare this region locally and answer with a digest for the same span.
     /// The responder may offer several depths; overlap must not be counted twice.
-    Summary(TreeSpanDigest),
+    Digest(TreeSpanDigest),
     /// The responder's complete leaf inventory within this page's bounds.
     Leaves(TreeSpanInventory),
     /// Enumerate the requester's leaves within these bounds, in bounded pages.
@@ -189,7 +189,7 @@ pub enum StateItem {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateAnswer {
     /// The requester's digest over the exact span offered by the responder.
-    Summary(TreeSpanDigest),
+    Digest(TreeSpanDigest),
     Leaves(TreeSpanInventory),
     /// An already offered snapshot did not incorporate target into local state.
     /// Only the exact offered entity/target is admissible, including after Complete.
@@ -209,7 +209,7 @@ pub enum StateAnswer {
 pub struct TreeSpanInventory {
     pub bounds: TreeSpan,
     /// Strictly increasing by canonical key bytes followed by entity ID.
-    pub leaves: Vec<KnownLeaf>,
+    pub leaves: Vec<KeyedEntityHead>,
 }
 
 /// An exhaustive range page in canonical address order, including empty gaps.
@@ -224,7 +224,7 @@ pub struct SnapshotPage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KnownLeaf {
+pub struct KeyedEntityHead {
     /// Canonical property values selected by the TreeSpec's KeySpec. The full
     /// address appends the entity ID; this key is empty for entity-ID-only trees.
     /// It belongs to this tree: another KeySpec can place the same EntityHead

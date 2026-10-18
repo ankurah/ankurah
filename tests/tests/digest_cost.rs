@@ -166,7 +166,7 @@ impl Meter {
                     proto::StateItem::Leaves(page) => self.traffic.leaves += page.leaves.len(),
                     proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
                     proto::StateItem::Snapshots(page) => self.traffic.snapshots += page.states.len(),
-                    proto::StateItem::Summary(_) => self.traffic.summaries += 1,
+                    proto::StateItem::Digest(_) => self.traffic.summaries += 1,
                     proto::StateItem::NeedLeaves(_) => self.traffic.leaf_questions += 1,
                     _ => {}
                 }

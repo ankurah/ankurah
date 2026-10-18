@@ -655,10 +655,10 @@ impl Driver {
         let mut answers = Vec::new();
         for item in items {
             match item {
-                StateItem::Summary(head) => {
+                StateItem::Digest(head) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
                     let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
-                    answers.push(StateAnswer::Summary(self.projection.round.as_mut().unwrap().snapshot.head(head.bounds).await?));
+                    answers.push(StateAnswer::Digest(self.projection.round.as_mut().unwrap().snapshot.head(head.bounds).await?));
                 }
                 StateItem::NeedLeaves(bounds) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");

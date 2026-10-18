@@ -1242,7 +1242,7 @@ impl Comparison {
         let mut regions = known.regions;
         regions.sort_by(|a, b| {
             let start = |region: &proto::KnownRegion| match region {
-                proto::KnownRegion::Summary(head) => head.bounds.start.clone(),
+                proto::KnownRegion::Digest(head) => head.bounds.start.clone(),
                 proto::KnownRegion::Heads(page) => page.bounds.start.clone(),
             };
             let a = start(a);
@@ -1261,7 +1261,7 @@ impl Comparison {
         for region in regions {
             ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
             let bounds = match &region {
-                proto::KnownRegion::Summary(head) => &head.bounds,
+                proto::KnownRegion::Digest(head) => &head.bounds,
                 proto::KnownRegion::Heads(page) => &page.bounds,
             };
             ensure!(
@@ -1277,7 +1277,7 @@ impl Comparison {
             }
             start = opposite(&bounds.end);
             match region {
-                proto::KnownRegion::Summary(head) => {
+                proto::KnownRegion::Digest(head) => {
                     let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
                     if let Some(frontier) = &mut frontier {
                         frontier.push(head.clone());
@@ -1339,7 +1339,7 @@ impl Comparison {
                     self.pending_repairs.insert(entity_id);
                     self.work.push_front(Work::History { entity_id, target });
                 }
-                StateAnswer::Summary(head) => {
+                StateAnswer::Digest(head) => {
                     let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
                     let prefix =
                         self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
@@ -1545,7 +1545,7 @@ impl Comparison {
                 self.work.push_front(Work::Repair(id, known));
                 return Ok(StateItem::Leaves(proto::TreeSpanInventory {
                     bounds: page_bounds,
-                    leaves: vec![proto::KnownLeaf {
+                    leaves: vec![proto::KeyedEntityHead {
                         key: address[..address.len() - proto::EntityId::BYTE_LEN].to_vec(),
                         entity: proto::EntityHead { entity_id: id, head: state.payload.state.head.clone() },
                     }],
@@ -1669,7 +1669,7 @@ impl Comparison {
                 }
                 Work::Offer(head) => {
                     self.summaries.insert(range_id(&head.bounds), head.prefix.clone());
-                    Some(StateItem::Summary(head))
+                    Some(StateItem::Digest(head))
                 }
                 Work::Expand { local: head, known } => {
                     // Descend locally within the work budget, preserving cached

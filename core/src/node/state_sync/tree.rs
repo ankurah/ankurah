@@ -390,7 +390,7 @@ impl Snapshot {
             }
             let inventory = proto::KnownState {
                 spec: self.spec.clone(),
-                regions: candidate.iter().map(|(head, _)| proto::KnownRegion::Summary(head.clone())).collect(),
+                regions: candidate.iter().map(|(head, _)| proto::KnownRegion::Digest(head.clone())).collect(),
             };
             if bincode::serialized_size(&inventory)? <= OFFER_BYTES {
                 frontier = candidate;
@@ -398,7 +398,7 @@ impl Snapshot {
         }
         Ok(proto::KnownState {
             spec: self.spec.clone(),
-            regions: frontier.into_iter().map(|(head, _)| proto::KnownRegion::Summary(head)).collect(),
+            regions: frontier.into_iter().map(|(head, _)| proto::KnownRegion::Digest(head)).collect(),
         })
     }
 
@@ -417,7 +417,7 @@ impl Snapshot {
             if minimum_bytes > super::INITIAL_INVENTORY_BYTES {
                 return None;
             }
-            leaves.push(proto::KnownLeaf {
+            leaves.push(proto::KeyedEntityHead {
                 key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
                 entity: proto::EntityHead { entity_id: *id, head: head.clone() },
             });
@@ -444,7 +444,7 @@ impl Snapshot {
         let mut leaves = Vec::new();
         let mut bytes = 0;
         for (index, (address, id)) in rows.iter().take(super::LEAF_PAGE).enumerate() {
-            let leaf = proto::KnownLeaf {
+            let leaf = proto::KeyedEntityHead {
                 key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
                 entity: proto::EntityHead { entity_id: **id, head: self.states[*id].payload.state.head.clone() },
             };

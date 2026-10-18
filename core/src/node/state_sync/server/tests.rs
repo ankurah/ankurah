@@ -84,14 +84,14 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
     assert!(items.is_empty(), "equal captured results need no response items");
 
     let empty =
-        known.regions.iter().position(|region| matches!(region, proto::KnownRegion::Summary(head) if head.digest.count() == 0)).unwrap();
+        known.regions.iter().position(|region| matches!(region, proto::KnownRegion::Digest(head) if head.digest.count() == 0)).unwrap();
     let mut withheld = known.clone();
     withheld.regions.remove(empty);
     let partial = Comparison::new(snapshot(source.clone()).await?, withheld)?;
     assert!(!partial.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))), "a withheld gap cannot claim aggregate equality");
 
     let mut mixed = known.clone();
-    let proto::KnownRegion::Summary(head) = &mixed.regions[empty] else { unreachable!() };
+    let proto::KnownRegion::Digest(head) = &mixed.regions[empty] else { unreachable!() };
     mixed.regions[empty] = proto::KnownRegion::Heads(requester.page(head.bounds.clone())?);
     let mixed = Comparison::new(snapshot(source.clone()).await?, mixed)?;
     assert!(!mixed.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))));
@@ -110,8 +110,7 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     let former = source[0].payload.entity_id;
     let former_clock = source[0].payload.state.head.clone();
     let mut requester = snapshot(source.clone()).await?;
-    let known =
-        proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Summary(requester.head(super::super::whole()).await?)] };
+    let known = proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Digest(requester.head(super::super::whole()).await?)] };
     let mut current = source[1..].to_vec();
     let added = states(1, 8).pop().unwrap();
     let new_id = added.payload.entity_id;
@@ -216,7 +215,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
         };
         let bounds = TreeSpan::new(start, end);
         start = opposite(&bounds.end);
-        regions.push(proto::KnownRegion::Summary(requester.head(bounds).await?));
+        regions.push(proto::KnownRegion::Digest(requester.head(bounds).await?));
     }
     let mut comparison = Comparison::new(snapshot(current).await?, proto::KnownState { spec: spec(), regions })?;
     let mut answers = Vec::new();
@@ -275,7 +274,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let mut requester = snapshot(cached.clone()).await?;
     let mut regions = Vec::new();
     for head in frontier {
-        regions.push(proto::KnownRegion::Summary(requester.head(head.bounds).await?));
+        regions.push(proto::KnownRegion::Digest(requester.head(head.bounds).await?));
     }
     let known = proto::KnownState { spec: spec(), regions };
     let mut comparison = Comparison::new(responder, known)?;
@@ -290,10 +289,10 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
         let mut answers = Vec::new();
         for item in items {
             match item {
-                StateItem::Summary(head) => {
+                StateItem::Digest(head) => {
                     assert_ne!(head.bounds, bounds, "the requester already supplied this exact digest");
                     narrower_questions += 1;
-                    answers.push(StateAnswer::Summary(requester.head(head.bounds).await?));
+                    answers.push(StateAnswer::Digest(requester.head(head.bounds).await?));
                 }
                 StateItem::NeedLeaves(bounds) => {
                     leaf_pages += 1;
@@ -341,7 +340,7 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
             })
             .sum::<usize>();
         assert_eq!(transferred, repairs);
-        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedLeaves(_) | StateItem::Summary(_))));
+        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedLeaves(_) | StateItem::Digest(_))));
     }
     Ok(())
 }
@@ -697,8 +696,7 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
     let (node, peer, messages) = node().await?;
     let source = states(128, 8);
     let mut requester = snapshot(source[..1].to_vec()).await?;
-    let known =
-        proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Summary(requester.head(super::super::whole()).await?)] };
+    let known = proto::KnownState { spec: spec(), regions: vec![proto::KnownRegion::Digest(requester.head(super::super::whole()).await?)] };
     let initial = start_comparison(
         &node,
         peer,
@@ -1360,7 +1358,7 @@ async fn initial_items(node: &TestNode, comparison: &mut Comparison) -> anyhow::
         let StateFrameBody::State { items, .. } = comparison.reply(node, &vec![], false, false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         assert!(bincode::serialized_size(&items)? <= PAGE_BYTES as u64);
-        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedLeaves(_) | StateItem::Summary(_))));
+        assert!(!items.iter().any(|item| matches!(item, StateItem::NeedLeaves(_) | StateItem::Digest(_))));
         all.extend(items);
     }
     anyhow::bail!("initial inventory did not complete")
@@ -1596,7 +1594,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     page.bounds.end = std::ops::Bound::Excluded(last.payload.entity_id.to_bytes().to_vec());
     oversized.regions.push(proto::KnownRegion::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
-        leaves: vec![proto::KnownLeaf {
+        leaves: vec![proto::KeyedEntityHead {
             key: vec![],
             entity: proto::EntityHead { entity_id: last.payload.entity_id, head: last.payload.state.head },
         }],

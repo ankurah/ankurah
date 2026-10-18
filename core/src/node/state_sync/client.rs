@@ -274,7 +274,7 @@ fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow
         .map(|state| {
             let entity_id = state.payload.entity_id;
             ensure!(ids.insert(entity_id), "duplicate entity in snapshot page");
-            Ok(proto::KnownLeaf {
+            Ok(proto::KeyedEntityHead {
                 key: super::tree::key(spec, state)?,
                 entity: proto::EntityHead { entity_id, head: state.payload.state.head.clone() },
             })

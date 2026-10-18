@@ -370,7 +370,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
             regions: vec![proto::KnownRegion::Heads(proto::TreeSpanInventory {
                 bounds: serde_json::from_value(serde_json::json!({ "start": { "Included": [] }, "end": "Unbounded" }))?,
-                leaves: vec![proto::KnownLeaf { key: vec![], entity: proto::EntityHead { entity_id, head: known_head.clone() } }],
+                leaves: vec![proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id, head: known_head.clone() } }],
             })],
         };
         let requests = [
