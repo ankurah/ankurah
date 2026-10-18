@@ -1,0 +1,99 @@
+Flat prefix inventory results — 2026-10-17
+
+Recommendation: retain the flat layout and investigate owned-buffer/borrowed
+consumption first. Prefix coding is useful for repeated keys, but it is a
+separate bandwidth optimization. It does not remove allocations if decoding
+still materializes every owned key and Clock. A recursive representation is not
+needed to obtain these savings. No production compression or ownership change
+has been made; the only production change here is KnownState.regions -> spans.
+
+Measured source: d5e775f5b34df5b9688eca78819ebc4fb19d920a
+Compiler: rustc 1.101.0-nightly (4ebd25825 2026-10-15)
+Platform: native macOS 26.7.1, aarch64; shared developer machine.
+Three independent runs, 20 deterministic fixtures, nine modes, nine samples
+per mode per run. Release optimization, LTO, one codegen unit.
+All 4,860 timing samples and allocation results are in results.json.
+Median below = median of three run medians; see raw values for variation.
+
+Wire bytes (one SpanContent envelope, excluding TreeSpec/request framing)
+
+Fixture                           Current    Prefix    Saved
+id_2048_tips1                     137,235   139,283   -1.49%
+numeric_2048_tips1                155,667   141,347    9.20%
+random_2048_tips1                 192,717   190,884    0.95%
+shared_2048_tips1                 225,299   145,693   35.33%
+clusters_2048_tips1               215,059   148,342   31.02%
+wide_32_tips1                     133,649     6,460   95.17%
+shared_8_tips256                   72,313    72,041    0.38%
+
+The single shared-key head grows 127 -> 128 bytes; empty inventories stay at
+17 bytes. ID-only keys contain no property bytes to compress. Random keys
+benefit only slightly from encoding/order prefixes. Clock-heavy inventories
+also save little because this codec does not compress IDs or clocks.
+
+Decode + consume + drop (microseconds, lower is better)
+
+Packed controls below include allocating/copying the wire buffer, validating
+the whole codec payload, then visiting it again to hash every key, ID and tip.
+Validation here is codec/clock validation, not KeySpec/order/membership checks.
+
+Fixture                          Owned now  Plain packed  Prefix packed
+id_2048_tips1                       314.30         44.88          46.66
+numeric_2048_tips1                  355.42         54.19          56.20
+random_2048_tips1                   382.88         62.62          70.44
+shared_2048_tips1                   395.81         67.82          73.08
+clusters_2048_tips1                 390.99         65.48          71.00
+wide_32_tips1                        80.12         25.46          23.06
+shared_8_tips256                    137.89         20.93          20.89
+
+Representative 2,048-head shared-key inventory: allocations and incremental
+peak live requested heap bytes. The existing input buffer is excluded from all
+modes; packed modes include an additional retained-buffer copy. Not RSS.
+
+Mode                          Alloc/realloc calls   Peak bytes  Total requested
+Production owned                            4,097      325,632          325,632
+Plain packed, two passes                        1      225,299          225,299
+Prefix packed, two passes                       3      145,736          145,779
+Prefix, owned output                        4,097      325,632          325,632
+
+What this establishes
+
+- Most CPU/allocation improvement comes from consuming packed bytes through
+  views, including the unchanged wire format. Those gains must not be credited
+  to prefix compression. Clocks in timed fixtures are canonical; noncanonical
+  clocks require a tested allocating normalization fallback.
+- With shared keys, compression adds about 5 us to the conservative packed
+  decoder while saving about 80 KB per inventory. For random keys it adds
+  about 8 us for less than 2 KB saved. A universal compression threshold is
+  not established; encoder cost and real consuming paths remain unmeasured.
+- Prefix coding alone leaves owned allocation counts unchanged. Same-parser
+  owned controls for shared keys are about 398 us plain / 401 us prefix.
+  The wide-key owned result (80 us production / 30 us prefix) is mostly parser
+  behavior: the same-parser plain control already takes about 31 us.
+- Retaining one byte buffer avoids per-head boxes. Traversing compressed keys
+  still needs one reusable full-key scratch buffer (43 bytes in the shared
+  example); two passes allocate it twice sequentially. Views of that scratch
+  cannot be retained after advancing, and arbitrary row access needs replay
+  or additional checkpoints. This is sequential storage, not a linked heap.
+- Small/ID-only inputs need a plain fallback. Encoding selection could be
+  per inventory, without splitting an inventory into artificial wire pages.
+
+Validation and limits
+
+Exact bytes/fields and clock normalization are checked before all three runs.
+The plain prototype encoder equals production bytes on all fixtures. Both
+decoders reject repaired-envelope truncations, trailing data, unsupported
+versions, invalid prefixes, invalid clock generations, excess row counts and
+excess expanded-key work; all bound forms and duplicate clock normalization
+are covered. This is not comprehensive adversarial fuzzing or hardening.
+
+The spans rename passed proto43, core462 (one existing ignored), integration39
+and JWT-auth test-target checking. Benchmark Clippy has no source warnings;
+existing workspace manifest warnings remain. Earlier prototype compile/parser
+check failures were corrected before measurement and preserved in private
+build logs; none of those failed builds supplies a timing result.
+
+There is no browser/network/query-readiness claim. Reading through views must
+be integrated with actual comparison ownership and validation before making
+an end-to-end performance claim. No protocol or API adoption is implied.
+README.txt documents reproduction and modes; results.json preserves samples.

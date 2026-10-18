@@ -5,6 +5,8 @@ implementations. Run from the workspace root:
 
   cargo bench -p ankurah-proto --bench prefix_inventory > results.json
 
+RESULTS.txt records the measured comparison; results.json preserves all samples.
+
 PREFIX_CHECK_ONLY=1 runs its correctness checks without timings.
 PREFIX_SAMPLES (default 9) and PREFIX_BATCH_MS (default 10) tune sampling.
 
