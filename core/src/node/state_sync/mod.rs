@@ -14,8 +14,8 @@ pub(crate) use server::expire_comparison;
 #[cfg(test)]
 pub(crate) use server::pump_comparison;
 pub(crate) use server::{
-    close_state, comparison_bypasses_policy, continue_state, kick_comparison, queue_live, schedule_round, source_unavailable,
-    start_comparison, Comparisons,
+    abandon_state_stream, comparison_bypasses_policy, continue_state, finish_state_round, kick_comparison, queue_live, schedule_round,
+    source_unavailable, start_comparison, Comparisons,
 };
 pub(crate) use tree::{QueryTree, Snapshot};
 

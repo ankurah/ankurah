@@ -49,7 +49,8 @@ pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) 
         }
         NodeRequestBody::ContinueState { .. }
         | NodeRequestBody::RefreshState { .. }
-        | NodeRequestBody::CloseComparison { .. }
+        | NodeRequestBody::FinishStateRound { .. }
+        | NodeRequestBody::AbandonStateStream { .. }
         | NodeRequestBody::Get { .. }
         | NodeRequestBody::GetEvents { .. }
         | NodeRequestBody::CommitTransaction { .. }

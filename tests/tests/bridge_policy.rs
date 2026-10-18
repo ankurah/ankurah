@@ -444,13 +444,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                     }
                     assert!(found, "catalog row must be readable through the numbered state stream");
                     assert!(matches!(
-                        client
-                            .request(
-                                server.id,
-                                &credentials,
-                                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned }
-                            )
-                            .await?,
+                        client.request(server.id, &credentials, proto::NodeRequestBody::AbandonStateStream { stream: comparison }).await?,
                         proto::NodeResponseBody::Success
                     ));
                 }

@@ -314,7 +314,7 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_preparing_i
     assert!(Arc::ptr_eq(&original_tree, &retained));
     assert!(!messages.lock().unwrap().iter().any(|message| matches!(message,
         proto::NodeMessage::Request { request: proto::NodeRequest {
-            body: proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Abandoned }, ..
+            body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
         }, .. } if *found == comparison
     )));
     release.send(()).unwrap();
@@ -382,7 +382,7 @@ async fn a_current_live_stream_failure_still_abandons_its_responder_query() -> a
         messages.lock().unwrap().iter().any(|message| {
             matches!(message,
                 proto::NodeMessage::Request { request: proto::NodeRequest {
-                    body: proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Abandoned }, ..
+                    body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
                 }, .. } if *found == comparison
             )
         })
@@ -508,7 +508,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     assert!(Arc::ptr_eq(&original_tree, &retained));
     assert!(!messages.lock().unwrap().iter().any(|message| matches!(message,
         proto::NodeMessage::Request { request: proto::NodeRequest {
-            body: proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Abandoned }, ..
+            body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
         }, .. } if *found == comparison
     )));
     gate.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -544,7 +544,7 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
     assert!(receive_state(&client, server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream).await.is_err());
     assert!(messages.lock().unwrap().iter().any(|message| matches!(message,
         proto::NodeMessage::Request { request: proto::NodeRequest {
-            body: proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Abandoned }, ..
+            body: proto::NodeRequestBody::AbandonStateStream { stream: found }, ..
         }, .. } if *found == comparison
     )));
     assert!(server.peer_connections.get(&client.id).unwrap().subscription_handler.query_tree_for_test(query_id).await.is_none());

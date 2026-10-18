@@ -110,11 +110,13 @@ impl Meter {
                         self.model.is_some_and(|model| selection.predicate.referenced_models().contains(&model))
                     }
                     proto::NodeRequestBody::ContinueState { comparison, .. }
-                    | proto::NodeRequestBody::CloseComparison { comparison, .. } => self.comparisons.contains(comparison),
+                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
+                    | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => self.comparisons.contains(comparison),
                     _ => false,
                 };
                 if include {
-                    if let proto::NodeRequestBody::CloseComparison { outcome: proto::ComparisonOutcome::Applied { .. }, .. } = &request.body
+                    if let proto::NodeRequestBody::FinishStateRound { outcome: proto::StateRoundOutcome::Applied { .. }, .. } =
+                        &request.body
                     {
                         self.traffic.completed += 1;
                     }

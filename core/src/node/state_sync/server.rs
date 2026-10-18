@@ -117,7 +117,7 @@ struct Stream {
     round: proto::StateRound,
     pending_round: Option<PendingRound>,
     last_refresh: Option<(u64, Vec<u8>)>,
-    retired_round: Option<proto::ComparisonOutcome>,
+    retired_round: Option<(u64, proto::StateRoundOutcome)>,
     retained: VecDeque<Retained>,
     bytes: usize,
     last_sent: u64,
@@ -543,7 +543,8 @@ where
 {
     let id = match body {
         proto::NodeRequestBody::ContinueState { comparison, .. }
-        | proto::NodeRequestBody::CloseComparison { comparison, .. }
+        | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
+        | proto::NodeRequestBody::AbandonStateStream { stream: comparison }
         | proto::NodeRequestBody::RefreshState { comparison, .. } => comparison,
         _ => return crate::schema::request_bypasses_policy(body),
     };
@@ -745,11 +746,12 @@ where
     Ok(proto::NodeResponseBody::Success)
 }
 
-pub(crate) async fn close_state<SE, PA>(
+pub(crate) async fn finish_state_round<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     id: StateStreamId,
-    outcome: proto::ComparisonOutcome,
+    round: u64,
+    outcome: proto::StateRoundOutcome,
     credentials: Vec<PA::ContextData>,
 ) -> anyhow::Result<proto::NodeResponseBody>
 where
@@ -766,55 +768,61 @@ where
     };
     ensure!(session.permits(&credentials), "comparison credentials changed");
     let mut state = session.state.lock().await;
+    if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) || state.failed {
+        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+    }
+    if state.retired_round == Some((round, outcome)) {
+        return Ok(proto::NodeResponseBody::Success);
+    }
+    ensure!(round == state.round.number, "FinishStateRound names a retired or future round");
+    let comparison = state.comparison.as_ref().ok_or_else(|| anyhow::anyhow!("round is already retired"))?;
+    if let proto::StateRoundOutcome::Applied { processed_through } = outcome {
+        ensure!(
+            comparison.complete && comparison.summaries.is_empty() && comparison.head_requests.is_empty(),
+            "comparison enumeration is not complete"
+        );
+        ensure!(processed_through >= state.required_through, "Applied does not cover the completed enumeration");
+        state.acknowledge(processed_through)?;
+    }
+    session.initial.lock().unwrap().take();
+    state.comparison = None;
+    state.retired_round = Some((round, outcome));
+    if session.query.is_none() {
+        connection.comparisons.finish(id);
+    }
+    drop(state);
+    kick_comparison(node, peer, id);
+    Ok(proto::NodeResponseBody::Success)
+}
+
+pub(crate) async fn abandon_state_stream<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: StateStreamId,
+    credentials: Vec<PA::ContextData>,
+) -> anyhow::Result<proto::NodeResponseBody>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let Some(session) = connection.comparisons.get(&id) else {
+        return Ok(if connection.comparisons.was_closed(&id) {
+            proto::NodeResponseBody::Success
+        } else {
+            proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
+        });
+    };
+    ensure!(session.permits(&credentials), "comparison credentials changed");
+    let state = session.state.lock().await;
     if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
     }
-    if state.failed && outcome != proto::ComparisonOutcome::Abandoned {
-        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
-    }
-    match outcome {
-        proto::ComparisonOutcome::Applied { round, processed_through } => {
-            if state.retired_round == Some(outcome) {
-                return Ok(proto::NodeResponseBody::Success);
-            }
-            ensure!(round == state.round.number, "Applied names a retired or future round");
-            let comparison = state.comparison.as_ref().ok_or_else(|| anyhow::anyhow!("round is already retired"))?;
-            ensure!(
-                comparison.complete && comparison.summaries.is_empty() && comparison.head_requests.is_empty(),
-                "comparison enumeration is not complete"
-            );
-            ensure!(processed_through >= state.required_through, "Applied does not cover the completed enumeration");
-            state.acknowledge(processed_through)?;
-            session.initial.lock().unwrap().take();
-            state.comparison = None;
-            state.retired_round = Some(outcome);
-            if session.query.is_none() {
-                connection.comparisons.finish(id);
-            }
-        }
-        proto::ComparisonOutcome::Cancelled { round } => {
-            if state.retired_round == Some(outcome) {
-                return Ok(proto::NodeResponseBody::Success);
-            }
-            ensure!(round == state.round.number && state.comparison.is_some(), "Cancelled names an inactive round");
-            state.comparison = None;
-            state.retired_round = Some(outcome);
-            session.initial.lock().unwrap().take();
-            if session.query.is_none() {
-                connection.comparisons.finish(id);
-            }
-        }
-        proto::ComparisonOutcome::Abandoned => {
-            connection.comparisons.finish(id);
-        }
-    }
+    // Failed streams must remain abandonable, without asserting round coverage.
+    connection.comparisons.finish(id);
     drop(state);
-    if outcome == proto::ComparisonOutcome::Abandoned {
-        if let Some((query, version)) = session.query {
-            connection.subscription_handler.abandon_comparison(query, version, id).await;
-        }
-    } else {
-        kick_comparison(node, peer, id);
+    if let Some((query, version)) = session.query {
+        connection.subscription_handler.abandon_comparison(query, version, id).await;
     }
     Ok(proto::NodeResponseBody::Success)
 }

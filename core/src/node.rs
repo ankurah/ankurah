@@ -624,8 +624,11 @@ where
                 peer.subscription_handler.refresh_query(self, comparison, round, known_state, &credentials).await?;
                 Ok(proto::NodeResponseBody::Success)
             }
-            proto::NodeRequestBody::CloseComparison { comparison, outcome } => {
-                state_sync::close_state(self, request.from, comparison, outcome, credentials).await
+            proto::NodeRequestBody::FinishStateRound { stream, round, outcome } => {
+                state_sync::finish_state_round(self, request.from, stream, round, outcome, credentials).await
+            }
+            proto::NodeRequestBody::AbandonStateStream { stream } => {
+                state_sync::abandon_state_stream(self, request.from, stream, credentials).await
             }
         }
     }

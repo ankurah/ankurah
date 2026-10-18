@@ -82,12 +82,12 @@ impl Captured {
             proto::NodeMessage::Request { request, .. } => {
                 let comparison = match request.body {
                     proto::NodeRequestBody::ContinueState { comparison, .. }
-                    | proto::NodeRequestBody::CloseComparison { comparison, .. } => Some(comparison),
+                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
+                    | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => Some(comparison),
                     _ => None,
                 };
                 if let Some(stream) = comparison.and_then(|id| streams.get_mut(&id)).filter(|stream| stream.scripted) {
-                    if matches!(request.body, proto::NodeRequestBody::CloseComparison { outcome: proto::ComparisonOutcome::Abandoned, .. })
-                    {
+                    if matches!(request.body, proto::NodeRequestBody::AbandonStateStream { .. }) {
                         stream.abandoned = true;
                     }
                     // This scenario has become a malicious source. Its control
@@ -238,7 +238,8 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
             format!("continue {}", payload_digest(&(round, processed_through, applied_through, answers)))
         }
         proto::NodeRequestBody::RefreshState { round, known_state, .. } => format!("refresh {}", payload_digest(&(round, known_state))),
-        proto::NodeRequestBody::CloseComparison { outcome, .. } => format!("close {outcome:?}"),
+        proto::NodeRequestBody::FinishStateRound { round, outcome, .. } => format!("finish round {round} {outcome:?}"),
+        proto::NodeRequestBody::AbandonStateStream { .. } => "abandon stream".into(),
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
         }

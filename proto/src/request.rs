@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, ComparisonOutcome,
-    EntityState, EventId, KnownState, RegisterModel, RegisteredModel, StateAnswer, StateReply, StateStreamId,
+    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventId,
+    KnownState, RegisterModel, RegisteredModel, StateAnswer, StateReply, StateRoundOutcome, StateStreamId,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -150,12 +150,18 @@ pub enum NodeRequestBody {
         round: u64,
         known_state: KnownState,
     },
-    /// Applied/Cancelled release only the named round; Abandoned cancels the
-    /// entire bound stream/query generation. Repeated acknowledgments are safe.
+    /// Release only the named round, preserving a subscription's live delivery.
+    /// Fetch retires its stream when its sole round finishes. Repeats are safe.
     /// The response is Success; readiness does not wait for the Applied reply.
-    CloseComparison {
-        comparison: StateStreamId,
-        outcome: ComparisonOutcome,
+    FinishStateRound {
+        stream: StateStreamId,
+        round: u64,
+        outcome: StateRoundOutcome,
+    },
+    /// Cancel this exact stream/query generation, including its active round
+    /// and live delivery. Never remove a replacement stream. Repeats are safe.
+    AbandonStateStream {
+        stream: StateStreamId,
     },
 }
 
@@ -278,7 +284,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::RefreshState { comparison, round, known_state } => {
                 write!(f, "RefreshState {comparison} round:{round} spans:{}", known_state.spans.len())
             }
-            NodeRequestBody::CloseComparison { comparison, outcome } => write!(f, "CloseComparison {comparison} {outcome:?}"),
+            NodeRequestBody::FinishStateRound { stream, round, outcome } => write!(f, "FinishStateRound {stream}/{round} {outcome:?}"),
+            NodeRequestBody::AbandonStateStream { stream } => write!(f, "AbandonStateStream {stream}"),
         }
     }
 }

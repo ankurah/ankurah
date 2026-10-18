@@ -1170,7 +1170,7 @@ impl Driver {
         let comparison = self.comparison;
         self.controls.push(Box::pin(async move {
             if let Some(node) = node.upgrade() {
-                close_comparison(&node, peer, comparison, &credentials, proto::ComparisonOutcome::Cancelled { round: number }).await?;
+                finish_state_round(&node, peer, comparison, number, &credentials, proto::StateRoundOutcome::Cancelled).await?;
             }
             Ok(())
         }));
@@ -1187,10 +1187,11 @@ impl Driver {
         let node = node.weak();
         let credentials = credentials.to_vec();
         let comparison = self.comparison;
-        let outcome = proto::ComparisonOutcome::Applied { round: self.round_number, processed_through: self.through };
+        let round = self.round_number;
+        let outcome = proto::StateRoundOutcome::Applied { processed_through: self.through };
         self.controls.push(Box::pin(async move {
             if let Some(node) = node.upgrade() {
-                close_comparison(&node, peer, comparison, &credentials, outcome).await?;
+                finish_state_round(&node, peer, comparison, round, &credentials, outcome).await?;
             }
             Ok(())
         }));

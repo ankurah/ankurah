@@ -61,7 +61,7 @@ where
                     return;
                 }
                 connection.outgoing_comparisons.insert(comparison, catalog);
-                let _ = close_comparison(&node, peer, comparison, &credentials, proto::ComparisonOutcome::Abandoned).await;
+                let _ = abandon_state_stream(&node, peer, comparison, &credentials).await;
             }
         });
     });
@@ -208,29 +208,46 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     if owns_state_stream(node, peer, stream) {
-        close_comparison(node, peer, comparison, credentials, proto::ComparisonOutcome::Abandoned).await?;
+        abandon_state_stream(node, peer, comparison, credentials).await?;
         stream.remote_closed();
     }
     Ok(())
 }
 
-pub(crate) async fn close_comparison<SE, PA>(
+async fn finish_state_round<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
-    comparison: proto::StateStreamId,
+    stream: proto::StateStreamId,
+    round: u64,
     credentials: &Vec<PA::ContextData>,
-    outcome: proto::ComparisonOutcome,
+    outcome: proto::StateRoundOutcome,
 ) -> Result<(), RetrievalError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let result = state_deadline(node.request(peer, credentials, proto::NodeRequestBody::CloseComparison { comparison, outcome })).await;
     // Live feedback still needs the catalog bypass after snapshot release.
-    if matches!(outcome, proto::ComparisonOutcome::Abandoned) {
-        if let Some(connection) = node.peer_connections.get(&peer) {
-            connection.outgoing_comparisons.remove(&comparison);
-        }
+    match state_deadline(node.request(peer, credentials, proto::NodeRequestBody::FinishStateRound { stream, round, outcome })).await?? {
+        proto::NodeResponseBody::Success => Ok(()),
+        proto::NodeResponseBody::ComparisonUnavailable { .. } => Err(RequestError::ConnectionLost.into()),
+        proto::NodeResponseBody::Error(error) => Err(RequestError::ServerError(error).into()),
+        other => Err(RequestError::UnexpectedResponse(other).into()),
+    }
+}
+
+async fn abandon_state_stream<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    stream: proto::StateStreamId,
+    credentials: &Vec<PA::ContextData>,
+) -> Result<(), RetrievalError>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let result = state_deadline(node.request(peer, credentials, proto::NodeRequestBody::AbandonStateStream { stream })).await;
+    if let Some(connection) = node.peer_connections.get(&peer) {
+        connection.outgoing_comparisons.remove(&stream);
     }
     match result?? {
         proto::NodeResponseBody::Success => Ok(()),

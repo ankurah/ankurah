@@ -67,7 +67,9 @@ impl PolicyAgent for CredentialAgent {
             proto::NodeRequestBody::GetEvents { event_ids } => {
                 self.event_requests.lock().unwrap().push((event_ids.clone(), credentials.clone()));
             }
-            proto::NodeRequestBody::ContinueState { .. } | proto::NodeRequestBody::CloseComparison { .. } => {
+            proto::NodeRequestBody::ContinueState { .. }
+            | proto::NodeRequestBody::FinishStateRound { .. }
+            | proto::NodeRequestBody::AbandonStateStream { .. } => {
                 let request = bincode::deserialize(&bincode::serialize(request).unwrap()).unwrap();
                 self.feedback.lock().unwrap().push((credentials.clone(), request));
                 self.feedback_arrived.notify_one();
@@ -354,7 +356,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
         loop {
             let notified = agent.feedback_arrived.notified();
             if agent.feedback.lock().unwrap().iter().any(|(_, request)| matches!(request.body,
-                proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Applied { .. } } if found == comparison)) {
+                proto::NodeRequestBody::FinishStateRound { stream: found, outcome: proto::StateRoundOutcome::Applied { .. }, .. } if found == comparison)) {
                 break;
             }
             notified.await;
@@ -367,9 +369,16 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
             matches!(answer, proto::StateAnswer::NeedRepair { entity_id, target } if *entity_id == id && *target == captured_target)))),
         "the uncovered initial snapshot must actually request connecting history"
     );
-    for (credentials, request) in feedback.iter().filter(|(_, request)| matches!(request.body,
-        proto::NodeRequestBody::ContinueState { comparison: found, .. } | proto::NodeRequestBody::CloseComparison { comparison: found, .. } if found == comparison)) {
-        assert_eq!(*credentials, [Credential(1)], "initial repair and Applied must retain alpha authority despite the beta standing query: {request:?}");
+    for (credentials, request) in feedback.iter().filter(|(_, request)| {
+        matches!(request.body,
+        proto::NodeRequestBody::ContinueState { comparison: found, .. } | proto::NodeRequestBody::FinishStateRound { stream: found, .. }
+                    | proto::NodeRequestBody::AbandonStateStream { stream: found } if found == comparison)
+    }) {
+        assert_eq!(
+            *credentials,
+            [Credential(1)],
+            "initial repair and Applied must retain alpha authority despite the beta standing query: {request:?}"
+        );
     }
     assert!(agent.subscriptions.lock().unwrap().iter().any(|(credential, query, _)| credential.0 == 2 && *query == broader.query_id()));
     Ok(())
@@ -442,11 +451,9 @@ async fn cancelled_fetch_abandons_with_its_credential_and_preserves_another_quer
     let close_request = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
             let notified = agent.feedback_arrived.notified();
-            if let Some((credentials, request)) = agent.feedback.lock().unwrap().iter().find(|(_, request)| {
-                matches!(request.body, proto::NodeRequestBody::CloseComparison {
-                    comparison: found, outcome: proto::ComparisonOutcome::Abandoned
-                } if found == comparison)
-            }) {
+            if let Some((credentials, request)) = agent.feedback.lock().unwrap().iter().find(
+                |(_, request)| matches!(request.body, proto::NodeRequestBody::AbandonStateStream { stream: found } if found == comparison),
+            ) {
                 assert_eq!(*credentials, [Credential(1)], "abandonment must retain the Fetch credential, not the peer credential union");
                 break request.id.clone();
             }
@@ -492,7 +499,7 @@ async fn cancelled_fetch_abandons_with_its_credential_and_preserves_another_quer
             .unwrap()
             .iter()
             .filter(|(_, request)| matches!(request.body,
-            proto::NodeRequestBody::CloseComparison { comparison: found, outcome: proto::ComparisonOutcome::Abandoned }
+            proto::NodeRequestBody::AbandonStateStream { stream: found }
             if found == comparison))
             .count(),
         1,
@@ -525,7 +532,7 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
                         arrived.notify_one();
                         return true;
                     }
-                    proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned } => {
+                    proto::NodeRequestBody::AbandonStateStream { stream: comparison } => {
                         *abandonment.lock().unwrap() = Some((auth.clone(), comparison));
                         arrived.notify_one();
                     }

@@ -215,7 +215,7 @@ pub struct SnapshotPage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ComparisonOutcome {
+pub enum StateRoundOutcome {
     /// After Complete, the round's offered targets are covered and local result
     /// installation succeeded, including live publications through its captured
     /// revision. Later live publications do not hold completion open.
@@ -225,11 +225,8 @@ pub enum ComparisonOutcome {
     /// a target whose requested history is still in flight; that work can retire.
     /// Later frames still receive credit but cannot change a retired round.
     /// The requester need not await the reply before reporting readiness.
-    Applied { round: u64, processed_through: u64 },
+    Applied { processed_through: u64 },
     /// Discard only this round, preserving the standing stream and its live
     /// publications. It may be followed by a new frozen offer and round.
-    Cancelled { round: u64 },
-    /// Cancel this exact stream/query generation, including after Complete.
-    /// Never remove a replacement query generation.
-    Abandoned,
+    Cancelled,
 }

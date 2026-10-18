@@ -161,7 +161,8 @@ impl Scheduler {
                     }
                     proto::NodeRequestBody::SubscribeQuery { .. } => true,
                     proto::NodeRequestBody::ContinueState { comparison, .. }
-                    | proto::NodeRequestBody::CloseComparison { comparison, .. } => self.catalog_comparisons.contains(comparison),
+                    | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
+                    | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => self.catalog_comparisons.contains(comparison),
                     _ => return false,
                 };
                 if !protected {

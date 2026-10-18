@@ -462,7 +462,7 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
         connection.comparisons.replay_initial(&origin, &[11], &[])?,
         Some(proto::NodeResponseBody::ComparisonUnavailable { .. })
     ));
-    close_state(&node, peer, initial.frame.comparison, proto::ComparisonOutcome::Abandoned, vec![]).await?;
+    abandon_state_stream(&node, peer, initial.frame.comparison, vec![]).await?;
     assert!(matches!(
         connection.comparisons.replay_initial(&origin, &[11], &[])?,
         Some(proto::NodeResponseBody::ComparisonUnavailable { .. })
@@ -481,7 +481,7 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
     continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
     assert!(continue_state(&node, peer, request, id, None, 1, None, vec![], vec![]).await.is_err());
     assert!(continue_state(&node, peer, proto::RequestId::new(), id, None, 1, None, vec![], vec![]).await.is_err());
-    close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, vec![]).await?;
+    finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     assert!(matches!(
         continue_state(&node, peer, proto::RequestId::new(), id, None, 0, None, vec![], vec![]).await?,
         proto::NodeResponseBody::Success
@@ -569,7 +569,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
         let request = if index == 0 { first.clone() } else { proto::RequestId::new() };
         let initial = start_comparison(&node, peer, request, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
         first_id.get_or_insert(initial.frame.comparison);
-        close_state(&node, peer, initial.frame.comparison, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, vec![])
+        finish_state_round(&node, peer, initial.frame.comparison, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![])
             .await?;
     }
     let connection = node.peer_connections.get(&peer).unwrap();
@@ -640,7 +640,7 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
         assert!(state.comparison.is_some(), "live output must not retire the pending round");
         assert!(state.bytes > 0, "live frames consume the retained window");
     }
-    close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, vec![]).await?;
+    finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     assert!(session.state.lock().await.comparison.is_none());
     assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_some());
     Ok(())
@@ -673,7 +673,7 @@ async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyho
         assert!(matches!(body, StateFrameBody::LiveChunk { complete: false, .. }));
         state.retain(StateFrame { comparison: id, sequence: 1, body }, false)?;
     }
-    close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, vec![]).await?;
+    finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     let mut next = snapshot(vec![]).await?;
     let offer = next.offer().await?;
     schedule_round(&node, peer, id, 1, 1, next, offer).await?;
@@ -794,6 +794,71 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
 }
 
 #[tokio::test]
+async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -> anyhow::Result<()> {
+    for query in [None, Some((proto::QueryId::new(), 1))] {
+        let (node, peer, messages) = node().await?;
+        let source = states(2, 8);
+        let mut requester = snapshot(source[..1].to_vec()).await?;
+        let known =
+            proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Digest(requester.head(super::super::whole()).await?)] };
+        let initial = start_comparison(
+            &node,
+            peer,
+            proto::RequestId::new(),
+            vec![],
+            vec![crate::policy::DEFAULT_CONTEXT],
+            query,
+            false,
+            0,
+            snapshot(source).await?,
+            known,
+        )
+        .await?;
+        let id = initial.frame.comparison;
+        assert!(state_items(&initial.frame).0.iter().any(|item| matches!(item, StateItem::NeedHeads(_))));
+        let connection = node.peer_connections.get(&peer).unwrap();
+        let session = connection.comparisons.get(&id).unwrap();
+        session.pumping.store(true, Ordering::Release);
+        let cancelled = proto::StateRoundOutcome::Cancelled;
+        let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+        assert!(finish_state_round(&node, peer, id, 0, cancelled, vec![]).await.is_err());
+        assert!(abandon_state_stream(&node, peer, id, vec![]).await.is_err());
+        assert!(finish_state_round(&node, peer, id, 1, cancelled, credentials.clone()).await.is_err());
+        finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
+        finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
+        assert!(session.state.lock().await.comparison.is_none(), "cancellation releases the unfinished comparison");
+        if query.is_none() {
+            assert!(connection.comparisons.get(&id).is_none(), "Fetch has no ongoing stream after cancellation");
+            continue;
+        }
+        assert!(connection.comparisons.get(&id).is_some());
+        queue_live(&node, peer, id, 1, vec![live_item(1)])?;
+        pump_comparison(&node, peer, id).await?;
+        assert!(
+            messages.lock().unwrap().iter().any(|message| matches!(message,
+                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame {
+                    frame: StateFrame { comparison, body: StateFrameBody::Live { revision: 1, complete: true, .. }, .. }, ..
+                }, .. }) if *comparison == id
+            )),
+            "a cancelled comparison must not stop live delivery"
+        );
+        schedule_round(&node, peer, id, 1, 1, snapshot(states(1, 8)).await?, unknown()).await?;
+        pump_comparison(&node, peer, id).await?;
+        finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
+        {
+            let state = session.state.lock().await;
+            assert_eq!(state.round.number, 1);
+            assert!(state.comparison.is_some(), "a duplicate old cancellation cannot retire the new round");
+        }
+        abandon_state_stream(&node, peer, id, credentials.clone()).await?;
+        abandon_state_stream(&node, peer, id, credentials).await?;
+        assert!(connection.comparisons.get(&id).is_none());
+        assert!(queue_live(&node, peer, id, 2, vec![live_item(1)]).is_err());
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire_the_next_round() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let first = snapshot(states(1, 8)).await?;
@@ -816,8 +881,8 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     assert!(captured.upgrade().is_some());
-    let applied = proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 };
-    close_state(&node, peer, id, applied, vec![]).await?;
+    let applied = proto::StateRoundOutcome::Applied { processed_through: 0 };
+    finish_state_round(&node, peer, id, 0, applied, vec![]).await?;
     assert!(captured.upgrade().is_none(), "round retirement must release captured source rows");
     let next = snapshot(states(1, 8)).await?;
     let next_capture = Arc::downgrade(next.states.values().next().unwrap());
@@ -825,7 +890,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let offer = empty.offer().await?;
     schedule_round(&node, peer, id, 1, 1, next, offer).await?;
     pump_comparison(&node, peer, id).await?;
-    close_state(&node, peer, id, applied, vec![]).await?;
+    finish_state_round(&node, peer, id, 0, applied, vec![]).await?;
     assert!(next_capture.upgrade().is_some(), "repeating an old Applied cannot release the new snapshot");
     let (members, targets) = {
         let state = session.state.lock().await;
@@ -855,9 +920,9 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     );
     let last = session.state.lock().await.required_through;
     assert_eq!(session.state.lock().await.round.number, 1);
-    let applied = proto::ComparisonOutcome::Applied { round: 1, processed_through: last };
-    close_state(&node, peer, id, applied, vec![]).await?;
-    close_state(&node, peer, id, applied, vec![]).await?;
+    let applied = proto::StateRoundOutcome::Applied { processed_through: last };
+    finish_state_round(&node, peer, id, 1, applied, vec![]).await?;
+    finish_state_round(&node, peer, id, 1, applied, vec![]).await?;
     assert!(next_capture.upgrade().is_none());
     assert!(session.state.lock().await.comparison.is_none());
     assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_some(), "the standing stream survives");
@@ -867,7 +932,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         schedule_round(&node, peer, id, round, round, next, empty.offer().await?).await?;
         pump_comparison(&node, peer, id).await?;
         let last = session.state.lock().await.required_through;
-        close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round, processed_through: last }, vec![]).await?;
+        finish_state_round(&node, peer, id, round, proto::StateRoundOutcome::Applied { processed_through: last }, vec![]).await?;
         assert!(captured.upgrade().is_none(), "round {round} retained captured rows");
         let state = session.state.lock().await;
         assert!(state.comparison.is_none() && state.pending_round.is_none());
@@ -912,7 +977,7 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
     }
     let last = session.state.lock().await.last_sent;
     continue_state(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
-    close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: last }, vec![]).await?;
+    finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: last }, vec![]).await?;
     {
         let mut state = session.state.lock().await;
         assert_eq!(state.live_targets.len(), 2);
@@ -1140,7 +1205,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     };
     // A live delivery may have covered the target independently. The receiver
     // proves that coverage; the sender accepts its claim through Complete.
-    close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, vec![]).await?;
+    finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     {
         let state = session.state.lock().await;
         assert!(state.comparison.is_none());
@@ -1268,7 +1333,7 @@ async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_outpu
         })
     )));
     drop(messages);
-    assert!(matches!(close_state(&node, peer, id, proto::ComparisonOutcome::Abandoned, vec![]).await?, proto::NodeResponseBody::Success));
+    assert!(matches!(abandon_state_stream(&node, peer, id, vec![]).await?, proto::NodeResponseBody::Success));
     assert!(node.peer_connections.get(&peer).is_some(), "successful restart control preserves other streams on this connection");
     Ok(())
 }
@@ -1304,7 +1369,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
         assert!(session.permits(&credentials));
         let authenticated = [crate::policy::DEFAULT_CONTEXT];
         assert!(!session.permits(if catalog { &authenticated } else { &[] }));
-        close_state(&node, peer, id, proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }, credentials).await?;
+        finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, credentials).await?;
         assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_none());
         assert_eq!(comparison_bypasses_policy(&node, peer, &receipt(), false), catalog);
 

@@ -598,9 +598,10 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison {
-                    comparison,
-                    outcome: proto::ComparisonOutcome::Applied { round: 0, processed_through: 1 }
+                proto::NodeRequestBody::FinishStateRound {
+                    stream: comparison,
+                    round: 0,
+                    outcome: proto::StateRoundOutcome::Applied { processed_through: 1 }
                 }
             )
             .await?,
@@ -643,13 +644,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
         NodeResponseBody::Error(_)
     ));
     assert!(matches!(
-        client
-            .request(
-                server.id,
-                &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned }
-            )
-            .await?,
+        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::AbandonStateStream { stream: comparison }).await?,
         NodeResponseBody::Success
     ));
     assert!(matches!(
@@ -817,13 +812,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
     })
     .await;
     assert!(matches!(
-        client
-            .request(
-                server.id,
-                &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned }
-            )
-            .await?,
+        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::AbandonStateStream { stream: comparison }).await?,
         NodeResponseBody::Success
     ));
     Ok(())
@@ -1051,22 +1040,17 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison {
-                    comparison,
-                    outcome: proto::ComparisonOutcome::Applied { round: 0, processed_through: 0 }
+                proto::NodeRequestBody::FinishStateRound {
+                    stream: comparison,
+                    round: 0,
+                    outcome: proto::StateRoundOutcome::Applied { processed_through: 0 }
                 }
             )
             .await?,
         NodeResponseBody::ComparisonUnavailable { .. }
     ));
     assert!(matches!(
-        client
-            .request(
-                server.id,
-                &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::CloseComparison { comparison, outcome: proto::ComparisonOutcome::Abandoned }
-            )
-            .await?,
+        client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::AbandonStateStream { stream: comparison }).await?,
         NodeResponseBody::Success
     ));
     let trx = writer.begin();

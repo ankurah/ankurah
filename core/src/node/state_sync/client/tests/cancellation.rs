@@ -17,7 +17,7 @@ fn abandoned(messages: &[proto::NodeMessage], comparison: proto::StateStreamId) 
         .filter(|message| {
             matches!(message,
                 proto::NodeMessage::Request { request: proto::NodeRequest {
-                    body: proto::NodeRequestBody::CloseComparison { comparison: id, outcome: proto::ComparisonOutcome::Abandoned }, ..
+                    body: proto::NodeRequestBody::AbandonStateStream { stream: id }, ..
                 }, .. } if *id == comparison
             )
         })

@@ -56,15 +56,13 @@ impl ScriptedConnection {
                 let response = if let proto::NodeMessage::Request { request, .. } = &message {
                     let comparison = match &request.body {
                         proto::NodeRequestBody::ContinueState { comparison, .. }
-                        | proto::NodeRequestBody::CloseComparison { comparison, .. } => Some(*comparison),
+                        | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
+                        | proto::NodeRequestBody::AbandonStateStream { stream: comparison } => Some(*comparison),
                         _ => None,
                     };
                     let mut routes = routes.lock().unwrap();
                     comparison.and_then(|id| routes.get_mut(&id)).filter(|stream| stream.scripted).map(|stream| {
-                        if matches!(
-                            request.body,
-                            proto::NodeRequestBody::CloseComparison { outcome: proto::ComparisonOutcome::Abandoned, .. }
-                        ) {
+                        if matches!(request.body, proto::NodeRequestBody::AbandonStateStream { .. }) {
                             stream.abandoned = true;
                         }
                         if let proto::NodeRequestBody::ContinueState { applied_through: Some(revision), .. } = request.body {

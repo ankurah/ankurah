@@ -259,18 +259,24 @@ fn repair_and_live_chunks_share_content_without_losing_typed_metadata() {
 #[test]
 fn completion_application_abandonment_and_snapshot_loss_are_distinct() {
     let comparison = StateStreamId::new();
-    for outcome in [
-        ComparisonOutcome::Applied { round: 2, processed_through: 19 },
-        ComparisonOutcome::Cancelled { round: 2 },
-        ComparisonOutcome::Abandoned,
-    ] {
-        let req = request(NodeRequestBody::CloseComparison { comparison, outcome });
-        let NodeRequestBody::CloseComparison { comparison: received, outcome: received_outcome } = wire(&req).body else {
-            panic!("close comparison")
+    for outcome in [StateRoundOutcome::Applied { processed_through: 19 }, StateRoundOutcome::Cancelled] {
+        let req = request(NodeRequestBody::FinishStateRound { stream: comparison, round: 2, outcome });
+        let NodeRequestBody::FinishStateRound { stream, round, outcome: received_outcome } = wire(&req).body else {
+            panic!("finish round")
         };
-        assert_eq!(received, comparison);
+        assert_eq!(stream, comparison);
+        assert_eq!(round, 2);
         assert_eq!(received_outcome, outcome);
     }
+    let abandon = request(NodeRequestBody::AbandonStateStream { stream: comparison });
+    assert!(matches!(wire(&abandon).body, NodeRequestBody::AbandonStateStream { stream } if stream == comparison));
+    let json = serde_json::to_value(&abandon.body).unwrap();
+    assert_eq!(json, serde_json::json!({ "AbandonStateStream": { "stream": comparison } }));
+    // Finishing needs a round; abandoning a stream does not imply Applied.
+    assert!(serde_json::from_value::<NodeRequestBody>(serde_json::json!({ "FinishStateRound": {
+        "stream": comparison, "outcome": "Cancelled"
+    }}))
+    .is_err());
     let expired = NodeResponseBody::ComparisonUnavailable { comparison };
     assert!(matches!(wire(&expired), NodeResponseBody::ComparisonUnavailable { comparison: id } if id == comparison));
     let complete = StateFrame {
@@ -459,13 +465,13 @@ fn late_repair_feedback_and_failure_have_distinct_wire_fixtures() {
     assert_eq!(frame.sequence, 8);
     let StateFrameBody::State { items, .. } = frame.body else { panic!("repair failure") };
     assert!(matches!(&items[0], StateItem::RepairUnavailable { entity_id: id, target: clock } if id == entity_id && clock == target));
-    let applied: NodeRequestBody = serde_json::from_value(serde_json::json!({ "CloseComparison": {
-        "comparison": "00000000000000000000000001", "outcome": { "Applied": { "round": 2, "processed_through": 9 }}
+    let applied: NodeRequestBody = serde_json::from_value(serde_json::json!({ "FinishStateRound": {
+        "stream": "00000000000000000000000001", "round": 2, "outcome": { "Applied": { "processed_through": 9 }}
     }}))
     .unwrap();
     assert!(matches!(
         wire(&applied),
-        NodeRequestBody::CloseComparison { outcome: ComparisonOutcome::Applied { round: 2, processed_through: 9 }, .. }
+        NodeRequestBody::FinishStateRound { round: 2, outcome: StateRoundOutcome::Applied { processed_through: 9 }, .. }
     ));
     assert!(matches!(wire(&NodeResponseBody::Success), NodeResponseBody::Success));
 }
