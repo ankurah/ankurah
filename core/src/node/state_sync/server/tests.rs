@@ -494,7 +494,7 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             Some(0),
             0,
             None,
-            vec![StateAnswer::Leaves(proto::LeafPage { bounds: super::super::whole(), leaves: vec![] })],
+            vec![StateAnswer::Leaves(proto::TreeSpanInventory { bounds: super::super::whole(), leaves: vec![] })],
             vec![]
         )
         .await?,
@@ -1594,7 +1594,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let last = ordered_states(2049, 2).pop().unwrap();
     let proto::KnownRegion::Heads(page) = oversized.regions.last_mut().unwrap() else { unreachable!() };
     page.bounds.end = std::ops::Bound::Excluded(last.payload.entity_id.to_bytes().to_vec());
-    oversized.regions.push(proto::KnownRegion::Heads(proto::LeafPage {
+    oversized.regions.push(proto::KnownRegion::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(last.payload.entity_id.to_bytes().to_vec()), super::super::whole().end),
         leaves: vec![proto::KnownLeaf {
             key: vec![],
@@ -1629,7 +1629,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     assert!(bincode::serialized_size(&StateAnswer::Leaves(page.clone()))? <= PAGE_BYTES as u64);
     let supplied_clock = page.leaves[0].entity.head.clone();
     let address = leaf_address(&page.leaves[0].key, page.leaves[0].entity.entity_id);
-    let removal = StateItem::Leaves(proto::LeafPage {
+    let removal = StateItem::Leaves(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(address.clone()), std::ops::Bound::Included(address)),
         leaves: vec![],
     });

@@ -57,7 +57,7 @@ pub enum KnownRegion {
     /// An initial inventory uses the request budget, independently of follow-up
     /// page limits. Replies need only describe changes; Complete confirms
     /// unchanged members too.
-    Heads(#[serde(with = "compact_initial_page")] LeafPage),
+    Heads(#[serde(with = "compact_initial_page")] TreeSpanInventory),
 }
 
 /// One captured query version. Revisions order publications in this stream,
@@ -165,7 +165,7 @@ pub enum StateItem {
     /// The responder may offer several depths; overlap must not be counted twice.
     Summary(TreeSpanDigest),
     /// The responder's complete leaf inventory within this page's bounds.
-    Leaves(LeafPage),
+    Leaves(TreeSpanInventory),
     /// Enumerate the requester's leaves within these bounds, in bounded pages.
     NeedLeaves(TreeSpan),
     /// Apply through the normal attestation and causal validation path.
@@ -190,7 +190,7 @@ pub enum StateItem {
 pub enum StateAnswer {
     /// The requester's digest over the exact span offered by the responder.
     Summary(TreeSpanDigest),
-    Leaves(LeafPage),
+    Leaves(TreeSpanInventory),
     /// An already offered snapshot did not incorporate target into local state.
     /// Only the exact offered entity/target is admissible, including after Complete.
     /// Answer with bounded connecting events or RepairUnavailable, never the same snapshot.
@@ -200,13 +200,13 @@ pub enum StateAnswer {
     },
 }
 
-/// An exhaustive inventory over exactly `bounds`, including gaps between leaves.
+/// All keyed entity heads within exactly `bounds`, including empty gaps.
 ///
-/// A large requested region is split into disjoint pages in address order. Each
-/// page completely describes its bounds; the remaining bounds stay pending.
-/// This is a wire page, separate from the tree crate's local snapshot cursor.
+/// A large requested span can be split into disjoint inventories in address order.
+/// Each inventory completely describes its bounds; the remaining bounds stay pending.
+/// This is a wire inventory, separate from the tree crate's local scan page and cursor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LeafPage {
+pub struct TreeSpanInventory {
     pub bounds: TreeSpan,
     /// Strictly increasing by canonical key bytes followed by entity ID.
     pub leaves: Vec<KnownLeaf>,
@@ -227,6 +227,8 @@ pub struct SnapshotPage {
 pub struct KnownLeaf {
     /// Canonical property values selected by the TreeSpec's KeySpec. The full
     /// address appends the entity ID; this key is empty for entity-ID-only trees.
+    /// It belongs to this tree: another KeySpec can place the same EntityHead
+    /// under a different key.
     pub key: Vec<u8>,
     /// The actual clock avoids another round trip when constructing an EventBridge.
     pub entity: EntityHead,

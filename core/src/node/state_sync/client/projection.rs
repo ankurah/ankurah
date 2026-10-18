@@ -46,7 +46,7 @@ impl Round {
 
     /// Validation belongs at the wire boundary. Here pages replace only staging
     /// membership, including gaps, and move an identity out of its old address.
-    pub fn replace(&mut self, page: proto::LeafPage) {
+    pub fn replace(&mut self, page: proto::TreeSpanInventory) {
         let removed = self.addresses.range((page.bounds.start, page.bounds.end)).map(|(_, id)| *id).collect::<Vec<_>>();
         for id in removed {
             self.remove(id);

@@ -13,14 +13,17 @@ fn leaf(n: u8) -> proto::KnownLeaf {
 #[test]
 fn authoritative_range_updates_remove_only_the_exact_interval() -> anyhow::Result<()> {
     let mut members: BTreeMap<_, _> = (0..10).map(|n| (address(n), id(n))).collect();
-    let page = proto::LeafPage { bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(7))), leaves: vec![leaf(4), leaf(6)] };
+    let page = proto::TreeSpanInventory {
+        bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(7))),
+        leaves: vec![leaf(4), leaf(6)],
+    };
     replace_members(&mut members, &spec(), page.clone(), super::super::LEAF_PAGE)?;
     replace_members(&mut members, &spec(), page, super::super::LEAF_PAGE)?;
     assert_eq!(members.values().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(4), id(6), id(8), id(9)]);
     replace_members(
         &mut members,
         &spec(),
-        proto::LeafPage { bounds: proto::TreeSpan::new(Included(address(4)), Excluded(address(8))), leaves: vec![] },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(4)), Excluded(address(8))), leaves: vec![] },
         super::super::LEAF_PAGE,
     )?;
     assert_eq!(members.values().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(8), id(9)]);
@@ -31,10 +34,10 @@ fn authoritative_range_updates_remove_only_the_exact_interval() -> anyhow::Resul
 fn malformed_pages_cannot_partly_replace_membership_or_panic() {
     let original: BTreeMap<_, _> = (0..10).map(|n| (address(n), id(n))).collect();
     let cases = [
-        proto::LeafPage { bounds: proto::TreeSpan::new(Excluded(address(4)), Excluded(address(4))), leaves: vec![] },
-        proto::LeafPage { bounds: proto::TreeSpan::new(Included(address(8)), Included(address(2))), leaves: vec![] },
-        proto::LeafPage { bounds: super::super::whole(), leaves: vec![leaf(4), leaf(3)] },
-        proto::LeafPage { bounds: proto::TreeSpan::new(Included(address(4)), Included(address(6))), leaves: vec![leaf(3)] },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Excluded(address(4)), Excluded(address(4))), leaves: vec![] },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(8)), Included(address(2))), leaves: vec![] },
+        proto::TreeSpanInventory { bounds: super::super::whole(), leaves: vec![leaf(4), leaf(3)] },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(4)), Included(address(6))), leaves: vec![leaf(3)] },
     ];
     for page in cases {
         let mut members = original.clone();

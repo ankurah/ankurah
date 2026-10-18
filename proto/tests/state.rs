@@ -30,7 +30,7 @@ fn request(body: NodeRequestBody) -> NodeRequest {
 #[test]
 fn fetch_and_subscribe_carry_the_same_known_state() {
     let summary = head(NodePrefix::root(), TreeSpan::new(Included(vec![]), Excluded(vec![1])), &known(1));
-    let leaves = LeafPage {
+    let leaves = TreeSpanInventory {
         bounds: TreeSpan::new(Included(vec![1]), Excluded(vec![2])),
         leaves: vec![KnownLeaf { key: vec![1], entity: known(2) }],
     };
@@ -66,7 +66,7 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
         selection: selection(),
         known_state: KnownState {
             spec: spec(),
-            regions: vec![KnownRegion::Heads(LeafPage { bounds: TreeSpan::under(&NodePrefix::root()), leaves: vec![] })],
+            regions: vec![KnownRegion::Heads(TreeSpanInventory { bounds: TreeSpan::under(&NodePrefix::root()), leaves: vec![] })],
         },
     });
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&unknown).body else { panic!("unknown inventory") };
@@ -97,7 +97,7 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
         answers: vec![
             StateAnswer::Summary(first.clone()),
             StateAnswer::Summary(second.clone()),
-            StateAnswer::Leaves(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![], entity: known(2) }] }),
+            StateAnswer::Leaves(TreeSpanInventory { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![], entity: known(2) }] }),
         ],
     });
     let NodeRequestBody::ContinueState { comparison: received, round, processed_through, applied_through, answers } = wire(&req).body
@@ -132,7 +132,7 @@ fn initial_replies_continue_with_mixed_work() {
                 round: 0,
                 items: vec![
                     StateItem::Summary(head(NodePrefix::root(), bounds.clone(), &known(2))),
-                    StateItem::Leaves(LeafPage { bounds: TreeSpan::new(Included(vec![3]), Included(vec![9])), leaves: vec![] }),
+                    StateItem::Leaves(TreeSpanInventory { bounds: TreeSpan::new(Included(vec![3]), Included(vec![9])), leaves: vec![] }),
                     StateItem::NeedLeaves(bounds.clone()),
                 ],
                 progress: ComparisonProgress::Continue,
@@ -291,7 +291,10 @@ fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
     let bounds = TreeSpan::under(&NodePrefix::root());
     let offer = KnownState {
         spec: spec(),
-        regions: vec![KnownRegion::Heads(LeafPage { bounds: bounds.clone(), leaves: vec![KnownLeaf { key: vec![7], entity: known(7) }] })],
+        regions: vec![KnownRegion::Heads(TreeSpanInventory {
+            bounds: bounds.clone(),
+            leaves: vec![KnownLeaf { key: vec![7], entity: known(7) }],
+        })],
     };
     let refresh = request(NodeRequestBody::RefreshState { comparison, round: 3, known_state: offer });
     let NodeRequestBody::RefreshState { comparison: received, round, known_state } = wire(&refresh).body else { panic!("refresh") };
@@ -537,7 +540,7 @@ fn snapshot_pages_preserve_attestations_and_omit_duplicate_leaf_and_target_data(
     assert_eq!(received.states[0].payload, state.payload);
     assert_eq!(received.states[0].attestations, state.attestations);
     let separate = vec![
-        StateItem::Leaves(LeafPage { bounds, leaves: vec![KnownLeaf { key: vec![], entity: entity.clone() }] }),
+        StateItem::Leaves(TreeSpanInventory { bounds, leaves: vec![KnownLeaf { key: vec![], entity: entity.clone() }] }),
         StateItem::Repair {
             target: entity.head,
             delta: EntityDelta { entity_id: entity.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } },

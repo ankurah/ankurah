@@ -424,12 +424,12 @@ impl Snapshot {
         }
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
-            regions: vec![proto::KnownRegion::Heads(proto::LeafPage { bounds: super::whole(), leaves })],
+            regions: vec![proto::KnownRegion::Heads(proto::TreeSpanInventory { bounds: super::whole(), leaves })],
         };
         bincode::serialized_size(&inventory).ok().filter(|size| *size <= super::INITIAL_INVENTORY_BYTES as u64).map(|_| inventory)
     }
 
-    pub fn page(&self, bounds: proto::TreeSpan) -> anyhow::Result<proto::LeafPage> {
+    pub fn page(&self, bounds: proto::TreeSpan) -> anyhow::Result<proto::TreeSpanInventory> {
         use std::ops::Bound;
         let empty = match (&bounds.start, &bounds.end) {
             (Bound::Included(start), Bound::Included(end)) => start > end,
@@ -449,7 +449,7 @@ impl Snapshot {
                 entity: proto::EntityHead { entity_id: **id, head: self.states[*id].payload.state.head.clone() },
             };
             let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
-            let overhead = bincode::serialized_size(&proto::StateAnswer::Leaves(proto::LeafPage {
+            let overhead = bincode::serialized_size(&proto::StateAnswer::Leaves(proto::TreeSpanInventory {
                 bounds: proto::TreeSpan::new(bounds.start.clone(), end),
                 leaves: Vec::new(),
             }))?;
@@ -466,7 +466,7 @@ impl Snapshot {
         } else {
             Bound::Included(leaf_address(&leaves.last().unwrap().key, leaves.last().unwrap().entity.entity_id))
         };
-        let page = proto::LeafPage { bounds: proto::TreeSpan::new(bounds.start, end), leaves };
+        let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), leaves };
         anyhow::ensure!(
             bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::PAGE_BYTES as u64,
             "leaf inventory bounds exceed byte limit"

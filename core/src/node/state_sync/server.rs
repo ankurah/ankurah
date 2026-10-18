@@ -250,8 +250,8 @@ enum Work {
     Offer(proto::TreeSpanDigest),
     Expand { local: proto::TreeSpanDigest, known: proto::TreeSpanDigest },
     AskLeaves(TreeSpan),
-    InitialHeads(proto::LeafPage),
-    AnswerLeaves { page: proto::LeafPage, rest: Option<TreeSpan> },
+    InitialHeads(proto::TreeSpanInventory),
+    AnswerLeaves { page: proto::TreeSpanInventory, rest: Option<TreeSpan> },
     SendLeaves(TreeSpan),
     SendSnapshots(TreeSpan),
     Item(StateItem),
@@ -1311,7 +1311,7 @@ impl Comparison {
         Ok(comparison)
     }
 
-    fn validate_initial_heads(&self, page: &proto::LeafPage) -> anyhow::Result<()> {
+    fn validate_initial_heads(&self, page: &proto::TreeSpanInventory) -> anyhow::Result<()> {
         ensure!(valid_range(&page.bounds), "invalid initial inventory bounds");
         let mut previous = None;
         for leaf in &page.leaves {
@@ -1383,7 +1383,7 @@ impl Comparison {
         Ok(())
     }
 
-    fn expand_initial_heads(&mut self, mut page: proto::LeafPage) -> anyhow::Result<()> {
+    fn expand_initial_heads(&mut self, mut page: proto::TreeSpanInventory) -> anyhow::Result<()> {
         use std::ops::Bound::{Excluded, Included};
 
         // The request carries one inventory. Process it in bounded batches so
@@ -1394,7 +1394,7 @@ impl Comparison {
             let end = leaf_address(&last.key, last.entity.entity_id);
             let bounds = TreeSpan::new(Excluded(end.clone()), page.bounds.end);
             page.bounds.end = Included(end);
-            self.work.push_front(Work::InitialHeads(proto::LeafPage { bounds, leaves: rest }));
+            self.work.push_front(Work::InitialHeads(proto::TreeSpanInventory { bounds, leaves: rest }));
         }
         let mut work = Vec::new();
         let former = page
@@ -1407,7 +1407,7 @@ impl Comparison {
         let mut removal: Option<TreeSpan> = None;
         let flush_removal = |removal: &mut Option<TreeSpan>, work: &mut Vec<Work>| {
             if let Some(bounds) = removal.take() {
-                work.push(Work::Item(StateItem::Leaves(proto::LeafPage { bounds, leaves: Vec::new() })));
+                work.push(Work::Item(StateItem::Leaves(proto::TreeSpanInventory { bounds, leaves: Vec::new() })));
             }
         };
         for leaf in page.leaves {
@@ -1463,7 +1463,7 @@ impl Comparison {
         Ok(())
     }
 
-    fn expand_leaf_answer(&mut self, page: proto::LeafPage, rest: Option<TreeSpan>) -> anyhow::Result<()> {
+    fn expand_leaf_answer(&mut self, page: proto::TreeSpanInventory, rest: Option<TreeSpan>) -> anyhow::Result<()> {
         let mut clocks =
             page.leaves.into_iter().map(|leaf| (leaf.entity.entity_id, leaf.entity.head)).collect::<std::collections::BTreeMap<_, _>>();
         let mut remaining = page.bounds.clone();
@@ -1543,7 +1543,7 @@ impl Comparison {
                     self.work.push_front(Work::SendSnapshots(bounds.after(address)));
                 }
                 self.work.push_front(Work::Repair(id, known));
-                return Ok(StateItem::Leaves(proto::LeafPage {
+                return Ok(StateItem::Leaves(proto::TreeSpanInventory {
                     bounds: page_bounds,
                     leaves: vec![proto::KnownLeaf {
                         key: address[..address.len() - proto::EntityId::BYTE_LEN].to_vec(),

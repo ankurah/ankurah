@@ -265,7 +265,7 @@ fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow:
     Ok(())
 }
 
-fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow::Result<proto::LeafPage> {
+fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow::Result<proto::TreeSpanInventory> {
     ensure!(page.states.len() <= super::MAX_SNAPSHOT_ROWS, "peer sent too many snapshots");
     let mut ids = std::collections::HashSet::new();
     let leaves = page
@@ -280,13 +280,13 @@ fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow
             })
         })
         .collect::<anyhow::Result<_>>()?;
-    Ok(proto::LeafPage { bounds: page.bounds.clone(), leaves })
+    Ok(proto::TreeSpanInventory { bounds: page.bounds.clone(), leaves })
 }
 
 fn replace_members(
     members: &mut BTreeMap<Vec<u8>, proto::EntityId>,
     spec: &proto::TreeSpec,
-    page: proto::LeafPage,
+    page: proto::TreeSpanInventory,
     max_rows: usize,
 ) -> anyhow::Result<()> {
     use std::ops::Bound::*;

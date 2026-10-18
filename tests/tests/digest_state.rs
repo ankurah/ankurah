@@ -633,7 +633,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                     round: Some(0),
                     applied_through: None,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
+                    answers: vec![proto::StateAnswer::Leaves(proto::TreeSpanInventory {
                         bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
                         leaves: vec![]
                     })],
@@ -678,7 +678,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                     round: Some(0),
                     applied_through: None,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Leaves(proto::LeafPage {
+                    answers: vec![proto::StateAnswer::Leaves(proto::TreeSpanInventory {
                         bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
                         leaves: vec![]
                     })],

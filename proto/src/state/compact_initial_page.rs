@@ -4,7 +4,7 @@
 use bincode::Options;
 use serde::{de::Visitor, Deserialize, Deserializer, Serialize, Serializer};
 
-use super::LeafPage;
+use super::TreeSpanInventory;
 
 const VERSION: u8 = 1;
 // The initial inventory has its own request budget, independent of follow-up pages.
@@ -14,7 +14,7 @@ fn options() -> impl Options {
     bincode::DefaultOptions::new().with_little_endian().with_varint_encoding().with_limit(MAX_ENCODED_BYTES as u64).reject_trailing_bytes()
 }
 
-pub(super) fn serialize<S: Serializer>(page: &LeafPage, serializer: S) -> Result<S::Ok, S::Error> {
+pub(super) fn serialize<S: Serializer>(page: &TreeSpanInventory, serializer: S) -> Result<S::Ok, S::Error> {
     if serializer.is_human_readable() {
         return page.serialize(serializer);
     }
@@ -22,9 +22,9 @@ pub(super) fn serialize<S: Serializer>(page: &LeafPage, serializer: S) -> Result
     serializer.serialize_bytes(&bytes)
 }
 
-pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<LeafPage, D::Error> {
+pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<TreeSpanInventory, D::Error> {
     if deserializer.is_human_readable() {
-        return LeafPage::deserialize(deserializer);
+        return TreeSpanInventory::deserialize(deserializer);
     }
     deserializer.deserialize_bytes(PageVisitor)
 }
@@ -32,13 +32,13 @@ pub(super) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 struct PageVisitor;
 
 impl<'de> Visitor<'de> for PageVisitor {
-    type Value = LeafPage;
+    type Value = TreeSpanInventory;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         formatter.write_str("a versioned compact initial head inventory of at most 256 KiB")
     }
 
-    fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<LeafPage, E> {
+    fn visit_bytes<E: serde::de::Error>(self, bytes: &[u8]) -> Result<TreeSpanInventory, E> {
         // Bincode's slice decoder does not enforce Options::with_limit. Check
         // the borrowed blob before any typed page decoding or allocation.
         if bytes.len() > MAX_ENCODED_BYTES {
@@ -64,8 +64,8 @@ mod tests {
         EventId::from_bytes(bytes)
     }
 
-    fn page(keys: Vec<Vec<u8>>, generation: u32, tips: usize) -> LeafPage {
-        LeafPage {
+    fn page(keys: Vec<Vec<u8>>, generation: u32, tips: usize) -> TreeSpanInventory {
+        TreeSpanInventory {
             bounds: TreeSpan::all(),
             leaves: keys
                 .into_iter()
@@ -81,7 +81,7 @@ mod tests {
         }
     }
 
-    fn decoded(encoded: &[u8]) -> bincode::Result<LeafPage> {
+    fn decoded(encoded: &[u8]) -> bincode::Result<TreeSpanInventory> {
         match bincode::deserialize::<KnownRegion>(encoded)? {
             KnownRegion::Heads(page) => Ok(page),
             _ => panic!("expected leaves"),
@@ -95,7 +95,7 @@ mod tests {
         bytes
     }
 
-    fn round_trip(page: LeafPage) {
+    fn round_trip(page: TreeSpanInventory) {
         let region = KnownRegion::Heads(page.clone());
         let encoded = bincode::serialize(&region).unwrap();
         assert_eq!(bincode::serialized_size(&region).unwrap() as usize, encoded.len());
