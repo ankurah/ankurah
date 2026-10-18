@@ -1,0 +1,138 @@
+Packed inventory adoption — 2026-10-17
+
+Implemented: TreeSpanInventory now retains packed immutable bytes, with lending
+cursors over keys and clocks. Initial and follow-up inventories share this codec.
+KnownState and spans retain their meaning. The producer still selects inventory
+versus digests by the existing policy; compression does not subdivide inventories.
+
+Implementation source: 2e1ceb179f77ea0c8429b3cd2b544cbb74f8d6fb
+Pre-adoption baseline: ae2fb89246a666f109c1918ef02c10fdebcbbbdb
+Compiler: rustc 1.101.0-nightly (4ebd25825 2026-10-15)
+Platform: native macOS 26.7.1, aarch64, shared developer machine.
+WIP, unreviewed; no PR. Storage and durable replication remain separate work.
+
+Representation and compatibility
+
+- One packed buffer; rows follow each other without pointers or per-row boxes.
+  Source construction borrows existing keys/clocks. Binary decoding validates
+  the complete payload before exposing rows, then retains one buffer copy.
+- Per inventory, compare exact sizes and use plain keys or preceding-key prefix
+  lengths plus suffixes. Generations use varints or fixed u32s, whichever is
+  smaller across the inventory. IDs remain complete. Bounds stay absolute.
+- A lending cursor uses a reusable key scratch buffer for compressed keys. A
+  borrowed key cannot survive the next advance. Clones and retained repair
+  clocks share the buffer; keeping one clock can keep that whole buffer alive.
+  Persistent query members still receive owned values where their lifetime
+  requires them. JSON remains the ordinary readable keyed-head list.
+- Initial comparison batches keep their cursor position, instead of decoding
+  or repacking each remainder. There is no recursive container or linked heap.
+- Decoded-work limits remain separate from wire credit, both per page and over
+  the whole message. Compression cannot bypass these limits. Fixed generation
+  fallback preserves previously valid large-clock pages near the size limit.
+- Binary protocol changed: communicating peers need this version together.
+  This is not a backwards-compatible wire change or transport-level zero-copy.
+
+Production codec measurements
+
+Three runs, 20 fixtures, nine timed samples per mode per run. The benchmark
+includes decode, validation, a retained-buffer copy, traversal hashing every key,
+ID and clock tip, and output drop. The old decoder is frozen in legacy.rs and
+legacy_compact.rs. Exact fields/bytes and checksums are verified before timings.
+Median below is the median of three run medians. Encoder time is not isolated.
+
+Fixture                    Wire bytes before -> after    Decode/traverse us
+ID-only, 2,048                   137,235 -> 137,248         311.48 -> 48.02
+Numeric, 2,048                   155,667 -> 141,360         351.77 -> 60.52
+Random binary, 2,048             192,717 -> 190,897         381.55 -> 75.29
+Shared strings, 2,048            225,299 -> 145,706         397.69 -> 76.82
+Clustered strings, 2,048         215,059 -> 148,355         392.09 -> 74.52
+Wide strings, 32                133,649 ->   6,473          79.54 -> 22.83
+Eight heads, 256 tips each        72,313 ->  72,054         138.29 -> 22.74
+
+For 2,048 shared-key heads, allocations/reallocations fall from 4,097 to 4;
+peak incremental requested heap falls from 325,632 to 145,745 bytes. This is
+allocator-requested memory during decoding, excluding the existing input buffer,
+not RSS or total query memory. Random keys need six calls due to scratch growth;
+clipped bounds also allocate. Borrowed consumption supplies most CPU/allocation
+gains; prefix coding supplies key-dependent bandwidth savings.
+
+An empty inventory grows from 17 to 30 bytes and from 0 to 2 allocations; its
+microbenchmark rises from 33 to 58 ns. Plain fallback avoids prefix overhead on
+ID-only keys, but the new framing adds 13 bytes in these fixtures. Savings are
+not universal. Noncanonical clocks use an allocating normalization fallback;
+canonical clocks are the timed common case.
+
+Native query regression measurements
+
+Compare exact baseline/candidate builds from the same compiler, with one fresh
+process per sample, alternating AB/BA order. Five samples per side per case;
+178 verified samples including the separate nine-pair cold confirmation below.
+Zero simulated RTT and unlimited link bandwidth. Setup/prefetch are excluded.
+Cold means opening a new query; cache says how much entity state is already
+local. warm_refresh updates the same active selection. warm_equal reconnects
+with a retained equal query. Cold/refresh endpoint is durable query readiness;
+reconnect endpoint is first fresh installed local result. Neither is time to
+first record. Correct final membership/heads and transport settlement are checked.
+
+Rows  Mode          Initial cache    Before ms   After ms
+    8 cold          empty                 1.013      0.949
+    8 cold          all                   0.353      0.371
+    8 warm_refresh  empty                 0.282      0.291
+    8 warm_refresh  all                   0.212      0.222
+    8 warm_equal    all                   0.283      0.295
+ 2048 cold          empty               128.809    128.939
+ 2048 cold          all                  64.847     62.859
+ 2048 warm_refresh  empty                24.821     23.087
+ 2048 warm_refresh  all                  20.302     19.887
+ 2048 warm_equal    all                  20.003     19.145
+ 4096 cold          empty               265.048    271.772
+ 4096 cold          half_interleaved    215.360    212.124
+ 4096 cold          all                 169.076    167.426
+ 4096 warm_refresh  empty                67.376     64.441
+ 4096 warm_refresh  half_interleaved     57.301     59.262
+ 4096 warm_refresh  all                  43.589     43.612
+
+The first 4,096-row cold/empty set measured +6.724 ms (+2.5%). A separate nine-pair
+confirmation measured 267.467 -> 268.015 ms (+0.548 ms), with median paired change
+-0.223 ms. Keeping both sets, all 14 pairs have medians 266.468 -> 268.320 ms
+(+0.7%) and median paired change +1.641 ms. Thus the larger first slowdown did
+not reproduce consistently; do not claim a universal zero-cost cold path.
+Across the measured cases there is no material startup regression, while several
+cached and warm cases improve. These focused checks compare this change to the
+previous branch, not a new comprehensive parity certification against main.
+No browser performance comparison, constrained-bandwidth sweep, isolated encoder
+timing, or statistical significance claim is made.
+
+Validation
+
+Protocol: 44 passed. Core: 465 passed, one existing ignored; the final budget
+optimization additionally passed all 105 state-sync tests. Native integration:
+43 passed, covering two-node state/deltas, live events, cost, bridges and catalog.
+Browser: 41 passed, including 50ms RTT cases, interleaved/blocked gaps, and the
+4,098-row summary frontier. WASM build and JWT-auth test-target checking passed.
+Protocol Clippy passed with existing workspace/test warnings.
+
+Tests cover both key/generation encodings, bounds, malformed/truncated payloads,
+invalid prefix lengths and clocks, normalization, expanded-work/aggregate limits,
+retained-clock lifetimes, and cursors continuing across processing batches.
+This does not replace the planned pre-release adversarial hardening pass.
+
+The browser runner initially hit a sandbox localhost denial; an authorized run
+then passed 18 tests while an old harness expected 17. Both preflight logs were
+preserved; after correcting the harness count, all 41 checks passed. Neither
+preflight supplies performance evidence. Earlier compile/check failures are
+also retained in the private evidence folder.
+
+Reproduction and evidence
+
+cargo bench -p ankurah-proto --bench prefix_inventory
+Run three times; PREFIX_SAMPLES=9 and PREFIX_BATCH_MS=10 are the defaults.
+README.txt explains modes and historical prototype controls. RESULTS.txt and
+results.json are unchanged historical evidence, not these adoption measurements.
+
+Native runner: tests/benches/compare_live_query_startup.py, using exact archived
+baseline and candidate live_query_startup binaries. adoption-results.json records
+binary hashes, compiler, case matrices, primary codec samples, allocations and
+query latency/traffic samples. Full controls, CPU/resource counters, build/test
+logs and browser evidence are preserved, with hashes linked from that JSON, at:
+research_notes/ankurah-replication/reviews/2026-10-17-packed-inventories/

@@ -1,4 +1,4 @@
-Flat prefix inventory experiment
+Flat prefix inventory benchmark
 
 The original nine modes preserve the benchmark-only experiment at ae2fb892.
 The added packed_production mode measures the adopted production decoder,
@@ -9,13 +9,14 @@ still measures the pre-adoption code. Run from the workspace root:
   cargo bench -p ankurah-proto --bench prefix_inventory > results.json
 
 RESULTS.txt and results.json preserve the original pre-adoption measurements.
+ADOPTION.txt and adoption-results.json report the subsequent production change.
 
 PREFIX_CHECK_ONLY=1 runs its correctness checks without timings.
 PREFIX_SAMPLES (default 9) and PREFIX_BATCH_MS (default 10) tune sampling.
 
-The input is one SpanContent::Heads envelope using the current compact initial
-inventory encoding. The plain control must reproduce its production bytes
-exactly. The prototype changes only its local version byte and key encoding:
+The input is one SpanContent::Heads envelope. Historical controls use the
+pre-adoption compact initial inventory encoding; the plain control reproduces
+those bytes exactly. The prototype changes its local version and key encoding:
 
   bounds, count, repeated(shared_prefix_length, suffix_length, suffix, EntityHead)
 
@@ -24,12 +25,14 @@ Records sit consecutively in one byte buffer, so explicit next pointers and
 nested allocations are unnecessary. Every inventory is independently decodable.
 IDs, clocks and bounds retain their existing encodings. The prefix never uses
 TreeSpanDigest.prefix and does not imply tree structure. Bounds remain absolute.
-The experiment reports both wire sizes and which encoding is smaller; it does
-not change the producer's policy or implement an adaptive production encoder.
+The historical experiment measures both encodings. The added production mode
+selects the smaller key encoding and uses fixed-width generations when those
+are smaller than varints. It uses the same codec for initial/follow-up inventories.
 
 Comparisons
 
-current_owned: the actual production deserializer and owned output.
+current_owned: the frozen pre-adoption production deserializer and owned output.
+packed_production: the actual adopted deserializer and lending cursor output.
 current_owned_control: the prototype parser on unchanged production bytes.
 prefix_owned: the same prototype parser, reconstructing owned keys.
 current_borrowed / prefix_borrowed: consume views over an existing byte slice.
@@ -75,12 +78,14 @@ expanded key work. This is not a complete untrusted-input hardening review.
 
 Limitations
 
-This measures native sequential inventory consumption. No browser, network,
-whole-query benchmark, encoder timing or source-inventory construction is
-included. Both encodings are measured even when prefix coding loses bytes.
+This benchmark measures native sequential inventory consumption. No browser,
+network, whole-query benchmark, encoder timing or source-inventory construction
+is included in its timings. ADOPTION.txt also reports separate query regressions.
+Historical controls measure both encodings even when prefix coding loses bytes.
 The prototype bounds rows, blob bytes and expanded key work, but does not replace
 production KeySpec, address-order, span-membership, or application validation.
-The borrowed parser is coupled to the current bincode layout; adopting it would
-require an explicit ownership/API and compatibility decision. No result here
-establishes end-to-end Fetch/livequery performance or makes recursive grouping
-necessary. Follow-up fixed-width inventories are outside this comparison.
+The borrowed parsers are coupled to their documented binary layouts. The adopted
+production codec changes the binary protocol and requires updated peers; JSON
+remains readable keyed heads. No microbenchmark result establishes end-to-end
+Fetch/livequery performance or makes recursive grouping necessary. Historical
+follow-up fixed-width inventories are outside this codec comparison.
