@@ -666,10 +666,12 @@ impl Driver {
                 }
                 StateItem::Leaves(page) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
+                    ensure!(4 + page.expanded_size() <= super::super::PAGE_BYTES as u64, "peer leaf page exceeds decoded-work budget");
                     let mut validation = BTreeMap::new();
                     replace_members(&mut validation, &self.spec, page.clone(), super::super::LEAF_PAGE)?;
-                    for leaf in &page.leaves {
-                        self.add_goal(owner, leaf.entity.entity_id, leaf.entity.head.clone())?;
+                    let mut cursor = page.leaves.cursor();
+                    while let Some(leaf) = cursor.next() {
+                        self.add_goal(owner, leaf.entity.entity_id, leaf.entity.head.to_owned())?;
                     }
                     self.projection.round.as_mut().unwrap().replace(page);
                 }

@@ -1,7 +1,8 @@
 //! Experimental v2 inventory payload, only linked by the benchmark.
 //! The v1 path reads the actual production encoding as a borrowed control.
 
-use ankurah_proto::{Clock, EntityHead, EntityId, KeyedEntityHead, TreeSpan, TreeSpanInventory};
+use super::legacy::{SpanContent, TreeSpanInventory};
+use ankurah_proto::{Clock, EntityHead, EntityId, KeyedEntityHead, TreeSpan};
 use bincode::Options;
 use serde::de::DeserializeOwned;
 use std::{io::Cursor, ops::Bound};
@@ -264,7 +265,7 @@ pub fn verify(page: &TreeSpanInventory, bytes: &[u8]) {
 }
 
 pub fn malformed_checks() {
-    use ankurah_proto::{EventId, SpanContent};
+    use ankurah_proto::EventId;
     let page = TreeSpanInventory {
         bounds: TreeSpan::all(),
         leaves: vec![KeyedEntityHead {

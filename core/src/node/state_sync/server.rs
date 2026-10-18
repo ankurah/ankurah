@@ -250,7 +250,7 @@ enum Work {
     Offer(proto::TreeSpanDigest),
     Expand { local: proto::TreeSpanDigest, known: proto::TreeSpanDigest },
     AskLeaves(TreeSpan),
-    InitialHeads(proto::TreeSpanInventory),
+    InitialHeads(InitialHeads),
     AnswerLeaves { page: proto::TreeSpanInventory, rest: Option<TreeSpan> },
     SendLeaves(TreeSpan),
     SendSnapshots(TreeSpan),
@@ -259,13 +259,18 @@ enum Work {
     History { entity_id: proto::EntityId, target: proto::Clock },
     Chunks { entity_id: proto::EntityId, target: proto::Clock, bytes: Vec<u8>, offset: usize },
 }
+
+struct InitialHeads {
+    bounds: TreeSpan,
+    leaves: proto::HeadCursor,
+}
 struct Comparison {
     snapshot: Snapshot,
     work: VecDeque<Work>,
     summaries: HashMap<Vec<u8>, NodePrefix>,
     leaves: Vec<TreeSpan>,
     repaired: HashSet<proto::EntityId>,
-    known_clocks: HashMap<proto::EntityId, proto::Clock>,
+    known_clocks: HashMap<proto::EntityId, proto::InventoryClock>,
     offered: HashMap<proto::EntityId, proto::Clock>,
     pending_repairs: HashSet<proto::EntityId>,
     repair_attempts: HashMap<proto::EntityId, usize>,
@@ -1289,13 +1294,11 @@ impl Comparison {
                     leaf_count += page.leaves.len();
                     ensure!(leaf_count <= INITIAL_INVENTORY_LEAVES, "initial inventory exceeds leaf limit");
                     comparison.validate_initial_heads(&page)?;
-                    for leaf in &page.leaves {
-                        ensure!(
-                            comparison.known_clocks.insert(leaf.entity.entity_id, leaf.entity.head.clone()).is_none(),
-                            "duplicate entity in initial inventory"
-                        );
+                    let mut cursor = page.leaves.cursor();
+                    while let Some((id, clock)) = cursor.next_clock() {
+                        ensure!(comparison.known_clocks.insert(id, clock).is_none(), "duplicate entity in initial inventory");
                     }
-                    comparison.work.push_back(Work::InitialHeads(page));
+                    comparison.work.push_back(Work::InitialHeads(InitialHeads { bounds: page.bounds, leaves: page.leaves.cursor() }));
                 }
             }
         }
@@ -1314,9 +1317,10 @@ impl Comparison {
     fn validate_initial_heads(&self, page: &proto::TreeSpanInventory) -> anyhow::Result<()> {
         ensure!(valid_range(&page.bounds), "invalid initial inventory bounds");
         let mut previous = None;
-        for leaf in &page.leaves {
-            CanonicalCodec.split(self.snapshot.spec.key_spec(), &leaf.key)?;
-            let address = leaf_address(&leaf.key, leaf.entity.entity_id);
+        let mut cursor = page.leaves.cursor();
+        while let Some(leaf) = cursor.next() {
+            CanonicalCodec.split(self.snapshot.spec.key_spec(), leaf.key)?;
+            let address = leaf_address(leaf.key, leaf.entity.entity_id);
             ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid leaf order or bounds");
             previous = Some(address);
         }
@@ -1347,6 +1351,7 @@ impl Comparison {
                 }
                 StateAnswer::Leaves(page) => {
                     ensure!(page.leaves.len() <= LEAF_PAGE, "too many leaves in one page");
+                    ensure!(4 + page.expanded_size() <= PAGE_BYTES as u64, "leaf page exceeds decoded-work budget");
                     let index = self
                         .leaves
                         .iter()
@@ -1356,9 +1361,10 @@ impl Comparison {
                     ensure!(end_le(&page.bounds.end, &requested.end), "leaf page exceeds requested bounds");
                     let mut previous = None;
                     let mut ids = HashSet::new();
-                    for leaf in &page.leaves {
-                        CanonicalCodec.split(self.snapshot.spec.key_spec(), &leaf.key)?;
-                        let address = leaf_address(&leaf.key, leaf.entity.entity_id);
+                    let mut cursor = page.leaves.cursor();
+                    while let Some(leaf) = cursor.next() {
+                        CanonicalCodec.split(self.snapshot.spec.key_spec(), leaf.key)?;
+                        let address = leaf_address(leaf.key, leaf.entity.entity_id);
                         ensure!(
                             page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address),
                             "invalid leaf order or bounds"
@@ -1383,35 +1389,27 @@ impl Comparison {
         Ok(())
     }
 
-    fn expand_initial_heads(&mut self, mut page: proto::TreeSpanInventory) -> anyhow::Result<()> {
+    fn expand_initial_heads(&mut self, mut page: InitialHeads) -> anyhow::Result<()> {
         use std::ops::Bound::{Excluded, Included};
 
         // The request carries one inventory. Process it in bounded batches so
         // alternating gaps/removals cannot expand the whole work queue at once.
-        if page.leaves.len() > LEAF_PAGE {
-            let rest = page.leaves.split_off(LEAF_PAGE);
-            let last = page.leaves.last().unwrap();
-            let end = leaf_address(&last.key, last.entity.entity_id);
-            let bounds = TreeSpan::new(Excluded(end.clone()), page.bounds.end);
-            page.bounds.end = Included(end);
-            self.work.push_front(Work::InitialHeads(proto::TreeSpanInventory { bounds, leaves: rest }));
-        }
         let mut work = Vec::new();
-        let former = page
-            .leaves
-            .iter()
-            .filter(|leaf| !self.snapshot.states.contains_key(&leaf.entity.entity_id))
-            .map(|leaf| leaf.entity.entity_id)
-            .collect::<Vec<_>>();
+        let mut former = Vec::new();
         let mut start = page.bounds.start.clone();
         let mut removal: Option<TreeSpan> = None;
         let flush_removal = |removal: &mut Option<TreeSpan>, work: &mut Vec<Work>| {
             if let Some(bounds) = removal.take() {
-                work.push(Work::Item(StateItem::Leaves(proto::TreeSpanInventory { bounds, leaves: Vec::new() })));
+                work.push(Work::Item(StateItem::Leaves(proto::TreeSpanInventory { bounds, leaves: Default::default() })));
             }
         };
-        for leaf in page.leaves {
-            let address = leaf_address(&leaf.key, leaf.entity.entity_id);
+        let count = page.leaves.len().min(LEAF_PAGE);
+        for _ in 0..count {
+            let leaf = page.leaves.next().expect("bounded by remaining rows");
+            if !self.snapshot.states.contains_key(&leaf.entity.entity_id) {
+                former.push(leaf.entity.entity_id);
+            }
+            let address = leaf_address(leaf.key, leaf.entity.entity_id);
             let gap = TreeSpan::new(start, Excluded(address.clone()));
             if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
                 flush_removal(&mut removal, &mut work);
@@ -1420,8 +1418,8 @@ impl Comparison {
             let point = TreeSpan::new(Included(address.clone()), Included(address.clone()));
             if let Some((_, state)) = self.snapshot.states_in(&point, 1).next() {
                 flush_removal(&mut removal, &mut work);
-                if state.payload.state.head != leaf.entity.head {
-                    work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head)));
+                if !leaf.entity.head.equals(&state.payload.state.head) {
+                    work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head.to_owned())));
                 }
             } else {
                 // Only bridge removed points across gaps proven empty above.
@@ -1431,12 +1429,18 @@ impl Comparison {
                 } else {
                     removal = Some(point);
                 }
-                work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head)));
+                work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head.to_owned())));
             }
             start = Excluded(address);
         }
         flush_removal(&mut removal, &mut work);
-        let gap = TreeSpan::new(start, page.bounds.end.clone());
+        let processed_bounds = if page.leaves.is_empty() {
+            page.bounds.clone()
+        } else {
+            let Excluded(last) = &start else { unreachable!("nonempty batch") };
+            TreeSpan::new(page.bounds.start.clone(), Included(last.clone()))
+        };
+        let gap = TreeSpan::new(start.clone(), processed_bounds.end.clone());
         if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
             work.push(Work::SendSnapshots(gap));
         }
@@ -1454,8 +1458,12 @@ impl Comparison {
             };
         }
         if !fits {
-            work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].clone()))).collect();
-            work.push(Work::SendLeaves(page.bounds));
+            work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].to_owned()))).collect();
+            work.push(Work::SendLeaves(processed_bounds));
+        }
+        if !page.leaves.is_empty() {
+            page.bounds.start = start;
+            self.work.push_front(Work::InitialHeads(page));
         }
         for item in work.into_iter().rev() {
             self.work.push_front(item);
@@ -1464,8 +1472,11 @@ impl Comparison {
     }
 
     fn expand_leaf_answer(&mut self, page: proto::TreeSpanInventory, rest: Option<TreeSpan>) -> anyhow::Result<()> {
-        let mut clocks =
-            page.leaves.into_iter().map(|leaf| (leaf.entity.entity_id, leaf.entity.head)).collect::<std::collections::BTreeMap<_, _>>();
+        let mut clocks = std::collections::BTreeMap::new();
+        let mut cursor = page.leaves.cursor();
+        while let Some(leaf) = cursor.next() {
+            clocks.insert(leaf.entity.entity_id, leaf.entity.head.to_owned());
+        }
         let mut remaining = page.bounds.clone();
         let mut pages = Vec::new();
         let mut repairs = Vec::new();
@@ -1474,7 +1485,8 @@ impl Comparison {
             let remote = self.snapshot.page(remaining.clone())?;
             count += remote.leaves.len();
             ensure!(count <= LEAF_PAGE, "leaf region was not fully refined");
-            for leaf in &remote.leaves {
+            let mut cursor = remote.leaves.cursor();
+            while let Some(leaf) = cursor.next() {
                 let id = leaf.entity.entity_id;
                 repairs.push(Work::Repair(id, clocks.remove(&id)));
             }
@@ -1529,7 +1541,7 @@ impl Comparison {
             // Reserve the larger possible page end, plus the item tag and vector length.
             let overhead = 12 + bincode::serialized_size(&bounds)?.max(bincode::serialized_size(&clipped)?) as usize;
             let size = bincode::serialized_size(state)? as usize;
-            let known = self.known_clocks.get(&id).cloned();
+            let known = self.known_clocks.get(&id).map(proto::InventoryClock::to_owned);
             if known.is_some() || overhead + bytes + size > PAGE_BYTES / 2 {
                 if !states.is_empty() {
                     break;
@@ -1548,7 +1560,8 @@ impl Comparison {
                     leaves: vec![proto::KeyedEntityHead {
                         key: address[..address.len() - proto::EntityId::BYTE_LEN].to_vec(),
                         entity: proto::EntityHead { entity_id: id, head: state.payload.state.head.clone() },
-                    }],
+                    }]
+                    .into(),
                 }));
             }
             bytes += size;
@@ -1712,9 +1725,10 @@ impl Comparison {
                         let std::ops::Bound::Included(last) = &page.bounds.end else { unreachable!("partial leaf page") };
                         self.work.push_back(Work::SendLeaves(bounds.after(last)));
                     }
-                    for leaf in &page.leaves {
+                    let mut cursor = page.leaves.cursor();
+                    while let Some(leaf) = cursor.next() {
                         let id = leaf.entity.entity_id;
-                        self.work.push_front(Work::Repair(id, self.known_clocks.get(&id).cloned()));
+                        self.work.push_front(Work::Repair(id, self.known_clocks.get(&id).map(proto::InventoryClock::to_owned)));
                     }
                     Some(StateItem::Leaves(page))
                 }

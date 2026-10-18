@@ -1,11 +1,14 @@
 Flat prefix inventory experiment
 
-This is a benchmark-only codec, not a proposed change to production serde
-implementations. Run from the workspace root:
+The original nine modes preserve the benchmark-only experiment at ae2fb892.
+The added packed_production mode measures the adopted production decoder,
+including validation, retained buffer ownership, traversal and output drop.
+The current_owned baseline is frozen in legacy.rs and legacy_compact.rs, so it
+still measures the pre-adoption code. Run from the workspace root:
 
   cargo bench -p ankurah-proto --bench prefix_inventory > results.json
 
-RESULTS.txt records the measured comparison; results.json preserves all samples.
+RESULTS.txt and results.json preserve the original pre-adoption measurements.
 
 PREFIX_CHECK_ONLY=1 runs its correctness checks without timings.
 PREFIX_SAMPLES (default 9) and PREFIX_BATCH_MS (default 10) tune sampling.

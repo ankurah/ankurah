@@ -406,22 +406,19 @@ impl Snapshot {
         if self.members.len() > super::INITIAL_INVENTORY_LEAVES {
             return None;
         }
-        let mut leaves = Vec::with_capacity(self.members.len());
         let mut minimum_bytes = 0usize;
         for (address, id) in self.members.iter() {
             let head = &self.states[id].payload.state.head;
-            // Bound cloning before encoding: keys, entity IDs and event IDs
-            // alone cannot exceed the request budget. The exact check below
-            // also includes clock generations, lengths, bounds and TreeSpec.
             minimum_bytes = minimum_bytes.saturating_add(address.len()).saturating_add(head.len().saturating_mul(32));
             if minimum_bytes > super::INITIAL_INVENTORY_BYTES {
                 return None;
             }
-            leaves.push(proto::KeyedEntityHead {
-                key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
-                entity: proto::EntityHead { entity_id: *id, head: head.clone() },
-            });
         }
+        let leaves = proto::PackedHeads::from_rows(
+            self.members
+                .iter()
+                .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), *id, &self.states[id].payload.state.head)),
+        );
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
             spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), leaves })],
@@ -441,31 +438,27 @@ impl Snapshot {
         } else {
             self.members.range((bounds.start.clone(), bounds.end.clone())).take(super::LEAF_PAGE + 1).collect::<Vec<_>>()
         };
-        let mut leaves = Vec::new();
+        let mut count = 0;
         let mut bytes = 0;
         for (index, (address, id)) in rows.iter().take(super::LEAF_PAGE).enumerate() {
-            let leaf = proto::KeyedEntityHead {
-                key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
-                entity: proto::EntityHead { entity_id: **id, head: self.states[*id].payload.state.head.clone() },
-            };
+            let head = &self.states[*id].payload.state.head;
             let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
-            let overhead = bincode::serialized_size(&proto::StateAnswer::Leaves(proto::TreeSpanInventory {
-                bounds: proto::TreeSpan::new(bounds.start.clone(), end),
-                leaves: Vec::new(),
-            }))?;
-            let size = bincode::serialized_size(&leaf)?;
+            // Preserve the decoded-work budget even when repeated keys compress well.
+            let overhead = 4 + bincode::serialized_size(&proto::TreeSpan::new(bounds.start.clone(), end))? + 8;
+            let size = 8 + address.len() as u64 + 8 + 36 * head.len() as u64;
             if overhead + bytes + size > super::PAGE_BYTES as u64 {
-                anyhow::ensure!(!leaves.is_empty(), "single leaf inventory exceeds byte limit");
+                anyhow::ensure!(count > 0, "single leaf inventory exceeds byte limit");
                 break;
             }
             bytes += size;
-            leaves.push(leaf);
+            count += 1;
         }
-        let end = if leaves.len() == rows.len() {
-            bounds.end
-        } else {
-            Bound::Included(leaf_address(&leaves.last().unwrap().key, leaves.last().unwrap().entity.entity_id))
-        };
+        let end = if count == rows.len() { bounds.end } else { Bound::Included(rows[count - 1].0.clone()) };
+        let leaves = proto::PackedHeads::from_rows(
+            rows.iter()
+                .take(count)
+                .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), **id, &self.states[*id].payload.state.head)),
+        );
         let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), leaves };
         anyhow::ensure!(
             bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::PAGE_BYTES as u64,

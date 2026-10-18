@@ -380,7 +380,7 @@ async fn small_and_empty_inventories_offer_exact_leaves_without_building_a_tree(
         assert_eq!(page.bounds, super::super::whole());
         assert_eq!(page.leaves.len(), count);
         assert_eq!(snapshot.members().len(), count);
-        for (id, leaf) in page.leaves.iter().enumerate() {
+        for (id, leaf) in page.leaves.to_vec().iter().enumerate() {
             assert!(leaf.key.is_empty());
             assert_eq!(leaf.entity.entity_id, EntityId::from_bytes([id as u8; EntityId::BYTE_LEN]));
         }
@@ -485,7 +485,7 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
         let page = old.page(remaining.clone())?;
         assert_eq!(page.bounds.start, remaining.start);
         assert!(bincode::serialized_size(&proto::StateAnswer::Leaves(page.clone()))? <= super::super::PAGE_BYTES as u64);
-        ids.extend(page.leaves.iter().map(|leaf| leaf.entity.entity_id));
+        ids.extend(page.leaves.to_vec().iter().map(|leaf| leaf.entity.entity_id));
         let complete = page.bounds.end == super::super::whole().end;
         if !complete {
             let Bound::Included(last) = &page.bounds.end else { panic!("a byte-bounded page must advance") };
@@ -528,7 +528,7 @@ async fn canonical_pages_cover_requested_bounds_without_building_a_tree() -> any
         let page = snapshot.page(remaining.clone())?;
         assert_eq!(page.bounds.start, remaining.start);
         assert!(page.leaves.len() <= super::super::LEAF_PAGE);
-        for leaf in page.leaves {
+        for leaf in page.leaves.to_vec() {
             let address = leaf_address(&leaf.key, leaf.entity.entity_id);
             assert!(requested.contains(&address));
             assert!(page.bounds.contains(&address));
@@ -558,7 +558,7 @@ async fn an_unbuilt_snapshot_stays_stable_after_refresh() -> anyhow::Result<()> 
     assert!(query.0.lock().await.as_ref().unwrap().tree.is_none(), "building an old snapshot cannot populate the current cache");
     let page = old.page(super::super::whole())?;
     assert_eq!(
-        page.leaves.iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>(),
+        page.leaves.to_vec().iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>(),
         old.members().values().copied().collect::<Vec<_>>()
     );
     assert_ne!(old.head(super::super::whole()).await?, current.head(super::super::whole()).await?);
@@ -655,7 +655,7 @@ async fn complete_initial_inventories_are_bounded_lazy_and_immutable() -> anyhow
         let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("one complete initial inventory") };
         assert_eq!(inventory.bounds, super::super::whole());
         assert_eq!(inventory.leaves.len(), count);
-        let received = inventory.leaves.iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>();
+        let received = inventory.leaves.to_vec().iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>();
         let wire = bincode::serialize(&offer)?;
         if count == super::super::INITIAL_INVENTORY_LEAVES {
             assert!(wire.len() > super::super::PAGE_BYTES, "the request has a separate byte budget");

@@ -20,7 +20,8 @@ pub use ankurah_digest_tree::{TreeSpan, TreeSpanDigest, TreeSpec};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-mod compact_initial_page;
+mod inventory;
+pub use inventory::{ClockRef, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHeadRef, PackedHeads};
 
 use crate::{Attested, Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityHead, EntityId, EntityState};
 
@@ -57,7 +58,7 @@ pub enum SpanContent {
     /// An initial inventory uses the request budget, independently of follow-up
     /// page limits. Replies need only describe changes; Complete confirms
     /// unchanged members too.
-    Heads(#[serde(with = "compact_initial_page")] TreeSpanInventory),
+    Heads(TreeSpanInventory),
 }
 
 /// One captured query version. Revisions order publications in this stream,
@@ -209,7 +210,13 @@ pub enum StateAnswer {
 pub struct TreeSpanInventory {
     pub bounds: TreeSpan,
     /// Strictly increasing by canonical key bytes followed by entity ID.
-    pub leaves: Vec<KeyedEntityHead>,
+    pub leaves: PackedHeads,
+}
+
+impl TreeSpanInventory {
+    /// Uncompressed logical size, including fixed-width lengths and generations.
+    /// Compression must not bypass the comparison's decoded-work budget.
+    pub fn expanded_size(&self) -> u64 { bincode::serialized_size(&self.bounds).expect("bounds serialize") + self.leaves.expanded_size() }
 }
 
 /// An exhaustive range page in canonical address order, including empty gaps.

@@ -268,18 +268,16 @@ fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow:
 fn snapshot_leaves(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow::Result<proto::TreeSpanInventory> {
     ensure!(page.states.len() <= super::MAX_SNAPSHOT_ROWS, "peer sent too many snapshots");
     let mut ids = std::collections::HashSet::new();
-    let leaves = page
+    let rows = page
         .states
         .iter()
         .map(|state| {
             let entity_id = state.payload.entity_id;
             ensure!(ids.insert(entity_id), "duplicate entity in snapshot page");
-            Ok(proto::KeyedEntityHead {
-                key: super::tree::key(spec, state)?,
-                entity: proto::EntityHead { entity_id, head: state.payload.state.head.clone() },
-            })
+            Ok((super::tree::key(spec, state)?, entity_id, &state.payload.state.head))
         })
-        .collect::<anyhow::Result<_>>()?;
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let leaves = proto::PackedHeads::from_rows(rows.iter().map(|(key, id, head)| (key.as_slice(), *id, *head)));
     Ok(proto::TreeSpanInventory { bounds: page.bounds.clone(), leaves })
 }
 
@@ -298,9 +296,10 @@ fn replace_members(
     };
     ensure!(nonempty, "invalid peer leaf bounds");
     let mut previous = None;
-    for leaf in &page.leaves {
-        CanonicalCodec.split(spec.key_spec(), &leaf.key)?;
-        let address = leaf_address(&leaf.key, leaf.entity.entity_id);
+    let mut cursor = page.leaves.cursor();
+    while let Some(leaf) = cursor.next() {
+        CanonicalCodec.split(spec.key_spec(), leaf.key)?;
+        let address = leaf_address(leaf.key, leaf.entity.entity_id);
         ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid peer leaf page");
         previous = Some(address);
     }
@@ -308,8 +307,9 @@ fn replace_members(
     for key in removed {
         members.remove(&key);
     }
-    for leaf in page.leaves {
-        members.insert(leaf_address(&leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
+    let mut cursor = page.leaves.cursor();
+    while let Some(leaf) = cursor.next() {
+        members.insert(leaf_address(leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
     }
     Ok(())
 }

@@ -32,7 +32,7 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
     let summary = head(NodePrefix::root(), TreeSpan::new(Included(vec![]), Excluded(vec![1])), &known(1));
     let leaves = TreeSpanInventory {
         bounds: TreeSpan::new(Included(vec![1]), Excluded(vec![2])),
-        leaves: vec![KeyedEntityHead { key: vec![1], entity: known(2) }],
+        leaves: vec![KeyedEntityHead { key: vec![1], entity: known(2) }].into(),
     };
     let inventory = KnownState { spec: spec(), spans: vec![SpanContent::Digest(summary.clone()), SpanContent::Heads(leaves.clone())] };
     for body in [
@@ -54,8 +54,8 @@ fn fetch_and_subscribe_carry_the_same_known_state() {
         assert!(matches!(&state.spans[0], SpanContent::Digest(received) if received == &summary));
         let SpanContent::Heads(received) = &state.spans[1] else { panic!("inline leaves") };
         assert_eq!(received.bounds, leaves.bounds);
-        assert_eq!(received.leaves[0].key, [1]);
-        assert_eq!(received.leaves[0].entity, known(2));
+        assert_eq!(received.leaves.to_vec()[0].key, [1]);
+        assert_eq!(received.leaves.to_vec()[0].entity, known(2));
     }
 }
 
@@ -66,7 +66,7 @@ fn unknown_inventory_is_distinct_from_explicit_empty_leaves_or_summary() {
         selection: selection(),
         known_state: KnownState {
             spec: spec(),
-            spans: vec![SpanContent::Heads(TreeSpanInventory { bounds: TreeSpan::under(&NodePrefix::root()), leaves: vec![] })],
+            spans: vec![SpanContent::Heads(TreeSpanInventory { bounds: TreeSpan::under(&NodePrefix::root()), leaves: vec![].into() })],
         },
     });
     let NodeRequestBody::Fetch { known_state: state, .. } = wire(&unknown).body else { panic!("unknown inventory") };
@@ -99,7 +99,7 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
             StateAnswer::Digest(second.clone()),
             StateAnswer::Leaves(TreeSpanInventory {
                 bounds: bounds.clone(),
-                leaves: vec![KeyedEntityHead { key: vec![], entity: known(2) }],
+                leaves: vec![KeyedEntityHead { key: vec![], entity: known(2) }].into(),
             }),
         ],
     });
@@ -115,7 +115,7 @@ fn followup_batches_mixed_depths_and_leaf_pages() {
     assert!(matches!(&answers[1], StateAnswer::Digest(head) if head == &second));
     let StateAnswer::Leaves(page) = &answers[2] else { panic!("leaves") };
     assert_eq!(page.bounds, bounds);
-    assert_eq!(page.leaves[0].entity, known(2));
+    assert_eq!(page.leaves.to_vec()[0].entity, known(2));
     let receipt =
         request(NodeRequestBody::ContinueState { comparison, round: None, processed_through: 18, applied_through: None, answers: vec![] });
     assert!(matches!(wire(&receipt).body, NodeRequestBody::ContinueState { processed_through: 18, answers, .. } if answers.is_empty()));
@@ -135,7 +135,10 @@ fn initial_replies_continue_with_mixed_work() {
                 round: 0,
                 items: vec![
                     StateItem::Digest(head(NodePrefix::root(), bounds.clone(), &known(2))),
-                    StateItem::Leaves(TreeSpanInventory { bounds: TreeSpan::new(Included(vec![3]), Included(vec![9])), leaves: vec![] }),
+                    StateItem::Leaves(TreeSpanInventory {
+                        bounds: TreeSpan::new(Included(vec![3]), Included(vec![9])),
+                        leaves: vec![].into(),
+                    }),
                     StateItem::NeedLeaves(bounds.clone()),
                 ],
                 progress: ComparisonProgress::Continue,
@@ -296,7 +299,7 @@ fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
         spec: spec(),
         spans: vec![SpanContent::Heads(TreeSpanInventory {
             bounds: bounds.clone(),
-            leaves: vec![KeyedEntityHead { key: vec![7], entity: known(7) }],
+            leaves: vec![KeyedEntityHead { key: vec![7], entity: known(7) }].into(),
         })],
     };
     let refresh = request(NodeRequestBody::RefreshState { comparison, round: 3, known_state: offer });
@@ -306,8 +309,8 @@ fn refresh_keeps_the_stream_and_freezes_a_numbered_offer() {
     assert_eq!(known_state.spec, spec());
     let SpanContent::Heads(page) = &known_state.spans[0] else { panic!("frozen offer") };
     assert_eq!(page.bounds, bounds);
-    assert_eq!(page.leaves[0].key, [7]);
-    assert_eq!(page.leaves[0].entity, known(7));
+    assert_eq!(page.leaves.to_vec()[0].key, [7]);
+    assert_eq!(page.leaves.to_vec()[0].entity, known(7));
 
     let begin = StateFrame { comparison, sequence: 25, body: StateFrameBody::BeginRound(StateRound { number: 3, revision: 90 }) };
     let StateFrame { comparison: received, sequence, body: StateFrameBody::BeginRound(round) } = wire(&begin) else {
@@ -543,7 +546,7 @@ fn snapshot_pages_preserve_attestations_and_omit_duplicate_leaf_and_target_data(
     assert_eq!(received.states[0].payload, state.payload);
     assert_eq!(received.states[0].attestations, state.attestations);
     let separate = vec![
-        StateItem::Leaves(TreeSpanInventory { bounds, leaves: vec![KeyedEntityHead { key: vec![], entity: entity.clone() }] }),
+        StateItem::Leaves(TreeSpanInventory { bounds, leaves: vec![KeyedEntityHead { key: vec![], entity: entity.clone() }].into() }),
         StateItem::Repair {
             target: entity.head,
             delta: EntityDelta { entity_id: entity.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } },

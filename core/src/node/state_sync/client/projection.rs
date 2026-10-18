@@ -51,11 +51,12 @@ impl Round {
         for id in removed {
             self.remove(id);
         }
-        for leaf in page.leaves {
+        let mut cursor = page.leaves.cursor();
+        while let Some(leaf) = cursor.next() {
             let id = leaf.entity.entity_id;
             self.remove(id);
-            self.addresses.insert(leaf_address(&leaf.key, id), id);
-            self.members.insert(id, QueryMember { key: leaf.key, head: leaf.entity.head });
+            self.addresses.insert(leaf_address(leaf.key, id), id);
+            self.members.insert(id, QueryMember { key: leaf.key.to_vec(), head: leaf.entity.head.to_owned() });
         }
     }
 

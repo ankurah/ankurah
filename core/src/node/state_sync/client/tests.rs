@@ -15,7 +15,7 @@ fn authoritative_range_updates_remove_only_the_exact_interval() -> anyhow::Resul
     let mut members: BTreeMap<_, _> = (0..10).map(|n| (address(n), id(n))).collect();
     let page = proto::TreeSpanInventory {
         bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(7))),
-        leaves: vec![leaf(4), leaf(6)],
+        leaves: vec![leaf(4), leaf(6)].into(),
     };
     replace_members(&mut members, &spec(), page.clone(), super::super::LEAF_PAGE)?;
     replace_members(&mut members, &spec(), page, super::super::LEAF_PAGE)?;
@@ -23,7 +23,7 @@ fn authoritative_range_updates_remove_only_the_exact_interval() -> anyhow::Resul
     replace_members(
         &mut members,
         &spec(),
-        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(4)), Excluded(address(8))), leaves: vec![] },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(4)), Excluded(address(8))), leaves: vec![].into() },
         super::super::LEAF_PAGE,
     )?;
     assert_eq!(members.values().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(8), id(9)]);
@@ -34,10 +34,10 @@ fn authoritative_range_updates_remove_only_the_exact_interval() -> anyhow::Resul
 fn malformed_pages_cannot_partly_replace_membership_or_panic() {
     let original: BTreeMap<_, _> = (0..10).map(|n| (address(n), id(n))).collect();
     let cases = [
-        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Excluded(address(4)), Excluded(address(4))), leaves: vec![] },
-        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(8)), Included(address(2))), leaves: vec![] },
-        proto::TreeSpanInventory { bounds: super::super::whole(), leaves: vec![leaf(4), leaf(3)] },
-        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(4)), Included(address(6))), leaves: vec![leaf(3)] },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Excluded(address(4)), Excluded(address(4))), leaves: vec![].into() },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(8)), Included(address(2))), leaves: vec![].into() },
+        proto::TreeSpanInventory { bounds: super::super::whole(), leaves: vec![leaf(4), leaf(3)].into() },
+        proto::TreeSpanInventory { bounds: proto::TreeSpan::new(Included(address(4)), Included(address(6))), leaves: vec![leaf(3)].into() },
     ];
     for page in cases {
         let mut members = original.clone();
@@ -67,8 +67,8 @@ fn snapshot_pages_derive_sender_keys_targets_and_exact_membership() -> anyhow::R
         .collect::<Vec<_>>();
     let page = proto::SnapshotPage { bounds: super::super::whole(), states: states.clone() };
     let leaves = snapshot_leaves(&spec, &page)?;
-    assert!(leaves.leaves.iter().all(|leaf| !leaf.key.is_empty()));
-    for (leaf, captured) in leaves.leaves.iter().zip(&states) {
+    assert!(leaves.leaves.to_vec().iter().all(|leaf| !leaf.key.is_empty()));
+    for (leaf, captured) in leaves.leaves.to_vec().iter().zip(&states) {
         assert_eq!(leaf.entity.entity_id, captured.payload.entity_id);
         assert_eq!(leaf.entity.head, captured.payload.state.head);
     }

@@ -1,16 +1,19 @@
-//! Benchmark-only prototype; never selected by the production protocol.
+//! Historical codec controls alongside the adopted packed production path.
 //! Run: cargo bench -p ankurah-proto --bench prefix_inventory > results.json
 //! PREFIX_CHECK_ONLY=1 runs correctness checks without timing. PREFIX_SAMPLES
 //! (default 9) and PREFIX_BATCH_MS (default 10) control repeated measurements.
 
 #[path = "prefix_inventory/codec.rs"]
 mod codec;
+#[path = "prefix_inventory/legacy.rs"]
+mod legacy;
 #[path = "prefix_inventory/measure.rs"]
 mod measure;
+use legacy::{SpanContent, TreeSpanInventory};
 
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
 use ankurah_digest_tree::{leaf_address, CanonicalCodec, NodePrefix};
-use ankurah_proto::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, SpanContent, TreeSpan, TreeSpanInventory};
+use ankurah_proto::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, TreeSpan};
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -132,6 +135,7 @@ fn consume_borrowed(bytes: &[u8]) -> u64 {
 #[serde(rename_all = "snake_case")]
 enum Mode {
     CurrentOwned,
+    PackedProduction,
     CurrentOwnedControl,
     CurrentBorrowed,
     CurrentRetained,
@@ -142,8 +146,9 @@ enum Mode {
     PrefixValidatedRetained,
 }
 impl Mode {
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::CurrentOwned,
+        Self::PackedProduction,
         Self::CurrentOwnedControl,
         Self::CurrentBorrowed,
         Self::CurrentRetained,
@@ -156,9 +161,24 @@ impl Mode {
     fn prefix(self) -> bool {
         matches!(self, Self::PrefixOwned | Self::PrefixBorrowed | Self::PrefixRetained | Self::PrefixValidatedRetained)
     }
+    fn packed(self) -> bool { matches!(self, Self::PackedProduction) }
     fn run(self, input: &[u8]) -> u64 {
         let input = black_box(input);
         match self {
+            Self::PackedProduction => {
+                let ankurah_proto::SpanContent::Heads(page) = bincode::deserialize(input).unwrap() else { panic!("inventory") };
+                let mut hash = DefaultHasher::new();
+                let mut cursor = page.leaves.cursor();
+                while let Some(leaf) = cursor.next() {
+                    hash.write(leaf.key);
+                    hash.write(&leaf.entity.entity_id.to_bytes());
+                    for (generation, id) in leaf.entity.head.entries() {
+                        hash.write_u32(generation);
+                        hash.write(id.as_bytes());
+                    }
+                }
+                hash.finish()
+            }
             Self::CurrentOwned => {
                 let SpanContent::Heads(page) = bincode::deserialize(input).unwrap() else { panic!("inventory") };
                 consume_owned(&page)
@@ -198,6 +218,7 @@ struct Case {
     clock_tips: usize,
     current_bytes: usize,
     prefix_bytes: usize,
+    packed_bytes: usize,
     choose_prefix: bool,
     measurements: Vec<Measurement>,
 }
@@ -224,12 +245,26 @@ fn main() {
         let current = bincode::serialize(&SpanContent::Heads(fixture.page.clone())).unwrap();
         assert_eq!(current, codec::encode(&fixture.page, false), "plain packed control must equal production bytes");
         let prefix = codec::encode(&fixture.page, true);
+        let packed = bincode::serialize(&ankurah_proto::SpanContent::Heads(ankurah_proto::TreeSpanInventory {
+            bounds: fixture.page.bounds.clone(),
+            leaves: fixture.page.leaves.clone().into(),
+        }))
+        .unwrap();
+        let ankurah_proto::SpanContent::Heads(decoded) = bincode::deserialize(&packed).unwrap() else { panic!("inventory") };
+        assert_eq!(decoded.bounds, fixture.page.bounds);
+        assert_eq!(serde_json::to_value(decoded.leaves).unwrap(), serde_json::to_value(&fixture.page.leaves).unwrap());
         codec::verify(&fixture.page, &current);
         codec::verify(&fixture.page, &prefix);
         let expected = consume_owned(&fixture.page);
         let mut measurements = Vec::new();
         for mode in Mode::ALL {
-            let bytes = if mode.prefix() { &prefix } else { &current };
+            let bytes = if mode.packed() {
+                &packed
+            } else if mode.prefix() {
+                &prefix
+            } else {
+                &current
+            };
             assert_eq!(mode.run(bytes), expected, "{} {mode:?}", fixture.name);
             if check_only {
                 continue;
@@ -257,7 +292,13 @@ fn main() {
             for offset in 0..measurements.len() {
                 let index = (offset + round) % measurements.len();
                 let measured = &mut measurements[index];
-                let bytes = if measured.mode.prefix() { &prefix } else { &current };
+                let bytes = if measured.mode.packed() {
+                    &packed
+                } else if measured.mode.prefix() {
+                    &prefix
+                } else {
+                    &current
+                };
                 let elapsed = batch(measured.mode, bytes, measured.iterations_per_sample);
                 measured.samples_ns.push(elapsed.as_nanos() as f64 / measured.iterations_per_sample as f64);
             }
@@ -274,17 +315,18 @@ fn main() {
             clock_tips: fixture.page.leaves.iter().map(|leaf| leaf.entity.head.len()).sum(),
             current_bytes: current.len(),
             prefix_bytes: prefix.len(),
+            packed_bytes: packed.len(),
             choose_prefix: prefix.len() < current.len(),
             measurements,
         });
     }
     let output = serde_json::json!({
-        "prototype": "benchmark-only; production codec unchanged", "check_only": check_only,
+        "prototype": "ae2fb892 owned baseline and experimental controls versus current packed production codec", "check_only": check_only,
         "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
         "rustc": std::process::Command::new("rustc").arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned()).ok(),
         "samples": samples, "target_batch_ms": target_ms,
         "endpoint": "decode and visit/hash every key, ID and normalized clock tip; output drop included",
-        "allocation_scope": "decode+visit only; fixture and existing wire buffer excluded; retained modes include one wire-buffer copy",
+        "allocation_scope": "decode+visit only; fixture and existing wire buffer excluded; retained modes and packed_production include a wire-buffer copy",
         "allocator": "System wrapper; allocation counting disabled during timings, enabled flag check remains",
         "wire_scope": "one SpanContent::Heads envelope; TreeSpec and outer request excluded",
         "limits": "fixtures fit 2048 heads and a 256KiB compact blob; prototype also bounds expanded key work",
