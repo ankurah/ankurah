@@ -1,5 +1,6 @@
 use super::*;
 use crate::{changes::EntityChange, node::applier::Delivery, reactor::ChangeNotification};
+use ankurah_digest_tree::CanonicalCodec;
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -150,7 +151,7 @@ pub(super) struct Driver {
     pub through: u64,
     pub feedback: Arc<Feedback>,
     pub stream: IncomingStream,
-    pub comparison: proto::StateStreamId,
+    pub stream_id: proto::StateStreamId,
     round_number: u64,
     received_revision: u64,
     waiting_applied: bool,
@@ -173,7 +174,7 @@ impl Driver {
         snapshot: Snapshot,
         round: proto::StateRound,
         stream: IncomingStream,
-        comparison: proto::StateStreamId,
+        stream_id: proto::StateStreamId,
     ) -> anyhow::Result<Self> {
         ensure!(round.number == 0, "initial round number is not zero");
         let spec = snapshot.spec.clone();
@@ -203,7 +204,7 @@ impl Driver {
             through: 0,
             feedback: Arc::new(Feedback::default()),
             stream,
-            comparison,
+            stream_id,
             round_number: 0,
             received_revision: round.revision,
             waiting_applied: false,
@@ -657,8 +658,8 @@ impl Driver {
             match item {
                 StateItem::Digest(head) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
-                    let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
-                    answers.push(StateAnswer::Digest(self.projection.round.as_mut().unwrap().snapshot.head(head.bounds).await?));
+                    head.validate()?;
+                    answers.push(StateAnswer::Digest(self.projection.round.as_mut().unwrap().snapshot.span_digest(head.bounds).await?));
                 }
                 StateItem::NeedHeads(bounds) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
@@ -667,8 +668,8 @@ impl Driver {
                 StateItem::Heads(page) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
                     ensure!(4 + page.expanded_size() <= super::super::PAGE_BYTES as u64, "peer head inventory exceeds decoded-work budget");
-                    let mut validation = BTreeMap::new();
-                    replace_members(&mut validation, &self.spec, page.clone(), super::super::HEAD_PAGE)?;
+                    ensure!(page.heads.len() <= super::super::HEAD_PAGE, "peer sent too many heads");
+                    page.validate(&self.spec)?;
                     let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         self.add_goal(owner, leaf.entity.entity_id, leaf.entity.head.to_owned())?;
@@ -678,8 +679,7 @@ impl Driver {
                 StateItem::Snapshots(page) => {
                     ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
                     let inventory = snapshot_inventory(&self.spec, &page)?;
-                    let mut validation = BTreeMap::new();
-                    replace_members(&mut validation, &self.spec, inventory.clone(), super::super::MAX_SNAPSHOT_ROWS)?;
+                    inventory.validate(&self.spec)?;
                     self.projection.round.as_mut().unwrap().replace(inventory);
                     for state in page.states {
                         let id = state.payload.entity_id;
@@ -811,7 +811,7 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(frame.comparison == self.comparison, "state stream identity changed");
+        ensure!(frame.stream == self.stream_id, "state stream identity changed");
         self.through = frame.sequence;
         let mut answers = Vec::new();
         let mut answer_round = None;
@@ -866,7 +866,7 @@ impl Driver {
             node,
             peer,
             credentials,
-            self.comparison,
+            self.stream_id,
             self.through,
             answer_round,
             self.applied_through,
@@ -970,7 +970,7 @@ impl Driver {
                     node,
                     peer,
                     credentials,
-                    self.comparison,
+                    self.stream_id,
                     self.through,
                     round,
                     self.applied_through,
@@ -1167,10 +1167,10 @@ impl Driver {
         self.waiting_applied = true;
         let node = node.weak();
         let credentials = credentials.to_vec();
-        let comparison = self.comparison;
+        let stream_id = self.stream_id;
         self.controls.push(Box::pin(async move {
             if let Some(node) = node.upgrade() {
-                finish_state_round(&node, peer, comparison, number, &credentials, proto::StateRoundOutcome::Cancelled).await?;
+                finish_state_round(&node, peer, stream_id, number, &credentials, proto::StateRoundOutcome::Cancelled).await?;
             }
             Ok(())
         }));
@@ -1186,12 +1186,12 @@ impl Driver {
         self.waiting_applied = true;
         let node = node.weak();
         let credentials = credentials.to_vec();
-        let comparison = self.comparison;
+        let stream_id = self.stream_id;
         let round = self.round_number;
         let outcome = proto::StateRoundOutcome::Applied { processed_through: self.through };
         self.controls.push(Box::pin(async move {
             if let Some(node) = node.upgrade() {
-                finish_state_round(&node, peer, comparison, round, &credentials, outcome).await?;
+                finish_state_round(&node, peer, stream_id, round, &credentials, outcome).await?;
             }
             Ok(())
         }));
@@ -1229,13 +1229,13 @@ impl Driver {
         self.pending_round = Some(PendingRound { number, snapshot, request: reply });
         let node = node.weak();
         let credentials = credentials.to_vec();
-        let comparison = self.comparison;
+        let stream_id = self.stream_id;
         self.controls.push(Box::pin(async move {
             let node = node.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
             let response = state_deadline(node.request(
                 peer,
                 &credentials,
-                proto::NodeRequestBody::RefreshState { comparison, round: number, known_state },
+                proto::NodeRequestBody::RefreshState { stream: stream_id, round: number, known_state },
             ))
             .await??;
             ensure!(matches!(response, proto::NodeResponseBody::Success), "refresh rejected: {response:?}");
@@ -1271,7 +1271,7 @@ impl Driver {
                     &node,
                     peer,
                     credentials,
-                    self.comparison,
+                    self.stream_id,
                     self.through,
                     None,
                     self.applied_through,

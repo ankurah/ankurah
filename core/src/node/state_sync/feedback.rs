@@ -40,7 +40,7 @@ impl Feedback {
         node: &Node<SE, PA>,
         peer: proto::EntityId,
         credentials: &[PA::ContextData],
-        comparison: proto::StateStreamId,
+        stream_id: proto::StateStreamId,
         through: u64,
         round: Option<u64>,
         applied_through: Option<u64>,
@@ -105,7 +105,7 @@ impl Feedback {
                         .request(
                             peer,
                             &credentials,
-                            proto::NodeRequestBody::ContinueState { comparison, round, processed_through, applied_through, answers },
+                            proto::NodeRequestBody::ContinueState { stream: stream_id, round, processed_through, applied_through, answers },
                         )
                         .fuse();
                     let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(120)).fuse();

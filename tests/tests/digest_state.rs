@@ -29,8 +29,8 @@ impl Trace {
         let comparisons: HashSet<_> = messages
             .iter()
             .filter_map(|message| match message {
-                NodeResponseBody::Fetch(state) if query.is_none() => Some(state.frame.comparison),
-                NodeResponseBody::QuerySubscribed { query_id, state } if Some(*query_id) == query => Some(state.frame.comparison),
+                NodeResponseBody::Fetch(state) if query.is_none() => Some(state.frame.stream),
+                NodeResponseBody::QuerySubscribed { query_id, state } if Some(*query_id) == query => Some(state.frame.stream),
                 _ => None,
             })
             .collect();
@@ -42,7 +42,7 @@ impl Trace {
                 _ => None,
             })
             .chain(pushed.iter())
-            .filter(|frame| comparisons.contains(&frame.comparison))
+            .filter(|frame| comparisons.contains(&frame.stream))
             .flat_map(|frame| match &frame.body {
                 proto::StateFrameBody::State { items, .. } => items.clone(),
                 _ => vec![],
@@ -350,7 +350,10 @@ async fn live_edits_cross_unfinished_comparison_then_reconnect_from_retained_sta
                 return false;
             }
             if let NodeMessage::Request {
-                request: proto::NodeRequest { body: proto::NodeRequestBody::ContinueState { comparison, round: Some(0), answers, .. }, .. },
+                request:
+                    proto::NodeRequest {
+                        body: proto::NodeRequestBody::ContinueState { stream: comparison, round: Some(0), answers, .. }, ..
+                    },
                 ..
             } = message
             {
@@ -468,7 +471,7 @@ async fn repeated_refresh_reuses_the_standing_stream_and_keeps_live_delivery() -
     };
     let replies = initial();
     assert_eq!(replies.len(), 1);
-    let stream = replies[0].frame.comparison;
+    let stream = replies[0].frame.stream;
 
     for round in 1..=10 {
         let age = round.to_string();
@@ -487,7 +490,7 @@ async fn repeated_refresh_reuses_the_standing_stream_and_keeps_live_delivery() -
             .unwrap()
             .iter()
             .filter_map(|frame| match frame.body {
-                proto::StateFrameBody::BeginRound(start) if frame.comparison == stream => Some(start.number),
+                proto::StateFrameBody::BeginRound(start) if frame.stream == stream => Some(start.number),
                 _ => None,
             })
             .collect();
@@ -592,7 +595,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
         )
         .await?;
     let NodeResponseBody::Fetch(state) = response else { panic!("{response:?}") };
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     assert!(matches!(
         client
             .request(
@@ -614,7 +617,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 server.id,
                 &no_credentials,
                 proto::NodeRequestBody::ContinueState {
-                    comparison,
+                    stream: comparison,
                     round: None,
                     processed_through: 0,
                     applied_through: None,
@@ -630,7 +633,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 server.id,
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::ContinueState {
-                    comparison,
+                    stream: comparison,
                     round: Some(0),
                     applied_through: None,
                     processed_through: 0,
@@ -650,7 +653,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 server.id,
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::ContinueState {
-                    comparison,
+                    stream: comparison,
                     round: None,
                     processed_through: 0,
                     applied_through: None,
@@ -666,7 +669,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 server.id,
                 &DEFAULT_CONTEXT,
                 proto::NodeRequestBody::ContinueState {
-                    comparison,
+                    stream: comparison,
                     round: Some(0),
                     applied_through: None,
                     processed_through: 0,
@@ -677,7 +680,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 }
             )
             .await?,
-        NodeResponseBody::ComparisonUnavailable { .. }
+        NodeResponseBody::StateStreamUnavailable { .. }
     ));
     Ok(())
 }
@@ -775,9 +778,14 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
     wait_for(|| replies().len() == 2).await;
     let initial = replies().remove(0);
     assert_eq!(bincode::serialize(&initial)?, bincode::serialize(&replies()[1])?);
-    let comparison = initial.frame.comparison;
-    let feedback =
-        proto::NodeRequestBody::ContinueState { comparison, round: None, processed_through: 0, applied_through: None, answers: vec![] };
+    let comparison = initial.frame.stream;
+    let feedback = proto::NodeRequestBody::ContinueState {
+        stream: comparison,
+        round: None,
+        processed_through: 0,
+        applied_through: None,
+        answers: vec![],
+    };
     let request = proto::RequestId::new();
     for _ in 0..2 {
         server
@@ -792,7 +800,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
             })
             .await?;
     }
-    assert!(trace.1.lock().unwrap().iter().all(|frame| frame.comparison != comparison), "receipt retries cannot create extra state output");
+    assert!(trace.1.lock().unwrap().iter().all(|frame| frame.stream != comparison), "receipt retries cannot create extra state output");
     server
         .handle_message(NodeMessage::Request {
             auth: vec![proto::AuthData(vec![])],
@@ -805,7 +813,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
             .lock()
             .unwrap()
             .iter()
-            .any(|body| matches!(body, NodeResponseBody::ComparisonUnavailable { comparison: id } if *id == comparison))
+            .any(|body| matches!(body, NodeResponseBody::StateStreamUnavailable { stream: id } if *id == comparison))
     })
     .await;
     server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
@@ -827,7 +835,7 @@ async fn fetch_restarts_when_unfinished_chunk_transfer_expires() -> Result<()> {
                 if let NodeResponseBody::Fetch(state) = &response.body {
                     let mut comparison = held.lock().unwrap();
                     if comparison.is_none() {
-                        *comparison = Some(state.frame.comparison);
+                        *comparison = Some(state.frame.stream);
                         return true;
                     }
                 }
@@ -841,7 +849,7 @@ async fn fetch_restarts_when_unfinished_chunk_transfer_expires() -> Result<()> {
     let fetch = tokio::spawn(async move { reader.fetch::<PetView>("true").await });
     wait_for(|| held.lock().unwrap().is_some()).await;
     let comparison = held.lock().unwrap().unwrap();
-    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
+    ankurah::core::test_helpers::expire_state_stream(&server, client.id, comparison).await?;
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("2")?;
     trx.commit().await?;
@@ -932,7 +940,7 @@ async fn oversized_source_publication_restarts_and_recovers_after_writes_settle(
         .unwrap()
         .iter()
         .find_map(|body| match body {
-            NodeResponseBody::QuerySubscribed { query_id, state } if *query_id == query.query_id() => Some(state.frame.comparison),
+            NodeResponseBody::QuerySubscribed { query_id, state } if *query_id == query.query_id() => Some(state.frame.stream),
             _ => None,
         })
         .unwrap();
@@ -945,12 +953,7 @@ async fn oversized_source_publication_restarts_and_recovers_after_writes_settle(
         "one captured state must exceed the source reader's 8 MiB state-plus-events budget"
     );
     wait_for(|| {
-        trace
-            .1
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|frame| frame.comparison == initial && matches!(frame.body, proto::StateFrameBody::RestartRequired))
+        trace.1.lock().unwrap().iter().any(|frame| frame.stream == initial && matches!(frame.body, proto::StateFrameBody::RestartRequired))
     })
     .await;
     assert_eq!(retained.title()?, "old", "the held stream metadata prevents receiver application");
@@ -972,7 +975,7 @@ async fn oversized_source_publication_restarts_and_recovers_after_writes_settle(
     assert!(
         trace.0.lock().unwrap().iter().any(|body| matches!(body,
         NodeResponseBody::QuerySubscribed { query_id, state }
-            if *query_id == query.query_id() && state.frame.comparison != initial)),
+            if *query_id == query.query_id() && state.frame.stream != initial)),
         "recovery must establish a new stream after the explicit restart"
     );
     Ok(())
@@ -1014,19 +1017,19 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
         )
         .await?;
     let NodeResponseBody::QuerySubscribed { state, .. } = response else { panic!("{response:?}") };
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("2")?;
     trx.commit().await?;
     wait_for(|| established.peek()[0].age().unwrap() == "2").await;
-    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
+    ankurah::core::test_helpers::expire_state_stream(&server, client.id, comparison).await?;
     wait_for(|| {
         trace
             .1
             .lock()
             .unwrap()
             .iter()
-            .any(|frame| frame.comparison == comparison && matches!(frame.body, proto::StateFrameBody::RestartRequired))
+            .any(|frame| frame.stream == comparison && matches!(frame.body, proto::StateFrameBody::RestartRequired))
     })
     .await;
     assert!(matches!(
@@ -1041,7 +1044,7 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
                 }
             )
             .await?,
-        NodeResponseBody::ComparisonUnavailable { .. }
+        NodeResponseBody::StateStreamUnavailable { .. }
     ));
     server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     let trx = writer.begin();
@@ -1075,12 +1078,12 @@ async fn pushed_chunks_can_outrun_metadata_and_arrive_out_of_order_without_early
                 NodeMessage::Response(proto::NodeResponse { body: NodeResponseBody::QuerySubscribed { query_id, state }, .. })
                     if Some(*query_id) == *target.lock().unwrap() =>
                 {
-                    *comparison.lock().unwrap() = Some(state.frame.comparison);
+                    *comparison.lock().unwrap() = Some(state.frame.stream);
                     parked.store(true, Ordering::Release);
                     true
                 }
                 NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                    Some(frame.comparison) == *comparison.lock().unwrap()
+                    Some(frame.stream) == *comparison.lock().unwrap()
                 }
                 _ => false,
             }

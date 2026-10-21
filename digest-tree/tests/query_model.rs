@@ -61,7 +61,7 @@ async fn mixed_directions_limits_and_pages_match_a_sorted_model() {
                     }
                 }
                 assert_eq!(rows, expected.iter().map(|(_, _, leaf)| leaf.entity_id).collect::<Vec<_>>());
-                for head in tx.heads(&scope).await.unwrap() {
+                for head in tx.span_digests(&scope).await.unwrap() {
                     let refined: Digest = tx.refine(&head).await.unwrap().iter().map(|head| head.digest).sum();
                     assert_eq!(refined, head.digest);
                 }
@@ -189,7 +189,7 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
     let scope = tx.scope(&TreeRequest::for_selection(&query, &types()).unwrap()).await.unwrap();
     assert_eq!(tx.count(&scope).await.unwrap(), 20);
     let scope = tx.scope_ranges([ankurah_digest_tree::TreeSpan::all()]);
-    let root = tx.heads(&scope).await.unwrap().pop().unwrap();
+    let root = tx.span_digests(&scope).await.unwrap().pop().unwrap();
     let children = tx.refine(&root).await.unwrap();
     assert_eq!(children.iter().map(|head| head.digest).sum::<Digest>(), root.digest);
     for head in children {
@@ -198,5 +198,31 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
         let mut invalid = head.to_bytes();
         invalid.push(0);
         assert!(ankurah_digest_tree::TreeSpanDigest::<ankurah_digest_tree::Ristretto255>::from_bytes(&invalid).is_err());
+    }
+}
+
+#[test]
+fn typed_and_decoded_span_digests_reject_the_same_invalid_bounds_and_counts() {
+    use ankurah_digest_tree::{NodePrefix, TreeSpan, TreeSpanDigest};
+    use std::ops::Bound::{Excluded, Included};
+
+    let prefix = NodePrefix::of(&[0x80], 1);
+    let valid = TreeSpanDigest::<ankurah_digest_tree::Ristretto255> {
+        prefix: prefix.clone(),
+        bounds: TreeSpan::under(&prefix),
+        digest: Digest::empty(),
+    };
+    valid.validate().unwrap();
+    assert_eq!(TreeSpanDigest::from_bytes(&valid.to_bytes()).unwrap(), valid);
+    let leaf = Digest::from(Leaf::new(&[], entity(1), HeadHash::of([[1; 32]])).element());
+    let invalid = [
+        TreeSpanDigest { bounds: TreeSpan::new(Excluded(vec![0x80]), Included(vec![0x80])), ..valid.clone() },
+        TreeSpanDigest { bounds: TreeSpan::new(Included(vec![0x90]), Included(vec![0x80])), ..valid.clone() },
+        TreeSpanDigest { bounds: TreeSpan::all(), ..valid.clone() },
+        TreeSpanDigest { digest: -leaf, ..valid },
+    ];
+    for head in invalid {
+        assert!(head.validate().is_err());
+        assert!(TreeSpanDigest::<ankurah_digest_tree::Ristretto255>::from_bytes(&head.to_bytes()).is_err());
     }
 }

@@ -1,30 +1,29 @@
 //! Live-query bookkeeping without keeping queries alive.
 
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+
+use ankurah_proto::QueryId;
 
 use super::{inner::LiveQueryInner, EntityLiveQuery, WeakEntityLiveQuery};
 
 pub(crate) struct LiveQueryRegistry {
-    // Each weak value keeps its allocation address reserved.
-    entries: std::sync::Mutex<HashMap<usize, WeakEntityLiveQuery>>,
+    entries: std::sync::Mutex<HashMap<QueryId, WeakEntityLiveQuery>>,
 }
 
 impl LiveQueryRegistry {
     pub(crate) fn new() -> Self { Self { entries: std::sync::Mutex::new(HashMap::new()) } }
 
-    pub(crate) fn get(&self, id: ankurah_proto::QueryId) -> Option<EntityLiveQuery> {
-        let entries: Vec<_> = self.entries.lock().unwrap_or_else(|error| error.into_inner()).values().cloned().collect();
-        entries.iter().filter_map(WeakEntityLiveQuery::upgrade).find(|query| query.query_id() == id)
+    pub(crate) fn get(&self, id: QueryId) -> Option<EntityLiveQuery> {
+        let entry = self.entries.lock().unwrap_or_else(|error| error.into_inner()).get(&id).cloned();
+        entry.and_then(|query| query.upgrade())
     }
 
     pub(super) fn insert(&self, query: &EntityLiveQuery) {
-        let address = Arc::as_ptr(&query.0) as usize;
-        self.entries.lock().unwrap_or_else(|error| error.into_inner()).insert(address, query.weak());
+        self.entries.lock().unwrap_or_else(|error| error.into_inner()).insert(query.query_id(), query.weak());
     }
 
     pub(super) fn unregister(&self, query: &LiveQueryInner) {
-        let address = query as *const LiveQueryInner as usize;
-        self.entries.lock().unwrap_or_else(|error| error.into_inner()).remove(&address);
+        self.entries.lock().unwrap_or_else(|error| error.into_inner()).remove(&query.query_id);
     }
 }
 
@@ -37,6 +36,7 @@ mod tests {
         policy::{PermissiveAgent, DEFAULT_CONTEXT},
         test_utils::TestStorage,
     };
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn clones_share_one_registration_until_the_last_handle_drops() {
@@ -48,10 +48,10 @@ mod tests {
             super::super::QueryResolution::Pending(Box::pin(futures::future::pending())),
         )
         .unwrap();
-        let address = Arc::as_ptr(&query.0) as usize;
+        let id = query.query_id();
         let clone = query.clone();
         node.live_queries.insert(&clone);
-        let registered = || node.live_queries.entries.lock().unwrap().contains_key(&address);
+        let registered = || node.live_queries.get(id).is_some();
         assert!(registered());
         drop(query);
         assert!(registered());

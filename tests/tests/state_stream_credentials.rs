@@ -323,7 +323,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     })
     .await?;
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = &response.body else { unreachable!() };
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     let proto::StateFrameBody::State { items, .. } = &state.frame.body else { unreachable!() };
     assert!(
         items.iter().any(|item| matches!(item, proto::StateItem::Repair { target, delta }
@@ -363,13 +363,13 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     let feedback = agent.feedback.lock().unwrap();
     assert!(
         feedback.iter().any(|(_, request)| matches!(&request.body,
-        proto::NodeRequestBody::ContinueState { comparison: found, answers, .. } if *found == comparison && answers.iter().any(|answer|
+        proto::NodeRequestBody::ContinueState { stream: found, answers, .. } if *found == comparison && answers.iter().any(|answer|
             matches!(answer, proto::StateAnswer::NeedRepair { entity_id, target } if *entity_id == id && *target == captured_target)))),
         "the uncovered initial snapshot must actually request connecting history"
     );
     for (credentials, request) in feedback.iter().filter(|(_, request)| {
         matches!(request.body,
-        proto::NodeRequestBody::ContinueState { comparison: found, .. } | proto::NodeRequestBody::FinishStateRound { stream: found, .. } if found == comparison)
+        proto::NodeRequestBody::ContinueState { stream: found, .. } | proto::NodeRequestBody::FinishStateRound { stream: found, .. } if found == comparison)
     }) {
         assert_eq!(
             *credentials,
@@ -434,7 +434,7 @@ async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_anothe
         }) => response?,
     };
     let proto::NodeResponseBody::Fetch(state) = &response.body else { unreachable!() };
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     drop(fetch);
     drop(alpha);
     assert!(client.storage.get_state(fetched_id).await.is_err(), "the cancelled Fetch must not have installed its held result");
@@ -451,7 +451,7 @@ async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_anothe
                     server.id,
                     &vec![Credential(1)],
                     proto::NodeRequestBody::ContinueState {
-                        comparison,
+                        stream: comparison,
                         round: Some(0),
                         processed_through: u64::MAX,
                         applied_through: None,
@@ -459,7 +459,7 @@ async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_anothe
                     },
                 )
                 .await?;
-            if matches!(result, proto::NodeResponseBody::ComparisonUnavailable { comparison: found } if found == comparison) {
+            if matches!(result, proto::NodeResponseBody::StateStreamUnavailable { stream: found } if found == comparison) {
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;
@@ -470,7 +470,7 @@ async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_anothe
     // A duplicate of the genuine initial metadata must neither resurrect the
     // cancelled Fetch nor abandon a different stream on this connection.
     client.handle_message(proto::NodeMessage::Response(response)).await?;
-    ankurah::core::test_helpers::expire_comparison(&server, client.id, comparison).await?;
+    ankurah::core::test_helpers::expire_state_stream(&server, client.id, comparison).await?;
     let watcher = TestWatcher::changeset();
     let _guard = query.subscribe(&watcher);
     let trx = writer.begin();
@@ -562,7 +562,7 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
                     server.id,
                     &vec![Credential(1)],
                     proto::NodeRequestBody::ContinueState {
-                        comparison,
+                        stream: comparison,
                         round: Some(0),
                         processed_through: u64::MAX,
                         applied_through: None,
@@ -570,7 +570,7 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
                     },
                 )
                 .await?;
-            if matches!(response, proto::NodeResponseBody::ComparisonUnavailable { comparison: found } if found == comparison) {
+            if matches!(response, proto::NodeResponseBody::StateStreamUnavailable { stream: found } if found == comparison) {
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;

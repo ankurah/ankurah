@@ -6,18 +6,17 @@ mod client;
 mod feedback;
 mod incoming;
 mod server;
+pub(crate) mod source;
 mod tree;
 
 pub(crate) use client::{abandon_current_state, finish_state, receive_state, request_state, RefreshHandle};
 pub(crate) use incoming::{Inbox, IncomingStates, IncomingStream};
-pub(crate) use server::expire_comparison;
-#[cfg(test)]
-pub(crate) use server::pump_comparison;
+pub(crate) use server::expire_state_stream;
 pub(crate) use server::{
-    abandon_state_stream, comparison_bypasses_policy, continue_state, finish_state_round, kick_comparison, queue_live, schedule_round,
-    source_unavailable, start_comparison, Comparisons,
+    abandon_state_stream, continue_state, finish_state_round, kick_state_stream, queue_live, schedule_round, source_unavailable,
+    start_state_stream, state_stream_bypasses_policy, StateStreams,
 };
-pub(crate) use tree::{QueryTree, Snapshot};
+pub(crate) use tree::{QueryTreeCache, Snapshot};
 
 // Local responder limits, deliberately absent from the wire request.
 const PAGE_BYTES: usize = 64 * 1024;

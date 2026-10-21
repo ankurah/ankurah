@@ -52,14 +52,14 @@ impl Captured {
             proto::NodeMessage::Response(response) => {
                 if let proto::NodeResponseBody::QuerySubscribed { query_id, state } = &response.body {
                     streams.insert(
-                        state.frame.comparison,
+                        state.frame.stream,
                         ScriptedRoute {
                             request: response.request_id.clone(),
                             query: *query_id,
                             from: response.from,
                             to: response.to,
                             source_index: out.src,
-                            comparison: state.frame.comparison,
+                            comparison: state.frame.stream,
                             next_sequence: state.frame.sequence + 1,
                             next_revision: state.round.revision + 1,
                             scripted: false,
@@ -69,7 +69,7 @@ impl Captured {
                 }
             }
             proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                if let Some(stream) = streams.get_mut(&frame.comparison) {
+                if let Some(stream) = streams.get_mut(&frame.stream) {
                     if stream.scripted {
                         return;
                     }
@@ -87,7 +87,7 @@ impl Captured {
             }
             proto::NodeMessage::Request { request, .. } => {
                 let comparison = match request.body {
-                    proto::NodeRequestBody::ContinueState { comparison, .. }
+                    proto::NodeRequestBody::ContinueState { stream: comparison, .. }
                     | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => Some(comparison),
                     _ => None,
                 };
@@ -131,7 +131,7 @@ impl Captured {
         let stream = streams.get_mut(&comparison).expect("captured standing origin");
         stream.scripted = true;
         let frame = proto::StateFrame {
-            comparison: stream.comparison,
+            stream: stream.comparison,
             sequence: stream.next_sequence,
             body: proto::StateFrameBody::Live {
                 revision: stream.next_revision,
@@ -269,7 +269,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { state, .. } => format!("subscribed {}", state_descriptor(state)),
-        proto::NodeResponseBody::ComparisonUnavailable { .. } => "comparison unavailable".into(),
+        proto::NodeResponseBody::StateStreamUnavailable { .. } => "state stream unavailable".into(),
         proto::NodeResponseBody::StateCaptureBusy => "state capture busy".into(),
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable

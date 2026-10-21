@@ -109,7 +109,7 @@ impl Meter {
                     proto::NodeRequestBody::Fetch { selection, .. } | proto::NodeRequestBody::SubscribeQuery { selection, .. } => {
                         self.model.is_some_and(|model| selection.predicate.referenced_models().contains(&model))
                     }
-                    proto::NodeRequestBody::ContinueState { comparison, .. }
+                    proto::NodeRequestBody::ContinueState { stream: comparison, .. }
                     | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => self.comparisons.contains(comparison),
                     _ => false,
                 };
@@ -128,7 +128,7 @@ impl Meter {
                 self.traffic.response_bytes += bincode::serialized_size(message).unwrap() as usize;
                 let page = match &response.body {
                     proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
-                        self.comparisons.insert(state.frame.comparison);
+                        self.comparisons.insert(state.frame.stream);
                         Some(&state.frame)
                     }
                     _ => None,

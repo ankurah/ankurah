@@ -8,7 +8,7 @@ use crate::{
     session::ContextData,
     storage::StorageEngine,
 };
-use ankurah_digest_tree::{leaf_address, CanonicalCodec, NodePrefix};
+use ankurah_digest_tree::{leaf_address, NodePrefix};
 use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan};
 use anyhow::{bail, ensure};
 use std::{
@@ -21,8 +21,8 @@ use std::{
 };
 use web_time::Instant;
 
-const COMPARISON_TTL: Duration = Duration::from_secs(120);
-const MAX_COMPARISONS: usize = 128;
+const STREAM_TTL: Duration = Duration::from_secs(120);
+const MAX_STATE_STREAMS: usize = 128;
 const MAX_FEEDBACK: usize = 256;
 const MAX_OFFERED_TARGETS: usize = 100_000;
 // Initial request identities live for the connection lifetime; reaching this
@@ -35,7 +35,7 @@ const MAX_LIVE_ITEMS: usize = 4096;
 #[cfg(test)]
 mod tests;
 
-pub(crate) struct Comparisons<CD: ContextData> {
+pub(crate) struct StateStreams<CD: ContextData> {
     sessions: Mutex<HashMap<StateStreamId, Arc<Session<CD>>>>,
     closed: Mutex<VecDeque<StateStreamId>>,
     retired: Mutex<VecDeque<RetiredOrigin<CD>>>,
@@ -49,7 +49,7 @@ struct RetiredOrigin<CD> {
     last_sent: u64,
     catalog: bool,
 }
-impl<CD: ContextData> Default for Comparisons<CD> {
+impl<CD: ContextData> Default for StateStreams<CD> {
     fn default() -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
@@ -139,7 +139,7 @@ struct Stream {
     applied_through: Option<u64>,
     next_lane: usize,
 }
-impl<CD: ContextData> Comparisons<CD> {
+impl<CD: ContextData> StateStreams<CD> {
     pub fn get(&self, id: &StateStreamId) -> Option<Arc<Session<CD>>> { self.sessions.lock().unwrap().get(id).cloned() }
     pub fn remove(&self, id: &StateStreamId) -> Option<Arc<Session<CD>>> {
         let session = self.sessions.lock().unwrap().remove(id)?;
@@ -154,7 +154,7 @@ impl<CD: ContextData> Comparisons<CD> {
             last_sent: session.sent.load(Ordering::Acquire),
             catalog: session.catalog,
         });
-        if retired.len() > MAX_COMPARISONS {
+        if retired.len() > MAX_STATE_STREAMS {
             retired.pop_front();
         }
         Some(session)
@@ -172,7 +172,7 @@ impl<CD: ContextData> Comparisons<CD> {
         if !closed.contains(&id) {
             closed.push_back(id);
         }
-        if closed.len() > MAX_COMPARISONS {
+        if closed.len() > MAX_STATE_STREAMS {
             closed.pop_front();
         }
     }
@@ -204,7 +204,7 @@ impl<CD: ContextData> Comparisons<CD> {
             ensure!(session.fingerprint == fingerprint && session.permits(credentials), "initial retry changed its request");
             let initial = session.initial.lock().unwrap();
             let Some(initial) = initial.as_ref() else {
-                return Ok(Some(proto::NodeResponseBody::ComparisonUnavailable { comparison: id }));
+                return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: id }));
             };
             let reply = proto::StateReply { spec: session.spec.clone(), round: session.initial_round, frame: (**initial).clone() };
             return Ok(Some(match session.query {
@@ -217,10 +217,10 @@ impl<CD: ContextData> Comparisons<CD> {
                 origin.fingerprint == fingerprint && same_credentials(&origin.credentials, credentials),
                 "retired initial retry changed its request"
             );
-            return Ok(Some(proto::NodeResponseBody::ComparisonUnavailable { comparison: origin.id }));
+            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: origin.id }));
         }
         if let Some(id) = self.origins.lock().unwrap().get(request) {
-            return Ok(Some(proto::NodeResponseBody::ComparisonUnavailable { comparison: *id }));
+            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: *id }));
         }
         Ok(None)
     }
@@ -531,7 +531,7 @@ impl Stream {
     }
 }
 
-pub(crate) fn comparison_bypasses_policy<SE, PA>(
+pub(crate) fn state_stream_bypasses_policy<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     body: &proto::NodeRequestBody,
@@ -542,20 +542,20 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let id = match body {
-        proto::NodeRequestBody::ContinueState { comparison, .. }
-        | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. }
-        | proto::NodeRequestBody::RefreshState { comparison, .. } => comparison,
+        proto::NodeRequestBody::ContinueState { stream, .. }
+        | proto::NodeRequestBody::FinishStateRound { stream, .. }
+        | proto::NodeRequestBody::RefreshState { stream, .. } => stream,
         _ => return crate::schema::request_bypasses_policy(body),
     };
     let Some(connection) = node.peer_connections.get(&peer) else { return false };
     if outgoing {
-        connection.outgoing_comparisons.get(id).is_some_and(|catalog| catalog)
+        connection.outgoing_state_streams.get(id).is_some_and(|catalog| catalog)
     } else {
-        connection.comparisons.bypasses_policy(id)
+        connection.state_streams.bypasses_policy(id)
     }
 }
 
-pub(crate) async fn start_comparison<SE, PA>(
+pub(crate) async fn start_state_stream<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     request: proto::RequestId,
@@ -576,7 +576,7 @@ where
     let id = StateStreamId::new();
     let round = proto::StateRound { number: 0, revision };
     let body = comparison.reply(node, &credentials, catalog, query.is_some(), round.number).await?;
-    let frame = StateFrame { comparison: id, sequence: 0, body };
+    let frame = StateFrame { stream: id, sequence: 0, body };
     let initial = proto::StateReply { spec: comparison.snapshot.spec.clone(), round, frame: frame.clone() };
     let mut state = Stream {
         comparison: Some(comparison),
@@ -624,9 +624,9 @@ where
         _cancel_expiry: cancel_expiry,
     });
     {
-        let mut sessions = connection.comparisons.sessions.lock().unwrap();
-        let mut origins = connection.comparisons.origins.lock().unwrap();
-        ensure!(sessions.len() < MAX_COMPARISONS, "too many open state streams");
+        let mut sessions = connection.state_streams.sessions.lock().unwrap();
+        let mut origins = connection.state_streams.origins.lock().unwrap();
+        ensure!(sessions.len() < MAX_STATE_STREAMS, "too many open state streams");
         ensure!(origins.len() < MAX_ORIGINS, "connection exhausted its bounded origin history");
         ensure!(!origins.contains_key(&session.initial_request), "initial request origin was already used");
         ensure!(!sessions.values().any(|s| s.initial_request == session.initial_request), "initial request already has a stream");
@@ -636,15 +636,15 @@ where
     let node = node.weak();
     crate::task::spawn(async move {
         loop {
-            let expiry = futures_timer::Delay::new(COMPARISON_TTL);
+            let expiry = futures_timer::Delay::new(STREAM_TTL);
             if matches!(futures::future::select(expiry, &mut cancelled).await, futures::future::Either::Right(_)) {
                 break;
             }
             let Some(node) = node.upgrade() else { break };
             let Some(connection) = node.peer_connections.get(&peer) else { break };
-            let Some(session) = connection.comparisons.get(&id) else { break };
+            let Some(session) = connection.state_streams.get(&id) else { break };
             let state = session.state.lock().await;
-            let idle = state.last_activity.elapsed() >= COMPARISON_TTL
+            let idle = state.last_activity.elapsed() >= STREAM_TTL
                 && (state.comparison.is_some()
                     || state.pending_round.is_some()
                     || !state.retained.is_empty()
@@ -652,7 +652,7 @@ where
                     || !session.live.lock().unwrap().publications.is_empty());
             drop(state);
             if idle {
-                let _ = expire_comparison(&node, peer, id).await;
+                let _ = expire_state_stream(&node, peer, id).await;
                 break;
             }
         }
@@ -676,32 +676,32 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-    let Some(session) = connection.comparisons.get(&id) else {
-        return Ok(if answers.is_empty() && connection.comparisons.permits_retired_receipt(id, processed_through, &credentials) {
+    let Some(session) = connection.state_streams.get(&id) else {
+        return Ok(if answers.is_empty() && connection.state_streams.permits_retired_receipt(id, processed_through, &credentials) {
             proto::NodeResponseBody::Success
         } else {
-            proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
+            proto::NodeResponseBody::StateStreamUnavailable { stream: id }
         });
     };
-    ensure!(session.permits(&credentials), "comparison credentials changed");
+    ensure!(session.permits(&credentials), "state stream credentials changed");
     ensure!(answers.len() <= 128, "too many comparison answers");
     let encoded = bincode::serialize(&(round, processed_through, applied_through, &answers))?;
-    ensure!(encoded.len() <= FRAME_BYTES, "comparison feedback exceeds limit");
+    ensure!(encoded.len() <= FRAME_BYTES, "state feedback exceeds limit");
     ensure!(
         encoded.len() as u64 + super::budget::answers_bytes(&answers)? - bincode::serialized_size(&answers)? <= FRAME_BYTES as u64,
-        "comparison feedback exceeds decoded-work limit"
+        "state feedback exceeds decoded-work limit"
     );
     let mut state = session.state.lock().await;
-    if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
-        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+    if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
     }
     if state.failed {
         if !answers.is_empty() {
-            return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+            return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
         }
         state.acknowledge(processed_through)?;
         if processed_through == state.last_sent {
-            connection.comparisons.finish(id);
+            connection.state_streams.finish(id);
         }
         return Ok(proto::NodeResponseBody::Success);
     }
@@ -710,7 +710,7 @@ where
         return Ok(proto::NodeResponseBody::Success);
     }
     if state.retired_feedback.contains(&request) {
-        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
     }
     ensure!(state.retired_feedback.len() < MAX_FEEDBACK_IDS, "stream exhausted control replay history");
     state.acknowledge(processed_through)?;
@@ -741,7 +741,7 @@ where
         state.retired_feedback.insert(retired);
     }
     drop(state);
-    kick_comparison(node, peer, id);
+    kick_state_stream(node, peer, id);
     Ok(proto::NodeResponseBody::Success)
 }
 
@@ -758,17 +758,17 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-    let Some(session) = connection.comparisons.get(&id) else {
-        return Ok(if connection.comparisons.was_closed(&id) {
+    let Some(session) = connection.state_streams.get(&id) else {
+        return Ok(if connection.state_streams.was_closed(&id) {
             proto::NodeResponseBody::Success
         } else {
-            proto::NodeResponseBody::ComparisonUnavailable { comparison: id }
+            proto::NodeResponseBody::StateStreamUnavailable { stream: id }
         });
     };
-    ensure!(session.permits(&credentials), "comparison credentials changed");
+    ensure!(session.permits(&credentials), "state stream credentials changed");
     let mut state = session.state.lock().await;
-    if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) || state.failed {
-        return Ok(proto::NodeResponseBody::ComparisonUnavailable { comparison: id });
+    if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) || state.failed {
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
     }
     if state.retired_round == Some((round, outcome)) {
         return Ok(proto::NodeResponseBody::Success);
@@ -787,10 +787,10 @@ where
     state.comparison = None;
     state.retired_round = Some((round, outcome));
     if session.query.is_none() {
-        connection.comparisons.finish(id);
+        connection.state_streams.finish(id);
     }
     drop(state);
-    kick_comparison(node, peer, id);
+    kick_state_stream(node, peer, id);
     Ok(proto::NodeResponseBody::Success)
 }
 
@@ -802,18 +802,18 @@ where
     // Cleanup grants no data access. Like unsubscribe, ownership is the peer's
     // connection plus its responder-issued handle, not a fresh credential check.
     let Some(connection) = node.peer_connections.get(&peer) else { return };
-    let Some(session) = connection.comparisons.get(&id) else { return };
+    let Some(session) = connection.state_streams.get(&id) else { return };
     let state = session.state.lock().await;
     if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
-        || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
+        || !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
     {
         return;
     }
     // Failed streams must remain abandonable, without asserting round coverage.
-    connection.comparisons.finish(id);
+    connection.state_streams.finish(id);
     drop(state);
     if let Some((query, version)) = session.query {
-        connection.subscription_handler.abandon_comparison(query, version, id).await;
+        connection.subscription_handler.abandon_state_stream(query, version, id).await;
     }
 }
 
@@ -834,7 +834,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-    let session = connection.comparisons.get(&id).ok_or_else(|| anyhow::anyhow!("state stream unavailable"))?;
+    let session = connection.state_streams.get(&id).ok_or_else(|| anyhow::anyhow!("state stream unavailable"))?;
     ensure!(session.query.is_some(), "Fetch cannot refresh a standing query");
     ensure!(snapshot.spec == session.spec && known.spec == session.spec, "refresh changed tree specification");
     let encoded = bincode::serialize(&known)?;
@@ -855,7 +855,7 @@ where
     state.last_refresh = Some((number, encoded));
     state.last_activity = Instant::now();
     drop(state);
-    kick_comparison(node, peer, id);
+    kick_state_stream(node, peer, id);
     Ok(())
 }
 
@@ -871,7 +871,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-    let session = connection.comparisons.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
+    let session = connection.state_streams.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
     ensure!(session.query.is_some(), "Fetch has no live route");
     ensure!(revision > session.initial_round.revision, "live publication does not follow the initial cut");
     ensure!(
@@ -894,7 +894,7 @@ where
     {
         queue.stopped = true;
         drop(queue);
-        kick_comparison(node, peer, id);
+        kick_state_stream(node, peer, id);
         bail!("live queue stopped, out of order, or exhausted");
     }
     queue.bytes += bytes;
@@ -902,17 +902,17 @@ where
     queue.last_revision = Some(revision);
     queue.publications.push_back(LivePublication { revision, items: items.into() });
     drop(queue);
-    kick_comparison(node, peer, id);
+    kick_state_stream(node, peer, id);
     Ok(())
 }
 
-pub(crate) fn kick_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId)
+pub(crate) fn kick_state_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId)
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let Some(connection) = node.peer_connections.get(&peer) else { return };
-    let Some(session) = connection.comparisons.get(&id) else { return };
+    let Some(session) = connection.state_streams.get(&id) else { return };
     session.wake.store(true, Ordering::Release);
     if session.pumping.swap(true, Ordering::AcqRel) {
         return;
@@ -922,9 +922,9 @@ where
         loop {
             session.wake.store(false, Ordering::Release);
             let Some(node) = node.upgrade() else { break };
-            if let Err(error) = pump_comparison(&node, peer, id).await {
+            if let Err(error) = pump_state_stream(&node, peer, id).await {
                 tracing::warn!(%error, "state stream failed");
-                let _ = expire_comparison(&node, peer, id).await;
+                let _ = expire_state_stream(&node, peer, id).await;
                 break;
             }
             if session.wake.swap(false, Ordering::AcqRel) {
@@ -942,21 +942,21 @@ where
     });
 }
 
-pub(crate) async fn pump_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
+pub(crate) async fn pump_state_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-    let Some(session) = connection.comparisons.get(&id) else { return Ok(()) };
+    let Some(session) = connection.state_streams.get(&id) else { return Ok(()) };
     let mut state = session.state.lock().await;
-    if state.failed || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+    if state.failed || !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(());
     }
     ensure!(!session.live.lock().unwrap().stopped, "live queue stopped");
     loop {
         if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
-            || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
+            || !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
         {
             break;
         }
@@ -1011,8 +1011,8 @@ where
         }
         let Some((body, priority)) = chosen else { break };
         let sequence = state.last_sent.checked_add(1).ok_or_else(|| anyhow::anyhow!("state sequence exhausted"))?;
-        let frame = StateFrame { comparison: id, sequence, body };
-        if !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
+        let frame = StateFrame { stream: id, sequence, body };
+        if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
             break;
         }
         if matches!(frame.body, StateFrameBody::BeginRound(_) | StateFrameBody::State { progress: ComparisonProgress::Complete, .. }) {
@@ -1033,7 +1033,7 @@ where
     Ok(())
 }
 
-pub(crate) async fn expire_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
+pub(crate) async fn expire_state_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1055,7 +1055,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let Some(connection) = node.peer_connections.get(&peer) else { return Ok(()) };
-    let Some(session) = connection.comparisons.get(&id) else { return Ok(()) };
+    let Some(session) = connection.state_streams.get(&id) else { return Ok(()) };
     let mut state = session.state.lock().await;
     if state.failed {
         return Ok(());
@@ -1079,12 +1079,12 @@ where
         live.items = 0;
         live.bytes = 0;
     }
-    let frame = StateFrame { comparison: id, sequence: state.last_sent.saturating_add(1), body };
+    let frame = StateFrame { stream: id, sequence: state.last_sent.saturating_add(1), body };
     let retained = state.room(true) && state.retain(frame.clone(), true).is_ok();
     session.sent.store(state.last_sent, Ordering::Release);
     drop(state);
     if let Some((query, version)) = session.query {
-        connection.subscription_handler.abandon_comparison(query, version, id).await;
+        connection.subscription_handler.abandon_state_stream(query, version, id).await;
     }
     if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection)) {
         return Ok(());
@@ -1110,7 +1110,7 @@ where
             futures_timer::Delay::new(Duration::from_secs(1)).await;
             let Some(node) = node.upgrade() else { return };
             if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
-                || !connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
+                || !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
             {
                 return;
             }
@@ -1129,7 +1129,7 @@ where
         }
         if let Some(node) = node.upgrade() {
             if node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
-                && connection.comparisons.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
+                && connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
             {
                 node.deregister_peer(peer);
             }
@@ -1248,19 +1248,13 @@ impl Comparison {
         );
         let mut spans = known.spans;
         spans.sort_by(|a, b| {
-            let start = |region: &proto::SpanContent| match region {
-                proto::SpanContent::Digest(head) => head.bounds.start.clone(),
-                proto::SpanContent::Heads(page) => page.bounds.start.clone(),
-            };
-            let a = start(a);
-            let b = start(b);
-            if a == b {
-                std::cmp::Ordering::Equal
-            } else if start_le(&a, &b) {
-                std::cmp::Ordering::Less
-            } else {
-                std::cmp::Ordering::Greater
+            fn bounds(span: &proto::SpanContent) -> &TreeSpan {
+                match span {
+                    proto::SpanContent::Digest(head) => &head.bounds,
+                    proto::SpanContent::Heads(page) => &page.bounds,
+                }
             }
+            bounds(a).cmp_start(bounds(b))
         });
         let mut start = super::whole().start;
         let mut frontier = Some(Vec::new());
@@ -1272,20 +1266,20 @@ impl Comparison {
                 proto::SpanContent::Heads(page) => &page.bounds,
             };
             ensure!(
-                valid_range(bounds) && start_le(&start, &bounds.start) && end_le(&bounds.end, &super::whole().end),
+                !bounds.is_empty() && bounds.is_subset_of(&TreeSpan::new(start.clone(), super::whole().end)),
                 "initial spans overlap or exceed scope"
             );
             if start != bounds.start {
                 frontier = None;
                 let gap = TreeSpan::new(start.clone(), opposite(&bounds.start));
-                if valid_range(&gap) {
+                if !gap.is_empty() {
                     comparison.work.push_back(Work::SendSnapshots(gap));
                 }
             }
             start = opposite(&bounds.end);
             match region {
                 proto::SpanContent::Digest(head) => {
-                    let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
+                    head.validate()?;
                     if let Some(frontier) = &mut frontier {
                         frontier.push(head.clone());
                     }
@@ -1295,7 +1289,7 @@ impl Comparison {
                     frontier = None;
                     head_count += page.heads.len();
                     ensure!(head_count <= INITIAL_INVENTORY_HEADS, "initial inventory exceeds head limit");
-                    comparison.validate_initial_heads(&page)?;
+                    page.validate(&comparison.snapshot.spec)?;
                     let mut cursor = page.heads.cursor();
                     while let Some((id, clock)) = cursor.next_clock() {
                         ensure!(comparison.known_clocks.insert(id, clock).is_none(), "duplicate entity in initial inventory");
@@ -1306,7 +1300,7 @@ impl Comparison {
         }
         if !matches!(start, std::ops::Bound::Unbounded) {
             let rest = TreeSpan::new(start, super::whole().end);
-            if valid_range(&rest) {
+            if !rest.is_empty() {
                 comparison.work.push_back(Work::SendSnapshots(rest));
             }
         } else if let Some(frontier) = frontier.filter(|heads| heads.len() > 1) {
@@ -1314,19 +1308,6 @@ impl Comparison {
             comparison.work.push_back(Work::CompareFrontier(frontier));
         }
         Ok(comparison)
-    }
-
-    fn validate_initial_heads(&self, page: &proto::TreeSpanInventory) -> anyhow::Result<()> {
-        ensure!(valid_range(&page.bounds), "invalid initial inventory bounds");
-        let mut previous = None;
-        let mut cursor = page.heads.cursor();
-        while let Some(leaf) = cursor.next() {
-            CanonicalCodec.split(self.snapshot.spec.key_spec(), leaf.key)?;
-            let address = leaf_address(leaf.key, leaf.entity.entity_id);
-            ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid head order or bounds");
-            previous = Some(address);
-        }
-        Ok(())
     }
 
     fn answer(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
@@ -1346,7 +1327,7 @@ impl Comparison {
                     self.work.push_front(Work::History { entity_id, target });
                 }
                 StateAnswer::Digest(head) => {
-                    let _: proto::TreeSpanDigest = proto::TreeSpanDigest::from_bytes(&head.to_bytes())?;
+                    head.validate()?;
                     let prefix =
                         self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
                     self.work.push_back(Work::Compare { head, prefix });
@@ -1360,23 +1341,20 @@ impl Comparison {
                         .position(|bounds| bounds.start == page.bounds.start)
                         .ok_or_else(|| anyhow::anyhow!("unsolicited head inventory"))?;
                     let requested = self.head_requests[index].clone();
-                    ensure!(end_le(&page.bounds.end, &requested.end), "head inventory exceeds requested bounds");
-                    let mut previous = None;
+                    ensure!(page.bounds.is_subset_of(&requested), "head inventory exceeds requested bounds");
+                    page.validate(&self.snapshot.spec)?;
+                    let mut last_address = None;
                     let mut ids = HashSet::new();
                     let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
-                        CanonicalCodec.split(self.snapshot.spec.key_spec(), leaf.key)?;
-                        let address = leaf_address(leaf.key, leaf.entity.entity_id);
-                        ensure!(
-                            page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address),
-                            "invalid head order or bounds"
-                        );
                         ensure!(ids.insert(leaf.entity.entity_id), "duplicate entity in head inventory");
-                        previous = Some(address);
+                        if ids.len() == page.heads.len() {
+                            last_address = Some(leaf_address(leaf.key, leaf.entity.entity_id));
+                        }
                     }
                     let rest = if page.bounds.end != requested.end {
                         let std::ops::Bound::Included(last) = &page.bounds.end else { bail!("partial page must end at its last leaf") };
-                        ensure!(previous.as_ref() == Some(last), "partial page made no progress");
+                        ensure!(last_address.as_ref() == Some(last), "partial page made no progress");
                         Some(requested.after(last))
                     } else {
                         None
@@ -1413,7 +1391,7 @@ impl Comparison {
             }
             let address = leaf_address(leaf.key, leaf.entity.entity_id);
             let gap = TreeSpan::new(start, Excluded(address.clone()));
-            if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
+            if !gap.is_empty() && self.snapshot.states_in(&gap, 1).next().is_some() {
                 flush_removal(&mut removal, &mut work);
                 work.push(Work::SendSnapshots(gap));
             }
@@ -1443,7 +1421,7 @@ impl Comparison {
             TreeSpan::new(page.bounds.start.clone(), Included(last.clone()))
         };
         let gap = TreeSpan::new(start.clone(), processed_bounds.end.clone());
-        if valid_range(&gap) && self.snapshot.states_in(&gap, 1).next().is_some() {
+        if !gap.is_empty() && self.snapshot.states_in(&gap, 1).next().is_some() {
             work.push(Work::SendSnapshots(gap));
         }
         // Splitting a valid region can repeat long keys in its bounds. Keep
@@ -1649,7 +1627,7 @@ impl Comparison {
                 }
                 Work::CompareFrontier(frontier) => {
                     let digest = ankurah_digest_tree::Digest::checked_sum(frontier.iter().map(|head| head.digest))?;
-                    if self.snapshot.head(super::whole()).await?.digest == digest {
+                    if self.snapshot.span_digest(super::whole()).await?.digest == digest {
                         None
                     } else {
                         for head in frontier {
@@ -1667,7 +1645,7 @@ impl Comparison {
                             None
                         }
                     } else {
-                        let mut local = self.snapshot.head(known.bounds.clone()).await?;
+                        let mut local = self.snapshot.span_digest(known.bounds.clone()).await?;
                         // The answering peer's topology may differ. Continue from
                         // the responder prefix retained with this question.
                         local.prefix = prefix;
@@ -1693,9 +1671,9 @@ impl Comparison {
                     if refined.len() == 1 && refined[0].bounds == head.bounds && refined[0].prefix == head.prefix {
                         let page = self.snapshot.page(head.bounds.clone())?;
                         if let std::ops::Bound::Included(last) = &page.bounds.end {
-                            self.work.push_back(Work::Offer(self.snapshot.head(head.bounds.after(last)).await?));
+                            self.work.push_back(Work::Offer(self.snapshot.span_digest(head.bounds.after(last)).await?));
                         }
-                        self.work.push_back(Work::Offer(self.snapshot.head(page.bounds).await?));
+                        self.work.push_back(Work::Offer(self.snapshot.span_digest(page.bounds).await?));
                     } else {
                         for head in refined {
                             self.work.push_back(if head.bounds == known.bounds {
@@ -1831,7 +1809,7 @@ impl Comparison {
         if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INITIAL_INVENTORY_HEADS {
             // Build before handoff above the initial inventory count limit.
             // Smaller inventories and Fetch keep construction on demand.
-            self.snapshot.head(super::whole()).await?;
+            self.snapshot.span_digest(super::whole()).await?;
         }
         self.complete |= finished;
         Ok(StateFrameBody::State {
@@ -1847,33 +1825,5 @@ fn opposite(bound: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<Vec<u8>> {
         std::ops::Bound::Included(value) => std::ops::Bound::Excluded(value.clone()),
         std::ops::Bound::Excluded(value) => std::ops::Bound::Included(value.clone()),
         std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
-    }
-}
-fn start_le(a: &std::ops::Bound<Vec<u8>>, b: &std::ops::Bound<Vec<u8>>) -> bool {
-    use std::ops::Bound::*;
-    match (a, b) {
-        (Unbounded, _) => true,
-        (_, Unbounded) => false,
-        (Included(a), Excluded(b)) => a <= b,
-        (Excluded(a), Included(b)) => a < b,
-        (Included(a), Included(b)) | (Excluded(a), Excluded(b)) => a <= b,
-    }
-}
-fn valid_range(bounds: &TreeSpan) -> bool {
-    use std::ops::Bound::*;
-    match (&bounds.start, &bounds.end) {
-        (Included(a), Included(b)) => a <= b,
-        (Included(a) | Excluded(a), Included(b) | Excluded(b)) => a < b,
-        _ => true,
-    }
-}
-
-fn end_le(a: &std::ops::Bound<Vec<u8>>, b: &std::ops::Bound<Vec<u8>>) -> bool {
-    use std::ops::Bound::*;
-    match (a, b) {
-        (_, Unbounded) => true,
-        (Unbounded, _) => false,
-        (Included(a), Excluded(b)) => a < b,
-        (Included(a), Included(b)) | (Excluded(a), Included(b)) | (Excluded(a), Excluded(b)) => a <= b,
     }
 }

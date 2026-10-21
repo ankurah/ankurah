@@ -137,3 +137,42 @@ impl Projection {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::state_sync::QueryTreeCache;
+    use std::ops::Bound::{Excluded, Included};
+
+    fn id(n: u8) -> EntityId { EntityId::from_bytes([n; 32]) }
+    fn address(n: u8) -> Vec<u8> { leaf_address(&[], id(n)) }
+    fn leaf(n: u8) -> proto::KeyedEntityHead {
+        proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() } }
+    }
+
+    #[tokio::test]
+    async fn authoritative_range_replacement_removes_only_the_exact_interval() -> anyhow::Result<()> {
+        let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
+        let states =
+            (0..10).map(|n| proto::Attested::opt(proto::EntityState { entity_id: id(n), state: Default::default() }, None)).collect();
+        let snapshot = QueryTreeCache::default().refresh(spec.clone(), states).await?;
+        let mut round = Round::new(StateRound { number: 0, revision: 0 }, snapshot);
+        let page = proto::TreeSpanInventory {
+            bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(7))),
+            heads: vec![leaf(4), leaf(6)].into(),
+        };
+        page.validate(&spec)?;
+        round.replace(page.clone());
+        round.replace(page);
+        assert_eq!(round.members.keys().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(4), id(6), id(8), id(9)]);
+        let empty = proto::TreeSpanInventory {
+            bounds: proto::TreeSpan::new(Included(address(4)), Excluded(address(8))),
+            heads: Default::default(),
+        };
+        empty.validate(&spec)?;
+        round.replace(empty);
+        assert_eq!(round.members.keys().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(8), id(9)]);
+        assert_eq!(round.addresses.values().copied().collect::<Vec<_>>(), vec![id(0), id(1), id(2), id(8), id(9)]);
+        Ok(())
+    }
+}

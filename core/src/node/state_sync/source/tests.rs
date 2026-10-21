@@ -141,7 +141,7 @@ async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read(
         ankurah_core_types::KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(property(), crate::value::ValueType::String)]),
         selection.predicate.clone(),
     );
-    let tree = Arc::new(QueryTree::default());
+    let tree = Arc::new(QueryTreeCache::default());
     let (entered, release) = hold_fetch(&node);
     let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], tree);
     tokio::pin!(capture);
@@ -173,7 +173,7 @@ async fn limited_projection_keeps_storage_query_order_independently_of_digest_ke
     apply(&node, &update(last, "02")?).await?;
     let selection = selection(Some(2));
     let by_id = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
-    let captured = capture_query(&node, selection, by_id, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    let captured = capture_query(&node, selection, by_id, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
     assert_eq!(
         captured.projection.rows.keys().copied().collect::<Vec<_>>(),
         vec![first.entity_id, last.entity_id],
@@ -195,9 +195,9 @@ async fn limited_capture_retries_to_discover_an_unchanged_replacement() -> anyho
         apply(&node, event).await?;
     }
     let selection = selection(Some(2));
-    let spec = QueryTree::spec(&selection, &node.catalog);
+    let spec = QueryTreeCache::spec(&selection, &node.catalog);
     let (entered, release) = hold_fetch(&node);
-    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()));
+    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default()));
     tokio::pin!(capture);
     assert!(futures::poll!(&mut capture).is_pending());
     entered.await?;
@@ -227,8 +227,8 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
         events.push(event);
     }
     let selection = selection(Some(2));
-    let spec = QueryTree::spec(&selection, &node.catalog);
-    let tree = Arc::new(QueryTree::default());
+    let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let tree = Arc::new(QueryTreeCache::default());
     let captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
     let CapturedQuery { revision, snapshot, projection, cursor } = captured;
     let old_members = snapshot.members();
@@ -239,7 +239,7 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
     )
     .await?;
     let known = proto::KnownState { spec: snapshot.spec.clone(), spans: vec![] };
-    let state = crate::node::state_sync::start_comparison(
+    let state = crate::node::state_sync::start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -252,7 +252,7 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
         known,
     )
     .await?;
-    let mut actor = QuerySource::new(peer, state.frame.comparison, vec![DEFAULT_CONTEXT], projection, cursor, revision);
+    let mut actor = QuerySource::new(peer, state.frame.stream, vec![DEFAULT_CONTEXT], projection, cursor, revision);
     let moved_a = update(&events[0], "09")?;
     apply(&node, &moved_a).await?;
     let batch = actor.cursor.next().await?;
@@ -381,8 +381,8 @@ async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_
     apply(&node, &inside).await?;
     apply(&node, &outside).await?;
     let selection = selection(None);
-    let spec = QueryTree::spec(&selection, &node.catalog);
-    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
     assert_eq!(captured.projection.rows.len(), 1);
     assert!(captured.projection.rows.contains_key(&inside.entity_id));
     apply(&node, &update(&outside, "08")?).await?;
@@ -425,7 +425,7 @@ async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree(
             selection(Some(2)),
             Some(&DEFAULT_CONTEXT),
             1,
-            proto::KnownState { spec: QueryTree::spec(&selection(Some(2)), &node.catalog), spans: vec![] },
+            proto::KnownState { spec: QueryTreeCache::spec(&selection(Some(2)), &node.catalog), spans: vec![] },
         )
         .await?;
     let (_, original_tree) = handler.query_tree_for_test(query).await.unwrap();
@@ -441,7 +441,7 @@ async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree(
             selection(Some(1)),
             Some(&DEFAULT_CONTEXT),
             2,
-            proto::KnownState { spec: QueryTree::spec(&selection(Some(1)), &node.catalog), spans: vec![] },
+            proto::KnownState { spec: QueryTreeCache::spec(&selection(Some(1)), &node.catalog), spans: vec![] },
         )
         .await?;
     assert!(release.send(()).is_err(), "the old generation's pending read must be dropped before replacement installs");
@@ -461,11 +461,11 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
     let selection = selection(None);
-    let spec = QueryTree::spec(&selection, &node.catalog);
+    let spec = QueryTreeCache::spec(&selection, &node.catalog);
     let (entered, observed) = oneshot::channel();
     let (read, resume) = oneshot::channel();
     *node.storage.1.lock().unwrap() = Some((entered, resume));
-    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()));
+    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default()));
     tokio::pin!(capture);
     assert!(futures::poll!(&mut capture).is_pending());
     observed.await?;
@@ -503,8 +503,8 @@ async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<(
     node.wait_ready().await?;
     apply(&node, &initial).await?;
     let selection = selection(None);
-    let spec = QueryTree::spec(&selection, &node.catalog);
-    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
     apply(&node, &denied).await?;
     let batch = captured.cursor.next().await?;
     let credentials = vec![DEFAULT_CONTEXT];

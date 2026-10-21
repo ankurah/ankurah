@@ -274,12 +274,12 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version, canceled).await {
                     _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
                     Ok(()) => {
-                        // Deltas applied successfully, now activate the livequery
+                        // The initial round has been applied and installed.
                         if let Some(lq) = livequery {
                             lq.subscription_established(version).await;
                         }
 
-                        // Mark as established - subscription succeeded even if livequery activation had issues
+                        // Keep relay status aligned with the completed subscription attempt.
                         let mut subscriptions = me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                         if !cancel.canceled() {
                             if let Some(info) = subscriptions.get_mut(&query_id) {
@@ -512,19 +512,19 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let livequery =
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
-        // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
+        // Offer current state and wait until the initial round is applied and installed.
         let attempt = cancel.clone();
         let canceled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || attempt.canceled());
         match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version, canceled).await {
             _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
             Ok(()) => {
-                // Deltas applied successfully, now activate the livequery
+                // The initial round has been applied and installed.
                 // The livequery handles its own errors internally
                 if let Some(lq) = livequery {
                     lq.subscription_established(version).await;
                 }
 
-                // Mark as established - subscription succeeded even if livequery activation had issues
+                // Keep relay status aligned with the completed subscription attempt.
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                 if !cancel.canceled() {
                     if let Some(info) = subscriptions.get_mut(&query_id) {
@@ -610,9 +610,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 /// Trait for communicating with remote peers (abstraction over WeakNode for testing)
 #[async_trait]
 pub trait TNode<CD: ContextData>: Send + Sync {
-    /// Send a predicate registration request to a remote peer, fetch known matches,
-    /// apply received deltas, and store used events.
-    /// Returns Ok(()) if subscription was established and deltas applied successfully.
+    /// Subscribe with the current state offer, apply the initial round, and install
+    /// its result. Live delivery continues on the same stream after this returns.
     async fn remote_subscribe(
         &self,
         peer_id: proto::EntityId,
@@ -669,22 +668,22 @@ where
         .await?;
         let state = match response {
             proto::NodeResponseBody::QuerySubscribed { query_id: response_query, state } if response_query == query_id => state,
-            proto::NodeResponseBody::ComparisonUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
+            proto::NodeResponseBody::StateStreamUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
             proto::NodeResponseBody::StateCaptureBusy => return Err(RequestError::StateCaptureBusy.into()),
             proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
             other => return Err(RequestError::UnexpectedResponse(other).into()),
         };
         let connection = node.peer_connections.get(&peer_id).ok_or(RequestError::PeerNotConnected)?;
-        stream.bind(state.frame.comparison, crate::schema::is_catalog_read(&selection.predicate), connection.outgoing_comparisons.clone());
+        stream.bind(state.frame.stream, crate::schema::is_catalog_read(&selection.predicate), connection.outgoing_state_streams.clone());
         if canceled()
             || !connection.incoming_states.is_current(&stream.request)
             || !node.subscription_relay.as_ref().is_some_and(|relay| relay.bind_stream(peer_id, query_id, version, stream.request.clone()))
         {
             let weak = node.weak();
-            let comparison = state.frame.comparison;
+            let stream_id = state.frame.stream;
             crate::task::spawn(async move {
                 if let Some(node) = weak.upgrade() {
-                    let _ = state_sync::abandon_current_state(&node, peer_id, comparison, &stream);
+                    let _ = state_sync::abandon_current_state(&node, peer_id, stream_id, &stream);
                 }
             });
             return Err(RequestError::ConnectionLost.into());

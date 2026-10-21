@@ -90,7 +90,7 @@ pub struct Scheduler {
     max_rounds: usize,
     /// Load-bearing request ids whose responses carry no collection.
     catalog_requests: std::collections::BTreeSet<proto::RequestId>,
-    /// Comparisons continuing a protected catalog or subscription handshake.
+    /// StateStreams continuing a protected catalog or subscription handshake.
     catalog_comparisons: std::collections::HashSet<proto::StateStreamId>,
 }
 
@@ -160,7 +160,7 @@ impl Scheduler {
                         selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy)
                     }
                     proto::NodeRequestBody::SubscribeQuery { .. } => true,
-                    proto::NodeRequestBody::ContinueState { comparison, .. }
+                    proto::NodeRequestBody::ContinueState { stream: comparison, .. }
                     | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => self.catalog_comparisons.contains(comparison),
                     _ => return false,
                 };
@@ -175,7 +175,7 @@ impl Scheduler {
                 if protected {
                     match &response.body {
                         proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
-                            self.catalog_comparisons.insert(state.frame.comparison);
+                            self.catalog_comparisons.insert(state.frame.stream);
                         }
                         _ => {}
                     }
@@ -185,7 +185,7 @@ impl Scheduler {
             proto::NodeMessage::AbandonStateStream { stream, .. } => self.catalog_comparisons.contains(stream),
             proto::NodeMessage::Update(update) => matches!(&update.body, proto::NodeUpdateBody::StateFrame { request_id, frame }
                 if matches!(frame.body, proto::StateFrameBody::State { .. })
-                    && (self.catalog_requests.contains(request_id) || self.catalog_comparisons.contains(&frame.comparison))),
+                    && (self.catalog_requests.contains(request_id) || self.catalog_comparisons.contains(&frame.stream))),
             _ => false,
         }
     }

@@ -26,39 +26,25 @@ pub(crate) enum Delivery {
     Live,
 }
 
-/// A snapshot the local entity did not incorporate: the entity stands at
-/// `actual`, which neither equals nor descends from the offered `target`, and
-/// nothing supplied with the snapshot connected the two. The caller decides
-/// whether to ask the sender for connecting history; the applier never treats
-/// an unchanged entity as coverage of the target.
-#[derive(Debug, Clone)]
-pub(crate) struct Divergence {
-    pub entity_id: proto::EntityId,
-    pub target: proto::Clock,
-    pub actual: proto::Clock,
-}
-
 /// What applying one delta did.
 ///
 /// `change` is set only when the entity advanced and carries what this
-/// delivery publishes. `divergence` is set when a snapshot target remains
-/// unincorporated. A failed delta returns an error without persisting a prefix.
+/// delivery publishes. A failed delta returns an error without persisting a prefix.
 #[derive(Debug)]
 pub(crate) struct DeltaOutcome {
     pub entity: Option<Entity>,
     pub change: Option<EntityChange>,
-    pub divergence: Option<Divergence>,
 }
 
 impl DeltaOutcome {
-    fn unchanged(entity: Option<Entity>) -> Self { Self { entity, change: None, divergence: None } }
+    fn unchanged(entity: Option<Entity>) -> Self { Self { entity, change: None } }
 }
 
 impl NodeApplier {
     /// Apply initial-transfer deltas concurrently, notifying the reactor for each
     /// batch that completes together. A concurrent bare snapshot may leave the
     /// local entity unchanged; callers needing causal coverage use apply_delta
-    /// and inspect its outcome, as the state-stream owner does.
+    /// and check coverage against the resulting entity head.
     pub(crate) async fn apply_deltas<SE, PA, E, S>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
@@ -178,9 +164,8 @@ impl NodeApplier {
     ///
     /// A snapshot that strictly advances the entity replaces its state. Otherwise
     /// the carried events are applied as one atomic batch on a fork. Each storage
-    /// retry decides again against the current state. An entity that
-    /// still neither equals nor descends from the target is reported as a
-    /// divergence; it is never reported as covered.
+    /// retry decides again against the current state. The state-stream owner
+    /// checks whether the resulting entity covers its outstanding targets.
     #[allow(clippy::too_many_arguments)]
     async fn apply_snapshot<SE, PA, E, S>(
         node: &Node<SE, PA>,
@@ -201,11 +186,10 @@ impl NodeApplier {
         let events = Self::validate_and_stage(node, from_peer_id, entity_id, carried, event_getter)?;
         let state: Attested<proto::EntityState> = (entity_id, fragment).into();
         node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
-        let target = &state.payload.state;
 
         if let Some(entity) = Self::save_new_entity(node, &state.payload, &events, delivery, event_getter, state_getter).await? {
             let change = Self::publish(entity.clone(), events, delivery);
-            return Ok(DeltaOutcome { entity: Some(entity), change: Some(change), divergence: None });
+            return Ok(DeltaOutcome { entity: Some(entity), change: Some(change) });
         }
         let entity = node
             .entities
@@ -213,14 +197,12 @@ impl NodeApplier {
             .await?
             .ok_or(RetrievalError::EntityNotFound(entity_id))?;
 
-        let (change, covered) = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?;
+        let change = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?;
         let change = change.map(|change| {
             let (entity, events) = change.into_parts();
             Self::publish(entity, events, delivery)
         });
-        let actual = entity.head();
-        let divergence = (!covered).then(|| Divergence { entity_id, target: target.head.clone(), actual });
-        Ok(DeltaOutcome { entity: Some(entity), change, divergence })
+        Ok(DeltaOutcome { entity: Some(entity), change })
     }
 
     /// Apply a bridge as one atomic batch for both initial and live delivery.
@@ -251,7 +233,7 @@ impl NodeApplier {
             Some(change) => Some(change.entity().clone()),
             None => node.entities.get_or_retrieve(state_getter, event_getter, &entity_id).await?,
         };
-        Ok(DeltaOutcome { entity, change, divergence: None })
+        Ok(DeltaOutcome { entity, change })
     }
 
     /// Before adopting a snapshot, check that its events lead to its head through the ordered batch,
@@ -351,7 +333,7 @@ impl NodeApplier {
         events: &[Attested<proto::Event>],
         delivery: Delivery,
         event_getter: &E,
-    ) -> Result<(Option<EntityChange>, bool), MutationError>
+    ) -> Result<Option<EntityChange>, MutationError>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -367,21 +349,8 @@ impl NodeApplier {
             } else {
                 candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
             }
-            let actual = candidate.head();
-            // Determine coverage on the unpublished fork: a failed comparison must
-            // not discard a notification after state has already been committed.
-            let covered = if adopted || actual == snapshot.state.head {
-                true
-            } else {
-                let comparison =
-                    crate::event_dag::compare(event_getter, &actual, &snapshot.state.head, crate::event_dag::DEFAULT_BUDGET).await?;
-                matches!(
-                    comparison.relation,
-                    crate::event_dag::AbstractCausalRelation::StrictDescends { .. } | crate::event_dag::AbstractCausalRelation::Equal
-                )
-            };
             if !adopted && events.is_empty() {
-                return Ok((None, covered));
+                return Ok(None);
             }
             let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
@@ -398,11 +367,11 @@ impl NodeApplier {
                     .await?;
                 let change = EntityChange::new(entity, events);
                 publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
-                Ok((Some(change), covered))
+                Ok(Some(change))
             } else {
                 let change = candidate.commit(&node.entities, event_getter).await?;
                 publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
-                Ok(((!change.events().is_empty()).then_some(change), covered))
+                Ok((!change.events().is_empty()).then_some(change))
             }
         })
     }

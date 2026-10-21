@@ -4,4 +4,5 @@ mod server;
 pub use client_relay::{RemoteQuerySubscriber, SubscriptionRelay};
 pub use server::SubscriptionHandler;
 
-pub(crate) use server::capture_query;
+#[cfg(test)]
+pub(crate) use client_relay::Status;

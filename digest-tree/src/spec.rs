@@ -3,7 +3,7 @@
 use std::hash::{Hash, Hasher};
 
 use ankql::ast::{Predicate, Resolved, Selection};
-use ankurah_core_types::{KeySpec, PropertyId, PropertyPath};
+use ankurah_core_types::{IndexDirection, KeySpec, PropertyId, PropertyPath};
 use serde::{Deserialize, Serialize};
 
 /// What defines a tree: the leaves it admits and the order it keeps them in.
@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 /// replica's scope, a live query's result (where the tree is the matched set,
 /// each entity with its head), a durable subscription, a fetch. What a use
 /// compares is its scope, which the use keeps and the spec does not carry: the
-/// spans of the tree it reads, as a head array of tree node prefixes with key
+/// spans of the tree it reads, as a list of span digests with tree node prefixes with key
 /// bounds where a span cuts a tree node, the order it walks them in, and the
 /// count it takes under a limit.
 ///
@@ -91,7 +91,13 @@ impl TreeSpec {
     /// spec with its directions and nulls placements dropped, every part
     /// ascending, and the whole predicate. `for_selection` uses this same
     /// constructor, so a spec never carries a direction.
-    pub fn new(key_spec: KeySpec<PropertyId>, predicate: Predicate<Resolved>) -> Self { Self { key_spec: key_spec.ascending(), predicate } }
+    pub fn new(mut key_spec: KeySpec<PropertyId>, predicate: Predicate<Resolved>) -> Self {
+        for part in &mut key_spec.keyparts {
+            part.direction = IndexDirection::Asc;
+            part.nulls = None;
+        }
+        Self { key_spec, predicate }
+    }
 
     /// The ordering: the parts that address the leaves, every one ascending.
     /// Empty for the entity-id tree. A predicate's range part can be present

@@ -30,12 +30,12 @@ async fn assert_released_with_live_query(
     origin: proto::RequestId,
     state: proto::StateReply,
 ) -> anyhow::Result<()> {
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     let server_peer = server.peer_connections.get(&client.id).unwrap();
     let client_peer = client.peer_connections.get(&server.id).unwrap();
-    until(|| server_peer.comparisons.was_closed(&comparison)).await;
-    until(|| !client_peer.outgoing_comparisons.contains_key(&comparison)).await;
-    assert!(server_peer.comparisons.get(&comparison).is_none());
+    until(|| server_peer.state_streams.was_closed(&comparison)).await;
+    until(|| !client_peer.outgoing_state_streams.contains_key(&comparison)).await;
+    assert!(server_peer.state_streams.get(&comparison).is_none());
     assert!(!client_peer.incoming_states.is_current(&origin));
     assert_eq!(abandoned(&messages.lock().unwrap(), comparison), 1);
 
@@ -49,7 +49,7 @@ async fn assert_released_with_live_query(
             body: proto::NodeResponseBody::Fetch(state),
         }))
         .await?;
-    super::super::super::expire_comparison(server, client.id, comparison).await?;
+    super::super::super::expire_state_stream(server, client.id, comparison).await?;
     let (live, revision) = messages
         .lock()
         .unwrap()
@@ -58,7 +58,7 @@ async fn assert_released_with_live_query(
             proto::NodeMessage::Response(proto::NodeResponse {
                 body: proto::NodeResponseBody::QuerySubscribed { query_id, state },
                 ..
-            }) if *query_id == query.query_id() => Some((state.frame.comparison, state.round.revision)),
+            }) if *query_id == query.query_id() => Some((state.frame.stream, state.round.revision)),
             _ => None,
         })
         .unwrap();
@@ -115,7 +115,7 @@ async fn cancelled_fetch_with_metadata_queued_in_its_waiter_abandons_the_stream(
     let connection = client.peer_connections.get(&server.id).unwrap();
     until(|| !connection.pending_requests.contains_key(&origin)).await;
     assert!(matches!(state.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
-    assert!(!connection.outgoing_comparisons.contains_key(&state.frame.comparison), "metadata has not been consumed");
+    assert!(!connection.outgoing_state_streams.contains_key(&state.frame.stream), "metadata has not been consumed");
     drop(fetch);
     assert_released_with_live_query(&server, &client, &query, &messages, origin, state).await?;
     client.deregister_peer(server.id);
@@ -129,8 +129,8 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     let (server, client, query, messages) = stream_fixture_with_gate(gate.clone()).await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTree::default()
-        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
+    let mut snapshot = super::super::super::QueryTreeCache::default()
+        .refresh(super::super::super::QueryTreeCache::spec(&selection, &client.catalog), states)
         .await?;
     // Force real refinement work beyond frame zero while holding its continuations.
     let mut start = super::super::super::whole().start;
@@ -140,11 +140,11 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
         spans.push(if n == 1 {
             proto::SpanContent::Heads(snapshot.page(bounds)?)
         } else {
-            proto::SpanContent::Digest(snapshot.head(bounds).await?)
+            proto::SpanContent::Digest(snapshot.span_digest(bounds).await?)
         });
         start = Included(address(n));
     }
-    spans.push(proto::SpanContent::Digest(snapshot.head(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
+    spans.push(proto::SpanContent::Digest(snapshot.span_digest(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
     gate.store(true, Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
@@ -157,10 +157,10 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     let proto::NodeResponseBody::Fetch(state) = response else { panic!("Fetch metadata") };
     assert!(matches!(state.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Continue, .. }));
     let origin = stream.request.clone();
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     let mut receive = Box::pin(receive_state(&client, server.id, &credentials, snapshot, state.clone(), false, None, stream));
     assert!(futures::poll!(&mut receive).is_pending());
-    assert!(client.peer_connections.get(&server.id).unwrap().outgoing_comparisons.contains_key(&comparison));
+    assert!(client.peer_connections.get(&server.id).unwrap().outgoing_state_streams.contains_key(&comparison));
     drop(receive);
     gate.store(false, Ordering::SeqCst);
     assert_released_with_live_query(&server, &client, &query, &messages, origin, state).await?;
@@ -190,7 +190,7 @@ async fn cancelled_fetch_during_final_local_hydration_releases_the_remote_stream
         }
     })
     .await?;
-    assert!(client.peer_connections.get(&server.id).unwrap().outgoing_comparisons.contains_key(&state.frame.comparison));
+    assert!(client.peer_connections.get(&server.id).unwrap().outgoing_state_streams.contains_key(&state.frame.stream));
     drop(fetch);
     assert!(release.send(()).is_err(), "the pending hydration must have been cancelled");
     assert_released_with_live_query(&server, &client, &query, &messages, origin, state).await?;
@@ -205,8 +205,8 @@ async fn successful_fetch_closes_with_applied_without_abandoning() -> anyhow::Re
     let rows = client.fetch_from_peer(query.selection().peek().unwrap().0, &vec![crate::policy::DEFAULT_CONTEXT]).await?;
     assert_eq!(rows.len(), 64);
     let (origin, state) = fetch_reply(&messages.lock().unwrap()).unwrap();
-    let comparison = state.frame.comparison;
-    until(|| server.peer_connections.get(&client.id).unwrap().comparisons.was_closed(&comparison)).await;
+    let comparison = state.frame.stream;
+    until(|| server.peer_connections.get(&client.id).unwrap().state_streams.was_closed(&comparison)).await;
     until(|| !client.peer_connections.get(&server.id).unwrap().incoming_states.is_current(&origin)).await;
     assert_eq!(abandoned(&messages.lock().unwrap(), comparison), 0);
     assert!(query.resultset().is_loaded());
@@ -220,8 +220,8 @@ async fn fetch_validation_error_abandons_once() -> anyhow::Result<()> {
     let (server, client, query, messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTree::default()
-        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
+    let mut snapshot = super::super::super::QueryTreeCache::default()
+        .refresh(super::super::super::QueryTreeCache::spec(&selection, &client.catalog), states)
         .await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) =
@@ -243,19 +243,19 @@ async fn queued_fetch_cleanup_cannot_send_on_a_replacement_connection() -> anyho
     let (server, client, query, messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTree::default()
-        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
+    let mut snapshot = super::super::super::QueryTreeCache::default()
+        .refresh(super::super::super::QueryTreeCache::spec(&selection, &client.catalog), states)
         .await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (mut stream, response) =
         request_state(&client, server.id, &credentials, proto::NodeRequestBody::Fetch { selection, known_state: snapshot.offer().await? })
             .await?;
     let proto::NodeResponseBody::Fetch(state) = response else { panic!("Fetch metadata") };
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     let original = client.peer_connections.get(&server.id).unwrap();
     until(|| original.pending_requests.is_empty()).await;
     let before_cleanup = Arc::weak_count(&original);
-    stream.bind(comparison, false, original.outgoing_comparisons.clone());
+    stream.bind(comparison, false, original.outgoing_state_streams.clone());
     drop(stream);
     // Swap the connection before the queued drop cleanup runs, retaining the
     // old Arc so the weak pointer alone cannot hide a missing generation check.
@@ -269,8 +269,8 @@ async fn queued_fetch_cleanup_cannot_send_on_a_replacement_connection() -> anyho
     // rather than checking for absent messages before the spawned task ran.
     until(|| Arc::weak_count(&original) < before_cleanup).await;
     assert_eq!(abandoned(&messages.lock().unwrap(), comparison), 0);
-    assert!(!original.outgoing_comparisons.contains_key(&comparison));
-    assert!(!replacement.outgoing_comparisons.contains_key(&comparison));
+    assert!(!original.outgoing_state_streams.contains_key(&comparison));
+    assert!(!replacement.outgoing_state_streams.contains_key(&comparison));
     assert!(Arc::ptr_eq(&replacement, &client.peer_connections.get(&server.id).unwrap()));
     original.incoming_states.close();
     client.deregister_peer(server.id);

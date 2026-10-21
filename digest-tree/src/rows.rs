@@ -84,6 +84,15 @@ impl TreeSpan {
     /// Every address.
     pub fn all() -> Self { Self::new(Bound::Unbounded, Bound::Unbounded) }
 
+    /// Whether this span contains no addresses.
+    pub fn is_empty(&self) -> bool { crate::bounds::empty(self) }
+
+    /// Whether every address in this span also belongs to `other`.
+    pub fn is_subset_of(&self, other: &Self) -> bool { crate::bounds::subset(self, other) }
+
+    /// Compare lower bounds in address order, including open and unbounded ends.
+    pub fn cmp_start(&self, other: &Self) -> std::cmp::Ordering { crate::bounds::lower_cmp(&self.start, &other.start) }
+
     /// Every address beneath `prefix`: the leaves of a bucket, or of any tree
     /// node.
     pub fn under(prefix: &NodePrefix) -> Self {

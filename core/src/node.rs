@@ -353,7 +353,7 @@ where
 
         // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
         // follow-on uses #426's node session union for catalog queries.
-        let auth = if state_sync::comparison_bypasses_policy(self, node_id, &request.body, true) {
+        let auth = if state_sync::state_stream_bypasses_policy(self, node_id, &request.body, true) {
             Vec::new()
         } else {
             self.policy_agent.sign_request(self, cdata, &request)?
@@ -456,7 +456,7 @@ where
 
                     // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
                     // follow-on uses #426's node session union for catalog queries.
-                    let cdata = if state_sync::comparison_bypasses_policy(self, request.from, &request.body, false) {
+                    let cdata = if state_sync::state_stream_bypasses_policy(self, request.from, &request.body, false) {
                         Ok(Vec::new())
                     } else {
                         self.policy_agent.check_request(self, &auth, &request).await
@@ -479,9 +479,9 @@ where
                         },
                         Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                     };
-                    let comparison = match &body {
+                    let stream_id = match &body {
                         proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
-                            Some(state.frame.comparison)
+                            Some(state.frame.stream)
                         }
                         _ => None,
                     };
@@ -492,8 +492,8 @@ where
                         body,
                     }));
                     if result.is_ok() {
-                        if let Some(id) = comparison {
-                            state_sync::kick_comparison(self, from, id);
+                        if let Some(id) = stream_id {
+                            state_sync::kick_state_stream(self, from, id);
                         }
                     }
                 }
@@ -501,16 +501,16 @@ where
             proto::NodeMessage::Response(response) => {
                 debug!("Node {} received response {}", self.id, response);
                 let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
-                let comparison = match &response.body {
+                let stream_id = match &response.body {
                     proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
-                        Some(state.frame.comparison)
+                        Some(state.frame.stream)
                     }
                     _ => None,
                 };
                 // Remember the handle before waking the waiter: it may be
                 // cancelled with this response still queued in its channel.
-                if let Some(comparison) = comparison {
-                    connection.incoming_states.observe_comparison(&response.request_id, comparison);
+                if let Some(stream_id) = stream_id {
+                    connection.incoming_states.observe_stream(&response.request_id, stream_id);
                 }
                 if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
                     let _ = tx.send(Ok(response.body));
@@ -536,13 +536,13 @@ where
     where C: Iterable<PA::ContextData> {
         let peer = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("peer disconnected"))?;
         let initial = matches!(&request.body, proto::NodeRequestBody::Fetch { .. } | proto::NodeRequestBody::SubscribeQuery { .. });
-        // Retried initial requests must observe the first comparison, even if
+        // Retried initial requests must observe the first state stream, even if
         // both requests arrive before its snapshot has finished building.
-        let _initial = if initial { Some(peer.initial_comparison.lock().await) } else { None };
+        let _initial = if initial { Some(peer.initial_state_stream.lock().await) } else { None };
         let fingerprint = if initial { bincode::serialize(&request.body)? } else { Vec::new() };
         let credentials: Vec<_> = cdata.iterable().cloned().collect();
         if initial {
-            if let Some(state) = peer.comparisons.replay_initial(&request.id, &fingerprint, &credentials)? {
+            if let Some(state) = peer.state_streams.replay_initial(&request.id, &fingerprint, &credentials)? {
                 return Ok(state);
             }
         }
@@ -562,17 +562,17 @@ where
                 }
             }
             proto::NodeRequestBody::Fetch { selection, known_state } => {
-                let spec = state_sync::QueryTree::offered_spec(&selection, &self.catalog, &known_state)?;
+                let spec = state_sync::QueryTreeCache::offered_spec(&selection, &self.catalog, &known_state)?;
                 let catalog = crate::schema::is_catalog_read(&selection.predicate);
-                let captured = crate::peer_subscription::capture_query(
+                let captured = state_sync::source::capture_query(
                     self,
                     selection,
                     spec,
                     credentials.clone(),
-                    Arc::new(state_sync::QueryTree::default()),
+                    Arc::new(state_sync::QueryTreeCache::default()),
                 )
                 .await?;
-                let state = state_sync::start_comparison(
+                let state = state_sync::start_state_stream(
                     self,
                     request.from,
                     request.id,
@@ -611,12 +611,12 @@ where
                     .subscribe_query(self, request.id, fingerprint, query_id, selection, cdata, version, known_state)
                     .await
             }
-            proto::NodeRequestBody::ContinueState { comparison, round, processed_through, applied_through, answers } => {
+            proto::NodeRequestBody::ContinueState { stream: stream_id, round, processed_through, applied_through, answers } => {
                 state_sync::continue_state(
                     self,
                     request.from,
                     request.id,
-                    comparison,
+                    stream_id,
                     round,
                     processed_through,
                     applied_through,
@@ -625,8 +625,8 @@ where
                 )
                 .await
             }
-            proto::NodeRequestBody::RefreshState { comparison, round, known_state } => {
-                peer.subscription_handler.refresh_query(self, comparison, round, known_state, &credentials).await?;
+            proto::NodeRequestBody::RefreshState { stream: stream_id, round, known_state } => {
+                peer.subscription_handler.refresh_query(self, stream_id, round, known_state, &credentials).await?;
                 Ok(proto::NodeResponseBody::Success)
             }
             proto::NodeRequestBody::FinishStateRound { stream, round, outcome } => {
@@ -870,7 +870,7 @@ where
         self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
-        let tree = state_sync::QueryTree::default();
+        let tree = state_sync::QueryTreeCache::default();
         for attempt in 0..2 {
             let entities = self.fetch_entities_from_local(&selection).await?;
             let mut snapshot = tree.snapshot(&selection, &self.catalog, entities).await?;

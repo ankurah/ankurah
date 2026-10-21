@@ -5,6 +5,7 @@ use crate::{
     policy::PermissiveAgent,
     test_utils::TestStorage,
 };
+use ankurah_digest_tree::CanonicalCodec;
 
 type TestNode = Node<TestStorage, PermissiveAgent>;
 #[derive(Clone)]
@@ -34,7 +35,7 @@ async fn node() -> anyhow::Result<(TestNode, proto::EntityId, Arc<Mutex<Vec<prot
 fn spec() -> proto::TreeSpec { proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True) }
 fn unknown() -> proto::KnownState { proto::KnownState { spec: spec(), spans: vec![] } }
 async fn snapshot(states: Vec<proto::Attested<proto::EntityState>>) -> anyhow::Result<Snapshot> {
-    super::super::QueryTree::default().refresh(spec(), states).await
+    super::super::QueryTreeCache::default().refresh(spec(), states).await
 }
 fn states(count: usize, payload: usize) -> Vec<proto::Attested<proto::EntityState>> {
     (0..count)
@@ -110,7 +111,8 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     let former = source[0].payload.entity_id;
     let former_clock = source[0].payload.state.head.clone();
     let mut requester = snapshot(source.clone()).await?;
-    let known = proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Digest(requester.head(super::super::whole()).await?)] };
+    let known =
+        proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Digest(requester.span_digest(super::super::whole()).await?)] };
     let mut current = source[1..].to_vec();
     let added = states(1, 8).pop().unwrap();
     let new_id = added.payload.entity_id;
@@ -215,7 +217,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
         };
         let bounds = TreeSpan::new(start, end);
         start = opposite(&bounds.end);
-        spans.push(proto::SpanContent::Digest(requester.head(bounds).await?));
+        spans.push(proto::SpanContent::Digest(requester.span_digest(bounds).await?));
     }
     let mut comparison = Comparison::new(snapshot(current).await?, proto::KnownState { spec: spec(), spans })?;
     let mut answers = Vec::new();
@@ -259,12 +261,12 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     }
     let missing = source[0].payload.entity_id;
     let mut responder = snapshot(source.clone()).await?;
-    let root = responder.head(super::super::whole()).await?;
+    let root = responder.span_digest(super::super::whole()).await?;
     let frontier = responder.refine(&root).await?;
     let original =
         frontier.iter().find(|head| head.digest.count() > HEAD_PAGE as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
     let bounds = original.bounds.clone();
-    let clipped = responder.head(bounds.clone()).await?;
+    let clipped = responder.span_digest(bounds.clone()).await?;
     let refined = responder.refine(&clipped).await?;
     assert!(
         matches!(refined.as_slice(), [head] if head.bounds == bounds && head.prefix != clipped.prefix),
@@ -274,7 +276,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let mut requester = snapshot(cached.clone()).await?;
     let mut spans = Vec::new();
     for head in frontier {
-        spans.push(proto::SpanContent::Digest(requester.head(head.bounds).await?));
+        spans.push(proto::SpanContent::Digest(requester.span_digest(head.bounds).await?));
     }
     let known = proto::KnownState { spec: spec(), spans };
     let mut comparison = Comparison::new(responder, known)?;
@@ -292,7 +294,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
                 StateItem::Digest(head) => {
                     assert_ne!(head.bounds, bounds, "the requester already supplied this exact digest");
                     narrower_questions += 1;
-                    answers.push(StateAnswer::Digest(requester.head(head.bounds).await?));
+                    answers.push(StateAnswer::Digest(requester.span_digest(head.bounds).await?));
                 }
                 StateItem::NeedHeads(bounds) => {
                     leaf_pages += 1;
@@ -325,9 +327,19 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
     let known = cached.offer().await?;
     let empty = snapshot(vec![]).await?.offer().await?;
     for (known, repairs) in [(unknown(), 8), (empty, 8), (known, 4)] {
-        let initial =
-            start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(source.clone()).await?, known)
-                .await?;
+        let initial = start_state_stream(
+            &node,
+            peer,
+            proto::RequestId::new(),
+            vec![],
+            vec![],
+            None,
+            false,
+            0,
+            snapshot(source.clone()).await?,
+            known,
+        )
+        .await?;
         let (items, progress) = state_items(&initial.frame);
         assert_eq!(initial.frame.sequence, 0);
         assert_eq!(progress, ComparisonProgress::Complete);
@@ -433,7 +445,8 @@ async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_anoth
 async fn empty_inventory_is_complete_without_questions() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
+        start_state_stream(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown())
+            .await?;
     let (items, progress) = state_items(&initial.frame);
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items, [StateItem::Snapshots(page)] if page.states.is_empty()));
@@ -446,26 +459,26 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
     let origin = proto::RequestId::new();
     let query = proto::QueryId::new();
     let initial =
-        start_comparison(&node, peer, origin.clone(), vec![11], vec![], Some((query, 7)), false, 0, snapshot(vec![]).await?, unknown())
+        start_state_stream(&node, peer, origin.clone(), vec![11], vec![], Some((query, 7)), false, 0, snapshot(vec![]).await?, unknown())
             .await?;
     let connection = node.peer_connections.get(&peer).unwrap();
-    let session = connection.comparisons.get(&initial.frame.comparison).unwrap();
+    let session = connection.state_streams.get(&initial.frame.stream).unwrap();
     let guard = session.state.lock().await;
-    let replay = connection.comparisons.replay_initial(&origin, &[11], &[])?.unwrap();
+    let replay = connection.state_streams.replay_initial(&origin, &[11], &[])?.unwrap();
     let proto::NodeResponseBody::QuerySubscribed { query_id, state } = replay else { panic!("subscription replay") };
     assert_eq!(query_id, query);
     assert_eq!(bincode::serialize(&state)?, bincode::serialize(&initial)?);
-    assert!(connection.comparisons.replay_initial(&origin, &[12], &[]).is_err());
+    assert!(connection.state_streams.replay_initial(&origin, &[12], &[]).is_err());
     drop(guard);
-    continue_state(&node, peer, proto::RequestId::new(), initial.frame.comparison, None, 0, None, vec![], vec![]).await?;
+    continue_state(&node, peer, proto::RequestId::new(), initial.frame.stream, None, 0, None, vec![], vec![]).await?;
     assert!(matches!(
-        connection.comparisons.replay_initial(&origin, &[11], &[])?,
-        Some(proto::NodeResponseBody::ComparisonUnavailable { .. })
+        connection.state_streams.replay_initial(&origin, &[11], &[])?,
+        Some(proto::NodeResponseBody::StateStreamUnavailable { .. })
     ));
-    abandon_state_stream(&node, peer, initial.frame.comparison).await;
+    abandon_state_stream(&node, peer, initial.frame.stream).await;
     assert!(matches!(
-        connection.comparisons.replay_initial(&origin, &[11], &[])?,
-        Some(proto::NodeResponseBody::ComparisonUnavailable { .. })
+        connection.state_streams.replay_initial(&origin, &[11], &[])?,
+        Some(proto::NodeResponseBody::StateStreamUnavailable { .. })
     ));
     Ok(())
 }
@@ -474,8 +487,9 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
 async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
-    let id = initial.frame.comparison;
+        start_state_stream(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown())
+            .await?;
+    let id = initial.frame.stream;
     let request = proto::RequestId::new();
     continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
     continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
@@ -499,7 +513,7 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             vec![]
         )
         .await?,
-        proto::NodeResponseBody::ComparisonUnavailable { .. }
+        proto::NodeResponseBody::StateStreamUnavailable { .. }
     ));
     Ok(())
 }
@@ -507,7 +521,7 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
 #[tokio::test]
 async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> anyhow::Result<()> {
     let (node, peer, messages) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -520,9 +534,9 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    pump_comparison(&node, peer, id).await?;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    pump_state_stream(&node, peer, id).await?;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     {
         let state = session.state.lock().await;
         assert!(state.bytes <= WINDOW_BYTES);
@@ -540,7 +554,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
             break;
         }
         continue_state(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
-        pump_comparison(&node, peer, id).await?;
+        pump_state_stream(&node, peer, id).await?;
     }
     let sequences = messages
         .lock()
@@ -548,7 +562,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         .iter()
         .filter_map(|message| match message {
             proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. })
-                if frame.comparison == id =>
+                if frame.stream == id =>
             {
                 Some(frame.sequence)
             }
@@ -565,18 +579,18 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
     let (node, peer, _) = node().await?;
     let first = proto::RequestId::new();
     let mut first_id = None;
-    for index in 0..MAX_COMPARISONS + 2 {
+    for index in 0..MAX_STATE_STREAMS + 2 {
         let request = if index == 0 { first.clone() } else { proto::RequestId::new() };
-        let initial = start_comparison(&node, peer, request, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
-        first_id.get_or_insert(initial.frame.comparison);
-        finish_state_round(&node, peer, initial.frame.comparison, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![])
+        let initial = start_state_stream(&node, peer, request, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
+        first_id.get_or_insert(initial.frame.stream);
+        finish_state_round(&node, peer, initial.frame.stream, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![])
             .await?;
     }
     let connection = node.peer_connections.get(&peer).unwrap();
     assert!(
-        matches!(connection.comparisons.replay_initial(&first, &[], &[])?, Some(proto::NodeResponseBody::ComparisonUnavailable { comparison }) if Some(comparison) == first_id)
+        matches!(connection.state_streams.replay_initial(&first, &[], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable { stream: comparison }) if Some(comparison) == first_id)
     );
-    assert!(start_comparison(&node, peer, first, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await.is_err());
+    assert!(start_state_stream(&node, peer, first, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await.is_err());
     Ok(())
 }
 
@@ -584,7 +598,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
 async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow::Result<()> {
     let (node, peer, messages) = node().await?;
     let origin = proto::RequestId::new();
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         origin.clone(),
@@ -597,15 +611,15 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     let oversized = live_item(PAGE_BYTES * 2);
     let entity = oversized.entity_id;
     let member = oversized.member.clone();
     let encoded = bincode::serialize(oversized.delta.as_ref().unwrap())?;
     queue_live(&node, peer, id, 1, vec![oversized, live_item(1)])?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     let mut assembled = Vec::new();
     let mut live_seen = false;
     for message in messages.lock().unwrap().iter() {
@@ -614,7 +628,7 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
             continue;
         };
         assert_eq!(request_id, &origin);
-        assert_eq!(frame.comparison, id);
+        assert_eq!(frame.stream, id);
         match &frame.body {
             StateFrameBody::LiveChunk { revision, chunk, member: received, complete } => {
                 assert_eq!(*revision, 1);
@@ -642,14 +656,14 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
     }
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     assert!(session.state.lock().await.comparison.is_none());
-    assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_some());
+    assert!(node.peer_connections.get(&peer).unwrap().state_streams.get(&id).is_some());
     Ok(())
 }
 
 #[tokio::test]
 async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -662,8 +676,8 @@ async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyho
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     // Drive the pump explicitly, including the cut between chunk fragments.
     session.pumping.store(true, Ordering::Release);
     queue_live(&node, peer, id, 1, vec![live_item(PAGE_BYTES * 2), live_item(1)])?;
@@ -671,7 +685,7 @@ async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyho
         let mut state = session.state.lock().await;
         let body = state.next_live(&session.live)?.unwrap();
         assert!(matches!(body, StateFrameBody::LiveChunk { complete: false, .. }));
-        state.retain(StateFrame { comparison: id, sequence: 1, body }, false)?;
+        state.retain(StateFrame { stream: id, sequence: 1, body }, false)?;
     }
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     let mut next = snapshot(vec![]).await?;
@@ -680,7 +694,7 @@ async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyho
     // This later publication must follow BeginRound; the unfinished revision 1
     // must finish before it, including its non-chunked final entity.
     queue_live(&node, peer, id, 2, vec![live_item(1)])?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     let state = session.state.lock().await;
     let bodies = state.retained.iter().map(|retained| &retained.frame.body).collect::<Vec<_>>();
     let marker = bodies.iter().position(|body| matches!(body, StateFrameBody::BeginRound(round) if round.number == 1)).unwrap();
@@ -698,8 +712,9 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
     let (node, peer, messages) = node().await?;
     let source = states(128, 8);
     let mut requester = snapshot(source[..1].to_vec()).await?;
-    let known = proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Digest(requester.head(super::super::whole()).await?)] };
-    let initial = start_comparison(
+    let known =
+        proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Digest(requester.span_digest(super::super::whole()).await?)] };
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -712,14 +727,14 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
         known,
     )
     .await?;
-    let id = initial.frame.comparison;
+    let id = initial.frame.stream;
     assert!(state_items(&initial.frame).0.iter().any(|item| matches!(item, StateItem::NeedHeads(_))));
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     for revision in 1..=8 {
         queue_live(&node, peer, id, revision, vec![live_item(1)])?;
     }
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     let state = session.state.lock().await;
     let comparison = state.comparison.as_ref().unwrap();
     assert!(!comparison.head_requests.is_empty(), "the unanswered baseline question must remain pending");
@@ -747,7 +762,7 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
 #[tokio::test]
 async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills() -> anyhow::Result<()> {
     let (node, peer, messages) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -760,13 +775,13 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     for revision in 1..=8 {
         queue_live(&node, peer, id, revision, vec![live_item(1)])?;
     }
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     let messages = messages.lock().unwrap();
     let bodies = messages
         .iter()
@@ -802,7 +817,7 @@ async fn abandonment_is_one_way_and_scoped_to_the_peer_and_recipient() -> anyhow
         Box::new(CaptureSender { peer: other_peer, messages: messages.clone() }),
     )
     .await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -815,19 +830,19 @@ async fn abandonment_is_one_way_and_scoped_to_the_peer_and_recipient() -> anyhow
         unknown(),
     )
     .await?;
-    let stream = initial.frame.comparison;
+    let stream = initial.frame.stream;
     let connection = node.peer_connections.get(&peer).unwrap();
-    connection.comparisons.get(&stream).unwrap().pumping.store(true, Ordering::Release);
+    connection.state_streams.get(&stream).unwrap().pumping.store(true, Ordering::Release);
     messages.lock().unwrap().clear();
     for (from, to, id) in [(other_peer, node.id, stream), (peer, other_peer, stream), (peer, node.id, StateStreamId::new())] {
         node.handle_message(proto::NodeMessage::AbandonStateStream { from, to, stream: id }).await?;
-        assert!(connection.comparisons.get(&stream).is_some(), "unrelated peer, recipient or handle cannot abandon this stream");
+        assert!(connection.state_streams.get(&stream).is_some(), "unrelated peer, recipient or handle cannot abandon this stream");
     }
     for _ in 0..2 {
         node.handle_message(proto::NodeMessage::AbandonStateStream { from: peer, to: node.id, stream }).await?;
-        assert!(connection.comparisons.get(&stream).is_none());
+        assert!(connection.state_streams.get(&stream).is_none());
     }
-    assert!(connection.comparisons.was_closed(&stream));
+    assert!(connection.state_streams.was_closed(&stream));
     assert!(messages.lock().unwrap().is_empty(), "one-way cleanup must send no response or acknowledgment");
     Ok(())
 }
@@ -838,9 +853,11 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
         let (node, peer, messages) = node().await?;
         let source = states(2, 8);
         let mut requester = snapshot(source[..1].to_vec()).await?;
-        let known =
-            proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Digest(requester.head(super::super::whole()).await?)] };
-        let initial = start_comparison(
+        let known = proto::KnownState {
+            spec: spec(),
+            spans: vec![proto::SpanContent::Digest(requester.span_digest(super::super::whole()).await?)],
+        };
+        let initial = start_state_stream(
             &node,
             peer,
             proto::RequestId::new(),
@@ -853,10 +870,10 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
             known,
         )
         .await?;
-        let id = initial.frame.comparison;
+        let id = initial.frame.stream;
         assert!(state_items(&initial.frame).0.iter().any(|item| matches!(item, StateItem::NeedHeads(_))));
         let connection = node.peer_connections.get(&peer).unwrap();
-        let session = connection.comparisons.get(&id).unwrap();
+        let session = connection.state_streams.get(&id).unwrap();
         session.pumping.store(true, Ordering::Release);
         let cancelled = proto::StateRoundOutcome::Cancelled;
         let credentials = vec![crate::policy::DEFAULT_CONTEXT];
@@ -866,22 +883,22 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
         finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
         assert!(session.state.lock().await.comparison.is_none(), "cancellation releases the unfinished comparison");
         if query.is_none() {
-            assert!(connection.comparisons.get(&id).is_none(), "Fetch has no ongoing stream after cancellation");
+            assert!(connection.state_streams.get(&id).is_none(), "Fetch has no ongoing stream after cancellation");
             continue;
         }
-        assert!(connection.comparisons.get(&id).is_some());
+        assert!(connection.state_streams.get(&id).is_some());
         queue_live(&node, peer, id, 1, vec![live_item(1)])?;
-        pump_comparison(&node, peer, id).await?;
+        pump_state_stream(&node, peer, id).await?;
         assert!(
             messages.lock().unwrap().iter().any(|message| matches!(message,
                 proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame {
-                    frame: StateFrame { comparison, body: StateFrameBody::Live { revision: 1, complete: true, .. }, .. }, ..
+                    frame: StateFrame { stream: comparison, body: StateFrameBody::Live { revision: 1, complete: true, .. }, .. }, ..
                 }, .. }) if *comparison == id
             )),
             "a cancelled comparison must not stop live delivery"
         );
         schedule_round(&node, peer, id, 1, 1, snapshot(states(1, 8)).await?, unknown()).await?;
-        pump_comparison(&node, peer, id).await?;
+        pump_state_stream(&node, peer, id).await?;
         finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
         {
             let state = session.state.lock().await;
@@ -890,7 +907,7 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
         }
         abandon_state_stream(&node, peer, id).await;
         abandon_state_stream(&node, peer, id).await;
-        assert!(connection.comparisons.get(&id).is_none());
+        assert!(connection.state_streams.get(&id).is_none());
         assert!(queue_live(&node, peer, id, 2, vec![live_item(1)]).is_err());
     }
     Ok(())
@@ -902,7 +919,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let first = snapshot(states(1, 8)).await?;
     let captured = Arc::downgrade(first.states.values().next().unwrap());
     let old = first.states.values().next().unwrap().payload.clone();
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -915,8 +932,8 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     assert!(captured.upgrade().is_some());
     let applied = proto::StateRoundOutcome::Applied { processed_through: 0 };
@@ -927,7 +944,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let mut empty = snapshot(vec![]).await?;
     let offer = empty.offer().await?;
     schedule_round(&node, peer, id, 1, 1, next, offer).await?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     finish_state_round(&node, peer, id, 0, applied, vec![]).await?;
     assert!(next_capture.upgrade().is_some(), "repeating an old Applied cannot release the new snapshot");
     let (members, targets) = {
@@ -963,12 +980,12 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     finish_state_round(&node, peer, id, 1, applied, vec![]).await?;
     assert!(next_capture.upgrade().is_none());
     assert!(session.state.lock().await.comparison.is_none());
-    assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_some(), "the standing stream survives");
+    assert!(node.peer_connections.get(&peer).unwrap().state_streams.get(&id).is_some(), "the standing stream survives");
     for round in 2..=32 {
         let next = snapshot(states(1, 8)).await?;
         let captured = Arc::downgrade(next.states.values().next().unwrap());
         schedule_round(&node, peer, id, round, round, next, empty.offer().await?).await?;
-        pump_comparison(&node, peer, id).await?;
+        pump_state_stream(&node, peer, id).await?;
         let last = session.state.lock().await.required_through;
         finish_state_round(&node, peer, id, round, proto::StateRoundOutcome::Applied { processed_through: last }, vec![]).await?;
         assert!(captured.upgrade().is_none(), "round {round} retained captured rows");
@@ -978,15 +995,15 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert_eq!(state.bytes, 0);
     }
     let connection = node.peer_connections.get(&peer).unwrap();
-    assert_eq!(connection.comparisons.sessions.lock().unwrap().len(), 1);
-    assert_eq!(connection.comparisons.origins.lock().unwrap().len(), 1, "new rounds do not allocate new stream origins");
+    assert_eq!(connection.state_streams.sessions.lock().unwrap().len(), 1);
+    assert_eq!(connection.state_streams.origins.lock().unwrap().len(), 1, "new rounds do not allocate new stream origins");
     Ok(())
 }
 
 #[tokio::test]
 async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -999,14 +1016,14 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     let first = live_item(1);
     let second = live_item(1);
     queue_live(&node, peer, id, 1, vec![first.clone()])?;
     queue_live(&node, peer, id, 3, vec![second])?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     {
         let mut state = session.state.lock().await;
         assert!(state.acknowledge_live(1).is_err(), "completed data is not yet processed");
@@ -1039,7 +1056,7 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
 #[tokio::test]
 async fn membership_only_publications_have_bounded_application_receipts() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1052,13 +1069,13 @@ async fn membership_only_publications_have_bounded_application_receipts() -> any
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     let mut state = session.state.lock().await;
     for sequence in 1..=MAX_LIVE_ITEMS as u64 {
         state.retain(
-            StateFrame { comparison: id, sequence, body: StateFrameBody::Live { revision: sequence * 2, items: vec![], complete: true } },
+            StateFrame { stream: id, sequence, body: StateFrameBody::Live { revision: sequence * 2, items: vec![], complete: true } },
             false,
         )?;
         // Frame credit keeps flowing; semantic application still has its own cap.
@@ -1069,7 +1086,7 @@ async fn membership_only_publications_have_bounded_application_receipts() -> any
     assert!(state
         .retain(
             StateFrame {
-                comparison: id,
+                stream: id,
                 sequence: MAX_LIVE_ITEMS as u64 + 1,
                 body: StateFrameBody::Live { revision: MAX_LIVE_ITEMS as u64 * 2 + 2, items: vec![], complete: true },
             },
@@ -1098,7 +1115,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
     )
     .await?;
     trx.commit().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1111,8 +1128,8 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     queue_live(
         &node,
@@ -1125,14 +1142,14 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
             delta: None,
         }],
     )?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     {
         let mut state = session.state.lock().await;
         while state.room(false) {
             let sequence = state.last_sent + 1;
             state.retain(
                 StateFrame {
-                    comparison: id,
+                    stream: id,
                     sequence,
                     body: StateFrameBody::State { round: 0, items: vec![], progress: ComparisonProgress::Continue },
                 },
@@ -1142,7 +1159,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
         assert!(state.room(true));
         state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: genesis.entity_id, target: target.clone() }])?;
     }
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     let frames = messages.lock().unwrap();
     let repair = frames
         .iter()
@@ -1167,7 +1184,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
 #[tokio::test]
 async fn absent_event_bridge_is_rejected_before_it_can_create_an_unrepairable_target() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1180,8 +1197,8 @@ async fn absent_event_bridge_is_rejected_before_it_can_create_an_unrepairable_ta
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, proto::OperationSet::default());
     let mut item = proto::QueryChange {
@@ -1193,7 +1210,7 @@ async fn absent_event_bridge_is_rejected_before_it_can_create_an_unrepairable_ta
     assert!(session.live.lock().unwrap().publications.is_empty());
     item.member = Some(proto::QueryMember { key: vec![], head: proto::Clock::singleton(&genesis) });
     queue_live(&node, peer, id, 1, vec![item])?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     assert_eq!(session.state.lock().await.live_targets.len(), 1);
     Ok(())
 }
@@ -1202,7 +1219,7 @@ async fn absent_event_bridge_is_rejected_before_it_can_create_an_unrepairable_ta
 async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair_receipt() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
     let source = states(1, 1);
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1216,8 +1233,8 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     )
     .await?;
     assert_eq!(state_items(&initial.frame).1, ComparisonProgress::Complete);
-    let id = initial.frame.comparison;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     let entity = &source[0].payload;
     continue_state(
@@ -1232,7 +1249,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
         vec![],
     )
     .await?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     let last = {
         let state = session.state.lock().await;
         let frame = &state.retained.back().unwrap().frame;
@@ -1255,7 +1272,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let mut empty = snapshot(vec![]).await?;
     let offer = empty.offer().await?;
     schedule_round(&node, peer, id, 1, 1, empty, offer).await?;
-    pump_comparison(&node, peer, id).await?;
+    pump_state_stream(&node, peer, id).await?;
     continue_state(
         &node,
         peer,
@@ -1307,13 +1324,13 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
         None,
     );
     let initial =
-        start_comparison(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![source]).await?, unknown())
+        start_state_stream(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![source]).await?, unknown())
             .await?;
     continue_state(
         &node,
         peer,
         proto::RequestId::new(),
-        initial.frame.comparison,
+        initial.frame.stream,
         Some(0),
         0,
         None,
@@ -1321,8 +1338,8 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
         vec![],
     )
     .await?;
-    pump_comparison(&node, peer, initial.frame.comparison).await?;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&initial.frame.comparison).unwrap();
+    pump_state_stream(&node, peer, initial.frame.stream).await?;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&initial.frame.stream).unwrap();
     let state = session.state.lock().await;
     let items = state_items(&state.retained.back().unwrap().frame).0;
     let StateItem::Repair { delta, .. } = &items[0] else { panic!("history repair") };
@@ -1341,7 +1358,7 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
 async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_output() -> anyhow::Result<()> {
     let (node, peer, messages) = node().await?;
     let query = proto::QueryId::new();
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1354,12 +1371,12 @@ async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_outpu
         unknown(),
     )
     .await?;
-    let id = initial.frame.comparison;
+    let id = initial.frame.stream;
     let item = live_item(1);
     assert!(queue_live(&node, peer, id, 1, vec![item; MAX_LIVE_ITEMS + 1]).is_err());
-    expire_comparison(&node, peer, id).await?;
+    expire_state_stream(&node, peer, id).await?;
     let messages = messages.lock().unwrap();
-    assert!(messages.iter().any(|message| matches!(message, proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame: StateFrame { comparison, body: StateFrameBody::RestartRequired, .. }, .. }, .. }) if *comparison == id)));
+    assert!(messages.iter().any(|message| matches!(message, proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame: StateFrame { stream: comparison, body: StateFrameBody::RestartRequired, .. }, .. }, .. }) if *comparison == id)));
     assert!(!messages.iter().any(|message| matches!(
         message,
         proto::NodeMessage::Update(proto::NodeUpdate {
@@ -1381,7 +1398,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
     let (node, peer, messages) = node().await?;
     for catalog in [false, true] {
         let credentials = if catalog { vec![] } else { vec![crate::policy::DEFAULT_CONTEXT] };
-        let initial = start_comparison(
+        let initial = start_state_stream(
             &node,
             peer,
             proto::RequestId::new(),
@@ -1394,22 +1411,22 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
             unknown(),
         )
         .await?;
-        let id = initial.frame.comparison;
+        let id = initial.frame.stream;
         let receipt = || proto::NodeRequestBody::ContinueState {
-            comparison: id,
+            stream: id,
             round: None,
             applied_through: None,
             processed_through: 0,
             answers: vec![],
         };
-        assert_eq!(comparison_bypasses_policy(&node, peer, &receipt(), false), catalog);
-        let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&id).unwrap();
+        assert_eq!(state_stream_bypasses_policy(&node, peer, &receipt(), false), catalog);
+        let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
         assert!(session.permits(&credentials));
         let authenticated = [crate::policy::DEFAULT_CONTEXT];
         assert!(!session.permits(if catalog { &authenticated } else { &[] }));
         finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, credentials).await?;
-        assert!(node.peer_connections.get(&peer).unwrap().comparisons.get(&id).is_none());
-        assert_eq!(comparison_bypasses_policy(&node, peer, &receipt(), false), catalog);
+        assert!(node.peer_connections.get(&peer).unwrap().state_streams.get(&id).is_none());
+        assert_eq!(state_stream_bypasses_policy(&node, peer, &receipt(), false), catalog);
 
         // Ordinary policy yields one nonempty credential for this auth entry.
         // Catalog controls must retain their original credentialless bypass.
@@ -1430,18 +1447,18 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
                 .unwrap();
             assert_eq!(matches!(response, proto::NodeResponseBody::Success), succeeds);
             if !succeeds {
-                assert!(matches!(response, proto::NodeResponseBody::ComparisonUnavailable { comparison } if *comparison == id));
+                assert!(matches!(response, proto::NodeResponseBody::StateStreamUnavailable { stream: comparison } if *comparison == id));
             }
         }
     }
     let unknown = proto::NodeRequestBody::ContinueState {
-        comparison: proto::StateStreamId::new(),
+        stream: proto::StateStreamId::new(),
         round: None,
         applied_through: None,
         processed_through: 0,
         answers: vec![],
     };
-    assert!(!comparison_bypasses_policy(&node, peer, &unknown, false), "unknown controls must pass through policy");
+    assert!(!state_stream_bypasses_policy(&node, peer, &unknown, false), "unknown controls must pass through policy");
     Ok(())
 }
 
@@ -1521,7 +1538,7 @@ fn positioned_state(id: u32, position: i64, head: u8) -> anyhow::Result<proto::A
 #[tokio::test]
 async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
-    let query = super::super::QueryTree::default();
+    let query = super::super::QueryTreeCache::default();
     let before = (0..256).map(|id| positioned_state(id, id as i64, 1)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut old = query.refresh(position_spec(), before).await?;
     let known = old.offer().await?;
@@ -1656,7 +1673,7 @@ async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::
 #[tokio::test]
 async fn prefix_encoded_initial_inventory_keeps_its_cursor_across_work_batches() -> anyhow::Result<()> {
     let states = (0..1024).map(|n| positioned_state(n, n as i64, 1)).collect::<anyhow::Result<Vec<_>>>()?;
-    let tree = super::super::QueryTree::default();
+    let tree = super::super::QueryTreeCache::default();
     let mut requester = tree.refresh(position_spec(), states.clone()).await?;
     let known = requester.offer().await?;
     let mut comparison = Comparison::new(tree.refresh(position_spec(), states).await?, known)?;
@@ -1704,7 +1721,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     known.spans.push(known.spans[0].clone());
     assert!(Comparison::new(snapshot(before.clone()).await?, known).is_err(), "overlapping pages must fail before comparison");
     let extra = positioned_state(3, 10000, 1)?;
-    let mut keyed = super::super::QueryTree::default().refresh(position_spec(), vec![extra]).await?;
+    let mut keyed = super::super::QueryTreeCache::default().refresh(position_spec(), vec![extra]).await?;
     let mut duplicate = keyed.offer().await?;
     let proto::SpanContent::Heads(first) = &mut duplicate.spans[0] else { unreachable!() };
     let mut second = first.clone();
@@ -1717,7 +1734,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     second.bounds.start = std::ops::Bound::Included(addr);
     duplicate.spans.push(proto::SpanContent::Heads(second));
     assert!(
-        Comparison::new(super::super::QueryTree::default().refresh(position_spec(), vec![]).await?, duplicate).is_err(),
+        Comparison::new(super::super::QueryTreeCache::default().refresh(position_spec(), vec![]).await?, duplicate).is_err(),
         "global duplicate IDs must fail even at distinct keys/pages"
     );
     let mut oversized = requester.offer().await?;
@@ -1773,7 +1790,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     };
     let before = text_state("z".repeat(40 * 1024), 1)?;
     let former = text_state("z".repeat(40 * 1024), 2)?;
-    let mut requester = super::super::QueryTree::default().refresh(spec.clone(), vec![before]).await?;
+    let mut requester = super::super::QueryTreeCache::default().refresh(spec.clone(), vec![before]).await?;
     let known = requester.offer().await?;
     let [proto::SpanContent::Heads(page)] = known.spans.as_slice() else { panic!("one valid complete initial inventory") };
     assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
@@ -1788,7 +1805,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let mut tx = node.storage.transaction();
     tx.set_state(&Default::default(), &former).await?;
     tx.commit().await?;
-    let empty = super::super::QueryTree::default().refresh(spec.clone(), vec![]).await?;
+    let empty = super::super::QueryTreeCache::default().refresh(spec.clone(), vec![]).await?;
     let mut comparison = Comparison::new(empty, known.clone())?;
     let Some(Work::InitialHeads(page)) = comparison.work.pop_front() else { panic!("initial region") };
     comparison.expand_initial_heads(page)?;
@@ -1803,7 +1820,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
         .any(|item| matches!(item, StateItem::Heads(page) if page.bounds == super::super::whole() && page.heads.is_empty())));
     assert_eq!(comparison.offered.get(&former.payload.entity_id), Some(&former.payload.state.head));
     let moved = text_state("a".into(), 2)?;
-    let captured = super::super::QueryTree::default().refresh(spec, vec![moved.clone()]).await?;
+    let captured = super::super::QueryTreeCache::default().refresh(spec, vec![moved.clone()]).await?;
     let mut comparison = Comparison::new(captured, known)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert!(items.iter().any(|item| matches!(item, StateItem::Heads(page) if page.heads.len() == 1 && page.heads.to_vec()[0].entity.entity_id == moved.payload.entity_id)));
@@ -1862,7 +1879,7 @@ fn comparison_credentials_require_the_same_order_independent_bag() {
 #[tokio::test]
 async fn shared_live_target_survives_until_every_offering_publication_is_applied() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1875,7 +1892,7 @@ async fn shared_live_target_survives_until_every_offering_publication_is_applied
         unknown(),
     )
     .await?;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&initial.frame.comparison).unwrap();
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&initial.frame.stream).unwrap();
     let mut state = session.state.lock().await;
     let item = live_item(1);
     let head = item.member.as_ref().unwrap().head.clone();
@@ -1888,7 +1905,7 @@ async fn shared_live_target_survives_until_every_offering_publication_is_applied
     for revision in 1..=2 {
         state.retain(
             StateFrame {
-                comparison: initial.frame.comparison,
+                stream: initial.frame.stream,
                 sequence: revision,
                 body: StateFrameBody::Live { revision, items: vec![], complete: true },
             },
@@ -1909,7 +1926,7 @@ async fn shared_live_target_survives_until_every_offering_publication_is_applied
 #[tokio::test]
 async fn first_live_frame_after_idle_starts_a_fresh_progress_timeout() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
-    let initial = start_comparison(
+    let initial = start_state_stream(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1922,17 +1939,17 @@ async fn first_live_frame_after_idle_starts_a_fresh_progress_timeout() -> anyhow
         unknown(),
     )
     .await?;
-    let session = node.peer_connections.get(&peer).unwrap().comparisons.get(&initial.frame.comparison).unwrap();
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&initial.frame.stream).unwrap();
     let mut state = session.state.lock().await;
-    state.last_activity = Instant::now() - COMPARISON_TTL;
+    state.last_activity = Instant::now() - STREAM_TTL;
     state.retain(
         StateFrame {
-            comparison: initial.frame.comparison,
+            stream: initial.frame.stream,
             sequence: 1,
             body: StateFrameBody::Live { revision: 1, items: vec![live_item(1)], complete: true },
         },
         false,
     )?;
-    assert!(state.last_activity.elapsed() < COMPARISON_TTL, "ordinary idle time is not an unacknowledged-frame timeout");
+    assert!(state.last_activity.elapsed() < STREAM_TTL, "ordinary idle time is not an unacknowledged-frame timeout");
     Ok(())
 }

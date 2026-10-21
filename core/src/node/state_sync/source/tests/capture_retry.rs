@@ -3,7 +3,7 @@ use crate::{
     error::RequestError,
     livequery::{EntityLiveQuery, QueryResolution},
     node::CachePolicy,
-    peer_subscription::client_relay::Status,
+    peer_subscription::Status,
 };
 
 type Messages = Arc<std::sync::Mutex<Vec<proto::NodeMessage>>>;

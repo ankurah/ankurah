@@ -14,9 +14,9 @@ pub struct PeerState<CD: ContextData> {
     pub(super) subscription_handler: SubscriptionHandler<CD>,
     pub(super) pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
     pub(super) pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-    pub(crate) initial_comparison: tokio::sync::Mutex<()>,
-    pub(crate) comparisons: super::state_sync::Comparisons<CD>,
-    pub(crate) outgoing_comparisons: std::sync::Arc<SafeMap<proto::StateStreamId, bool>>,
+    pub(crate) initial_state_stream: tokio::sync::Mutex<()>,
+    pub(crate) state_streams: super::state_sync::StateStreams<CD>,
+    pub(crate) outgoing_state_streams: std::sync::Arc<SafeMap<proto::StateStreamId, bool>>,
     pub(crate) incoming_states: std::sync::Arc<super::state_sync::IncomingStates>,
 }
 
@@ -28,9 +28,9 @@ impl<CD: ContextData> PeerState<CD> {
             subscription_handler,
             pending_requests: SafeMap::new(),
             pending_updates: SafeMap::new(),
-            initial_comparison: tokio::sync::Mutex::new(()),
-            comparisons: Default::default(),
-            outgoing_comparisons: Default::default(),
+            initial_state_stream: tokio::sync::Mutex::new(()),
+            state_streams: Default::default(),
+            outgoing_state_streams: Default::default(),
             incoming_states: Default::default(),
         }
     }

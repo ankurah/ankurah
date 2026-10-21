@@ -6,13 +6,13 @@ use crate::schema::registration::RegistrationError;
 
 pub use crate::node::handler::commit_transaction;
 
-/// Drive the same cleanup as the comparison expiry timer, without a real-time wait.
-pub async fn expire_comparison<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, comparison: proto::StateStreamId) -> anyhow::Result<()>
+/// Drive the same cleanup as the state stream expiry timer, without a real-time wait.
+pub async fn expire_state_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, stream_id: proto::StateStreamId) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    crate::node::state_sync::expire_comparison(node, peer, comparison).await
+    crate::node::state_sync::expire_state_stream(node, peer, stream_id).await
 }
 
 /// Bind `schema`'s cells from a hand-built definition under the node's

@@ -76,10 +76,18 @@ impl<G: DigestGroup> TreeSpanDigest<G> {
         let prefix = NodePrefix::from_bytes(&prefix).map_err(|e| TreeError::unreadable("span digest prefix", e))?;
         let bounds = TreeSpan::new(start, end);
         let digest = Digest::from_row_bytes(&digest).map_err(|e| TreeError::unreadable("span digest", e))?;
-        if crate::bounds::empty(&bounds) || !subset(&bounds, &TreeSpan::under(&prefix)) || digest.count() < 0 {
+        let head = Self { prefix, bounds, digest };
+        head.validate()?;
+        Ok(head)
+    }
+
+    /// Validate a typed span digest without encoding and decoding it again.
+    /// Prefix and group encodings are already checked by their constructors.
+    pub fn validate(&self) -> Result<(), TreeError> {
+        if self.bounds.is_empty() || !self.bounds.is_subset_of(&TreeSpan::under(&self.prefix)) || self.digest.count() < 0 {
             return Err(TreeError::InvalidKey("invalid tree span digest bounds or count"));
         }
-        Ok(Self { prefix, bounds, digest })
+        Ok(())
     }
 }
 
@@ -152,11 +160,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// nodes contribute their stored digest; boundary buckets are clipped by
     /// reading only their leaves inside the requested address bounds. Empty
     /// regions remain in the cover: a peer may have leaves there.
-    pub async fn heads(&mut self, scope: &TreeScope) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
+    pub async fn span_digests(&mut self, scope: &TreeScope) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         self.check_scope(scope)?;
         let mut heads = Vec::new();
         for range in &scope.ranges {
-            heads.extend(self.heads_in(&NodePrefix::root(), range).await?);
+            heads.extend(self.span_digests_in(&NodePrefix::root(), range).await?);
         }
         Ok(heads)
     }
@@ -169,7 +177,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     /// Sum the exact span digests of a scope.
     pub async fn digest(&mut self, scope: &TreeScope) -> Result<Digest<G>, TreeError> {
-        Digest::checked_sum(self.heads(scope).await?.iter().map(|head| head.digest)).map_err(Into::into)
+        Digest::checked_sum(self.span_digests(scope).await?.iter().map(|head| head.digest)).map_err(Into::into)
     }
 
     /// Refine a span digest into the nearest cached descendants, keeping its address
@@ -178,17 +186,17 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let bounds = intersect(&TreeSpan::under(&head.prefix), &head.bounds).ok_or(TreeError::InvalidKey("empty tree span"))?;
         let children = self.child_prefixes(&head.prefix).await?;
         if children.is_empty() {
-            return self.heads_in(&head.prefix, &bounds).await;
+            return self.span_digests_in(&head.prefix, &bounds).await;
         }
         let mut heads = empty_gaps(&head.prefix, &bounds, &children);
         for prefix in children {
-            heads.extend(self.heads_in(&prefix, &bounds).await?);
+            heads.extend(self.span_digests_in(&prefix, &bounds).await?);
         }
         heads.sort_by(|a, b| lower_cmp(&a.bounds.start, &b.bounds.start));
         Ok(heads)
     }
 
-    async fn heads_in(&mut self, prefix: &NodePrefix, range: &TreeSpan) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
+    async fn span_digests_in(&mut self, prefix: &NodePrefix, range: &TreeSpan) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         let mut pending = vec![prefix.clone()];
         let mut heads = Vec::new();
         while let Some(prefix) = pending.pop() {

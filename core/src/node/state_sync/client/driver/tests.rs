@@ -12,10 +12,33 @@ async fn fixture(
 ) -> anyhow::Result<(TestNode, Driver, Arc<super::super::super::IncomingStates>)> {
     let node = TestNode::new(Arc::new(crate::test_utils::TestStorage::default()), crate::policy::PermissiveAgent::new());
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
-    let snapshot = super::super::super::QueryTree::default().refresh(spec, rows).await?;
+    let snapshot = super::super::super::QueryTreeCache::default().refresh(spec, rows).await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), None, None)?;
     Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new())?, registry))
+}
+
+#[tokio::test]
+async fn malformed_inventories_do_not_change_the_round_projection() -> anyhow::Result<()> {
+    let (node, mut driver, _registry) = fixture(vec![state(2), state(4)]).await?;
+    let original = driver.projection.round.as_ref().unwrap().members.clone();
+    let head = |n| proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id: id(n), head: head(n) } };
+    let address = |n| ankurah_digest_tree::leaf_address(&[], id(n));
+    let invalid = [
+        StateItem::Heads(proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: vec![head(4), head(2)].into() }),
+        StateItem::Heads(proto::TreeSpanInventory {
+            bounds: proto::TreeSpan::new(std::ops::Bound::Included(address(4)), std::ops::Bound::Included(address(2))),
+            heads: Default::default(),
+        }),
+        StateItem::Snapshots(proto::SnapshotPage { bounds: proto::TreeSpan::all(), states: vec![state(4), state(2)] }),
+    ];
+    for item in invalid {
+        assert!(driver.items(&node, id(90), &[], Owner::Round(0), vec![item]).await.is_err());
+        assert_eq!(driver.projection.round.as_ref().unwrap().members, original);
+        assert!(driver.goals.rows.is_empty());
+        assert!(driver.jobs.is_empty());
+    }
+    Ok(())
 }
 
 fn application_genesis(seed: u8) -> proto::Event {
@@ -307,7 +330,7 @@ async fn bind_query_driver(
 ) -> anyhow::Result<(Driver, Arc<super::super::super::IncomingStates>, crate::livequery::EntityLiveQuery)> {
     use crate::peer_subscription::RemoteQuerySubscriber;
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
-    let snapshot = super::super::super::QueryTree::default()
+    let snapshot = super::super::super::QueryTreeCache::default()
         .refresh(spec, vec![proto::Attested::opt(proto::EntityState { entity_id: entity.id(), state: entity.to_state()? }, None)])
         .await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
@@ -658,7 +681,7 @@ async fn cancelled_round_jobs_do_not_complete_or_write_the_next_round_membership
     let (node, mut driver, _registry) = fixture(vec![state(1)]).await?;
     driver.projection.publish(11, vec![(id(1), None)])?;
     driver.cancel_round(&node, id(90), &[])?;
-    let snapshot = super::super::super::QueryTree::default().refresh(driver.spec.clone(), vec![state(2)]).await?;
+    let snapshot = super::super::super::QueryTreeCache::default().refresh(driver.spec.clone(), vec![state(2)]).await?;
     driver.projection.begin(Round::new(proto::StateRound { number: 1, revision: 11 }, snapshot))?;
     driver.round_number = 1;
     driver.round_jobs = 1;

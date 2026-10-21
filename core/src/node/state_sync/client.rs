@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use ankurah_digest_tree::{leaf_address, CanonicalCodec};
 use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrameBody, StateItem};
 use anyhow::{bail, ensure};
 use bincode::Options;
@@ -20,7 +19,7 @@ mod projection;
 pub(crate) use driver::RefreshHandle;
 
 pub(crate) struct RemoteState {
-    pub comparison: proto::StateStreamId,
+    pub stream_id: proto::StateStreamId,
     pub ids: Vec<proto::EntityId>,
     driver: driver::Driver,
 }
@@ -43,7 +42,7 @@ where
     let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
     let weak = node.weak();
     let original_connection = Arc::downgrade(&connection);
-    let abandon = Arc::new(move |comparison| {
+    let abandon = Arc::new(move |stream_id| {
         let weak = weak.clone();
         let original_connection = original_connection.clone();
         crate::task::spawn(async move {
@@ -52,7 +51,7 @@ where
                 if !node.peer_connections.get(&peer).is_some_and(|current| Arc::ptr_eq(&current, &connection)) {
                     return;
                 }
-                let _ = send_abandonment(&connection, node.id, peer, comparison);
+                let _ = send_abandonment(&connection, node.id, peer, stream_id);
             }
         });
     });
@@ -76,29 +75,29 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let comparison = initial.frame.comparison;
+    let stream_id = initial.frame.stream;
     let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
-    stream.bind(comparison, catalog, connection.outgoing_comparisons.clone());
+    stream.bind(stream_id, catalog, connection.outgoing_state_streams.clone());
     drop(connection);
     if initial.spec != snapshot.spec || initial.frame.sequence != 0 || initial.round.number != 0 {
-        let _ = abandon_current_state(node, peer, comparison, &stream);
-        return Err(RetrievalError::Other("invalid initial comparison metadata".into()));
+        let _ = abandon_current_state(node, peer, stream_id, &stream);
+        return Err(RetrievalError::Other("invalid initial state stream metadata".into()));
     }
     if let Err(error) = stream.inbox.insert(initial.frame) {
-        let _ = abandon_current_state(node, peer, comparison, &stream);
+        let _ = abandon_current_state(node, peer, stream_id, &stream);
         return Err(error.into());
     }
-    let mut driver = driver::Driver::new(snapshot, initial.round, stream, comparison)?;
+    let mut driver = driver::Driver::new(snapshot, initial.round, stream, stream_id)?;
     let result = async {
         driver.prepare(node, query).await?;
         driver.drive(node.weak(), peer, credentials, query, true).await
     }
     .await;
     if let Err(error) = result {
-        let _ = abandon_current_state(node, peer, comparison, &driver.stream);
+        let _ = abandon_current_state(node, peer, stream_id, &driver.stream);
         return Err(stream_error(error));
     }
-    Ok(RemoteState { comparison, ids: driver.ids(), driver })
+    Ok(RemoteState { stream_id, ids: driver.ids(), driver })
 }
 
 fn stream_error(error: anyhow::Error) -> RetrievalError {
@@ -171,7 +170,7 @@ pub(crate) fn finish_state<SE, PA>(
                     }
                 }
             }
-            let _ = abandon_current_state(&node, peer, remote.comparison, &driver.stream);
+            let _ = abandon_current_state(&node, peer, remote.stream_id, &driver.stream);
         }
     });
 }
@@ -190,7 +189,7 @@ where
 pub(crate) fn abandon_current_state<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
-    comparison: proto::StateStreamId,
+    stream_id: proto::StateStreamId,
     stream: &IncomingStream,
 ) -> Result<(), RetrievalError>
 where
@@ -201,7 +200,7 @@ where
     if connection.incoming_states.is_current(&stream.request)
         && stream.query.is_none_or(|(query, version)| node.live_queries.get(query).is_some_and(|query| query.is_current(version)))
     {
-        send_abandonment(&connection, node.id, peer, comparison)?;
+        send_abandonment(&connection, node.id, peer, stream_id)?;
         stream.disarm_abandonment();
     }
     Ok(())
@@ -222,7 +221,7 @@ where
     // Live feedback still needs the catalog bypass after snapshot release.
     match state_deadline(node.request(peer, credentials, proto::NodeRequestBody::FinishStateRound { stream, round, outcome })).await?? {
         proto::NodeResponseBody::Success => Ok(()),
-        proto::NodeResponseBody::ComparisonUnavailable { .. } => Err(RequestError::ConnectionLost.into()),
+        proto::NodeResponseBody::StateStreamUnavailable { .. } => Err(RequestError::ConnectionLost.into()),
         proto::NodeResponseBody::Error(error) => Err(RequestError::ServerError(error).into()),
         other => Err(RequestError::UnexpectedResponse(other).into()),
     }
@@ -235,7 +234,7 @@ fn send_abandonment<CD: crate::session::ContextData>(
     stream: proto::StateStreamId,
 ) -> Result<(), RequestError> {
     let result = connection.send_message(proto::NodeMessage::AbandonStateStream { from, to, stream });
-    connection.outgoing_comparisons.remove(&stream);
+    connection.outgoing_state_streams.remove(&stream);
     result.map_err(RequestError::from)
 }
 
@@ -278,39 +277,6 @@ fn snapshot_inventory(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> any
         .collect::<anyhow::Result<Vec<_>>>()?;
     let heads = proto::PackedHeads::from_rows(rows.iter().map(|(key, id, head)| (key.as_slice(), *id, *head)));
     Ok(proto::TreeSpanInventory { bounds: page.bounds.clone(), heads })
-}
-
-fn replace_members(
-    members: &mut BTreeMap<Vec<u8>, proto::EntityId>,
-    spec: &proto::TreeSpec,
-    page: proto::TreeSpanInventory,
-    max_rows: usize,
-) -> anyhow::Result<()> {
-    use std::ops::Bound::*;
-    ensure!(page.heads.len() <= max_rows, "peer sent too many heads");
-    let nonempty = match (&page.bounds.start, &page.bounds.end) {
-        (Unbounded, _) | (_, Unbounded) => true,
-        (Included(a), Included(b)) => a <= b,
-        (Included(a) | Excluded(a), Included(b) | Excluded(b)) => a < b,
-    };
-    ensure!(nonempty, "invalid peer inventory bounds");
-    let mut previous = None;
-    let mut cursor = page.heads.cursor();
-    while let Some(leaf) = cursor.next() {
-        CanonicalCodec.split(spec.key_spec(), leaf.key)?;
-        let address = leaf_address(leaf.key, leaf.entity.entity_id);
-        ensure!(page.bounds.contains(&address) && previous.as_ref().is_none_or(|p| p < &address), "invalid peer head inventory");
-        previous = Some(address);
-    }
-    let removed: Vec<_> = members.range((page.bounds.start.clone(), page.bounds.end.clone())).map(|(key, _)| key.clone()).collect();
-    for key in removed {
-        members.remove(&key);
-    }
-    let mut cursor = page.heads.cursor();
-    while let Some(leaf) = cursor.next() {
-        members.insert(leaf_address(leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use crate::{
     entity::TemporaryEntity,
     node::{
         source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
-        state_sync::{QueryTree, Snapshot},
+        state_sync::{QueryTreeCache, Snapshot},
         Node, WeakNode,
     },
     policy::{ContextPolicy, PolicyAgent},
@@ -34,21 +34,21 @@ struct Row {
 pub(crate) struct CapturedQuery {
     pub(crate) revision: u64,
     pub(crate) snapshot: Snapshot,
-    pub(super) projection: QueryProjection,
-    pub(super) cursor: SourceCursor,
+    pub(crate) projection: QueryProjection,
+    pub(crate) cursor: SourceCursor,
 }
 
-pub(super) struct QueryProjection {
+pub(crate) struct QueryProjection {
     selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     rows: Rows,
-    tree: Arc<QueryTree>,
+    tree: Arc<QueryTreeCache>,
 }
 
-pub(super) struct Refresh {
-    pub(super) number: u64,
-    pub(super) known: proto::KnownState,
-    pub(super) response: oneshot::Sender<anyhow::Result<()>>,
+pub(crate) struct Refresh {
+    pub(crate) number: u64,
+    pub(crate) known: proto::KnownState,
+    pub(crate) response: oneshot::Sender<anyhow::Result<()>>,
 }
 
 /// Register before scanning, then fold a complete source window or validate the
@@ -58,7 +58,7 @@ pub(crate) async fn capture_query<SE, PA>(
     mut selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     credentials: Vec<PA::ContextData>,
-    tree: Arc<QueryTree>,
+    tree: Arc<QueryTreeCache>,
 ) -> anyhow::Result<CapturedQuery>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -114,7 +114,7 @@ impl QueryProjection {
         if !evaluate_predicate(&entity, &self.selection.predicate)? {
             return Ok(None);
         }
-        let values = QueryTree::key_paths(&self.spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+        let values = QueryTreeCache::key_paths(&self.spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
         let key = CanonicalCodec.encode_nullable(self.spec.key_spec(), &values)?;
         Ok(Some(Row { state, values, key }))
     }
@@ -214,9 +214,9 @@ impl QueryProjection {
     }
 }
 
-pub(super) struct QuerySource<CD: ContextData> {
+pub(crate) struct QuerySource<CD: ContextData> {
     peer: proto::EntityId,
-    comparison: proto::StateStreamId,
+    stream_id: proto::StateStreamId,
     credentials: Vec<CD>,
     projection: QueryProjection,
     cursor: SourceCursor,
@@ -224,18 +224,18 @@ pub(super) struct QuerySource<CD: ContextData> {
 }
 
 impl<CD: ContextData> QuerySource<CD> {
-    pub(super) fn new(
+    pub(crate) fn new(
         peer: proto::EntityId,
-        comparison: proto::StateStreamId,
+        stream_id: proto::StateStreamId,
         credentials: Vec<CD>,
         projection: QueryProjection,
         cursor: SourceCursor,
         revision: u64,
     ) -> Self {
-        Self { peer, comparison, credentials, projection, cursor, revision }
+        Self { peer, stream_id, credentials, projection, cursor, revision }
     }
 
-    pub(super) async fn run<SE, PA>(mut self, weak: WeakNode<SE, PA>, mut commands: mpsc::Receiver<Refresh>) -> anyhow::Result<()>
+    pub(crate) async fn run<SE, PA>(mut self, weak: WeakNode<SE, PA>, mut commands: mpsc::Receiver<Refresh>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -255,7 +255,7 @@ impl<CD: ContextData> QuerySource<CD> {
                     // Bad or premature round requests do not invalidate an
                     // otherwise sound source projection.
                     let result = crate::node::state_sync::schedule_round(
-                        &node, self.peer, self.comparison, command.number, self.revision, snapshot, command.known,
+                        &node, self.peer, self.stream_id, command.number, self.revision, snapshot, command.known,
                     ).await;
                     let _ = command.response.send(result);
                 }
@@ -289,7 +289,7 @@ impl<CD: ContextData> QuerySource<CD> {
         } else {
             let changes = self.projection.apply(node, &self.credentials, &batch).await?;
             if !changes.is_empty() {
-                crate::node::state_sync::queue_live(node, self.peer, self.comparison, batch.revision.0, changes)?;
+                crate::node::state_sync::queue_live(node, self.peer, self.stream_id, batch.revision.0, changes)?;
             }
             self.revision = batch.revision.0;
         }
@@ -353,7 +353,7 @@ impl<CD: ContextData> QuerySource<CD> {
             }
         }
         self.projection.tree.refresh_captured(self.projection.spec.clone(), self.projection.attested_rows(node)).await?;
-        crate::node::state_sync::queue_live(node, self.peer, self.comparison, revision, changed)?;
+        crate::node::state_sync::queue_live(node, self.peer, self.stream_id, revision, changed)?;
         self.revision = revision;
         Ok(())
     }

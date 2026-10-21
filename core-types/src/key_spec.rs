@@ -110,19 +110,6 @@ impl IndexDirection {
 impl<K> KeySpec<K> {
     /// A key spec of these parts, most significant first.
     pub fn new(keyparts: Vec<IndexKeyPart<K>>) -> Self { Self { keyparts } }
-
-    /// The same parts with every direction ascending and no nulls placement:
-    /// the order a digest tree files them in, whatever order a use walks them.
-    pub fn ascending(&self) -> Self
-    where K: Clone {
-        Self {
-            keyparts: self
-                .keyparts
-                .iter()
-                .map(|part| IndexKeyPart { direction: IndexDirection::Asc, nulls: None, ..part.clone() })
-                .collect(),
-        }
-    }
 }
 
 impl KeySpec<String> {

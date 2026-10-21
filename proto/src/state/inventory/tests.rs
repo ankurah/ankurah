@@ -190,3 +190,38 @@ fn fixed_generations_keep_previously_valid_large_clock_pages_within_budget() {
         assert!(PackedHeads::decode(&packed.bytes[..n]).is_err());
     }
 }
+
+#[test]
+fn inventory_validation_checks_bounds_order_duplicates_and_canonical_keys() {
+    use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, ValueType};
+    use ankurah_digest_tree::leaf_address;
+    use std::ops::Bound::{Excluded, Included};
+
+    let spec = TreeSpec::new(KeySpec::new(vec![]), ankql::ast::Predicate::True);
+    let heads = rows(&[vec![], vec![], vec![]], 1);
+    let address = |index: usize| leaf_address(&heads[index].key, heads[index].entity.entity_id);
+    for bounds in [TreeSpan::all(), TreeSpan::new(Included(address(0)), Included(address(2)))] {
+        let inventory = TreeSpanInventory { bounds, heads: heads.clone().into() };
+        inventory.validate(&spec).unwrap();
+        let decoded: TreeSpanInventory = bincode::deserialize(&bincode::serialize(&inventory).unwrap()).unwrap();
+        decoded.validate(&spec).unwrap();
+    }
+    TreeSpanInventory { bounds: TreeSpan::all(), heads: Default::default() }.validate(&spec).unwrap();
+    let invalid = [
+        TreeSpanInventory { bounds: TreeSpan::new(Excluded(address(1)), Excluded(address(1))), heads: Default::default() },
+        TreeSpanInventory { bounds: TreeSpan::new(Included(address(2)), Included(address(0))), heads: Default::default() },
+        TreeSpanInventory { bounds: TreeSpan::new(Excluded(address(0)), Included(address(2))), heads: heads.clone().into() },
+        TreeSpanInventory { bounds: TreeSpan::new(Included(address(0)), Excluded(address(2))), heads: heads.clone().into() },
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: vec![heads[1].clone(), heads[0].clone()].into() },
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: vec![heads[0].clone(), heads[0].clone()].into() },
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: rows(&[vec![1]], 1).into() },
+    ];
+    for inventory in invalid {
+        assert!(inventory.validate(&spec).is_err(), "{inventory:?}");
+        let decoded: TreeSpanInventory = bincode::deserialize(&bincode::serialize(&inventory).unwrap()).unwrap();
+        assert!(decoded.validate(&spec).is_err());
+    }
+    let keyed = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(PropertyId::Id, ValueType::EntityId)]), ankql::ast::Predicate::True);
+    let inventory = TreeSpanInventory { bounds: TreeSpan::all(), heads: heads.into() };
+    assert!(inventory.validate(&keyed).is_err(), "an inventory valid under another key spec is not sufficient");
+}

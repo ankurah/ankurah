@@ -104,9 +104,9 @@ fn frames(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::St
     let ids: Vec<_> = replies
         .iter()
         .filter_map(|reply| match reply {
-            StateTraffic::Response(proto::NodeResponseBody::Fetch(state)) if query.is_none() => Some(state.frame.comparison),
+            StateTraffic::Response(proto::NodeResponseBody::Fetch(state)) if query.is_none() => Some(state.frame.stream),
             StateTraffic::Response(proto::NodeResponseBody::QuerySubscribed { query_id, state }) if Some(*query_id) == query => {
-                Some(state.frame.comparison)
+                Some(state.frame.stream)
             }
             _ => None,
         })
@@ -120,7 +120,7 @@ fn frames(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::St
             StateTraffic::Frame(frame) => Some(frame),
             _ => None,
         })
-        .filter(|page| ids.contains(&page.comparison))
+        .filter(|page| ids.contains(&page.stream))
         .cloned()
         .collect()
 }
@@ -212,7 +212,7 @@ async fn run(db_prefix: &str) -> anyhow::Result<()> {
         gloo_timers::future::TimeoutFuture::new(10).await;
     }
     anyhow::ensure!(query.ids().len() == 66, "live delivery resumes after reconnect");
-    let stream = frames(&responses, Some(query.query_id())).first().expect("reconnect frame").comparison;
+    let stream = frames(&responses, Some(query.query_id())).first().expect("reconnect frame").stream;
     let subscribed_before = responses
         .lock()
         .unwrap()
@@ -226,8 +226,10 @@ async fn run(db_prefix: &str) -> anyhow::Result<()> {
         query.refresh().await?;
         anyhow::ensure!(query.ids().len() == 66, "refresh preserves exact membership");
         anyhow::ensure!(
-            frames(&responses, Some(query.query_id())).iter().any(|frame| frame.comparison == stream
-                && matches!(frame.body, proto::StateFrameBody::BeginRound(round) if round.number == number)),
+            frames(&responses, Some(query.query_id()))
+                .iter()
+                .any(|frame| frame.stream == stream
+                    && matches!(frame.body, proto::StateFrameBody::BeginRound(round) if round.number == number)),
             "refresh begins a round on the existing stream"
         );
     }

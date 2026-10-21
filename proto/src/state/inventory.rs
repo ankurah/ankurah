@@ -1,10 +1,11 @@
 //! Packed, independently decodable inventories. Binary serde retains the validated
 //! byte buffer; JSON keeps the readable list of keyed entity heads.
 
+use ankurah_digest_tree::{CanonicalCodec, TreeError};
 use bytes::Bytes;
 use serde::{de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Clock, EntityHead, EntityId, EventId, TreeSpan};
+use crate::{Clock, EntityHead, EntityId, EventId, TreeSpan, TreeSpec};
 
 mod codec;
 use codec::{Reader, PLAIN, PLAIN_FIXED, PREFIX, PREFIX_FIXED};
@@ -22,6 +23,29 @@ pub struct TreeSpanInventory {
 }
 
 impl TreeSpanInventory {
+    /// Check canonical keys, nonempty bounds and strictly increasing addresses
+    /// within those bounds. Reads borrowed heads without rebuilding their clocks.
+    /// Message budgets and correspondence to a requested span belong to the caller.
+    pub fn validate(&self, spec: &TreeSpec) -> Result<(), TreeError> {
+        if self.bounds.is_empty() {
+            return Err(TreeError::InvalidKey("empty inventory bounds"));
+        }
+        let mut previous = Vec::new();
+        let mut address = Vec::new();
+        let mut cursor = self.heads.cursor();
+        while let Some(leaf) = cursor.next() {
+            CanonicalCodec.split(spec.key_spec(), leaf.key)?;
+            address.clear();
+            address.extend_from_slice(leaf.key);
+            address.extend_from_slice(&leaf.entity.entity_id.to_bytes());
+            if !self.bounds.contains(&address) || address <= previous {
+                return Err(TreeError::InvalidKey("invalid inventory address order or bounds"));
+            }
+            std::mem::swap(&mut previous, &mut address);
+        }
+        Ok(())
+    }
+
     /// Uncompressed logical size, including fixed-width lengths and generations.
     /// Compression must not bypass the comparison's decoded-work budget.
     pub fn expanded_size(&self) -> u64 { bincode::serialized_size(&self.bounds).expect("bounds serialize") + self.heads.expanded_size() }

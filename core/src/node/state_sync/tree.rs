@@ -26,10 +26,11 @@ const OFFER_SPANS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
 
-/// Retained by an active query; Fetch uses a temporary instance. Sparse refreshes
-/// update changed leaves in place; dense refreshes reconstruct the digest on demand.
+/// Retains the active query's derived rows and tree; Fetch uses a temporary cache.
+/// A different TreeSpec replaces the cached tree. Sparse updates under the same
+/// spec change leaves in place; dense updates reconstruct the digest on demand.
 #[derive(Default)]
-pub(crate) struct QueryTree(Arc<Cache>);
+pub(crate) struct QueryTreeCache(Arc<Cache>);
 
 struct Cached {
     spec: TreeSpec,
@@ -85,7 +86,7 @@ impl PropertyTypes for CatalogTypes<'_> {
     }
 }
 
-impl QueryTree {
+impl QueryTreeCache {
     pub fn spec(selection: &Selection<Resolved>, catalog: &CatalogManager) -> TreeSpec {
         // Materialization preserves every Selection, including expressions and
         // JSON paths the tree's scalar range planner cannot address exactly.
@@ -97,9 +98,12 @@ impl QueryTree {
 
     pub fn offered_spec(selection: &Selection<Resolved>, catalog: &CatalogManager, known: &proto::KnownState) -> anyhow::Result<TreeSpec> {
         let default = Self::spec(selection, catalog);
-        let by_id = TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone());
-        anyhow::ensure!(known.spec == default || known.spec == by_id, "unsupported comparison tree spec");
+        anyhow::ensure!(Self::accepts_spec(&known.spec, &default), "unsupported comparison tree spec");
         Ok(known.spec.clone())
+    }
+
+    fn accepts_spec(spec: &TreeSpec, default: &TreeSpec) -> bool {
+        spec == default || *spec == TreeSpec::new(KeySpec::new(vec![]), default.predicate().clone())
     }
 
     pub async fn snapshot(
@@ -108,14 +112,12 @@ impl QueryTree {
         catalog: &CatalogManager,
         entities: Vec<Entity>,
     ) -> anyhow::Result<Snapshot> {
-        // Keep a valid layout even if catalog arrival now permits a richer one.
+        // Reuse only layouts the responder accepts for this selection. The
+        // entity-ID fallback remains valid after catalog arrival, but ORDER BY
+        // or LIMIT changes can make a previously chosen keyed layout invalid.
+        let default = Self::spec(selection, catalog);
         let cached = self.0.lock().await.as_ref().map(|cached| cached.spec.clone());
-        let spec = cached
-            .filter(|spec| {
-                TreeSpec::new(KeySpec::new(vec![]), spec.predicate().clone())
-                    == TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone())
-            })
-            .unwrap_or_else(|| Self::spec(selection, catalog));
+        let spec = cached.filter(|spec| Self::accepts_spec(spec, &default)).unwrap_or(default);
         let paths = Self::key_paths(&spec);
         let rows = entities
             .into_iter()
@@ -317,7 +319,7 @@ pub(super) fn key(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Res
         return Ok(Vec::new());
     }
     let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
-    let values = QueryTree::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+    let values = QueryTreeCache::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
     Ok(CanonicalCodec.encode_nullable(spec.key_spec(), &values)?)
 }
 
@@ -354,7 +356,7 @@ impl Snapshot {
         Ok(self.tree.as_mut().unwrap())
     }
 
-    pub async fn head(&mut self, bounds: proto::TreeSpan) -> anyhow::Result<TreeSpanDigest> {
+    pub async fn span_digest(&mut self, bounds: proto::TreeSpan) -> anyhow::Result<TreeSpanDigest> {
         let tree = self.tree().await?;
         let scope = tree.scope_ranges([bounds.clone()]);
         Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
@@ -366,7 +368,7 @@ impl Snapshot {
         }
         // A bounded disjoint frontier recognizes both equal inventories and
         // small changed spans without serial refinement exchanges.
-        let root = self.head(super::whole()).await?;
+        let root = self.span_digest(super::whole()).await?;
         let mut frontier = vec![(root, true)];
         for _ in 0..OFFER_REFINEMENTS {
             let Some(index) = frontier

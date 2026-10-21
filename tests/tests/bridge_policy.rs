@@ -391,7 +391,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                 proto::NodeResponseBody::GetEvents(received) => assert_eq!(received.len(), events.len()),
                 proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. } => {
                     let mut frame = state.frame;
-                    let comparison = frame.comparison;
+                    let comparison = frame.stream;
                     let mut found = false;
                     loop {
                         let sequence = frame.sequence;
@@ -416,7 +416,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                                     server.id,
                                     &credentials,
                                     proto::NodeRequestBody::ContinueState {
-                                        comparison,
+                                        stream: comparison,
                                         round: None,
                                         processed_through: sequence,
                                         applied_through: None,
@@ -432,7 +432,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                                     .lock()
                                     .unwrap()
                                     .iter()
-                                    .find(|frame| frame.comparison == comparison && frame.sequence == sequence + 1)
+                                    .find(|frame| frame.stream == comparison && frame.sequence == sequence + 1)
                                     .cloned()
                                 {
                                     break next;

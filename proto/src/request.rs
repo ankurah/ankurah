@@ -131,7 +131,7 @@ pub enum NodeRequestBody {
     /// Retrying the same request id is idempotent. A processed prefix may contain
     /// explicit pending NeedRepair; it is not the global Applied acknowledgment.
     ContinueState {
-        comparison: StateStreamId,
+        stream: StateStreamId,
         /// Answers belong to this round; None addresses live-target repair.
         /// Credit-only feedback needs no active round.
         round: Option<u64>,
@@ -146,7 +146,7 @@ pub enum NodeRequestBody {
     /// the number must be the previous round plus one. The responder sends an
     /// ordered BeginRound marker and returns Success, without an extra page poll.
     RefreshState {
-        comparison: StateStreamId,
+        stream: StateStreamId,
         round: u64,
         known_state: KnownState,
     },
@@ -194,10 +194,10 @@ pub enum NodeResponseBody {
     /// The initial Fetch or SubscribeQuery capture could not keep up with
     /// concurrent source changes. No stream was created; retry after backoff.
     StateCaptureBusy,
-    /// The snapshot expired or was invalidated. Restart the original Fetch or
+    /// The state stream expired or was invalidated. Restart the original Fetch or
     /// SubscribeQuery; previously received pages cannot complete a new comparison.
-    ComparisonUnavailable {
-        comparison: StateStreamId,
+    StateStreamUnavailable {
+        stream: StateStreamId,
     },
 }
 
@@ -273,11 +273,11 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
-            NodeRequestBody::ContinueState { comparison, processed_through, answers, .. } => {
-                write!(f, "ContinueState {comparison} through:{processed_through} answers:{}", answers.len())
+            NodeRequestBody::ContinueState { stream, processed_through, answers, .. } => {
+                write!(f, "ContinueState {stream} through:{processed_through} answers:{}", answers.len())
             }
-            NodeRequestBody::RefreshState { comparison, round, known_state } => {
-                write!(f, "RefreshState {comparison} round:{round} spans:{}", known_state.spans.len())
+            NodeRequestBody::RefreshState { stream, round, known_state } => {
+                write!(f, "RefreshState {stream} round:{round} spans:{}", known_state.spans.len())
             }
             NodeRequestBody::FinishStateRound { stream, round, outcome } => write!(f, "FinishStateRound {stream}/{round} {outcome:?}"),
         }
@@ -288,7 +288,7 @@ impl std::fmt::Display for NodeResponseBody {
         match self {
             NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
             NodeResponseBody::Fetch(state) => {
-                write!(f, "Fetch {} frame:{}", state.frame.comparison, state.frame.sequence)
+                write!(f, "Fetch {} frame:{}", state.frame.stream, state.frame.sequence)
             }
             NodeResponseBody::Get(states) => {
                 write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
@@ -297,7 +297,7 @@ impl std::fmt::Display for NodeResponseBody {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::QuerySubscribed { query_id, state } => {
-                write!(f, "Subscribed {query_id} {} frame:{}", state.frame.comparison, state.frame.sequence)
+                write!(f, "Subscribed {query_id} {} frame:{}", state.frame.stream, state.frame.sequence)
             }
             NodeResponseBody::SchemaRegistered { model } => {
                 write!(f, "SchemaRegistered {} properties:{}", model.label, model.properties.len())
@@ -305,7 +305,7 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
             NodeResponseBody::StateCaptureBusy => write!(f, "StateCaptureBusy"),
-            NodeResponseBody::ComparisonUnavailable { comparison } => write!(f, "ComparisonUnavailable {comparison}"),
+            NodeResponseBody::StateStreamUnavailable { stream } => write!(f, "StateStreamUnavailable {stream}"),
         }
     }
 }

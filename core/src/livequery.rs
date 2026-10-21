@@ -140,7 +140,7 @@ impl EntityLiveQuery {
         self.0.set_refresh(version, origin, refresh);
     }
     pub(crate) fn resolved_selection(&self) -> Option<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.value() }
-    pub(crate) fn digest_tree(&self) -> Arc<crate::node::state_sync::QueryTree> { self.0.tree.clone() }
+    pub(crate) fn digest_tree(&self) -> Arc<crate::node::state_sync::QueryTreeCache> { self.0.tree.clone() }
     pub(crate) async fn activate_remote(
         &self,
         version: u32,

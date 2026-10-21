@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     entity::Entity,
     error::{LineageError, ValidationError},
-    policy::{AccessDenied, DefaultContext, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT},
+    policy::{AccessDenied, DefaultContext, PermissiveAgent, PolicyAgent},
     property::backend::{lww::LWWBackend, PropertyBackend},
     retrieval::LocalEventGetter,
     test_utils::TestStorage,
@@ -575,9 +575,6 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     // An initially divergent bare snapshot is ignored too: a retry must make the same decision.
     let outcome = applying.await?;
     assert!(outcome.change.is_none());
-    let divergence = outcome.divergence.expect("the concurrent commit leaves the snapshot uncovered");
-    assert_eq!(divergence.target, Clock::singleton(&incoming));
-    assert_eq!(divergence.actual, before.head);
     assert_eq!(fixture.entity.to_state()?, before);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
@@ -1357,7 +1354,7 @@ async fn supplied_batch_can_exceed_the_single_event_history_budget() -> anyhow::
 }
 
 #[tokio::test]
-async fn a_concurrent_snapshot_without_events_is_reported_not_adopted() -> anyhow::Result<()> {
+async fn a_concurrent_snapshot_without_events_leaves_the_entity_unchanged() -> anyhow::Result<()> {
     for delivery in [Delivery::Initial, Delivery::Live] {
         let fixture = Fixture::new().await?;
         let remote =
@@ -1377,10 +1374,6 @@ async fn a_concurrent_snapshot_without_events_is_reported_not_adopted() -> anyho
         let _listener = fixture.entity.broadcast().reference().listen(notifications);
 
         let outcome = fixture.apply(proto::DeltaContent::StateSnapshot { state: fragment(snapshot.clone()) }, delivery).await?;
-        let divergence = outcome.divergence.expect("a concurrent snapshot is not covered");
-        assert_eq!(divergence.entity_id, fixture.entity.id());
-        assert_eq!(divergence.target, snapshot.head);
-        assert_eq!(divergence.actual, Clock::singleton(&local));
         assert!(outcome.change.is_none(), "{delivery:?}");
 
         assert_eq!(outcome.entity, Some(fixture.entity.clone()));
@@ -1393,7 +1386,7 @@ async fn a_concurrent_snapshot_without_events_is_reported_not_adopted() -> anyho
 }
 
 /// A concurrent snapshot whose connecting events are carried merges those events: the local
-/// edit survives, the sender's branch is incorporated, and the target counts as covered.
+/// edit survives and the sender's branch is incorporated.
 #[tokio::test]
 async fn a_concurrent_snapshot_with_its_events_merges_and_keeps_the_local_edit() -> anyhow::Result<()> {
     for delivery in [Delivery::Initial, Delivery::Live] {
@@ -1414,7 +1407,6 @@ async fn a_concurrent_snapshot_with_its_events_merges_and_keeps_the_local_edit()
         let outcome = fixture
             .apply(proto::DeltaContent::StateAndEvents { state: fragment(snapshot.clone()), events: fragments([remote.clone()]) }, delivery)
             .await?;
-        assert!(outcome.divergence.is_none(), "{delivery:?}");
 
         let change = outcome.change.expect("the merged branch is published");
         let published: &[Attested<Event>] = match delivery {
@@ -1435,10 +1427,10 @@ async fn a_concurrent_snapshot_with_its_events_merges_and_keeps_the_local_edit()
     Ok(())
 }
 
-/// Equal and older snapshots are covered already: nothing changes, nothing is published, and
+/// Equal and older snapshots leave state unchanged and publish nothing;
 /// events carried beside them that the entity has applied are not applied again.
 #[tokio::test]
-async fn equal_and_older_snapshots_are_covered_without_change() -> anyhow::Result<()> {
+async fn equal_and_older_snapshots_leave_the_entity_unchanged() -> anyhow::Result<()> {
     for delivery in [Delivery::Initial, Delivery::Live] {
         let fixture = Fixture::new().await?;
         let older = fixture.entity.to_state()?;
@@ -1458,7 +1450,6 @@ async fn equal_and_older_snapshots_are_covered_without_change() -> anyhow::Resul
         for content in shapes {
             let description = format!("{delivery:?}: {content:?}");
             let outcome = fixture.apply(content, delivery).await?;
-            assert!(outcome.divergence.is_none(), "{description}");
             assert!(outcome.change.is_none(), "{description}");
 
             assert_eq!(outcome.entity, Some(fixture.entity.clone()), "{description}");
@@ -1504,7 +1495,6 @@ async fn delivery_decides_whether_applied_events_are_published() -> anyhow::Resu
             let _listener = fixture.entity.broadcast().reference().listen(notifications);
 
             let outcome = fixture.apply(content, delivery).await?;
-            assert!(outcome.divergence.is_none(), "{delivery:?} {shape:?}");
 
             let change = outcome.change.expect("the entity advanced");
             let published: &[Attested<Event>] = match (delivery, shape) {
@@ -1872,7 +1862,6 @@ async fn adopted_snapshot_reports_change_when_a_reader_loaded_the_committed_stat
                 Delivery::Live => vec![Attested::from(incoming)],
             }
         );
-        assert!(outcome.divergence.is_none());
     }
     Ok(())
 }

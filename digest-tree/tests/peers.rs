@@ -60,7 +60,7 @@ async fn differences<G: DigestGroup>(
     let mut a = opener.begin();
     let mut b = responder.begin();
     let scope = a.scope_ranges(ranges.iter().cloned());
-    let mut pending = a.heads(&scope).await.unwrap();
+    let mut pending = a.span_digests(&scope).await.unwrap();
     let mut changes = BTreeMap::new();
     let mut comparisons = 0;
     while let Some(head) = pending.pop() {
@@ -143,7 +143,7 @@ async fn head_and_refinement_bounds_cover_empty_gaps_exactly_once() {
     let range = TreeSpan::new(Excluded(key(10)), Included(key(250)));
     let mut tx = tree.begin();
     let scope = tx.scope_ranges([range.clone()]);
-    let heads = tx.heads(&scope).await.unwrap();
+    let heads = tx.span_digests(&scope).await.unwrap();
     let samples: Vec<_> = (-20..300).flat_map(|n| [key(n), address(&leaf(n, 0))]).collect();
     for sample in &samples {
         assert_eq!(heads.iter().filter(|head| head.bounds.contains(sample)).count(), usize::from(range.contains(sample)));

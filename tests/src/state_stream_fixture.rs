@@ -62,7 +62,7 @@ impl ScriptedConnection {
                 }
                 let response = if let proto::NodeMessage::Request { request, .. } = &message {
                     let comparison = match &request.body {
-                        proto::NodeRequestBody::ContinueState { comparison, .. }
+                        proto::NodeRequestBody::ContinueState { stream: comparison, .. }
                         | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => Some(*comparison),
                         _ => None,
                     };
@@ -97,10 +97,10 @@ impl ScriptedConnection {
                             if let proto::NodeResponseBody::QuerySubscribed { query_id, state } = &response.body {
                                 assert!(state.spec.key_spec().keyparts.is_empty(), "script fixture requires the entity-ID query key");
                                 routes.insert(
-                                    state.frame.comparison,
+                                    state.frame.stream,
                                     Stream {
                                         request: response.request_id.clone(),
-                                        comparison: state.frame.comparison,
+                                        comparison: state.frame.stream,
                                         query: *query_id,
                                         next_sequence: state.frame.sequence + 1,
                                         next_revision: state.round.revision + 1,
@@ -113,7 +113,7 @@ impl ScriptedConnection {
                             false
                         }
                         proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                            if let Some(stream) = routes.get_mut(&frame.comparison) {
+                            if let Some(stream) = routes.get_mut(&frame.stream) {
                                 if stream.scripted {
                                     true
                                 } else {
@@ -162,7 +162,7 @@ impl ScriptedConnection {
                 stream.scripted = true;
                 let revision = stream.next_revision;
                 let frame = proto::StateFrame {
-                    comparison: stream.comparison,
+                    stream: stream.comparison,
                     sequence: stream.next_sequence,
                     body: proto::StateFrameBody::Live { revision, items: vec![change(delta)], complete: true },
                 };

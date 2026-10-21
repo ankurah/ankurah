@@ -47,14 +47,14 @@ async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> a
 
     release.send(()).unwrap();
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = subscribe.await? else { panic!("expected comparison") };
-    let comparison = state.frame.comparison;
+    let comparison = state.frame.stream;
     let connection = node.peer_connections.get(&peer).unwrap();
-    let session = Arc::downgrade(&connection.comparisons.get(&comparison).unwrap());
+    let session = Arc::downgrade(&connection.state_streams.get(&comparison).unwrap());
     unsubscribe.await?;
     assert!(session.upgrade().is_none(), "unsubscribe must release the frozen snapshot and its timer");
     assert!(matches!(
         state_sync::continue_state(&node, peer, proto::RequestId::new(), comparison, None, 0, None, vec![], vec![]).await?,
-        proto::NodeResponseBody::ComparisonUnavailable { .. }
+        proto::NodeResponseBody::StateStreamUnavailable { .. }
     ));
     Ok(())
 }

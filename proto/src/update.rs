@@ -13,17 +13,6 @@ pub enum NodeUpdateBody {
     StateFrame { request_id: RequestId, frame: StateFrame },
 }
 
-/// How an entity's membership changed for a specific predicate
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub enum MembershipChange {
-    /// First time seeing this entity for this predicate
-    Initial,
-    /// Entity now matches predicate (wasn't matching before)
-    Add,
-    /// Entity no longer matches predicate (was matching before)  
-    Remove,
-}
-
 /// An update from one node to another
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdate {
@@ -76,7 +65,7 @@ impl std::fmt::Display for NodeUpdateBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeUpdateBody::StateFrame { request_id, frame } => {
-                write!(f, "StateFrame {request_id} {} sequence:{}", frame.comparison, frame.sequence)
+                write!(f, "StateFrame {request_id} {} sequence:{}", frame.stream, frame.sequence)
             }
         }
     }

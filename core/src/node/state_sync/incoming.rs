@@ -24,8 +24,8 @@ struct Registered {
     query: Option<(proto::QueryId, u32)>,
     inbox: Arc<Inbox>,
     abandon: Option<AbandonStream>,
-    comparison: Option<proto::StateStreamId>,
-    deferred_comparison: Option<proto::StateStreamId>,
+    stream_id: Option<proto::StateStreamId>,
+    deferred_stream: Option<proto::StateStreamId>,
 }
 impl Registry {
     fn remove(&mut self, request: &RequestId) -> Option<(AbandonStream, proto::StateStreamId)> {
@@ -33,9 +33,9 @@ impl Registry {
             stream.inbox.close();
             // Bound queries belong to replacement/unsubscribe. A finite Fetch
             // has no such owner: dropping it must abandon its remote stream too.
-            if let Some(handler) = stream.abandon.filter(|_| stream.query.is_none() || stream.comparison.is_none()) {
-                if let Some(comparison) = stream.comparison.or(stream.deferred_comparison) {
-                    return Some((handler, comparison));
+            if let Some(handler) = stream.abandon.filter(|_| stream.query.is_none() || stream.stream_id.is_none()) {
+                if let Some(stream_id) = stream.stream_id.or(stream.deferred_stream) {
+                    return Some((handler, stream_id));
                 }
                 self.retired.push_back((request.clone(), handler));
                 if self.retired.len() > 128 {
@@ -57,7 +57,7 @@ pub(crate) struct IncomingStream {
     pub query: Option<(proto::QueryId, u32)>,
     pub inbox: Arc<Inbox>,
     owner: Weak<IncomingStates>,
-    comparison: Option<(proto::StateStreamId, Arc<crate::util::safemap::SafeMap<proto::StateStreamId, bool>>)>,
+    binding: Option<(proto::StateStreamId, Arc<crate::util::safemap::SafeMap<proto::StateStreamId, bool>>)>,
 }
 
 impl IncomingStream {
@@ -74,30 +74,30 @@ impl IncomingStream {
         &mut self,
         id: proto::StateStreamId,
         catalog: bool,
-        comparisons: Arc<crate::util::safemap::SafeMap<proto::StateStreamId, bool>>,
+        streams: Arc<crate::util::safemap::SafeMap<proto::StateStreamId, bool>>,
     ) {
         if let Some(owner) = self.owner.upgrade() {
             let mut registry = owner.0.lock().unwrap();
             if let Some(stream) = registry.streams.get_mut(&self.request) {
-                if stream.deferred_comparison.is_some_and(|previous| previous != id) {
+                if stream.deferred_stream.is_some_and(|previous| previous != id) {
                     stream.inbox.close();
                 }
-                stream.comparison = Some(id);
-                stream.deferred_comparison = None;
+                stream.stream_id = Some(id);
+                stream.deferred_stream = None;
             }
             // The caller consumed this metadata even if cancellation removed
             // the origin first. Its subscription owner now handles cleanup.
             registry.retired.retain(|(request, _)| request != &self.request);
         }
-        comparisons.insert(id, catalog);
-        self.comparison = Some((id, comparisons));
+        streams.insert(id, catalog);
+        self.binding = Some((id, streams));
     }
 }
 
 impl Drop for IncomingStream {
     fn drop(&mut self) {
-        if let Some((id, comparisons)) = &self.comparison {
-            comparisons.remove(id);
+        if let Some((id, streams)) = &self.binding {
+            streams.remove(id);
         }
         if let Some(owner) = self.owner.upgrade() {
             owner.remove(&self.request);
@@ -113,7 +113,7 @@ pub(crate) struct Inbox {
 
 #[derive(Default)]
 struct Pending {
-    comparison: Option<proto::StateStreamId>,
+    stream_id: Option<proto::StateStreamId>,
     next: u64,
     frames: BTreeMap<u64, (StateFrame, Vec<u8>)>,
     bytes: usize,
@@ -134,18 +134,18 @@ impl IncomingStates {
         let inbox = Arc::new(Inbox::default());
         registry
             .streams
-            .insert(request.clone(), Registered { query, inbox: inbox.clone(), abandon, comparison: None, deferred_comparison: None });
+            .insert(request.clone(), Registered { query, inbox: inbox.clone(), abandon, stream_id: None, deferred_stream: None });
         drop(registry);
-        for (handler, comparison) in cleanup {
-            handler(comparison);
+        for (handler, stream_id) in cleanup {
+            handler(stream_id);
         }
-        Ok(IncomingStream { request, query, inbox, owner: Arc::downgrade(self), comparison: None })
+        Ok(IncomingStream { request, query, inbox, owner: Arc::downgrade(self), binding: None })
     }
 
     pub fn route(&self, request: &RequestId, frame: StateFrame) -> anyhow::Result<()> {
         let inbox = self.0.lock().unwrap().streams.get(request).map(|stream| stream.inbox.clone());
         let Some(inbox) = inbox else {
-            self.observe_comparison(request, frame.comparison);
+            self.observe_stream(request, frame.stream);
             return Ok(());
         };
         if frame.sequence == 0 {
@@ -160,13 +160,13 @@ impl IncomingStates {
     }
 
     /// Remember the remote handle even when cancellation races with its delivery.
-    pub fn observe_comparison(&self, request: &RequestId, comparison: proto::StateStreamId) {
+    pub fn observe_stream(&self, request: &RequestId, stream_id: proto::StateStreamId) {
         let handler = {
             let mut registry = self.0.lock().unwrap();
             if let Some(stream) = registry.streams.get_mut(request) {
                 let closed = stream.inbox.state.lock().unwrap().closed;
-                if let Some(bound) = stream.comparison {
-                    if bound != comparison {
+                if let Some(bound) = stream.stream_id {
+                    if bound != stream_id {
                         stream.inbox.close();
                     }
                     None
@@ -176,10 +176,10 @@ impl IncomingStates {
                     // The first response may have reached its waiter without
                     // being consumed yet. Bind disarms a duplicate; drop
                     // abandons metadata whose receiver was canceled.
-                    if stream.deferred_comparison.is_some_and(|previous| previous != comparison) {
+                    if stream.deferred_stream.is_some_and(|previous| previous != stream_id) {
                         stream.inbox.close();
                     } else {
-                        stream.deferred_comparison = Some(comparison);
+                        stream.deferred_stream = Some(stream_id);
                     }
                     None
                 }
@@ -192,21 +192,21 @@ impl IncomingStates {
             }
         };
         if let Some(handler) = handler {
-            handler(comparison);
+            handler(stream_id);
         }
     }
 
     pub fn remove(&self, request: &RequestId) {
         let cleanup = self.0.lock().unwrap().remove(request);
-        if let Some((handler, comparison)) = cleanup {
-            handler(comparison);
+        if let Some((handler, stream_id)) = cleanup {
+            handler(stream_id);
         }
     }
     pub fn is_current(&self, request: &RequestId) -> bool { self.0.lock().unwrap().streams.contains_key(request) }
     pub fn cancel_query(&self, query: proto::QueryId) {
         let cleanup = self.0.lock().unwrap().cancel_query(query);
-        for (handler, comparison) in cleanup {
-            handler(comparison);
+        for (handler, stream_id) in cleanup {
+            handler(stream_id);
         }
     }
     pub fn close(&self) {
@@ -232,8 +232,8 @@ impl Inbox {
         );
         let mut state = self.state.lock().unwrap();
         ensure!(!state.closed, "state stream closed");
-        ensure!(state.comparison.is_none_or(|id| id == frame.comparison), "state stream changed its comparison");
-        state.comparison = Some(frame.comparison);
+        ensure!(state.stream_id.is_none_or(|id| id == frame.stream), "state stream changed its identity");
+        state.stream_id = Some(frame.stream);
         if frame.sequence < state.next {
             return Ok(());
         }
@@ -294,9 +294,9 @@ impl Inbox {
 mod tests {
     use super::*;
 
-    fn frame(comparison: proto::StateStreamId, sequence: u64) -> StateFrame {
+    fn frame(stream_id: proto::StateStreamId, sequence: u64) -> StateFrame {
         StateFrame {
-            comparison,
+            stream: stream_id,
             sequence,
             body: proto::StateFrameBody::State { round: 0, items: Vec::new(), progress: proto::ComparisonProgress::Continue },
         }
@@ -373,11 +373,11 @@ mod tests {
         let stream = registry.register(RequestId::new(), None, Some(handler.clone()))?;
         let request = stream.request.clone();
         drop(stream);
-        let comparison = proto::StateStreamId::new();
-        registry.route(&request, frame(comparison, 1))?;
-        registry.observe_comparison(&request, comparison);
-        registry.observe_comparison(&RequestId::new(), proto::StateStreamId::new());
-        assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
+        let stream_id = proto::StateStreamId::new();
+        registry.route(&request, frame(stream_id, 1))?;
+        registry.observe_stream(&request, stream_id);
+        registry.observe_stream(&RequestId::new(), proto::StateStreamId::new());
+        assert_eq!(*cancelled.lock().unwrap(), vec![stream_id]);
         for _ in 0..256 {
             drop(registry.register(RequestId::new(), None, Some(handler.clone()))?);
         }
@@ -396,17 +396,17 @@ mod tests {
         };
         let mut stream = registry.register(RequestId::new(), Some((query, 1)), Some(handler))?;
         let request = stream.request.clone();
-        let comparison = proto::StateStreamId::new();
-        let comparisons = Arc::new(crate::util::safemap::SafeMap::new());
-        stream.bind(comparison, true, comparisons.clone());
+        let stream_id = proto::StateStreamId::new();
+        let streams = Arc::new(crate::util::safemap::SafeMap::new());
+        stream.bind(stream_id, true, streams.clone());
         registry.cancel_query(query);
         assert!(!registry.is_current(&request));
         assert!(stream.inbox.state.lock().unwrap().closed);
-        registry.route(&request, frame(comparison, 1))?;
-        registry.observe_comparison(&request, comparison);
+        registry.route(&request, frame(stream_id, 1))?;
+        registry.observe_stream(&request, stream_id);
         assert!(cancelled.lock().unwrap().is_empty(), "late traffic from a replaced bound stream cannot abandon the standing query");
         drop(stream);
-        assert!(comparisons.get(&comparison).is_none());
+        assert!(streams.get(&stream_id).is_none());
         assert!(registry.0.lock().unwrap().retired.is_empty());
         Ok(())
     }
@@ -423,10 +423,10 @@ mod tests {
         let mut stream = registry.register(RequestId::new(), Some((query, 1)), Some(handler))?;
         registry.cancel_query(query);
         assert_eq!(registry.0.lock().unwrap().retired.len(), 1, "unconsumed metadata still needs orphan cleanup");
-        let comparison = proto::StateStreamId::new();
-        stream.bind(comparison, false, Arc::new(crate::util::safemap::SafeMap::new()));
-        registry.route(&stream.request, frame(comparison, 1))?;
-        registry.observe_comparison(&stream.request, comparison);
+        let stream_id = proto::StateStreamId::new();
+        stream.bind(stream_id, false, Arc::new(crate::util::safemap::SafeMap::new()));
+        registry.route(&stream.request, frame(stream_id, 1))?;
+        registry.observe_stream(&stream.request, stream_id);
         assert!(cancelled.lock().unwrap().is_empty(), "consumed metadata belongs to the superseding subscription's cleanup");
         assert!(registry.0.lock().unwrap().retired.is_empty());
         Ok(())
@@ -441,17 +441,17 @@ mod tests {
             Arc::new(move |id| cancelled.lock().unwrap().push(id))
         };
         let mut stream = registry.register(RequestId::new(), None, Some(handler))?;
-        let comparison = proto::StateStreamId::new();
-        registry.observe_comparison(&stream.request, comparison);
+        let stream_id = proto::StateStreamId::new();
+        registry.observe_stream(&stream.request, stream_id);
         assert!(cancelled.lock().unwrap().is_empty());
-        stream.bind(comparison, false, Arc::new(crate::util::safemap::SafeMap::new()));
-        registry.observe_comparison(&stream.request, comparison);
+        stream.bind(stream_id, false, Arc::new(crate::util::safemap::SafeMap::new()));
+        registry.observe_stream(&stream.request, stream_id);
         assert!(cancelled.lock().unwrap().is_empty());
         assert!(!stream.inbox.state.lock().unwrap().closed);
         assert!(registry.is_current(&stream.request));
-        registry.observe_comparison(&stream.request, proto::StateStreamId::new());
-        assert!(stream.inbox.state.lock().unwrap().closed, "changed comparison must fail the active stream");
-        assert!(cancelled.lock().unwrap().is_empty(), "a conflicting duplicate cannot abandon an unrelated comparison");
+        registry.observe_stream(&stream.request, proto::StateStreamId::new());
+        assert!(stream.inbox.state.lock().unwrap().closed, "changed stream identity must fail the active stream");
+        assert!(cancelled.lock().unwrap().is_empty(), "a conflicting duplicate cannot abandon an unrelated stream");
         Ok(())
     }
 
@@ -470,13 +470,13 @@ mod tests {
             })
         };
         let stream = registry.register(request.clone(), None, Some(handler))?;
-        let comparison = proto::StateStreamId::new();
-        registry.observe_comparison(&request, comparison);
+        let stream_id = proto::StateStreamId::new();
+        registry.observe_stream(&request, stream_id);
         assert!(cancelled.lock().unwrap().is_empty());
         drop(stream);
-        assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
-        registry.observe_comparison(&request, comparison);
-        assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
+        assert_eq!(*cancelled.lock().unwrap(), vec![stream_id]);
+        registry.observe_stream(&request, stream_id);
+        assert_eq!(*cancelled.lock().unwrap(), vec![stream_id]);
         Ok(())
     }
 
@@ -496,10 +496,10 @@ mod tests {
             })
         };
         let first = registry.register(RequestId::new(), Some((query, 1)), Some(handler))?;
-        let comparison = proto::StateStreamId::new();
-        registry.observe_comparison(&first.request, comparison);
+        let stream_id = proto::StateStreamId::new();
+        registry.observe_stream(&first.request, stream_id);
         let next = registry.register(replacement, Some((query, 2)), None)?;
-        assert_eq!(*cancelled.lock().unwrap(), vec![comparison]);
+        assert_eq!(*cancelled.lock().unwrap(), vec![stream_id]);
         drop(first);
         assert!(registry.is_current(&next.request));
         assert!(!next.inbox.state.lock().unwrap().closed);
