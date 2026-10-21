@@ -71,6 +71,7 @@ pub(crate) struct Session<CD: ContextData> {
     fingerprint: Vec<u8>,
     state: tokio::sync::Mutex<Stream>,
     live: Mutex<LiveQueue>,
+    initialized: AtomicBool,
     pumping: AtomicBool,
     wake: AtomicBool,
     _cancel_expiry: futures::channel::oneshot::Sender<()>,
@@ -82,6 +83,10 @@ struct LiveQueue {
     bytes: usize,
     last_revision: Option<u64>,
     stopped: bool,
+    round: Option<proto::StateRound>,
+    round_open: bool,
+    pending_round: Option<PendingRound>,
+    last_refresh: Option<(u64, Vec<u8>)>,
 }
 struct LivePublication {
     revision: u64,
@@ -116,7 +121,6 @@ struct Stream {
     comparison: Option<Comparison>,
     round: proto::StateRound,
     pending_round: Option<PendingRound>,
-    last_refresh: Option<(u64, Vec<u8>)>,
     retired_round: Option<(u64, proto::StateRoundOutcome)>,
     retained: VecDeque<Retained>,
     bytes: usize,
@@ -402,6 +406,11 @@ impl Stream {
         let mut queue = live.lock().unwrap();
         let Some(publication) = queue.publications.front() else { return Ok(None) };
         let revision = publication.revision;
+        // A refresh can be enqueued after the pump checked for its marker.
+        // Leave later publications queued until the pump installs that cut.
+        if queue.pending_round.as_ref().is_some_and(|pending| revision > pending.round.revision) {
+            return Ok(None);
+        }
         let mut items = Vec::new();
         let mut bytes = 0;
         let mut entities = HashSet::new();
@@ -555,6 +564,54 @@ where
     }
 }
 
+/// A registered stream whose initial frame is still being prepared. Live
+/// publications can queue at its captured cut without holding a shared tree.
+/// Cancellation removes the registration synchronously.
+pub(crate) struct PendingStateStream<CD: ContextData> {
+    connection: std::sync::Weak<crate::node::PeerState<CD>>,
+    session: Arc<Session<CD>>,
+    peer: proto::EntityId,
+    id: StateStreamId,
+    armed: bool,
+}
+impl<CD: ContextData> PendingStateStream<CD> {
+    pub(crate) fn id(&self) -> StateStreamId { self.id }
+
+    pub(crate) async fn initialize<SE, PA>(mut self, node: &Node<SE, PA>) -> anyhow::Result<proto::StateReply>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        let connection = self.connection.upgrade().ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+        let mut state = self.session.state.lock().await;
+        let round = self.session.initial_round;
+        let comparison = state.comparison.as_mut().ok_or_else(|| anyhow::anyhow!("initial comparison unavailable"))?;
+        let body =
+            comparison.reply(node, &self.session.credentials, self.session.catalog, self.session.query.is_some(), round.number).await?;
+        ensure!(
+            node.peer_connections.get(&self.peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
+                && connection.state_streams.get(&self.id).is_some_and(|current| Arc::ptr_eq(&current, &self.session)),
+            "initial stream was closed"
+        );
+        ensure!(!self.session.live.lock().unwrap().stopped, "initial live queue stopped");
+        let frame = StateFrame { stream: self.id, sequence: 0, body };
+        state.retain(frame.clone(), false)?;
+        *self.session.initial.lock().unwrap() = Some(Arc::new(frame.clone()));
+        self.session.initialized.store(true, Ordering::Release);
+        self.armed = false;
+        Ok(proto::StateReply { spec: self.session.spec.clone(), round, frame })
+    }
+}
+impl<CD: ContextData> Drop for PendingStateStream<CD> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Some(connection) = self.connection.upgrade() {
+                connection.state_streams.finish(self.id);
+            }
+        }
+    }
+}
+
 pub(crate) async fn start_state_stream<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
@@ -571,18 +628,34 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
+    prepare_state_stream(node, peer, request, fingerprint, credentials, query, catalog, revision, snapshot, known)?.initialize(node).await
+}
+
+pub(crate) fn prepare_state_stream<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    request: proto::RequestId,
+    fingerprint: Vec<u8>,
+    credentials: Vec<PA::ContextData>,
+    query: Option<(proto::QueryId, u32)>,
+    catalog: bool,
+    revision: u64,
+    snapshot: Snapshot,
+    known: proto::KnownState,
+) -> anyhow::Result<PendingStateStream<PA::ContextData>>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-    let mut comparison = Comparison::new(snapshot, known)?;
+    let comparison = Comparison::new(snapshot, known)?;
+    let spec = comparison.snapshot.spec.clone();
     let id = StateStreamId::new();
     let round = proto::StateRound { number: 0, revision };
-    let body = comparison.reply(node, &credentials, catalog, query.is_some(), round.number).await?;
-    let frame = StateFrame { stream: id, sequence: 0, body };
-    let initial = proto::StateReply { spec: comparison.snapshot.spec.clone(), round, frame: frame.clone() };
-    let mut state = Stream {
+    let state = Stream {
         comparison: Some(comparison),
         round,
         pending_round: None,
-        last_refresh: None,
         retired_round: None,
         retained: VecDeque::new(),
         bytes: 0,
@@ -605,20 +678,20 @@ where
         applied_through: None,
         next_lane: 0,
     };
-    state.retain(frame, false)?;
     let (cancel_expiry, mut cancelled) = futures::channel::oneshot::channel();
     let session = Arc::new(Session {
         catalog,
         credentials,
         query,
         initial_request: request,
-        initial: Mutex::new(Some(state.retained.front().unwrap().frame.clone())),
+        initial: Mutex::new(None),
         initial_round: round,
         sent: AtomicU64::new(0),
-        spec: initial.spec.clone(),
+        spec,
         fingerprint,
         state: tokio::sync::Mutex::new(state),
-        live: Mutex::new(LiveQueue::default()),
+        live: Mutex::new(LiveQueue { round: Some(round), round_open: true, ..Default::default() }),
+        initialized: AtomicBool::new(false),
         pumping: AtomicBool::new(false),
         wake: AtomicBool::new(false),
         _cancel_expiry: cancel_expiry,
@@ -631,8 +704,9 @@ where
         ensure!(!origins.contains_key(&session.initial_request), "initial request origin was already used");
         ensure!(!sessions.values().any(|s| s.initial_request == session.initial_request), "initial request already has a stream");
         origins.insert(session.initial_request.clone(), id);
-        sessions.insert(id, session);
+        sessions.insert(id, session.clone());
     }
+    let pending = PendingStateStream { connection: Arc::downgrade(&connection), session, peer, id, armed: true };
     let node = node.weak();
     crate::task::spawn(async move {
         loop {
@@ -657,7 +731,7 @@ where
             }
         }
     });
-    Ok(initial)
+    Ok(pending)
 }
 
 pub(crate) async fn continue_state<SE, PA>(
@@ -786,6 +860,7 @@ where
     session.initial.lock().unwrap().take();
     state.comparison = None;
     state.retired_round = Some((round, outcome));
+    session.live.lock().unwrap().round_open = false;
     if session.query.is_none() {
         connection.state_streams.finish(id);
     }
@@ -817,10 +892,9 @@ where
     }
 }
 
-/// The source actor calls this after queueing all publications through revision,
-/// and before queueing any later publication. The marker shares the live ordering
-/// boundary, while the round's pages remain independently schedulable.
-pub(crate) async fn schedule_round<SE, PA>(
+/// Reserve a round cut in the same short queue lock as live publications.
+/// Preparing or sending another frame never blocks a shared tree's updater.
+pub(crate) fn queue_round<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     id: StateStreamId,
@@ -839,24 +913,44 @@ where
     ensure!(snapshot.spec == session.spec && known.spec == session.spec, "refresh changed tree specification");
     let encoded = bincode::serialize(&known)?;
     ensure!(encoded.len() <= INITIAL_INVENTORY_BYTES + FRAME_BYTES, "refresh offer exceeds limit");
-    let mut state = session.state.lock().await;
-    if let Some((previous, offer)) = &state.last_refresh {
+    let comparison = Comparison::new(snapshot, known)?;
+    let mut queue = session.live.lock().unwrap();
+    ensure!(!queue.stopped, "live stream stopped");
+    if let Some((previous, offer)) = &queue.last_refresh {
         if *previous == number {
             ensure!(*offer == encoded, "refresh retry changed frozen offer");
             return Ok(());
         }
     }
-    ensure!(!state.failed && state.comparison.is_none() && state.pending_round.is_none(), "a comparison round is already active");
-    ensure!(state.round.number.checked_add(1) == Some(number) && revision >= state.round.revision, "invalid next round");
-    ensure!(state.last_live_complete.is_none_or(|sent| sent <= revision), "round cut precedes delivered live state");
-    ensure!(session.live.lock().unwrap().last_revision.is_none_or(|queued| queued <= revision), "round cut precedes queued live state");
-    let comparison = Comparison::new(snapshot, known)?;
-    state.pending_round = Some(PendingRound { round: proto::StateRound { number, revision }, comparison });
-    state.last_refresh = Some((number, encoded));
-    state.last_activity = Instant::now();
-    drop(state);
+    ensure!(!queue.round_open && queue.pending_round.is_none(), "a comparison round is already active");
+    let previous = queue.round.ok_or_else(|| anyhow::anyhow!("stream has no initial round"))?;
+    ensure!(previous.number.checked_add(1) == Some(number) && revision >= previous.revision, "invalid next round");
+    ensure!(queue.last_revision.is_none_or(|queued| queued <= revision), "round cut precedes queued live state");
+    let round = proto::StateRound { number, revision };
+    queue.pending_round = Some(PendingRound { round, comparison });
+    queue.last_refresh = Some((number, encoded));
+    queue.round = Some(round);
+    queue.round_open = true;
+    drop(queue);
     kick_state_stream(node, peer, id);
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn schedule_round<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: StateStreamId,
+    number: u64,
+    revision: u64,
+    snapshot: Snapshot,
+    known: proto::KnownState,
+) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    queue_round(node, peer, id, number, revision, snapshot, known)
 }
 
 pub(crate) fn queue_live<SE, PA>(
@@ -913,6 +1007,9 @@ where
 {
     let Some(connection) = node.peer_connections.get(&peer) else { return };
     let Some(session) = connection.state_streams.get(&id) else { return };
+    if !session.initialized.load(Ordering::Acquire) {
+        return;
+    }
     session.wake.store(true, Ordering::Release);
     if session.pumping.swap(true, Ordering::AcqRel) {
         return;
@@ -949,6 +1046,9 @@ where
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
     let Some(session) = connection.state_streams.get(&id) else { return Ok(()) };
+    if !session.initialized.load(Ordering::Acquire) {
+        return Ok(());
+    }
     let mut state = session.state.lock().await;
     if state.failed || !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(());
@@ -959,6 +1059,9 @@ where
             || !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session))
         {
             break;
+        }
+        if state.pending_round.is_none() {
+            state.pending_round = session.live.lock().unwrap().pending_round.take();
         }
         // Round markers cannot split a source publication. Before activating
         // the next cut, drain every queued publication included in that cut.
@@ -1063,7 +1166,6 @@ where
     state.failed = true;
     state.comparison = None;
     state.pending_round = None;
-    state.last_refresh = None;
     state.live_chunk = None;
     state.live_targets.clear();
     state.live_target_index.clear();
@@ -1075,6 +1177,8 @@ where
     {
         let mut live = session.live.lock().unwrap();
         live.stopped = true;
+        live.pending_round = None;
+        live.last_refresh = None;
         live.publications.clear();
         live.items = 0;
         live.bytes = 0;

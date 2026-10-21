@@ -236,6 +236,7 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_preparing_i
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
     client.storage.hold_fetch.lock().unwrap().insert(model, (entered, release_rx));
+    client.resident_trees.evict_idle();
     query.update_selection("true")?;
     entered_rx.await?;
     let client_peer = client.peer_connections.get(&server.id).unwrap();
@@ -312,6 +313,7 @@ async fn a_current_live_stream_failure_still_abandons_its_responder_query() -> a
     assert!(client.peer_connections.get(&server.id).unwrap().incoming_states.is_current(&origin));
     // Hold the immediate retry so the old failure cleanup is observable
     // before a replacement can reinstall the same query.
+    client.resident_trees.evict_idle();
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
     client.storage.hold_fetch.lock().unwrap().insert(proto::ModelId::EntityId(id(99)), (entered, release_rx));
@@ -364,6 +366,7 @@ async fn dropping_a_query_after_permanent_inventory_preparation_failure_cleans_i
     corrupt.payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([42; 32]));
     corrupt.payload.state.state_buffers = proto::StateBuffers([("unknown-test-backend".into(), vec![1])].into());
     client.storage.set_state(corrupt);
+    client.resident_trees.evict_idle();
     query.update_selection("true")?;
     assert!(tokio::time::timeout(std::time::Duration::from_secs(5), query.wait_initialized()).await?.is_err());
     assert!(
@@ -446,6 +449,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
     client.storage.hold_fetch.lock().unwrap().insert(proto::ModelId::EntityId(id(99)), (entered, release_rx));
+    client.resident_trees.evict_idle();
     query.update_selection("true")?;
     entered_rx.await?;
     assert!(receive.await.is_err(), "replacement must close the unfinished initial receiver");
@@ -496,6 +500,29 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
         }
     })
     .await?;
+    client.deregister_peer(server.id);
+    server.deregister_peer(client.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn fetch_and_subscription_share_each_nodes_resident_tree() -> anyhow::Result<()> {
+    use ankurah_signals::Peek;
+    let (server, client, query, _messages) = stream_fixture().await?;
+    let selection = query.selection().peek().unwrap().0;
+    let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+    let spec = super::super::QueryTreeCache::spec(&selection, &client.catalog);
+    let local = client.resident_trees.acquire(&client, selection.clone(), spec.clone(), credentials.clone()).await?;
+    let local_tree = local.tree();
+    drop(local);
+    let connection = server.peer_connections.get(&client.id).unwrap();
+    let (_, serving_tree) = connection.subscription_handler.query_tree_for_test(query.query_id()).await.unwrap();
+    let rows = client.fetch_from_peer(selection.clone(), &credentials).await?;
+    assert_eq!(rows.len(), 64);
+    let local = client.resident_trees.acquire(&client, selection.clone(), spec.clone(), credentials.clone()).await?;
+    let serving = server.resident_trees.acquire(&server, selection, spec, credentials).await?;
+    assert!(Arc::ptr_eq(&local_tree, &local.tree()), "making Fetch reuses the tree used to make SubscribeQuery");
+    assert!(Arc::ptr_eq(&serving_tree, &serving.tree()), "serving Fetch reuses the standing subscription tree");
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
     Ok(())

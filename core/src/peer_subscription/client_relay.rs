@@ -652,9 +652,8 @@ where
         }
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
-        let tree = node.live_queries.get(query_id).ok_or(NodeDropped)?.digest_tree();
-        let entities = node.fetch_entities_from_local(&selection).await?;
-        let mut snapshot = tree.snapshot(&selection, &node.catalog, entities).await?;
+        let spec = state_sync::QueryTreeCache::spec(&selection, &node.catalog);
+        let mut snapshot = node.resident_trees.capture(&node, selection.clone(), spec, context_data.clone()).await?.snapshot;
         let known_state = snapshot.offer().await?;
         if canceled() {
             return Err(RequestError::ConnectionLost.into());

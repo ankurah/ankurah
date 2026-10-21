@@ -5,16 +5,18 @@ mod budget;
 mod client;
 mod feedback;
 mod incoming;
+mod resident;
 mod server;
 pub(crate) mod source;
 mod tree;
 
 pub(crate) use client::{abandon_current_state, finish_state, receive_state, request_state, RefreshHandle};
 pub(crate) use incoming::{Inbox, IncomingStates, IncomingStream};
+pub(crate) use resident::{ResidentSubscription, ResidentTrees};
 pub(crate) use server::expire_state_stream;
 pub(crate) use server::{
-    abandon_state_stream, continue_state, finish_state_round, kick_state_stream, queue_live, schedule_round, source_unavailable,
-    start_state_stream, state_stream_bypasses_policy, StateStreams,
+    abandon_state_stream, continue_state, finish_state_round, kick_state_stream, prepare_state_stream, queue_live, queue_round,
+    source_unavailable, start_state_stream, state_stream_bypasses_policy, PendingStateStream, StateStreams,
 };
 pub(crate) use tree::{QueryTreeCache, Snapshot};
 

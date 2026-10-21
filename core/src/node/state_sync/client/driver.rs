@@ -1222,8 +1222,8 @@ impl Driver {
         let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
         let (selection, stored) = query.resolved_selection().ok_or_else(|| anyhow::anyhow!("query selection disappeared"))?;
         ensure!(stored == version, "refresh selection changed");
-        let entities = node.fetch_entities_from_local(&selection).await?;
-        let mut snapshot = query.digest_tree().snapshot(&selection, &node.catalog, entities).await?;
+        let spec = super::super::QueryTreeCache::spec(&selection, &node.catalog);
+        let mut snapshot = node.resident_trees.capture(node, selection, spec, credentials.to_vec()).await?.snapshot;
         let known_state = snapshot.offer().await?;
         let number = self.round_number.checked_add(1).ok_or_else(|| anyhow::anyhow!("round number exhausted"))?;
         self.pending_round = Some(PendingRound { number, snapshot, request: reply });

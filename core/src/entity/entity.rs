@@ -5,7 +5,6 @@ use crate::{
     schema::SystemEpoch,
     value::Value,
 };
-use ankurah_core_types::PropertyPath;
 use ankurah_proto::{Clock, EntityId, EntityState as ProtoEntityState, ModelId, PropertyId, State};
 use ankurah_signals::broadcast::Broadcast;
 use std::{collections::BTreeSet, sync::Arc};
@@ -69,13 +68,6 @@ impl Entity {
 
     pub fn to_entity_state(&self) -> Result<ProtoEntityState, StateError> {
         Ok(ProtoEntityState { entity_id: self.id(), state: self.to_state()? })
-    }
-
-    /// Capture full state and requested values from the same entity revision.
-    /// Comparison callers use committed entities whose backend buffers can be serialized.
-    pub(crate) fn to_entity_state_with_values(&self, paths: &[PropertyPath]) -> Result<(ProtoEntityState, Vec<Option<Value>>), StateError> {
-        let id = self.id();
-        self.with_state(|state| state.to_entity_state_with_values(id, paths)).map_err(|_| StateError::TransactionClosed)?
     }
 
     pub fn values(&self) -> Result<Vec<(PropertyId, Option<Value>)>, PropertyError> { self.with_state(EntityState::values) }

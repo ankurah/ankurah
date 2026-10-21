@@ -80,7 +80,9 @@ async fn assert_released_with_live_query(
 #[tokio::test]
 async fn cancelled_fetch_before_metadata_abandons_the_late_reply() -> anyhow::Result<()> {
     let (server, client, query, messages) = stream_fixture().await?;
-    let selection = query.selection().peek().unwrap().0;
+    let mut selection = query.selection().peek().unwrap().0;
+    // Use a distinct selection so the existing standing tree is not a cache hit.
+    selection.predicate = ankql::ast::Predicate::And(Box::new(selection.predicate), Box::new(ankql::ast::Predicate::True));
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
     server.storage.hold_fetch.lock().unwrap().insert(proto::ModelId::EntityId(id(99)), (entered, release_rx));
@@ -109,7 +111,21 @@ async fn cancelled_fetch_with_metadata_queued_in_its_waiter_abandons_the_stream(
     let (server, client, query, messages) = stream_fixture().await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let mut fetch = Box::pin(client.fetch_from_peer(query.selection().peek().unwrap().0, &credentials));
-    assert!(futures::poll!(&mut fetch).is_pending());
+    futures::future::poll_fn(|cx| {
+        use std::{future::Future, task::Poll};
+        assert!(fetch.as_mut().poll(cx).is_pending());
+        if messages.lock().unwrap().iter().any(|message| {
+            matches!(
+                message,
+                proto::NodeMessage::Request { request: proto::NodeRequest { body: proto::NodeRequestBody::Fetch { .. }, .. }, .. }
+            )
+        }) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
     until(|| fetch_reply(&messages.lock().unwrap()).is_some()).await;
     let (origin, state) = fetch_reply(&messages.lock().unwrap()).unwrap();
     let connection = client.peer_connections.get(&server.id).unwrap();
@@ -174,7 +190,21 @@ async fn cancelled_fetch_during_final_local_hydration_releases_the_remote_stream
     let (server, client, query, messages) = stream_fixture().await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let mut fetch = Box::pin(client.fetch_from_peer(query.selection().peek().unwrap().0, &credentials));
-    assert!(futures::poll!(&mut fetch).is_pending());
+    futures::future::poll_fn(|cx| {
+        use std::{future::Future, task::Poll};
+        assert!(fetch.as_mut().poll(cx).is_pending());
+        if messages.lock().unwrap().iter().any(|message| {
+            matches!(
+                message,
+                proto::NodeMessage::Request { request: proto::NodeRequest { body: proto::NodeRequestBody::Fetch { .. }, .. }, .. }
+            )
+        }) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    })
+    .await;
     until(|| fetch_reply(&messages.lock().unwrap()).is_some()).await;
     let (origin, state) = fetch_reply(&messages.lock().unwrap()).unwrap();
     until(|| !client.peer_connections.get(&server.id).unwrap().pending_requests.contains_key(&origin)).await;

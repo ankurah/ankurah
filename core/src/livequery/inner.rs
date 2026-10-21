@@ -13,7 +13,6 @@ use tracing::{debug, warn};
 
 /// Shared query state; versions identify selection attempts, not system epochs.
 pub(super) struct LiveQueryInner {
-    pub(super) tree: Arc<crate::node::state_sync::QueryTreeCache>,
     pub(super) remote_activated_version: AtomicU32,
     remote_stream: std::sync::Mutex<Option<RemoteStream>>,
     pub(super) query_id: proto::QueryId,
@@ -62,7 +61,6 @@ impl LiveQueryInner {
         let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(Context(context.clone())));
 
         Self {
-            tree: Arc::new(crate::node::state_sync::QueryTreeCache::default()),
             remote_activated_version: AtomicU32::new(0),
             remote_stream: std::sync::Mutex::new(None),
             query_id,

@@ -800,14 +800,15 @@ async fn catalog_arrival_preserves_an_accepted_entity_id_fallback() -> anyhow::R
         order_by: Some(vec![OrderByItem { path, direction: OrderDirection::Asc }]),
         limit: None,
     };
-    let tree = QueryTreeCache::default();
-    let unknown_catalog = CatalogManager::default();
-    let first = tree.snapshot(&selection, &unknown_catalog, vec![]).await?;
-    assert!(first.spec.key_spec().keyparts.is_empty(), "missing catalog types require entity-ID keys");
+    let fallback = QueryTreeCache::spec(&selection, &CatalogManager::default());
+    assert!(fallback.key_spec().keyparts.is_empty(), "missing catalog types require entity-ID keys");
     assert_eq!(QueryTreeCache::spec(&selection, &node.catalog).key_spec().keyparts.len(), 1, "catalog types now permit a keyed layout");
-    let mut retained = tree.snapshot(&selection, &node.catalog, vec![]).await?;
-    assert_eq!(retained.spec, first.spec, "catalog arrival need not rebuild an accepted fallback");
-    assert_eq!(QueryTreeCache::offered_spec(&selection, &node.catalog, &retained.offer().await?)?, first.spec);
+    let offer = proto::KnownState { spec: fallback.clone(), spans: vec![] };
+    assert_eq!(
+        QueryTreeCache::offered_spec(&selection, &node.catalog, &offer)?,
+        fallback,
+        "the accepted fallback remains a distinct tree specification"
+    );
     Ok(())
 }
 

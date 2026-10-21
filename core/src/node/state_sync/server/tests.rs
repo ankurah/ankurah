@@ -1953,3 +1953,116 @@ async fn first_live_frame_after_idle_starts_a_fresh_progress_timeout() -> anyhow
     assert!(state.last_activity.elapsed() < STREAM_TTL, "ordinary idle time is not an unacknowledged-frame timeout");
     Ok(())
 }
+
+#[tokio::test]
+async fn registered_stream_queues_live_changes_before_initial_frame_is_ready() -> anyhow::Result<()> {
+    let (node, peer, messages) = node().await?;
+    let pending = prepare_state_stream(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((proto::QueryId::new(), 1)),
+        false,
+        10,
+        snapshot(vec![]).await?,
+        unknown(),
+    )?;
+    let id = pending.id();
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
+    queue_live(&node, peer, id, 11, vec![live_item(8)])?;
+    pump_state_stream(&node, peer, id).await?;
+    assert!(messages.lock().unwrap().is_empty(), "no output before frame 0 is prepared");
+    assert_eq!(session.live.lock().unwrap().publications.len(), 1);
+    let initial = pending.initialize(&node).await?;
+    assert_eq!(initial.frame.sequence, 0);
+    assert_eq!(initial.round.revision, 10);
+    assert!(matches!(initial.frame.body, StateFrameBody::State { progress: ComparisonProgress::Complete, .. }));
+    session.pumping.store(true, Ordering::Release);
+    pump_state_stream(&node, peer, id).await?;
+    assert!(messages.lock().unwrap().iter().any(|message| matches!(
+        message,
+        proto::NodeMessage::Update(proto::NodeUpdate {
+            body: proto::NodeUpdateBody::StateFrame {
+                frame: StateFrame { sequence: 1, body: StateFrameBody::Live { revision: 11, complete: true, .. }, .. },
+                ..
+            },
+            ..
+        })
+    )));
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropping_uninitialized_stream_releases_its_route_and_snapshot() -> anyhow::Result<()> {
+    let (node, peer, _) = node().await?;
+    let pending = prepare_state_stream(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((proto::QueryId::new(), 1)),
+        false,
+        0,
+        snapshot(vec![]).await?,
+        unknown(),
+    )?;
+    let id = pending.id();
+    queue_live(&node, peer, id, 1, vec![live_item(8)])?;
+    drop(pending);
+    let connection = node.peer_connections.get(&peer).unwrap();
+    assert!(connection.state_streams.get(&id).is_none());
+    assert!(connection.state_streams.was_closed(&id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn refresh_cut_is_queued_without_waiting_for_stream_io_and_blocks_later_live_data() -> anyhow::Result<()> {
+    let (node, peer, messages) = node().await?;
+    let initial = start_state_stream(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        Some((proto::QueryId::new(), 1)),
+        false,
+        0,
+        snapshot(vec![]).await?,
+        unknown(),
+    )
+    .await?;
+    let id = initial.frame.stream;
+    let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
+    session.pumping.store(true, Ordering::Release);
+    finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
+    let mut next = snapshot(vec![]).await?;
+    let offer = next.offer().await?;
+    {
+        // The pump holds this lock while preparing frames, including history I/O.
+        let mut state = session.state.lock().await;
+        queue_round(&node, peer, id, 1, 1, next, offer)?;
+        queue_live(&node, peer, id, 2, vec![live_item(8)])?;
+        assert!(state.next_live(&session.live)?.is_none(), "the queued marker fences this racing live read");
+    }
+    pump_state_stream(&node, peer, id).await?;
+    let messages = messages.lock().unwrap();
+    let bodies: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message {
+            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
+                Some(&frame.body)
+            }
+            _ => None,
+        })
+        .collect();
+    let marker = bodies
+        .iter()
+        .position(|body| matches!(body, StateFrameBody::BeginRound(round) if round.number == 1 && round.revision == 1))
+        .unwrap();
+    let live = bodies.iter().position(|body| matches!(body, StateFrameBody::Live { revision: 2, .. })).unwrap();
+    assert!(marker < live);
+    Ok(())
+}

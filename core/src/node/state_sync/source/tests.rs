@@ -2,7 +2,10 @@ use super::*;
 use crate::{
     connector::{PeerSender, SendError},
     error::{MutationError, RetrievalError},
-    node::applier::{Delivery, NodeApplier},
+    node::{
+        applier::{Delivery, NodeApplier},
+        WeakNode,
+    },
     policy::{PermissiveAgent, DEFAULT_CONTEXT},
     property::backend::{lww::LWWBackend, PropertyBackend},
     retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
@@ -13,12 +16,18 @@ use ankql::ast::{OrderByItem, OrderDirection, Predicate};
 use ankurah_core_types::PropertyPath;
 
 mod capture_retry;
+mod resident;
 
 /// The core test engine deliberately rejects ORDER BY/LIMIT. This fixture adds
 /// exactly the ordered bounded read exercised here, leaving its real commit and
 /// pause seams intact.
 #[derive(Default)]
-struct OrderedStorage(TestStorage, std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>);
+struct OrderedStorage(
+    TestStorage,
+    std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    std::sync::atomic::AtomicUsize,
+    std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+);
 
 #[async_trait::async_trait]
 impl StorageEngine for OrderedStorage {
@@ -27,6 +36,7 @@ impl StorageEngine for OrderedStorage {
     fn transaction(&self) -> Self::Transaction<'_> { self.0.transaction() }
     async fn get_state(&self, id: proto::EntityId) -> Result<Attested<proto::EntityState>, RetrievalError> { self.0.get_state(id).await }
     async fn fetch_states(&self, selection: &Selection<Resolved>) -> Result<Vec<Attested<proto::EntityState>>, RetrievalError> {
+        self.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pause = self.1.lock().unwrap().take();
         if let Some((entered, resume)) = pause {
             let _ = entered.send(());
@@ -59,6 +69,11 @@ impl StorageEngine for OrderedStorage {
         Ok(rows.into_iter().map(|(_, _, state)| state).collect())
     }
     async fn get_events(&self, ids: Vec<proto::EventId>) -> Result<Vec<Attested<proto::Event>>, RetrievalError> {
+        let pause = self.3.lock().unwrap().take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
         self.0.get_events(ids).await
     }
     async fn dump_entity_events(&self, id: proto::EntityId) -> Result<Vec<Attested<proto::Event>>, RetrievalError> {
@@ -279,6 +294,9 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
 #[derive(Clone, Default)]
 struct RestrictedDiscovery {
     denied_event: Option<proto::EventId>,
+    read_allowed: Option<Arc<std::sync::atomic::AtomicBool>>,
+    discover_all: Option<Arc<std::sync::atomic::AtomicBool>>,
+    deny_empty: bool,
 }
 #[async_trait::async_trait]
 impl PolicyAgent for RestrictedDiscovery {
@@ -303,6 +321,9 @@ impl PolicyAgent for RestrictedDiscovery {
         &self,
         _: &C,
     ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
+        if self.discover_all.as_ref().is_some_and(|allowed| allowed.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Ok(Predicate::True);
+        }
         Ok(Predicate::Comparison {
             left: Box::new(ankql::ast::Expr::Path(PropertyPath::from(property()))),
             operator: ankql::ast::ComparisonOperator::LessThan,
@@ -314,6 +335,19 @@ impl PolicyAgent for RestrictedDiscovery {
         _: &C,
     ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
         Ok(Predicate::True)
+    }
+    fn check_reads<C: crate::util::Iterable<Self::ContextData>>(
+        &self,
+        data: &C,
+        states: &[(&proto::EntityId, &proto::State)],
+    ) -> std::collections::HashMap<proto::EntityId, crate::policy::AccessDenied> {
+        if (self.deny_empty && data.iterable().next().is_none())
+            || self.read_allowed.as_ref().is_some_and(|allowed| !allowed.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            states.iter().map(|(id, _)| (**id, crate::policy::AccessDenied::ByPolicy("fixture state denied"))).collect()
+        } else {
+            Default::default()
+        }
     }
     fn check_read_event<C: crate::util::Iterable<Self::ContextData>>(
         &self,
@@ -387,20 +421,22 @@ async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_
     assert!(captured.projection.rows.contains_key(&inside.entity_id));
     apply(&node, &update(&outside, "08")?).await?;
     let batch = captured.cursor.next().await?;
-    assert!(captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch).await?.is_empty());
+    assert!(captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?.is_empty());
     assert!(!captured.projection.rows.contains_key(&outside.entity_id));
     apply(&node, &update(&inside, "09")?).await?;
     let batch = captured.cursor.next().await?;
-    let changes = captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch).await?;
+    let changes = captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?;
     assert_eq!(changes.len(), 1);
-    assert!(changes[0].member.is_none());
-    assert!(changes[0].delta.is_some(), "readable former matches still carry causal data");
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
+    let change = captured.projection.change(&node, &policy, &changes[0])?;
+    assert!(change.member.is_none());
+    assert!(change.delta.is_some(), "readable former matches still carry causal data");
     assert!(captured.projection.rows.is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree() -> anyhow::Result<()> {
+async fn replacing_a_query_uses_a_different_resident_and_leaves_the_old_tree_maintained() -> anyhow::Result<()> {
     let node = node().await?;
     let mut initial = Vec::new();
     for value in ["01", "02", "03"] {
@@ -444,10 +480,10 @@ async fn replacing_a_query_cancels_its_in_flight_refill_before_reusing_the_tree(
             proto::KnownState { spec: QueryTreeCache::spec(&selection(Some(1)), &node.catalog), spans: vec![] },
         )
         .await?;
-    assert!(release.send(()).is_err(), "the old generation's pending read must be dropped before replacement installs");
+    release.send(()).expect("the idle resident keeps its independent update feed");
     let (version, reused) = handler.query_tree_for_test(query).await.unwrap();
     assert_eq!(version, 2);
-    assert!(Arc::ptr_eq(&original_tree, &reused));
+    assert!(!Arc::ptr_eq(&original_tree, &reused), "a different limited selection is a different resident tree");
     let snapshot = reused.current_snapshot().await?;
     assert_eq!(snapshot.states.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
     handler.remove_predicate(&node, query).await?;
@@ -497,7 +533,7 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
 async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<()> {
     let initial = genesis("01")?;
     let denied = update(&initial, "02")?;
-    let policy = RestrictedDiscovery { denied_event: Some(denied.id()) };
+    let policy = RestrictedDiscovery { denied_event: Some(denied.id()), ..Default::default() };
     let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
     node.system.create().await?;
     node.wait_ready().await?;
@@ -511,7 +547,10 @@ async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<(
     let read_policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     read_policy.check_read(&initial.entity_id, &batch.changes[0].state.state)?;
     assert_eq!(batch.changes[0].events[0].payload.id(), denied.id());
-    let error = captured.projection.apply(&node, &credentials, &batch).await.expect_err("denied event must fail the publication");
+    let changes = captured.projection.apply(&node, &credentials, &batch, true).await?;
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
+    let error =
+        captured.projection.change(&node, &policy, &changes[0]).expect_err("denied event must fail delivery without poisoning the tree");
     assert!(matches!(error.downcast_ref::<crate::policy::AccessDenied>(), Some(crate::policy::AccessDenied::ByPolicy(_))));
     Ok(())
 }

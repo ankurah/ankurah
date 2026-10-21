@@ -1,19 +1,19 @@
 use crate::{
     error::SubscriptionError,
-    node::{source_publications::SourceError, state_sync::QueryTreeCache, Node},
+    node::{
+        state_sync::{QueryTreeCache, ResidentSubscription},
+        Node,
+    },
     policy::PolicyAgent,
     session::{ContextData, SessionSet},
     storage::StorageEngine,
 };
 use ankql::ast::Resolved;
 use ankurah_proto as proto;
-use ankurah_signals::Wait;
 use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::Mutex;
 
-use crate::node::state_sync::source::{self, capture_query, CapturedQuery};
-
-/// Owns one immutable source projection per query generation for this peer.
+/// Owns this peer's standing routes into node-resident trees.
 pub struct SubscriptionHandler<CD: ContextData> {
     peer_id: proto::EntityId,
     queries: Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
@@ -24,10 +24,7 @@ struct StandingQuery<CD: ContextData> {
     _sessions: SessionSet<CD>,
     version: u32,
     stream_id: proto::StateStreamId,
-    tree: Arc<QueryTreeCache>,
-    commands: mpsc::Sender<source::Refresh>,
-    stop: Option<oneshot::Sender<()>>,
-    stopped: oneshot::Receiver<()>,
+    subscription: Arc<ResidentSubscription<CD>>,
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
@@ -42,10 +39,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if let Some(peer) = node.peer_connections.get(&self.peer_id) {
             peer.state_streams.invalidate_query(query);
         }
-        if let Some(mut standing) = queries.remove(&query) {
-            standing.stop.take();
-            let _ = standing.stopped.await;
-        }
+        queries.remove(&query);
         Ok(())
     }
 
@@ -75,60 +69,26 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let sessions = cdata.cloned().map(SessionSet::from).unwrap_or_else(SessionSet::new);
         node.sessions.attach(&sessions);
         let peer = node.peer_connections.get(&self.peer_id).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
-        let tree = if let Some(mut previous) = queries.remove(&query_id) {
-            previous.stop.take();
-            let _ = previous.stopped.await;
-            previous.tree
-        } else {
-            Arc::new(QueryTreeCache::default())
-        };
+        queries.remove(&query_id);
         peer.state_streams.invalidate_query(query_id);
-        let captured = capture_query(node, selection, spec, credentials.clone(), tree.clone()).await?;
-        let CapturedQuery { revision, snapshot, projection, cursor } = captured;
-        let state = crate::node::state_sync::start_state_stream(
-            node,
-            self.peer_id,
-            request,
-            fingerprint,
-            credentials.clone(),
-            Some((query_id, version)),
-            catalog,
-            revision,
-            snapshot,
-            known_state,
-        )
-        .await?;
-        let stream_id = state.frame.stream;
-        // Moving the snapshot into the round must not consume the independent
-        // cursor/projection that owns every later source publication.
-        let actor = source::QuerySource::new(self.peer_id, stream_id, credentials.clone(), projection, cursor, revision);
-        let (commands, receiver) = mpsc::channel(8);
-        let (stop, canceled) = oneshot::channel();
-        let (stopped, done) = oneshot::channel();
-        let weak = node.weak();
-        let run = node.run.clone();
-        let peer_id = self.peer_id;
-        crate::task::spawn(async move {
-            let result = tokio::select! {
-                _ = canceled => Ok(()),
-                _ = run.wait_value(false) => Ok(()),
-                result = actor.run(weak.clone(), receiver) => result,
-            };
-            // Unblock replacement before failure cleanup takes the handler lock.
-            let _ = stopped.send(());
-            if let Err(error) = result {
-                tracing::warn!(%peer_id, %stream_id, %error, "query source stopped");
-                if let Some(node) = weak.upgrade() {
-                    if matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Unavailable)) {
-                        let _ = crate::node::state_sync::source_unavailable(&node, peer_id, stream_id).await;
-                    } else {
-                        let _ = crate::node::state_sync::expire_state_stream(&node, peer_id, stream_id).await;
+        let (state, subscription) = {
+            let mut attempt = 0;
+            loop {
+                let resident = node.resident_trees.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await?;
+                let result = resident
+                    .subscribe(node, self.peer_id, request.clone(), fingerprint.clone(), query_id, version, catalog, known_state.clone())
+                    .await;
+                match result {
+                    Err(error) if attempt == 0 && crate::node::state_sync::ResidentTrees::<CD>::can_retry(&error) => {
+                        node.resident_trees.discard_failed(&resident);
+                        attempt += 1;
                     }
+                    result => break result?,
                 }
             }
-        });
-        queries
-            .insert(query_id, StandingQuery { _sessions: sessions, version, stream_id, tree, commands, stop: Some(stop), stopped: done });
+        };
+        let stream_id = state.frame.stream;
+        queries.insert(query_id, StandingQuery { _sessions: sessions, version, stream_id, subscription: Arc::new(subscription) });
         Ok(proto::NodeResponseBody::QuerySubscribed { query_id, state })
     }
 
@@ -144,7 +104,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let commands = {
+        let subscription = {
             let queries = self.queries.lock().await;
             let standing = queries
                 .values()
@@ -153,11 +113,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             let peer = node.peer_connections.get(&self.peer_id).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
             let session = peer.state_streams.get(&stream_id).ok_or_else(|| anyhow::anyhow!("query stream unavailable"))?;
             anyhow::ensure!(session.permits(credentials), "query stream credentials changed");
-            standing.commands.clone()
+            standing.subscription.clone()
         };
-        let (response, result) = oneshot::channel();
-        commands.send(source::Refresh { number, known, response }).await.map_err(|_| anyhow::anyhow!("query source stopped"))?;
-        result.await.map_err(|_| anyhow::anyhow!("query source stopped"))?
+        subscription.refresh(number, known).await
     }
 
     pub(crate) async fn abandon_state_stream(&self, query: proto::QueryId, version: u32, stream_id: proto::StateStreamId) {
@@ -171,6 +129,6 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
 #[cfg(test)]
 impl<CD: ContextData> SubscriptionHandler<CD> {
     pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<QueryTreeCache>)> {
-        self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.tree.clone()))
+        self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.subscription.tree()))
     }
 }

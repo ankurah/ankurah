@@ -10,12 +10,7 @@ use ankurah_digest_tree::{
 };
 use ankurah_proto::{self as proto, Attested, EntityId, EntityState, TreeSpanDigest, TreeSpec};
 
-use crate::{
-    entity::{Entity, TemporaryEntity},
-    schema::catalog::CatalogManager,
-    selection::filter::ValueLookup,
-    value::Value,
-};
+use crate::{entity::TemporaryEntity, schema::catalog::CatalogManager, selection::filter::ValueLookup, value::Value};
 
 type States = BTreeMap<EntityId, Arc<Attested<EntityState>>>;
 type Members = BTreeMap<Vec<u8>, EntityId>;
@@ -26,9 +21,9 @@ const OFFER_SPANS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
 
-/// Retains the active query's derived rows and tree; Fetch uses a temporary cache.
-/// A different TreeSpec replaces the cached tree. Sparse updates under the same
-/// spec change leaves in place; dense updates reconstruct the digest on demand.
+/// One resident entry's captured rows and lazy digest. The node LRU owns its
+/// identity and update feed; comparison snapshots freeze independent versions.
+/// Sparse updates change leaves in place; dense updates defer digest construction.
 #[derive(Default)]
 pub(crate) struct QueryTreeCache(Arc<Cache>);
 
@@ -106,29 +101,6 @@ impl QueryTreeCache {
         spec == default || *spec == TreeSpec::new(KeySpec::new(vec![]), default.predicate().clone())
     }
 
-    pub async fn snapshot(
-        &self,
-        selection: &Selection<Resolved>,
-        catalog: &CatalogManager,
-        entities: Vec<Entity>,
-    ) -> anyhow::Result<Snapshot> {
-        // Reuse only layouts the responder accepts for this selection. The
-        // entity-ID fallback remains valid after catalog arrival, but ORDER BY
-        // or LIMIT changes can make a previously chosen keyed layout invalid.
-        let default = Self::spec(selection, catalog);
-        let cached = self.0.lock().await.as_ref().map(|cached| cached.spec.clone());
-        let spec = cached.filter(|spec| Self::accepts_spec(spec, &default)).unwrap_or(default);
-        let paths = Self::key_paths(&spec);
-        let rows = entities
-            .into_iter()
-            .map(|entity| {
-                let (state, values) = entity.to_entity_state_with_values(&paths)?;
-                Ok((Attested::opt(state, None), values))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        self.refresh_captured(spec, rows).await
-    }
-
     pub fn key_paths(spec: &TreeSpec) -> Vec<PropertyPath> {
         spec.key_spec()
             .keyparts
@@ -157,6 +129,7 @@ impl QueryTreeCache {
         self.refresh_keyed(spec, rows).await
     }
 
+    #[cfg(test)]
     pub async fn refresh(&self, spec: TreeSpec, states: Vec<Attested<EntityState>>) -> anyhow::Result<Snapshot> {
         let rows = states
             .into_iter()
