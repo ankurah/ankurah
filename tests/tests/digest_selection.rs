@@ -1,5 +1,6 @@
 //! Real peers reuse compatible trees while comparing only each query's scope.
 mod common;
+use ankurah::signals::Signal;
 use ankurah::Mutable;
 use anyhow::Result;
 use common::*;
@@ -221,4 +222,68 @@ async fn differing_local_and_remote_limit_cuts_converge_using_a_shared_broad_tre
     assert_eq!(fetched.iter().map(|row| row.id()).collect::<Vec<_>>(), [pets[3].id(), pets[1].id()]);
     assert_eq!(offer(&offers, None, age).spec, original);
     Ok(())
+}
+
+async fn reconnect_after_sort_key_grows(direction: &str) -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server.system.create().await?;
+    server.wait_ready().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let writer = server.context(DEFAULT_CONTEXT)?;
+    let trx = writer.begin();
+    let mut pets = Vec::new();
+    for position in 0..32 {
+        pets.push(trx.create(&Pet { name: format!("pet-{position}"), age: format!("row-{position:08}") }).await?.read()?);
+    }
+    trx.commit().await?;
+    let offers = Offers::default();
+    let connection = connect(&client, &server, &offers).await;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    let query = reader.query::<PetView>(nocache(format!("age >= 'row-' ORDER BY age {direction} LIMIT 10"))?)?;
+    tokio::time::timeout(Duration::from_secs(10), query.wait_durable_answered()).await??;
+    let positions = if direction == "ASC" { (0..10).collect::<Vec<_>>() } else { (22..32).rev().collect() };
+    let expected = positions.iter().map(|position| pets[*position].id()).collect::<Vec<_>>();
+    assert_eq!(query.ids(), expected);
+    client.deregister_peer(server.id);
+    server.deregister_peer(client.id);
+    drop(connection);
+
+    let edited = positions[5];
+    let changed = format!("row-{edited:08}-offline-edit");
+    let trx = writer.begin();
+    pets[edited].edit(&trx)?.age()?.replace(&changed)?;
+    trx.commit().await?;
+    assert_ne!(query.peek()[5].age()?, changed, "the client has not received the offline edit");
+
+    // Check the first installed reconnect result, before later traffic can repair it.
+    let resultset = query.resultset();
+    resultset.set_loaded(false);
+    let installed = Arc::new(Mutex::new(None));
+    let _guard = resultset.listen(Arc::new({
+        let observed = resultset.clone();
+        let installed = installed.clone();
+        move |_| {
+            if observed.is_loaded() {
+                let mut installed = installed.lock().unwrap();
+                if installed.is_none() {
+                    *installed = Some(observed.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>());
+                }
+            }
+        }
+    }));
+    let _connection = connect(&client, &server, &offers).await;
+    wait_for(|| installed.lock().unwrap().is_some()).await?;
+    assert_eq!(installed.lock().unwrap().as_ref(), Some(&expected), "{direction} reconnect must preserve the edited row's rank");
+    assert_eq!(query.peek()[5].age()?, changed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconnect_keeps_ascending_order_when_a_sort_key_outgrows_inline_storage() -> Result<()> {
+    reconnect_after_sort_key_grows("ASC").await
+}
+
+#[tokio::test]
+async fn reconnect_keeps_descending_order_when_a_sort_key_outgrows_inline_storage() -> Result<()> {
+    reconnect_after_sort_key_grows("DESC").await
 }
