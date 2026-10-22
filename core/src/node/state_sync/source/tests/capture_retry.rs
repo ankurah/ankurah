@@ -76,6 +76,109 @@ fn query(client: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<En
     Ok(EntityLiveQuery::new(context.0, CachePolicy::Durable, QueryResolution::Resolved(selection))?)
 }
 
+async fn add_catalog_model(node: &TestNode, label: &str) -> anyhow::Result<()> {
+    let context = node.privileged_context();
+    let transaction = context.begin();
+    transaction.create(&crate::schema::catalog::SysModelRow { label: label.into(), name: "Capture retry fixture".into() }).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_change_during_fetch_capture_reopens_the_source() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let (entered, release) = hold_fetch(&node);
+    let capture = node.resident_trees.capture(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
+    tokio::pin!(capture);
+    assert!(futures::poll!(&mut capture).is_pending());
+    entered.await?;
+    add_catalog_model(&node, "fetch_capture_fixture").await?;
+    release.send(()).unwrap();
+    let captured = capture.await?;
+    assert_eq!(captured.snapshot.states.len(), 1);
+    assert_eq!(captured.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&initial));
+    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed) - scans, 2, "the raced admission must be read again");
+    assert_eq!(node.resident_trees.len(), 1, "only the replacement admission may be reusable");
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_change_during_subscription_capture_reopens_the_source() -> anyhow::Result<()> {
+    let (server, client, messages) = pair().await?;
+    let initial = genesis("01")?;
+    apply(&server, &initial).await?;
+    let (entered, release) = hold_fetch(&server);
+    let query = query(&client, selection(None))?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
+    add_catalog_model(&server, "subscribe_capture_fixture").await?;
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), query.wait_durable_answered()).await??;
+    let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id(), initial.entity_id);
+    assert_eq!(rows[0].head(), proto::Clock::singleton(&initial));
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 0);
+    drop(query);
+    client.deregister_peer(server.id);
+    server.deregister_peer(client.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_churn_bounds_capture_retries_and_later_capture_recovers() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let (mut entered, mut release) = hold_fetch(&node);
+    let capture = node.resident_trees.capture(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
+    tokio::pin!(capture);
+    for attempt in 0..2 {
+        assert!(futures::poll!(&mut capture).is_pending());
+        entered.await?;
+        add_catalog_model(&node, &format!("catalog_churn_{attempt}")).await?;
+        if attempt == 1 {
+            release.send(()).unwrap();
+            break;
+        }
+        let next = hold_fetch(&node);
+        release.send(()).unwrap();
+        (entered, release) = next;
+    }
+    let error = capture.await.err().expect("continued catalog churn must exhaust the bounded retry");
+    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
+    assert!(crate::node::state_sync::ResidentTrees::<&'static crate::policy::DefaultContext>::can_retry(&error));
+    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
+    assert_eq!(node.resident_trees.len(), 0);
+    let current = node.resident_trees.capture(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(current.snapshot.states.len(), 1);
+    assert!(current.snapshot.states.contains_key(&initial.entity_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() -> anyhow::Result<()> {
+    let node = node().await?;
+    let selected = selection(None);
+    let captured = capture_query(
+        &node,
+        selected.clone(),
+        QueryTreeCache::spec(&selected, &node.catalog),
+        vec![DEFAULT_CONTEXT],
+        Arc::new(QueryTreeCache::default()),
+    )
+    .await?;
+    let mut source = QuerySource::from_capture(vec![DEFAULT_CONTEXT], captured);
+    add_catalog_model(&node, "existing_capture_fixture").await?;
+    let error = source.refresh(&node).await.err().expect("an existing source cannot cross a catalog change");
+    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
+    assert!(crate::node::state_sync::ResidentTrees::<&'static crate::policy::DefaultContext>::can_retry(&error));
+    Ok(())
+}
+
 async fn assert_recovers(client: &TestNode, query: &EntityLiveQuery, messages: &Messages, expected: &proto::Event) -> anyhow::Result<()> {
     let relay = client.subscription_relay.as_ref().unwrap();
     until(|| matches!(relay.get_status(query.query_id()), Some(Status::PendingRemote))).await;

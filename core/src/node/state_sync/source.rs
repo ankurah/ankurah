@@ -190,7 +190,7 @@ impl QueryProjection {
         anyhow::ensure!(
             crate::schema::is_catalog_read(&self.selection.predicate)
                 || !batch.changes.iter().any(|change| change.state.state.memberships.iter().any(crate::schema::is_catalog_model)),
-            "query catalog changed; reopen the query generation"
+            SourceError::CatalogChanged
         );
         Ok(())
     }

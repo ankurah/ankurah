@@ -472,7 +472,11 @@ where
                                 if initial_state
                                     && matches!(
                                         e.downcast_ref::<source_publications::SourceError>(),
-                                        Some(source_publications::SourceError::Changed | source_publications::SourceError::Lagged)
+                                        Some(
+                                            source_publications::SourceError::Changed
+                                                | source_publications::SourceError::Lagged
+                                                | source_publications::SourceError::CatalogChanged
+                                        )
                                     ) =>
                             {
                                 proto::NodeResponseBody::StateCaptureBusy

@@ -1,6 +1,7 @@
 use crate::{
     error::SubscriptionError,
     node::{
+        source_publications::SourceError,
         state_sync::{QueryTreeCache, ResidentSubscription},
         Node,
     },
@@ -74,7 +75,13 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let (state, subscription) = {
             let mut attempt = 0;
             loop {
-                let resident = node.resident_trees.acquire(node, selection.clone(), Some(spec.clone()), credentials.clone()).await?;
+                let resident = match node.resident_trees.acquire(node, selection.clone(), Some(spec.clone()), credentials.clone()).await {
+                    Err(error) if attempt == 0 && matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)) => {
+                        attempt += 1;
+                        continue;
+                    }
+                    result => result?,
+                };
                 let result = resident
                     .subscribe(node, self.peer_id, request.clone(), fingerprint.clone(), query_id, version, catalog, known_state.clone())
                     .await;

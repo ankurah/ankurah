@@ -28,6 +28,8 @@ pub(crate) enum SourceError {
     Lagged,
     #[error("source changed while the query was being read")]
     Changed,
+    #[error("query catalog changed; reopen the query generation")]
+    CatalogChanged,
 }
 
 /// State and published events from one admitted entity revision. Neither is

@@ -274,7 +274,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
     pub(crate) fn len(&self) -> usize { self.entries.lock().unwrap().entries.len() }
 
     pub(crate) fn can_retry(error: &anyhow::Error) -> bool {
-        matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Changed | SourceError::Lagged))
+        matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Changed | SourceError::Lagged | SourceError::CatalogChanged))
     }
     pub(crate) async fn capture<SE, PA>(
         &self,
@@ -288,7 +288,12 @@ impl<CD: ContextData> ResidentTrees<CD> {
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         for attempt in 0..2 {
-            let resident = self.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await?;
+            let resident = match self.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await {
+                // Reopen admission and revalidate its layout and policy after a
+                // catalog publication crosses the initial storage read.
+                Err(error) if attempt == 0 && matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)) => continue,
+                result => result?,
+            };
             match resident.snapshot().await {
                 Err(error) if attempt == 0 && Self::can_retry(&error) => continue,
                 result => return result,
