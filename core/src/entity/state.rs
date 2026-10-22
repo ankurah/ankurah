@@ -98,6 +98,30 @@ pub(crate) struct EntityState {
     pub(super) broadcast: Broadcast,
 }
 
+/// A coherent borrowed read of committed head, membership and properties.
+/// It cannot outlive the entity's state lock or retain its property backends.
+pub(crate) struct EntityRead<'a> {
+    id: ankurah_proto::EntityId,
+    state: &'a EntityInnerState,
+}
+
+impl EntityRead<'_> {
+    pub(crate) fn head(&self) -> &Clock { &self.state.head }
+    pub(crate) fn to_state(&self) -> Result<State, StateError> { self.state.to_state() }
+}
+
+impl crate::selection::filter::Filterable for EntityRead<'_> {
+    fn value(&self, property: &PropertyId) -> Option<Value> {
+        if *property == PropertyId::Id {
+            Some(Value::EntityId(self.id))
+        } else {
+            self.state.backends.values().find_map(|backend| backend.property_value(property))
+        }
+    }
+
+    fn is_member_of(&self, model: &ModelId) -> Result<bool, crate::selection::filter::Error> { Ok(self.state.memberships.contains(model)) }
+}
+
 impl EntityState {
     pub(super) fn new(state: EntityInnerState) -> Self { Self { inner: RwLock::new(state), broadcast: Broadcast::new() } }
 
@@ -106,13 +130,11 @@ impl EntityState {
 
     pub(crate) fn head(&self) -> Clock { self.inner.read().unwrap().head.clone() }
 
-    pub(crate) fn to_state(&self) -> Result<State, StateError> { self.inner.read().unwrap().to_state() }
-
-    pub(super) fn capture(&self, entity_id: ankurah_proto::EntityId) -> Result<super::CapturedEntity, StateError> {
-        let state = self.inner.read().unwrap();
-        let data = ankurah_proto::EntityState { entity_id, state: state.to_state()? };
-        Ok(super::CapturedEntity::from_validated(data, state.backends.values().flat_map(|backend| backend.property_values())))
+    pub(super) fn with_read<T>(&self, id: ankurah_proto::EntityId, read: impl FnOnce(&EntityRead<'_>) -> T) -> T {
+        read(&EntityRead { id, state: &self.inner.read().unwrap() })
     }
+
+    pub(crate) fn to_state(&self) -> Result<State, StateError> { self.inner.read().unwrap().to_state() }
 
     pub(super) fn fork(&self) -> Self { Self::new(self.inner.read().unwrap().fork()) }
 

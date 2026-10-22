@@ -181,7 +181,7 @@ impl Driver {
     ) -> anyhow::Result<Self> {
         ensure!(round.number == 0, "initial round number is not zero");
         let spec = snapshot.spec.clone();
-        let observed = snapshot.states.iter().map(|(id, state)| (*id, state.payload.state.head.clone())).collect();
+        let observed = snapshot.entries.iter().map(|(id, entry)| (*id, entry.head.clone())).collect();
         let (tx, refresh_rx) = tokio::sync::mpsc::channel(2);
         Ok(Self {
             resident: snapshot.resident.clone(),
@@ -273,7 +273,13 @@ impl Driver {
             .filter(|id| self.projection.members.contains_key(id) || !replace.contains(id))
             .copied()
             .collect();
-        let membership = crate::reactor::PeerQueryMembership { replace, remove: self.partial_removals.clone(), preserve };
+        let baseline = self
+            .projection
+            .round
+            .as_ref()
+            .map(|round| round.members.iter().map(|(id, member)| (*id, member.head.clone())).collect())
+            .unwrap_or_default();
+        let membership = crate::reactor::PeerQueryMembership { replace, remove: self.partial_removals.clone(), preserve, baseline };
         let installed = if complete {
             query.activate_remote(version, entities, membership, changes, origin, &canceled).await?
         } else {
@@ -385,7 +391,13 @@ impl Driver {
             )
             .await?;
             let head = outcome.entity.as_ref().map(|entity| entity.head());
-            Ok(Applied { owner, id, head, change: outcome.change, bytes, repair })
+            let change = if matches!(owner, Owner::Live(_)) && !outcome.live_events.is_empty() {
+                let entity = outcome.entity.ok_or_else(|| anyhow::anyhow!("accepted live events have no entity"))?;
+                Some(EntityChange::new(entity, outcome.live_events))
+            } else {
+                outcome.change
+            };
+            Ok(Applied { owner, id, head, change, bytes, repair })
         });
         self.push_application(id, job);
         Ok(())
@@ -679,25 +691,6 @@ impl Driver {
                         self.add_goal(owner, leaf.entity.entity_id, leaf.entity.head.to_owned())?;
                     }
                     self.projection.round.as_mut().unwrap().replace(page);
-                }
-                StateItem::Snapshots(page) => {
-                    ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
-                    let inventory = snapshot_inventory(&self.spec, &page)?;
-                    inventory.validate(&self.spec)?;
-                    self.projection.round.as_mut().unwrap().replace(inventory);
-                    for state in page.states {
-                        let id = state.payload.entity_id;
-                        let target = state.payload.state.head.clone();
-                        self.add_goal(owner, id, target)?;
-                        self.enqueue(
-                            node,
-                            peer,
-                            credentials,
-                            owner,
-                            proto::EntityDelta { entity_id: id, content: proto::DeltaContent::StateSnapshot { state: state.into() } },
-                            None,
-                        )?;
-                    }
                 }
                 StateItem::Repair { target, delta } => {
                     check_target(&target, &delta.content)?;
@@ -1073,7 +1066,7 @@ impl Driver {
                     let changes =
                         changes.into_iter().map(|change| StreamChange { change, origin: Some(origin.clone()), deferred: false }).collect();
                     let preserve = self.publications.iter().flat_map(|publication| publication.changes.keys()).copied().collect();
-                    node.reactor.notify_query_changes(query.subscription_id(), id, changes, preserve).await
+                    node.reactor.notify_query_changes(query.subscription_id(), id, changes, preserve).await?
                 } else {
                     HashSet::new()
                 }
@@ -1114,7 +1107,7 @@ impl Driver {
         self.feedback.cancel_round(self.round_number);
         self.discarded_chunks.clear();
         let round = self.projection.round.as_ref().unwrap();
-        let replace = round.snapshot.states.keys().copied().collect();
+        let replace = round.snapshot.entries.keys().copied().collect();
         self.partial_removals.extend(round.absent_ids());
         let baseline = self.projection.finish(self.round_number)?;
         for id in baseline.keys() {
@@ -1358,7 +1351,7 @@ impl Driver {
                         query.map(|(query, version)| crate::reactor::QueryOrigin { query, version, request: self.stream.request.clone() }),
                         changes,
                     )
-                    .await;
+                    .await?;
                 }
                 Event::Control(control) => {
                     control?;
@@ -1419,7 +1412,11 @@ impl ChangeNotification for StreamChange {
 
 /// Reactor batches must contain each identity at most once; it coalesces
 /// repeated identities and therefore cannot represent two event batches for one ID.
-async fn notify_changes<SE, PA>(node: &Node<SE, PA>, origin: Option<crate::reactor::QueryOrigin>, changes: Vec<(EntityChange, bool)>)
+async fn notify_changes<SE, PA>(
+    node: &Node<SE, PA>,
+    origin: Option<crate::reactor::QueryOrigin>,
+    changes: Vec<(EntityChange, bool)>,
+) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1428,15 +1425,24 @@ where
     let mut ids = HashSet::new();
     for (change, deferred) in changes {
         if !ids.insert(change.entity().id()) {
-            node.reactor.notify_change(std::mem::take(&mut batch)).await;
+            let failures = node.reactor.notify_change(std::mem::take(&mut batch)).await;
+            node.live_queries.fail_notifications(&failures);
+            if let Some(failure) = failures.into_iter().next() {
+                return Err(failure.error.into());
+            }
             ids.clear();
             ids.insert(change.entity().id());
         }
         batch.push(StreamChange { change, origin: origin.clone(), deferred });
     }
     if !batch.is_empty() {
-        node.reactor.notify_change(batch).await;
+        let failures = node.reactor.notify_change(batch).await;
+        node.live_queries.fail_notifications(&failures);
+        if let Some(failure) = failures.into_iter().next() {
+            return Err(failure.error.into());
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -1865,3 +1865,24 @@ async fn adopted_snapshot_reports_change_when_a_reader_loaded_the_committed_stat
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn initial_snapshot_does_not_consume_later_live_event_delivery() -> anyhow::Result<()> {
+    for ingress in [EventIngress::LiveBridge, EventIngress::LiveStateAndEvents] {
+        let fixture = Fixture::new().await?;
+        let event =
+            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("new")?]));
+        fixture.events.stage_event(event.clone());
+        let newer = fixture.remote_snapshot(&event).await?;
+        let initial = fixture.apply(proto::DeltaContent::StateSnapshot { state: fragment(newer.clone()) }, Delivery::Initial).await?;
+        assert!(initial.live_events.is_empty());
+        assert!(initial.change.unwrap().events().is_empty());
+        assert_eq!(fixture.entity.head(), newer.head);
+        let live = fixture.deliver(ingress, vec![event.clone()]).await?;
+        assert!(live.change.is_none(), "the data was already adopted by the initial snapshot");
+        assert_eq!(live.live_events.iter().map(|event| event.payload.id()).collect::<Vec<_>>(), [event.id()]);
+        let history = fixture.deliver(EventIngress::InitialBridge, vec![event]).await?;
+        assert!(history.live_events.is_empty(), "historical repair is never a live event delivery");
+    }
+    Ok(())
+}

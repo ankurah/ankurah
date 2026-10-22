@@ -53,6 +53,11 @@ impl Entity {
     /// A rolled-back creation has no history, so its head is empty.
     pub fn head(&self) -> Clock { self.with_state(EntityState::head).unwrap_or_default() }
 
+    pub(crate) fn with_read<T>(&self, read: impl FnOnce(&super::EntityRead<'_>) -> T) -> Result<T, PropertyError> {
+        let id = self.id();
+        self.with_state(|state| state.with_read(id, read))
+    }
+
     /// Model memberships visible through this handle, including transaction-local additions.
     /// A rolled-back creation has none.
     pub fn memberships(&self) -> BTreeSet<ModelId> { self.with_state(EntityState::memberships).unwrap_or_default() }
@@ -68,11 +73,6 @@ impl Entity {
 
     pub fn to_entity_state(&self) -> Result<ProtoEntityState, StateError> {
         Ok(ProtoEntityState { entity_id: self.id(), state: self.to_state()? })
-    }
-
-    pub(crate) fn capture(&self) -> Result<super::CapturedEntity, StateError> {
-        let id = self.id();
-        self.with_state(|state| state.capture(id)).map_err(|_| StateError::TransactionClosed)?
     }
 
     pub fn values(&self) -> Result<Vec<(PropertyId, Option<Value>)>, PropertyError> { self.with_state(EntityState::values) }
@@ -137,6 +137,7 @@ impl std::fmt::Display for Entity {
 }
 
 impl crate::reactor::AbstractEntity for Entity {
+    fn head(&self) -> Option<Clock> { Some(self.head()) }
     fn id(&self) -> EntityId { self.id() }
     fn memberships(&self) -> BTreeSet<ModelId> { self.memberships() }
     fn value(&self, property: &PropertyId) -> Option<Value> { self.property_value(property).ok().flatten() }

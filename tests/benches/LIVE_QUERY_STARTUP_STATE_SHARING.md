@@ -1,5 +1,12 @@
 # Captured-state sharing — 2026-10-22
 
+> Historical measurements: this report describes the captured-state cache at
+> `034735dd`, which the subsequent maintained-tree correction removes. The
+> current implementation retains only keys, IDs, cloned Clocks and digests,
+> maintains every resident tree through the reactor, and reads payloads from
+> entity/storage ownership when sending. These timings do **not** qualify that
+> revised implementation; fresh paired performance measurements remain required.
+
 The captured-state change reduces decoding and allocation work, with a mixed
 end-to-end result. In the fixed two-pair comparison with the previous candidate,
 endpoint CPU falls **56.352 ms**, but readiness rises **6.173 ms** and

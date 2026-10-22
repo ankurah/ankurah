@@ -35,16 +35,28 @@ async fn node() -> anyhow::Result<(TestNode, proto::EntityId, Arc<Mutex<Vec<prot
 fn spec() -> proto::TreeSpec { proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True) }
 fn unknown() -> proto::KnownState { proto::KnownState { spec: spec(), spans: vec![] } }
 async fn snapshot(states: Vec<proto::Attested<proto::EntityState>>) -> anyhow::Result<Snapshot> {
-    super::super::QueryTreeCache::default().refresh(spec(), states).await
+    super::super::QueryTree::default().refresh(spec(), states).await
+}
+// Comparison views contain only metadata. Payloads must be loaded from the node.
+async fn stored_snapshot(node: &TestNode, states: Vec<proto::Attested<proto::EntityState>>) -> anyhow::Result<Snapshot> {
+    for state in &states {
+        node.storage.set_state(state.clone());
+    }
+    snapshot(states).await
 }
 fn states(count: usize, payload: usize) -> Vec<proto::Attested<proto::EntityState>> {
+    use crate::property::backend::{LWWBackend, PropertyBackend};
+    let backend = LWWBackend::new();
+    backend.set(proto::PropertyId::System(proto::SystemProperty::Label), Some(crate::value::Value::String("x".repeat(payload))));
+    crate::test_helpers::commit_backend(&backend, 1).unwrap();
+    let buffer = backend.to_state_buffer().unwrap();
     (0..count)
         .map(|_| proto::Attested {
             payload: proto::EntityState {
                 entity_id: proto::EntityId::random(),
                 state: proto::State {
                     head: proto::Clock::genesis(proto::EventId::from_bytes([1; 32])),
-                    state_buffers: proto::StateBuffers([("lww".into(), vec![7; payload])].into()),
+                    state_buffers: proto::StateBuffers([("lww".into(), buffer.clone())].into()),
                     ..Default::default()
                 },
             },
@@ -78,9 +90,9 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
     let mut requester = snapshot(source.clone()).await?;
     let known = requester.offer().await?;
     assert!(known.spans.len() > 1);
-    let mut equal = Comparison::new(snapshot(source.clone()).await?, known.clone())?;
+    let mut equal = Comparison::new(stored_snapshot(&node, source.clone()).await?, known.clone())?;
     assert!(matches!(equal.work.front(), Some(Work::CompareFrontier(_))));
-    let StateFrameBody::State { items, progress, .. } = equal.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
+    let StateFrameBody::State { items, progress, .. } = equal.reply(&node, &vec![], false, 0).await? else { panic!("state") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(items.is_empty(), "equal captured results need no response items");
 
@@ -88,18 +100,18 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
         known.spans.iter().position(|region| matches!(region, proto::SpanContent::Digest(head) if head.digest.count() == 0)).unwrap();
     let mut withheld = known.clone();
     withheld.spans.remove(empty);
-    let partial = Comparison::new(snapshot(source.clone()).await?, withheld)?;
+    let partial = Comparison::new(stored_snapshot(&node, source.clone()).await?, withheld)?;
     assert!(!partial.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))), "a withheld gap cannot claim aggregate equality");
 
     let mut mixed = known.clone();
     let proto::SpanContent::Digest(head) = &mixed.spans[empty] else { unreachable!() };
     mixed.spans[empty] = proto::SpanContent::Heads(requester.page(head.bounds.clone())?);
-    let mixed = Comparison::new(snapshot(source.clone()).await?, mixed)?;
+    let mixed = Comparison::new(stored_snapshot(&node, source.clone()).await?, mixed)?;
     assert!(!mixed.work.iter().any(|work| matches!(work, Work::CompareFrontier(_))));
 
     let mut overlap = known;
     overlap.spans.push(overlap.spans[0].clone());
-    assert!(Comparison::new(snapshot(source).await?, overlap).is_err());
+    assert!(Comparison::new(stored_snapshot(&node, source).await?, overlap).is_err());
     Ok(())
 }
 
@@ -117,8 +129,8 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     let added = states(1, 8).pop().unwrap();
     let new_id = added.payload.entity_id;
     current.push(added);
-    let mut comparison = Comparison::new(snapshot(current).await?, known)?;
-    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
+    let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, known)?;
+    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
     assert!(matches!(items.as_slice(), [StateItem::NeedHeads(bounds)] if *bounds == super::super::whole()));
     comparison.answer(vec![StateAnswer::Heads(requester.page(super::super::whole())?)])?;
     let Some(Work::AnswerHeads { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
@@ -219,10 +231,10 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
         start = opposite(&bounds.end);
         spans.push(proto::SpanContent::Digest(requester.span_digest(bounds).await?));
     }
-    let mut comparison = Comparison::new(snapshot(current).await?, proto::KnownState { spec: spec(), spans })?;
+    let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, proto::KnownState { spec: spec(), spans })?;
     let mut answers = Vec::new();
     while !comparison.work.is_empty() {
-        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
+        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         for item in items {
             let StateItem::NeedHeads(bounds) = item else { panic!("each changed supplied region must ask for leaves directly") };
             answers.push(StateAnswer::Heads(requester.page(bounds)?));
@@ -237,7 +249,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     assert_eq!(comparison.work.len(), 32, "one bounded work item must represent each accepted answer");
     let mut repaired = HashSet::new();
     while !comparison.complete {
-        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else { panic!("state") };
+        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         for item in items {
             if let StateItem::Repair { delta, .. } = item {
@@ -260,7 +272,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
         state.payload.entity_id = proto::EntityId::from_bytes(id);
     }
     let missing = source[0].payload.entity_id;
-    let mut responder = snapshot(source.clone()).await?;
+    let mut responder = stored_snapshot(&node, source.clone()).await?;
     let root = responder.span_digest(super::super::whole()).await?;
     let frontier = responder.refine(&root).await?;
     let original =
@@ -285,7 +297,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let mut leaf_pages = 0;
     let mut finished = false;
     for _ in 0..64 {
-        let body = comparison.reply(&node, &vec![], false, false, 0).await?;
+        let body = comparison.reply(&node, &vec![], false, 0).await?;
         assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
         let StateFrameBody::State { items, progress, .. } = body else { panic!("state frame") };
         let mut answers = Vec::new();
@@ -336,7 +348,7 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
             None,
             false,
             0,
-            snapshot(source.clone()).await?,
+            stored_snapshot(&node, source.clone()).await?,
             known,
         )
         .await?;
@@ -347,7 +359,6 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
             .iter()
             .map(|item| match item {
                 StateItem::Repair { .. } => 1,
-                StateItem::Snapshots(page) => page.states.len(),
                 _ => 0,
             })
             .sum::<usize>();
@@ -358,86 +369,84 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
 }
 
 #[tokio::test]
-async fn snapshot_pages_tile_gaps_split_by_bytes_and_resume_after_an_oversized_row() -> anyhow::Result<()> {
+async fn inventories_tile_the_captured_membership_while_current_payloads_are_chunked() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
     let mut source = states(5, PAGE_BYTES / 4);
     for (index, state) in source.iter_mut().enumerate() {
         state.payload.entity_id = proto::EntityId::from_bytes([index as u8 + 1; 32]);
     }
-    source[2].payload.state.state_buffers.0.insert("lww".into(), vec![9; PAGE_BYTES * 2]);
+    source[2].payload.state.state_buffers = states(1, PAGE_BYTES * 2).pop().unwrap().payload.state.state_buffers;
     let large = source[2].clone();
-    let mut comparison = Comparison::new(snapshot(source.clone()).await?, unknown())?;
+    let mut comparison = Comparison::new(stored_snapshot(&node, source.clone()).await?, unknown())?;
     let mut start = super::super::whole().start;
-    let mut received = Vec::new();
+    let mut members = Vec::new();
+    let mut received = HashSet::new();
     let mut chunks = Vec::new();
-    let mut inline_after_chunks = false;
     while !comparison.complete {
-        let body = comparison.reply(&node, &vec![], false, false, 0).await?;
+        let body = comparison.reply(&node, &vec![], false, 0).await?;
         assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
         let StateFrameBody::State { items, .. } = body else { panic!("state frame") };
         for item in items {
-            let bounds = match item {
-                StateItem::Snapshots(page) => {
-                    assert!(page.states.len() < super::super::MAX_SNAPSHOT_ROWS, "bytes, not row count, split these pages");
-                    if !chunks.is_empty() {
-                        inline_after_chunks = true;
-                    }
-                    received.extend(page.states.iter().map(|state| state.payload.entity_id));
-                    Some(page.bounds)
-                }
+            match item {
                 StateItem::Heads(page) => {
-                    assert_eq!(page.heads.len(), 1);
-                    assert_eq!(page.heads.to_vec()[0].entity.entity_id, large.payload.entity_id);
-                    received.push(page.heads.to_vec()[0].entity.entity_id);
-                    Some(page.bounds)
+                    assert_eq!(page.bounds.start, start, "inventory coverage must have no gaps or overlap");
+                    start = opposite(&page.bounds.end);
+                    members.extend(page.heads.to_vec().iter().map(|head| head.entity.entity_id));
+                }
+                StateItem::Repair { target, delta } => {
+                    let expected = source.iter().find(|state| state.payload.entity_id == delta.entity_id).unwrap();
+                    assert_eq!(target, expected.payload.state.head);
+                    let proto::DeltaContent::StateSnapshot { state } = delta.content else { panic!("current snapshot") };
+                    assert_eq!(state.state, expected.payload.state);
+                    assert!(received.insert(delta.entity_id));
                 }
                 StateItem::RepairChunk { target, chunk } => {
                     assert_eq!(chunk.entity_id, large.payload.entity_id);
                     assert_eq!(target, large.payload.state.head);
                     assert_eq!(chunk.offset as usize, chunks.len());
                     chunks.extend_from_slice(&chunk.bytes);
-                    None
+                    if chunk.last {
+                        assert!(received.insert(chunk.entity_id));
+                    }
                 }
                 other => panic!("unexpected cold item: {other:?}"),
-            };
-            if let Some(bounds) = bounds {
-                assert_eq!(bounds.start, start, "page coverage must have no gaps or overlap");
-                start = opposite(&bounds.end);
             }
         }
     }
-    assert_eq!(start, std::ops::Bound::Unbounded, "the final page includes the trailing gap");
-    assert_eq!(received, source.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>());
-    assert!(inline_after_chunks);
+    assert_eq!(start, std::ops::Bound::Unbounded);
+    assert_eq!(members, source.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>());
+    assert_eq!(received, members.into_iter().collect());
     let decoded: proto::DeltaContent = bincode::deserialize(&chunks)?;
     let proto::DeltaContent::StateSnapshot { state } = decoded else { panic!("chunked snapshot") };
     assert_eq!(state.state, large.payload.state);
     for state in &source {
-        assert_eq!(comparison.offered.get(&state.payload.entity_id), Some(&state.payload.state.head));
+        assert!(comparison.offered.contains(&target_id(state.payload.entity_id, &state.payload.state.head)));
     }
     comparison
         .answer(vec![StateAnswer::NeedRepair { entity_id: source[0].payload.entity_id, target: source[0].payload.state.head.clone() }])?;
-    assert!(comparison.pending_repairs.contains(&source[0].payload.entity_id));
+    assert!(comparison.pending_repairs.contains(&target_id(source[0].payload.entity_id, &source[0].payload.state.head)));
     Ok(())
 }
 
 #[tokio::test]
-async fn snapshot_page_keeps_a_supplied_clock_for_a_member_that_moved_from_another_range() -> anyhow::Result<()> {
+async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_range() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
     let source = states(1, 10);
     let id = source[0].payload.entity_id;
-    let mut comparison = Comparison::new(snapshot(source.clone()).await?, unknown())?;
+    let mut comparison = Comparison::new(stored_snapshot(&node, source.clone()).await?, unknown())?;
     let clock =
         proto::PackedHeads::from_rows(std::iter::once((&[][..], id, &source[0].payload.state.head))).cursor().next_clock().unwrap().1;
     comparison.known_clocks.insert(id, clock);
-    let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, false, 0).await? else {
-        panic!("state frame")
-    };
+    let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state frame") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items.as_slice(), [StateItem::Heads(page)] if page.heads.to_vec()[0].entity.entity_id == id));
-    assert!(comparison.offered.is_empty(), "equal supplied state must not be sent again");
-    let mut comparison = Comparison::new(snapshot(source).await?, unknown())?;
-    assert!(comparison.reply(&node, &vec![], true, false, 0).await.is_err(), "an exhaustive catalog page cannot skip an inadmissible row");
+    assert!(comparison.offered.contains(&target_id(id, &source[0].payload.state.head)), "membership still offers its captured target");
+    let mut comparison = Comparison::new(stored_snapshot(&node, source).await?, unknown())?;
+    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], true, 0).await? else { panic!("state") };
+    assert!(
+        items.iter().any(|item| matches!(item, StateItem::RepairUnavailable { entity_id, .. } if *entity_id == id)),
+        "a captured member cannot authorize an out-of-scope current payload"
+    );
     Ok(())
 }
 
@@ -449,7 +458,7 @@ async fn empty_inventory_is_complete_without_questions() -> anyhow::Result<()> {
             .await?;
     let (items, progress) = state_items(&initial.frame);
     assert_eq!(progress, ComparisonProgress::Complete);
-    assert!(matches!(items, [StateItem::Snapshots(page)] if page.states.is_empty()));
+    assert!(matches!(items, [StateItem::Heads(page)] if page.heads.is_empty()));
     Ok(())
 }
 
@@ -530,7 +539,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         None,
         false,
         0,
-        snapshot(states(200, PAGE_BYTES / 2)).await?,
+        stored_snapshot(&node, states(200, PAGE_BYTES / 2)).await?,
         unknown(),
     )
     .await?;
@@ -723,7 +732,7 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
         Some((proto::QueryId::new(), 1)),
         false,
         0,
-        snapshot(source).await?,
+        stored_snapshot(&node, source).await?,
         known,
     )
     .await?;
@@ -771,7 +780,7 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
         Some((proto::QueryId::new(), 1)),
         false,
         0,
-        snapshot(states(200, PAGE_BYTES / 2)).await?,
+        stored_snapshot(&node, states(200, PAGE_BYTES / 2)).await?,
         unknown(),
     )
     .await?;
@@ -866,7 +875,7 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
             query,
             false,
             0,
-            snapshot(source).await?,
+            stored_snapshot(&node, source).await?,
             known,
         )
         .await?;
@@ -897,7 +906,7 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
             )),
             "a cancelled comparison must not stop live delivery"
         );
-        schedule_round(&node, peer, id, 1, 1, snapshot(states(1, 8)).await?, unknown()).await?;
+        schedule_round(&node, peer, id, 1, 1, stored_snapshot(&node, states(1, 8)).await?, unknown()).await?;
         pump_state_stream(&node, peer, id).await?;
         finish_state_round(&node, peer, id, 0, cancelled, credentials.clone()).await?;
         {
@@ -916,9 +925,9 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
 #[tokio::test]
 async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire_the_next_round() -> anyhow::Result<()> {
     let (node, peer, _) = node().await?;
-    let first = snapshot(states(1, 8)).await?;
-    let captured = Arc::downgrade(first.states.values().next().unwrap());
-    let old = first.states.values().next().unwrap().payload.clone();
+    let first = stored_snapshot(&node, states(1, 8)).await?;
+    let captured = Arc::downgrade(&first.entries);
+    let old = first.entries.values().next().unwrap().clone();
     let initial = start_state_stream(
         &node,
         peer,
@@ -939,8 +948,8 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let applied = proto::StateRoundOutcome::Applied { processed_through: 0 };
     finish_state_round(&node, peer, id, 0, applied, vec![]).await?;
     assert!(captured.upgrade().is_none(), "round retirement must release captured source rows");
-    let next = snapshot(states(1, 8)).await?;
-    let next_capture = Arc::downgrade(next.states.values().next().unwrap());
+    let next = stored_snapshot(&node, states(1, 8)).await?;
+    let next_capture = Arc::downgrade(&next.entries);
     let mut empty = snapshot(vec![]).await?;
     let offer = empty.offer().await?;
     schedule_round(&node, peer, id, 1, 1, next, offer).await?;
@@ -954,7 +963,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert!(comparison.pending_repairs.is_empty());
         (comparison.snapshot.members(), comparison.offered.clone())
     };
-    for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.state.head.clone() }]] {
+    for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.head.clone() }]] {
         assert!(
             matches!(
                 continue_state(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, answers, vec![]).await?,
@@ -982,8 +991,8 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     assert!(session.state.lock().await.comparison.is_none());
     assert!(node.peer_connections.get(&peer).unwrap().state_streams.get(&id).is_some(), "the standing stream survives");
     for round in 2..=32 {
-        let next = snapshot(states(1, 8)).await?;
-        let captured = Arc::downgrade(next.states.values().next().unwrap());
+        let next = stored_snapshot(&node, states(1, 8)).await?;
+        let captured = Arc::downgrade(&next.entries);
         schedule_round(&node, peer, id, round, round, next, empty.offer().await?).await?;
         pump_state_stream(&node, peer, id).await?;
         let last = session.state.lock().await.required_through;
@@ -1228,7 +1237,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
         Some((proto::QueryId::new(), 1)),
         false,
         0,
-        snapshot(source.clone()).await?,
+        stored_snapshot(&node, source.clone()).await?,
         unknown(),
     )
     .await?;
@@ -1323,9 +1332,19 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
         proto::EntityState { entity_id: genesis.entity_id, state: proto::State { head: target.clone(), ..Default::default() } },
         None,
     );
-    let initial =
-        start_state_stream(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![source]).await?, unknown())
-            .await?;
+    let initial = start_state_stream(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![],
+        None,
+        false,
+        0,
+        stored_snapshot(&node, vec![source]).await?,
+        unknown(),
+    )
+    .await?;
     continue_state(
         &node,
         peer,
@@ -1477,7 +1496,7 @@ async fn initial_items(node: &TestNode, comparison: &mut Comparison) -> anyhow::
         if comparison.complete {
             return Ok(all);
         }
-        let StateFrameBody::State { items, .. } = comparison.reply(node, &vec![], false, false, 0).await? else { panic!("state") };
+        let StateFrameBody::State { items, .. } = comparison.reply(node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         assert!(bincode::serialized_size(&items)? <= PAGE_BYTES as u64);
         assert!(!items.iter().any(|item| matches!(item, StateItem::NeedHeads(_) | StateItem::Digest(_))));
@@ -1493,7 +1512,7 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
         let source = ordered_states(count, 2);
         let mut requester = snapshot(source.clone()).await?;
         let known = requester.offer().await?;
-        let mut comparison = Comparison::new(snapshot(source).await?, known)?;
+        let mut comparison = Comparison::new(stored_snapshot(&node, source).await?, known)?;
         assert_eq!(comparison.known_clocks.len(), count);
         assert!(comparison.work.iter().all(|work| matches!(work, Work::InitialHeads(_))));
         let items = initial_items(&node, &mut comparison).await?;
@@ -1504,10 +1523,10 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
     let mut after = before.clone();
     after[17].payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([2; 32]));
     let mut requester = snapshot(before).await?;
-    let mut comparison = Comparison::new(snapshot(after.clone()).await?, requester.offer().await?)?;
+    let mut comparison = Comparison::new(stored_snapshot(&node, after.clone()).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert!(
-        matches!(items.as_slice(), [StateItem::Repair { target, delta }] if delta.entity_id == after[17].payload.entity_id && *target == after[17].payload.state.head)
+        matches!(items.as_slice(), [StateItem::Heads(page), StateItem::Repair { target, delta }] if page.heads.to_vec()[0].entity.head == after[17].payload.state.head && delta.entity_id == after[17].payload.entity_id && *target == after[17].payload.state.head)
     );
     Ok(())
 }
@@ -1536,9 +1555,75 @@ fn positioned_state(id: u32, position: i64, head: u8) -> anyhow::Result<proto::A
 }
 
 #[tokio::test]
+async fn captured_membership_and_current_payload_keep_both_targets_across_moves_and_exits() -> anyhow::Result<()> {
+    use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyPath};
+    let property = proto::PropertyId::EntityId(proto::EntityId::from_bytes([42; 32]));
+    let spec = proto::TreeSpec::new(
+        position_spec().key_spec().clone(),
+        Predicate::Comparison {
+            left: Box::new(Expr::Path(PropertyPath::from(property))),
+            operator: ComparisonOperator::GreaterThan,
+            right: Box::new(Expr::Literal(ankurah_core_types::Value::I64(7))),
+        },
+    );
+    for position in [10, 20, 1] {
+        let (node, _, _) = node().await?;
+        let captured = positioned_state(1, 10, 2)?;
+        let current = positioned_state(1, position, 3)?;
+        let id = captured.payload.entity_id;
+        let snapshot = super::super::QueryTree::default().refresh(spec.clone(), vec![captured.clone()]).await?;
+        let captured_entry = snapshot.entries[&id].clone();
+        node.storage.set_state(current.clone());
+        let mut comparison = Comparison::new(snapshot, proto::KnownState { spec: spec.clone(), spans: vec![] })?;
+        let items = initial_items(&node, &mut comparison).await?;
+        let [StateItem::Heads(page), StateItem::Repair { target, delta }] = items.as_slice() else {
+            panic!("metadata plus current data: {items:?}")
+        };
+        let head = &page.heads.to_vec()[0];
+        assert_eq!(head.key, captured_entry.key);
+        assert_eq!(head.entity.head, captured.payload.state.head);
+        assert_eq!(target, &current.payload.state.head);
+        let proto::DeltaContent::StateSnapshot { state } = &delta.content else { panic!("current snapshot") };
+        assert_eq!(state.state, current.payload.state, "payload is current even after key movement or predicate exit");
+        let old_key = target_id(id, &captured.payload.state.head);
+        let new_key = target_id(id, &current.payload.state.head);
+        assert!(comparison.offered.contains(&old_key) && comparison.offered.contains(&new_key));
+        comparison.answer(vec![
+            StateAnswer::NeedRepair { entity_id: id, target: captured.payload.state.head.clone() },
+            StateAnswer::NeedRepair { entity_id: id, target: current.payload.state.head.clone() },
+        ])?;
+        assert_eq!(comparison.pending_repairs.len(), 2, "the current payload does not retire the captured head's proof obligation");
+        assert_eq!(comparison.repair_attempts[&old_key], 1);
+        assert_eq!(comparison.repair_attempts[&new_key], 1);
+        comparison.answer(vec![StateAnswer::NeedRepair { entity_id: id, target: captured.payload.state.head.clone() }])?;
+        assert_eq!(comparison.repair_attempts[&old_key], 1, "pending retries are idempotent for this exact target");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_head_at_the_same_key_sends_captured_metadata_before_newer_payload() -> anyhow::Result<()> {
+    let (node, _, _) = node().await?;
+    let before = positioned_state(1, 10, 1)?;
+    let captured = positioned_state(1, 10, 2)?;
+    let current = positioned_state(1, 10, 3)?;
+    let tree = super::super::QueryTree::default();
+    let mut requester = tree.refresh(position_spec(), vec![before]).await?;
+    let snapshot = tree.refresh(position_spec(), vec![captured.clone()]).await?;
+    node.storage.set_state(current.clone());
+    let mut comparison = Comparison::new(snapshot, requester.offer().await?)?;
+    let items = initial_items(&node, &mut comparison).await?;
+    let [StateItem::Heads(page), StateItem::Repair { target, .. }] = items.as_slice() else { panic!("metadata and repair") };
+    assert_eq!(page.heads.to_vec()[0].entity.head, captured.payload.state.head);
+    assert_eq!(target, &current.payload.state.head);
+    assert_ne!(page.heads.to_vec()[0].entity.head, *target);
+    Ok(())
+}
+
+#[tokio::test]
 async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
-    let query = super::super::QueryTreeCache::default();
+    let query = super::super::QueryTree::default();
     let before = (0..256).map(|id| positioned_state(id, id as i64, 1)).collect::<anyhow::Result<Vec<_>>>()?;
     let mut old = query.refresh(position_spec(), before).await?;
     let known = old.offer().await?;
@@ -1564,6 +1649,9 @@ async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs
     let mut tx = node.storage.transaction();
     tx.set_state(&Default::default(), &former).await?;
     tx.commit().await?;
+    for state in &current {
+        node.storage.set_state(state.clone());
+    }
     let captured = query.refresh(position_spec(), current.clone()).await?;
     let expected = captured.members();
     let mut comparison = Comparison::new(captured, known)?;
@@ -1576,13 +1664,6 @@ async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs
                 members.retain(|address, _| !page.bounds.contains(address));
                 for leaf in page.heads.to_vec() {
                     members.insert(leaf_address(&leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
-                }
-            }
-            StateItem::Snapshots(page) => {
-                members.retain(|address, _| !page.bounds.contains(address));
-                for state in page.states {
-                    let key = super::super::tree::key(&position_spec(), &state)?;
-                    members.insert(leaf_address(&key, state.payload.entity_id), state.payload.entity_id);
                 }
             }
             StateItem::Repair { target, delta } => {
@@ -1609,27 +1690,24 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     let mut current = ordered_states(1024, 1);
     current.extend(old);
     let expected = current.iter().take(1024).map(|state| state.payload.entity_id).collect::<HashSet<_>>();
-    let mut comparison = Comparison::new(snapshot(current).await?, requester.offer().await?)?;
+    let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     let mut incoming = HashSet::new();
     for item in items {
-        if let StateItem::Snapshots(page) = item {
-            assert!(page.states.len() <= super::super::MAX_SNAPSHOT_ROWS);
-            incoming.extend(page.states.into_iter().map(|state| state.payload.entity_id));
+        if let StateItem::Repair { delta, .. } = item {
+            incoming.insert(delta.entity_id);
         }
     }
     assert_eq!(incoming, expected);
 
     let source = ordered_states(2048, 2);
-    let mut tx = node.storage.transaction();
     for state in &source {
         let mut newer = state.clone();
         newer.payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([2; 32]));
-        tx.set_state(&Default::default(), &newer).await?;
+        node.storage.set_state(newer);
     }
-    tx.commit().await?;
     let mut requester = snapshot(source).await?;
-    let mut comparison = Comparison::new(snapshot(vec![]).await?, requester.offer().await?)?;
+    let mut comparison = Comparison::new(stored_snapshot(&node, vec![]).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 16);
     assert_eq!(
@@ -1652,7 +1730,7 @@ async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::
         state.payload.entity_id = proto::EntityId::from_bytes(id);
     }
     let mut requester = snapshot(before).await?;
-    let mut comparison = Comparison::new(snapshot(current).await?, requester.offer().await?)?;
+    let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, requester.offer().await?)?;
     assert_eq!(comparison.work.len(), 1);
     let Some(Work::InitialHeads(page)) = comparison.work.pop_front() else { panic!("initial page") };
     comparison.expand_initial_heads(page)?;
@@ -1663,17 +1741,14 @@ async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::
         Work::InitialHeads(rest) if rest.heads.len() == 2048 - HEAD_PAGE)));
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 2048);
-    assert_eq!(
-        items.iter().filter_map(|item| if let StateItem::Snapshots(page) = item { Some(page.states.len()) } else { None }).sum::<usize>(),
-        2048
-    );
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 2048);
     Ok(())
 }
 
 #[tokio::test]
 async fn prefix_encoded_initial_inventory_keeps_its_cursor_across_work_batches() -> anyhow::Result<()> {
     let states = (0..1024).map(|n| positioned_state(n, n as i64, 1)).collect::<anyhow::Result<Vec<_>>>()?;
-    let tree = super::super::QueryTreeCache::default();
+    let tree = super::super::QueryTree::default();
     let mut requester = tree.refresh(position_spec(), states.clone()).await?;
     let known = requester.offer().await?;
     let mut comparison = Comparison::new(tree.refresh(position_spec(), states).await?, known)?;
@@ -1714,14 +1789,24 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     assert_eq!(exact.work.len(), unknown_gaps, "a validated equal point adds no equality echo");
     assert_eq!(exact.known_clocks.len(), 1);
     let (node, _, _) = node().await?;
+    for state in &before {
+        node.storage.set_state(state.clone());
+    }
     let items = initial_items(&node, &mut exact).await?;
     assert!(exact.complete);
-    assert!(items.iter().all(|item| matches!(item, StateItem::Snapshots(_))), "unknown gaps still require membership output");
-    assert_eq!(items.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 2047);
+    assert!(
+        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
+        "unknown gaps require both membership and current state"
+    );
+    assert_eq!(items.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum::<usize>(), 2047);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 2047);
     known.spans.push(known.spans[0].clone());
-    assert!(Comparison::new(snapshot(before.clone()).await?, known).is_err(), "overlapping pages must fail before comparison");
+    assert!(
+        Comparison::new(stored_snapshot(&node, before.clone()).await?, known).is_err(),
+        "overlapping pages must fail before comparison"
+    );
     let extra = positioned_state(3, 10000, 1)?;
-    let mut keyed = super::super::QueryTreeCache::default().refresh(position_spec(), vec![extra]).await?;
+    let mut keyed = super::super::QueryTree::default().refresh(position_spec(), vec![extra]).await?;
     let mut duplicate = keyed.offer().await?;
     let proto::SpanContent::Heads(first) = &mut duplicate.spans[0] else { unreachable!() };
     let mut second = first.clone();
@@ -1734,7 +1819,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     second.bounds.start = std::ops::Bound::Included(addr);
     duplicate.spans.push(proto::SpanContent::Heads(second));
     assert!(
-        Comparison::new(super::super::QueryTreeCache::default().refresh(position_spec(), vec![]).await?, duplicate).is_err(),
+        Comparison::new(super::super::QueryTree::default().refresh(position_spec(), vec![]).await?, duplicate).is_err(),
         "global duplicate IDs must fail even at distinct keys/pages"
     );
     let mut oversized = requester.offer().await?;
@@ -1749,7 +1834,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
         }]
         .into(),
     }));
-    assert!(Comparison::new(snapshot(before).await?, oversized).is_err(), "total leaf cap spans all pages");
+    assert!(Comparison::new(stored_snapshot(&node, before).await?, oversized).is_err(), "total leaf cap spans all pages");
     Ok(())
 }
 
@@ -1790,7 +1875,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     };
     let before = text_state("z".repeat(40 * 1024), 1)?;
     let former = text_state("z".repeat(40 * 1024), 2)?;
-    let mut requester = super::super::QueryTreeCache::default().refresh(spec.clone(), vec![before]).await?;
+    let mut requester = super::super::QueryTree::default().refresh(spec.clone(), vec![before]).await?;
     let known = requester.offer().await?;
     let [proto::SpanContent::Heads(page)] = known.spans.as_slice() else { panic!("one valid complete initial inventory") };
     assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
@@ -1805,7 +1890,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let mut tx = node.storage.transaction();
     tx.set_state(&Default::default(), &former).await?;
     tx.commit().await?;
-    let empty = super::super::QueryTreeCache::default().refresh(spec.clone(), vec![]).await?;
+    let empty = super::super::QueryTree::default().refresh(spec.clone(), vec![]).await?;
     let mut comparison = Comparison::new(empty, known.clone())?;
     let Some(Work::InitialHeads(page)) = comparison.work.pop_front() else { panic!("initial region") };
     comparison.expand_initial_heads(page)?;
@@ -1818,13 +1903,14 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     assert!(items
         .iter()
         .any(|item| matches!(item, StateItem::Heads(page) if page.bounds == super::super::whole() && page.heads.is_empty())));
-    assert_eq!(comparison.offered.get(&former.payload.entity_id), Some(&former.payload.state.head));
+    assert!(comparison.offered.contains(&target_id(former.payload.entity_id, &former.payload.state.head)));
     let moved = text_state("a".into(), 2)?;
-    let captured = super::super::QueryTreeCache::default().refresh(spec, vec![moved.clone()]).await?;
+    node.storage.set_state(moved.clone());
+    let captured = super::super::QueryTree::default().refresh(spec, vec![moved.clone()]).await?;
     let mut comparison = Comparison::new(captured, known)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert!(items.iter().any(|item| matches!(item, StateItem::Heads(page) if page.heads.len() == 1 && page.heads.to_vec()[0].entity.entity_id == moved.payload.entity_id)));
-    assert_eq!(comparison.offered.get(&moved.payload.entity_id), Some(&moved.payload.state.head));
+    assert!(comparison.offered.contains(&target_id(moved.payload.entity_id, &moved.payload.state.head)));
     Ok(())
 }
 

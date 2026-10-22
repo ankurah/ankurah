@@ -1,5 +1,12 @@
 # Livequery startup after captured-state sharing — 2026-10-22
 
+> Historical measurements: this report describes the captured-state cache at
+> `034735dd`, which the subsequent maintained-tree correction removes. The
+> current implementation retains only keys, IDs, cloned Clocks and digests,
+> maintains every resident tree through the reactor, and reads payloads from
+> entity/storage ownership when sending. These timings do **not** qualify that
+> revised implementation; fresh paired performance measurements remain required.
+
 The final production source is `034735dd` (captured-state sharing `db6fcc28`
 plus the catalog retry repair). All **420 ordinary main/candidate observations**,
 **four separate previous/new observations** and **16 diagnostic captures** passed

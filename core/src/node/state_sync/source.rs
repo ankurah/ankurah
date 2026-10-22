@@ -1,39 +1,35 @@
-//! Complete or explicitly limited resident coverage, maintained by commit publications.
-#[cfg(test)]
-use crate::entity::TemporaryEntity;
+//! Resident tree admission and its standing reactor maintenance subscription.
+use super::tree::TreeEntry;
 use crate::{
-    entity::CapturedEntity,
+    entity::TemporaryEntity,
     node::{
-        source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
-        state_sync::{QueryTreeCache, Snapshot},
+        state_sync::{QueryTree, Snapshot},
         Node,
     },
     policy::{ContextPolicy, PolicyAgent},
-    selection::{
-        filter::{evaluate_predicate, ValueLookup},
-        ordering::compare_items,
+    reactor::{
+        maintenance::{MaintenanceSubscription, ProjectedChange, SourceBatch, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
+        ChangeNotification,
     },
+    selection::filter::{evaluate_predicate, ValueLookup},
     session::ContextData,
     storage::StorageEngine,
-    value::Value,
 };
 use ankql::ast::{Resolved, Selection};
 use ankurah_digest_tree::CanonicalCodec;
 use ankurah_proto::{self as proto, Attested};
-use indexmap::IndexMap;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
 };
 #[cfg(test)]
-use tokio::sync::oneshot;
+use {crate::value::Value, tokio::sync::oneshot};
 
 const MAX_READ_ATTEMPTS: usize = 8;
+type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
+type RouteMembership = (BTreeMap<proto::EntityId, proto::QueryMember>, Vec<proto::EntityId>);
 
-type Rows = IndexMap<proto::EntityId, Arc<Row>>;
-
-/// Which selections the resident has actually captured. A limited result never
-/// proves complete admission for its TreeSpec's predicate.
+/// A limited resident cannot establish completeness for another rank cut.
 #[derive(Clone, PartialEq)]
 pub(super) enum Coverage {
     Complete,
@@ -50,7 +46,7 @@ impl Coverage {
     pub(super) fn permits(&self, selection: &Selection<Resolved>) -> bool {
         match self {
             Self::Complete => true,
-            Self::Limited(captured) => captured == selection,
+            Self::Limited(original) => original == selection,
         }
     }
     pub(super) async fn select(
@@ -61,20 +57,22 @@ impl Coverage {
     ) -> anyhow::Result<Snapshot> {
         match self {
             Self::Complete => snapshot.select(selection, catalog).await,
-            Self::Limited(captured) => {
-                anyhow::ensure!(captured == selection, "limited resident does not cover this selection");
+            Self::Limited(original) => {
+                anyhow::ensure!(original == selection, "limited resident does not cover this selection");
                 Ok(snapshot)
             }
         }
     }
 }
-type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
 
-struct Row {
-    state: Arc<CapturedEntity>,
-    values: Vec<Option<Value>>,
-    key: Vec<u8>,
-    bytes: usize,
+/// Only index metadata and event identities cross the maintenance queue.
+/// Event bodies are read for active routes when constructing their outgoing messages.
+#[derive(Clone, Debug)]
+pub(crate) struct TreeUpdate {
+    pub entity_id: proto::EntityId,
+    pub entry: Option<TreeEntry>,
+    pub matches: bool,
+    pub events: Vec<proto::EventId>,
 }
 
 pub(crate) struct CapturedQuery {
@@ -82,28 +80,26 @@ pub(crate) struct CapturedQuery {
     #[cfg(test)]
     pub(crate) snapshot: Snapshot,
     pub(crate) projection: QueryProjection,
-    pub(crate) cursor: SourceCursor,
+    pub(crate) cursor: MaintenanceSubscription<TreeUpdate>,
 }
 
 pub(crate) struct QueryProjection {
     pub(super) coverage: Coverage,
     selection: Selection<Resolved>,
     spec: proto::TreeSpec,
-    rows: Rows,
-    // Retain denied candidates too: policy can change without an entity commit.
-    candidates: Rows,
-    candidate_bytes: usize,
-    pub(super) tree: Arc<QueryTreeCache>,
+    // IDs only: denied candidates must also be rechecked when opaque policy changes.
+    candidates: BTreeSet<proto::EntityId>,
+    bytes: usize,
+    pub(super) tree: Arc<QueryTree>,
 }
 
-/// Test helper for a complete resident with an independently selected query view.
 #[cfg(test)]
 pub(crate) async fn capture_query<SE, PA>(
     node: &Node<SE, PA>,
     selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     credentials: Vec<PA::ContextData>,
-    tree: Arc<QueryTreeCache>,
+    tree: Arc<QueryTree>,
 ) -> anyhow::Result<CapturedQuery>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -112,8 +108,8 @@ where
     node.system.require_system_ready()?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     let admission = Selection::from(policy.filter_predicate(spec.predicate().clone())?);
-    let mut captured = capture_filtered_query(node, admission, spec, credentials, tree, Coverage::Complete).await?;
-    captured.snapshot = captured.snapshot.select(&selection, &node.catalog).await?;
+    let mut captured = capture_filtered_query(node, admission, spec, credentials.clone(), tree, Coverage::Complete).await?;
+    captured.snapshot = captured.projection.coverage.select(captured.snapshot, &selection, &node.catalog).await?;
     Ok(captured)
 }
 
@@ -122,7 +118,7 @@ pub(super) async fn capture_filtered_query<SE, PA>(
     selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     credentials: Vec<PA::ContextData>,
-    tree: Arc<QueryTreeCache>,
+    tree: Arc<QueryTree>,
     coverage: Coverage,
 ) -> anyhow::Result<CapturedQuery>
 where
@@ -138,18 +134,46 @@ where
         },
         "resident capture does not match its declared coverage"
     );
-    let (mut start, mut cursor) = node.source_publications.subscribe().await?;
-    let mut projection =
-        QueryProjection { coverage, selection, spec, rows: Rows::new(), candidates: Rows::new(), candidate_bytes: 0, tree };
+    let weak = node.weak();
+    let subscribed_selection = selection.clone();
+    let subscribed_spec = spec.clone();
+    let subscribed_paths = QueryTree::key_paths(&spec);
+    let subscribed_credentials = credentials.clone();
+    let (mut start, mut cursor) = node
+        .reactor
+        .subscribe_maintenance(move |change, live_events| {
+            let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
+            let policy = ContextPolicy::from_credentials(&node.policy_agent, &subscribed_credentials);
+            let entity_id = change.entity().id();
+            change.entity().with_read(|entity| {
+                let matches = evaluate_predicate(entity, &subscribed_selection.predicate)?;
+                let entry = if matches && policy.check_read(&entity_id, &entity.to_state()?).is_ok() {
+                    let values = subscribed_paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+                    Some(TreeEntry {
+                        entity_id,
+                        key: CanonicalCodec.encode_nullable(subscribed_spec.key_spec(), &values)?,
+                        head: entity.head().clone(),
+                    })
+                } else {
+                    None
+                };
+                let events = if live_events { change.events().iter().map(|event| event.payload.id()).collect() } else { Vec::new() };
+                let bytes = 128 + entry.as_ref().map_or(0, |entry| entry.key.len() + entry.head.len() * 40) + events.len() * 32;
+                Ok(ProjectedChange { value: TreeUpdate { entity_id, entry, matches, events }, member: matches, bytes })
+            })?
+        })
+        .await?;
+    let mut projection = QueryProjection { coverage, selection, spec, candidates: BTreeSet::new(), bytes: 0, tree };
+    let mut rows = BTreeMap::new();
+    let mut populated = false;
     let mut attempts = 0;
-    let window = loop {
+    let revision = loop {
         attempts += 1;
         anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
-        if projection.selection.limit != Some(0) {
-            projection.replace_candidates(projection.read(node).await?);
-            projection.rows = projection.authorized_rows(&policy);
+        if !populated {
+            (rows, projection.candidates, _) = projection.read(node, &policy).await?;
         }
-        if matches!(projection.coverage, Coverage::Limited(_)) && projection.selection.limit != Some(0) {
+        let window = if matches!(projection.coverage, Coverage::Limited(_)) && projection.selection.limit != Some(0) {
             match cursor.validate_limited_read(start).await {
                 Err(SourceError::Changed) => {
                     let window = cursor.fence().await?;
@@ -157,8 +181,10 @@ where
                         projection.check_catalog(batch)?;
                     }
                     start = window.revision;
+                    populated = false;
+                    continue;
                 }
-                result => break result?,
+                result => result?,
             }
         } else {
             let window = cursor.fence().await?;
@@ -166,18 +192,36 @@ where
                 projection.check_catalog(batch)?;
                 if projection.selection.limit != Some(0) {
                     for change in &batch.changes {
-                        projection.fold(&policy, change)?;
+                        projection.fold_candidates(change);
+                        if let Some(entry) = &change.entry {
+                            rows.insert(change.entity_id, entry.clone());
+                        } else {
+                            rows.remove(&change.entity_id);
+                        }
                     }
                 }
             }
-            break window;
+            window
+        };
+        // Narrow the bootstrap's broad watch only at the same applied fence.
+        match cursor.finish_bootstrap(projection.selection.predicate.clone(), projection.candidates.iter().copied(), window.revision).await
+        {
+            Err(SourceError::Changed) => {
+                start = window.revision;
+                populated = matches!(projection.coverage, Coverage::Complete);
+            }
+            result => {
+                result?;
+                break window.revision;
+            }
         }
     };
-    let snapshot = projection.tree.refresh_captured(projection.spec.clone(), projection.attested_rows(node)).await?;
+    let snapshot = projection.tree.refresh_entries(projection.spec.clone(), rows.into_values().collect()).await?;
+    projection.bytes = snapshot.accounted_bytes();
     #[cfg(not(test))]
     drop(snapshot);
     Ok(CapturedQuery {
-        revision: window.revision.0,
+        revision: revision.0,
         #[cfg(test)]
         snapshot,
         projection,
@@ -186,153 +230,83 @@ where
 }
 
 impl QueryProjection {
-    fn check_catalog(&self, batch: &SourceBatch) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            crate::schema::is_catalog_read(&self.selection.predicate)
-                || !batch.changes.iter().any(|change| change.state.state.memberships.iter().any(crate::schema::is_catalog_model)),
-            SourceError::CatalogChanged
-        );
+    fn check_catalog(&self, batch: &SourceBatch<TreeUpdate>) -> anyhow::Result<()> {
+        anyhow::ensure!(crate::schema::is_catalog_read(&self.selection.predicate) || !batch.catalog_changed, SourceError::CatalogChanged);
         Ok(())
     }
-
-    fn candidate(&self, state: Arc<CapturedEntity>) -> anyhow::Result<Option<Arc<Row>>> {
-        let entity = state.read()?;
-        if !evaluate_predicate(&entity, &self.selection.predicate)? {
-            return Ok(None);
+    fn fold_candidates(&mut self, change: &TreeUpdate) {
+        if change.matches {
+            self.candidates.insert(change.entity_id);
+        } else {
+            self.candidates.remove(&change.entity_id);
         }
-        let values = QueryTreeCache::key_paths(&self.spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
-        let key = CanonicalCodec.encode_nullable(self.spec.key_spec(), &values)?;
-        let bytes = (bincode::serialized_size(state.as_ref())? as usize)
-            .saturating_mul(4)
-            .saturating_add(key.len().saturating_mul(16))
-            .saturating_add(2048)
-            .saturating_add(state.lookup_bytes());
-        Ok(Some(Arc::new(Row { state, values, key, bytes })))
     }
-
-    async fn read<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<Rows>
+    async fn read<SE, PA>(
+        &self,
+        node: &Node<SE, PA>,
+        policy: &ReadPolicy<'_, PA>,
+    ) -> anyhow::Result<(BTreeMap<proto::EntityId, TreeEntry>, BTreeSet<proto::EntityId>, Vec<proto::EntityId>)>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
         node.system.check_not_halted()?;
-        let states = node.storage.fetch_states(&self.selection).await?;
-        let mut rows = Rows::new();
-        for state in states {
-            if let Some(row) = self.candidate(Arc::new(CapturedEntity::new(state.payload)))? {
-                rows.insert(row.state.entity_id, row);
+        let mut rows = BTreeMap::new();
+        let mut candidates = BTreeSet::new();
+        let mut ordered = Vec::new();
+        let paths = QueryTree::key_paths(&self.spec);
+        if self.selection.limit != Some(0) {
+            for state in node.storage.fetch_states(&self.selection).await? {
+                let id = state.payload.entity_id;
+                let entity = TemporaryEntity::new(id, &state.payload.state)?;
+                if !evaluate_predicate(&entity, &self.selection.predicate)? {
+                    continue;
+                }
+                candidates.insert(id);
+                if policy.check_read(&id, &state.payload.state).is_err() {
+                    continue;
+                }
+                if matches!(self.coverage, Coverage::Limited(_)) {
+                    ordered.push(id);
+                }
+                let values = paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+                rows.insert(
+                    id,
+                    TreeEntry {
+                        entity_id: id,
+                        key: CanonicalCodec.encode_nullable(self.spec.key_spec(), &values)?,
+                        head: state.payload.state.head,
+                    },
+                );
             }
         }
-        Ok(rows)
+        Ok((rows, candidates, ordered))
     }
 
-    fn replace_candidates(&mut self, rows: Rows) {
-        self.candidate_bytes = rows.values().map(|row| row.bytes).sum();
-        self.candidates = rows;
-    }
-
-    fn authorized_rows<PA: PolicyAgent>(&self, policy: &ReadPolicy<'_, PA>) -> Rows {
-        self.candidates
-            .iter()
-            .filter(|(_, row)| policy.check_read_captured(&row.state).is_ok())
-            .map(|(id, row)| (*id, row.clone()))
-            .collect()
-    }
-
-    fn fold<PA: PolicyAgent>(&mut self, policy: &ReadPolicy<'_, PA>, change: &SourceChange) -> anyhow::Result<()> {
-        let id = change.state.entity_id;
-        if let Some(row) = self.candidate(change.state.clone())? {
-            if policy.check_read_captured(&row.state).is_ok() {
-                self.rows.insert(id, row.clone());
-            } else {
-                self.rows.swap_remove(&id);
-            }
-            self.candidate_bytes = self.candidate_bytes.saturating_add(row.bytes);
-            if let Some(previous) = self.candidates.insert(id, row) {
-                self.candidate_bytes = self.candidate_bytes.saturating_sub(previous.bytes);
-            }
-        } else {
-            self.rows.swap_remove(&id);
-            if let Some(previous) = self.candidates.swap_remove(&id) {
-                self.candidate_bytes = self.candidate_bytes.saturating_sub(previous.bytes);
-            }
-        }
-        Ok(())
-    }
-
-    fn attested<SE, PA>(node: &Node<SE, PA>, row: &Row) -> (super::tree::SharedState, Vec<Option<Value>>)
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        (
-            super::tree::SharedState {
-                payload: row.state.clone(),
-                attestations: proto::AttestationSet(node.policy_agent.attest_state(node, &row.state).into_iter().collect()),
-            },
-            row.values.clone(),
-        )
-    }
-
-    fn attested_rows<SE, PA>(&self, node: &Node<SE, PA>) -> Vec<(super::tree::SharedState, Vec<Option<Value>>)>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        self.rows.values().map(|row| Self::attested(node, row)).collect()
-    }
-
-    fn change<SE, PA>(&self, node: &Node<SE, PA>, policy: &ReadPolicy<'_, PA>, change: &SourceChange) -> anyhow::Result<proto::QueryChange>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let entity_id = change.state.entity_id;
-        let member = self.rows.get(&entity_id).map(|row| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() });
-        let delta = if policy.check_read_captured(&change.state).is_ok() {
-            for event in &change.events {
-                policy.check_read_captured_event(event, &change.state)?;
-            }
-            Some(proto::DeltaContent::StateAndEvents {
-                state: Attested::opt(change.state.to_entity_state(), node.policy_agent.attest_state(node, &change.state)).into(),
-                events: change.events.iter().cloned().map(Into::into).collect(),
-            })
-        } else {
-            None
-        };
-        Ok(proto::QueryChange { entity_id, member, delta })
-    }
-
-    async fn apply<SE, PA>(
-        &mut self,
-        node: &Node<SE, PA>,
-        credentials: &Vec<PA::ContextData>,
-        batch: &SourceBatch,
-        delivery: bool,
-    ) -> anyhow::Result<Vec<SourceChange>>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-        let mut changed = Vec::new();
-        let mut rows = Vec::new();
-        let mut removed = Vec::new();
+    async fn apply(&mut self, batch: &SourceBatch<TreeUpdate>, delivery: bool) -> anyhow::Result<Vec<TreeUpdate>> {
+        let before = self.tree.current_snapshot().await?;
+        let mut affected = BTreeSet::new();
+        let mut latest = BTreeMap::new();
         for change in &batch.changes {
-            let id = change.state.entity_id;
-            let was_member = self.rows.contains_key(&id);
-            self.fold(&policy, change)?;
-            if let Some(row) = self.rows.get(&id) {
-                rows.push(Self::attested(node, row));
-            } else if was_member {
+            self.fold_candidates(change);
+            latest.insert(change.entity_id, change.entry.clone());
+            if delivery && (before.entries.contains_key(&change.entity_id) || change.entry.is_some()) {
+                affected.insert(change.entity_id);
+            }
+        }
+        drop(before); // Do not force a full metadata copy solely for this update's membership check.
+        let mut entries = Vec::new();
+        let mut removed = Vec::new();
+        for (id, entry) in latest {
+            if let Some(entry) = entry {
+                entries.push(entry);
+            } else {
                 removed.push(id);
             }
-            if delivery && (was_member || self.rows.contains_key(&id)) {
-                changed.push(change.clone());
-            }
         }
-        self.tree.apply_captured(rows, removed).await?;
-        Ok(changed)
+        let snapshot = self.tree.apply_entries(entries, removed).await?;
+        self.bytes = snapshot.accounted_bytes();
+        Ok(batch.changes.iter().filter(|change| affected.contains(&change.entity_id)).cloned().collect())
     }
 }
 
@@ -345,87 +319,108 @@ pub(super) struct Route {
     pub(super) members: BTreeMap<proto::EntityId, proto::QueryMember>,
 }
 
+async fn current_state<SE, PA>(node: &Node<SE, PA>, id: proto::EntityId) -> anyhow::Result<Option<proto::EntityState>>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    if let Some(entity) = node.entities.get(&id) {
+        return Ok(Some(entity.to_entity_state()?));
+    }
+    Ok(node.storage.get_states(vec![id], &ankql::ast::Predicate::True).await?.into_iter().next().and_then(|result| match result {
+        crate::storage::GetStateResult::Found(state) => Some(state.payload),
+        _ => None,
+    }))
+}
+
 impl Route {
-    /// Membership belongs to the subscription, not to its shared resident tree.
-    /// Unlimited queries only inspect changed rows. A limited query also finds
-    /// unchanged rows entering its result when another member leaves the cut.
     async fn changes<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
         projection: &QueryProjection,
         policy: &ReadPolicy<'_, PA>,
-        sources: &[SourceChange],
+        sources: &[TreeUpdate],
     ) -> anyhow::Result<Vec<proto::QueryChange>>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let mut updates = BTreeMap::new();
-        if self.selection.limit.is_some() {
-            let snapshot = projection.tree.current_snapshot().await?;
-            let snapshot = projection.coverage.select(snapshot, &self.selection, &node.catalog).await?;
-            updates.extend(self.members.keys().map(|id| (*id, None)));
-            updates.extend(snapshot.query_members().into_iter().map(|(id, member)| (id, Some(member))));
-        } else {
-            for source in sources {
-                let id = source.state.entity_id;
-                let member = if let Some(row) = projection.rows.get(&id) {
-                    let entity = row.state.read()?;
-                    evaluate_predicate(&entity, &self.selection.predicate)?
-                        .then(|| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() })
+        let snapshot = projection.tree.current_snapshot().await?;
+        let selected = projection.coverage.select(snapshot, &self.selection, &node.catalog).await?;
+        let ordered = match selected.ordered_ids(&self.selection, &node.catalog) {
+            Ok(ordered) => ordered,
+            Err(error) if self.selection.limit.is_none() && error.is::<super::tree::UnsupportedTreeSelection>() => {
+                selected.members().into_values().collect()
+            }
+            Err(error) => return Err(error),
+        };
+        let next = selected.query_members();
+        self.changes_for_members(node, policy, sources, next, ordered).await
+    }
+    async fn changes_for_members<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        policy: &ReadPolicy<'_, PA>,
+        sources: &[TreeUpdate],
+        next: BTreeMap<proto::EntityId, proto::QueryMember>,
+        ordered: Vec<proto::EntityId>,
+    ) -> anyhow::Result<Vec<proto::QueryChange>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let mut events: BTreeMap<proto::EntityId, Vec<proto::EventId>> = BTreeMap::new();
+        let mut ids = Vec::new();
+        for source in sources {
+            if (self.members.contains_key(&source.entity_id) || next.contains_key(&source.entity_id))
+                && !events.contains_key(&source.entity_id)
+            {
+                ids.push(source.entity_id);
+            }
+            events.entry(source.entity_id).or_default().extend(source.events.iter().cloned());
+        }
+        // A LIMIT refill can admit unchanged entities. They need data as well.
+        for id in ordered {
+            if self.members.get(&id) != next.get(&id) && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        for id in self.members.keys() {
+            if !next.contains_key(id) && !ids.contains(id) {
+                ids.push(*id);
+            }
+        }
+        let mut changes = Vec::new();
+        for id in ids {
+            let member = next.get(&id).cloned();
+            let delta = if let Some(state) = current_state(node, id).await? {
+                if policy.check_read(&id, &state.state).is_ok() {
+                    let event_ids = events.remove(&id).unwrap_or_default();
+                    let found = node.storage.get_events(event_ids.clone()).await?;
+                    let by_id = found.into_iter().map(|event| (event.payload.id(), event)).collect::<BTreeMap<_, _>>();
+                    let mut carried = Vec::new();
+                    for event_id in event_ids {
+                        let event = by_id.get(&event_id).ok_or_else(|| anyhow::anyhow!("live event unavailable"))?;
+                        anyhow::ensure!(event.payload.entity_id == id, "live event entity mismatch");
+                        policy.check_read_event(event, &state.state)?;
+                        if !carried.iter().any(|existing: &proto::Attested<proto::Event>| existing.payload.id() == event_id) {
+                            carried.push(event.clone());
+                        }
+                    }
+                    let attestation = node.policy_agent.attest_state(node, &state);
+                    Some(proto::DeltaContent::StateAndEvents {
+                        state: Attested::opt(state, attestation).into(),
+                        events: carried.into_iter().map(Into::into).collect(),
+                    })
                 } else {
                     None
-                };
-                updates.insert(id, member);
-            }
-        }
-
-        let mut changes = Vec::new();
-        let mut included = BTreeSet::new();
-        for source in sources {
-            let id = source.state.entity_id;
-            let member = updates.get(&id).cloned().unwrap_or_else(|| self.members.get(&id).cloned());
-            if self.members.contains_key(&id) || member.is_some() {
-                let mut change = projection.change(node, policy, source)?;
-                change.member = member;
-                changes.push(change);
-                included.insert(id);
-            }
-        }
-        let mut entrants = Vec::new();
-        let mut removed = Vec::new();
-        for (id, member) in &updates {
-            if included.contains(id) || self.members.get(id) == member.as_ref() {
-                continue;
-            }
-            if member.is_some() {
-                let row = projection.rows.get(id).ok_or_else(|| anyhow::anyhow!("query member missing from resident tree"))?;
-                let source = SourceChange { state: row.state.clone(), events: Vec::new() };
-                let mut change = projection.change(node, policy, &source)?;
-                change.member = member.clone();
-                entrants.push((change, row.state.read()?));
+                }
             } else {
-                removed.push(proto::QueryChange { entity_id: *id, member: None, delta: None });
-            }
+                None
+            };
+            changes.push(proto::QueryChange { entity_id: id, member, delta });
         }
-        // Commit changes keep their publication order. Unchanged replacements
-        // follow query order, as they did when storage supplied the refill.
-        if let Some(order) = &self.selection.order_by {
-            entrants.sort_by(|(a_change, a), (b_change, b)| {
-                compare_items(a, b, order).then_with(|| a_change.entity_id.cmp(&b_change.entity_id))
-            });
-        }
-        changes.extend(entrants.into_iter().map(|(change, _)| change));
-        changes.extend(removed);
-        // Event authorization must succeed for the complete publication before
-        // advancing this route's membership. Other routes remain independent.
-        for (id, member) in updates {
-            if let Some(member) = member {
-                self.members.insert(id, member);
-            } else {
-                self.members.remove(&id);
-            }
-        }
+        self.members = next;
         Ok(changes)
     }
 }
@@ -433,46 +428,44 @@ impl Route {
 pub(crate) struct QuerySource<CD: ContextData> {
     credentials: Vec<CD>,
     pub(super) projection: QueryProjection,
-    pub(super) cursor: SourceCursor,
+    pub(super) cursor: MaintenanceSubscription<TreeUpdate>,
     pub(super) revision: u64,
     pub(super) routes: Vec<Route>,
 }
-
 impl<CD: ContextData> QuerySource<CD> {
     pub(super) fn credentials(&self) -> &[CD] { &self.credentials }
-
     pub(super) fn from_capture(credentials: Vec<CD>, capture: CapturedQuery) -> Self {
         Self { credentials, projection: capture.projection, cursor: capture.cursor, revision: capture.revision, routes: Vec::new() }
     }
-
-    pub(super) fn check_authorization<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
+    pub(super) async fn check_authorization<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
-        // External policy changes have no source revision. Reopen rather than
-        // authoring different membership at an already published revision.
-        for (id, row) in &self.projection.candidates {
-            anyhow::ensure!(policy.check_read_captured(&row.state).is_ok() == self.projection.rows.contains_key(id), SourceError::Changed);
+        let snapshot = self.projection.tree.current_snapshot().await?;
+        for id in &self.projection.candidates {
+            let state = current_state(node, *id).await?.ok_or(SourceError::Changed)?;
+            anyhow::ensure!(policy.check_read(id, &state.state).is_ok() == snapshot.entries.contains_key(id), SourceError::Changed);
         }
         Ok(())
     }
-
-    pub(super) fn accounted_bytes(&self) -> usize {
-        // Per-row accounting includes candidate and visible captures, map nodes,
-        // canonical keys, and space for lazily constructed digest rows.
-        4096usize.saturating_add(self.projection.candidate_bytes)
-    }
-
-    async fn deliver<SE, PA>(&mut self, node: &Node<SE, PA>, revision: u64, sources: Vec<SourceChange>)
-    where
+    pub(super) fn accounted_bytes(&self) -> usize { self.projection.bytes.saturating_add(self.projection.candidates.len() * 64) }
+    async fn deliver<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        revision: u64,
+        sources: Vec<TreeUpdate>,
+        prepared: Option<Vec<anyhow::Result<RouteMembership>>>,
+    ) where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
         let mut retained = Vec::with_capacity(self.routes.len());
+        let mut prepared = prepared.map(Vec::into_iter);
         for mut route in std::mem::take(&mut self.routes) {
+            let membership = prepared.as_mut().map(|prepared| prepared.next().expect("one prepared membership per route"));
             if route.owner.strong_count() == 0 {
                 continue;
             }
@@ -481,7 +474,12 @@ impl<CD: ContextData> QuerySource<CD> {
                     policy.filter_predicate(route.selection.predicate.clone())? == route.filtered.predicate,
                     SourceError::Changed
                 );
-                route.changes(node, &self.projection, &policy, &sources).await
+                if let Some(membership) = membership {
+                    let (next, ordered) = membership?;
+                    route.changes_for_members(node, &policy, &sources, next, ordered).await
+                } else {
+                    route.changes(node, &self.projection, &policy, &sources).await
+                }
             }
             .await;
             match result {
@@ -491,8 +489,6 @@ impl<CD: ContextData> QuerySource<CD> {
                     }
                 }
                 Err(error) => {
-                    // An invalid view or unreadable event fails this route, not
-                    // the resident tree or an unrelated subscription using it.
                     tracing::debug!(%error, "resident tree live delivery failed");
                     let weak = node.weak();
                     crate::task::spawn(async move {
@@ -505,8 +501,7 @@ impl<CD: ContextData> QuerySource<CD> {
         }
         self.routes = retained;
     }
-
-    pub(super) async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Arc<SourceBatch>) -> anyhow::Result<()>
+    pub(super) async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Arc<SourceBatch<TreeUpdate>>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -514,40 +509,63 @@ impl<CD: ContextData> QuerySource<CD> {
         self.projection.check_catalog(&batch)?;
         self.routes.retain(|route| route.owner.strong_count() != 0);
         if matches!(self.projection.coverage, Coverage::Limited(_)) {
-            if self.projection.selection.limit != Some(0) && self.relevant(&batch)? {
+            if self.projection.selection.limit != Some(0) && self.relevant(&batch) {
                 return self.refill(node, vec![batch]).await;
             }
         } else {
-            let changes = self.projection.apply(node, &self.credentials, &batch, !self.routes.is_empty()).await?;
-            if !changes.is_empty() {
-                self.deliver(node, batch.revision.0, changes).await;
-            }
+            let window = self.cursor.fence().await?;
+            let pending = std::iter::once(batch).chain(window.batches).collect();
+            return self.advance_complete(node, pending, window.revision.0).await;
         }
         self.revision = batch.revision.0;
         Ok(())
     }
 
-    fn relevant(&self, batch: &SourceBatch) -> anyhow::Result<bool> {
-        for change in &batch.changes {
-            if self.projection.candidates.contains_key(&change.state.entity_id)
-                || self.projection.candidate(change.state.clone())?.is_some()
-            {
-                return Ok(true);
+    /// Apply a finite metadata window before publishing its net membership.
+    /// Repeated changes keep their event identities but update the index once.
+    async fn advance_complete<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        pending: Vec<Arc<SourceBatch<TreeUpdate>>>,
+        revision: u64,
+    ) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        let mut bytes = 0usize;
+        let mut changes = Vec::new();
+        anyhow::ensure!(pending.len() <= MAX_PENDING_BATCHES, SourceError::Lagged);
+        for batch in pending {
+            self.projection.check_catalog(&batch)?;
+            anyhow::ensure!(batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes), SourceError::Lagged);
+            bytes += batch.bytes;
+            changes.extend(batch.changes.iter().cloned());
+        }
+        self.routes.retain(|route| route.owner.strong_count() != 0);
+        if !changes.is_empty() {
+            let batch =
+                SourceBatch { revision: crate::reactor::maintenance::SourceRevision(revision), changes, catalog_changed: false, bytes };
+            let sources = self.projection.apply(&batch, !self.routes.is_empty()).await?;
+            if !sources.is_empty() {
+                self.deliver(node, revision, sources, None).await;
             }
         }
-        Ok(false)
+        self.revision = revision;
+        Ok(())
     }
-
-    /// A bounded resident must reread its rank cut when membership can change:
-    /// a departed row's unchanged replacement may never have been captured.
-    async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<Arc<SourceBatch>>) -> anyhow::Result<()>
+    fn relevant(&self, batch: &SourceBatch<TreeUpdate>) -> bool {
+        batch.changes.iter().any(|change| change.matches || self.projection.candidates.contains(&change.entity_id))
+    }
+    async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<Arc<SourceBatch<TreeUpdate>>>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let mut bytes = pending.iter().map(|batch| batch.bytes).sum::<usize>();
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
         let mut attempts = 0;
-        let (rows, revision) = loop {
+        let (rows, candidates, ordered, revision) = loop {
             attempts += 1;
             anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
             let window = self.cursor.fence().await?;
@@ -560,28 +578,37 @@ impl<CD: ContextData> QuerySource<CD> {
                 bytes += batch.bytes;
                 pending.push(batch);
             }
-            let rows = self.projection.read(node).await?;
+            let (rows, candidates, ordered) = self.projection.read(node, &policy).await?;
             match self.cursor.validate_limited_read(window.revision).await {
                 Err(SourceError::Changed) => continue,
-                result => break (rows, result?.revision.0),
+                result => {
+                    let revision = result?.revision;
+                    // Keep bounded residents' explicit entity watches bounded
+                    // too; predicate routing still observes future entrants.
+                    match self
+                        .cursor
+                        .finish_bootstrap(self.projection.selection.predicate.clone(), candidates.iter().copied(), revision)
+                        .await
+                    {
+                        Err(SourceError::Changed) => continue,
+                        result => {
+                            result?;
+                            break (rows, candidates, ordered, revision.0);
+                        }
+                    }
+                }
             }
         };
-        self.projection.replace_candidates(rows);
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
-        let rows = self.projection.authorized_rows(&policy);
-        let previous = std::mem::replace(&mut self.projection.rows, rows);
-        self.projection.tree.refresh_captured(self.projection.spec.clone(), self.projection.attested_rows(node)).await?;
-        let sources = pending
-            .into_iter()
-            .flat_map(|batch| batch.changes.clone())
-            .filter(|change| previous.contains_key(&change.state.entity_id) || self.projection.rows.contains_key(&change.state.entity_id))
-            .collect();
-        // Even a window containing no carried events can change ranked membership.
-        self.deliver(node, revision, sources).await;
+        self.projection.candidates = candidates;
+        let snapshot = self.projection.tree.refresh_entries(self.projection.spec.clone(), rows.into_values().collect()).await?;
+        self.projection.bytes = snapshot.accounted_bytes();
+        let sources = pending.into_iter().flat_map(|batch| batch.changes.clone()).collect();
+        let members = snapshot.query_members();
+        let prepared = self.routes.iter().map(|_| Ok((members.clone(), ordered.clone()))).collect();
+        self.deliver(node, revision, sources, Some(prepared)).await;
         self.revision = revision;
         Ok(())
     }
-
     pub(super) async fn refresh<SE, PA>(&mut self, node: &Node<SE, PA>) -> anyhow::Result<Snapshot>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -592,22 +619,15 @@ impl<CD: ContextData> QuerySource<CD> {
             let mut relevant = false;
             for batch in &window.batches {
                 self.projection.check_catalog(batch)?;
-                if self.projection.selection.limit != Some(0) {
-                    relevant |= self.relevant(batch)?;
-                }
+                relevant |= self.projection.selection.limit != Some(0) && self.relevant(batch);
             }
             if relevant {
-                // Refill may consume later batches too. Never overwrite its newer
-                // revision or replay the rest of this already-drained window.
                 self.refill(node, window.batches).await?;
             } else {
                 self.revision = window.revision.0;
             }
         } else {
-            for batch in window.batches {
-                self.publish(node, batch).await?;
-            }
-            self.revision = window.revision.0;
+            self.advance_complete(node, window.batches, window.revision.0).await?;
         }
         self.projection.tree.current_snapshot().await
     }

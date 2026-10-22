@@ -12,7 +12,7 @@ async fn fixture(
 ) -> anyhow::Result<(TestNode, Driver, Arc<super::super::super::IncomingStates>)> {
     let node = TestNode::new(Arc::new(crate::test_utils::TestStorage::default()), crate::policy::PermissiveAgent::new());
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
-    let snapshot = super::super::super::QueryTreeCache::default().refresh(spec, rows).await?;
+    let snapshot = super::super::super::QueryTree::default().refresh(spec, rows).await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), None, None)?;
     Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new())?, registry))
@@ -30,7 +30,6 @@ async fn malformed_inventories_do_not_change_the_round_projection() -> anyhow::R
             bounds: proto::TreeSpan::new(std::ops::Bound::Included(address(4)), std::ops::Bound::Included(address(2))),
             heads: Default::default(),
         }),
-        StateItem::Snapshots(proto::SnapshotPage { bounds: proto::TreeSpan::all(), states: vec![state(4), state(2)] }),
     ];
     for item in invalid {
         assert!(driver.items(&node, id(90), &[], Owner::Round(0), vec![item]).await.is_err());
@@ -330,7 +329,7 @@ async fn bind_query_driver(
 ) -> anyhow::Result<(Driver, Arc<super::super::super::IncomingStates>, crate::livequery::EntityLiveQuery)> {
     use crate::peer_subscription::RemoteQuerySubscriber;
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
-    let snapshot = super::super::super::QueryTreeCache::default()
+    let snapshot = super::super::super::QueryTree::default()
         .refresh(spec, vec![proto::Attested::opt(proto::EntityState { entity_id: entity.id(), state: entity.to_state()? }, None)])
         .await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
@@ -426,7 +425,7 @@ async fn actual_owner_publication_retires_round_update_but_metadata_only_does_no
                 Some(crate::reactor::QueryOrigin { query: query.query_id(), version: 1, request: driver.stream.request.clone() }),
                 vec![(change, deferred)],
             )
-            .await;
+            .await?;
         }
         assert!(updates.lock().unwrap().is_empty(), "raw data application is not an owner publication");
         driver.commit_publications(&node, owner).await?;
@@ -681,7 +680,7 @@ async fn cancelled_round_jobs_do_not_complete_or_write_the_next_round_membership
     let (node, mut driver, _registry) = fixture(vec![state(1)]).await?;
     driver.projection.publish(11, vec![(id(1), None)])?;
     driver.cancel_round(&node, id(90), &[])?;
-    let snapshot = super::super::super::QueryTreeCache::default().refresh(driver.spec.clone(), vec![state(2)]).await?;
+    let snapshot = super::super::super::QueryTree::default().refresh(driver.spec.clone(), vec![state(2)]).await?;
     driver.projection.begin(Round::new(proto::StateRound { number: 1, revision: 11 }, snapshot))?;
     driver.round_number = 1;
     driver.round_jobs = 1;
@@ -910,7 +909,7 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
         changes.extend(outcome.change);
     }
     assert_eq!(changes.len(), 2);
-    notify_changes(&node, None, changes.into_iter().map(|change| (change, true)).collect()).await;
+    notify_changes(&node, None, changes.into_iter().map(|change| (change, true)).collect()).await?;
     assert_eq!(*received.lock().unwrap(), [first.id(), second.id()], "a ready batch cannot coalesce away the second event vector");
     Ok(())
 }
@@ -1032,5 +1031,127 @@ async fn older_actual_head_does_not_fail_when_later_target_history_is_not_local_
     driver.observe_head(&node, entity.id(), entity.head()).await?;
     assert!(!driver.goals.covered(), "an older successful application must not certify that later target");
     assert_eq!(entity.head().entries().len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn snapshot_on_one_stream_does_not_consume_live_events_on_another() -> anyhow::Result<()> {
+    use crate::retrieval::SuspenseEvents;
+    let (node, mut initial, _initial_registry) = fixture(vec![]).await?;
+    let (_, mut live, _live_registry) = fixture(vec![]).await?;
+    let (genesis, entity) = committed_entity(&node).await?;
+    let query = local_query(&node).await?;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    let _listener = query.listen_updates(move |update| {
+        recorded.lock().unwrap().extend(update.items.iter().flat_map(|item| item.events.iter().map(|event| event.payload.id())));
+    });
+    let event = edit(entity.id(), entity.head(), 92);
+    let getter = LocalEventGetter::new(node.storage.clone(), false);
+    getter.stage_event(event.clone());
+    let fork = crate::entity::RemoteTrxEntity::edit(&entity)?;
+    fork.apply_events(&getter, &mut [proto::Attested::opt(event.clone(), None)], |_| Ok(None)).await?;
+    let newer = fork.to_state()?;
+    initial.enqueue(
+        &node,
+        id(90),
+        &[crate::policy::DEFAULT_CONTEXT],
+        Owner::Round(0),
+        proto::EntityDelta {
+            entity_id: entity.id(),
+            content: proto::DeltaContent::StateAndEvents {
+                state: proto::StateFragment { state: newer, attestations: Default::default() },
+                events: vec![proto::Attested::from(event.clone()).into()],
+            },
+        },
+        None,
+    )?;
+    let adopted = initial.jobs.next().await.unwrap()?;
+    assert!(adopted.change.as_ref().unwrap().events().is_empty());
+    assert_eq!(entity.head(), proto::Clock::singleton(&event));
+    live.enqueue(&node, id(91), &[crate::policy::DEFAULT_CONTEXT], Owner::Live(11), bridge(event.clone()), None)?;
+    let delivered = live.jobs.next().await.unwrap()?;
+    let change = delivered.change.unwrap();
+    assert_eq!(change.events().iter().map(|event| event.payload.id()).collect::<Vec<_>>(), [event.id()]);
+    assert!(node.reactor.notify_change(vec![change]).await.is_empty());
+    // Another source can carry the same live event after the first source.
+    let (_, mut second_live, _second_registry) = fixture(vec![]).await?;
+    second_live.enqueue(&node, id(92), &[crate::policy::DEFAULT_CONTEXT], Owner::Live(11), bridge(event.clone()), None)?;
+    let replay = second_live.jobs.next().await.unwrap()?;
+    assert!(node.reactor.notify_change(vec![replay.change.unwrap()]).await.is_empty());
+    // A pre-subscription ancestor is also covered by this query's event frontier.
+    assert!(node.reactor.notify_change(vec![EntityChange::new(entity, vec![proto::Attested::from(genesis)])]).await.is_empty());
+    assert_eq!(*events.lock().unwrap(), [event.id()], "live delivery is independent of data adoption and deduplicated across sources");
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_peer_install_uses_captured_head_for_event_baseline_not_newer_entity_state() -> anyhow::Result<()> {
+    use crate::{context::Context, reactor::fetch_gap::QueryGapFetcher};
+    use ankurah_signals::Subscribe;
+    let (node, mut initial, _registry) = fixture(vec![]).await?;
+    let (_, entity) = committed_entity(&node).await?;
+    let baseline = entity.head();
+    let event = edit(entity.id(), baseline.clone(), 92);
+    initial.enqueue(&node, id(90), &[crate::policy::DEFAULT_CONTEXT], Owner::Round(0), bridge(event.clone()), None)?;
+    initial.jobs.next().await.unwrap()?;
+    let subscription = node.reactor.subscribe();
+    let query = proto::QueryId::new();
+    let context = Context::new(node.clone(), crate::policy::DEFAULT_CONTEXT);
+    node.reactor
+        .upsert_query_from_peer(
+            subscription.id(),
+            query,
+            ankql::ast::Selection::from(ankql::ast::Predicate::True),
+            context.0.clone(),
+            crate::resultset::EntityResultSet::empty(),
+            Arc::new(QueryGapFetcher::new(context)),
+            1,
+            (),
+            vec![entity.clone()],
+            crate::reactor::PeerQueryMembership { baseline: [(entity.id(), baseline)].into_iter().collect(), ..Default::default() },
+            vec![],
+        )
+        .await?;
+    let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = received.clone();
+    let _guard = subscription.subscribe(move |update: crate::reactor::ReactorUpdate| {
+        recorded.lock().unwrap().extend(update.items.into_iter().flat_map(|item| item.events.into_iter().map(|event| event.payload.id())));
+    });
+    assert!(node.reactor.notify_change(vec![EntityChange::new(entity, vec![proto::Attested::from(event.clone())])]).await.is_empty());
+    assert_eq!(*received.lock().unwrap(), [event.id()]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_notification_history_fails_the_query_without_claiming_the_committed_state_failed() -> anyhow::Result<()> {
+    let (node, _, _registry) = fixture(vec![]).await?;
+    node.system.wait_loaded().await?;
+    let genesis = application_genesis(55);
+    let unknown = proto::Clock::new(vec![(2, proto::EventId::from_bytes([99; 32]))])?;
+    let state = proto::State { head: unknown.clone(), memberships: [proto::ModelId::EntityId(id(91))].into(), ..Default::default() };
+    let credentials = vec![crate::policy::DEFAULT_CONTEXT];
+    let outcome = NodeApplier::apply_delta(
+        &node,
+        &id(90),
+        proto::EntityDelta {
+            entity_id: genesis.entity_id,
+            content: proto::DeltaContent::StateSnapshot { state: proto::StateFragment { state, attestations: Default::default() } },
+        },
+        Delivery::Initial,
+        &CachedEventGetter::new(&node, &credentials),
+        &LocalStateGetter::new(node.storage.clone()),
+    )
+    .await?;
+    let entity = outcome.entity.unwrap();
+    let query = local_query(&node).await?;
+    assert!(query.resultset().is_loaded());
+    let failures = node.reactor.notify_change(vec![EntityChange::new(entity.clone(), vec![proto::Attested::from(genesis)])]).await;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].query, Some(query.query_id()));
+    node.live_queries.fail_notifications(&failures);
+    assert!(!query.resultset().is_loaded());
+    assert!(query.error().value().is_some());
+    assert_eq!(entity.head(), unknown, "notification failure cannot undo or misreport an already committed entity");
     Ok(())
 }

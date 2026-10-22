@@ -167,9 +167,9 @@ async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read(
         ankurah_core_types::KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(property(), crate::value::ValueType::String)]),
         selection.predicate.clone(),
     );
-    let tree = Arc::new(QueryTreeCache::default());
+    let tree = Arc::new(QueryTree::default());
     let (entered, release) = hold_fetch(&node);
-    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], tree);
+    let capture = capture_query(&node, selection.clone(), spec, vec![DEFAULT_CONTEXT], tree);
     tokio::pin!(capture);
     assert!(futures::poll!(&mut capture).is_pending());
     entered.await?;
@@ -179,15 +179,15 @@ async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read(
     apply(&node, &b).await?;
     release.send(()).unwrap();
     let captured = capture.await?;
-    assert_eq!(captured.projection.rows.len(), 2);
-    assert_eq!(captured.snapshot.states[&a.entity_id].payload.state.head, proto::Clock::singleton(&moved));
-    assert!(captured.snapshot.states.contains_key(&b.entity_id));
-    assert!(captured.projection.rows[&b.entity_id].key < captured.projection.rows[&a.entity_id].key);
+    assert_eq!(captured.projection.tree.current_snapshot().await?.entries.len(), 2);
+    assert_eq!(captured.snapshot.entries[&a.entity_id].head, proto::Clock::singleton(&moved));
+    assert!(captured.snapshot.entries.contains_key(&b.entity_id));
+    assert!(captured.snapshot.entries[&b.entity_id].key < captured.snapshot.entries[&a.entity_id].key);
     Ok(())
 }
 
 #[tokio::test]
-async fn limited_fallback_selects_query_order_without_truncating_the_id_keyed_tree() -> anyhow::Result<()> {
+async fn a_complete_id_keyed_tree_cannot_select_an_unindexed_ordered_limit() -> anyhow::Result<()> {
     let node = node().await?;
     let a = genesis("01")?;
     let b = genesis("02")?;
@@ -199,10 +199,10 @@ async fn limited_fallback_selects_query_order_without_truncating_the_id_keyed_tr
     apply(&node, &update(last, "02")?).await?;
     let selection = selection(Some(1));
     let by_id = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
-    let tree = Arc::new(QueryTreeCache::default());
-    let captured = capture_query(&node, selection, by_id, vec![DEFAULT_CONTEXT], tree.clone()).await?;
-    assert_eq!(captured.projection.rows.len(), 2, "the resident tree retains the entire admission");
-    assert_eq!(captured.snapshot.states.keys().copied().collect::<Vec<_>>(), vec![first.entity_id], "LIMIT follows query order");
+    let tree = Arc::new(QueryTree::default());
+    let result = capture_query(&node, selection, by_id, vec![DEFAULT_CONTEXT], tree.clone()).await;
+    assert!(result.is_err(), "a complete tree cannot rank properties absent from its keys");
+    assert_eq!(tree.current_snapshot().await?.entries.len(), 2, "a failed scope never truncates the resident admission");
     assert_eq!(
         tree.current_snapshot().await?.members().values().copied().collect::<Vec<_>>(),
         vec![last.entity_id, first.entity_id],
@@ -219,18 +219,18 @@ async fn full_capture_folds_changes_before_resolving_a_limit_with_unchanged_entr
         apply(&node, event).await?;
     }
     let selection = selection(Some(2));
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let spec = QueryTree::spec(&selection, &node.catalog);
     let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
-    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default()));
+    let capture = capture_query(&node, selection.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()));
     tokio::pin!(capture);
     assert!(futures::poll!(&mut capture).is_pending());
     entered.await?;
     apply(&node, &update(&a, "09")?).await?;
     release.send(()).unwrap();
     let captured = capture.await?;
-    assert_eq!(captured.projection.rows.len(), 3, "the unchanged replacement is already resident");
-    assert_eq!(captured.snapshot.states.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
+    assert_eq!(captured.projection.tree.current_snapshot().await?.entries.len(), 3, "the unchanged replacement is already resident");
+    assert_eq!(captured.snapshot.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans + 1, "a concurrent update does not cause a refill read");
     Ok(())
 }
@@ -253,8 +253,8 @@ async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutati
         events.push(event);
     }
     let selection = selection(Some(2));
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
-    let tree = Arc::new(QueryTreeCache::default());
+    let spec = QueryTree::spec(&selection, &node.catalog);
+    let tree = Arc::new(QueryTree::default());
     let captured = capture_query(&node, selection.clone(), spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
     let mut actor = QuerySource::from_capture(vec![DEFAULT_CONTEXT], captured);
     let frozen = tree.current_snapshot().await?.select(&selection, &node.catalog).await?;
@@ -262,16 +262,16 @@ async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutati
     let moved_a = update(&events[0], "09")?;
     apply(&node, &moved_a).await?;
     let intermediate = actor.refresh(&node).await?.select(&selection, &node.catalog).await?;
-    assert_eq!(intermediate.states.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
+    assert_eq!(intermediate.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
     // C now moves past A. The next scope must re-admit unchanged A from the
     // same resident tree, while both previous comparisons stay frozen.
     apply(&node, &update(&events[2], "10")?).await?;
     let current = actor.refresh(&node).await?.select(&selection, &node.catalog).await?;
-    assert_eq!(current.states.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[0].entity_id, events[1].entity_id]));
-    assert_eq!(current.states[&events[0].entity_id].payload.state.head, proto::Clock::singleton(&moved_a));
-    assert_eq!(frozen.states[&events[0].entity_id].payload.state.head, proto::Clock::singleton(&events[0]));
-    assert_eq!(intermediate.states[&events[2].entity_id].payload.state.head, proto::Clock::singleton(&events[2]));
-    assert_eq!(actor.projection.rows.len(), 3);
+    assert_eq!(current.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[0].entity_id, events[1].entity_id]));
+    assert_eq!(current.entries[&events[0].entity_id].head, proto::Clock::singleton(&moved_a));
+    assert_eq!(frozen.entries[&events[0].entity_id].head, proto::Clock::singleton(&events[0]));
+    assert_eq!(intermediate.entries[&events[2].entity_id].head, proto::Clock::singleton(&events[2]));
+    assert_eq!(actor.projection.tree.current_snapshot().await?.entries.len(), 3);
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans, "supported limited scopes never refill from storage");
     Ok(())
 }
@@ -392,6 +392,55 @@ impl PolicyAgent for RestrictedDiscovery {
 }
 
 #[tokio::test]
+async fn maintenance_respects_retrieval_permission_when_query_membership_is_unchanged() -> anyhow::Result<()> {
+    let retrieval = Predicate::Comparison {
+        left: Box::new(ankql::ast::Expr::Path(PropertyPath::from(property()))),
+        operator: ankql::ast::ComparisonOperator::LessThan,
+        right: Box::new(ankql::ast::Expr::Literal(Value::String("03".into()))),
+    };
+    let node =
+        Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery { retrieval: Some(retrieval), ..Default::default() });
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let initial = genesis("01")?;
+    let initially_denied = genesis("04")?;
+    apply(&node, &initial).await?;
+    apply(&node, &initially_denied).await?;
+    let selected = selection(None);
+    let spec = QueryTree::spec(&selected, &node.catalog);
+    let mut capture = capture_query(&node, selected, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    assert!(capture.snapshot.entries.contains_key(&initial.entity_id));
+    assert!(!capture.snapshot.entries.contains_key(&initially_denied.entity_id));
+
+    let mut current = initial;
+    for (value, readable) in [("04", false), ("02", true), ("04", false)] {
+        current = update(&current, value)?;
+        apply(&node, &current).await?;
+        let batch = capture.cursor.next().await?;
+        let change = batch.changes.iter().find(|change| change.entity_id == current.entity_id).unwrap();
+        assert!(change.matches, "all values still satisfy the query/discovery predicate");
+        assert_eq!(change.entry.is_some(), readable, "maintenance must enforce the separate retrieval predicate");
+        capture.projection.apply(&batch, false).await?;
+        let snapshot = capture.projection.tree.current_snapshot().await?;
+        assert_eq!(snapshot.entries.contains_key(&current.entity_id), readable);
+        if readable {
+            assert_eq!(snapshot.entries[&current.entity_id].head, proto::Clock::singleton(&current));
+        }
+        assert!(capture.projection.candidates.contains(&current.entity_id), "denied query candidates remain watched for reentry");
+    }
+    let newly_readable = update(&initially_denied, "02")?;
+    apply(&node, &newly_readable).await?;
+    let batch = capture.cursor.next().await?;
+    capture.projection.apply(&batch, false).await?;
+    assert_eq!(
+        capture.projection.tree.current_snapshot().await?.entries[&newly_readable.entity_id].head,
+        proto::Clock::singleton(&newly_readable),
+        "an initially denied candidate enters when it becomes readable"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_broader() -> anyhow::Result<()> {
     let node = Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery::default());
     node.system.create().await?;
@@ -401,23 +450,26 @@ async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_
     apply(&node, &inside).await?;
     apply(&node, &outside).await?;
     let selection = selection(None);
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
-    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
-    assert_eq!(captured.projection.rows.len(), 1);
-    assert!(captured.projection.rows.contains_key(&inside.entity_id));
+    let spec = QueryTree::spec(&selection, &node.catalog);
+    let mut captured = capture_query(&node, selection.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    assert_eq!(captured.projection.tree.current_snapshot().await?.entries.len(), 1);
+    assert!(captured.projection.tree.current_snapshot().await?.entries.contains_key(&inside.entity_id));
+    let mut route = routes::route(&node, &captured.projection, selection).await?;
     apply(&node, &update(&outside, "08")?).await?;
-    let batch = captured.cursor.next().await?;
-    assert!(captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?.is_empty());
-    assert!(!captured.projection.rows.contains_key(&outside.entity_id));
+    for batch in captured.cursor.fence().await?.batches {
+        assert!(captured.projection.apply(&batch, true).await?.is_empty());
+    }
+    assert!(!captured.projection.tree.current_snapshot().await?.entries.contains_key(&outside.entity_id));
     apply(&node, &update(&inside, "09")?).await?;
     let batch = captured.cursor.next().await?;
-    let changes = captured.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?;
+    let changes = captured.projection.apply(&batch, true).await?;
     assert_eq!(changes.len(), 1);
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let change = captured.projection.change(&node, &policy, &changes[0])?;
-    assert!(change.member.is_none());
-    assert!(change.delta.is_some(), "readable former matches still carry causal data");
-    assert!(captured.projection.rows.is_empty());
+    let changes = route.changes(&node, &captured.projection, &policy, &changes).await?;
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].member.is_none());
+    assert!(changes[0].delta.is_some(), "readable former matches still carry causal data");
+    assert!(captured.projection.tree.current_snapshot().await?.entries.is_empty());
     Ok(())
 }
 
@@ -439,7 +491,7 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
     // Complete coverage can serve several limits without a bounded refill.
     let _full = node
         .resident_trees
-        .acquire(&node, selection(None), Some(QueryTreeCache::spec(&selection(Some(2)), &node.catalog)), vec![DEFAULT_CONTEXT])
+        .acquire(&node, selection(None), Some(QueryTree::spec(&selection(Some(2)), &node.catalog)), vec![DEFAULT_CONTEXT])
         .await?;
     let handler = crate::peer_subscription::SubscriptionHandler::new(peer);
     let query = proto::QueryId::new();
@@ -452,7 +504,7 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
             selection(Some(2)),
             Some(&DEFAULT_CONTEXT),
             1,
-            proto::KnownState { spec: QueryTreeCache::spec(&selection(Some(2)), &node.catalog), spans: vec![] },
+            proto::KnownState { spec: QueryTree::spec(&selection(Some(2)), &node.catalog), spans: vec![] },
         )
         .await?;
     let (_, original_tree) = handler.query_tree_for_test(query).await.unwrap();
@@ -467,16 +519,16 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
             selection(Some(1)),
             Some(&DEFAULT_CONTEXT),
             2,
-            proto::KnownState { spec: QueryTreeCache::spec(&selection(Some(1)), &node.catalog), spans: vec![] },
+            proto::KnownState { spec: QueryTree::spec(&selection(Some(1)), &node.catalog), spans: vec![] },
         )
         .await?;
     let (version, reused) = handler.query_tree_for_test(query).await.unwrap();
     assert_eq!(version, 2);
     assert!(Arc::ptr_eq(&original_tree, &reused), "compatible limits select scopes of the same resident tree");
     let snapshot = reused.current_snapshot().await?;
-    assert_eq!(snapshot.states.len(), 3, "the resident keeps the full admission");
+    assert_eq!(snapshot.entries.len(), 3, "the resident keeps the full admission");
     let snapshot = snapshot.select(&selection(Some(1)), &node.catalog).await?;
-    assert_eq!(snapshot.states.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
+    assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans);
     handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
@@ -489,11 +541,11 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
     let selection = selection(None);
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let spec = QueryTree::spec(&selection, &node.catalog);
     let (entered, observed) = oneshot::channel();
     let (read, resume) = oneshot::channel();
     *node.storage.1.lock().unwrap() = Some((entered, resume));
-    let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default()));
+    let capture = capture_query(&node, selection.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()));
     tokio::pin!(capture);
     assert!(futures::poll!(&mut capture).is_pending());
     observed.await?;
@@ -515,9 +567,7 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
     let (published, captured) = tokio::join!(publishing, capture);
     published?;
     let captured = captured?;
-    assert_eq!(captured.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&second));
-    let row = &captured.snapshot.states[&initial.entity_id].payload;
-    assert_eq!(TemporaryEntity::new(row.entity_id, &row.state)?.value(&property()), Some(Value::String("03".into())));
+    assert_eq!(captured.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&second));
     Ok(())
 }
 
@@ -531,18 +581,21 @@ async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<(
     node.wait_ready().await?;
     apply(&node, &initial).await?;
     let selection = selection(None);
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
-    let mut captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
+    let spec = QueryTree::spec(&selection, &node.catalog);
+    let mut captured = capture_query(&node, selection.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    let mut route = routes::route(&node, &captured.projection, selection).await?;
     apply(&node, &denied).await?;
     let batch = captured.cursor.next().await?;
     let credentials = vec![DEFAULT_CONTEXT];
     let read_policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    read_policy.check_read(&initial.entity_id, &batch.changes[0].state.state)?;
-    assert_eq!(batch.changes[0].events[0].payload.id(), denied.id());
-    let changes = captured.projection.apply(&node, &credentials, &batch, true).await?;
+    read_policy.check_read(&initial.entity_id, &current_state(&node, initial.entity_id).await?.unwrap().state)?;
+    assert_eq!(batch.changes[0].events[0], denied.id());
+    let changes = captured.projection.apply(&batch, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    let error =
-        captured.projection.change(&node, &policy, &changes[0]).expect_err("denied event must fail delivery without poisoning the tree");
+    let error = route
+        .changes(&node, &captured.projection, &policy, &changes)
+        .await
+        .expect_err("denied event must fail delivery without poisoning the tree");
     assert!(matches!(error.downcast_ref::<crate::policy::AccessDenied>(), Some(crate::policy::AccessDenied::ByPolicy(_))));
     Ok(())
 }

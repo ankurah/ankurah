@@ -1,13 +1,13 @@
 use super::*;
 
 async fn capture(node: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<CapturedQuery> {
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let spec = QueryTree::spec(&selection, &node.catalog);
     capture_filtered_query(
         node,
         selection.clone(),
         spec,
         vec![DEFAULT_CONTEXT],
-        Arc::new(QueryTreeCache::default()),
+        Arc::new(QueryTree::default()),
         Coverage::Limited(selection),
     )
     .await
@@ -31,7 +31,7 @@ async fn bounded_capture_retries_to_find_an_unchanged_replacement() -> anyhow::R
         release.send(()).unwrap();
         capture.await?
     };
-    assert_eq!(captured.snapshot.states.keys().copied().collect::<Vec<_>>(), vec![second.entity_id]);
+    assert_eq!(captured.snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![second.entity_id]);
     assert_eq!(captured.projection.candidates.len(), 1);
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans + 2, "the raced bounded scan must be repeated");
     let mut different = selection(Some(2));
@@ -119,9 +119,9 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
         refresh.await?
     };
     let revision = actor.revision;
-    assert_eq!(current.states.keys().copied().collect::<BTreeSet<_>>(), [initial[1].entity_id, initial[2].entity_id].into());
-    assert_eq!(frozen.states[&initial[0].entity_id].payload.state.head, proto::Clock::singleton(&initial[0]));
-    assert_eq!(actor.projection.rows.len(), 2);
+    assert_eq!(current.entries.keys().copied().collect::<BTreeSet<_>>(), [initial[1].entity_id, initial[2].entity_id].into());
+    assert_eq!(frozen.entries[&initial[0].entity_id].head, proto::Clock::singleton(&initial[0]));
+    assert_eq!(actor.projection.tree.current_snapshot().await?.entries.len(), 2);
     assert_eq!(actor.projection.candidates.len(), 2);
     assert_eq!(actor.routes.len(), 1);
     let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
@@ -166,7 +166,11 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
             _ => Vec::new(),
         })
         .collect::<Vec<_>>();
-    assert_eq!(events, vec![first.id(), other.id(), latest.id()], "both changes to the same entity retain their events and order");
+    assert_eq!(events.iter().cloned().collect::<BTreeSet<_>>(), [first.id(), other.id(), latest.id()].into());
+    assert_eq!(events.len(), 3, "each committed event is delivered once");
+    let first_position = events.iter().position(|id| *id == first.id()).unwrap();
+    let latest_position = events.iter().position(|id| *id == latest.id()).unwrap();
+    assert!(first_position < latest_position, "causal event order is preserved within an entity");
     let replacement = items.last().unwrap();
     assert_eq!(replacement.entity_id, initial[2].entity_id);
     assert!(replacement.member.is_some());
@@ -188,8 +192,8 @@ async fn zero_limit_ignores_application_publications_without_reads_or_retention(
     let before = actor.revision;
     let current = actor.refresh(&node).await?;
     assert!(actor.revision > before);
-    assert!(current.states.is_empty());
-    assert!(actor.projection.rows.is_empty());
+    assert!(current.entries.is_empty());
+    assert!(actor.projection.tree.current_snapshot().await?.entries.is_empty());
     assert!(actor.projection.candidates.is_empty());
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans);
     Ok(())

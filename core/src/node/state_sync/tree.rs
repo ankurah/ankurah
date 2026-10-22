@@ -1,111 +1,75 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Bound,
-    sync::{Arc, Weak},
+    sync::Arc,
 };
 
 use ankql::ast::{Resolved, Selection};
 use ankurah_core_types::{KeySpec, PropertyPath, ValueType};
 use ankurah_digest_tree::{
-    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafData, NodePrefix, PropertyTypes, TreeMatch, TreeRequest,
+    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafData, NodePrefix, PropertyTypes, TreeRequest,
     TreeTransaction,
 };
-use ankurah_proto::{self as proto, Attested, EntityId, EntityState, TreeSpanDigest, TreeSpec};
+use ankurah_proto::{self as proto, Clock, EntityId, TreeSpanDigest, TreeSpec};
 
-use crate::{
-    entity::{CapturedEntity, TemporaryEntity},
-    schema::catalog::CatalogManager,
-    selection::{
-        filter::{evaluate_predicate, ValueLookup},
-        ordering::compare_items,
-    },
-    value::Value,
-};
+use crate::schema::catalog::CatalogManager;
+#[cfg(test)]
+use crate::{entity::TemporaryEntity, selection::filter::ValueLookup};
+#[cfg(test)]
+use ankurah_proto::{Attested, EntityState};
 
-/// A local attestation of a shared immutable capture. Only emission needs an
-/// owned protocol payload; the serialized representation is identical.
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename = "Attested")]
-pub(crate) struct SharedState {
-    #[serde(serialize_with = "serialize_capture")]
-    pub payload: Arc<CapturedEntity>,
-    pub attestations: proto::AttestationSet,
-}
-impl SharedState {
-    pub fn to_owned(&self) -> Attested<EntityState> {
-        Attested { payload: self.payload.to_entity_state(), attestations: self.attestations.clone() }
-    }
-}
-impl From<Attested<EntityState>> for SharedState {
-    fn from(state: Attested<EntityState>) -> Self {
-        Self { payload: Arc::new(CapturedEntity::new(state.payload)), attestations: state.attestations }
-    }
-}
-fn serialize_capture<S: serde::Serializer>(state: &Arc<CapturedEntity>, serializer: S) -> Result<S::Ok, S::Error> {
-    serde::Serialize::serialize(state.as_ref(), serializer)
-}
-
-type States = BTreeMap<EntityId, Arc<SharedState>>;
+type Entries = BTreeMap<EntityId, TreeEntry>;
 type Members = BTreeMap<Vec<u8>, EntityId>;
-type Cache = tokio::sync::Mutex<Option<Cached>>;
 
 const OFFER_BYTES: u64 = 16 * 1024;
 const OFFER_SPANS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
+const COMPACT_AFTER_CHANGES: usize = 128;
 
-/// One resident entry's captured rows and lazy digest. The node LRU owns its
-/// identity and update feed; comparison snapshots freeze independent versions.
-/// Sparse updates change leaves in place; dense updates defer digest construction.
-#[derive(Default)]
-pub(crate) struct QueryTreeCache(Arc<Cache>);
-
-struct Cached {
-    spec: TreeSpec,
-    tree: Option<DigestTree>,
-    rows: BTreeMap<EntityId, CapturedRow>,
-    states: Arc<States>,
-    missing_counts: Vec<usize>,
-    members: Arc<Members>,
-    generation: Arc<()>,
+/// The entity metadata retained with a leaf. Payloads remain in entity/storage ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeEntry {
+    pub entity_id: EntityId,
+    pub key: Vec<u8>,
+    pub head: Clock,
 }
 
-/// The key and serialized state are captured from the same entity version.
-struct CapturedRow {
-    key: Vec<u8>,
-    state: Arc<SharedState>,
-    missing_parts: Vec<usize>,
-}
-
-impl CapturedRow {
-    fn member(&self) -> (Vec<u8>, EntityId) {
-        let id = self.state.payload.entity_id;
-        (leaf_address(&self.key, id), id)
-    }
+impl TreeEntry {
+    fn address(&self) -> Vec<u8> { leaf_address(&self.key, self.entity_id) }
 
     fn leaf(&self) -> LeafData {
-        LeafData {
-            key: self.key.clone(),
-            entity_id: self.state.payload.entity_id,
-            head: HeadHash::of(self.state.payload.state.head.ids().map(|id| id.clone().to_bytes())),
-        }
+        LeafData { key: self.key.clone(), entity_id: self.entity_id, head: HeadHash::of(self.head.ids().map(|id| id.clone().to_bytes())) }
     }
+}
+
+/// A resident's fixed-spec index, updated by its reactor maintenance subscription.
+/// Initialization and every subsequent update publish a complete digest and matching heads.
+#[derive(Default)]
+pub(crate) struct QueryTree(tokio::sync::Mutex<Option<Index>>);
+
+struct Index {
+    tree: DigestTree,
+    entries: Arc<Entries>,
+    members: Arc<Members>,
+    missing_counts: Vec<usize>,
 }
 
 pub(crate) struct Snapshot {
-    // A comparison may use the peer's compatible spec without changing the
-    // resident tree's admission or addressing identity.
+    // A peer may use a compatible admission without changing resident identity.
     pub spec: TreeSpec,
     pub(crate) resident: Option<super::resident::ResidentPin>,
     physical_spec: TreeSpec,
-    pub states: Arc<States>,
-    tree: Option<TreeTransaction>,
+    pub entries: Arc<Entries>,
+    tree: TreeTransaction,
     ranges: Option<Vec<proto::TreeSpan>>,
     members: Arc<Members>,
     missing_counts: Vec<usize>,
-    cache: Weak<Cache>,
-    generation: Arc<()>,
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("selection cannot be represented by this tree's keys")]
+pub(crate) struct UnsupportedTreeSelection;
 
 struct CatalogTypes<'a>(&'a CatalogManager);
 impl PropertyTypes for CatalogTypes<'_> {
@@ -123,10 +87,10 @@ impl PropertyTypes for CatalogTypes<'_> {
     }
 }
 
-impl QueryTreeCache {
+impl QueryTree {
     pub fn spec(selection: &Selection<Resolved>, catalog: &CatalogManager) -> TreeSpec {
-        // Materialization preserves every Selection, including expressions and
-        // JSON paths the tree's scalar range planner cannot address exactly.
+        // Entity-ID keys also support exact selections with expressions or JSON
+        // paths that the scalar range planner cannot address.
         TreeSpec::for_selection(selection, &CatalogTypes(catalog)).unwrap_or_else(|error| {
             tracing::debug!(%error, "query uses entity-id digest keys");
             TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone())
@@ -155,9 +119,9 @@ impl QueryTreeCache {
         {
             return false;
         }
-        // Unknown scalar types and opaque predicates can still use an exact
-        // admission with entity-ID keys. Their limited views order captured
-        // states with the same comparator used by storage.
+        // Unknown scalar types and opaque predicates use exact admission with
+        // entity-ID keys. Limited views requiring property ordering are
+        // selected through storage before their metadata is scoped.
         if spec.predicate() == &selection.predicate && (selection.limit.is_none() || spec.key_spec().keyparts.is_empty()) {
             return true;
         }
@@ -176,234 +140,213 @@ impl QueryTreeCache {
             .collect()
     }
 
-    /// Values must be captured with the state under the same entity read lock.
-    pub async fn refresh_captured(
-        &self,
-        spec: TreeSpec,
-        rows: Vec<(impl Into<SharedState>, Vec<Option<Value>>)>,
-    ) -> anyhow::Result<Snapshot> {
-        let rows = rows
-            .into_iter()
-            .map(|(state, values)| {
-                let state = state.into();
-                let key = CanonicalCodec.encode_nullable(spec.key_spec(), &values)?;
-                let missing_parts = values.iter().enumerate().filter_map(|(index, value)| value.is_none().then_some(index)).collect();
-                Ok((state, key, missing_parts))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        self.refresh_keyed(spec, rows).await
+    pub async fn refresh_entries(&self, spec: TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Snapshot> {
+        let entries = checked_entries(&spec, entries)?;
+        let mut current = self.0.lock().await;
+        match current.as_mut() {
+            Some(index) => {
+                anyhow::ensure!(index.tree.spec() == &spec, "different TreeSpec requires a different tree");
+                let mut changes = BTreeMap::new();
+                for (id, before) in index.entries.iter() {
+                    let after = entries.get(id);
+                    if after != Some(before) {
+                        changes.insert(*id, after.cloned());
+                    }
+                }
+                for (id, after) in &entries {
+                    if !index.entries.contains_key(id) {
+                        changes.insert(*id, Some(after.clone()));
+                    }
+                }
+                index.apply(changes).await?;
+            }
+            None => *current = Some(Index::build(spec, entries).await?),
+        }
+        Ok(current.as_ref().unwrap().snapshot())
+    }
+
+    pub async fn apply_entries(&self, entries: Vec<TreeEntry>, removed: Vec<EntityId>) -> anyhow::Result<Snapshot> {
+        let mut current = self.0.lock().await;
+        let index = current.as_mut().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?;
+        let entries = checked_entries(index.tree.spec(), entries)?;
+        let mut changes = BTreeMap::new();
+        for id in removed {
+            if index.entries.contains_key(&id) {
+                changes.insert(id, None);
+            }
+        }
+        for (id, entry) in entries {
+            if index.entries.get(&id) != Some(&entry) {
+                changes.insert(id, Some(entry));
+            } else {
+                changes.remove(&id);
+            }
+        }
+        index.apply(changes).await?;
+        Ok(index.snapshot())
+    }
+
+    pub async fn current_snapshot(&self) -> anyhow::Result<Snapshot> {
+        let current = self.0.lock().await;
+        Ok(current.as_ref().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?.snapshot())
     }
 
     #[cfg(test)]
     pub async fn refresh(&self, spec: TreeSpec, states: Vec<Attested<EntityState>>) -> anyhow::Result<Snapshot> {
-        let rows = states
-            .into_iter()
-            .map(|state| {
-                let key = key(&spec, &state)?;
-                let missing_parts = CanonicalCodec
-                    .split(spec.key_spec(), &key)?
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, part)| (part[0] == 0).then_some(index))
-                    .collect();
-                Ok((state.into(), key, missing_parts))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        self.refresh_keyed(spec, rows).await
+        let entries = states.into_iter().map(|state| entry_from_state(&spec, &state)).collect::<anyhow::Result<Vec<_>>>()?;
+        self.refresh_entries(spec, entries).await
+    }
+}
+
+fn checked_entries(spec: &TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Entries> {
+    let mut checked = Entries::new();
+    for entry in entries {
+        CanonicalCodec.split(spec.key_spec(), &entry.key)?;
+        anyhow::ensure!(checked.insert(entry.entity_id, entry).is_none(), "duplicate tree entity");
+    }
+    Ok(checked)
+}
+
+fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
+    CanonicalCodec
+        .split(spec.key_spec(), &entry.key)
+        .expect("tree entries have validated canonical keys")
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| (part[0] == 0).then_some(index))
+        .collect()
+}
+
+impl Index {
+    async fn build(spec: TreeSpec, entries: Entries) -> anyhow::Result<Self> {
+        let tree = DigestTree::new(spec.clone());
+        let mut tx = tree.begin();
+        tx.build(entries.values().map(TreeEntry::leaf)).await?;
+        tx.commit().await?;
+        let mut missing_counts = vec![0; spec.key_spec().keyparts.len()];
+        for entry in entries.values() {
+            for index in missing_parts(&spec, entry) {
+                missing_counts[index] += 1;
+            }
+        }
+        let members = entries.values().map(|entry| (entry.address(), entry.entity_id)).collect();
+        Ok(Self { tree, entries: Arc::new(entries), members: Arc::new(members), missing_counts })
     }
 
-    /// Apply immutable source rows without recapturing the rest of a standing query.
-    /// All encoding and tree work succeeds before the cached row set is replaced.
-    pub async fn apply_captured(
-        &self,
-        rows: Vec<(impl Into<SharedState>, Vec<Option<Value>>)>,
-        removed: Vec<EntityId>,
-    ) -> anyhow::Result<()> {
-        let mut cache = self.0.lock().await;
-        let cached = cache.as_mut().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?;
-        let rows: BTreeMap<_, _> = rows
-            .into_iter()
-            .map(|(state, values)| {
-                let state = state.into();
-                let key = CanonicalCodec.encode_nullable(cached.spec.key_spec(), &values)?;
-                let missing_parts = values.iter().enumerate().filter_map(|(index, value)| value.is_none().then_some(index)).collect();
-                Ok((state.payload.entity_id, CapturedRow { key, state: Arc::new(state), missing_parts }))
-            })
-            .collect::<anyhow::Result<_>>()?;
-        let mut changed = BTreeMap::new();
-        for id in removed {
-            if cached.rows.contains_key(&id) {
-                changed.insert(id, None);
-            }
-        }
-        for (id, after) in rows {
-            if cached
-                .rows
-                .get(&id)
-                .is_none_or(|before| before.key != after.key || before.state.payload.state.head != after.state.payload.state.head)
-            {
-                changed.insert(id, Some(after));
-            }
-        }
-        if changed.is_empty() {
+    async fn apply(&mut self, changes: BTreeMap<EntityId, Option<TreeEntry>>) -> anyhow::Result<()> {
+        if changes.is_empty() {
             return Ok(());
         }
-        let bulk = changed.len() >= BULK_REFRESH_CHANGES && changed.len() >= cached.rows.len().div_ceil(4);
-        // Cancellation during an awaited tree mutation must leave a rebuildable
-        // cache, rather than a digest whose rows still describe the old version.
-        let prior_tree = cached.tree.take();
-        let mut tx = if bulk { None } else { prior_tree.as_ref().map(DigestTree::begin) };
-        if let Some(tx) = &mut tx {
-            for (id, after) in &changed {
-                tx.apply_change(LeafChange {
-                    before: cached.rows.get(id).map(CapturedRow::leaf),
-                    after: after.as_ref().map(CapturedRow::leaf),
-                })
-                .await?;
-            }
-        }
-        if let Some(tx) = tx {
-            tx.commit().await?;
-        }
-        let members = Arc::make_mut(&mut cached.members);
-        let states = Arc::make_mut(&mut cached.states);
-        for (id, after) in changed {
-            if let Some(before) = cached.rows.remove(&id) {
-                members.remove(&before.member().0);
-                states.remove(&id);
-                for index in before.missing_parts {
-                    cached.missing_counts[index] -= 1;
-                }
-            }
-            if let Some(after) = after {
-                let (address, id) = after.member();
-                members.insert(address, id);
-                states.insert(id, after.state.clone());
-                for index in &after.missing_parts {
-                    cached.missing_counts[*index] += 1;
-                }
-                cached.rows.insert(id, after);
-            }
-        }
-        cached.tree = if bulk { None } else { prior_tree };
-        cached.generation = Arc::new(());
-        Ok(())
-    }
-
-    pub async fn current_snapshot(&self) -> anyhow::Result<Snapshot> {
-        let cache = self.0.lock().await;
-        let cached = cache.as_ref().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?;
-        Ok(self.snapshot_cached(cached))
-    }
-
-    fn snapshot_cached(&self, cached: &Cached) -> Snapshot {
-        Snapshot {
-            spec: cached.spec.clone(),
-            resident: None,
-            physical_spec: cached.spec.clone(),
-            tree: cached.tree.as_ref().map(DigestTree::begin),
-            ranges: None,
-            states: cached.states.clone(),
-            members: cached.members.clone(),
-            missing_counts: cached.missing_counts.clone(),
-            cache: Arc::downgrade(&self.0),
-            generation: cached.generation.clone(),
-        }
-    }
-
-    async fn refresh_keyed(&self, spec: TreeSpec, rows: Vec<(SharedState, Vec<u8>, Vec<usize>)>) -> anyhow::Result<Snapshot> {
-        let rows: BTreeMap<_, _> = rows
-            .into_iter()
-            .map(|(state, key, missing_parts)| (state.payload.entity_id, CapturedRow { key, state: Arc::new(state), missing_parts }))
-            .collect();
-        let mut missing_counts = vec![0; spec.key_spec().keyparts.len()];
-        for row in rows.values() {
-            for index in &row.missing_parts {
-                missing_counts[*index] += 1;
-            }
-        }
-        let mut cache = self.0.lock().await;
-        if cache.as_ref().is_none_or(|cached| cached.spec != spec) {
-            let members = rows.values().map(CapturedRow::member).collect();
-            let states = Arc::new(rows.iter().map(|(id, row)| (*id, row.state.clone())).collect());
-            *cache = Some(Cached {
-                spec: spec.clone(),
-                tree: None,
-                rows,
-                states,
-                missing_counts,
-                members: Arc::new(members),
-                generation: Arc::new(()),
-            });
-        } else {
-            let cached = cache.as_mut().unwrap();
-            let changes = cached
-                .rows
-                .iter()
-                .filter(|(id, before)| rows.get(id).is_none_or(|after| after.state.payload.state.head != before.state.payload.state.head))
-                .count()
-                + rows.keys().filter(|id| !cached.rows.contains_key(id)).count();
-            // Individual topology maintenance wins for sparse changes. A
-            // dense inventory fill is cheaper to construct once on demand.
-            let bulk = changes >= BULK_REFRESH_CHANGES && changes >= cached.rows.len().div_ceil(4);
-            let prior_tree = cached.tree.take();
-            let mut tx = if bulk { None } else { prior_tree.as_ref().map(DigestTree::begin) };
-            let mut members = cached.members.clone();
-            let mut changed = false;
-            for (id, before) in &cached.rows {
-                let after = rows.get(id);
-                if after.is_some_and(|after| after.state.payload.state.head == before.state.payload.state.head) {
-                    continue;
-                }
-                changed = true;
-                Arc::make_mut(&mut members).remove(&before.member().0);
-                if let Some(after) = after {
-                    let (address, id) = after.member();
-                    Arc::make_mut(&mut members).insert(address, id);
-                }
-                if let Some(tx) = &mut tx {
-                    tx.apply_change(LeafChange { before: Some(before.leaf()), after: after.map(CapturedRow::leaf) }).await?;
-                }
-            }
-            for (id, after) in &rows {
-                if !cached.rows.contains_key(id) {
-                    changed = true;
-                    let (address, id) = after.member();
-                    Arc::make_mut(&mut members).insert(address, id);
-                    if let Some(tx) = &mut tx {
-                        tx.apply_change(LeafChange { before: None, after: Some(after.leaf()) }).await?;
+        if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= self.entries.len().div_ceil(4) {
+            let mut entries = (*self.entries).clone();
+            for (id, after) in changes {
+                match after {
+                    Some(entry) => {
+                        entries.insert(id, entry);
+                    }
+                    None => {
+                        entries.remove(&id);
                     }
                 }
             }
-            if let Some(tx) = tx {
-                tx.commit().await?;
-            }
-            cached.tree = if bulk { None } else { prior_tree };
-            cached.states = Arc::new(rows.iter().map(|(id, row)| (*id, row.state.clone())).collect());
-            cached.missing_counts = missing_counts;
-            cached.rows = rows;
-            cached.members = members;
-            if changed {
-                cached.generation = Arc::new(());
+            // Construct the new maps before publishing them. No reader can observe
+            // a digest whose metadata belongs to another version, including cancellation.
+            *self = Self::build(self.tree.spec().clone(), entries).await?;
+            return Ok(());
+        }
+        let mut tx = self.tree.begin();
+        let mut addresses = BTreeSet::new();
+        for (index, (id, after)) in changes.iter().enumerate() {
+            let before = self.entries.get(id);
+            addresses.extend(before.into_iter().chain(after.iter()).map(TreeEntry::address));
+            tx.apply_change(LeafChange { before: before.map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) }).await?;
+            if (index + 1) % COMPACT_AFTER_CHANGES == 0 {
+                compact_paths(&mut tx, &addresses).await?;
+                addresses.clear();
             }
         }
-        let cached = cache.as_ref().unwrap();
-        Ok(self.snapshot_cached(cached))
+        compact_paths(&mut tx, &addresses).await?;
+        // Memory commit has no suspension after publication; metadata is replaced
+        // under the same owner lock before another reader can capture the index.
+        tx.commit().await?;
+        let entries = Arc::make_mut(&mut self.entries);
+        let members = Arc::make_mut(&mut self.members);
+        for (id, after) in changes {
+            if let Some(before) = entries.remove(&id) {
+                members.remove(&before.address());
+                for index in missing_parts(self.tree.spec(), &before) {
+                    self.missing_counts[index] -= 1;
+                }
+            }
+            if let Some(after) = after {
+                members.insert(after.address(), id);
+                for index in missing_parts(self.tree.spec(), &after) {
+                    self.missing_counts[index] += 1;
+                }
+                entries.insert(id, after);
+            }
+        }
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            spec: self.tree.spec().clone(),
+            resident: None,
+            physical_spec: self.tree.spec().clone(),
+            tree: self.tree.begin(),
+            ranges: None,
+            entries: self.entries.clone(),
+            members: self.members.clone(),
+            missing_counts: self.missing_counts.clone(),
+        }
     }
 }
 
-pub(super) fn key(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<Vec<u8>> {
-    if spec.key_spec().keyparts.is_empty() {
-        return Ok(Vec::new());
+/// Resident memory trees serialize their writes, so compact touched paths before
+/// publishing instead of retaining an ever-growing history of digest deltas.
+async fn compact_paths(tree: &mut TreeTransaction, addresses: &BTreeSet<Vec<u8>>) -> anyhow::Result<()> {
+    if addresses.is_empty() {
+        return Ok(());
     }
+    let mut pending = vec![NodePrefix::root()];
+    while let Some(prefix) = pending.pop() {
+        anyhow::ensure!(!tree.compact_node(&prefix).await?, "resident digest compaction exceeded its maintenance batch");
+        for (child, _) in tree.children(&prefix).await? {
+            if addresses.iter().any(|address| child.contains_address(address)) {
+                pending.push(child);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn entry_from_state(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<TreeEntry> {
     let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
-    let values = QueryTreeCache::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
-    Ok(CanonicalCodec.encode_nullable(spec.key_spec(), &values)?)
+    let values = QueryTree::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+    Ok(TreeEntry {
+        entity_id: state.payload.entity_id,
+        key: CanonicalCodec.encode_nullable(spec.key_spec(), &values)?,
+        head: state.payload.state.head.clone(),
+    })
 }
 
 impl Snapshot {
-    /// Select a query view without changing the maintained tree. The view's
-    /// absent addresses remain empty when answering a peer's wider bounds.
+    pub fn cannot_select(&self, selection: &Selection<Resolved>, catalog: &CatalogManager) -> bool {
+        if selection.limit == Some(0) || (self.physical_spec.predicate() == &selection.predicate && selection.limit.is_none()) {
+            return false;
+        }
+        match QueryTree::request(selection, catalog) {
+            Ok(request) if self.physical_spec.serves(&request).is_some() => {
+                selection.limit.is_some() && self.has_descending_nulls(selection)
+            }
+            _ => true,
+        }
+    }
+
+    /// Select a query view without changing the maintained tree. Scope gaps are
+    /// empty query addresses even when the resident contains other leaves there.
     pub async fn select(mut self, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Self> {
         anyhow::ensure!(self.ranges.is_none(), "a query view cannot be selected again");
         if self.physical_spec.predicate() == &selection.predicate && selection.limit.is_none() {
@@ -413,69 +356,18 @@ impl Snapshot {
             self.restrict(Vec::new());
             return Ok(self);
         }
-        let request = QueryTreeCache::request(selection, catalog).ok();
-        if let Some(request) = request.filter(|request| self.physical_spec.serves(request).is_some()) {
-            if selection.limit.is_none() && self.physical_spec.serves(&request) == Some(TreeMatch::Whole) {
-                return Ok(self);
-            }
-            // Storage keeps missing values first in both directions. Reversing
-            // canonical null-first keys would put them last for DESC.
-            if selection.limit.is_none() || !self.has_descending_nulls(selection)? {
-                return self.select_request(&request).await;
-            }
-        } else {
-            anyhow::ensure!(
-                self.physical_spec.predicate() == &selection.predicate && self.physical_spec.key_spec().keyparts.is_empty(),
-                "unsupported query tree scope"
-            );
-        }
-        self.select_ordered(selection).await
+        anyhow::ensure!(!self.cannot_select(selection, catalog), UnsupportedTreeSelection);
+        self.select_request(&QueryTree::request(selection, catalog)?).await
     }
 
-    fn has_descending_nulls(&self, selection: &Selection<Resolved>) -> anyhow::Result<bool> {
-        let descending = selection
-            .order_by
-            .iter()
-            .flatten()
-            .filter(|item| item.direction == ankql::ast::OrderDirection::Desc)
-            .map(|item| &item.path)
-            .collect::<Vec<_>>();
-        if descending.is_empty() {
-            return Ok(false);
-        }
-        let paths = QueryTreeCache::key_paths(&self.physical_spec);
-        if descending.iter().all(|path| {
-            **path == PropertyPath::id() || paths.iter().position(|key| key == *path).is_some_and(|index| self.missing_counts[index] == 0)
-        }) {
-            return Ok(false);
-        }
-        for state in self.states.values() {
-            let entity = state.payload.read()?;
-            if descending.iter().any(|path| entity.value_at(path).is_none()) {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    async fn select_ordered(self, selection: &Selection<Resolved>) -> anyhow::Result<Self> {
-        // Opaque ordering and null placement use the same comparator as storage,
-        // over this captured version's already authorized states. No second read
-        // can race the source revision or block unrelated views of the tree.
-        let mut rows = Vec::with_capacity(self.states.len());
-        for (id, state) in self.states.iter() {
-            let entity = state.payload.read()?;
-            if self.physical_spec.predicate() == &selection.predicate || evaluate_predicate(&entity, &selection.predicate).unwrap_or(false)
-            {
-                rows.push((*id, entity));
-            }
-        }
-        if let Some(order) = &selection.order_by {
-            rows.sort_by(|(a_id, a), (b_id, b)| compare_items(a, b, order).then_with(|| a_id.cmp(b_id)));
-        }
-        let limit = selection.limit.map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(usize::MAX));
-        let ids = rows.into_iter().take(limit).map(|(id, _)| id).collect();
-        self.select_ids(&ids).await
+    fn has_descending_nulls(&self, selection: &Selection<Resolved>) -> bool {
+        let paths = QueryTree::key_paths(&self.physical_spec);
+        selection.order_by.iter().flatten().filter(|item| item.direction == ankql::ast::OrderDirection::Desc).any(|item| {
+            item.path != PropertyPath::id()
+                && !(item.path.subpath.is_empty()
+                    && selection.predicate.assume_null(&[item.path.property_id()]) == ankql::ast::Predicate::False)
+                && paths.iter().position(|path| path == &item.path).is_none_or(|index| self.missing_counts[index] != 0)
+        })
     }
 
     async fn select_request(mut self, request: &TreeRequest) -> anyhow::Result<Self> {
@@ -484,26 +376,11 @@ impl Snapshot {
         Ok(self)
     }
 
-    /// Fallback for selections whose ordering the scalar planner cannot express.
-    /// The caller selects these identities by ordering this snapshot's captured states.
-    async fn select_ids(mut self, ids: &BTreeSet<EntityId>) -> anyhow::Result<Self> {
-        anyhow::ensure!(self.ranges.is_none(), "a query view cannot be selected again");
-        anyhow::ensure!(ids.iter().all(|id| self.states.contains_key(id)), "selected identity is absent from captured tree");
-        let ranges = self
-            .members
-            .iter()
-            .filter(|(_, id)| ids.contains(id))
-            .map(|(address, _)| proto::TreeSpan::new(Bound::Included(address.clone()), Bound::Included(address.clone())))
-            .collect();
-        self.restrict(ranges);
-        Ok(self)
-    }
-
     pub fn with_spec(mut self, spec: TreeSpec, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Self> {
         anyhow::ensure!(
             self.physical_spec.key_spec() == spec.key_spec()
-                && QueryTreeCache::serves(&self.physical_spec, selection, catalog)
-                && QueryTreeCache::serves(&spec, selection, catalog),
+                && QueryTree::serves(&self.physical_spec, selection, catalog)
+                && QueryTree::serves(&spec, selection, catalog),
             "incompatible comparison tree spec"
         );
         self.spec = spec;
@@ -515,43 +392,9 @@ impl Snapshot {
         for range in ranges.iter().filter(|range| !range.is_empty()) {
             members.extend(self.members.range((range.start.clone(), range.end.clone())).map(|(address, id)| (address.clone(), *id)));
         }
-        self.states = Arc::new(members.values().map(|id| (*id, self.states[id].clone())).collect());
+        self.entries = Arc::new(members.values().map(|id| (*id, self.entries[id].clone())).collect());
         self.members = Arc::new(members);
         self.ranges = Some(ranges);
-    }
-
-    async fn build_tree(&self) -> anyhow::Result<DigestTree> {
-        let tree = DigestTree::new(self.physical_spec.clone());
-        let mut tx = tree.begin();
-        let leaves = self.members.iter().map(|(address, id)| LeafData {
-            key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
-            entity_id: *id,
-            head: HeadHash::of(self.states[id].payload.state.head.ids().map(|id| id.clone().to_bytes())),
-        });
-        tx.build(leaves).await?;
-        tx.commit().await?;
-        Ok(tree)
-    }
-
-    async fn tree(&mut self) -> anyhow::Result<&mut TreeTransaction> {
-        if self.tree.is_none() {
-            // A narrowed snapshot builds only its selected rows. It must never
-            // read or populate the complete resident's digest cache.
-            if let Some(cache) = self.cache.upgrade().filter(|_| self.ranges.is_none()) {
-                let mut cache = cache.lock().await;
-                if let Some(cached) = cache.as_mut().filter(|cached| Arc::ptr_eq(&cached.generation, &self.generation)) {
-                    if cached.tree.is_none() {
-                        cached.tree = Some(self.build_tree().await?);
-                    }
-                    self.tree = cached.tree.as_ref().map(DigestTree::begin);
-                }
-            }
-            // An older snapshot must never read a refreshed cache generation.
-            if self.tree.is_none() {
-                self.tree = Some(self.build_tree().await?.begin());
-            }
-        }
-        Ok(self.tree.as_mut().unwrap())
     }
 
     pub async fn span_digest(&mut self, bounds: proto::TreeSpan) -> anyhow::Result<TreeSpanDigest> {
@@ -562,7 +405,7 @@ impl Snapshot {
         if ranges.is_empty() {
             return Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: Digest::empty() });
         }
-        let tree = self.tree().await?;
+        let tree = &mut self.tree;
         let scope = tree.scope_ranges(ranges);
         Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
     }
@@ -615,16 +458,14 @@ impl Snapshot {
         }
         let mut minimum_bytes = 0usize;
         for (address, id) in self.members.iter() {
-            let head = &self.states[id].payload.state.head;
+            let head = &self.entries[id].head;
             minimum_bytes = minimum_bytes.saturating_add(address.len()).saturating_add(head.len().saturating_mul(32));
             if minimum_bytes > super::INITIAL_INVENTORY_BYTES {
                 return None;
             }
         }
         let heads = proto::PackedHeads::from_rows(
-            self.members
-                .iter()
-                .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), *id, &self.states[id].payload.state.head)),
+            self.members.iter().map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), *id, &self.entries[id].head)),
         );
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
@@ -648,7 +489,7 @@ impl Snapshot {
         let mut count = 0;
         let mut bytes = 0;
         for (index, (address, id)) in rows.iter().take(super::HEAD_PAGE).enumerate() {
-            let head = &self.states[*id].payload.state.head;
+            let head = &self.entries[*id].head;
             let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
             // Preserve the decoded-work budget even when repeated keys compress well.
             let overhead = 4 + bincode::serialized_size(&proto::TreeSpan::new(bounds.start.clone(), end))? + 8;
@@ -664,7 +505,7 @@ impl Snapshot {
         let heads = proto::PackedHeads::from_rows(
             rows.iter()
                 .take(count)
-                .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), **id, &self.states[*id].payload.state.head)),
+                .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), **id, &self.entries[*id].head)),
         );
         let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), heads };
         anyhow::ensure!(
@@ -678,13 +519,80 @@ impl Snapshot {
         if self.ranges.as_ref().is_some_and(Vec::is_empty) {
             return Ok(vec![TreeSpanDigest { digest: Digest::empty(), ..head.clone() }]);
         }
-        let mut children = self.tree().await?.refine(head).await?;
+        let mut children = self.tree.refine(head).await?;
         if self.ranges.is_some() {
             for child in &mut children {
                 child.digest = self.span_digest(child.bounds.clone()).await?.digest;
             }
         }
         Ok(children)
+    }
+
+    /// Conservative resident accounting for head/key metadata and digest-map rows.
+    pub fn accounted_bytes(&self) -> usize {
+        self.entries.values().fold(4096usize, |total, entry| {
+            total
+                .saturating_add(1024)
+                .saturating_add(entry.key.capacity().saturating_mul(4))
+                .saturating_add(entry.head.len().saturating_mul(36))
+        })
+    }
+
+    /// Order a view using its indexed key parts, without reading entity properties.
+    pub fn ordered_ids(&self, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Vec<EntityId>> {
+        if selection.limit == Some(0) {
+            return Ok(Vec::new());
+        }
+        let limit = selection.limit.map_or(usize::MAX, |limit| usize::try_from(limit).unwrap_or(usize::MAX));
+        if selection.order_by.as_ref().is_none_or(Vec::is_empty) && self.physical_spec.predicate() == &selection.predicate {
+            return Ok(self.entries.keys().copied().take(limit).collect());
+        }
+        let mut membership = selection.clone();
+        membership.order_by = None;
+        membership.limit = None;
+        let ranges = if self.physical_spec.predicate() == &membership.predicate {
+            vec![super::whole()]
+        } else {
+            self.physical_spec.scope_addresses(&QueryTree::request(&membership, catalog)?, &self.members)?
+        };
+        let paths = QueryTree::key_paths(&self.physical_spec);
+        let order = selection
+            .order_by
+            .iter()
+            .flatten()
+            .map(|item| {
+                let part = if item.path == PropertyPath::id() {
+                    None
+                } else {
+                    Some(paths.iter().position(|path| path == &item.path).ok_or(UnsupportedTreeSelection)?)
+                };
+                Ok((part, item.direction.clone()))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let mut rows = Vec::new();
+        for range in ranges.iter().filter(|range| !range.is_empty()) {
+            for (_, id) in self.members.range((range.start.clone(), range.end.clone())) {
+                let entry = &self.entries[id];
+                let parts = if order.is_empty() { Vec::new() } else { CanonicalCodec.split(self.physical_spec.key_spec(), &entry.key)? };
+                rows.push((*id, parts));
+            }
+        }
+        rows.sort_unstable_by(|(left_id, left), (right_id, right)| {
+            for (part, direction) in &order {
+                let (compared, missing) = match part {
+                    Some(index) => (left[*index].cmp(right[*index]), left[*index][0] == 0 || right[*index][0] == 0),
+                    None => (left_id.cmp(right_id), false),
+                };
+                // Storage places missing values first in both directions.
+                let compared = if *direction == ankql::ast::OrderDirection::Desc && !missing { compared.reverse() } else { compared };
+                if !compared.is_eq() {
+                    return compared;
+                }
+            }
+            left_id.cmp(right_id)
+        });
+        rows.truncate(limit);
+        Ok(rows.into_iter().map(|(id, _)| id).collect())
     }
 
     pub fn members(&self) -> Members { (*self.members).clone() }
@@ -695,20 +603,17 @@ impl Snapshot {
             .map(|(address, id)| {
                 (
                     *id,
-                    proto::QueryMember {
-                        key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
-                        head: self.states[id].payload.state.head.clone(),
-                    },
+                    proto::QueryMember { key: address[..address.len() - EntityId::BYTE_LEN].to_vec(), head: self.entries[id].head.clone() },
                 )
             })
             .collect()
     }
 
-    pub fn states_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (&[u8], &SharedState)> {
+    pub fn entries_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (&[u8], &TreeEntry)> {
         self.members
             .range((bounds.start.clone(), bounds.end.clone()))
             .take(limit)
-            .map(|(address, id)| (address.as_slice(), self.states[id].as_ref()))
+            .map(|(address, id)| (address.as_slice(), &self.entries[id]))
     }
 }
 

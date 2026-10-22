@@ -18,6 +18,17 @@ impl LiveQueryRegistry {
         entry.and_then(|query| query.upgrade())
     }
 
+    /// A failed event-history proof invalidates the query, not the write already committed.
+    pub(crate) fn fail_notifications(&self, failures: &[crate::reactor::NotificationFailure]) {
+        for failure in failures {
+            if let Some(query) = failure.query.and_then(|id| self.get(id)) {
+                query.fail_resolution(failure.version, failure.error.clone());
+            } else {
+                tracing::warn!(error = %failure.error, "reactor notification could not establish event coverage");
+            }
+        }
+    }
+
     pub(super) fn insert(&self, query: &EntityLiveQuery) {
         self.entries.lock().unwrap_or_else(|error| error.into_inner()).insert(query.query_id(), query.weak());
     }

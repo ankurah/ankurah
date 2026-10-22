@@ -42,7 +42,6 @@ pub mod handles;
 mod match_args;
 mod peer_state;
 mod schema_registration;
-pub(crate) mod source_publications;
 mod state;
 pub(crate) mod state_sync;
 #[cfg(test)]
@@ -101,8 +100,6 @@ where PA: PolicyAgent
     pub storage: Arc<SE>,
 
     pub(crate) entities: WeakEntitySet,
-    /// Serializes commit/resident publication and admits immutable source batches.
-    pub(crate) source_publications: source_publications::SourcePublications,
     pub(crate) resident_trees: state_sync::ResidentTrees<PA::ContextData>,
     pub(crate) peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,
@@ -206,7 +203,7 @@ where
             let state = state.clone();
             Calculated::new(move || alive.get() && !matches!(state.get(), NodeState::Halted(_)))
         };
-        let reactor = Reactor::new(run.clone());
+        let reactor = Reactor::with_history(run.clone(), Some(Arc::new(crate::retrieval::LocalEventGetter::new(engine.clone(), durable))));
         notice_info!("Node {id:#} created as {}", if durable { "durable" } else { "ephemeral" });
 
         let live_queries = crate::livequery::LiveQueryRegistry::new();
@@ -218,7 +215,6 @@ where
             id,
             storage: engine,
             entities: entityset,
-            source_publications: source_publications::SourcePublications::default(),
             resident_trees: state_sync::ResidentTrees::default(),
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
@@ -471,11 +467,11 @@ where
                             Err(e)
                                 if initial_state
                                     && matches!(
-                                        e.downcast_ref::<source_publications::SourceError>(),
+                                        e.downcast_ref::<crate::reactor::maintenance::SourceError>(),
                                         Some(
-                                            source_publications::SourceError::Changed
-                                                | source_publications::SourceError::Lagged
-                                                | source_publications::SourceError::CatalogChanged
+                                            crate::reactor::maintenance::SourceError::Changed
+                                                | crate::reactor::maintenance::SourceError::Lagged
+                                                | crate::reactor::maintenance::SourceError::CatalogChanged
                                         )
                                     ) =>
                             {
@@ -568,7 +564,7 @@ where
                 }
             }
             proto::NodeRequestBody::Fetch { selection, known_state } => {
-                let spec = state_sync::QueryTreeCache::offered_spec(&selection, &self.catalog, &known_state)?;
+                let spec = state_sync::QueryTree::offered_spec(&selection, &self.catalog, &known_state)?;
                 let catalog = crate::schema::is_catalog_read(&selection.predicate);
                 let captured = self.resident_trees.capture(self, selection, Some(spec), credentials.clone()).await?;
                 let state = state_sync::start_state_stream(

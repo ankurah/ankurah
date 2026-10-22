@@ -1,12 +1,12 @@
 use super::*;
 
-async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
+pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
     node: &Node<OrderedStorage, PA>,
     projection: &QueryProjection,
     selection: Selection<Resolved>,
 ) -> anyhow::Result<Route> {
-    let snapshot = projection.tree.current_snapshot().await?.select(&selection, &node.catalog).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
+    let snapshot = projection.coverage.select(projection.tree.current_snapshot().await?, &selection, &node.catalog).await?;
     let mut filtered = selection.clone();
     filtered.predicate = policy.filter_predicate(filtered.predicate)?;
     Ok(Route {
@@ -39,8 +39,8 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
     for event in &events {
         apply(&node, event).await?;
     }
-    let spec = QueryTreeCache::spec(&selection(Some(2)), &node.catalog);
-    let tree = Arc::new(QueryTreeCache::default());
+    let spec = QueryTree::spec(&selection(Some(2)), &node.catalog);
+    let tree = Arc::new(QueryTree::default());
     let mut capture = capture_query(&node, selection(None), spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
     let frozen = tree.current_snapshot().await?.select(&selection(Some(1)), &node.catalog).await?;
     let mut one = route(&node, &capture.projection, selection(Some(1))).await?;
@@ -48,7 +48,7 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
     let moved = update(&events[0], "09")?;
     apply(&node, &moved).await?;
     let batch = capture.cursor.next().await?;
-    let sources = capture.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?;
+    let sources = capture.projection.apply(&batch, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     let changes_one = one.changes(&node, &capture.projection, &policy, &sources).await?;
     let changes_two = two.changes(&node, &capture.projection, &policy, &sources).await?;
@@ -71,8 +71,8 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
             _ => panic!("unchanged entrant must carry its captured state"),
         }
     }
-    assert_eq!(frozen.states[&events[0].entity_id].payload.state.head, proto::Clock::singleton(&events[0]));
-    assert_eq!(tree.current_snapshot().await?.states.len(), 3, "neither limit truncates the resident tree");
+    assert_eq!(frozen.entries[&events[0].entity_id].head, proto::Clock::singleton(&events[0]));
+    assert_eq!(tree.current_snapshot().await?.entries.len(), 3, "neither limit truncates the resident tree");
     Ok(())
 }
 
@@ -83,8 +83,8 @@ async fn shared_tree_routes_apply_different_membership_predicates() -> anyhow::R
     apply(&node, &initial).await?;
     let mut admitted = above("00");
     admitted.order_by = None;
-    let spec = QueryTreeCache::spec(&admitted, &node.catalog);
-    let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
+    let spec = QueryTree::spec(&admitted, &node.catalog);
+    let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     let mut all = route(&node, &capture.projection, admitted).await?;
     let mut narrow = route(&node, &capture.projection, above("05")).await?;
     assert!(narrow.members.is_empty());
@@ -94,7 +94,7 @@ async fn shared_tree_routes_apply_different_membership_predicates() -> anyhow::R
         let next = update(&current, value)?;
         apply(&node, &next).await?;
         let batch = capture.cursor.next().await?;
-        let sources = capture.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?;
+        let sources = capture.projection.apply(&batch, true).await?;
         let all_changes = all.changes(&node, &capture.projection, &policy, &sources).await?;
         let narrow_changes = narrow.changes(&node, &capture.projection, &policy, &sources).await?;
         assert_eq!(all_changes.len(), 1);
@@ -124,68 +124,24 @@ async fn a_denied_event_only_fails_routes_that_would_deliver_it() -> anyhow::Res
     node.wait_ready().await?;
     apply(&node, &initial).await?;
     let admitted = above("00");
-    let spec = QueryTreeCache::spec(&admitted, &node.catalog);
-    let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
+    let spec = QueryTree::spec(&admitted, &node.catalog);
+    let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     let mut includes = route(&node, &capture.projection, admitted).await?;
     let mut excludes = route(&node, &capture.projection, above("03")).await?;
     let old = includes.members.clone();
     apply(&node, &denied).await?;
     let batch = capture.cursor.next().await?;
-    let sources = capture.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?;
+    let sources = capture.projection.apply(&batch, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     assert!(includes.changes(&node, &capture.projection, &policy, &sources).await.is_err());
     assert_eq!(includes.members, old, "a failed publication never partially advances route membership");
     assert!(excludes.changes(&node, &capture.projection, &policy, &sources).await?.is_empty());
-    assert_eq!(
-        capture.projection.tree.current_snapshot().await?.states[&initial.entity_id].payload.state.head,
-        proto::Clock::singleton(&denied)
-    );
+    assert_eq!(capture.projection.tree.current_snapshot().await?.entries[&initial.entity_id].head, proto::Clock::singleton(&denied));
     Ok(())
 }
 
 #[tokio::test]
-async fn fallback_limit_uses_frozen_rows_and_folds_queued_updates_without_reads() -> anyhow::Result<()> {
-    let node = node().await?;
-    let events = [genesis("01")?, genesis("02")?, genesis("03")?];
-    for event in &events {
-        apply(&node, event).await?;
-    }
-    let admitted = selection(None);
-    let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), admitted.predicate.clone());
-    let tree = Arc::new(QueryTreeCache::default());
-    let mut capture = capture_query(&node, admitted, spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
-    let frozen = tree.current_snapshot().await?;
-    let mut limited = route(&node, &capture.projection, selection(Some(1))).await?;
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-
-    // Both commits are visible to storage before either publication is folded.
-    // Selecting this older capture must neither reread storage nor reject it.
-    for event in &events[..2] {
-        apply(&node, &update(event, "09")?).await?;
-    }
-    let frozen = frozen.select(&selection(Some(1)), &node.catalog).await?;
-    assert_eq!(frozen.states.keys().copied().collect::<Vec<_>>(), vec![events[0].entity_id]);
-    for entrant in &events[1..] {
-        let batch = capture.cursor.next().await?;
-        let sources = capture.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?;
-        let changes = limited.changes(&node, &capture.projection, &policy, &sources).await?;
-        assert_eq!(limited.members.keys().copied().collect::<Vec<_>>(), vec![entrant.entity_id]);
-        let entering = changes.iter().find(|change| change.entity_id == entrant.entity_id).unwrap();
-        assert!(entering.member.is_some());
-        let Some(proto::DeltaContent::StateAndEvents { events, .. }) = &entering.delta else {
-            panic!("unchanged entrant needs a snapshot")
-        };
-        assert!(events.is_empty());
-    }
-    assert_eq!(frozen.states[&events[0].entity_id].payload.state.head, proto::Clock::singleton(&events[0]));
-    assert_eq!(tree.current_snapshot().await?.states.len(), 3, "limits leave resident admission intact");
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans, "scoping and publication never reread storage");
-    Ok(())
-}
-
-#[tokio::test]
-async fn fallback_limit_ranks_only_authorized_captured_rows() -> anyhow::Result<()> {
+async fn fallback_limit_ranks_only_authorized_current_rows() -> anyhow::Result<()> {
     let node = Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery::default());
     node.system.create().await?;
     node.wait_ready().await?;
@@ -196,56 +152,113 @@ async fn fallback_limit_ranks_only_authorized_captured_rows() -> anyhow::Result<
     let mut limited = selection(Some(1));
     limited.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), limited.predicate.clone());
-    let tree = Arc::new(QueryTreeCache::default());
-    let capture = capture_query(&node, limited, spec, vec![DEFAULT_CONTEXT], tree).await?;
-    assert_eq!(capture.snapshot.states.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
-    assert_eq!(capture.projection.rows.len(), 2, "policy filtering precedes ranking");
+    let tree = Arc::new(QueryTree::default());
+    let capture = capture_limited(&node, limited, spec, tree).await?;
+    assert_eq!(capture.snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
+    assert_eq!(capture.projection.tree.current_snapshot().await?.entries.len(), 1, "only the authorized bounded result is retained");
     Ok(())
 }
 
 #[tokio::test]
 async fn unchanged_replacements_follow_query_order_after_commit_changes() -> anyhow::Result<()> {
-    for fallback in [false, true] {
-        let node = node().await?;
-        let mut events = [genesis("01")?, genesis("02")?, genesis("03")?, genesis("04")?];
-        events.sort_by_key(|event| event.entity_id);
-        for (index, event) in events.iter_mut().enumerate() {
-            apply(&node, event).await?;
-            *event = update(event, &format!("{:02}", index + 1))?;
-            apply(&node, event).await?;
-        }
-        let mut limited = selection(Some(2));
-        limited.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
-        let spec = if fallback {
-            proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), limited.predicate.clone())
-        } else {
-            QueryTreeCache::spec(&limited, &node.catalog)
-        };
-        let tree = Arc::new(QueryTreeCache::default());
-        let mut capture = capture_query(&node, selection(None), spec, vec![DEFAULT_CONTEXT], tree).await?;
-        let mut route = route(&node, &capture.projection, limited).await?;
-        for event in &events[2..] {
-            apply(&node, &update(event, "00")?).await?;
-        }
-        let first = capture.cursor.next().await?;
-        let second = capture.cursor.next().await?;
-        let batch = SourceBatch {
-            revision: second.revision,
-            changes: first.changes.iter().chain(&second.changes).cloned().collect(),
-            bytes: first.bytes + second.bytes,
-        };
-        let sources = capture.projection.apply(&node, &vec![DEFAULT_CONTEXT], &batch, true).await?;
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-        let changes = route.changes(&node, &capture.projection, &policy, &sources).await?;
-        assert_eq!(
-            changes.iter().map(|change| (change.entity_id, change.member.is_some())).collect::<Vec<_>>(),
-            vec![(events[2].entity_id, false), (events[3].entity_id, false), (events[1].entity_id, true), (events[0].entity_id, true)],
-            "commit order is preserved; replacement query order deliberately opposes EntityId order"
-        );
-        for change in &changes[2..] {
-            let Some(proto::DeltaContent::StateAndEvents { events, .. }) = &change.delta else { panic!("replacement needs its state") };
-            assert!(events.is_empty());
-        }
+    let node = node().await?;
+    let mut events = [genesis("01")?, genesis("02")?, genesis("03")?, genesis("04")?];
+    events.sort_by_key(|event| event.entity_id);
+    for (index, event) in events.iter_mut().enumerate() {
+        apply(&node, event).await?;
+        *event = update(event, &format!("{:02}", index + 1))?;
+        apply(&node, event).await?;
+    }
+    let mut limited = selection(Some(2));
+    limited.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
+    let spec = QueryTree::spec(&limited, &node.catalog);
+    let tree = Arc::new(QueryTree::default());
+    let mut capture = capture_query(&node, selection(None), spec, vec![DEFAULT_CONTEXT], tree).await?;
+    let mut route = route(&node, &capture.projection, limited).await?;
+    for event in &events[2..] {
+        apply(&node, &update(event, "00")?).await?;
+    }
+    let first = capture.cursor.next().await?;
+    let second = capture.cursor.next().await?;
+    let batch = SourceBatch {
+        revision: second.revision,
+        changes: first.changes.iter().chain(&second.changes).cloned().collect(),
+        bytes: first.bytes + second.bytes,
+        catalog_changed: first.catalog_changed || second.catalog_changed,
+    };
+    let sources = capture.projection.apply(&batch, true).await?;
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
+    let changes = route.changes(&node, &capture.projection, &policy, &sources).await?;
+    assert_eq!(
+        changes.iter().map(|change| (change.entity_id, change.member.is_some())).collect::<Vec<_>>(),
+        vec![(events[2].entity_id, false), (events[3].entity_id, false), (events[1].entity_id, true), (events[0].entity_id, true)],
+        "commit order is preserved; replacement query order deliberately opposes EntityId order"
+    );
+    for change in &changes[2..] {
+        let Some(proto::DeltaContent::StateAndEvents { events, .. }) = &change.delta else { panic!("replacement needs its state") };
+        assert!(events.is_empty());
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = [genesis("01")?, genesis("02")?, genesis("03")?];
+    for event in &initial {
+        apply(&node, event).await?;
+    }
+    let admitted = selection(None);
+    let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), admitted.predicate.clone());
+    let tree = Arc::new(QueryTree::default());
+    let selected = selection(Some(1));
+    let capture = capture_limited(&node, selected.clone(), spec, tree.clone()).await?;
+    let mut snapshot = tree.current_snapshot().await?;
+    let members = snapshot.query_members();
+    let peer = proto::EntityId::from_bytes([92; 32]);
+    node.register_peer(
+        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+        Box::new(Sender(peer)),
+    )
+    .await?;
+    let known = snapshot.offer().await?;
+    let pending = crate::node::state_sync::prepare_state_stream(
+        &node,
+        peer,
+        proto::RequestId::new(),
+        vec![],
+        vec![DEFAULT_CONTEXT],
+        Some((proto::QueryId::new(), 1)),
+        false,
+        capture.revision,
+        snapshot,
+        known,
+    )?;
+    let stream = pending.id();
+    pending.initialize(&node).await?;
+    let owner = Arc::new(());
+    let mut actor = QuerySource::from_capture(vec![DEFAULT_CONTEXT], capture);
+    actor.routes.push(Route { peer, stream, owner: Arc::downgrade(&owner), selection: selected.clone(), filtered: selected, members });
+    let first = update(&initial[0], "09")?;
+    let second = update(&initial[1], "08")?;
+    apply(&node, &first).await?;
+    apply(&node, &second).await?;
+    let current = actor.refresh(&node).await?;
+    assert_eq!(current.entries.keys().copied().collect::<Vec<_>>(), vec![initial[2].entity_id]);
+    assert_eq!(actor.routes.len(), 1, "storage ahead of a queued intermediate revision must not expire the route");
+    assert_eq!(actor.routes[0].members.keys().copied().collect::<Vec<_>>(), vec![initial[2].entity_id]);
+    node.deregister_peer(peer);
+    Ok(())
+}
+
+async fn capture_limited<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
+    node: &Node<OrderedStorage, PA>,
+    selection: Selection<Resolved>,
+    spec: proto::TreeSpec,
+    tree: Arc<QueryTree>,
+) -> anyhow::Result<CapturedQuery> {
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
+    let mut filtered = selection.clone();
+    filtered.predicate = policy.filter_predicate(filtered.predicate)?;
+    capture_filtered_query(node, filtered, spec, vec![DEFAULT_CONTEXT], tree, Coverage::Limited(selection)).await
 }

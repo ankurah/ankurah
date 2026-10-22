@@ -229,7 +229,7 @@ impl Transaction {
                 }
                 relayed = true;
             }
-            let mut publication = node.source_publications.begin_commit().await;
+            let mut publication = node.reactor.begin_commit().await;
             publication.storage_result(storage_trx.commit().await)?.committed()?;
             let mut changes = Vec::new();
             for (entity, fork) in forks {
@@ -239,7 +239,8 @@ impl Transaction {
             }
             publication.publish(&changes, true);
             changes.retain(|change| !change.events().is_empty());
-            node.reactor.notify_change(changes).await;
+            let failures = node.reactor.notify_change(changes).await;
+            node.live_queries.fail_notifications(&failures);
             Ok(attested_events.into_iter().map(|event| event.payload).collect())
         })
     }

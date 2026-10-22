@@ -6,7 +6,6 @@ mod cancellation;
 
 fn id(n: u8) -> proto::EntityId { proto::EntityId::from_bytes([n; 32]) }
 fn address(n: u8) -> Vec<u8> { leaf_address(&[], id(n)) }
-fn spec() -> proto::TreeSpec { proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True) }
 #[test]
 fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
     let rows = (0..128)
@@ -29,54 +28,6 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
     assert!(bincode::serialized_size(&frame).unwrap() < super::super::FRAME_BYTES as u64);
     let inbox = super::super::Inbox::default();
     assert!(inbox.insert(frame).unwrap_err().to_string().contains("decoded-work limit"));
-}
-
-#[test]
-fn snapshot_pages_derive_sender_keys_and_targets() -> anyhow::Result<()> {
-    let spec = proto::TreeSpec::new(
-        ankurah_core_types::KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(
-            proto::PropertyId::Id,
-            ankurah_core_types::ValueType::EntityId,
-        )]),
-        ankql::ast::Predicate::True,
-    );
-    let states = [2, 4]
-        .into_iter()
-        .map(|n| proto::Attested {
-            payload: proto::EntityState {
-                entity_id: id(n),
-                state: proto::State { head: proto::Clock::genesis(proto::EventId::from_bytes([n; 32])), ..Default::default() },
-            },
-            attestations: proto::AttestationSet(vec![proto::Attestation(vec![n])]),
-        })
-        .collect::<Vec<_>>();
-    let page = proto::SnapshotPage { bounds: super::super::whole(), states: states.clone() };
-    let leaves = snapshot_inventory(&spec, &page)?;
-    assert!(leaves.heads.to_vec().iter().all(|leaf| !leaf.key.is_empty()));
-    for (leaf, captured) in leaves.heads.to_vec().iter().zip(&states) {
-        assert_eq!(leaf.entity.entity_id, captured.payload.entity_id);
-        assert_eq!(leaf.entity.head, captured.payload.state.head);
-    }
-    leaves.validate(&spec)?;
-    Ok(())
-}
-
-#[test]
-fn malformed_snapshot_pages_are_rejected() {
-    let state = |n| proto::Attested::opt(proto::EntityState { entity_id: id(n), state: Default::default() }, None);
-    let pages = [
-        proto::SnapshotPage { bounds: super::super::whole(), states: vec![state(2), state(2)] },
-        proto::SnapshotPage { bounds: super::super::whole(), states: vec![state(4), state(2)] },
-        proto::SnapshotPage { bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(4))), states: vec![state(2)] },
-        proto::SnapshotPage {
-            bounds: super::super::whole(),
-            states: (0..=super::super::MAX_SNAPSHOT_ROWS).map(|n| state(n as u8)).collect(),
-        },
-    ];
-    for page in pages {
-        let result = snapshot_inventory(&spec(), &page).and_then(|inventory| Ok(inventory.validate(&spec())?));
-        assert!(result.is_err());
-    }
 }
 
 // An empty compiled model keeps this lifecycle fixture independent of derives
@@ -395,7 +346,7 @@ async fn dropping_a_query_after_permanent_inventory_preparation_failure_cleans_i
     // This is a local preparation failure, before a replacement SubscribeQuery
     // can reach the peer. The previous remote generation still needs an owner.
     // An uncertain commit makes a new source capture permanently unavailable.
-    drop(client.source_publications.begin_commit().await);
+    drop(client.reactor.begin_commit().await);
     query.update_selection("true")?;
     assert!(tokio::time::timeout(std::time::Duration::from_secs(5), query.wait_initialized()).await?.is_err());
     assert!(
@@ -437,8 +388,8 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let query_id = query.query_id();
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let tree = super::super::QueryTreeCache::default();
-    let mut snapshot = tree.refresh(super::super::QueryTreeCache::spec(&selection, &client.catalog), states).await?;
+    let tree = super::super::QueryTree::default();
+    let mut snapshot = tree.refresh(super::super::QueryTree::spec(&selection, &client.catalog), states).await?;
     // A mixed leaf/summary inventory requires per-region work. Thirty-three
     // positive spans exceed that budget, leaving a continuation on wire.
     let mut start = super::super::whole().start;
@@ -504,7 +455,7 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
     let mut snapshot =
-        super::super::QueryTreeCache::default().refresh(super::super::QueryTreeCache::spec(&selection, &client.catalog), states).await?;
+        super::super::QueryTree::default().refresh(super::super::QueryTree::spec(&selection, &client.catalog), states).await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
         &client,
@@ -538,7 +489,7 @@ async fn fetch_and_subscription_share_each_nodes_resident_tree() -> anyhow::Resu
     let (server, client, query, _messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
-    let spec = super::super::QueryTreeCache::spec(&selection, &client.catalog);
+    let spec = super::super::QueryTree::spec(&selection, &client.catalog);
     let local = client.resident_trees.acquire(&client, selection.clone(), Some(spec.clone()), credentials.clone()).await?;
     let local_tree = local.tree();
     drop(local);

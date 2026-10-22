@@ -18,8 +18,9 @@ pub struct NodeApplier;
 ///
 /// Initial transfer publishes no events on its reactor changes: a repair for
 /// one subscribing query must not surface on another established query holding
-/// the same entity as an event update. Live delivery publishes the events it
-/// applied, which is what subscribers are listening for.
+/// the same entity as an event update. Live delivery also returns validated events
+/// independently of state advancement; the reactor tracks each subscriber's
+/// event delivery so a prior initial snapshot cannot swallow a live update.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Delivery {
     Initial,
@@ -34,10 +35,13 @@ pub(crate) enum Delivery {
 pub(crate) struct DeltaOutcome {
     pub entity: Option<Entity>,
     pub change: Option<EntityChange>,
+    /// Validated live events remain delivery obligations even when an earlier
+    /// initial snapshot already advanced the entity through them.
+    pub live_events: Vec<Attested<proto::Event>>,
 }
 
 impl DeltaOutcome {
-    fn unchanged(entity: Option<Entity>) -> Self { Self { entity, change: None } }
+    fn unchanged(entity: Option<Entity>) -> Self { Self { entity, change: None, live_events: Vec::new() } }
 }
 
 impl NodeApplier {
@@ -77,7 +81,8 @@ impl NodeApplier {
                 }
             }
             if !batch.is_empty() {
-                node.reactor.notify_change(batch).await;
+                let failures = node.reactor.notify_change(batch).await;
+                node.live_queries.fail_notifications(&failures);
             }
         }
 
@@ -184,12 +189,13 @@ impl NodeApplier {
         S: crate::retrieval::GetState + Send + Sync,
     {
         let events = Self::validate_and_stage(node, from_peer_id, entity_id, carried, event_getter)?;
+        let live_events = if delivery == Delivery::Live { events.clone() } else { Vec::new() };
         let state: Attested<proto::EntityState> = (entity_id, fragment).into();
         node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
         if let Some(entity) = Self::save_new_entity(node, &state.payload, &events, delivery, event_getter, state_getter).await? {
             let change = Self::publish(entity.clone(), events, delivery);
-            return Ok(DeltaOutcome { entity: Some(entity), change: Some(change) });
+            return Ok(DeltaOutcome { entity: Some(entity), change: Some(change), live_events });
         }
         let entity = node
             .entities
@@ -202,7 +208,7 @@ impl NodeApplier {
             let (entity, events) = change.into_parts();
             Self::publish(entity, events, delivery)
         });
-        Ok(DeltaOutcome { entity: Some(entity), change })
+        Ok(DeltaOutcome { entity: Some(entity), change, live_events })
     }
 
     /// Apply a bridge as one atomic batch for both initial and live delivery.
@@ -225,6 +231,7 @@ impl NodeApplier {
         if events.is_empty() {
             return Ok(DeltaOutcome::unchanged(node.entities.get(&entity_id)));
         }
+        let live_events = if delivery == Delivery::Live { events.clone() } else { Vec::new() };
         let change = Self::apply_and_commit_events(node, &events, delivery, event_getter).await?.map(|change| {
             let (entity, events) = change.into_parts();
             Self::publish(entity, events, delivery)
@@ -233,7 +240,7 @@ impl NodeApplier {
             Some(change) => Some(change.entity().clone()),
             None => node.entities.get_or_retrieve(state_getter, event_getter, &entity_id).await?,
         };
-        Ok(DeltaOutcome { entity, change })
+        Ok(DeltaOutcome { entity, change, live_events })
     }
 
     /// Before adopting a snapshot, check that its events lead to its head through the ordered batch,
@@ -313,7 +320,7 @@ impl NodeApplier {
         let mut storage_trx = node.storage.transaction();
         storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
         storage_trx.add_events(events).await?;
-        let mut publication = node.source_publications.begin_commit().await;
+        let mut publication = node.reactor.begin_commit().await;
         match publication.storage_result(storage_trx.commit().await)? {
             crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
             crate::storage::StorageCommitOutcome::Committed(_) => {}
@@ -358,7 +365,7 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
-            let mut publication = node.source_publications.begin_commit().await;
+            let mut publication = node.reactor.begin_commit().await;
             publication.storage_result(storage_trx.commit().await)?.committed()?;
             if adopted {
                 let (_, entity) = node
@@ -402,7 +409,7 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
             storage_trx.add_events(&events).await?;
-            let mut publication = node.source_publications.begin_commit().await;
+            let mut publication = node.reactor.begin_commit().await;
             publication.storage_result(storage_trx.commit().await)?.committed()?;
             let change = candidate.commit(&node.entities, event_getter).await?;
             publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);

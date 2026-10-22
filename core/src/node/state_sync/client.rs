@@ -263,21 +263,5 @@ fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow:
     Ok(())
 }
 
-fn snapshot_inventory(spec: &proto::TreeSpec, page: &proto::SnapshotPage) -> anyhow::Result<proto::TreeSpanInventory> {
-    ensure!(page.states.len() <= super::MAX_SNAPSHOT_ROWS, "peer sent too many snapshots");
-    let mut ids = std::collections::HashSet::new();
-    let rows = page
-        .states
-        .iter()
-        .map(|state| {
-            let entity_id = state.payload.entity_id;
-            ensure!(ids.insert(entity_id), "duplicate entity in snapshot page");
-            Ok((super::tree::key(spec, state)?, entity_id, &state.payload.state.head))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
-    let heads = proto::PackedHeads::from_rows(rows.iter().map(|(key, id, head)| (key.as_slice(), *id, *head)));
-    Ok(proto::TreeSpanInventory { bounds: page.bounds.clone(), heads })
-}
-
 #[cfg(test)]
 mod tests;

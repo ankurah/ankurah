@@ -168,8 +168,12 @@ impl Meter {
             for item in items {
                 match item {
                     proto::StateItem::Heads(page) => self.traffic.leaves += page.heads.len(),
-                    proto::StateItem::Repair { .. } => self.traffic.repairs += 1,
-                    proto::StateItem::Snapshots(page) => self.traffic.snapshots += page.states.len(),
+                    proto::StateItem::Repair { delta, .. } => {
+                        self.traffic.repairs += 1;
+                        if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }) {
+                            self.traffic.snapshots += 1;
+                        }
+                    }
                     proto::StateItem::Digest(_) => self.traffic.summaries += 1,
                     proto::StateItem::NeedHeads(_) => self.traffic.leaf_questions += 1,
                     _ => {}
@@ -293,7 +297,7 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
         reset(&server, &client, &meter);
         assert_eq!(reader.fetch::<CostRowView>("true").await?.len(), n);
         let cold = record("fetch_cold", n, &server, &client, &meter);
-        assert_eq!((cold.snapshots, cold.repairs, cold.leaves), (n, 0, 0));
+        assert_eq!((cold.snapshots, cold.repairs, cold.leaves), (n, n, n));
         assert_eq!((cold.summaries, cold.leaf_questions), (0, 0));
         // Require roughly 96 small rows per exchange, with six exchanges of
         // startup/tail slack. This is a regression target, not a protocol limit.

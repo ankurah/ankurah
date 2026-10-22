@@ -32,13 +32,7 @@ impl Round {
         let members = addresses
             .iter()
             .map(|(address, id)| {
-                (
-                    *id,
-                    QueryMember {
-                        key: address[..address.len() - EntityId::BYTE_LEN].to_vec(),
-                        head: snapshot.states[id].payload.state.head.clone(),
-                    },
-                )
+                (*id, QueryMember { key: address[..address.len() - EntityId::BYTE_LEN].to_vec(), head: snapshot.entries[id].head.clone() })
             })
             .collect();
         Self { descriptor, snapshot, members, addresses, overlay: BTreeMap::new(), overlay_bytes: 0, complete: false }
@@ -141,7 +135,7 @@ impl Projection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::state_sync::QueryTreeCache;
+    use crate::node::state_sync::QueryTree;
     use std::ops::Bound::{Excluded, Included};
 
     fn id(n: u8) -> EntityId { EntityId::from_bytes([n; 32]) }
@@ -155,7 +149,7 @@ mod tests {
         let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
         let states =
             (0..10).map(|n| proto::Attested::opt(proto::EntityState { entity_id: id(n), state: Default::default() }, None)).collect();
-        let snapshot = QueryTreeCache::default().refresh(spec.clone(), states).await?;
+        let snapshot = QueryTree::default().refresh(spec.clone(), states).await?;
         let mut round = Round::new(StateRound { number: 0, revision: 0 }, snapshot);
         let page = proto::TreeSpanInventory {
             bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(7))),

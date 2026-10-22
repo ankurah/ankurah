@@ -544,26 +544,30 @@ fn shared_state_and_events_preserve_history_and_attestations_in_repair_and_live_
 }
 
 #[test]
-fn snapshot_pages_preserve_attestations_and_omit_duplicate_leaf_and_target_data() {
+fn inventory_membership_and_current_payload_preserve_independent_heads() {
     let entity = known(3);
+    let current_head = Clock::genesis(EventId::from_bytes([4; 32]));
     let state = Attested {
-        payload: EntityState { entity_id: entity.entity_id, state: State { head: entity.head.clone(), ..Default::default() } },
+        payload: EntityState { entity_id: entity.entity_id, state: State { head: current_head.clone(), ..Default::default() } },
         attestations: AttestationSet(vec![Attestation(vec![11, 12])]),
     };
-    let bounds = TreeSpan::under(&NodePrefix::root());
-    let page = StateItem::Snapshots(SnapshotPage { bounds: bounds.clone(), states: vec![state.clone()] });
-    let StateItem::Snapshots(received) = wire(&page) else { panic!("snapshot page") };
-    assert_eq!(received.bounds, bounds);
-    assert_eq!(received.states[0].payload, state.payload);
-    assert_eq!(received.states[0].attestations, state.attestations);
-    let separate = vec![
-        StateItem::Heads(TreeSpanInventory { bounds, heads: vec![KeyedEntityHead { key: vec![], entity: entity.clone() }].into() }),
+    let items = vec![
+        StateItem::Heads(TreeSpanInventory {
+            bounds: TreeSpan::under(&NodePrefix::root()),
+            heads: vec![KeyedEntityHead { key: vec![], entity: entity.clone() }].into(),
+        }),
         StateItem::Repair {
-            target: entity.head,
-            delta: EntityDelta { entity_id: entity.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } },
+            target: current_head.clone(),
+            delta: EntityDelta { entity_id: entity.entity_id, content: DeltaContent::StateSnapshot { state: state.clone().into() } },
         },
     ];
-    assert!(bincode::serialized_size(&vec![page]).unwrap() < bincode::serialized_size(&separate).unwrap());
+    let received = wire(&items);
+    let [StateItem::Heads(inventory), StateItem::Repair { target, delta }] = received.as_slice() else { panic!("heads and repair") };
+    assert_eq!(inventory.heads.to_vec()[0].entity, entity);
+    assert_eq!(target, &current_head);
+    let DeltaContent::StateSnapshot { state: payload } = &delta.content else { panic!("snapshot") };
+    assert_eq!(payload.state, state.payload.state);
+    assert_eq!(payload.attestations, state.attestations);
 }
 
 #[test]

@@ -77,7 +77,6 @@ fn bridge_for(items: &[StateItem], id: EntityId) -> bool {
 }
 fn offers_target(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool {
     items.iter().any(|item| match item {
-        StateItem::Snapshots(page) => page.states.iter().any(|state| state.payload.entity_id == id && state.payload.state.head == *head),
         StateItem::Repair { target, delta } => delta.entity_id == id && target == head,
         _ => false,
     })
@@ -122,7 +121,7 @@ async fn fetch_and_subscription_send_one_complete_initial_head_inventory() -> Re
 }
 
 #[tokio::test]
-async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo() -> Result<()> {
+async fn fetch_initial_inventory_omits_equal_heads_and_sends_only_the_changed_target() -> Result<()> {
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
     let trx = writer.begin();
@@ -143,11 +142,14 @@ async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo(
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 256);
     let cold = trace.items(None);
-    assert!(cold.iter().filter(|item| matches!(item, StateItem::Snapshots(_))).count() > 1, "cold fetch must page its snapshots");
-    assert_eq!(cold.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 256);
-    assert!(
-        !cold.iter().any(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
-        "cold inline snapshots also carry membership and targets"
+    assert!(cold.iter().filter(|item| matches!(item, StateItem::Heads(_))).count() > 1, "cold fetch must page membership metadata");
+    assert_eq!(cold.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum::<usize>(), 256);
+    assert_eq!(
+        cold.iter()
+            .filter(|item| matches!(item, StateItem::Repair { delta, .. }
+        if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })))
+            .count(),
+        256
     );
     trace.clear();
     assert_eq!(reader.fetch::<PetView>("true").await?.len(), 256);
@@ -171,12 +173,21 @@ async fn fetch_initial_inventory_avoids_equal_and_sparse_response_identity_echo(
     let items = trace.items(None);
     assert!(bridge_for(&items, pets[117].id()), "a changed leaf should use its actual clock for an event bridge");
     assert!(offers_target(&items, pets[117].id(), &pets[117].entity().head()), "the one repair must cover the captured target");
-    // The request carries a complete initial inventory; the response must
-    // repair only the changed head rather than echoing unchanged identities.
-    let heads: usize = items.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum();
-    assert_eq!(heads, 0, "a changed head with unchanged membership needs no response identity echo");
+    // Captured membership is independent of the current repair target. Only
+    // the changed member needs its head repeated; equal members remain omitted.
+    let heads = items
+        .iter()
+        .filter_map(|item| if let StateItem::Heads(page) = item { Some(page.heads.to_vec()) } else { None })
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0].entity.entity_id, pets[117].id());
+    assert_eq!(heads[0].entity.head, pets[117].entity().head());
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 1);
-    assert!(items.iter().all(|item| matches!(item, StateItem::Repair { .. })), "only the changed target needs output: {items:?}");
+    assert!(
+        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
+        "only the changed target needs output: {items:?}"
+    );
     Ok(())
 }
 
@@ -253,7 +264,15 @@ async fn empty_query_inventory_sends_snapshots_without_asserting_global_entity_a
     let items = trace.items(None);
     assert!(items.iter().all(|item| !matches!(item, StateItem::Digest(_) | StateItem::NeedHeads(_))));
     assert!(known.iter().all(|pet| offers_target(&items, pet.id(), &pet.entity().head())));
-    assert_eq!(items.iter().map(|item| if let StateItem::Snapshots(page) = item { page.states.len() } else { 0 }).sum::<usize>(), 192);
+    assert_eq!(
+        items
+            .iter()
+            .filter(
+                |item| matches!(item, StateItem::Repair { delta, .. } if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))
+            )
+            .count(),
+        192
+    );
     Ok(())
 }
 
@@ -903,7 +922,7 @@ async fn catchup_batches_many_edits_with_their_connecting_events() -> Result<()>
 }
 
 #[tokio::test]
-async fn oversized_source_publication_restarts_and_recovers_after_writes_settle() -> Result<()> {
+async fn large_payload_does_not_overflow_metadata_maintenance_and_streams_in_chunks() -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
@@ -950,16 +969,12 @@ async fn oversized_source_publication_restarts_and_recovers_after_writes_settle(
     trx.commit().await?;
     assert!(
         bincode::serialized_size(&record.entity().to_entity_state()?)? > 8 * 1024 * 1024,
-        "one captured state must exceed the source reader's 8 MiB state-plus-events budget"
+        "the entity payload exceeds the maintenance queue budget, but the queue retains only metadata"
     );
-    wait_for(|| {
-        trace.1.lock().unwrap().iter().any(|frame| frame.stream == initial && matches!(frame.body, proto::StateFrameBody::RestartRequired))
-    })
-    .await;
     assert_eq!(retained.title()?, "old", "the held stream metadata prevents receiver application");
     gate.release_held(&client).await;
-    // Writes have stopped. A fresh source capture can transfer this state
-    // within the independent 64 MiB assembly limit, without replaying live backlog.
+    // Payload transport has its own chunk and assembly bounds. Its size must
+    // not invalidate the resident tree's compact maintenance subscription.
     tokio::time::timeout(Duration::from_secs(120), async {
         query.wait_durable_answered().await?;
         while !query.peek().first().is_some_and(|row| row.title().as_deref() == Ok(payload.as_str())) {
@@ -969,14 +984,13 @@ async fn oversized_source_publication_restarts_and_recovers_after_writes_settle(
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    assert_eq!(query.peek()[0].entity().head(), record.entity().head(), "recovery must incorporate the final target");
+    assert_eq!(query.peek()[0].entity().head(), record.entity().head(), "chunked delivery must incorporate the final target");
     assert_eq!(query.ids(), [record.id()]);
     assert_eq!(query.peek()[0].artist()?, "artist");
     assert!(
-        trace.0.lock().unwrap().iter().any(|body| matches!(body,
-        NodeResponseBody::QuerySubscribed { query_id, state }
-            if *query_id == query.query_id() && state.frame.stream != initial)),
-        "recovery must establish a new stream after the explicit restart"
+        !trace.1.lock().unwrap().iter().any(|frame| frame.stream == initial
+            && matches!(frame.body, proto::StateFrameBody::RestartRequired | proto::StateFrameBody::SourceUnavailable)),
+        "payload size must not overflow the metadata queue or restart the stream"
     );
     Ok(())
 }
@@ -1148,7 +1162,7 @@ async fn byte_smaller_snapshot_advances_a_retained_older_entity_truthfully() -> 
 }
 
 #[tokio::test]
-async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_change() -> Result<()> {
+async fn head_inventory_preserves_captured_keys_while_repair_joins_a_concurrent_key_change() -> Result<()> {
     use std::sync::atomic::{AtomicBool, Ordering};
     let (server, client) = nodes().await?;
     let writer = server.context(DEFAULT_CONTEXT)?;
@@ -1206,18 +1220,12 @@ async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_cha
     let page = offered
         .iter()
         .find_map(|item| match item {
-            StateItem::Snapshots(page) if page.states.iter().any(|state| state.payload.entity_id == record.id()) => Some(page),
+            StateItem::Heads(page) if page.heads.to_vec().iter().any(|head| head.entity.entity_id == record.id()) => Some(page),
             _ => None,
         })
-        .expect("the outside-query entity must be offered as a captured snapshot");
+        .expect("the outside-query entity must have explicit captured membership");
     assert!(matches!(page.bounds.end, std::ops::Bound::Included(_)), "the first page must have a finite key boundary");
-    assert_eq!(page.states[0].payload.entity_id, record.id());
-    assert_eq!(page.states[0].payload.state.head, captured);
-    {
-        use ankurah::core::{entity::TemporaryEntity, selection::filter::Filterable, value::Value};
-        let captured_entity = TemporaryEntity::new(record.id(), &page.states[0].payload.state)?;
-        assert_eq!(captured_entity.value(&resolved_prop(&client, Record::descriptor(), "title")), Some(Value::String("a-000".into())));
-    }
+    assert!(page.heads.to_vec().iter().any(|head| head.entity.entity_id == record.id() && head.entity.head == captured));
     assert_eq!(retained.title()?, "zz-local");
     assert_eq!(retained.artist()?, "outside", "the held sender branch has not reached the receiver");
     assert!(
@@ -1227,6 +1235,10 @@ async fn snapshot_page_uses_captured_keys_and_repairs_a_concurrent_local_key_cha
     assert!(!query.loaded());
     gate.release_held(&client).await;
     wait_for(|| repair_parked.load(Ordering::Acquire)).await;
+    assert!(
+        snapshot_offer(&trace.items(Some(query.query_id())), record.id(), &captured),
+        "current payload is sent separately from captured membership, possibly in a later frame"
+    );
     assert!(!query.loaded(), "the concurrent branch cannot become ready while its connecting history is withheld");
     assert_eq!(retained.artist()?, "outside", "the snapshot alone did not incorporate the remote branch");
     gate.release_held(&client).await;
@@ -1264,7 +1276,6 @@ fn snapshot_offer(items: &[StateItem], id: EntityId, head: &proto::Clock) -> boo
         StateItem::Repair { target, delta } => {
             delta.entity_id == id && target == head && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
         }
-        StateItem::Snapshots(page) => page.states.iter().any(|state| state.payload.entity_id == id && state.payload.state.head == *head),
         _ => false,
     })
 }

@@ -25,7 +25,7 @@ pub use inventory::{
     ClockRef, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
 };
 
-use crate::{Attested, Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId, EntityState};
+use crate::{Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId};
 
 /// A responder-issued state stream handle, scoped to one peer connection/query generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -183,9 +183,6 @@ pub enum StateItem {
     /// Fail while this target remains required and uncovered. A retired round or
     /// independently covered target does not become unavailable retroactively.
     RepairUnavailable { entity_id: EntityId, target: Clock },
-    /// Exhaustive captured membership with inline snapshots, avoiding a separate
-    /// head inventory and duplicate repair targets for a cold range.
-    Snapshots(SnapshotPage),
 }
 
 /// Answers for any subset of the outstanding spans/entities in a comparison.
@@ -201,17 +198,6 @@ pub enum StateAnswer {
         entity_id: EntityId,
         target: Clock,
     },
-}
-
-/// An exhaustive range page in canonical address order, including empty gaps.
-/// Derive keys and target clocks from these captured snapshots before applying
-/// them: a newer or concurrent local state may have a different key or head.
-/// Normal attestation, causal validation and target coverage still apply.
-/// Oversized snapshots use Heads plus RepairChunk instead of a partial page.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotPage {
-    pub bounds: TreeSpan,
-    pub states: Vec<Attested<EntityState>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

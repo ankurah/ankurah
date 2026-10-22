@@ -1,6 +1,9 @@
 mod candidate_changes;
+mod delivery;
+pub use delivery::{NotificationFailure, ReactorEvent};
 mod comparison_index;
 pub mod fetch_gap;
+pub(crate) mod maintenance;
 mod subscription;
 mod subscription_state;
 mod update;
@@ -48,12 +51,15 @@ pub(crate) struct PeerQueryMembership {
     pub replace: HashSet<proto::EntityId>,
     pub remove: HashSet<proto::EntityId>,
     pub preserve: HashSet<proto::EntityId>,
+    /// Captured membership heads, before newer initial payloads were applied.
+    pub baseline: HashMap<proto::EntityId, proto::Clock>,
 }
 
 /// Trait for entities that can be used in reactor notifications
 pub trait AbstractEntity: Clone + std::fmt::Debug {
     fn memberships(&self) -> std::collections::BTreeSet<proto::ModelId>;
     fn id(&self) -> proto::EntityId;
+    fn head(&self) -> Option<proto::Clock> { None }
     fn value(&self, property: &ankql::ast::PropertyId) -> Option<Value>;
 }
 
@@ -105,10 +111,12 @@ impl PreNotifyHook for () {
 /// A Reactor is a collection of subscriptions, which are to be notified of changes to a set of entities
 pub struct Reactor<
     E: AbstractEntity + Filterable + Send + 'static = Entity,
-    Ev: Clone + Send + 'static = ankurah_proto::Attested<ankurah_proto::Event>,
+    Ev: ReactorEvent = ankurah_proto::Attested<ankurah_proto::Event>,
 >(Arc<ReactorInner<E, Ev>>);
 
 struct ReactorInner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
+    maintenance: maintenance::Maintenance,
+    history: Option<Arc<dyn crate::retrieval::GetEvents + Send + Sync>>,
     subscriptions: std::sync::Mutex<HashMap<ReactorSubscriptionId, Subscription<E, Ev>>>,
     // Shared with all subscriptions to allow them to manage their own watchers
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
@@ -120,19 +128,28 @@ struct ReactorInner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     publication_pause: Mutex<Option<(proto::ModelId, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 // don't require Clone SE or PA, because we have an Arc
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for Reactor<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Clone for Reactor<E, Ev> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
 }
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<E, Ev> {
     #[cfg(test)]
     fn new_test() -> Self { Self::new(ankurah_signals::Mut::new(true)) }
 
+    #[cfg(test)]
+    pub(crate) fn new(run: impl Wait<bool> + Send + Sync + 'static) -> Self { Self::with_history(run, None) }
+
     /// Clear subscriptions when the owner stops running, without retaining the reactor while waiting.
-    pub(crate) fn new(run: impl Wait<bool> + Send + Sync + 'static) -> Self {
+    pub(crate) fn with_history(
+        run: impl Wait<bool> + Send + Sync + 'static,
+        history: Option<Arc<dyn crate::retrieval::GetEvents + Send + Sync>>,
+    ) -> Self {
+        let watcher_set = Arc::new(Mutex::new(WatcherSet::new()));
         let reactor = Self(Arc::new(ReactorInner {
+            maintenance: maintenance::Maintenance::new(watcher_set.clone()),
+            history,
             subscriptions: Mutex::new(HashMap::new()),
-            watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
+            watcher_set,
             notify_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             publication_pause: Mutex::new(None),
@@ -298,7 +315,7 @@ pub(crate) fn build_key_spec_from_selection<E: AbstractEntity>(
     Ok(KeySpec { keyparts })
 }
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Reactor<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<E, Ev> {
     /// Install or update a local query, notifying its owner before listeners.
     pub async fn upsert_query_and_notify<H: PreNotifyHook>(
         &self,
@@ -358,7 +375,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         pre_notify_hook: H,
         entities: Option<Vec<E>>,
         membership: Option<PeerQueryMembership>,
-        changes: Vec<ReactorUpdateItem<E, Ev>>,
+        mut changes: Vec<ReactorUpdateItem<E, Ev>>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
         let authoritative = entities.is_some();
         let included_entities = match entities {
@@ -381,6 +398,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
         let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node.clone());
 
+        changes.retain(|change| node.can_read(&change.entity));
+        let carried_events: HashSet<_> =
+            changes.iter().filter(|change| !change.events.is_empty()).map(|change| change.entity.id()).collect();
+        let empty_baseline = HashMap::new();
+        let delivered = subscription
+            .filter_query_events(
+                query_id,
+                &mut changes,
+                membership.as_ref().map(|m| &m.baseline).unwrap_or(&empty_baseline),
+                self.0.history.as_deref(),
+            )
+            .await?;
         let mut reactor_update_items = Vec::new();
         subscription.update_query(
             query_id,
@@ -414,7 +443,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                     item.events.append(&mut change.events);
                     ordered.push(item);
                 }
-            } else if resultset.contains_key(&change.entity.id()) {
+            } else if resultset.contains_key(&change.entity.id())
+                && (!carried_events.contains(&change.entity.id()) || !change.events.is_empty())
+            {
                 ordered.push(change);
             }
         }
@@ -436,6 +467,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         if pre_notify_hook.marks_loaded() {
             resultset.set_loaded(true);
         }
+        subscription.commit_query_events(query_id, delivered);
         pre_notify_hook.pre_notify(version);
         #[cfg(test)]
         self.pause_publication_if_requested(&selection).await;
@@ -449,7 +481,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 
     /// Notify subscriptions about an entity change
-    pub async fn notify_change<C: ChangeNotification<Entity = E, Event = Ev>>(&self, changes: Vec<C>) {
+    pub async fn notify_change<C: ChangeNotification<Entity = E, Event = Ev>>(&self, changes: Vec<C>) -> Vec<NotificationFailure> {
         let _notify_guard = self.0.notify_lock.lock().await;
         let changes: Arc<Vec<C>> = Arc::from(changes);
 
@@ -472,13 +504,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
                 .collect::<Vec<_>>()
         };
 
-        let all_watcher_changes: Vec<_> =
-            evaluations.into_iter().flat_map(|(subscription, candidates)| subscription.evaluate_changes(candidates)).collect();
-
+        let mut all_watcher_changes = Vec::new();
+        let mut failures = Vec::new();
+        for (subscription, candidates) in evaluations {
+            let (prepared, failed) = subscription.prepare_events(&candidates, None, self.0.history.as_deref()).await;
+            failures.extend(failed);
+            all_watcher_changes.extend(subscription.evaluate_changes(candidates, prepared));
+        }
         let mut watcher_set = self.0.watcher_set.lock().unwrap();
         for change in all_watcher_changes {
             watcher_set.apply_watcher_change(change);
         }
+        failures
     }
 
     /// Publish an already applied source publication to its owning query only.
@@ -489,26 +526,31 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
         query: proto::QueryId,
         changes: Vec<C>,
         preserve: HashSet<proto::EntityId>,
-    ) -> HashSet<proto::EntityId> {
+    ) -> anyhow::Result<HashSet<proto::EntityId>> {
         let _notify = self.0.notify_lock.lock().await;
         let subscription = self.0.subscriptions.lock().unwrap().get(&subscription_id).cloned();
-        let Some(subscription) = subscription else { return HashSet::new() };
+        let Some(subscription) = subscription else { return Ok(HashSet::new()) };
         let changes = Arc::new(changes);
         let mut candidates = CandidateChanges::new(changes.clone());
         for offset in 0..changes.len() {
             candidates.add_query(query, offset);
         }
-        let (changes, notified) = subscription.evaluate_publication(candidates, &preserve);
+        let (prepared, failures) = subscription.prepare_events(&candidates, Some(&preserve), self.0.history.as_deref()).await;
+        if let Some(failure) = failures.into_iter().next() {
+            return Err(failure.error.into());
+        }
+        let (changes, notified) = subscription.evaluate_publication(candidates, prepared, &preserve);
         let mut watchers = self.0.watcher_set.lock().unwrap();
         for change in changes {
             watchers.apply_watcher_change(change);
         }
-        notified
+        Ok(notified)
     }
 
     /// Clear current subscription results and watchers when the owner stops running.
     pub(crate) async fn close(&self) {
         let _notify = self.0.notify_lock.lock().await;
+        self.0.maintenance.invalidate();
         {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             watcher_set.clear();
@@ -521,7 +563,20 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 }
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug for Reactor<E, Ev> {
+impl Reactor<Entity, proto::Attested<proto::Event>> {
+    pub(crate) async fn begin_commit(&self) -> maintenance::SourceCommit { self.0.maintenance.begin_commit().await }
+
+    /// Subscribe an index before reading its initial contents. Projection runs
+    /// before public event filtering and may retain only the index's metadata.
+    pub(crate) async fn subscribe_maintenance<T: Send + Sync + 'static>(
+        &self,
+        project: impl Fn(&crate::changes::EntityChange, bool) -> anyhow::Result<maintenance::ProjectedChange<T>> + Send + Sync + 'static,
+    ) -> Result<(maintenance::SourceRevision, maintenance::MaintenanceSubscription<T>), maintenance::SourceError> {
+        self.0.maintenance.subscribe(project).await
+    }
+}
+
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> std::fmt::Debug for Reactor<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let watcher_set = self.0.watcher_set.lock().unwrap();
         let subscriptions = self.0.subscriptions.lock().unwrap();
@@ -534,7 +589,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     }
 }
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> std::fmt::Debug for Subscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> std::fmt::Debug for Subscription<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Subscription {{ id: {:?}, queries: {} }}", self.id(), self.queries_len())
     }
@@ -634,6 +689,8 @@ mod tests {
         id: proto::EventId,
         changes: HashMap<String, String>,
     }
+    impl ReactorEvent for TestEvent {}
+
     impl TestEntity {
         fn new(name: &str, status: &str) -> Self {
             Self {
@@ -871,7 +928,12 @@ mod tests {
                 1,
                 (),
                 vec![],
-                PeerQueryMembership { replace: [entity.id].into_iter().collect(), remove: HashSet::new(), preserve: HashSet::new() },
+                PeerQueryMembership {
+                    replace: [entity.id].into_iter().collect(),
+                    remove: HashSet::new(),
+                    preserve: HashSet::new(),
+                    baseline: HashMap::new(),
+                },
                 vec![],
             )
             .await
@@ -1006,7 +1068,7 @@ mod tests {
                 1,
                 (),
                 vec![source_row.clone()],
-                PeerQueryMembership { replace: known, remove: HashSet::new(), preserve: HashSet::new() },
+                PeerQueryMembership { replace: known, remove: HashSet::new(), preserve: HashSet::new(), baseline: HashMap::new() },
                 vec![],
             )
             .await
@@ -1052,7 +1114,12 @@ mod tests {
                 1,
                 (),
                 vec![source_row.clone()],
-                PeerQueryMembership { replace: HashSet::new(), remove: [local.id].into_iter().collect(), preserve: HashSet::new() },
+                PeerQueryMembership {
+                    replace: HashSet::new(),
+                    remove: [local.id].into_iter().collect(),
+                    preserve: HashSet::new(),
+                    baseline: HashMap::new(),
+                },
                 vec![],
             )
             .await
@@ -1075,7 +1142,12 @@ mod tests {
                 1,
                 (),
                 vec![source_row.clone()],
-                PeerQueryMembership { replace: HashSet::new(), remove: [fetched.id].into_iter().collect(), preserve: HashSet::new() },
+                PeerQueryMembership {
+                    replace: HashSet::new(),
+                    remove: [fetched.id].into_iter().collect(),
+                    preserve: HashSet::new(),
+                    baseline: HashMap::new(),
+                },
                 vec![],
             )
             .await
@@ -1317,7 +1389,8 @@ mod tests {
                 vec![OwnChange { change: TestChange { entity: first.clone(), events: vec![event.clone()] }, origin: origin(query) }],
                 HashSet::new(),
             )
-            .await;
+            .await
+            .unwrap();
         assert_eq!(notified, [first.id].into_iter().collect());
         let first_callback = updates();
         assert_eq!(first_callback.len(), 1, "reported IDs must already have completed their synchronous publication callback");
@@ -1560,6 +1633,7 @@ mod tests {
                     replace: [exiting.id].into_iter().collect(),
                     remove: HashSet::new(),
                     preserve: [exiting.id].into_iter().collect(),
+                    baseline: HashMap::new(),
                 },
                 vec![],
             )
@@ -1576,7 +1650,8 @@ mod tests {
                 vec![OwnChange { change: TestChange { entity: exiting.clone(), events: vec![earlier.clone()] }, origin: origin(query) }],
                 [exiting.id].into_iter().collect(),
             )
-            .await;
+            .await
+            .unwrap();
         let earlier_updates = updates();
         assert_eq!(earlier_updates.len(), 1);
         assert_eq!(earlier_updates[0].items.len(), 1);
@@ -1597,7 +1672,12 @@ mod tests {
                 1,
                 (),
                 vec![entrant.clone()],
-                PeerQueryMembership { replace: HashSet::new(), remove: [exiting.id].into_iter().collect(), preserve: HashSet::new() },
+                PeerQueryMembership {
+                    replace: HashSet::new(),
+                    remove: [exiting.id].into_iter().collect(),
+                    preserve: HashSet::new(),
+                    baseline: HashMap::new(),
+                },
                 vec![ReactorUpdateItem { entity: exiting.clone(), events: vec![event.clone()], predicate_relevance: vec![] }],
             )
             .await

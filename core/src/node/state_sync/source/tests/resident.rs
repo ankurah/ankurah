@@ -25,7 +25,7 @@ async fn idle_resident_updates_then_exact_reuse_avoids_another_scan() -> anyhow:
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             let snapshot = tree.current_snapshot().await.unwrap();
-            if snapshot.states[&initial.entity_id].payload.state.head == proto::Clock::singleton(&next) {
+            if snapshot.entries[&initial.entity_id].head == proto::Clock::singleton(&next) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -35,8 +35,8 @@ async fn idle_resident_updates_then_exact_reuse_avoids_another_scan() -> anyhow:
     let reused = acquire(&node.resident_trees, &node, selection(None)).await?;
     assert!(Arc::ptr_eq(&tree, &reused.tree()));
     let current = reused.snapshot().await?;
-    assert_eq!(current.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&next));
-    assert_eq!(frozen.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&initial));
+    assert_eq!(current.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&next));
+    assert_eq!(frozen.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
     assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "ordinary updates and exact reuse never rescan storage");
     Ok(())
 }
@@ -56,7 +56,7 @@ async fn count_limit_evicts_idle_trees_but_pins_preserve_active_owners() -> anyh
     drop(first);
     drop(second);
     assert_eq!(cache.len(), 2, "the captured active comparison also pins its tree");
-    assert_eq!(snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&initial));
+    assert_eq!(snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
     drop(snapshot);
     assert_eq!(cache.len(), 1);
     let second = acquire(&cache, &node, selection(Some(1))).await?;
@@ -71,35 +71,25 @@ async fn oversized_miss_does_not_evict_a_useful_small_entry() -> anyhow::Result<
         apply(&node, &genesis(value)?).await?;
     }
     let small = above("03", None);
-    let capture = capture_query(
-        &node,
-        small.clone(),
-        QueryTreeCache::spec(&small, &node.catalog),
-        vec![DEFAULT_CONTEXT],
-        Arc::new(QueryTreeCache::default()),
-    )
-    .await?;
-    assert_eq!(capture.projection.rows.len(), 1);
+    let capture =
+        capture_query(&node, small.clone(), QueryTree::spec(&small, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()))
+            .await?;
+    assert_eq!(capture.projection.tree.current_snapshot().await?.entries.len(), 1);
     let small_bytes = QuerySource::from_capture(vec![DEFAULT_CONTEXT], capture).accounted_bytes();
     let budget = small_bytes + 1;
     assert!(small_bytes <= budget);
     let all = selection(None);
-    let full_capture = capture_query(
-        &node,
-        all.clone(),
-        QueryTreeCache::spec(&all, &node.catalog),
-        vec![DEFAULT_CONTEXT],
-        Arc::new(QueryTreeCache::default()),
-    )
-    .await?;
-    assert_eq!(full_capture.projection.rows.len(), 4);
+    let full_capture =
+        capture_query(&node, all.clone(), QueryTree::spec(&all, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()))
+            .await?;
+    assert_eq!(full_capture.projection.tree.current_snapshot().await?.entries.len(), 4);
     assert!(QuerySource::from_capture(vec![DEFAULT_CONTEXT], full_capture).accounted_bytes() > budget);
     let cache = ResidentTrees::with_limits(2, budget);
     let resident = acquire(&cache, &node, above("03", None)).await?;
     let tree = resident.tree();
     drop(resident);
     let oversized = acquire(&cache, &node, selection(None)).await?;
-    assert_eq!(oversized.snapshot().await?.snapshot.states.len(), 4);
+    assert_eq!(oversized.snapshot().await?.snapshot.entries.len(), 4);
     drop(oversized);
     assert_eq!(cache.len(), 1);
     assert!(Arc::ptr_eq(&tree, &acquire(&cache, &node, above("03", None)).await?.tree()));
@@ -136,7 +126,7 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
                 selection.clone(),
                 Some(&DEFAULT_CONTEXT),
                 1,
-                proto::KnownState { spec: QueryTreeCache::spec(&selection, &node.catalog), spans: vec![] },
+                proto::KnownState { spec: QueryTree::spec(&selection, &node.catalog), spans: vec![] },
             )
             .await?;
         let (_, tree) = handler.subscription_handler.query_tree_for_test(query).await.unwrap();
@@ -151,7 +141,7 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
     let next = update(&event, "02")?;
     apply(&node, &next).await?;
     let resident = acquire(&node.resident_trees, &node, selection).await?;
-    assert_eq!(resident.snapshot().await?.snapshot.states[&event.entity_id].payload.state.head, proto::Clock::singleton(&next));
+    assert_eq!(resident.snapshot().await?.snapshot.entries[&event.entity_id].head, proto::Clock::singleton(&next));
     let (peer, query) = subscriptions.remove(0);
     node.peer_connections.get(&peer).unwrap().subscription_handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
@@ -175,7 +165,7 @@ async fn an_idle_tree_does_not_require_event_delivery_permission() -> anyhow::Re
     apply(&node, &denied).await?;
     let reused = acquire(&node.resident_trees, &node, selection(None)).await?;
     assert!(Arc::ptr_eq(&tree, &reused.tree()));
-    assert_eq!(reused.snapshot().await?.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&denied));
+    assert_eq!(reused.snapshot().await?.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&denied));
     Ok(())
 }
 
@@ -196,21 +186,21 @@ async fn permissions_are_rechecked_and_new_grants_are_not_lost() -> anyhow::Resu
         apply(&node, &genesis(value)?).await?;
     }
     let selection = selection(None);
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let spec = QueryTree::spec(&selection, &node.catalog);
     let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
-    assert!(capture.snapshot.states.is_empty());
+    assert!(capture.snapshot.entries.is_empty());
     allowed.store(true, Ordering::SeqCst);
     let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
-    assert_eq!(capture.snapshot.states.len(), 1, "a newly granted cached candidate is discovered");
+    assert_eq!(capture.snapshot.entries.len(), 1, "a newly granted cached candidate is discovered");
     discovery.store(true, Ordering::SeqCst);
     let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
-    assert_eq!(capture.snapshot.states.len(), 2, "a broader discovery scope requires a fresh capture");
+    assert_eq!(capture.snapshot.entries.len(), 2, "a broader discovery scope requires a fresh capture");
     let denied = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![]).await?;
-    assert!(denied.snapshot.states.is_empty(), "empty credentials are not privileged and never borrow an authorized view");
+    assert!(denied.snapshot.entries.is_empty(), "empty credentials are not privileged and never borrow an authorized view");
     allowed.store(false, Ordering::SeqCst);
     let denied = node.resident_trees.capture(&node, selection, Some(spec), vec![DEFAULT_CONTEXT]).await?;
-    assert!(denied.snapshot.states.is_empty(), "revoked rows cannot be disclosed by a cache hit");
-    assert_eq!(capture.snapshot.states.len(), 2, "the old comparison snapshot is frozen independently");
+    assert!(denied.snapshot.entries.is_empty(), "revoked rows cannot be disclosed by a cache hit");
+    assert_eq!(capture.snapshot.entries.len(), 2, "the old comparison snapshot is frozen independently");
     Ok(())
 }
 
@@ -243,10 +233,10 @@ async fn canceled_build_never_becomes_reusable_and_halt_stops_idle_entries() -> 
 async fn an_idle_entry_that_grows_beyond_retention_is_evicted() -> anyhow::Result<()> {
     let node = node().await?;
     apply(&node, &genesis("01")?).await?;
-    let cache = ResidentTrees::with_limits(8, 10_000);
+    let cache = ResidentTrees::with_limits(8, 7_000);
     let resident = acquire(&cache, &node, selection(None)).await?;
     let frozen = resident.snapshot().await?.snapshot;
-    assert_eq!(frozen.states.len(), 1);
+    assert_eq!(frozen.entries.len(), 1);
     drop(frozen);
     drop(resident);
     for value in ["02", "03", "04"] {
@@ -259,7 +249,7 @@ async fn an_idle_entry_that_grows_beyond_retention_is_evicted() -> anyhow::Resul
     })
     .await?;
     let current = acquire(&cache, &node, selection(None)).await?;
-    assert_eq!(current.snapshot().await?.snapshot.states.len(), 4);
+    assert_eq!(current.snapshot().await?.snapshot.entries.len(), 4);
     drop(current);
     assert_eq!(cache.len(), 0);
     Ok(())
@@ -293,7 +283,7 @@ async fn slow_initial_history_does_not_block_the_shared_tree() -> anyhow::Result
     let newest = update(&later, "03")?;
     apply(&node, &newest).await?;
     let current = tokio::time::timeout(std::time::Duration::from_secs(3), resident.snapshot()).await??;
-    assert_eq!(current.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&newest));
+    assert_eq!(current.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&newest));
     release.send(()).unwrap();
     let (_, route) = subscription.await?;
     drop(route);
@@ -318,7 +308,7 @@ async fn catalog_changes_invalidate_ordinary_entries_but_maintain_catalog_entrie
     );
     apply(&node, &event).await?;
     assert!(ordinary.snapshot().await.is_err(), "old catalog interpretation cannot serve another capture");
-    assert!(catalog.snapshot().await?.snapshot.states.contains_key(&event.entity_id));
+    assert!(catalog.snapshot().await?.snapshot.entries.contains_key(&event.entity_id));
     assert_eq!(node.resident_trees.len(), 1);
     Ok(())
 }
@@ -343,7 +333,7 @@ async fn initial_state_transfer_also_updates_a_resident_tree() -> anyhow::Result
     )
     .await?;
     let capture = resident.snapshot().await?;
-    assert_eq!(capture.snapshot.states[&event.entity_id].payload.state.head, proto::Clock::singleton(&event));
+    assert_eq!(capture.snapshot.entries[&event.entity_id].head, proto::Clock::singleton(&event));
     Ok(())
 }
 
@@ -485,18 +475,18 @@ async fn compatible_selections_share_full_resident_with_independent_scopes() -> 
         assert!(Arc::ptr_eq(&full, &lease.tree()), "compatible selections use the same physical tree");
         let snapshot = lease.snapshot().await?.snapshot;
         let expected: BTreeSet<_> = expected.into_iter().map(|index| events[index].entity_id).collect();
-        assert_eq!(snapshot.states.keys().copied().collect::<BTreeSet<_>>(), expected);
+        assert_eq!(snapshot.entries.keys().copied().collect::<BTreeSet<_>>(), expected);
     }
     assert_eq!(node.resident_trees.len(), 1);
     assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "scopes do not scan storage again");
-    assert_eq!(full.current_snapshot().await?.states.len(), 4, "query limits never truncate the resident");
+    assert_eq!(full.current_snapshot().await?.entries.len(), 4, "query limits never truncate the resident");
     let before = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
     let changed = update(&events[1], "15")?;
     apply(&node, &changed).await?;
     let after = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
-    assert!(!before.states.contains_key(&events[1].entity_id));
-    assert!(after.states.contains_key(&events[1].entity_id));
-    assert_eq!(full.current_snapshot().await?.states.len(), 4);
+    assert!(!before.entries.contains_key(&events[1].entity_id));
+    assert!(after.entries.contains_key(&events[1].entity_id));
+    assert_eq!(full.current_snapshot().await?.entries.len(), 4);
     Ok(())
 }
 
@@ -512,20 +502,20 @@ async fn limited_coverage_is_explicit_and_complete_coverage_is_preferred() -> an
     let first = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
     let tree = first.tree();
     let frozen = first.snapshot().await?.snapshot;
-    assert_eq!(frozen.states.len(), 1);
-    assert_eq!(tree.current_snapshot().await?.states.len(), 1);
+    assert_eq!(frozen.entries.len(), 1);
+    assert_eq!(tree.current_snapshot().await?.entries.len(), 1);
     let exact = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
     assert!(Arc::ptr_eq(&tree, &exact.tree()));
     let all = node.resident_trees.acquire(&node, selection(None), Some(frozen.spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert!(!Arc::ptr_eq(&tree, &all.tree()), "bounded coverage cannot satisfy the unlimited request");
     let preferred = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
     assert!(Arc::ptr_eq(&all.tree(), &preferred.tree()), "prefer a compatible complete resident");
-    assert_eq!(all.snapshot().await?.snapshot.states.len(), 3);
+    assert_eq!(all.snapshot().await?.snapshot.entries.len(), 3);
     apply(&node, &update(&events[0], "09")?).await?;
     let after = first.snapshot().await?.snapshot;
-    assert_eq!(after.states.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
-    assert_eq!(frozen.states.keys().copied().collect::<Vec<_>>(), vec![events[0].entity_id]);
-    assert_eq!(tree.current_snapshot().await?.states.len(), 1);
+    assert_eq!(after.entries.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
+    assert_eq!(frozen.entries.keys().copied().collect::<Vec<_>>(), vec![events[0].entity_id]);
+    assert_eq!(tree.current_snapshot().await?.entries.len(), 1);
     assert_eq!(node.resident_trees.len(), 2);
     Ok(())
 }
@@ -575,15 +565,15 @@ async fn cold_limit_bounds_physical_retention_and_zero_limit_reads_nothing() -> 
     }
     let rows_read = node.storage.4.load(Ordering::Relaxed);
     let limited = acquire(&node.resident_trees, &node, selection(Some(3))).await?;
-    assert_eq!(limited.snapshot().await?.snapshot.states.len(), 3);
-    assert_eq!(limited.tree().current_snapshot().await?.states.len(), 3, "the physical resident, not only its view, must be bounded");
+    assert_eq!(limited.snapshot().await?.snapshot.entries.len(), 3);
+    assert_eq!(limited.tree().current_snapshot().await?.entries.len(), 3, "the physical resident, not only its view, must be bounded");
     assert_eq!(node.storage.4.load(Ordering::Relaxed) - rows_read, 3, "cold capture requests only the selected rows from storage");
 
     let scans = node.storage.2.load(Ordering::Relaxed);
     let rows_read = node.storage.4.load(Ordering::Relaxed);
     let empty = acquire(&node.resident_trees, &node, selection(Some(0))).await?;
-    assert!(empty.snapshot().await?.snapshot.states.is_empty());
-    assert!(empty.tree().current_snapshot().await?.states.is_empty());
+    assert!(empty.snapshot().await?.snapshot.entries.is_empty());
+    assert!(empty.tree().current_snapshot().await?.entries.is_empty());
     assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "LIMIT 0 must not start an application scan");
     assert_eq!(node.storage.4.load(Ordering::Relaxed), rows_read);
     Ok(())
@@ -621,7 +611,7 @@ async fn limited_coverage_rejects_other_selections_and_shares_exact_responder_re
         let other = acquire(&node.resident_trees, &node, other).await?;
         assert!(!Arc::ptr_eq(&tree, &other.tree()), "bounded coverage never proves another selection complete");
     }
-    assert_eq!(tree.current_snapshot().await?.states.len(), 1);
+    assert_eq!(tree.current_snapshot().await?.entries.len(), 1);
     connection.subscription_handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
     Ok(())

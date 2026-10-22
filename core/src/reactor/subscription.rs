@@ -33,13 +33,13 @@ impl std::fmt::Display for ReactorSubscriptionId {
 }
 
 /// Inner state for ReactorSubscription
-pub(super) struct ReactorSubInner<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> {
+pub(super) struct ReactorSubInner<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> {
     pub(super) subscription_id: ReactorSubscriptionId,
     pub(super) reactor: Reactor<E, Ev>,
     pub(super) broadcast: Broadcast<ReactorUpdate<E, Ev>>,
 }
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Drop for ReactorSubInner<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> Drop for ReactorSubInner<E, Ev> {
     fn drop(&mut self) {
         // Automatically unsubscribe when the ReactorSubscription is dropped
         let _ = self.reactor.unsubscribe(self.subscription_id);
@@ -49,12 +49,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 /// A handle to a reactor subscription that automatically cleans up on drop
 pub struct ReactorSubscription<
     E: AbstractEntity + Filterable + Send + 'static = crate::entity::Entity,
-    Ev: Clone + Send + 'static = ankurah_proto::Attested<ankurah_proto::Event>,
+    Ev: crate::reactor::ReactorEvent = ankurah_proto::Attested<ankurah_proto::Event>,
 >(pub(super) Arc<ReactorSubInner<E, Ev>>);
 
 // TODO Consider adding a weak ref and combining this with subscription_state::Subscription
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> ReactorSubscription<E, Ev> {
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
@@ -113,12 +113,12 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
     }
 }
 
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Clone for ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> Clone for ReactorSubscription<E, Ev> {
     fn clone(&self) -> Self { ReactorSubscription(self.0.clone()) }
 }
 
 // Implement Subscribe trait for ReactorUpdate
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Subscribe<ReactorUpdate<E, Ev>>
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> Subscribe<ReactorUpdate<E, Ev>>
     for ReactorSubscription<E, Ev>
 {
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
@@ -131,7 +131,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 // Implement Signal trait - Listener<()> is automatically converted to Listener::Unit
 // This allows ReactorSubscription to be tracked by React observers without cloning ReactorUpdate
-impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static> Signal for ReactorSubscription<E, Ev> {
+impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> Signal for ReactorSubscription<E, Ev> {
     fn listen(&self, listener: ankurah_signals::signal::Listener) -> ListenerGuard {
         use ankurah_signals::broadcast::BroadcastListener;
         self.0.broadcast.reference().listen(BroadcastListener::NotifyOnly(Arc::new(move || listener(())))).into()

@@ -86,7 +86,7 @@ async fn comparison_membership_removes_denied_cached_rows_from_fetch_and_liveque
 }
 
 #[tokio::test]
-async fn snapshot_pages_validate_received_state_attestations_before_fetch_succeeds() -> Result<()> {
+async fn current_snapshot_repairs_validate_received_state_attestations_before_fetch_succeeds() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     server.system.create().await?;
     let writer = server.context_async(DEFAULT_CONTEXT).await?;
@@ -107,8 +107,10 @@ async fn snapshot_pages_validate_received_state_attestations_before_fetch_succee
             };
             if let Some(proto::StateFrame { body: proto::StateFrameBody::State { items, .. }, .. }) = frame {
                 for item in items {
-                    if let proto::StateItem::Snapshots(page) = item {
-                        pages.lock().unwrap().push(page.clone());
+                    if let proto::StateItem::Repair { delta, .. } = item {
+                        if let proto::DeltaContent::StateSnapshot { state } = &delta.content {
+                            pages.lock().unwrap().push((delta.entity_id, state.clone()));
+                        }
                     }
                 }
             }
@@ -117,9 +119,9 @@ async fn snapshot_pages_validate_received_state_attestations_before_fetch_succee
     })
     .await;
     let reader = client.context_async(DEFAULT_CONTEXT).await?;
-    assert!(reader.fetch::<PetView>("true").await.is_err(), "rejected state attestation must fail the snapshot-page fetch");
-    assert!(pages.lock().unwrap().iter().any(|page| page.states.iter().any(|state| state.payload.entity_id == id)));
-    assert!(agent.received_state_checks.lock().unwrap().contains(&id), "SnapshotPage must reach ordinary received-state validation");
+    assert!(reader.fetch::<PetView>("true").await.is_err(), "rejected state attestation must fail the snapshot repair fetch");
+    assert!(pages.lock().unwrap().iter().any(|(entity_id, _)| *entity_id == id));
+    assert!(agent.received_state_checks.lock().unwrap().contains(&id), "Snapshot repair must reach ordinary received-state validation");
     assert!(
         matches!(client.storage.get_state(id).await, Err(ankurah::core::error::RetrievalError::EntityNotFound(missing)) if missing == id)
     );

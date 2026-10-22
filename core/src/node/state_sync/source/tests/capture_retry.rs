@@ -2,8 +2,9 @@ use super::*;
 use crate::{
     error::RequestError,
     livequery::{EntityLiveQuery, QueryResolution},
-    node::{source_publications::MAX_PENDING_BATCHES, CachePolicy},
+    node::CachePolicy,
     peer_subscription::Status,
+    reactor::maintenance::MAX_PENDING_BATCHES,
 };
 
 type Messages = Arc<std::sync::Mutex<Vec<proto::NodeMessage>>>;
@@ -98,8 +99,8 @@ async fn catalog_change_during_fetch_capture_reopens_the_source() -> anyhow::Res
     add_catalog_model(&node, "fetch_capture_fixture").await?;
     release.send(()).unwrap();
     let captured = capture.await?;
-    assert_eq!(captured.snapshot.states.len(), 1);
-    assert_eq!(captured.snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&initial));
+    assert_eq!(captured.snapshot.entries.len(), 1);
+    assert_eq!(captured.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed) - scans, 2, "the raced admission must be read again");
     assert_eq!(node.resident_trees.len(), 1, "only the replacement admission may be reusable");
     Ok(())
@@ -154,8 +155,8 @@ async fn catalog_churn_bounds_capture_retries_and_later_capture_recovers() -> an
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
     assert_eq!(node.resident_trees.len(), 0);
     let current = node.resident_trees.capture(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
-    assert_eq!(current.snapshot.states.len(), 1);
-    assert!(current.snapshot.states.contains_key(&initial.entity_id));
+    assert_eq!(current.snapshot.entries.len(), 1);
+    assert!(current.snapshot.entries.contains_key(&initial.entity_id));
     Ok(())
 }
 
@@ -166,9 +167,9 @@ async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() 
     let captured = capture_query(
         &node,
         selected.clone(),
-        QueryTreeCache::spec(&selected, &node.catalog),
+        QueryTree::spec(&selected, &node.catalog),
         vec![DEFAULT_CONTEXT],
-        Arc::new(QueryTreeCache::default()),
+        Arc::new(QueryTree::default()),
     )
     .await?;
     let mut source = QuerySource::from_capture(vec![DEFAULT_CONTEXT], captured);
@@ -276,7 +277,7 @@ async fn fetch_bounds_busy_retries_and_can_be_retried_after_quiescence() -> anyh
 async fn unavailable_source_is_terminal_for_initial_query_and_fetch() -> anyhow::Result<()> {
     let (server, client, messages) = pair().await?;
     // An unknown commit outcome cannot be repaired by retrying a capture.
-    drop(server.source_publications.begin_commit().await);
+    drop(server.reactor.begin_commit().await);
     let query = query(&client, selection(None))?;
     let error = tokio::time::timeout(std::time::Duration::from_secs(2), query.wait_durable_answered()).await?.unwrap_err();
     assert!(matches!(error, RetrievalError::RequestError(RequestError::ServerError(_))));

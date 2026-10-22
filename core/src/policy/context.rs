@@ -117,25 +117,13 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
 
     /// Apply the retrieval predicate and additional read checks to an entity already available locally.
     pub fn check_read(&self, id: &EntityId, state: &State) -> Result<(), AccessDenied> {
-        self.check_read_with(id, state, || TemporaryEntity::new(*id, state))
-    }
-
-    pub(crate) fn check_read_captured(&self, entity: &crate::entity::CapturedEntity) -> Result<(), AccessDenied> {
-        self.check_read_with(&entity.entity_id, &entity.state, || entity.read())
-    }
-
-    fn check_read_with<I: crate::selection::filter::Filterable>(
-        &self,
-        id: &EntityId,
-        state: &State,
-        read: impl FnOnce() -> Result<I, crate::error::RetrievalError>,
-    ) -> Result<(), AccessDenied> {
         if state.memberships.iter().any(crate::schema::reads_bypass_policy) {
             return Ok(());
         }
         let predicate = self.retrieval_predicate();
         if *predicate != Predicate::True {
-            let entity = read().map_err(|_| AccessDenied::ByPolicy("Read predicate entity state could not be evaluated"))?;
+            let entity = TemporaryEntity::new(*id, state)
+                .map_err(|_| AccessDenied::ByPolicy("Read predicate entity state could not be evaluated"))?;
             match evaluate_predicate(&entity, &predicate) {
                 Ok(true) => {}
                 Ok(false) => return Err(AccessDenied::ByPolicy("Entity is outside the retrieval predicate")),
@@ -187,18 +175,6 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
     pub fn check_read_event(&self, event: &Attested<Event>, state: &State) -> Result<(), AccessDenied> {
         self.check_read(&event.payload.entity_id, state)?;
         self.check_event_permission(event, state)
-    }
-
-    pub(crate) fn check_read_captured_event(
-        &self,
-        event: &Attested<Event>,
-        entity: &crate::entity::CapturedEntity,
-    ) -> Result<(), AccessDenied> {
-        if event.payload.entity_id != entity.entity_id {
-            return Err(AccessDenied::ByPolicy("Event and captured entity do not match"));
-        }
-        self.check_read_captured(entity)?;
-        self.check_event_permission(event, &entity.state)
     }
 
     fn check_event_permission(&self, event: &Attested<Event>, state: &State) -> Result<(), AccessDenied> {

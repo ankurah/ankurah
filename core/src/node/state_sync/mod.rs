@@ -18,7 +18,7 @@ pub(crate) use server::{
     abandon_state_stream, continue_state, finish_state_round, kick_state_stream, prepare_state_stream, queue_live, queue_round,
     source_unavailable, start_state_stream, state_stream_bypasses_policy, PendingStateStream, StateStreams,
 };
-pub(crate) use tree::{QueryTreeCache, Snapshot};
+pub(crate) use tree::{QueryTree, Snapshot};
 
 // Local responder limits, deliberately absent from the wire request.
 const PAGE_BYTES: usize = 64 * 1024;
@@ -29,7 +29,6 @@ const PAGE_WORK: usize = 32;
 const HEAD_PAGE: usize = 128;
 const INITIAL_INVENTORY_BYTES: usize = 256 * 1024;
 const INITIAL_INVENTORY_HEADS: usize = 2048;
-const MAX_SNAPSHOT_ROWS: usize = 128;
 const MAX_REPAIR_BYTES: usize = 64 * 1024 * 1024;
 const FRAME_BYTES: usize = PAGE_BYTES + 4096;
 const WINDOW_BYTES: usize = 4 * 1024 * 1024;

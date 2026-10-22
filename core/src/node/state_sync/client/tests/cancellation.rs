@@ -142,8 +142,8 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     let (server, client, query, messages) = stream_fixture_with_gate(gate.clone()).await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTreeCache::default()
-        .refresh(super::super::super::QueryTreeCache::spec(&selection, &client.catalog), states)
+    let mut snapshot = super::super::super::QueryTree::default()
+        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
         .await?;
     // Force real refinement work beyond frame zero while holding its continuations.
     let mut start = super::super::super::whole().start;
@@ -247,8 +247,8 @@ async fn fetch_validation_error_abandons_once() -> anyhow::Result<()> {
     let (server, client, query, messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTreeCache::default()
-        .refresh(super::super::super::QueryTreeCache::spec(&selection, &client.catalog), states)
+    let mut snapshot = super::super::super::QueryTree::default()
+        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
         .await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) =
@@ -270,8 +270,8 @@ async fn queued_fetch_cleanup_cannot_send_on_a_replacement_connection() -> anyho
     let (server, client, query, messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTreeCache::default()
-        .refresh(super::super::super::QueryTreeCache::spec(&selection, &client.catalog), states)
+    let mut snapshot = super::super::super::QueryTree::default()
+        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
         .await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (mut stream, response) =

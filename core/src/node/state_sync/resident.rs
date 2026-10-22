@@ -1,11 +1,12 @@
 //! One node-local LRU for every caller and responder using a digest tree.
 use super::{
     source::{self, Coverage, QuerySource, Route},
-    QueryTreeCache, Snapshot,
+    QueryTree, Snapshot,
 };
 use crate::{
-    node::{source_publications::SourceError, Node, WeakNode},
+    node::{Node, WeakNode},
     policy::{ContextPolicy, PolicyAgent},
+    reactor::maintenance::SourceError,
     session::ContextData,
     storage::StorageEngine,
 };
@@ -78,7 +79,7 @@ struct Resident<CD: ContextData> {
     alive: AtomicBool,
     pins: AtomicUsize,
     #[cfg(test)]
-    tree: Arc<QueryTreeCache>,
+    tree: Arc<QueryTree>,
     cache: Weak<Mutex<Entries<CD>>>,
 }
 impl<CD: ContextData> Drop for Resident<CD> {
@@ -156,7 +157,7 @@ impl<CD: ContextData> ResidentLease<CD> {
         Ok((reply, subscription))
     }
     #[cfg(test)]
-    pub(crate) fn tree(&self) -> Arc<QueryTreeCache> { self.0.tree.clone() }
+    pub(crate) fn tree(&self) -> Arc<QueryTree> { self.0.tree.clone() }
 }
 impl<CD: ContextData> Clone for ResidentLease<CD> {
     fn clone(&self) -> Self { Self::new(self.0.clone(), self.1.clone()) }
@@ -191,7 +192,7 @@ impl<CD: ContextData> ResidentSubscription<CD> {
         result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))?
     }
     #[cfg(test)]
-    pub(crate) fn tree(&self) -> Arc<QueryTreeCache> { self.lease.tree() }
+    pub(crate) fn tree(&self) -> Arc<QueryTree> { self.lease.tree() }
 }
 impl<CD: ContextData> Drop for ResidentSubscription<CD> {
     fn drop(&mut self) {
@@ -318,8 +319,8 @@ impl<CD: ContextData> ResidentTrees<CD> {
         let mut filtered = selection.clone();
         filtered.predicate = policy.filter_predicate(filtered.predicate)?;
         let wire_required = spec.is_some();
-        let spec = spec.unwrap_or_else(|| QueryTreeCache::spec(&selection, &node.catalog));
-        anyhow::ensure!(QueryTreeCache::serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
+        let spec = spec.unwrap_or_else(|| QueryTree::spec(&selection, &node.catalog));
+        anyhow::ensure!(QueryTree::serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
         let requested = Identity {
             coverage: Coverage::for_selection(&selection),
             selection,
@@ -351,7 +352,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
             Coverage::Limited(_) => (requested.selection.clone(), requested.filtered.clone()),
         };
         let identity = Identity { selection, filtered, spec, ..requested };
-        let tree = Arc::new(QueryTreeCache::default());
+        let tree = Arc::new(QueryTree::default());
         let captured = source::capture_filtered_query(
             node,
             identity.filtered.clone(),
@@ -441,7 +442,7 @@ impl<CD: ContextData> Entries<CD> {
                 && existing.credentials == requested.credentials
                 && existing.retrieval == requested.retrieval
                 && (!wire_required || existing.spec.key_spec() == requested.spec.key_spec())
-                && compatible_selection(&existing.spec, requested, catalog)
+                && compatible_selection(existing, requested, catalog)
                 && compatible_access(existing, requested, catalog)
         };
         let position = self
@@ -484,19 +485,28 @@ impl<CD: ContextData> Entries<CD> {
 }
 
 fn compatible_selection<CD: ContextData>(
-    spec: &TreeSpec,
+    existing: &Identity<CD>,
     requested: &Identity<CD>,
     catalog: &crate::schema::catalog::CatalogManager,
 ) -> bool {
-    if !QueryTreeCache::serves(spec, &requested.selection, catalog) {
+    let spec = &existing.spec;
+    if !QueryTree::serves(spec, &requested.selection, catalog) {
         return false;
     }
-    // An opaque-ordering fallback is only reused for its own admission/layout.
-    // It must not turn a failed scalar range/order proof into a cache hit.
-    match QueryTreeCache::request(&requested.selection, catalog) {
-        Ok(request) if spec.serves(&request).is_some() => true,
-        _ => *spec == requested.spec && (requested.selection.limit.is_none() || spec.key_spec().keyparts.is_empty()),
+    if matches!(existing.coverage, Coverage::Limited(_)) || requested.selection.limit.is_none() {
+        return true;
     }
+    // A shared complete index must answer the rank cut from its own keys.
+    // Opaque ordering and descending nullable fields need a separate bounded
+    // resident, whose storage refill cannot stall this tree's other owners.
+    if requested.selection.order_by.iter().flatten().any(|item| {
+        item.direction == ankql::ast::OrderDirection::Desc
+            && item.path != ankql::ast::PropertyPath::id()
+            && (!item.path.subpath.is_empty() || requested.selection.predicate.assume_null(&[item.path.property_id()]) != Predicate::False)
+    }) {
+        return false;
+    }
+    QueryTree::request(&requested.selection, catalog).ok().is_some_and(|request| spec.serves(&request).is_some())
 }
 
 /// A policy may depend on the requested predicate. A shared resident is safe
@@ -516,7 +526,7 @@ fn compatible_access<CD: ContextData>(
     let mut filtered = requested.filtered.clone();
     filtered.limit = None;
     filtered.order_by = None;
-    QueryTreeCache::request(&filtered, catalog).ok().and_then(|request| intersection.serves(&request)) == Some(TreeMatch::Whole)
+    QueryTree::request(&filtered, catalog).ok().and_then(|request| intersection.serves(&request)) == Some(TreeMatch::Whole)
 }
 
 async fn run_resident<SE, PA>(
@@ -542,7 +552,7 @@ where
                     node.system.check_not_halted()?;
                     scope.check(&node)?;
                     let snapshot = actor.refresh(&node).await?;
-                    actor.check_authorization(&node)?;
+                    actor.check_authorization(&node).await?;
                     let entries = entries.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                     entries.lock().unwrap().update_bytes(id, actor.accounted_bytes())?;
                     Ok::<_, anyhow::Error>(snapshot)

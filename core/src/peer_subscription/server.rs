@@ -1,8 +1,8 @@
+use crate::reactor::maintenance::SourceError;
 use crate::{
     error::SubscriptionError,
     node::{
-        source_publications::SourceError,
-        state_sync::{QueryTreeCache, ResidentSubscription},
+        state_sync::{QueryTree, ResidentSubscription},
         Node,
     },
     policy::PolicyAgent,
@@ -64,7 +64,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if let Some(standing) = queries.get(&query_id) {
             anyhow::ensure!(version >= standing.version, "stale subscription version {version}; current version is {}", standing.version);
         }
-        let spec = QueryTreeCache::offered_spec(&selection, &node.catalog, &known_state)?;
+        let spec = QueryTree::offered_spec(&selection, &node.catalog, &known_state)?;
         let catalog = crate::schema::is_catalog_read(&selection.predicate);
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
         let sessions = cdata.cloned().map(SessionSet::from).unwrap_or_else(SessionSet::new);
@@ -134,7 +134,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
 
 #[cfg(test)]
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<QueryTreeCache>)> {
+    pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<QueryTree>)> {
         self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.subscription.tree()))
     }
 }

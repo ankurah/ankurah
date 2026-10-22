@@ -257,7 +257,6 @@ enum Work {
     InitialHeads(InitialHeads),
     AnswerHeads { page: proto::TreeSpanInventory, rest: Option<TreeSpan> },
     SendHeads(TreeSpan),
-    SendSnapshots(TreeSpan),
     Item(StateItem),
     Repair(proto::EntityId, Option<proto::Clock>),
     History { entity_id: proto::EntityId, target: proto::Clock },
@@ -275,11 +274,14 @@ struct Comparison {
     head_requests: Vec<TreeSpan>,
     repaired: HashSet<proto::EntityId>,
     known_clocks: HashMap<proto::EntityId, proto::InventoryClock>,
-    offered: HashMap<proto::EntityId, proto::Clock>,
-    pending_repairs: HashSet<proto::EntityId>,
-    repair_attempts: HashMap<proto::EntityId, usize>,
+    offered: HashSet<Vec<u8>>,
+    pending_repairs: HashSet<Vec<u8>>,
+    repair_attempts: HashMap<Vec<u8>, usize>,
     complete: bool,
     unavailable: bool,
+}
+fn target_id(entity: proto::EntityId, head: &proto::Clock) -> Vec<u8> {
+    bincode::serialize(&(entity, head)).expect("causal target serializes")
 }
 fn range_id(range: &TreeSpan) -> Vec<u8> { bincode::serialize(range).expect("address bounds serialize") }
 impl Stream {
@@ -494,7 +496,7 @@ impl Stream {
     {
         let Some(work) = self.live_repairs.pop_front() else { return Ok(None) };
         let item = match work {
-            Work::History { entity_id, target } => match target_history(node, entity_id, &target, None, credentials, catalog).await {
+            Work::History { entity_id, target } => match target_history(node, entity_id, &target, credentials, catalog).await {
                 Ok(events) => {
                     let content = proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() };
                     let bytes = bincode::serialize(&content)?;
@@ -586,8 +588,7 @@ impl<CD: ContextData> PendingStateStream<CD> {
         let mut state = self.session.state.lock().await;
         let round = self.session.initial_round;
         let comparison = state.comparison.as_mut().ok_or_else(|| anyhow::anyhow!("initial comparison unavailable"))?;
-        let body =
-            comparison.reply(node, &self.session.credentials, self.session.catalog, self.session.query.is_some(), round.number).await?;
+        let body = comparison.reply(node, &self.session.credentials, self.session.catalog, round.number).await?;
         ensure!(
             node.peer_connections.get(&self.peer).is_some_and(|current| Arc::ptr_eq(&current, &connection))
                 && connection.state_streams.get(&self.id).is_some_and(|current| Arc::ptr_eq(&current, &self.session)),
@@ -1092,8 +1093,7 @@ where
                         let round = state.round.number;
                         if let Some(comparison) = state.comparison.as_mut() {
                             if !comparison.work.is_empty() && !comparison.waiting_for_capacity() {
-                                let body =
-                                    comparison.reply(node, &session.credentials, session.catalog, session.query.is_some(), round).await?;
+                                let body = comparison.reply(node, &session.credentials, session.catalog, round).await?;
                                 chosen = Some((body, priority));
                             }
                         }
@@ -1246,7 +1246,6 @@ async fn target_history<SE, PA>(
     node: &Node<SE, PA>,
     entity_id: proto::EntityId,
     target: &proto::Clock,
-    snapshot: Option<&Snapshot>,
     credentials: &Vec<PA::ContextData>,
     catalog: bool,
 ) -> anyhow::Result<Vec<proto::Attested<proto::Event>>>
@@ -1255,18 +1254,9 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-    let owned;
-    let state = match snapshot.and_then(|snapshot| snapshot.states.get(&entity_id)) {
-        Some(state) => state.payload.as_ref(),
-        None => {
-            owned = crate::entity::CapturedEntity::new(
-                node_state(node, entity_id, &policy).await?.ok_or_else(|| anyhow::anyhow!("repair state unavailable"))?.payload,
-            );
-            &owned
-        }
-    };
-    policy.check_read_captured(state)?;
-    ensure!(!catalog || state.state.memberships.iter().any(crate::schema::reads_bypass_policy), "repair is outside catalog scope");
+    let state = node_state(node, entity_id, &policy).await?.ok_or_else(|| anyhow::anyhow!("repair state unavailable"))?;
+    policy.check_read(&entity_id, &state.payload.state)?;
+    ensure!(!catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy), "repair is outside catalog scope");
     ensure!(!target.is_empty(), "empty causal repair target");
     let mut pending = target.entries().iter().map(|(generation, id)| (id.clone(), *generation)).collect::<HashMap<_, _>>();
     let mut visited = HashSet::new();
@@ -1283,7 +1273,7 @@ where
             ensure!(batch.get(&id) == Some(&event.payload.generation()), "causal repair event or generation mismatch");
             ensure!(event.payload.entity_id == entity_id, "causal repair entity mismatch");
             event.payload.validate_structure()?;
-            policy.check_read_captured_event(&event, state)?;
+            policy.check_read_event(&event, &state.payload.state)?;
             if !visited.insert(id.clone()) {
                 continue;
             }
@@ -1345,7 +1335,7 @@ impl Comparison {
             head_requests: Vec::new(),
             repaired: HashSet::new(),
             known_clocks: HashMap::new(),
-            offered: HashMap::new(),
+            offered: HashSet::new(),
             pending_repairs: HashSet::new(),
             repair_attempts: HashMap::new(),
             complete: false,
@@ -1383,7 +1373,7 @@ impl Comparison {
                 frontier = None;
                 let gap = TreeSpan::new(start.clone(), opposite(&bounds.start));
                 if !gap.is_empty() {
-                    comparison.work.push_back(Work::SendSnapshots(gap));
+                    comparison.work.push_back(Work::SendHeads(gap));
                 }
             }
             start = opposite(&bounds.end);
@@ -1411,7 +1401,7 @@ impl Comparison {
         if !matches!(start, std::ops::Bound::Unbounded) {
             let rest = TreeSpan::new(start, super::whole().end);
             if !rest.is_empty() {
-                comparison.work.push_back(Work::SendSnapshots(rest));
+                comparison.work.push_back(Work::SendHeads(rest));
             }
         } else if let Some(frontier) = frontier.filter(|heads| heads.len() > 1) {
             comparison.work.clear();
@@ -1425,15 +1415,16 @@ impl Comparison {
         for answer in answers {
             match answer {
                 StateAnswer::NeedRepair { entity_id, target } => {
-                    ensure!(self.offered.get(&entity_id) == Some(&target), "unsolicited causal repair target");
-                    if self.pending_repairs.contains(&entity_id) {
+                    let key = target_id(entity_id, &target);
+                    ensure!(self.offered.contains(&key), "unsolicited causal repair target");
+                    if self.pending_repairs.contains(&key) {
                         continue;
                     }
                     ensure!(self.pending_repairs.len() < 128, "too many pending causal repairs");
-                    let attempts = self.repair_attempts.entry(entity_id).or_default();
+                    let attempts = self.repair_attempts.entry(key.clone()).or_default();
                     *attempts += 1;
                     ensure!(*attempts <= 8, "causal repair retry budget exhausted");
-                    self.pending_repairs.insert(entity_id);
+                    self.pending_repairs.insert(key);
                     self.work.push_front(Work::History { entity_id, target });
                 }
                 StateAnswer::Digest(head) => {
@@ -1496,19 +1487,27 @@ impl Comparison {
         let count = page.heads.len().min(HEAD_PAGE);
         for _ in 0..count {
             let leaf = page.heads.next().expect("bounded by remaining rows");
-            if !self.snapshot.states.contains_key(&leaf.entity.entity_id) {
+            if !self.snapshot.entries.contains_key(&leaf.entity.entity_id) {
                 former.push(leaf.entity.entity_id);
             }
             let address = leaf_address(leaf.key, leaf.entity.entity_id);
             let gap = TreeSpan::new(start, Excluded(address.clone()));
-            if !gap.is_empty() && self.snapshot.states_in(&gap, 1).next().is_some() {
+            if !gap.is_empty() && self.snapshot.entries_in(&gap, 1).next().is_some() {
                 flush_removal(&mut removal, &mut work);
-                work.push(Work::SendSnapshots(gap));
+                work.push(Work::SendHeads(gap));
             }
             let point = TreeSpan::new(Included(address.clone()), Included(address.clone()));
-            if let Some((_, state)) = self.snapshot.states_in(&point, 1).next() {
+            if let Some((_, entry)) = self.snapshot.entries_in(&point, 1).next() {
                 flush_removal(&mut removal, &mut work);
-                if !leaf.entity.head.equals(&state.payload.state.head) {
+                if !leaf.entity.head.equals(&entry.head) {
+                    work.push(Work::Item(StateItem::Heads(proto::TreeSpanInventory {
+                        bounds: point,
+                        heads: vec![proto::KeyedEntityHead {
+                            key: entry.key.clone(),
+                            entity: proto::EntityHead { entity_id: entry.entity_id, head: entry.head.clone() },
+                        }]
+                        .into(),
+                    })));
                     work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head.to_owned())));
                 }
             } else {
@@ -1531,8 +1530,8 @@ impl Comparison {
             TreeSpan::new(page.bounds.start.clone(), Included(last.clone()))
         };
         let gap = TreeSpan::new(start.clone(), processed_bounds.end.clone());
-        if !gap.is_empty() && self.snapshot.states_in(&gap, 1).next().is_some() {
-            work.push(Work::SendSnapshots(gap));
+        if !gap.is_empty() && self.snapshot.entries_in(&gap, 1).next().is_some() {
+            work.push(Work::SendHeads(gap));
         }
         // Splitting a valid region can repeat long keys in its bounds. Keep
         // the original regional exchange when those patches cannot fit.
@@ -1540,8 +1539,8 @@ impl Comparison {
         for item in &work {
             fits &= match item {
                 Work::Item(item) => bincode::serialized_size(item)? <= PAGE_BYTES as u64,
-                Work::SendSnapshots(bounds) => {
-                    let item = StateItem::Snapshots(proto::SnapshotPage { bounds: bounds.clone(), states: Vec::new() });
+                Work::SendHeads(bounds) => {
+                    let item = StateItem::Heads(proto::TreeSpanInventory { bounds: bounds.clone(), heads: Default::default() });
                     bincode::serialized_size(&item)? <= (PAGE_BYTES / 2) as u64
                 }
                 _ => true,
@@ -1603,77 +1602,11 @@ impl Comparison {
         Ok(())
     }
 
-    fn snapshot_page<SE, PA>(
-        &mut self,
-        node: &Node<SE, PA>,
-        credentials: &Vec<PA::ContextData>,
-        catalog: bool,
-        bounds: TreeSpan,
-    ) -> anyhow::Result<StateItem>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-    {
-        use std::ops::Bound::Included;
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-        let rows = self.snapshot.states_in(&bounds, super::MAX_SNAPSHOT_ROWS + 1).collect::<Vec<_>>();
-        let mut states = Vec::new();
-        let mut bytes = 0;
-        let mut last = None;
-        for (address, state) in rows.iter().take(super::MAX_SNAPSHOT_ROWS) {
-            let id = state.payload.entity_id;
-            policy.check_read_captured(&state.payload)?;
-            ensure!(
-                !catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy),
-                "snapshot page is outside catalog scope"
-            );
-            let clipped = TreeSpan::new(bounds.start.clone(), Included(address.to_vec()));
-            // Reserve the larger possible page end, plus the item tag and vector length.
-            let overhead = 12 + bincode::serialized_size(&bounds)?.max(bincode::serialized_size(&clipped)?) as usize;
-            let size = bincode::serialized_size(state)? as usize;
-            let known = self.known_clocks.get(&id).map(proto::InventoryClock::to_owned);
-            if known.is_some() || overhead + bytes + size > PAGE_BYTES / 2 {
-                if !states.is_empty() {
-                    break;
-                }
-                // A moved member may have supplied its clock in another range.
-                // Keep that bridge choice, and use the same fallback for a row
-                // too large to fit inline. Only this one row needs Leaves/Repair.
-                let end = if rows.len() == 1 { bounds.end.clone() } else { Included(address.to_vec()) };
-                let page_bounds = TreeSpan::new(bounds.start.clone(), end);
-                if page_bounds.end != bounds.end {
-                    self.work.push_front(Work::SendSnapshots(bounds.after(address)));
-                }
-                self.work.push_front(Work::Repair(id, known));
-                return Ok(StateItem::Heads(proto::TreeSpanInventory {
-                    bounds: page_bounds,
-                    heads: vec![proto::KeyedEntityHead {
-                        key: address[..address.len() - proto::EntityId::BYTE_LEN].to_vec(),
-                        entity: proto::EntityHead { entity_id: id, head: state.payload.state.head.clone() },
-                    }]
-                    .into(),
-                }));
-            }
-            bytes += size;
-            last = Some(address.to_vec());
-            states.push((*state).to_owned());
-        }
-        let end = if states.len() == rows.len() {
-            bounds.end.clone()
-        } else {
-            let last = last.expect("a partial snapshot page contains at least one row");
-            self.work.push_front(Work::SendSnapshots(bounds.after(&last)));
-            Included(last)
-        };
-        Ok(StateItem::Snapshots(proto::SnapshotPage { bounds: TreeSpan::new(bounds.start, end), states }))
-    }
-
     async fn reply<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
         credentials: &Vec<PA::ContextData>,
         catalog: bool,
-        standing_query: bool,
         round: u64,
     ) -> anyhow::Result<StateFrameBody>
     where
@@ -1701,9 +1634,8 @@ impl Comparison {
                 | Work::Compare { .. }
                 | Work::Expand { .. }
                 | Work::SendHeads(_)
-                | Work::SendSnapshots(_) => true,
-                Work::Repair(id, known) => known.is_some() || !self.snapshot.states.contains_key(id),
-                Work::History { .. } => true,
+                | Work::Repair(..)
+                | Work::History { .. } => true,
                 _ => false,
             };
             if expensive {
@@ -1714,27 +1646,25 @@ impl Comparison {
                 tree_or_history_work += 1;
             }
             let item = match work {
-                Work::History { entity_id, target } => {
-                    match target_history(node, entity_id, &target, Some(&self.snapshot), credentials, catalog).await {
-                        Ok(events) => {
-                            let delta = proto::EntityDelta {
-                                entity_id,
-                                content: proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() },
-                            };
-                            let bytes = bincode::serialize(&delta.content)?;
-                            if bytes.len() > PAGE_BYTES / 2 {
-                                self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
-                                None
-                            } else {
-                                Some(StateItem::Repair { target, delta })
-                            }
-                        }
-                        Err(error) => {
-                            tracing::debug!(%entity_id, %error, "required causal repair unavailable");
-                            Some(StateItem::RepairUnavailable { entity_id, target })
+                Work::History { entity_id, target } => match target_history(node, entity_id, &target, credentials, catalog).await {
+                    Ok(events) => {
+                        let delta = proto::EntityDelta {
+                            entity_id,
+                            content: proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() },
+                        };
+                        let bytes = bincode::serialize(&delta.content)?;
+                        if bytes.len() > PAGE_BYTES / 2 {
+                            self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
+                            None
+                        } else {
+                            Some(StateItem::Repair { target, delta })
                         }
                     }
-                }
+                    Err(error) => {
+                        tracing::debug!(%entity_id, %error, "required causal repair unavailable");
+                        Some(StateItem::RepairUnavailable { entity_id, target })
+                    }
+                },
                 Work::CompareFrontier(frontier) => {
                     let digest = ankurah_digest_tree::Digest::checked_sum(frontier.iter().map(|head| head.digest))?;
                     if self.snapshot.span_digest(super::whole()).await?.digest == digest {
@@ -1748,10 +1678,10 @@ impl Comparison {
                 }
                 Work::Compare { head: known, prefix } => {
                     if known.digest == ankurah_digest_tree::Digest::empty() {
-                        if self.snapshot.states_in(&known.bounds, 1).next().is_none() {
+                        if self.snapshot.entries_in(&known.bounds, 1).next().is_none() {
                             None
                         } else {
-                            self.work.push_front(Work::SendSnapshots(known.bounds));
+                            self.work.push_front(Work::SendHeads(known.bounds));
                             None
                         }
                     } else {
@@ -1822,24 +1752,24 @@ impl Comparison {
                     }
                     Some(StateItem::Heads(page))
                 }
-                Work::SendSnapshots(bounds) => Some(self.snapshot_page(node, credentials, catalog, bounds)?),
                 Work::Item(item) => Some(item),
                 Work::Repair(id, known) => {
                     if !self.repaired.insert(id) {
                         continue;
                     }
                     let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-                    let state: Option<proto::Attested<proto::EntityState>> = match self.snapshot.states.get(&id) {
-                        Some(state) => Some(state.as_ref().to_owned()),
-                        None => node_state(node, id, &policy).await?,
-                    };
-                    let Some(state) = state else { continue };
-                    if catalog && !state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy) {
+                    let state = node_state(node, id, &policy).await?;
+                    let allowed = state.as_ref().is_some_and(|state| {
+                        (!catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy))
+                            && policy.check_read(&id, &state.payload.state).is_ok()
+                    });
+                    if !allowed {
+                        if let Some(entry) = self.snapshot.entries.get(&id) {
+                            self.work.push_front(Work::Item(StateItem::RepairUnavailable { entity_id: id, target: entry.head.clone() }));
+                        }
                         continue;
                     }
-                    if policy.check_read(&id, &state.payload.state).is_err() {
-                        continue;
-                    }
+                    let state = state.expect("authorized state exists");
                     let target = state.payload.state.head.clone();
                     let snapshot = known.as_ref().map(|_| proto::DeltaContent::StateSnapshot { state: state.clone().into() });
                     let known = known.map(|head| HashMap::from([(id, head)])).unwrap_or_default();
@@ -1887,26 +1817,27 @@ impl Comparison {
                 }
                 bytes += size;
                 match &item {
-                    StateItem::Snapshots(page) => {
-                        for state in &page.states {
-                            let id = state.payload.entity_id;
-                            self.repaired.insert(id);
-                            self.offered.insert(id, state.payload.state.head.clone());
+                    StateItem::Heads(page) => {
+                        let mut cursor = page.heads.cursor();
+                        while let Some(leaf) = cursor.next() {
+                            self.offered.insert(target_id(leaf.entity.entity_id, &leaf.entity.head.to_owned()));
                         }
                     }
                     StateItem::Repair { target, delta } => {
-                        self.offered.insert(delta.entity_id, target.clone());
-                        self.pending_repairs.remove(&delta.entity_id);
+                        let key = target_id(delta.entity_id, target);
+                        self.offered.insert(key.clone());
+                        self.pending_repairs.remove(&key);
                     }
                     StateItem::RepairChunk { target, chunk } => {
-                        self.offered.insert(chunk.entity_id, target.clone());
+                        let key = target_id(chunk.entity_id, target);
+                        self.offered.insert(key.clone());
                         if chunk.last {
-                            self.pending_repairs.remove(&chunk.entity_id);
+                            self.pending_repairs.remove(&key);
                         }
                     }
-                    StateItem::RepairUnavailable { entity_id, .. } => {
+                    StateItem::RepairUnavailable { entity_id, target } => {
                         self.unavailable = true;
-                        self.pending_repairs.remove(entity_id);
+                        self.pending_repairs.remove(&target_id(*entity_id, target));
                     }
                     _ => {}
                 }
@@ -1916,11 +1847,6 @@ impl Comparison {
         }
         let finished = self.work.is_empty() && self.summaries.is_empty() && self.head_requests.is_empty();
         let first_complete = finished && !self.complete;
-        if first_complete && standing_query && !self.unavailable && self.snapshot.states.len() > INITIAL_INVENTORY_HEADS {
-            // Build before handoff above the initial inventory count limit.
-            // Smaller inventories and Fetch keep construction on demand.
-            self.snapshot.span_digest(super::whole()).await?;
-        }
         self.complete |= finished;
         Ok(StateFrameBody::State {
             round,
