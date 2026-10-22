@@ -125,6 +125,9 @@ struct PendingRound {
 }
 
 pub(super) struct Driver {
+    // Own the stream's tree, including old generations during replacement.
+    // LiveQueryInner separately keeps the active selection pinned across disconnects.
+    resident: Option<super::super::resident::ResidentPin>,
     projection: Projection,
     spec: proto::TreeSpec,
     goals: Goals,
@@ -181,6 +184,7 @@ impl Driver {
         let observed = snapshot.states.iter().map(|(id, state)| (*id, state.payload.state.head.clone())).collect();
         let (tx, refresh_rx) = tokio::sync::mpsc::channel(2);
         Ok(Self {
+            resident: snapshot.resident.clone(),
             projection: Projection::new(Round::new(round, snapshot)),
             spec,
             goals: Goals::default(),
@@ -822,6 +826,7 @@ impl Driver {
                 ensure!(pending.number == descriptor.number && descriptor.number == self.round_number + 1, "wrong round number");
                 ensure!(descriptor.revision >= self.received_revision, "round cut precedes received source publications");
                 self.received_revision = descriptor.revision;
+                self.resident = pending.snapshot.resident.clone();
                 self.projection.begin(Round::new(descriptor, pending.snapshot))?;
                 self.round_number = descriptor.number;
                 self.round_waiter = Some(pending.request);
@@ -1222,8 +1227,8 @@ impl Driver {
         let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
         let (selection, stored) = query.resolved_selection().ok_or_else(|| anyhow::anyhow!("query selection disappeared"))?;
         ensure!(stored == version, "refresh selection changed");
-        let spec = super::super::QueryTreeCache::spec(&selection, &node.catalog);
-        let mut snapshot = node.resident_trees.capture(node, selection, spec, credentials.to_vec()).await?.snapshot;
+        let mut snapshot = node.resident_trees.capture(node, selection, Some(self.spec.clone()), credentials.to_vec()).await?.snapshot;
+        query.retain_tree(version, snapshot.resident.clone());
         let known_state = snapshot.offer().await?;
         let number = self.round_number.checked_add(1).ok_or_else(|| anyhow::anyhow!("round number exhausted"))?;
         self.pending_round = Some(PendingRound { number, snapshot, request: reply });

@@ -326,21 +326,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     context.resolve_model_id::<Pet>().await?;
     agent.deny_reads.store(true, Ordering::SeqCst);
 
-    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let frames = Arc::new(Mutex::new(Vec::<proto::StateFrame>::new()));
-    let (_conn, _) = common::GatedConnection::new(&server, &client, {
-        let frames = frames.clone();
-        move |message| {
-            if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
-                frames.lock().unwrap().push(frame.clone());
-            }
-            false
-        }
-    })
-    .await;
-    client.system.wait_system_ready().await.unwrap();
-    let credentials = Vec::<&'static DefaultContext>::new();
-
+    let mut cases = Vec::new();
     for label in [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID] {
         let model = ankurah::core::schema::system_model_id(label).unwrap();
         let storage = &server.storage;
@@ -349,7 +335,8 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let mut state = states[0].clone();
         let entity_id = state.payload.entity_id;
         let known_head = state.payload.state.head.clone();
-        // Advance the stored row with an idempotent membership event to exercise a real bridge.
+        // Seed the protected catalog fixture before connecting peers or creating
+        // resident trees; direct storage writes do not publish node changes.
         let update = proto::Event::update(
             entity_id,
             known_head.clone(),
@@ -366,6 +353,25 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let events = storage.dump_entity_events(entity_id).await?;
         assert!(!events.is_empty());
 
+        cases.push((label, model, entity_id, known_head, events));
+    }
+
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let frames = Arc::new(Mutex::new(Vec::<proto::StateFrame>::new()));
+    let (_conn, _) = common::GatedConnection::new(&server, &client, {
+        let frames = frames.clone();
+        move |message| {
+            if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+                frames.lock().unwrap().push(frame.clone());
+            }
+            false
+        }
+    })
+    .await;
+    client.system.wait_system_ready().await.unwrap();
+    let credentials = Vec::<&'static DefaultContext>::new();
+
+    for (label, model, entity_id, known_head, events) in cases {
         let known_state = proto::KnownState {
             spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::MemberOf(model)),
             spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory {

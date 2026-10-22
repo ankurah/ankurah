@@ -2,8 +2,8 @@
 //!
 //! This is a source revision, not an atomic database snapshot. A query subscribes
 //! before reading, then reconciles its captured rows with the complete window up
-//! to a fence. Ranked/limited reads must instead validate an unchanged revision
-//! around the whole read, including any refill, to discover unchanged replacements.
+//! to a fence. Ordering and limits select views from that complete captured
+//! admission, including unchanged replacements when another row moves.
 use crate::{changes::EntityChange, reactor::ChangeNotification};
 use ankurah_proto::{Attested, EntityState, Event};
 use std::{
@@ -212,15 +212,7 @@ impl Drop for SourceCommit {
 
 impl SourceCursor {
     /// Close a finite read window. Publications after this fence remain queued.
-    pub(crate) async fn fence(&mut self) -> Result<SourceWindow, SourceError> { self.fence_inner(None).await }
-
-    /// Admit a ranked/limited refetch only if no source batch crossed its read.
-    /// A changed revision leaves the entire window queued for the next attempt.
-    pub(crate) async fn validate(&mut self, started: SourceRevision) -> Result<SourceWindow, SourceError> {
-        self.fence_inner(Some(started)).await
-    }
-
-    async fn fence_inner(&mut self, started: Option<SourceRevision>) -> Result<SourceWindow, SourceError> {
+    pub(crate) async fn fence(&mut self) -> Result<SourceWindow, SourceError> {
         let _gate = self.source.0.gate.lock().await;
         let source = self.source.0.state.lock().unwrap();
         if source.unavailable {
@@ -231,9 +223,6 @@ impl SourceCursor {
             return Err(error.clone());
         }
         let revision = SourceRevision(source.revision);
-        if started.is_some_and(|started| started != revision) {
-            return Err(SourceError::Changed);
-        }
         reader.bytes = 0;
         Ok(SourceWindow { revision, batches: reader.queue.drain(..).map(|(batch, _)| batch).collect() })
     }

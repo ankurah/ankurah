@@ -139,6 +139,7 @@ impl EntityLiveQuery {
     pub(crate) fn set_refresh(&self, version: u32, origin: &proto::RequestId, refresh: crate::node::state_sync::RefreshHandle) {
         self.0.set_refresh(version, origin, refresh);
     }
+    pub(crate) fn retain_tree(&self, version: u32, pin: Option<crate::node::state_sync::ResidentPin>) { self.0.retain_tree(version, pin); }
     pub(crate) fn resolved_selection(&self) -> Option<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.value() }
     pub(crate) async fn activate_remote(
         &self,

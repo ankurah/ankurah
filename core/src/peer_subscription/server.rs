@@ -74,13 +74,12 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let (state, subscription) = {
             let mut attempt = 0;
             loop {
-                let resident = node.resident_trees.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await?;
+                let resident = node.resident_trees.acquire(node, selection.clone(), Some(spec.clone()), credentials.clone()).await?;
                 let result = resident
                     .subscribe(node, self.peer_id, request.clone(), fingerprint.clone(), query_id, version, catalog, known_state.clone())
                     .await;
                 match result {
                     Err(error) if attempt == 0 && crate::node::state_sync::ResidentTrees::<CD>::can_retry(&error) => {
-                        node.resident_trees.discard_failed(&resident);
                         attempt += 1;
                     }
                     result => break result?,

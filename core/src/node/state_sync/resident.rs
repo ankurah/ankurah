@@ -10,6 +10,7 @@ use crate::{
     storage::StorageEngine,
 };
 use ankql::ast::{Predicate, Resolved, Selection};
+use ankurah_digest_tree::{TreeMatch, TreeSpec};
 use ankurah_proto as proto;
 use ankurah_signals::Wait;
 use std::{
@@ -83,16 +84,37 @@ impl<CD: ContextData> Drop for Resident<CD> {
     fn drop(&mut self) { self.stop.lock().unwrap().take(); }
 }
 
-pub(crate) struct ResidentLease<CD: ContextData>(Arc<Resident<CD>>);
+/// The query view is separate from the resident tree's admission and lifetime.
+#[derive(Clone)]
+struct QueryView {
+    selection: Selection<Resolved>,
+    filtered: Selection<Resolved>,
+    spec: proto::TreeSpec,
+}
+
+/// Type-erased ownership lets live queries and protocol drivers hold the same RAII lease
+/// without depending on the node's credential type.
+#[derive(Clone)]
+pub(crate) struct ResidentPin {
+    _lease: Arc<dyn Send + Sync>,
+}
+
+pub(crate) struct ResidentLease<CD: ContextData>(Arc<Resident<CD>>, Arc<QueryView>);
 impl<CD: ContextData> ResidentLease<CD> {
-    fn new(resident: Arc<Resident<CD>>) -> Self {
+    fn new(resident: Arc<Resident<CD>>, view: Arc<QueryView>) -> Self {
         resident.pins.fetch_add(1, Ordering::AcqRel);
-        Self(resident)
+        Self(resident, view)
     }
     pub(crate) async fn snapshot(&self) -> anyhow::Result<Capture> {
         let (response, result) = oneshot::channel();
-        self.0.commands.send(Command::Snapshot(response)).await.map_err(|_| anyhow::anyhow!(SourceError::Changed))?;
-        result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))?
+        self.0
+            .commands
+            .send(Command::Snapshot { view: self.1.clone(), response })
+            .await
+            .map_err(|_| anyhow::anyhow!(SourceError::Changed))?;
+        let mut capture = result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))??;
+        capture.snapshot.resident = Some(ResidentPin { _lease: Arc::new(self.clone()) });
+        Ok(capture)
     }
     pub(crate) async fn subscribe<SE, PA>(
         &self,
@@ -114,6 +136,7 @@ impl<CD: ContextData> ResidentLease<CD> {
         self.0
             .commands
             .send(Command::Subscribe {
+                view: self.1.clone(),
                 peer,
                 request,
                 fingerprint,
@@ -135,7 +158,7 @@ impl<CD: ContextData> ResidentLease<CD> {
     pub(crate) fn tree(&self) -> Arc<QueryTreeCache> { self.0.tree.clone() }
 }
 impl<CD: ContextData> Clone for ResidentLease<CD> {
-    fn clone(&self) -> Self { Self::new(self.0.clone()) }
+    fn clone(&self) -> Self { Self::new(self.0.clone(), self.1.clone()) }
 }
 impl<CD: ContextData> Drop for ResidentLease<CD> {
     fn drop(&mut self) {
@@ -161,7 +184,7 @@ impl<CD: ContextData> ResidentSubscription<CD> {
         self.lease
             .0
             .commands
-            .send(Command::Refresh { peer: self.peer, stream: self.stream, number, known, response })
+            .send(Command::Refresh { view: self.lease.1.clone(), peer: self.peer, stream: self.stream, number, known, response })
             .await
             .map_err(|_| anyhow::anyhow!(SourceError::Changed))?;
         result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))?
@@ -182,8 +205,12 @@ pub(crate) struct Capture {
     pub(crate) snapshot: Snapshot,
 }
 enum Command<CD: ContextData> {
-    Snapshot(oneshot::Sender<anyhow::Result<Capture>>),
+    Snapshot {
+        view: Arc<QueryView>,
+        response: oneshot::Sender<anyhow::Result<Capture>>,
+    },
     Subscribe {
+        view: Arc<QueryView>,
         peer: proto::EntityId,
         request: proto::RequestId,
         fingerprint: Vec<u8>,
@@ -195,6 +222,7 @@ enum Command<CD: ContextData> {
         response: oneshot::Sender<anyhow::Result<super::PendingStateStream<CD>>>,
     },
     Refresh {
+        view: Arc<QueryView>,
         peer: proto::EntityId,
         stream: proto::StateStreamId,
         number: u64,
@@ -204,11 +232,17 @@ enum Command<CD: ContextData> {
 }
 
 impl<CD: ContextData> Command<CD> {
+    fn view(&self) -> &QueryView {
+        match self {
+            Self::Snapshot { view, .. } | Self::Subscribe { view, .. } | Self::Refresh { view, .. } => view,
+        }
+    }
+
     fn reject(self, error: &anyhow::Error) {
         let error =
             error.downcast_ref::<SourceError>().map_or_else(|| anyhow::anyhow!(error.to_string()), |error| anyhow::anyhow!(error.clone()));
         match self {
-            Self::Snapshot(response) => {
+            Self::Snapshot { response, .. } => {
                 let _ = response.send(Err(error));
             }
             Self::Subscribe { response, .. } => {
@@ -238,9 +272,6 @@ impl<CD: ContextData> ResidentTrees<CD> {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize { self.entries.lock().unwrap().entries.len() }
 
-    pub(crate) fn discard_failed(&self, lease: &ResidentLease<CD>) {
-        self.entries.lock().unwrap().entries.retain(|entry| !Arc::ptr_eq(&entry.resident, &lease.0));
-    }
     pub(crate) fn can_retry(error: &anyhow::Error) -> bool {
         matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Changed | SourceError::Lagged))
     }
@@ -248,7 +279,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         &self,
         node: &Node<SE, PA>,
         selection: Selection<Resolved>,
-        spec: proto::TreeSpec,
+        spec: Option<proto::TreeSpec>,
         credentials: Vec<CD>,
     ) -> anyhow::Result<Capture>
     where
@@ -258,7 +289,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         for attempt in 0..2 {
             let resident = self.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await?;
             match resident.snapshot().await {
-                Err(error) if attempt == 0 && Self::can_retry(&error) => self.discard_failed(&resident),
+                Err(error) if attempt == 0 && Self::can_retry(&error) => continue,
                 result => return result,
             }
         }
@@ -269,7 +300,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         &self,
         node: &Node<SE, PA>,
         selection: Selection<Resolved>,
-        spec: proto::TreeSpec,
+        spec: Option<proto::TreeSpec>,
         credentials: Vec<CD>,
     ) -> anyhow::Result<ResidentLease<CD>>
     where
@@ -280,14 +311,30 @@ impl<CD: ContextData> ResidentTrees<CD> {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
         let mut filtered = selection.clone();
         filtered.predicate = policy.filter_predicate(filtered.predicate)?;
-        let identity = Identity { selection, filtered, retrieval: policy.retrieval_predicate(), spec, credentials };
-        if let Some(lease) = self.entries.lock().unwrap().get(&identity) {
+        let wire_required = spec.is_some();
+        let spec = spec.unwrap_or_else(|| QueryTreeCache::spec(&selection, &node.catalog));
+        anyhow::ensure!(QueryTreeCache::serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
+        let requested = Identity { selection, filtered, retrieval: policy.retrieval_predicate(), spec, credentials };
+        if let Some(lease) = self.entries.lock().unwrap().get(&requested, &node.catalog, wire_required) {
             return Ok(lease);
         }
         let _build = self.builds.lock().await;
-        if let Some(lease) = self.entries.lock().unwrap().get(&identity) {
+        if let Some(lease) = self.entries.lock().unwrap().get(&requested, &node.catalog, wire_required) {
             return Ok(lease);
         }
+        let view = Arc::new(QueryView {
+            selection: requested.selection.clone(),
+            filtered: requested.filtered.clone(),
+            spec: requested.spec.clone(),
+        });
+        // A resident contains the full admission predicate. ORDER BY and LIMIT
+        // belong to each view, never to the maintained membership.
+        // A peer's broader admission is not a request to load that broader
+        // result. On a miss, keep its layout but admit only this query predicate.
+        let spec = TreeSpec::new(requested.spec.key_spec().clone(), requested.selection.predicate.clone());
+        let selection = Selection::from(requested.selection.predicate.clone());
+        let filtered = Selection::from(requested.filtered.predicate.clone());
+        let identity = Identity { selection, filtered, spec, ..requested };
         let tree = Arc::new(QueryTreeCache::default());
         let captured = source::capture_filtered_query(
             node,
@@ -313,7 +360,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
             tree,
             cache: Arc::downgrade(&self.entries),
         });
-        let lease = ResidentLease::new(resident.clone());
+        let lease = ResidentLease::new(resident.clone(), view);
         let scope = identity.clone();
         let id = {
             let mut entries = self.entries.lock().unwrap();
@@ -364,11 +411,33 @@ impl<CD: ContextData> ResidentTrees<CD> {
 }
 
 impl<CD: ContextData> Entries<CD> {
-    fn get(&mut self, identity: &Identity<CD>) -> Option<ResidentLease<CD>> {
+    fn get(
+        &mut self,
+        requested: &Identity<CD>,
+        catalog: &crate::schema::catalog::CatalogManager,
+        wire_required: bool,
+    ) -> Option<ResidentLease<CD>> {
         self.entries.retain(|entry| entry.resident.alive.load(Ordering::Acquire));
-        let position = self.entries.iter().position(|entry| &entry.identity == identity)?;
+        let compatible = |entry: &Entry<CD>| {
+            let existing = &entry.identity;
+            existing.credentials == requested.credentials
+                && existing.retrieval == requested.retrieval
+                && (!wire_required || existing.spec.key_spec() == requested.spec.key_spec())
+                && compatible_selection(&existing.spec, requested, catalog)
+                && compatible_access(existing, requested, catalog)
+        };
+        let position = self
+            .entries
+            .iter()
+            .rposition(|entry| entry.identity.spec == requested.spec && compatible(entry))
+            .or_else(|| self.entries.iter().rposition(compatible))?;
         let entry = self.entries.remove(position)?;
-        let lease = ResidentLease::new(entry.resident.clone());
+        let view = Arc::new(QueryView {
+            selection: requested.selection.clone(),
+            filtered: requested.filtered.clone(),
+            spec: if wire_required { requested.spec.clone() } else { entry.identity.spec.clone() },
+        });
+        let lease = ResidentLease::new(entry.resident.clone(), view);
         self.entries.push_back(entry);
         Some(lease)
     }
@@ -393,6 +462,42 @@ impl<CD: ContextData> Entries<CD> {
         self.trim_idle();
         Ok(())
     }
+}
+
+fn compatible_selection<CD: ContextData>(
+    spec: &TreeSpec,
+    requested: &Identity<CD>,
+    catalog: &crate::schema::catalog::CatalogManager,
+) -> bool {
+    if !QueryTreeCache::serves(spec, &requested.selection, catalog) {
+        return false;
+    }
+    // An opaque-ordering fallback is only reused for its own admission/layout.
+    // It must not turn a failed scalar range/order proof into a cache hit.
+    match QueryTreeCache::request(&requested.selection, catalog) {
+        Ok(request) if spec.serves(&request).is_some() => true,
+        _ => *spec == requested.spec && (requested.selection.limit.is_none() || spec.key_spec().keyparts.is_empty()),
+    }
+}
+
+/// A policy may depend on the requested predicate. A shared resident is safe
+/// only when selecting from its admitted rows gives the same filtered query.
+fn compatible_access<CD: ContextData>(
+    existing: &Identity<CD>,
+    requested: &Identity<CD>,
+    catalog: &crate::schema::catalog::CatalogManager,
+) -> bool {
+    if existing.selection.predicate == requested.selection.predicate {
+        return existing.filtered.predicate == requested.filtered.predicate;
+    }
+    let intersection = TreeSpec::new(
+        existing.spec.key_spec().clone(),
+        Predicate::And(Box::new(existing.filtered.predicate.clone()), Box::new(requested.selection.predicate.clone())),
+    );
+    let mut filtered = requested.filtered.clone();
+    filtered.limit = None;
+    filtered.order_by = None;
+    QueryTreeCache::request(&filtered, catalog).ok().and_then(|request| intersection.serves(&request)) == Some(TreeMatch::Whole)
 }
 
 async fn run_resident<SE, PA>(
@@ -425,19 +530,44 @@ where
                 }.await;
                 let snapshot = match captured {
                     Ok(snapshot) => snapshot,
-                    Err(error) => { command.reject(&error); return Err(error); }
+                    Err(error) => {
+                        // A retry must not reacquire the failed source before
+                        // the actor's outer cleanup has removed its entry.
+                        if let Some(entries) = entries.upgrade() {
+                            entries.lock().unwrap().entries.retain(|entry| entry.id != id);
+                        }
+                        command.reject(&error);
+                        return Err(error);
+                    }
+                };
+                let selected = async {
+                    let view = command.view();
+                    let policy = ContextPolicy::from_credentials(&node.policy_agent, &actor.credentials().to_vec());
+                    anyhow::ensure!(policy.filter_predicate(view.selection.predicate.clone())? == view.filtered.predicate, SourceError::Changed);
+                    snapshot.select(&view.selection, &node.catalog).await?
+                        .with_spec(view.spec.clone(), &view.selection, &node.catalog)
+                }.await;
+                let snapshot = match selected {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        command.reject(&error);
+                        // An invalid view does not invalidate the source used
+                        // by other query owners.
+                        continue;
+                    }
                 };
                 match command {
-                    Command::Snapshot(response) => { let _ = response.send(Ok(Capture { revision: actor.revision, snapshot })); }
-                    Command::Subscribe { peer, request, fingerprint, query, version, catalog, known, owner, response } => {
+                    Command::Snapshot { response, .. } => { let _ = response.send(Ok(Capture { revision: actor.revision, snapshot })); }
+                    Command::Subscribe { view, peer, request, fingerprint, query, version, catalog, known, owner, response } => {
                         if response.is_closed() || owner.strong_count() == 0 { continue; }
+                        let members = snapshot.query_members();
                         let result = super::prepare_state_stream(&node, peer, request, fingerprint, actor.credentials().to_vec(), Some((query, version)), catalog, actor.revision, snapshot, known);
                         if let Ok(pending) = &result {
-                            actor.routes.push(Route { peer, stream: pending.id(), owner });
+                            actor.routes.push(Route { peer, stream: pending.id(), owner, selection: view.selection.clone(), filtered: view.filtered.clone(), members });
                         }
                         let _ = response.send(result);
                     }
-                    Command::Refresh { peer, stream, number, known, response } => {
+                    Command::Refresh { peer, stream, number, known, response, .. } => {
                         let result = if actor.routes.iter().any(|route| route.peer == peer && route.stream == stream && route.owner.strong_count() != 0) {
                             super::queue_round(&node, peer, stream, number, actor.revision, snapshot, known)
                         } else { Err(anyhow::anyhow!("query stream unavailable")) };

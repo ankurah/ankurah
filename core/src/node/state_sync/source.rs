@@ -1,13 +1,16 @@
-//! A query's source projection, driven by immutable commit publications.
+//! A resident tree's complete admission, driven by immutable commit publications.
 use crate::{
     entity::TemporaryEntity,
     node::{
-        source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
+        source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError},
         state_sync::{QueryTreeCache, Snapshot},
         Node,
     },
     policy::{ContextPolicy, PolicyAgent},
-    selection::filter::{evaluate_predicate, ValueLookup},
+    selection::{
+        filter::{evaluate_predicate, ValueLookup},
+        ordering::compare_items,
+    },
     session::ContextData,
     storage::StorageEngine,
     value::Value,
@@ -17,15 +20,12 @@ use ankurah_digest_tree::CanonicalCodec;
 use ankurah_proto::{self as proto, Attested};
 use indexmap::IndexMap;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Weak},
 };
 #[cfg(test)]
 use tokio::sync::oneshot;
 
-const MAX_READ_ATTEMPTS: usize = 8;
-
-// Limited reads retain storage query order for unchanged refill entrants.
 type Rows = IndexMap<proto::EntityId, Row>;
 type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
 
@@ -55,12 +55,11 @@ pub(crate) struct QueryProjection {
     pub(super) tree: Arc<QueryTreeCache>,
 }
 
-/// Register before scanning, then fold a complete source window or validate the
-/// whole limited selection. No scan holds the source commit gate.
+/// Test helper using the same full admission and query scope as the node LRU.
 #[cfg(test)]
 pub(crate) async fn capture_query<SE, PA>(
     node: &Node<SE, PA>,
-    mut selection: Selection<Resolved>,
+    selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     credentials: Vec<PA::ContextData>,
     tree: Arc<QueryTreeCache>,
@@ -71,8 +70,10 @@ where
 {
     node.system.require_system_ready()?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    selection.predicate = policy.filter_predicate(selection.predicate)?;
-    capture_filtered_query(node, selection, spec, credentials, tree).await
+    let admission = Selection::from(policy.filter_predicate(spec.predicate().clone())?);
+    let mut captured = capture_filtered_query(node, admission, spec, credentials, tree).await?;
+    captured.snapshot = captured.snapshot.select(&selection, &node.catalog).await?;
+    Ok(captured)
 }
 
 pub(super) async fn capture_filtered_query<SE, PA>(
@@ -87,36 +88,20 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    let (mut start, mut cursor) = node.source_publications.subscribe().await?;
+    anyhow::ensure!(selection.limit.is_none() && selection.order_by.is_none(), "resident capture requires complete admission");
+    // Subscribe before the read, then fold every publication through a finite
+    // boundary. Queries apply their order and limit to this complete capture.
+    let (_, mut cursor) = node.source_publications.subscribe().await?;
     let mut projection = QueryProjection { selection, spec, rows: Rows::new(), candidates: Rows::new(), candidate_bytes: 0, tree };
-    let mut attempts = 0;
-    let window = loop {
-        attempts += 1;
-        anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
-        projection.replace_candidates(projection.read(node).await?);
-        projection.rows = projection.authorized_rows(&policy);
-        if projection.selection.limit.is_some() {
-            match cursor.validate(start).await {
-                Err(SourceError::Changed) => {
-                    let window = cursor.fence().await?;
-                    for batch in &window.batches {
-                        projection.check_catalog(batch)?;
-                    }
-                    start = window.revision;
-                }
-                result => break result?,
-            }
-        } else {
-            let window = cursor.fence().await?;
-            for batch in &window.batches {
-                projection.check_catalog(batch)?;
-                for change in &batch.changes {
-                    projection.fold(&policy, change)?;
-                }
-            }
-            break window;
+    projection.replace_candidates(projection.read(node).await?);
+    projection.rows = projection.authorized_rows(&policy);
+    let window = cursor.fence().await?;
+    for batch in &window.batches {
+        projection.check_catalog(batch)?;
+        for change in &batch.changes {
+            projection.fold(&policy, change)?;
         }
-    };
+    }
     let snapshot = projection.tree.refresh_captured(projection.spec.clone(), projection.attested_rows(node)).await?;
     #[cfg(not(test))]
     drop(snapshot);
@@ -277,6 +262,94 @@ pub(super) struct Route {
     pub(super) peer: proto::EntityId,
     pub(super) stream: proto::StateStreamId,
     pub(super) owner: Weak<()>,
+    pub(super) selection: Selection<Resolved>,
+    pub(super) filtered: Selection<Resolved>,
+    pub(super) members: BTreeMap<proto::EntityId, proto::QueryMember>,
+}
+
+impl Route {
+    /// Membership belongs to the subscription, not to its shared resident tree.
+    /// Unlimited queries only inspect changed rows. A limited query also finds
+    /// unchanged rows entering its result when another member leaves the cut.
+    async fn changes<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        projection: &QueryProjection,
+        policy: &ReadPolicy<'_, PA>,
+        sources: &[SourceChange],
+    ) -> anyhow::Result<Vec<proto::QueryChange>>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        let mut updates = BTreeMap::new();
+        if self.selection.limit.is_some() {
+            let snapshot = projection.tree.current_snapshot().await?;
+            let snapshot = snapshot.select(&self.selection, &node.catalog).await?;
+            updates.extend(self.members.keys().map(|id| (*id, None)));
+            updates.extend(snapshot.query_members().into_iter().map(|(id, member)| (id, Some(member))));
+        } else {
+            for source in sources {
+                let id = source.state.entity_id;
+                let member = if let Some(row) = projection.rows.get(&id) {
+                    let entity = TemporaryEntity::new(id, &row.state.state)?;
+                    evaluate_predicate(&entity, &self.selection.predicate)?
+                        .then(|| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() })
+                } else {
+                    None
+                };
+                updates.insert(id, member);
+            }
+        }
+
+        let mut changes = Vec::new();
+        let mut included = BTreeSet::new();
+        for source in sources {
+            let id = source.state.entity_id;
+            let member = updates.get(&id).cloned().unwrap_or_else(|| self.members.get(&id).cloned());
+            if self.members.contains_key(&id) || member.is_some() {
+                let mut change = projection.change(node, policy, source)?;
+                change.member = member;
+                changes.push(change);
+                included.insert(id);
+            }
+        }
+        let mut entrants = Vec::new();
+        let mut removed = Vec::new();
+        for (id, member) in &updates {
+            if included.contains(id) || self.members.get(id) == member.as_ref() {
+                continue;
+            }
+            if member.is_some() {
+                let row = projection.rows.get(id).ok_or_else(|| anyhow::anyhow!("query member missing from resident tree"))?;
+                let source = SourceChange { state: row.state.clone(), events: Vec::new() };
+                let mut change = projection.change(node, policy, &source)?;
+                change.member = member.clone();
+                entrants.push((change, TemporaryEntity::new(*id, &row.state.state)?));
+            } else {
+                removed.push(proto::QueryChange { entity_id: *id, member: None, delta: None });
+            }
+        }
+        // Commit changes keep their publication order. Unchanged replacements
+        // follow query order, as they did when storage supplied the refill.
+        if let Some(order) = &self.selection.order_by {
+            entrants.sort_by(|(a_change, a), (b_change, b)| {
+                compare_items(a, b, order).then_with(|| a_change.entity_id.cmp(&b_change.entity_id))
+            });
+        }
+        changes.extend(entrants.into_iter().map(|(change, _)| change));
+        changes.extend(removed);
+        // Event authorization must succeed for the complete publication before
+        // advancing this route's membership. Other routes remain independent.
+        for (id, member) in updates {
+            if let Some(member) = member {
+                self.members.insert(id, member);
+            } else {
+                self.members.remove(&id);
+            }
+        }
+        Ok(changes)
+    }
 }
 
 pub(crate) struct QuerySource<CD: ContextData> {
@@ -292,20 +365,6 @@ impl<CD: ContextData> QuerySource<CD> {
 
     pub(super) fn from_capture(credentials: Vec<CD>, capture: CapturedQuery) -> Self {
         Self { credentials, projection: capture.projection, cursor: capture.cursor, revision: capture.revision, routes: Vec::new() }
-    }
-
-    #[cfg(test)]
-    fn new(
-        peer: proto::EntityId,
-        stream: proto::StateStreamId,
-        credentials: Vec<CD>,
-        projection: QueryProjection,
-        cursor: SourceCursor,
-        revision: u64,
-    ) -> Self {
-        // The direct source tests keep their stream alive independently of a cache lease.
-        let _ = (peer, stream);
-        Self { credentials, projection, cursor, revision, routes: Vec::new() }
     }
 
     pub(super) fn check_authorization<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
@@ -328,23 +387,35 @@ impl<CD: ContextData> QuerySource<CD> {
         4096usize.saturating_add(self.projection.candidate_bytes)
     }
 
-    fn deliver<SE, PA>(&mut self, node: &Node<SE, PA>, revision: u64, sources: Vec<SourceChange>, removed: Vec<proto::EntityId>)
+    async fn deliver<SE, PA>(&mut self, node: &Node<SE, PA>, revision: u64, sources: Vec<SourceChange>)
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
-        let changes = sources.iter().map(|source| self.projection.change(node, &policy, source)).collect::<anyhow::Result<Vec<_>>>();
-        match changes {
-            Ok(mut changes) => {
-                changes.extend(removed.into_iter().map(|entity_id| proto::QueryChange { entity_id, member: None, delta: None }));
-                self.queue_changes(node, revision, changes);
+        let mut retained = Vec::with_capacity(self.routes.len());
+        for mut route in std::mem::take(&mut self.routes) {
+            if route.owner.strong_count() == 0 {
+                continue;
             }
-            Err(error) => {
-                // State access and event delivery are separate permissions.
-                // An unreadable event fails these routes, not the resident tree.
-                tracing::debug!(%error, "resident tree live delivery denied");
-                for route in self.routes.drain(..) {
+            let result = async {
+                anyhow::ensure!(
+                    policy.filter_predicate(route.selection.predicate.clone())? == route.filtered.predicate,
+                    SourceError::Changed
+                );
+                route.changes(node, &self.projection, &policy, &sources).await
+            }
+            .await;
+            match result {
+                Ok(changes) => {
+                    if changes.is_empty() || super::queue_live(node, route.peer, route.stream, revision, changes).is_ok() {
+                        retained.push(route);
+                    }
+                }
+                Err(error) => {
+                    // An invalid view or unreadable event fails this route, not
+                    // the resident tree or an unrelated subscription using it.
+                    tracing::debug!(%error, "resident tree live delivery failed");
                     let weak = node.weak();
                     crate::task::spawn(async move {
                         if let Some(node) = weak.upgrade() {
@@ -354,21 +425,7 @@ impl<CD: ContextData> QuerySource<CD> {
                 }
             }
         }
-    }
-
-    fn queue_changes<SE, PA>(&mut self, node: &Node<SE, PA>, revision: u64, changes: Vec<proto::QueryChange>)
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
-    {
-        self.routes.retain(|route| route.owner.strong_count() != 0);
-        if changes.is_empty() {
-            return;
-        }
-        self.routes.retain(|route| {
-            // One slow or disconnected stream cannot poison the shared tree.
-            crate::node::state_sync::queue_live(node, route.peer, route.stream, revision, changes.clone()).is_ok()
-        });
+        self.routes = retained;
     }
 
     pub(super) async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Arc<SourceBatch>) -> anyhow::Result<()>
@@ -378,91 +435,11 @@ impl<CD: ContextData> QuerySource<CD> {
     {
         self.projection.check_catalog(&batch)?;
         self.routes.retain(|route| route.owner.strong_count() != 0);
-        if self.projection.selection.limit.is_some() {
-            let mut relevant = false;
-            for change in &batch.changes {
-                relevant |= self.projection.candidates.contains_key(&change.state.entity_id)
-                    || self.projection.candidate(change.state.clone())?.is_some();
-            }
-            if relevant {
-                self.refill(node, vec![batch]).await?;
-            } else {
-                self.revision = batch.revision.0;
-            }
-        } else {
-            let changes = self.projection.apply(node, &self.credentials, &batch, !self.routes.is_empty()).await?;
-            if !changes.is_empty() {
-                self.deliver(node, batch.revision.0, changes, Vec::new());
-            }
-            self.revision = batch.revision.0;
+        let changes = self.projection.apply(node, &self.credentials, &batch, !self.routes.is_empty()).await?;
+        if !changes.is_empty() {
+            self.deliver(node, batch.revision.0, changes).await;
         }
-        Ok(())
-    }
-
-    async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<Arc<SourceBatch>>) -> anyhow::Result<()>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
-    {
-        for batch in &pending {
-            self.projection.check_catalog(batch)?;
-        }
-        let mut bytes = pending.iter().map(|batch| batch.bytes).sum::<usize>();
-        let mut attempts = 0;
-        let (rows, revision) = loop {
-            attempts += 1;
-            anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
-            let window = self.cursor.fence().await?;
-            for batch in window.batches {
-                self.projection.check_catalog(&batch)?;
-                anyhow::ensure!(
-                    pending.len() < MAX_PENDING_BATCHES && batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes),
-                    SourceError::Lagged
-                );
-                bytes += batch.bytes;
-                pending.push(batch);
-            }
-            let rows = self.projection.read(node).await?;
-            match self.cursor.validate(window.revision).await {
-                Err(SourceError::Changed) => continue,
-                result => break (rows, result?.revision.0),
-            }
-        };
-        self.projection.replace_candidates(rows);
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
-        let rows = self.projection.authorized_rows(&policy);
-        let previous = std::mem::replace(&mut self.projection.rows, rows);
-        let delivery = self.routes.iter().any(|route| route.owner.strong_count() != 0);
-        let mut changed = Vec::new();
-        let mut removed = Vec::new();
-        let mut included = BTreeSet::new();
-        for batch in pending {
-            for source in &batch.changes {
-                let id = source.state.entity_id;
-                if delivery && (previous.contains_key(&id) || self.projection.rows.contains_key(&id)) {
-                    changed.push(source.clone());
-                    included.insert(id);
-                }
-            }
-        }
-        for (id, row) in &self.projection.rows {
-            if delivery
-                && !included.contains(id)
-                && previous.get(id).is_none_or(|before| before.key != row.key || before.state.state.head != row.state.state.head)
-            {
-                changed.push(SourceChange { state: row.state.clone(), events: Vec::new() });
-            }
-        }
-        for id in previous.keys() {
-            if delivery && !included.contains(id) && !self.projection.rows.contains_key(id) {
-                // Rank eviction still authors absence even though this entity
-                // itself did not change during the validated read.
-                removed.push(*id);
-            }
-        }
-        self.projection.tree.refresh_captured(self.projection.spec.clone(), self.projection.attested_rows(node)).await?;
-        self.deliver(node, revision, changed, removed);
-        self.revision = revision;
+        self.revision = batch.revision.0;
         Ok(())
     }
 
@@ -472,27 +449,11 @@ impl<CD: ContextData> QuerySource<CD> {
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let window = self.cursor.fence().await?;
-        if self.projection.selection.limit.is_some() {
-            let mut relevant = false;
-            for batch in &window.batches {
-                self.projection.check_catalog(batch)?;
-                for change in &batch.changes {
-                    relevant |= self.projection.candidates.contains_key(&change.state.entity_id)
-                        || self.projection.candidate(change.state.clone())?.is_some();
-                }
-            }
-            if relevant {
-                self.refill(node, window.batches).await?;
-            } else {
-                self.revision = window.revision.0;
-            }
-        } else {
-            for batch in window.batches {
-                self.publish(node, batch).await?;
-            }
-            // An empty fence can still advance the source publication boundary.
-            self.revision = window.revision.0;
+        for batch in window.batches {
+            self.publish(node, batch).await?;
         }
+        // An empty fence can still advance the source publication boundary.
+        self.revision = window.revision.0;
         self.projection.tree.current_snapshot().await
     }
 }

@@ -91,19 +91,22 @@ async fn captured_window_precedes_reactor_notification_and_keeps_old_rows() -> a
 }
 
 #[tokio::test]
-async fn changed_refill_cannot_be_admitted_and_its_window_is_not_consumed() -> anyhow::Result<()> {
+async fn a_fence_drains_its_finite_window_and_leaves_later_commits_for_the_next_window() -> anyhow::Result<()> {
     let node = node().await?;
-    let (read_start, mut cursor) = node.source_publications.subscribe().await?;
-    // A LIMIT refill started before this commit may have missed an unchanged
-    // replacement. Its complete query must be read again, rather than accepting
-    // a stale continuation just because the returned entity still matches.
+    let (start, mut cursor) = node.source_publications.subscribe().await?;
     apply(&node, &genesis(2), Delivery::Live).await?;
-    assert!(matches!(cursor.validate(read_start).await, Err(SourceError::Changed)));
-    let window = cursor.fence().await?;
-    assert_eq!(window.batches.len(), 1);
-    let validated = cursor.validate(window.revision).await?;
-    assert_eq!(validated.revision, window.revision);
-    assert!(validated.batches.is_empty());
+    let first = cursor.fence().await?;
+    assert!(first.revision > start);
+    assert_eq!(first.batches.len(), 1);
+    let empty = cursor.fence().await?;
+    assert_eq!(empty.revision, first.revision);
+    assert!(empty.batches.is_empty());
+    let later = genesis(3);
+    apply(&node, &later, Delivery::Live).await?;
+    let next = cursor.fence().await?;
+    assert!(next.revision > first.revision);
+    assert_eq!(next.batches.len(), 1);
+    assert_eq!(next.batches[0].changes[0].state.entity_id, later.entity_id);
     Ok(())
 }
 
@@ -157,7 +160,7 @@ async fn definite_storage_rejection_does_not_poison_source() -> anyhow::Result<(
         crate::storage::StorageCommitOutcome::Conflict { .. }
     ));
     drop(commit);
-    assert_eq!(cursor.validate(start).await?.revision, start);
+    assert_eq!(cursor.fence().await?.revision, start);
     source.subscribe().await?;
     Ok(())
 }

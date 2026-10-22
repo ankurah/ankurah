@@ -79,19 +79,16 @@ async fn assert_released_with_live_query(
 
 #[tokio::test]
 async fn cancelled_fetch_before_metadata_abandons_the_late_reply() -> anyhow::Result<()> {
-    let (server, client, query, messages) = stream_fixture().await?;
-    let mut selection = query.selection().peek().unwrap().0;
-    // Use a distinct selection so the existing standing tree is not a cache hit.
-    selection.predicate = ankql::ast::Predicate::And(Box::new(selection.predicate), Box::new(ankql::ast::Predicate::True));
-    let (entered, entered_rx) = tokio::sync::oneshot::channel();
-    let (release, release_rx) = tokio::sync::oneshot::channel();
-    server.storage.hold_fetch.lock().unwrap().insert(proto::ModelId::EntityId(id(99)), (entered, release_rx));
+    let requests = RequestGate::default();
+    let (server, client, query, messages) = stream_fixture_with_gates(Arc::new(AtomicBool::new(false)), requests.clone()).await?;
+    let selection = query.selection().peek().unwrap().0;
+    let (entered_rx, release) = hold_request(&requests);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let mut fetch = Box::pin(client.fetch_from_peer(selection, &credentials));
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         tokio::select! {
             entered = entered_rx => entered.unwrap(),
-            result = &mut fetch => panic!("Fetch finished before the capture gate: {result:?}"),
+            result = &mut fetch => panic!("Fetch finished before the request gate: {result:?}"),
         }
     })
     .await?;

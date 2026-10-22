@@ -15,6 +15,8 @@ use tracing::{debug, warn};
 pub(super) struct LiveQueryInner {
     pub(super) remote_activated_version: AtomicU32,
     remote_stream: std::sync::Mutex<Option<RemoteStream>>,
+    /// The current selection keeps its tree resident across peer disconnections.
+    resident_tree: std::sync::Mutex<Option<crate::node::state_sync::ResidentPin>>,
     pub(super) query_id: proto::QueryId,
     // Must drop before context, which may hold the node's last strong reference.
     pub(super) subscription: ReactorSubscription,
@@ -63,6 +65,7 @@ impl LiveQueryInner {
         Self {
             remote_activated_version: AtomicU32::new(0),
             remote_stream: std::sync::Mutex::new(None),
+            resident_tree: std::sync::Mutex::new(None),
             query_id,
             context,
             subscription,
@@ -188,6 +191,13 @@ impl LiveQueryInner {
         }
     }
 
+    pub(super) fn retain_tree(&self, version: u32, pin: Option<crate::node::state_sync::ResidentPin>) {
+        let _state = self.version_lock.lock().unwrap_or_else(|error| error.into_inner());
+        if self.is_current(version) {
+            *self.resident_tree.lock().unwrap() = pin;
+        }
+    }
+
     pub(super) fn refresh_handle(&self) -> Option<crate::node::state_sync::RefreshHandle> {
         self.remote_stream.lock().unwrap().as_ref().filter(|stream| stream.activated).and_then(|stream| stream.refresh.clone())
     }
@@ -257,6 +267,7 @@ impl LiveQueryInner {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |version| version.checked_add(1))
             .expect("live-query version exhausted");
         let version = previous + 1;
+        self.resident_tree.lock().unwrap().take();
         if let Some(stream) = self.remote_stream.lock().unwrap().as_ref() {
             stream.admission.store(false, Ordering::Release);
         }

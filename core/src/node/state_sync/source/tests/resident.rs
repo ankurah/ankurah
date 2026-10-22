@@ -7,8 +7,7 @@ async fn acquire<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultCo
     node: &Node<OrderedStorage, PA>,
     selection: Selection<Resolved>,
 ) -> anyhow::Result<crate::node::state_sync::resident::ResidentLease<PA::ContextData>> {
-    let spec = QueryTreeCache::spec(&selection, &node.catalog);
-    cache.acquire(node, selection, spec, vec![DEFAULT_CONTEXT]).await
+    cache.acquire(node, selection, None, vec![DEFAULT_CONTEXT]).await
 }
 
 #[tokio::test]
@@ -56,10 +55,12 @@ async fn count_limit_evicts_idle_trees_but_pins_preserve_active_owners() -> anyh
     assert!(Arc::ptr_eq(&tree, &acquire(&cache, &node, selection(None)).await?.tree()));
     drop(first);
     drop(second);
+    assert_eq!(cache.len(), 2, "the captured active comparison also pins its tree");
+    assert_eq!(snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&initial));
+    drop(snapshot);
     assert_eq!(cache.len(), 1);
     let second = acquire(&cache, &node, selection(Some(1))).await?;
     assert!(!Arc::ptr_eq(&tree, &second.tree()));
-    assert_eq!(snapshot.states[&initial.entity_id].payload.state.head, proto::Clock::singleton(&initial));
     Ok(())
 }
 
@@ -70,14 +71,14 @@ async fn oversized_miss_does_not_evict_a_useful_small_entry() -> anyhow::Result<
         apply(&node, &genesis(value)?).await?;
     }
     let cache = ResidentTrees::with_limits(2, 10_000);
-    let resident = acquire(&cache, &node, selection(Some(1))).await?;
+    let resident = acquire(&cache, &node, above("03", None)).await?;
     let tree = resident.tree();
     drop(resident);
     let oversized = acquire(&cache, &node, selection(None)).await?;
     assert_eq!(oversized.snapshot().await?.snapshot.states.len(), 4);
     drop(oversized);
     assert_eq!(cache.len(), 1);
-    assert!(Arc::ptr_eq(&tree, &acquire(&cache, &node, selection(Some(1))).await?.tree()));
+    assert!(Arc::ptr_eq(&tree, &acquire(&cache, &node, above("03", None)).await?.tree()));
     Ok(())
 }
 
@@ -172,18 +173,18 @@ async fn permissions_are_rechecked_and_new_grants_are_not_lost() -> anyhow::Resu
     }
     let selection = selection(None);
     let spec = QueryTreeCache::spec(&selection, &node.catalog);
-    let capture = node.resident_trees.capture(&node, selection.clone(), spec.clone(), vec![DEFAULT_CONTEXT]).await?;
+    let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert!(capture.snapshot.states.is_empty());
     allowed.store(true, Ordering::SeqCst);
-    let capture = node.resident_trees.capture(&node, selection.clone(), spec.clone(), vec![DEFAULT_CONTEXT]).await?;
+    let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(capture.snapshot.states.len(), 1, "a newly granted cached candidate is discovered");
     discovery.store(true, Ordering::SeqCst);
-    let capture = node.resident_trees.capture(&node, selection.clone(), spec.clone(), vec![DEFAULT_CONTEXT]).await?;
+    let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(capture.snapshot.states.len(), 2, "a broader discovery scope requires a fresh capture");
-    let denied = node.resident_trees.capture(&node, selection.clone(), spec.clone(), vec![]).await?;
+    let denied = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![]).await?;
     assert!(denied.snapshot.states.is_empty(), "empty credentials are not privileged and never borrow an authorized view");
     allowed.store(false, Ordering::SeqCst);
-    let denied = node.resident_trees.capture(&node, selection, spec, vec![DEFAULT_CONTEXT]).await?;
+    let denied = node.resident_trees.capture(&node, selection, Some(spec), vec![DEFAULT_CONTEXT]).await?;
     assert!(denied.snapshot.states.is_empty(), "revoked rows cannot be disclosed by a cache hit");
     assert_eq!(capture.snapshot.states.len(), 2, "the old comparison snapshot is frozen independently");
     Ok(())
@@ -221,6 +222,8 @@ async fn an_idle_entry_that_grows_beyond_retention_is_evicted() -> anyhow::Resul
     let cache = ResidentTrees::with_limits(8, 10_000);
     let resident = acquire(&cache, &node, selection(None)).await?;
     let frozen = resident.snapshot().await?.snapshot;
+    assert_eq!(frozen.states.len(), 1);
+    drop(frozen);
     drop(resident);
     for value in ["02", "03", "04"] {
         apply(&node, &genesis(value)?).await?;
@@ -231,7 +234,6 @@ async fn an_idle_entry_that_grows_beyond_retention_is_evicted() -> anyhow::Resul
         }
     })
     .await?;
-    assert_eq!(frozen.states.len(), 1);
     let current = acquire(&cache, &node, selection(None)).await?;
     assert_eq!(current.snapshot().await?.snapshot.states.len(), 4);
     drop(current);
@@ -412,5 +414,126 @@ async fn invalidation_reaches_another_peer_while_first_initial_reply_waits_for_h
     assert!(release.send(()).is_err());
     node.deregister_peer(slow_peer);
     node.deregister_peer(healthy_peer);
+    Ok(())
+}
+
+fn above(value: &str, limit: Option<u64>) -> Selection<Resolved> {
+    use ankql::ast::{ComparisonOperator, Expr};
+    let mut selected = selection(limit);
+    selected.predicate = Predicate::And(
+        Box::new(selected.predicate),
+        Box::new(Predicate::Comparison {
+            left: Box::new(Expr::Path(PropertyPath::from(property()))),
+            operator: ComparisonOperator::GreaterThan,
+            right: Box::new(Expr::Literal(Value::String(value.into()))),
+        }),
+    );
+    selected
+}
+
+#[tokio::test]
+async fn compatible_selections_share_full_resident_with_independent_scopes() -> anyhow::Result<()> {
+    let node = node().await?;
+    let mut events = Vec::new();
+    for value in ["01", "08", "10", "12", "20"] {
+        let event = genesis(value)?;
+        apply(&node, &event).await?;
+        events.push(event);
+    }
+    let broad = acquire(&node.resident_trees, &node, above("07", None)).await?;
+    let full = broad.tree();
+    let scans = node.storage.2.load(Ordering::Relaxed);
+    let cases = [
+        (above("07", None), vec![1, 2, 3, 4]),
+        (Selection { order_by: None, ..above("07", None) }, vec![1, 2, 3, 4]),
+        (above("10", None), vec![3, 4]),
+        (above("07", Some(2)), vec![1, 2]),
+        (
+            Selection {
+                order_by: Some(vec![OrderByItem { path: PropertyPath::from(property()), direction: OrderDirection::Desc }]),
+                ..above("10", Some(1))
+            },
+            vec![4],
+        ),
+    ];
+    for (selected, expected) in cases {
+        let lease = acquire(&node.resident_trees, &node, selected).await?;
+        assert!(Arc::ptr_eq(&full, &lease.tree()), "compatible selections use the same physical tree");
+        let snapshot = lease.snapshot().await?.snapshot;
+        let expected: BTreeSet<_> = expected.into_iter().map(|index| events[index].entity_id).collect();
+        assert_eq!(snapshot.states.keys().copied().collect::<BTreeSet<_>>(), expected);
+    }
+    assert_eq!(node.resident_trees.len(), 1);
+    assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "scopes do not scan storage again");
+    assert_eq!(full.current_snapshot().await?.states.len(), 4, "query limits never truncate the resident");
+    let before = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
+    let changed = update(&events[1], "15")?;
+    apply(&node, &changed).await?;
+    let after = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
+    assert!(!before.states.contains_key(&events[1].entity_id));
+    assert!(after.states.contains_key(&events[1].entity_id));
+    assert_eq!(full.current_snapshot().await?.states.len(), 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn limited_creation_retains_full_admission_for_later_unlimited_use() -> anyhow::Result<()> {
+    let node = node().await?;
+    let mut events = Vec::new();
+    for value in ["01", "02", "03"] {
+        let event = genesis(value)?;
+        apply(&node, &event).await?;
+        events.push(event);
+    }
+    let first = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
+    let tree = first.tree();
+    let frozen = first.snapshot().await?.snapshot;
+    assert_eq!(frozen.states.len(), 1);
+    assert_eq!(tree.current_snapshot().await?.states.len(), 3);
+    let all = acquire(&node.resident_trees, &node, selection(None)).await?;
+    assert!(Arc::ptr_eq(&tree, &all.tree()));
+    assert_eq!(all.snapshot().await?.snapshot.states.len(), 3);
+    apply(&node, &update(&events[0], "09")?).await?;
+    let after = first.snapshot().await?.snapshot;
+    assert_eq!(after.states.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
+    assert_eq!(frozen.states.keys().copied().collect::<Vec<_>>(), vec![events[0].entity_id]);
+    assert_eq!(node.resident_trees.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_coverage_or_unaddressable_order_requires_another_tree() -> anyhow::Result<()> {
+    let node = node().await?;
+    for value in ["01", "08", "12"] {
+        apply(&node, &genesis(value)?).await?;
+    }
+    let initial = acquire(&node.resident_trees, &node, above("07", None)).await?;
+    let wider = acquire(&node.resident_trees, &node, above("03", None)).await?;
+    assert!(!Arc::ptr_eq(&initial.tree(), &wider.tree()), "narrow admission cannot cover a wider predicate");
+    let all = acquire(&node.resident_trees, &node, selection(None)).await?;
+    assert!(!Arc::ptr_eq(&initial.tree(), &all.tree()));
+    assert!(!Arc::ptr_eq(&wider.tree(), &all.tree()));
+    let ordered_limit = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
+    assert!(!Arc::ptr_eq(&all.tree(), &ordered_limit.tree()), "an entity-ID tree cannot provide a label-ordered limit");
+    assert_eq!(node.resident_trees.len(), 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn active_snapshot_lease_pins_tree_until_last_raii_owner_drops() -> anyhow::Result<()> {
+    let node = node().await?;
+    apply(&node, &genesis("01")?).await?;
+    let cache = ResidentTrees::with_limits(0, 0);
+    let lease = acquire(&cache, &node, selection(None)).await?;
+    let another = lease.clone();
+    let snapshot = lease.snapshot().await?.snapshot;
+    drop(lease);
+    cache.evict_idle();
+    assert_eq!(cache.len(), 1);
+    drop(another);
+    cache.evict_idle();
+    assert_eq!(cache.len(), 1, "an active comparison owns a lease independent of its caller");
+    drop(snapshot);
+    assert_eq!(cache.len(), 0, "dropping the last lease automatically releases idle retention");
     Ok(())
 }

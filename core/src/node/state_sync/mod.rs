@@ -12,7 +12,7 @@ mod tree;
 
 pub(crate) use client::{abandon_current_state, finish_state, receive_state, request_state, RefreshHandle};
 pub(crate) use incoming::{Inbox, IncomingStates, IncomingStream};
-pub(crate) use resident::{ResidentSubscription, ResidentTrees};
+pub(crate) use resident::{ResidentPin, ResidentSubscription, ResidentTrees};
 pub(crate) use server::expire_state_stream;
 pub(crate) use server::{
     abandon_state_stream, continue_state, finish_state_round, kick_state_stream, prepare_state_stream, queue_live, queue_round,

@@ -652,8 +652,10 @@ where
         }
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
-        let spec = state_sync::QueryTreeCache::spec(&selection, &node.catalog);
-        let mut snapshot = node.resident_trees.capture(&node, selection.clone(), spec, context_data.clone()).await?.snapshot;
+        let mut snapshot = node.resident_trees.capture(&node, selection.clone(), None, context_data.clone()).await?.snapshot;
+        if let Some(query) = node.live_queries.get(query_id) {
+            query.retain_tree(version, snapshot.resident.clone());
+        }
         let known_state = snapshot.offer().await?;
         if canceled() {
             return Err(RequestError::ConnectionLost.into());

@@ -566,7 +566,7 @@ where
             proto::NodeRequestBody::Fetch { selection, known_state } => {
                 let spec = state_sync::QueryTreeCache::offered_spec(&selection, &self.catalog, &known_state)?;
                 let catalog = crate::schema::is_catalog_read(&selection.predicate);
-                let captured = self.resident_trees.capture(self, selection, spec, credentials.clone()).await?;
+                let captured = self.resident_trees.capture(self, selection, Some(spec), credentials.clone()).await?;
                 let state = state_sync::start_state_stream(
                     self,
                     request.from,
@@ -866,8 +866,7 @@ where
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         for attempt in 0..2 {
-            let spec = state_sync::QueryTreeCache::spec(&selection, &self.catalog);
-            let mut snapshot = self.resident_trees.capture(self, selection.clone(), spec, cdata.clone()).await?.snapshot;
+            let mut snapshot = self.resident_trees.capture(self, selection.clone(), None, cdata.clone()).await?.snapshot;
             let known_state = snapshot.offer().await?;
             let (stream, response) = state_sync::request_state(
                 self,

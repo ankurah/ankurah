@@ -17,6 +17,8 @@ use ankurah_core_types::PropertyPath;
 
 mod capture_retry;
 mod resident;
+mod routes;
+mod view_isolation;
 
 /// The core test engine deliberately rejects ORDER BY/LIMIT. This fixture adds
 /// exactly the ordered bounded read exercised here, leaving its real commit and
@@ -176,7 +178,7 @@ async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read(
 }
 
 #[tokio::test]
-async fn limited_projection_keeps_storage_query_order_independently_of_digest_keys() -> anyhow::Result<()> {
+async fn limited_fallback_selects_query_order_without_truncating_the_id_keyed_tree() -> anyhow::Result<()> {
     let node = node().await?;
     let a = genesis("01")?;
     let b = genesis("02")?;
@@ -186,24 +188,22 @@ async fn limited_projection_keeps_storage_query_order_independently_of_digest_ke
     let (first, last) = if a.entity_id > b.entity_id { (&a, &b) } else { (&b, &a) };
     apply(&node, &update(first, "01")?).await?;
     apply(&node, &update(last, "02")?).await?;
-    let selection = selection(Some(2));
+    let selection = selection(Some(1));
     let by_id = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
-    let captured = capture_query(&node, selection, by_id, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default())).await?;
+    let tree = Arc::new(QueryTreeCache::default());
+    let captured = capture_query(&node, selection, by_id, vec![DEFAULT_CONTEXT], tree.clone()).await?;
+    assert_eq!(captured.projection.rows.len(), 2, "the resident tree retains the entire admission");
+    assert_eq!(captured.snapshot.states.keys().copied().collect::<Vec<_>>(), vec![first.entity_id], "LIMIT follows query order");
     assert_eq!(
-        captured.projection.rows.keys().copied().collect::<Vec<_>>(),
-        vec![first.entity_id, last.entity_id],
-        "unchanged refill entrants must retain storage query order, not entity-ID order"
-    );
-    assert_eq!(
-        captured.snapshot.members().values().copied().collect::<Vec<_>>(),
+        tree.current_snapshot().await?.members().values().copied().collect::<Vec<_>>(),
         vec![last.entity_id, first.entity_id],
-        "digest address order is independently allowed to be by ID"
+        "physical digest address order remains by ID"
     );
     Ok(())
 }
 
 #[tokio::test]
-async fn limited_capture_retries_to_discover_an_unchanged_replacement() -> anyhow::Result<()> {
+async fn full_capture_folds_changes_before_resolving_a_limit_with_unchanged_entrants() -> anyhow::Result<()> {
     let node = node().await?;
     let [a, b, c]: [proto::Event; 3] = ["01", "02", "03"].map(genesis).into_iter().collect::<anyhow::Result<Vec<_>>>()?.try_into().unwrap();
     for event in [&a, &b, &c] {
@@ -211,6 +211,7 @@ async fn limited_capture_retries_to_discover_an_unchanged_replacement() -> anyho
     }
     let selection = selection(Some(2));
     let spec = QueryTreeCache::spec(&selection, &node.catalog);
+    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
     let capture = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTreeCache::default()));
     tokio::pin!(capture);
@@ -219,8 +220,9 @@ async fn limited_capture_retries_to_discover_an_unchanged_replacement() -> anyho
     apply(&node, &update(&a, "09")?).await?;
     release.send(()).unwrap();
     let captured = capture.await?;
-    assert_eq!(captured.projection.rows.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
-    assert_eq!(captured.snapshot.states.len(), 2);
+    assert_eq!(captured.projection.rows.len(), 3, "the unchanged replacement is already resident");
+    assert_eq!(captured.snapshot.states.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
+    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans + 1, "a concurrent update does not cause a refill read");
     Ok(())
 }
 
@@ -233,7 +235,7 @@ impl PeerSender for Sender {
 }
 
 #[tokio::test]
-async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snapshot() -> anyhow::Result<()> {
+async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutating_old_snapshots() -> anyhow::Result<()> {
     let node = node().await?;
     let mut events = Vec::new();
     for value in ["01", "02", "03"] {
@@ -244,50 +246,24 @@ async fn a_delayed_limit_refill_rejects_stale_membership_and_keeps_the_old_snaps
     let selection = selection(Some(2));
     let spec = QueryTreeCache::spec(&selection, &node.catalog);
     let tree = Arc::new(QueryTreeCache::default());
-    let captured = capture_query(&node, selection, spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
-    let CapturedQuery { revision, snapshot, projection, cursor } = captured;
-    let old_members = snapshot.members();
-    let peer = proto::EntityId::from_bytes([25; 32]);
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(Sender(peer)),
-    )
-    .await?;
-    let known = proto::KnownState { spec: snapshot.spec.clone(), spans: vec![] };
-    let state = crate::node::state_sync::start_state_stream(
-        &node,
-        peer,
-        proto::RequestId::new(),
-        Vec::new(),
-        vec![DEFAULT_CONTEXT],
-        Some((proto::QueryId::new(), 1)),
-        false,
-        revision,
-        snapshot,
-        known,
-    )
-    .await?;
-    let mut actor = QuerySource::new(peer, state.frame.stream, vec![DEFAULT_CONTEXT], projection, cursor, revision);
+    let captured = capture_query(&node, selection.clone(), spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
+    let mut actor = QuerySource::from_capture(vec![DEFAULT_CONTEXT], captured);
+    let frozen = tree.current_snapshot().await?.select(&selection, &node.catalog).await?;
+    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
     let moved_a = update(&events[0], "09")?;
     apply(&node, &moved_a).await?;
-    let batch = actor.cursor.next().await?;
-    let (entered, release) = hold_fetch(&node);
-    {
-        let refill = actor.refill(&node, vec![batch]);
-        tokio::pin!(refill);
-        assert!(futures::poll!(&mut refill).is_pending());
-        entered.await?;
-        // The in-flight read selected B,C. C moves past A before its rows
-        // are captured, so accepting that stale list would miss unchanged A.
-        apply(&node, &update(&events[2], "10")?).await?;
-        release.send(()).unwrap();
-        refill.await?;
-    }
-    assert_eq!(actor.projection.rows.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[0].entity_id, events[1].entity_id]));
-    assert_eq!(actor.projection.rows.len(), 2);
-    let current = tree.current_snapshot().await?;
-    assert_ne!(current.members(), old_members, "the moved source key must be replaced, not left stale");
-    node.deregister_peer(peer);
+    let intermediate = actor.refresh(&node).await?.select(&selection, &node.catalog).await?;
+    assert_eq!(intermediate.states.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
+    // C now moves past A. The next scope must re-admit unchanged A from the
+    // same resident tree, while both previous comparisons stay frozen.
+    apply(&node, &update(&events[2], "10")?).await?;
+    let current = actor.refresh(&node).await?.select(&selection, &node.catalog).await?;
+    assert_eq!(current.states.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[0].entity_id, events[1].entity_id]));
+    assert_eq!(current.states[&events[0].entity_id].payload.state.head, proto::Clock::singleton(&moved_a));
+    assert_eq!(frozen.states[&events[0].entity_id].payload.state.head, proto::Clock::singleton(&events[0]));
+    assert_eq!(intermediate.states[&events[2].entity_id].payload.state.head, proto::Clock::singleton(&events[2]));
+    assert_eq!(actor.projection.rows.len(), 3);
+    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans, "supported limited scopes never refill from storage");
     Ok(())
 }
 
@@ -436,7 +412,7 @@ async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_
 }
 
 #[tokio::test]
-async fn replacing_a_query_uses_a_different_resident_and_leaves_the_old_tree_maintained() -> anyhow::Result<()> {
+async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()> {
     let node = node().await?;
     let mut initial = Vec::new();
     for value in ["01", "02", "03"] {
@@ -465,9 +441,8 @@ async fn replacing_a_query_uses_a_different_resident_and_leaves_the_old_tree_mai
         )
         .await?;
     let (_, original_tree) = handler.query_tree_for_test(query).await.unwrap();
-    let (entered, release) = hold_fetch(&node);
+    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
     apply(&node, &update(&initial[0], "09")?).await?;
-    entered.await?;
     handler
         .subscribe_query(
             &node,
@@ -480,12 +455,14 @@ async fn replacing_a_query_uses_a_different_resident_and_leaves_the_old_tree_mai
             proto::KnownState { spec: QueryTreeCache::spec(&selection(Some(1)), &node.catalog), spans: vec![] },
         )
         .await?;
-    release.send(()).expect("the idle resident keeps its independent update feed");
     let (version, reused) = handler.query_tree_for_test(query).await.unwrap();
     assert_eq!(version, 2);
-    assert!(!Arc::ptr_eq(&original_tree, &reused), "a different limited selection is a different resident tree");
+    assert!(Arc::ptr_eq(&original_tree, &reused), "compatible limits select scopes of the same resident tree");
     let snapshot = reused.current_snapshot().await?;
+    assert_eq!(snapshot.states.len(), 3, "the resident keeps the full admission");
+    let snapshot = snapshot.select(&selection(Some(1)), &node.catalog).await?;
     assert_eq!(snapshot.states.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
+    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans);
     handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
     Ok(())

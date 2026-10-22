@@ -2,7 +2,7 @@ use super::*;
 use crate::{
     error::RequestError,
     livequery::{EntityLiveQuery, QueryResolution},
-    node::CachePolicy,
+    node::{source_publications::MAX_PENDING_BATCHES, CachePolicy},
     peer_subscription::Status,
 };
 
@@ -93,25 +93,23 @@ async fn assert_recovers(client: &TestNode, query: &EntityLiveQuery, messages: &
 }
 
 #[tokio::test]
-async fn exhausted_limit_capture_retries_after_quiescence() -> anyhow::Result<()> {
+async fn limited_query_folds_concurrent_capture_updates_without_refill_retries() -> anyhow::Result<()> {
     let (server, client, messages) = pair().await?;
     let mut latest = genesis("01")?;
     apply(&server, &latest).await?;
-    let (mut entered, mut release) = hold_fetch(&server);
+    let (entered, release) = hold_fetch(&server);
     let query = query(&client, selection(Some(1)))?;
-    for attempt in 0..MAX_READ_ATTEMPTS {
-        tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
+    for attempt in 0..8 {
         latest = update(&latest, &format!("01-{attempt}"))?;
         apply(&server, &latest).await?;
-        if attempt + 1 == MAX_READ_ATTEMPTS {
-            release.send(()).unwrap();
-            break;
-        }
-        let next = hold_fetch(&server);
-        release.send(()).unwrap();
-        (entered, release) = next;
     }
-    assert_recovers(&client, &query, &messages, &latest).await?;
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), query.wait_durable_answered()).await??;
+    let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].head(), proto::Clock::singleton(&latest));
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 0);
     drop(query);
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
@@ -146,11 +144,13 @@ async fn fetch_bounds_busy_retries_and_can_be_retried_after_quiescence() -> anyh
     let (mut entered, mut release) = hold_fetch(&server);
     let fetcher = client.clone();
     let fetch = tokio::spawn(async move { fetcher.fetch_from_peer(selection(Some(1)), &vec![DEFAULT_CONTEXT]).await });
-    for attempt in 0..(2 * MAX_READ_ATTEMPTS) {
+    for attempt in 0..2 {
         tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
-        latest = update(&latest, &format!("01-{attempt}"))?;
-        apply(&server, &latest).await?;
-        if attempt + 1 == 2 * MAX_READ_ATTEMPTS {
+        for change in 0..=MAX_PENDING_BATCHES {
+            latest = update(&latest, &format!("01-{attempt}-{change}"))?;
+            apply(&server, &latest).await?;
+        }
+        if attempt + 1 == 2 {
             release.send(()).unwrap();
             break;
         }

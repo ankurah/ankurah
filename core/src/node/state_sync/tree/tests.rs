@@ -1,4 +1,5 @@
 use super::*;
+mod ordering;
 use std::ops::Bound;
 
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![]), ankql::ast::Predicate::True) }
@@ -832,5 +833,200 @@ async fn different_spec_creates_a_new_tree_and_preserves_old_snapshots() -> anyh
         assert_eq!(cache.0.lock().await.as_ref().unwrap().tree.as_ref().unwrap().spec(), &keyed_spec());
         assert_eq!(cache.current_snapshot().await?.span_digest(super::super::whole()).await?, replacement_digest);
     }
+    Ok(())
+}
+
+fn range_request(lower: i64, limit: Option<u64>, descending: bool) -> TreeRequest {
+    use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate};
+    let property = keyed_spec().key_spec().keyparts[0].key;
+    let path = PropertyPath::from(property);
+    let selection = Selection {
+        predicate: Predicate::Comparison {
+            left: Box::new(Expr::Path(path.clone())),
+            operator: ComparisonOperator::GreaterThan,
+            right: Box::new(Expr::Literal(Value::I64(lower))),
+        },
+        order_by: Some(vec![OrderByItem { path, direction: if descending { OrderDirection::Desc } else { OrderDirection::Asc } }]),
+        limit,
+    };
+    TreeRequest::for_selection(&selection, &std::collections::HashMap::from([(property, ValueType::I64)])).unwrap()
+}
+
+#[tokio::test]
+async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyhow::Result<()> {
+    let rows = (0..256).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
+    let cache = QueryTreeCache::default();
+    let mut view = cache.refresh_captured(keyed_spec(), rows.clone()).await?.select_request(&range_request(200, None, false)).await?;
+    assert_eq!(view.states.len(), 55);
+    assert_eq!(
+        view.members.values().copied().collect::<Vec<_>>(),
+        (201..256).map(|id| numbered_state(id, 1).payload.entity_id).collect::<Vec<_>>()
+    );
+    let offer = view.offer().await?;
+    let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("small scoped inventory") };
+    assert_eq!(inventory.bounds, super::super::whole(), "scope gaps remain known-empty query addresses");
+    assert_eq!(inventory.heads.len(), 55);
+
+    let oracle = QueryTreeCache::default();
+    let mut selected = oracle.refresh_captured(keyed_spec(), rows[201..].to_vec()).await?;
+    let expected = selected.span_digest(super::super::whole()).await?;
+    let digest = view.span_digest(super::super::whole()).await?;
+    assert_eq!(digest, expected);
+    let children = view.refine(&digest).await?;
+    assert_eq!(Digest::checked_sum(children.iter().map(|child| child.digest))?, digest.digest);
+    for child in &children {
+        assert_eq!(
+            child.digest,
+            selected.span_digest(child.bounds.clone()).await?.digest,
+            "refinement must never expose the full resident digest"
+        );
+    }
+    let mut full = cache.current_snapshot().await?;
+    assert_eq!(full.span_digest(super::super::whole()).await?.digest.count(), 256, "selecting a view must not cache a partial tree");
+    assert_eq!(full.states.len(), 256);
+    Ok(())
+}
+
+#[tokio::test]
+async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Result<()> {
+    let rows = (0..8).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
+    let cache = QueryTreeCache::default();
+    cache.refresh_captured(keyed_spec(), rows).await?;
+    let mut low = cache.current_snapshot().await?.select_request(&range_request(-1000, Some(2), false)).await?;
+    let mut high = cache.current_snapshot().await?.select_request(&range_request(-1000, Some(3), true)).await?;
+    assert_eq!(
+        low.states.keys().copied().collect::<Vec<_>>(),
+        (0..2).map(|id| numbered_state(id, 1).payload.entity_id).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        high.states.keys().copied().collect::<Vec<_>>(),
+        (5..8).map(|id| numbered_state(id, 1).payload.entity_id).collect::<Vec<_>>()
+    );
+    let low_before = low.span_digest(super::super::whole()).await?;
+    let high_before = high.span_digest(super::super::whole()).await?;
+    assert_eq!(low_before.digest.count(), 2);
+    assert_eq!(high_before.digest.count(), 3);
+    let high_point = high.members.keys().next().unwrap().clone();
+    assert_eq!(
+        low.span_digest(proto::TreeSpan::new(Bound::Included(high_point.clone()), Bound::Included(high_point))).await?.digest,
+        Digest::empty()
+    );
+
+    cache.apply_captured(vec![keyed_state(99, 2, Some(Value::I64(-10)))?], vec![]).await?;
+    let after = cache.current_snapshot().await?.select_request(&range_request(-1000, Some(2), false)).await?;
+    assert_eq!(after.states.keys().copied().collect::<Vec<_>>(), [0, 99].map(|id| numbered_state(id, 1).payload.entity_id));
+    assert_eq!(low.span_digest(super::super::whole()).await?, low_before);
+    assert_eq!(high.span_digest(super::super::whole()).await?, high_before);
+    assert_eq!(cache.current_snapshot().await?.states.len(), 9);
+    Ok(())
+}
+
+#[tokio::test]
+async fn limited_peers_answer_bounds_using_their_own_cut() -> anyhow::Result<()> {
+    let requester = QueryTreeCache::default();
+    let responder = QueryTreeCache::default();
+    let request = range_request(-1, Some(2), false);
+    let rows = |ids: &[u32]| ids.iter().map(|id| keyed_state(*id, 1, Some(Value::I64(*id as i64)))).collect::<anyhow::Result<Vec<_>>>();
+    let mut left = requester.refresh_captured(keyed_spec(), rows(&[0, 3, 4])?).await?.select_request(&request).await?;
+    let mut right = responder.refresh_captured(keyed_spec(), rows(&[1, 2, 4])?).await?.select_request(&request).await?;
+    for view in [&mut left, &mut right] {
+        let offer = view.offer().await?;
+        let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("limited inventory") };
+        assert_eq!(inventory.bounds, super::super::whole());
+        assert_eq!(inventory.heads.len(), 2);
+    }
+    let left_last = left.members.keys().last().unwrap().clone();
+    let point = proto::TreeSpan::new(Bound::Included(left_last.clone()), Bound::Included(left_last));
+    assert_eq!(left.span_digest(point.clone()).await?.digest.count(), 1);
+    assert_eq!(right.span_digest(point).await?.digest.count(), 0);
+    let right_last = right.members.keys().last().unwrap().clone();
+    let point = proto::TreeSpan::new(Bound::Included(right_last.clone()), Bound::Included(right_last));
+    assert_eq!(left.span_digest(point.clone()).await?.digest.count(), 0);
+    assert_eq!(right.span_digest(point).await?.digest.count(), 1);
+    assert_eq!(left.span_digest(super::super::whole()).await?.digest.count(), 2);
+    assert_eq!(right.span_digest(super::super::whole()).await?.digest.count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> anyhow::Result<()> {
+    use ankql::ast::{ComparisonOperator, Expr, Predicate};
+    let predicate = Predicate::Comparison {
+        left: Box::new(Expr::Path(PropertyPath::id())),
+        operator: ComparisonOperator::GreaterThan,
+        right: Box::new(Expr::Literal(Value::EntityId(state(0, 1).payload.entity_id))),
+    };
+    let selection = Selection::from(predicate.clone());
+    let wire_spec = TreeSpec::new(KeySpec::new(vec![]), predicate);
+    let catalog = CatalogManager::default();
+    let cache = QueryTreeCache::default();
+    let full = cache.refresh(spec(), (0..3).map(|id| state(id, 1)).collect()).await?;
+    assert!(full.tree.is_none());
+    let mut view = full.with_spec(wire_spec.clone(), &selection, &catalog)?.select(&selection, &catalog).await?;
+    assert_eq!(view.spec, wire_spec);
+    assert_eq!(view.span_digest(super::super::whole()).await?.digest.count(), 2);
+    let resident = cache.0.lock().await;
+    let resident = resident.as_ref().unwrap();
+    assert_eq!(resident.spec, spec());
+    assert_eq!(resident.tree.as_ref().unwrap().spec(), &spec());
+    assert_eq!(resident.rows.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn selected_fallback_ids_keep_unselected_addresses_empty() -> anyhow::Result<()> {
+    let cache = QueryTreeCache::default();
+    let full = cache.refresh(spec(), (0..5).map(|id| state(id, 1)).collect()).await?;
+    let ids = [state(1, 1).payload.entity_id, state(3, 1).payload.entity_id].into();
+    let mut view = full.select_ids(&ids).await?;
+    assert_eq!(view.span_digest(super::super::whole()).await?.digest.count(), 2);
+    assert_eq!(view.query_members().keys().copied().collect::<BTreeSet<_>>(), ids);
+    let point = state(2, 1).payload.entity_id.to_bytes().to_vec();
+    assert_eq!(
+        view.span_digest(proto::TreeSpan::new(Bound::Included(point.clone()), Bound::Included(point))).await?.digest,
+        Digest::empty()
+    );
+    assert_eq!(cache.current_snapshot().await?.span_digest(super::super::whole()).await?.digest.count(), 5);
+    assert!(cache.current_snapshot().await?.select_ids(&[state(99, 1).payload.entity_id].into()).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn zero_limit_view_does_not_build_or_empty_the_resident_tree() -> anyhow::Result<()> {
+    let cache = QueryTreeCache::default();
+    let full = cache.refresh(spec(), (0..8).map(|id| state(id, 1)).collect()).await?;
+    let mut selection = Selection::from(ankql::ast::Predicate::True);
+    selection.limit = Some(0);
+    let mut view = full.select(&selection, &CatalogManager::default()).await?;
+    assert!(view.states.is_empty());
+    assert_eq!(view.span_digest(super::super::whole()).await?.digest, Digest::empty());
+    assert!(cache.0.lock().await.as_ref().unwrap().tree.is_none());
+    assert_eq!(cache.current_snapshot().await?.span_digest(super::super::whole()).await?.digest.count(), 8);
+    Ok(())
+}
+
+#[test]
+fn compatible_offered_spec_accepts_broader_admission_but_rejects_invalid_keys() -> anyhow::Result<()> {
+    use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate};
+    let catalog = CatalogManager::default();
+    let selection = Selection::from(Predicate::Comparison {
+        left: Box::new(Expr::Path(PropertyPath::id())),
+        operator: ComparisonOperator::GreaterThan,
+        right: Box::new(Expr::Literal(Value::EntityId(state(1, 1).payload.entity_id))),
+    });
+    let offer = proto::KnownState { spec: spec(), spans: vec![] };
+    assert_eq!(QueryTreeCache::offered_spec(&selection, &catalog, &offer)?, spec());
+    let mut differently_ordered = selection.clone();
+    differently_ordered.order_by = Some(vec![OrderByItem {
+        path: PropertyPath::from(proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN]))),
+        direction: OrderDirection::Desc,
+    }]);
+    assert!(QueryTreeCache::serves(&spec(), &differently_ordered, &catalog), "an unlimited order does not change the selected span");
+    let invalid =
+        TreeSpec::new(KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(proto::PropertyId::Id, ValueType::I64)]), Predicate::True);
+    assert!(!QueryTreeCache::serves(&invalid, &Selection::from(Predicate::True), &catalog));
+    let mut invalid = ankurah_core_types::IndexKeyPart::asc(proto::PropertyId::Id, ValueType::EntityId);
+    invalid.collation = Some("unsupported".into());
+    assert!(!QueryTreeCache::serves(&TreeSpec::new(KeySpec::new(vec![invalid]), Predicate::True), &selection, &catalog));
     Ok(())
 }

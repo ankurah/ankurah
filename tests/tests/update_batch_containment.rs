@@ -57,6 +57,8 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         id
     };
     let relay = ctx_c.query_wait::<RecordView>("true").await?;
+    // Local initialization can precede the registered stream that this test scripts.
+    relay.wait_durable_answered().await?;
     let view = ctx_c.get::<RecordView>(rec_id).await?;
     assert_eq!(view.title().unwrap(), "t0");
 
@@ -127,6 +129,8 @@ async fn test_unknown_entity_fails_stream_without_corrupting_prior_publication()
         ids
     };
     let relay = ctx_c.query_wait::<RecordView>("true").await?;
+    // The malicious publications must target an established remote origin.
+    relay.wait_durable_answered().await?;
     let view_a = ctx_c.get::<RecordView>(a_id).await?;
     let view_b = ctx_c.get::<RecordView>(b_id).await?;
     assert_eq!(view_a.title().unwrap(), "a0");
