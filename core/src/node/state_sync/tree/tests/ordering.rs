@@ -49,7 +49,10 @@ async fn unknown_and_nested_ordering_use_captured_values_with_stable_ties() -> a
                 view.states.keys().copied().collect::<Vec<_>>(),
                 expected.into_iter().map(|id| state(id, 1).payload.entity_id).collect::<Vec<_>>()
             );
+            assert!(view.tree.is_none(), "ordering captured rows must not eagerly hash them");
+            assert!(cache.0.lock().await.as_ref().unwrap().tree.is_none());
             assert_eq!(view.span_digest(super::super::super::whole()).await?.digest.count(), limit as i64);
+            assert!(cache.0.lock().await.as_ref().unwrap().tree.is_none(), "a fallback view digest stays private");
         }
         assert_eq!(cache.current_snapshot().await?.states.len(), 4);
     }

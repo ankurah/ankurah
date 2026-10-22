@@ -5,9 +5,12 @@ use crate::key::prefix_end;
 use crate::layout;
 use crate::map::{MapAccess, MapName};
 use crate::request::{prefix_range, ReusePlan};
-use crate::{CanonicalCodec, Digest, DigestGroup, LeafRow, NodePrefix, Ristretto255, TreeError, TreeRequest, TreeSpan, TreeTransaction};
-use ankurah_core_types::{IndexDirection, KeySpec, PropertyId};
+use crate::{
+    CanonicalCodec, Digest, DigestGroup, LeafRow, NodePrefix, Ristretto255, TreeError, TreeRequest, TreeSpan, TreeSpec, TreeTransaction,
+};
+use ankurah_core_types::{EntityId, IndexDirection, KeySpec, PropertyId};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::sync::Arc;
 
@@ -27,6 +30,51 @@ impl TreeScope {
     /// be absent here. Reusing these bounds on another tree requires proving
     /// that both trees describe the same admitted selection in these bounds.
     pub fn ranges(&self) -> &[TreeSpan] { &self.ranges }
+}
+
+impl TreeSpec {
+    /// Resolve a request's membership and limit using an existing ordered address
+    /// map, without building or reading digests. Underfilled limits retain the
+    /// membership bounds, just as [`TreeTransaction::scope`] does.
+    ///
+    /// The caller must supply this spec's admitted members, with exactly one
+    /// canonical address (complete key followed by entity ID) per entity. Only
+    /// addresses encountered while selecting the limit are validated; checking
+    /// admission and uniqueness requires the caller's maintained membership index.
+    pub fn scope_addresses<V>(&self, request: &TreeRequest, addresses: &BTreeMap<Vec<u8>, V>) -> Result<Vec<TreeSpan>, TreeError> {
+        let ReusePlan { mut ranges, directions, id_direction, .. } = self.plan(request).ok_or(TreeError::UnsupportedSelection)?;
+        let Some(limit) = request.limit else { return Ok(ranges) };
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut walk = TierWalk::new(self.key_spec(), &directions, id_direction, limit, &ranges);
+        let mut last = None;
+        while let Some(scan) = walk.next_scan() {
+            let mut range = addresses.range::<[u8], _>(scan.bounds.bounds());
+            let mut first = None;
+            let mut count = 0;
+            for _ in 0..scan.limit {
+                let next = match scan.direction {
+                    IndexDirection::Asc => range.next(),
+                    IndexDirection::Desc => range.next_back(),
+                };
+                let Some((address, _)) = next else { break };
+                address_parts(self.key_spec(), address)?;
+                first.get_or_insert(address.as_slice());
+                if scan.leaves {
+                    last = Some(address.as_slice());
+                }
+                count += 1;
+            }
+            walk.advance(first, count)?;
+        }
+        if walk.seen == limit {
+            let cut = order_cut(self.key_spec(), &directions, id_direction, last.expect("a positive limit was filled"), true)?;
+            ranges = intersections(&ranges, &cut);
+        }
+        Ok(ranges)
+    }
 }
 
 /// A tree span and the digest of its leaves, cached or computed for clipped bounds.
@@ -141,7 +189,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 let rows = self.walk(&ranges, &directions, id_direction, limit).await?;
                 if rows.len() == limit {
                     let last = rows.last().expect("a positive limit was filled");
-                    let cut = order_cut(spec.key_spec(), &directions, id_direction, last, true)?;
+                    let cut = order_cut(spec.key_spec(), &directions, id_direction, &last.address(), true)?;
                     ranges = intersections(&ranges, &cut);
                 }
             }
@@ -250,7 +298,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         rows.truncate(limit);
         let next = if more {
             let spec = &self.spec;
-            let cut = order_cut(spec.key_spec(), &scope.directions, scope.id_direction, rows.last().unwrap(), false)?;
+            let cut = order_cut(spec.key_spec(), &scope.directions, scope.id_direction, &rows.last().unwrap().address(), false)?;
             Some(LeafCursor { remaining: intersections(ranges, &cut), scope: scope.clone() })
         } else {
             None
@@ -266,9 +314,22 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         limit: usize,
     ) -> Result<Vec<LeafRow<G>>, TreeError> {
         let spec = self.spec.key_spec().clone();
-        let mut walk = LeafWalk { spec, directions, id_direction, limit, leaves: Vec::new() };
-        walk.read(self, ranges.to_vec(), 0).await?;
-        Ok(walk.leaves)
+        let mut walk = TierWalk::new(&spec, directions, id_direction, limit, ranges);
+        let mut leaves = Vec::new();
+        while let Some(scan) = walk.next_scan() {
+            let rows = match scan.direction {
+                IndexDirection::Asc => self.transaction.scan(MapName::Leaves, scan.bounds.bounds(), scan.limit).await?,
+                IndexDirection::Desc => self.transaction.scan_reverse(MapName::Leaves, scan.bounds.bounds(), scan.limit).await?,
+            };
+            walk.advance(rows.first().map(|(address, _)| address.as_slice()), rows.len())?;
+            for (key, value) in rows {
+                let row = layout::leaf_row(&key, &value)?;
+                if scan.leaves {
+                    leaves.push(row);
+                }
+            }
+        }
+        Ok(leaves)
     }
 }
 
@@ -279,66 +340,94 @@ fn empty_gaps<G: DigestGroup>(prefix: &NodePrefix, bounds: &TreeSpan, children: 
     gaps(bounds, &covered).into_iter().map(|bounds| TreeSpanDigest { prefix: prefix.clone(), bounds, digest: Digest::empty() }).collect()
 }
 
-/// A walk's fixed order and accumulated page, shared by all tuple tiers.
-struct LeafWalk<'a, G: DigestGroup> {
-    spec: KeySpec<PropertyId>,
+/// Traversal decisions shared by stored leaves and an already ordered address
+/// map. Each tuple tier has its own direction; entity IDs break final ties.
+struct TierWalk<'a> {
+    spec: &'a KeySpec<PropertyId>,
     directions: &'a [IndexDirection],
     id_direction: IndexDirection,
     limit: usize,
-    leaves: Vec<LeafRow<G>>,
+    seen: usize,
+    tiers: Vec<Tier>,
+}
+struct Tier {
+    ranges: Vec<TreeSpan>,
+    depth: usize,
+    next: usize,
+}
+struct TierScan {
+    bounds: TreeSpan,
+    direction: IndexDirection,
+    limit: usize,
+    leaves: bool,
 }
 
-impl<G: DigestGroup> LeafWalk<'_, G> {
-    async fn read<T: MapAccess>(
-        &mut self,
-        transaction: &mut TreeTransaction<G, T>,
-        mut ranges: Vec<TreeSpan>,
-        depth: usize,
-    ) -> Result<(), TreeError> {
-        let direction = self.directions.get(depth).copied().unwrap_or(self.id_direction);
-        while !ranges.is_empty() && self.leaves.len() < self.limit {
-            let indices: Vec<_> = match direction {
-                IndexDirection::Asc => (0..ranges.len()).collect(),
-                IndexDirection::Desc => (0..ranges.len()).rev().collect(),
-            };
-            let mut seed = None;
-            for index in indices {
-                let take = if depth == self.spec.keyparts.len() { self.limit - self.leaves.len() } else { 1 };
-                let rows = match direction {
-                    IndexDirection::Asc => transaction.transaction.scan(MapName::Leaves, ranges[index].bounds(), take).await?,
-                    IndexDirection::Desc => transaction.transaction.scan_reverse(MapName::Leaves, ranges[index].bounds(), take).await?,
-                };
-                if depth == self.spec.keyparts.len() {
-                    for (key, value) in rows {
-                        self.leaves.push(layout::leaf_row(&key, &value)?);
-                    }
-                    if self.leaves.len() == self.limit {
-                        return Ok(());
-                    }
-                } else if let Some((key, value)) = rows.into_iter().next() {
-                    seed = Some(layout::leaf_row::<G>(&key, &value)?);
-                    break;
-                }
-            }
-            if depth == self.spec.keyparts.len() {
-                return Ok(());
-            }
-            let Some(seed) = seed else { return Ok(()) };
-            let parts = CanonicalCodec.split(&self.spec, &seed.key)?;
-            let prefix = parts[..=depth].concat();
-            let inside = intersections(&ranges, &[prefix_range(&prefix)]);
-            Box::pin(self.read(transaction, inside, depth + 1)).await?;
-            let rest = match direction {
-                IndexDirection::Asc => match prefix_end(&prefix) {
-                    Some(end) => TreeSpan::new(Included(end), Unbounded),
-                    None => break,
-                },
-                IndexDirection::Desc => TreeSpan::new(Unbounded, Excluded(prefix)),
-            };
-            ranges = intersections(&ranges, &[rest]);
+impl<'a> TierWalk<'a> {
+    fn new(
+        spec: &'a KeySpec<PropertyId>,
+        directions: &'a [IndexDirection],
+        id_direction: IndexDirection,
+        limit: usize,
+        ranges: &[TreeSpan],
+    ) -> Self {
+        Self { spec, directions, id_direction, limit, seen: 0, tiers: vec![Tier { ranges: ranges.to_vec(), depth: 0, next: 0 }] }
+    }
+
+    fn next_scan(&mut self) -> Option<TierScan> {
+        if self.seen == self.limit {
+            return None;
         }
+        loop {
+            let tier = self.tiers.last()?;
+            if tier.next == tier.ranges.len() {
+                self.tiers.pop();
+                continue;
+            }
+            let direction = self.directions.get(tier.depth).copied().unwrap_or(self.id_direction);
+            let index = match direction {
+                IndexDirection::Asc => tier.next,
+                IndexDirection::Desc => tier.ranges.len() - tier.next - 1,
+            };
+            let leaves = tier.depth == self.spec.keyparts.len();
+            return Some(TierScan {
+                bounds: tier.ranges[index].clone(),
+                direction,
+                limit: if leaves { self.limit - self.seen } else { 1 },
+                leaves,
+            });
+        }
+    }
+
+    fn advance(&mut self, first: Option<&[u8]>, count: usize) -> Result<(), TreeError> {
+        let tier = self.tiers.last_mut().expect("advance follows a scan");
+        if tier.depth == self.spec.keyparts.len() {
+            self.seen += count;
+            tier.next += 1;
+            return Ok(());
+        }
+        let Some(address) = first else {
+            tier.next += 1;
+            return Ok(());
+        };
+        let parts = address_parts(self.spec, address)?;
+        let prefix = parts[..=tier.depth].concat();
+        let inside = intersections(&tier.ranges, &[prefix_range(&prefix)]);
+        let direction = self.directions[tier.depth];
+        let rest = match direction {
+            IndexDirection::Asc => prefix_end(&prefix).map(|end| TreeSpan::new(Included(end), Unbounded)),
+            IndexDirection::Desc => Some(TreeSpan::new(Unbounded, Excluded(prefix))),
+        };
+        tier.ranges = rest.map(|rest| intersections(&tier.ranges, &[rest])).unwrap_or_default();
+        tier.next = 0;
+        let depth = tier.depth + 1;
+        self.tiers.push(Tier { ranges: inside, depth, next: 0 });
         Ok(())
     }
+}
+
+fn address_parts<'a>(spec: &KeySpec<PropertyId>, address: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
+    let key_len = address.len().checked_sub(EntityId::BYTE_LEN).ok_or(TreeError::InvalidKey("truncated leaf address"))?;
+    CanonicalCodec.split(spec, &address[..key_len])
 }
 
 fn intersections(a: &[TreeSpan], b: &[TreeSpan]) -> Vec<TreeSpan> {
@@ -347,14 +436,14 @@ fn intersections(a: &[TreeSpan], b: &[TreeSpan]) -> Vec<TreeSpan> {
 
 // A lexicographic cut has one interval for each earlier differing tuple part
 // and one for the entity-id tie. All intervals use ascending physical bytes.
-fn order_cut<G: DigestGroup>(
+fn order_cut(
     spec: &KeySpec<PropertyId>,
     directions: &[IndexDirection],
     id_direction: IndexDirection,
-    pivot: &LeafRow<G>,
+    address: &[u8],
     before: bool,
 ) -> Result<Vec<TreeSpan>, TreeError> {
-    let parts = CanonicalCodec.split(spec, &pivot.key)?;
+    let parts = address_parts(spec, address)?;
     let mut prefix = Vec::new();
     let mut ranges = Vec::new();
     for (part, direction) in parts.iter().zip(directions) {
@@ -372,7 +461,7 @@ fn order_cut<G: DigestGroup>(
         prefix = value;
     }
     let tier = prefix_range(&prefix);
-    let address = pivot.address();
+    let address = address.to_vec();
     let smaller = before == (id_direction == IndexDirection::Asc);
     let edge = if smaller {
         TreeSpan::new(tier.start, if before { Included(address) } else { Excluded(address) })
@@ -381,4 +470,145 @@ fn order_cut<G: DigestGroup>(
     };
     ranges.push(edge);
     Ok(normalize(ranges))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{leaf_address, DigestTree, HeadHash, LeafData};
+    use ankql::ast::{Resolved, Selection};
+    use ankurah_core_types::{IndexKeyPart, ModelId, PropertyPath, Value, ValueType};
+    use std::collections::HashMap;
+
+    fn property(name: &str) -> PropertyId {
+        let byte = match name {
+            "project" => 1,
+            "foo" => 2,
+            "bar" => 3,
+            _ => panic!("unknown fixture property"),
+        };
+        PropertyId::EntityId(EntityId::from_bytes([byte; 32]))
+    }
+
+    fn selection(text: &str) -> Selection<Resolved> {
+        ankql::selection::map_references(
+            &ankql::parser::parse_selection(text).unwrap(),
+            &|path| PropertyPath::from(if path.steps[0] == "id" { PropertyId::Id } else { property(&path.steps[0]) }),
+            &|_| ModelId::EntityId(EntityId::from_bytes([99; 32])),
+        )
+    }
+
+    fn types() -> HashMap<PropertyId, ValueType> {
+        HashMap::from([(property("project"), ValueType::String), (property("foo"), ValueType::I64), (property("bar"), ValueType::I64)])
+    }
+
+    #[tokio::test]
+    async fn address_scopes_match_tree_scopes_and_sorted_members() {
+        let admission = selection("project = 'acme'");
+        let spec = TreeSpec::new(
+            KeySpec::new(vec![
+                IndexKeyPart::asc(property("project"), ValueType::String),
+                IndexKeyPart::asc(property("foo"), ValueType::I64),
+                IndexKeyPart::asc(property("bar"), ValueType::I64),
+            ]),
+            admission.predicate,
+        );
+        let model: Vec<_> = (0..90u8)
+            .map(|n| {
+                let (foo, bar) = (i64::from(n % 5), i64::from(n / 5 % 3));
+                let key = CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::from("acme"), Value::I64(foo), Value::I64(bar)]).unwrap();
+                (foo, bar, LeafData { key, entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[n; 32]]) })
+            })
+            .collect();
+        let tree: DigestTree = DigestTree::new(spec);
+        let mut tx = tree.begin();
+        tx.build(model.iter().map(|(_, _, row)| row.clone())).await.unwrap();
+        let addresses: BTreeMap<_, _> = model.iter().map(|(_, _, row)| (leaf_address(&row.key, row.entity_id), ())).collect();
+        for disjoint in [false, true] {
+            for foo_desc in [false, true] {
+                for bar_desc in [false, true] {
+                    for id_desc in [false, true] {
+                        for limit in [0, 1, 9, 37, 200] {
+                            let dir = |desc| if desc { "DESC" } else { "ASC" };
+                            let predicate = if disjoint { "project = 'acme' AND (foo < 1 OR foo > 3)" } else { "project = 'acme'" };
+                            let query = selection(&format!(
+                                "{predicate} ORDER BY foo {}, bar {}, id {} LIMIT {limit}",
+                                dir(foo_desc),
+                                dir(bar_desc),
+                                dir(id_desc),
+                            ));
+                            let request = TreeRequest::for_selection(&query, &types()).unwrap();
+                            let actual = tree.spec().scope_addresses(&request, &addresses).unwrap();
+                            let scope = tx.scope(&request).await.unwrap();
+                            assert_eq!(actual, scope.ranges(), "{query}");
+
+                            let mut expected: Vec<_> = model.iter().filter(|(foo, _, _)| !disjoint || *foo < 1 || *foo > 3).collect();
+                            let compare = |a: std::cmp::Ordering, desc| if desc { a.reverse() } else { a };
+                            expected.sort_by(|a, b| {
+                                compare(a.0.cmp(&b.0), foo_desc)
+                                    .then(compare(a.1.cmp(&b.1), bar_desc))
+                                    .then(compare(a.2.entity_id.cmp(&b.2.entity_id), id_desc))
+                            });
+                            expected.truncate(limit);
+                            let mut expected_ids: Vec<_> = expected.iter().map(|(_, _, row)| row.entity_id).collect();
+                            expected_ids.sort();
+                            let mut actual_ids: Vec<_> = model
+                                .iter()
+                                .filter(|(_, _, row)| actual.iter().any(|span| span.contains(&leaf_address(&row.key, row.entity_id))))
+                                .map(|(_, _, row)| row.entity_id)
+                                .collect();
+                            actual_ids.sort();
+                            assert_eq!(actual_ids, expected_ids, "{query}");
+                        }
+                    }
+                }
+            }
+        }
+        for query in ["project = 'acme'", "project = 'acme' AND foo > 2", "project = 'acme' AND foo > 10 ORDER BY foo, bar LIMIT 10"] {
+            let request = TreeRequest::for_selection(&selection(query), &types()).unwrap();
+            assert_eq!(tree.spec().scope_addresses(&request, &addresses).unwrap(), tx.scope(&request).await.unwrap().ranges());
+        }
+        let request = TreeRequest::for_selection(&selection("project = 'acme' ORDER BY foo, bar LIMIT 10"), &types()).unwrap();
+        let mut empty: crate::TreeTransaction = DigestTree::new(tree.spec().clone()).begin();
+        let empty_ranges = tree.spec().scope_addresses::<()>(&request, &BTreeMap::new()).unwrap();
+        assert_eq!(empty_ranges, empty.scope(&request).await.unwrap().ranges());
+        assert_eq!(empty_ranges, vec![TreeSpan::all()], "an empty local capture must allow missing peer members");
+        let incompatible = TreeRequest::for_selection(&selection("project = 'acme' ORDER BY bar LIMIT 1"), &types()).unwrap();
+        assert!(matches!(tree.spec().scope_addresses(&incompatible, &addresses), Err(TreeError::UnsupportedSelection)));
+    }
+
+    #[tokio::test]
+    async fn entity_id_scopes_match_without_tuple_parts() {
+        let spec = TreeSpec::new(KeySpec::new(vec![]), selection("true").predicate);
+        let rows: Vec<_> = (0..20u8)
+            .map(|n| LeafData { key: Vec::new(), entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[n; 32]]) })
+            .collect();
+        let addresses: BTreeMap<_, _> = rows.iter().map(|row| (leaf_address(&row.key, row.entity_id), ())).collect();
+        let tree: DigestTree = DigestTree::new(spec);
+        let mut tx = tree.begin();
+        tx.build(rows).await.unwrap();
+        for query in ["true LIMIT 0", "true LIMIT 3", "true ORDER BY id DESC LIMIT 3", "true ORDER BY id DESC LIMIT 30"] {
+            let request = TreeRequest::for_selection(&selection(query), &types()).unwrap();
+            assert_eq!(tree.spec().scope_addresses(&request, &addresses).unwrap(), tx.scope(&request).await.unwrap().ranges(), "{query}");
+        }
+    }
+
+    #[test]
+    fn address_scope_validates_only_encountered_addresses() {
+        let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property("foo"), ValueType::I64)]), selection("true").predicate);
+        let request = TreeRequest::for_selection(&selection("true ORDER BY foo LIMIT 1"), &types()).unwrap();
+        for malformed in [vec![0], vec![1; 33], vec![0xff; 64]] {
+            assert!(matches!(spec.scope_addresses(&request, &BTreeMap::from([(malformed, ())])), Err(TreeError::InvalidKey(_))));
+        }
+        let key = CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(0)]).unwrap();
+        let address = leaf_address(&key, EntityId::from_bytes([0; 32]));
+        let mut addresses = BTreeMap::from([(address.clone(), ()), (vec![0xff; 64], ())]);
+        assert!(spec.scope_addresses(&request, &addresses).unwrap().iter().any(|span| span.contains(&address)));
+        addresses.remove(&address);
+        let zero = TreeRequest::for_selection(&selection("true ORDER BY foo LIMIT 0"), &types()).unwrap();
+        assert!(spec.scope_addresses(&zero, &addresses).unwrap().is_empty());
+        let scalar = TreeSpec::new(KeySpec::new(vec![]), selection("true").predicate);
+        let scalar_request = TreeRequest::for_selection(&selection("true LIMIT 1"), &types()).unwrap();
+        assert!(matches!(scalar.scope_addresses(&scalar_request, &BTreeMap::from([(vec![0], ())])), Err(TreeError::InvalidKey(_))));
+    }
 }

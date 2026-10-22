@@ -853,6 +853,74 @@ fn range_request(lower: i64, limit: Option<u64>, descending: bool) -> TreeReques
 }
 
 #[tokio::test]
+async fn missing_key_counts_track_updates_removals_and_frozen_snapshots() -> anyhow::Result<()> {
+    use ankql::ast::{OrderByItem, OrderDirection, Predicate};
+    let spec = keyed_spec();
+    let selection = Selection {
+        predicate: Predicate::True,
+        order_by: Some(vec![OrderByItem { path: PropertyPath::from(spec.key_spec().keyparts[0].key), direction: OrderDirection::Desc }]),
+        limit: Some(2),
+    };
+    let cache = QueryTreeCache::default();
+    let initial = cache.refresh_captured(spec.clone(), vec![keyed_state(1, 1, Some(Value::I64(1)))?, keyed_state(2, 1, None)?]).await?;
+    assert_eq!(initial.missing_counts, [1]);
+    assert!(initial.has_descending_nulls(&selection)?);
+    cache.apply_captured(vec![keyed_state(2, 2, Some(Value::I64(2)))?], vec![]).await?;
+    let present = cache.current_snapshot().await?;
+    assert_eq!(present.missing_counts, [0]);
+    assert!(!present.has_descending_nulls(&selection)?);
+    cache.apply_captured(vec![keyed_state(1, 2, None)?, keyed_state(3, 1, None)?], vec![]).await?;
+    assert_eq!(cache.current_snapshot().await?.missing_counts, [2]);
+    cache.apply_captured(vec![], vec![numbered_state(1, 2).payload.entity_id]).await?;
+    assert_eq!(cache.current_snapshot().await?.missing_counts, [1]);
+    cache.apply_captured(vec![], vec![numbered_state(3, 1).payload.entity_id]).await?;
+    assert_eq!(cache.current_snapshot().await?.missing_counts, [0]);
+    let rebuilt = cache.refresh_captured(spec, vec![keyed_state(4, 1, None)?]).await?;
+    assert_eq!(rebuilt.missing_counts, [1]);
+    assert_eq!(initial.missing_counts, [1], "later changes cannot rewrite captured null metadata");
+    assert_eq!(present.missing_counts, [0]);
+    assert!(initial.has_descending_nulls(&selection)?);
+    assert!(!present.has_descending_nulls(&selection)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn limited_inventory_does_not_hash_or_retain_the_complete_snapshot() -> anyhow::Result<()> {
+    let rows = (0..4096).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
+    let cache = QueryTreeCache::default();
+    let first = cache.refresh_captured(keyed_spec(), rows.clone()).await?;
+    let second = cache.current_snapshot().await?;
+    assert!(Arc::ptr_eq(&first.states, &second.states), "capturing unchanged rows must not clone the complete map");
+    let mut view = second.select_request(&range_request(-1, Some(10), false)).await?;
+    drop(first);
+    assert_eq!(view.states.len(), 10);
+    assert!(view.tree.is_none(), "selecting a small view must not build hashes");
+    {
+        let cached = cache.0.lock().await;
+        let cached = cached.as_ref().unwrap();
+        assert!(cached.tree.is_none());
+        assert_eq!(Arc::strong_count(&cached.states), 1, "the selected view must not retain all 4096 captured rows");
+    }
+    assert!(matches!(view.offer().await?.spans.as_slice(), [proto::SpanContent::Heads(inventory)] if inventory.heads.len() == 10));
+    assert!(cache.0.lock().await.as_ref().unwrap().tree.is_none());
+
+    cache
+        .apply_captured(
+            vec![keyed_state(5, 2, Some(Value::I64(5)))?, keyed_state(4096, 2, Some(Value::I64(-1)))?],
+            vec![numbered_state(0, 1).payload.entity_id],
+        )
+        .await?;
+    let oracle = QueryTreeCache::default();
+    let expected = oracle.refresh_captured(keyed_spec(), rows[..10].to_vec()).await?.span_digest(super::super::whole()).await?;
+    assert_eq!(view.span_digest(super::super::whole()).await?, expected, "late hashes must describe the captured selection");
+    assert!(cache.0.lock().await.as_ref().unwrap().tree.is_none(), "a private view digest must not populate the full resident cache");
+    let mut full = cache.current_snapshot().await?;
+    assert_eq!(full.span_digest(super::super::whole()).await?.digest.count(), 4096);
+    assert_eq!(view.span_digest(super::super::whole()).await?, expected);
+    Ok(())
+}
+
+#[tokio::test]
 async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyhow::Result<()> {
     let rows = (0..256).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
     let cache = QueryTreeCache::default();
@@ -965,11 +1033,15 @@ async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> 
     let mut view = full.with_spec(wire_spec.clone(), &selection, &catalog)?.select(&selection, &catalog).await?;
     assert_eq!(view.spec, wire_spec);
     assert_eq!(view.span_digest(super::super::whole()).await?.digest.count(), 2);
-    let resident = cache.0.lock().await;
-    let resident = resident.as_ref().unwrap();
-    assert_eq!(resident.spec, spec());
-    assert_eq!(resident.tree.as_ref().unwrap().spec(), &spec());
-    assert_eq!(resident.rows.len(), 3);
+    {
+        let resident = cache.0.lock().await;
+        let resident = resident.as_ref().unwrap();
+        assert_eq!(resident.spec, spec());
+        assert!(resident.tree.is_none(), "hashing a scoped view must leave the full cache lazy");
+        assert_eq!(resident.rows.len(), 3);
+    }
+    assert_eq!(cache.current_snapshot().await?.span_digest(super::super::whole()).await?.digest.count(), 3);
+    assert_eq!(cache.0.lock().await.as_ref().unwrap().tree.as_ref().unwrap().spec(), &spec());
     Ok(())
 }
 
