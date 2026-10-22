@@ -4,15 +4,15 @@
 serialized protocol messages. The current qualification compares the shared
 resident-tree implementation with main `b5fcfd3eac3ea4247c4bd7613c439393beb42aad`,
 using identical public-API fixtures. See [the current report](LIVE_QUERY_STARTUP_RESULTS.md)
-for measurements and immutable artifact pins. The [intermediate unlimited-only reuse report](LIVE_QUERY_STARTUP_RESULTS_UNLIMITED_REUSE.md) is pinned before the bounded-coverage fix. The [pre-reuse](LIVE_QUERY_STARTUP_RESULTS_PRE_REUSE.md),
+for measurements and immutable artifact pins. The [pre-state-sharing report](LIVE_QUERY_STARTUP_RESULTS_PRE_STATE_SHARING.md) preserves the previous candidate's measurements. The [intermediate unlimited-only reuse report](LIVE_QUERY_STARTUP_RESULTS_UNLIMITED_REUSE.md) is pinned before the bounded-coverage fix. The [pre-reuse](LIVE_QUERY_STARTUP_RESULTS_PRE_REUSE.md),
 [post-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_ONGOING.md) and
 [pre-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) reports remain historical;
 their source pins and measurements have not been relabelled.
 
 The [captured-state sharing follow-up](LIVE_QUERY_STARTUP_STATE_SHARING.md)
-records the newer implementation, final correctness checks and frozen measurement
-plan. Its performance run is pending a quiet host window; the existing measured
-reports still describe their older pinned artifacts.
+records the newer implementation, correctness checks, direct optimization
+comparison and separate CPU, allocation and browser tracing evidence. Historical
+reports retain their original source pins and measurements.
 
 ```sh
 STARTUP_LABEL=candidate cargo bench -p ankurah-tests --bench live_query_startup
@@ -129,7 +129,11 @@ Use separate production-only Cargo targets for baseline, candidate and wasm;
 never share them with private instrumentation. Preserve each executable/package,
 check source hashes before and after builds, and scan artifacts for private
 production diagnostics; source stability alone cannot detect stale dependency
-reuse. Finish builds before timed sampling and document any unrelated host load.
+reuse. Finish builds before timed sampling. Record aggregate host CPU/load and
+the benchmark's own resource use; aggregate totals include the benchmark and
+cannot identify the cause of contention. Preserve every planned observation and
+record any pre-sample wait or unavailable monitoring. The current report records
+the exact monitoring policy used for its run.
 
 ```sh
 python3 tests/benches/compare_live_query_startup.py \

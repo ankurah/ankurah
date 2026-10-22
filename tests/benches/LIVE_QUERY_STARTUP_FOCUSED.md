@@ -2,7 +2,7 @@
 
 This pass explains more of the resource cost and reproduces a native reconnect tail. It does **not** establish universal cold/warm parity or resolve the variable 16,384-record browser cold cases. No production code or protocol changed. Design/code review can proceed; performance acceptance remains open.
 
-The comparison remains production `ec767596` / source fingerprint `db233818433b` against main `b5fcfd3e`. The original [420-sample comparison and subsequent evidence](LIVE_QUERY_STARTUP_RESULTS.md) are unchanged. This is a whole-branch comparison, not an experiment isolating the LRU.
+The comparison remains production `ec767596` / source fingerprint `db233818433b` against main `b5fcfd3e`. The original [420-sample comparison and subsequent evidence](LIVE_QUERY_STARTUP_RESULTS_PRE_STATE_SHARING.md) are unchanged. This is a whole-branch comparison, not an experiment isolating the LRU.
 
 ## Fixed pass and correctness
 
