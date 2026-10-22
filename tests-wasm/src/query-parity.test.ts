@@ -6,6 +6,10 @@ import init, { query_parity_browser } from "../bindings/pkg/ankurah_tests_wasm_b
 const setting = (name: string, fallback: string): string => import.meta.env[`VITE_QUERY_PARITY_${name}`] ?? fallback;
 const numbers = (name: string, fallback: string): number[] => setting(name, fallback).split(",").map(Number);
 const label = setting("LABEL", "candidate");
+// An omitted value is unlimited; zero requests an empty ordered result.
+const limitSetting = setting("LIMIT", "");
+const limit = limitSetting === "" ? undefined : Number(limitSetting);
+if (limit !== undefined && (!Number.isSafeInteger(limit) || limit < 0)) throw new Error("LIMIT must be a nonnegative integer");
 const fixtures: { n: number; rtt: number; bps: number; mode: string; cache: string; repeat: number }[] = [];
 for (const n of numbers("SIZES", "8")) {
     for (const rtt of numbers("RTTS", "0")) {
@@ -25,9 +29,11 @@ for (const n of numbers("SIZES", "8")) {
 it.each(fixtures)("public-API query parity $mode/$n/$cache/$rtt ms/$bps Bps/$repeat", async ({ n, rtt, bps, mode, cache, repeat }) => {
     await init();
     const prefix = `query_parity_${label}_${Date.now()}_${crypto.randomUUID()}`;
-    const record = JSON.parse(await query_parity_browser(prefix, n, cache, mode, rtt, bps, label));
+    const record = JSON.parse(await query_parity_browser(prefix, n, cache, mode, rtt, bps, label, limit));
     expect(record.verified).toBe(true);
     expect(record.entities).toBe(n);
+    expect(record.result_limit).toBe(limit ?? null);
+    expect(record.expected_results).toBe(Math.min(n, limit ?? n));
     expect(record.mode).toBe(mode);
     expect(record.cache).toBe(cache);
     console.log(`BROWSER_STARTUP ${JSON.stringify({ ...record, repeat })}`);

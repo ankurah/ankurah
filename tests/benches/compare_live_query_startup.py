@@ -95,15 +95,16 @@ def main():
     parser.add_argument("--bandwidths", default="0", help="bytes/second per direction; zero is unlimited")
     parser.add_argument("--modes", default="cold,warm_refresh,warm_equal,warm_edit,warm_membership")
     parser.add_argument("--cache", default="empty,half,all")
+    parser.add_argument("--limit", type=int, help="ordered result limit; absent is unlimited, zero is LIMIT 0")
     parser.add_argument("--repeats", type=int, default=7)
     parser.add_argument("--timeout", type=float, default=240)
     args = parser.parse_args()
     sizes, rtts, bandwidths = ([int(n) for n in text.split(",")] for text in (args.sizes, args.rtts, args.bandwidths))
     caches, modes = args.cache.split(","), args.modes.split(",")
-    if args.repeats < 1 or args.timeout <= 0 or any(n < 0 for n in sizes + rtts + bandwidths):
+    if args.repeats < 1 or args.timeout <= 0 or any(n < 0 for n in sizes + rtts + bandwidths) or (args.limit is not None and args.limit < 0):
         parser.error("positive repeats/timeout and nonnegative sizes/RTTs/bandwidths required")
-    if any(cache not in ("empty", "half", "all", "half_blocks", "half_interleaved") for cache in caches):
-        parser.error("cache modes: empty,half,all,half_blocks,half_interleaved")
+    if any(cache not in ("empty", "half", "all", "half_blocks", "half_interleaved", "full") for cache in caches):
+        parser.error("cache modes: empty,half,all,half_blocks,half_interleaved,full")
     if any(mode not in ("cold", "warm_equal", "warm_edit", "warm_membership", "warm_refresh") for mode in modes):
         parser.error("modes: cold,warm_refresh,warm_equal,warm_edit,warm_membership")
     cases = [(n, rtt, bps, mode, cache) for n, rtt, bps, mode, cache in itertools.product(sizes, rtts, bandwidths, modes, caches)
@@ -119,10 +120,10 @@ def main():
                      for label, path in binaries.items()},
         "harness_sha256": hashlib.sha256(Path(__file__).with_name("live_query_startup.rs").read_bytes()).hexdigest(),
         "runner_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "sizes": sizes, "rtt_ms": rtts, "bandwidth_bytes_per_second": bandwidths, "cache": caches, "modes": modes,
+        "sizes": sizes, "result_limit": args.limit, "rtt_ms": rtts, "bandwidth_bytes_per_second": bandwidths, "cache": caches, "modes": modes,
         "repeats": args.repeats, "sample_timeout_seconds": args.timeout,
         "order": "AB then BA, alternating per repetition within each case",
-        "scope": "cold no-query-tree or first same-selection refresh versioned durable readiness, or retained-query reconnect fresh local installation; setup/prefetch excluded from latency",
+        "scope": "initial query or first same-selection refresh versioned durable readiness, or retained-query reconnect fresh local installation; setup/prefetch excluded from latency; all prefetches the query selection, full separately prefetches the entire predicate result",
         "transport": "serialized real-node in-process full-duplex link; per-direction shared bandwidth serialization plus one-way RTT/2 propagation; no transport framing or socket cost",
         "resource_scope": "CPU and peak RSS cover whole isolated fixture process; storage counters and traffic cover timed transfer plus settle tail",
         "warm_endpoint": "same-selection refresh uses versioned durable ready then captures immutable resident membership/full state before async verification; reconnect resets public loading metadata before arm/timing, timestamps first fresh loaded=true in Signal.listen then synchronously captures resident membership/full state; capture is atomic per entity, not globally atomic, and its work is separate from readiness; captured state is compared to the static sender and persisted state checked asynchronously before own QuerySubscribed validity gate and one drain; installation precedes durable bookkeeping, reconnect ready_us is null; initial/final drain fields are legacy aliases",
@@ -134,9 +135,12 @@ def main():
         for repeat in range(args.repeats):
             order = ("baseline", "candidate") if repeat % 2 == 0 else ("candidate", "baseline")
             for label in order:
-                name = f"{mode}-{n}-{cache}-{rtt}ms-{bps}bps-{repeat}-{label}.log"
+                name = f"{mode}-{n}-{cache}-limit{args.limit if args.limit is not None else 'unlimited'}-{rtt}ms-{bps}bps-{repeat}-{label}.log"
                 env = dict(os.environ, STARTUP_LABEL=label, STARTUP_SIZES=str(n), STARTUP_RTT_MS=str(rtt),
                            STARTUP_BPS=str(bps), STARTUP_MODES=mode, STARTUP_CACHE=cache, STARTUP_REPEATS="1")
+                env.pop("STARTUP_LIMIT", None)
+                if args.limit is not None:
+                    env["STARTUP_LIMIT"] = str(args.limit)
                 with (args.output / name).open("w") as log:
                     status, resources = run_sample(binaries[label], env, log, args.timeout)
                 lines = (args.output / name).read_text().splitlines()
@@ -151,10 +155,12 @@ def main():
                 record = records[0]
                 if (record["entities"], record["cache"], record["mode"], record["rtt_ms"], record["bandwidth_bytes_per_second"], record["label"], record["verified"]) != (n, cache, mode, rtt, bps, label, True):
                     raise RuntimeError(f"unexpected or unverified workload in {name}")
+                if record["result_limit"] != args.limit or record["expected_results"] != min(n, args.limit if args.limit is not None else n):
+                    raise RuntimeError(f"unexpected result limit or count in {name}")
                 record.update(repeat=repeat, resources=resources, raw_log=name)
                 samples[label].append(record)
                 results.append(record)
-        row = {"entities": n, "cache": cache, "mode": mode, "rtt_ms": rtt, "bandwidth_bytes_per_second": bps,
+        row = {"entities": n, "result_limit": args.limit, "cache": cache, "mode": mode, "rtt_ms": rtt, "bandwidth_bytes_per_second": bps,
                "complete": all(len(data) == args.repeats for data in samples.values())}
         row.update({label: summarize(data) for label, data in samples.items()})
         if row["baseline"] and row["candidate"]:

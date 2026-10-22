@@ -1,13 +1,12 @@
 # Cold and retained-query performance
 
 `live_query_startup` exercises two real nodes, Sled, two Tokio workers and
-serialized protocol messages. The current qualification compares candidate
-`81299f2185fa89918c79decbe02106e4ed66a82f` with main after #526,
-`ae8962798085dbf6d717429e4b6566940f0051e1`, and the previous digest branch,
-`6ef6f35e08064d2ae0d1c299d02a6acf1bee5eb1`, using identical public-API fixtures.
-See [the current report](LIVE_QUERY_STARTUP_RESULTS.md) for measurements and
-immutable artifact pins. The [post-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_ONGOING.md)
-and [pre-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) reports remain historical;
+serialized protocol messages. The current qualification compares the shared
+resident-tree implementation with main `b5fcfd3eac3ea4247c4bd7613c439393beb42aad`,
+using identical public-API fixtures. See [the current report](LIVE_QUERY_STARTUP_RESULTS.md)
+for measurements and immutable artifact pins. The [intermediate unlimited-only reuse report](LIVE_QUERY_STARTUP_RESULTS_UNLIMITED_REUSE.md) is pinned before the bounded-coverage fix. The [pre-reuse](LIVE_QUERY_STARTUP_RESULTS_PRE_REUSE.md),
+[post-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_ONGOING.md) and
+[pre-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) reports remain historical;
 their source pins and measurements have not been relabelled.
 
 ```sh
@@ -16,17 +15,27 @@ STARTUP_LABEL=candidate cargo bench -p ankurah-tests --bench live_query_startup
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `STARTUP_SIZES` | `0,8,32,256,4096` | Server result sizes |
+| `STARTUP_SIZES` | `0,8,32,256,4096` | Server population sizes |
+| `STARTUP_LIMIT` | absent | Optional result limit; absence is unlimited, explicit `0` is `LIMIT 0` |
 | `STARTUP_RTT_MS` | `0,50` | Propagation round trip in milliseconds |
 | `STARTUP_BPS` | `0` | Full-duplex bytes/second per direction; zero is unlimited |
-| `STARTUP_CACHE` | `empty,half,all` | Entity coverage before initial subscription; optional `half_blocks,half_interleaved` diagnostics |
+| `STARTUP_CACHE` | `empty,half,all` | Entity coverage before initial subscription; optional `half_blocks,half_interleaved,full` diagnostics |
 | `STARTUP_MODES` | `cold` | `cold,warm_refresh,warm_equal,warm_edit,warm_membership` |
 | `STARTUP_REPEATS` | `3` | Fresh-fixture repetitions |
 | `STARTUP_LABEL` | `candidate` | Revision label in every JSON record |
 
-Cold cases use a new client without an active or retained query tree. Partial
-and full entity cache come from Fetch outside the timed interval. Node creation,
-catalog negotiation, server population and prefetch are excluded from latency.
+The `cold` mode measures the initial subscription. With `cache=empty`, neither
+peer has a resident tree for this application query before timing. Partial and
+full entity caches come from Fetch outside the timed interval. With `cache=all`,
+that Fetch uses the subscription's same Selection and now warms compatible
+resident trees too: report it as **cached startup**, not a tree-free cold start.
+With `cache=half`, the narrower prefetch tree cannot serve the wider subscription.
+With `STARTUP_LIMIT=10`, the Selection is `body >= 'row-' ORDER BY body ASC LIMIT 10`, using the existing zero-padded `row-00000000` strings; population and expected result count are recorded separately. The normal `all` prefetch uses this same bounded Selection. The separate `full` diagnostic prefetches `body >= 'row-'` without ordering or a limit, allowing the subsequent limited query to reuse a complete resident. This is a cache-hit cost experiment, not cold startup. Limited cases verify ordered IDs as well as membership, full state and heads. Bounded warm edits change a selected row's nonsort `position` payload, leaving its body key unchanged. Membership changes set the first row's body to `excluded` and add a correctly padded row at position N; the result must include the unchanged row just beyond its previous limit. Zero-result cases do not run warm mutation fixtures.
+The attempted numeric-order fixture failed its strict oracle on both arms and is preserved separately. The existing Sled numeric ORDER BY defect (fwd `wJfo-978`, GitHub #210) is outside this branch; string-order qualification must not be presented as numeric-order correctness. An exploratory body-suffix edit passed main but failed the candidate, exposing the existing Small/Large sort-key comparator defect (fwd `JTAKZLw2`) through fresh result installation. Checkpoint `fcd05988` fixes that blocker by comparing actual bytes and preserving inline lengths. Separate ASC/DESC reconnect tests failed before the fix and pass afterward, checking the first installed result. Timed payload-edit cases still edit the nonsort field, as intended by that workload. No result-order, membership, state or head assertion is disabled for the replacement fixture.
+The complete-resident-to-LIMIT experiment exposed eager full-digest construction in `fcd05988`. Checkpoint `ec767596` resolves spans from the maintained address index and keeps narrow digests lazy; unchanged captures share an immutable state map, and a narrowed view retains only its selected rows. The original slow measurements remain separate from the new artifact’s qualification.
+
+Node creation, catalog negotiation, server population and prefetch are excluded
+from latency.
 `ready_us` starts immediately before `query_wait` and ends after
 `wait_durable_answered`: the durable response and local application must finish.
 After state verification, one transport drain checks subscription delivery and
@@ -52,7 +61,7 @@ the connection and calls `update_selection_wait` with the same selection, then
 This does not measure the new same-stream `refresh()` API. Query identity is
 retained; actual internal tree reuse must also be checked
 in implementation/work counters. The other warm cases disconnect/reconnect.
-`warm_equal` has no offline change. `warm_edit` edits one body while offline.
+`warm_equal` has no offline change. `warm_edit` edits one selected entity while offline: its body for unlimited selections, or its nonsort position for bounded selections.
 `warm_membership` additionally moves one entity out of the predicate and adds
 another. Reconnection, including registration and catalog work it triggers, is
 timed. The baseline's durable-answer flag is sticky across reconnect. Before

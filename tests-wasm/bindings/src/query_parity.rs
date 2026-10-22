@@ -53,8 +53,9 @@ pub async fn query_parity_browser(
     rtt_ms: u32,
     bytes_per_second: u32,
     label: &str,
+    limit: Option<usize>,
 ) -> Result<String, JsValue> {
-    sample(db_prefix, n, cache, mode, rtt_ms as u64, bytes_per_second as u64, label)
+    sample(db_prefix, n, cache, mode, rtt_ms as u64, bytes_per_second as u64, label, limit)
         .await
         .map_err(|error| JsValue::from_str(&format!("{error:#}")))
 }
@@ -84,6 +85,7 @@ struct Meter {
     query_subscriptions_handled: HashMap<proto::QueryId, usize>,
     local_result_installed_at: Option<Instant>,
     local_result_states: Option<BTreeMap<proto::EntityId, proto::State>>,
+    local_result_order: Option<Vec<proto::EntityId>>,
     local_result_capture_us: Option<u128>,
     last_activity: Option<Instant>,
     uplink_free: Option<Instant>,
@@ -234,8 +236,17 @@ async fn sample(
     rtt_ms: u64,
     bytes_per_second: u64,
     label: &str,
+    limit: Option<usize>,
 ) -> anyhow::Result<String> {
     anyhow::ensure!(["cold", "warm_equal", "warm_edit", "warm_membership", "warm_refresh"].contains(&mode), "unknown mode: {mode}");
+    // Numeric ORDER BY is a known baseline defect; bounded cases use one string predicate/order.
+    let predicate = if limit.is_some() { "body >= 'row-'" } else { "position >= 0" };
+    let selection = limit.map_or_else(|| predicate.to_owned(), |limit| format!("{predicate} ORDER BY body ASC LIMIT {limit}"));
+    let result_count = limit.unwrap_or(n).min(n);
+    anyhow::ensure!(
+        !matches!(mode, "warm_edit" | "warm_membership") || result_count > 0,
+        "warm mutation fixtures require at least one result"
+    );
     let server_name = format!("{db_prefix}_server");
     let client_name = format!("{db_prefix}_client");
     phase("server-create");
@@ -247,10 +258,13 @@ async fn sample(
     let mut rows = Vec::new();
     for position in 0..n {
         let row = trx.create(&StartupRow { position: position as i64, body: format!("row-{position:08}") }).await?;
-        expected.insert(ankurah::Mutable::id(&*row));
+        if position < result_count {
+            expected.insert(ankurah::Mutable::id(&*row));
+        }
         rows.push(row.read()?);
     }
     trx.commit().await?;
+    let mut expected_order = limit.map(|_| rows.iter().take(result_count).map(|row| row.id()).collect::<Vec<_>>());
     phase("server-populated");
     // Also register the model in the empty-result case.
     writer.resolve_model_id::<StartupRow>().await?;
@@ -263,14 +277,33 @@ async fn sample(
     phase("prefetch");
     let cached = match cache {
         "empty" => 0,
-        "half" => reader.fetch::<StartupRowView>(format!("position < {}", n / 2)).await?.len(),
+        "half" => {
+            let selection = if limit.is_some() {
+                format!("body >= 'row-' AND body < 'row-{:08}'", result_count / 2)
+            } else {
+                format!("position < {}", result_count / 2)
+            };
+            reader.fetch::<StartupRowView>(selection).await?.len()
+        }
         "half_blocks" => {
-            let intervals = (0..n)
+            let intervals = (0..result_count)
                 .step_by(512)
-                .map(|start| format!("(position >= {start} AND position < {})", (start + 256).min(n)))
+                .map(|start| {
+                    let end = (start + 256).min(result_count);
+                    if limit.is_some() {
+                        format!("(body >= 'row-{start:08}' AND body < 'row-{end:08}')")
+                    } else {
+                        format!("(position >= {start} AND position < {end})")
+                    }
+                })
                 .collect::<Vec<_>>();
-            let wanted: BTreeSet<_> =
-                rows.iter().enumerate().filter(|(position, _)| position / 256 % 2 == 0).map(|(_, row)| row.id()).collect();
+            let wanted: BTreeSet<_> = rows
+                .iter()
+                .take(result_count)
+                .enumerate()
+                .filter(|(position, _)| position / 256 % 2 == 0)
+                .map(|(_, row)| row.id())
+                .collect();
             let mut cached_ids = BTreeSet::new();
             for batch in intervals.chunks(16) {
                 cached_ids.extend(reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
@@ -279,8 +312,12 @@ async fn sample(
             cached_ids.len()
         }
         "half_interleaved" => {
-            let positions = (0..n).step_by(2).map(|position| format!("position = {position}")).collect::<Vec<_>>();
-            let wanted: BTreeSet<_> = rows.iter().enumerate().filter(|(position, _)| position % 2 == 0).map(|(_, row)| row.id()).collect();
+            let positions = (0..result_count)
+                .step_by(2)
+                .map(|position| if limit.is_some() { format!("body = 'row-{position:08}'") } else { format!("position = {position}") })
+                .collect::<Vec<_>>();
+            let wanted: BTreeSet<_> =
+                rows.iter().take(result_count).enumerate().filter(|(position, _)| position % 2 == 0).map(|(_, row)| row.id()).collect();
             let mut cached_ids = BTreeSet::new();
             for batch in positions.chunks(32) {
                 cached_ids.extend(reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
@@ -288,17 +325,29 @@ async fn sample(
             assert_eq!(cached_ids, wanted, "gapped prefetch membership");
             cached_ids.len()
         }
-        "all" => reader.fetch::<StartupRowView>("position >= 0").await?.len(),
+        "all" => {
+            let fetched = reader.fetch::<StartupRowView>(selection.as_str()).await?;
+            if let Some(order) = &expected_order {
+                anyhow::ensure!(
+                    fetched.iter().map(|row| row.id()).collect::<Vec<_>>() == *order,
+                    "prefetch has incorrect ordered membership"
+                );
+            }
+            fetched.len()
+        }
+        // Separate exploratory case: an unlimited resident tree precedes a bounded query.
+        "full" => reader.fetch::<StartupRowView>(predicate).await?.len(),
         _ => anyhow::bail!("unknown cache mode: {cache}"),
     };
     assert_eq!(
         cached,
         match cache {
             "empty" => 0,
-            "half" => n / 2,
-            "half_blocks" => (0..n).filter(|position| position / 256 % 2 == 0).count(),
-            "half_interleaved" => n.div_ceil(2),
-            _ => n,
+            "half" => result_count / 2,
+            "half_blocks" => (0..result_count).filter(|position| position / 256 % 2 == 0).count(),
+            "half_interleaved" => result_count.div_ceil(2),
+            "full" => n,
+            _ => result_count,
         },
         "prefetch coverage"
     );
@@ -307,7 +356,7 @@ async fn sample(
         None
     } else {
         phase("initial-query");
-        let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
+        let query = reader.query_wait::<StartupRowView>(selection.as_str()).await?;
         query.wait_durable_answered().await?;
         settle(&meter, 1, None).await?;
         if mode != "warm_refresh" {
@@ -316,12 +365,32 @@ async fn sample(
         }
         if mode == "warm_edit" || mode == "warm_membership" {
             let trx = writer.begin();
-            rows[n / 2].edit(&trx)?.body()?.replace("offline-edit")?;
+            let edited = result_count / 2;
+            if limit.is_some() {
+                // Mutate payload without touching the bounded selection's string sort key.
+                rows[edited].edit(&trx)?.position()?.set(&(n as i64 + 1))?;
+            } else {
+                rows[edited].edit(&trx)?.body()?.replace("offline-edit")?;
+            }
             if mode == "warm_membership" {
-                rows[0].edit(&trx)?.position()?.set(&-1)?;
-                expected.remove(&rows[0].id());
-                let added = trx.create(&StartupRow { position: n as i64, body: "offline-added".into() }).await?;
-                expected.insert(ankurah::Mutable::id(&*added));
+                if limit.is_some() {
+                    rows[0].edit(&trx)?.body()?.replace("excluded")?;
+                } else {
+                    rows[0].edit(&trx)?.position()?.set(&-1)?;
+                }
+                let body = if limit.is_some() { format!("row-{n:08}") } else { "offline-added".to_owned() };
+                let added = trx.create(&StartupRow { position: n as i64, body }).await?;
+                let added_id = ankurah::Mutable::id(&*added);
+                if let Some(limit) = limit {
+                    // Removing the first result pulls the next original row into the window;
+                    // the new row at position n stays outside unless the window reaches it.
+                    let order = rows.iter().skip(1).map(|row| row.id()).chain(std::iter::once(added_id)).take(limit).collect::<Vec<_>>();
+                    expected = order.iter().copied().collect();
+                    expected_order = Some(order);
+                } else {
+                    expected.remove(&rows[0].id());
+                    expected.insert(added_id);
+                }
             }
             trx.commit().await?;
         }
@@ -343,11 +412,10 @@ async fn sample(
                     // Capture before any transport drain or asynchronous verifier can
                     // allow a later repair to rescue an early installation landmark.
                     let capture_start = Instant::now();
-                    let states = observed
-                        .read()
-                        .iter_entities()
-                        .map(|(id, entity)| Ok((id, entity.to_state()?)))
-                        .collect::<anyhow::Result<BTreeMap<_, _>>>();
+                    let result = observed.read();
+                    meter.local_result_order = limit.map(|_| result.iter_entities().map(|(id, _)| id).collect());
+                    let states =
+                        result.iter_entities().map(|(id, entity)| Ok((id, entity.to_state()?))).collect::<anyhow::Result<BTreeMap<_, _>>>();
                     meter.local_result_capture_us = Some(capture_start.elapsed().as_micros());
                     match states {
                         Ok(states) => meter.local_result_states = Some(states),
@@ -373,7 +441,7 @@ async fn sample(
     let start = Instant::now();
     let (query, ready_us) = if let Some(query) = retained_query {
         if mode == "warm_refresh" {
-            query.update_selection_wait("position >= 0").await?;
+            query.update_selection_wait(selection.as_str()).await?;
             query.wait_durable_answered().await?;
             let ready_us = start.elapsed().as_micros();
             (query, Some(ready_us))
@@ -382,7 +450,7 @@ async fn sample(
             (query, None)
         }
     } else {
-        let query = reader.query_wait::<StartupRowView>("position >= 0").await?;
+        let query = reader.query_wait::<StartupRowView>(selection.as_str()).await?;
         query.wait_durable_answered().await?;
         let ready_us = start.elapsed().as_micros();
         (query, Some(ready_us))
@@ -415,16 +483,26 @@ async fn sample(
     // versioned wait, without awaiting response bookkeeping or a transport drain.
     // Each entity's full state is atomic; the collection is not one global
     // snapshot. This fixture performs no writes after measurement begins.
-    let captured_states = if ready_us.is_none() {
-        meter.lock().unwrap().local_result_states.take().expect("installation callback captured states")
+    let (captured_states, captured_order) = if ready_us.is_none() {
+        let mut meter = meter.lock().unwrap();
+        (meter.local_result_states.take().expect("installation callback captured states"), meter.local_result_order.take())
     } else {
-        query
-            .resultset()
-            .read()
-            .iter_entities()
-            .map(|(id, entity)| Ok((id, entity.to_state()?)))
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?
+        let resultset = query.resultset();
+        let result = resultset.read();
+        let order = limit.map(|_| result.iter_entities().map(|(id, _)| id).collect::<Vec<_>>());
+        let states = result.iter_entities().map(|(id, entity)| Ok((id, entity.to_state()?))).collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        (states, order)
     };
+    if let Some(order) = &expected_order {
+        anyhow::ensure!(
+            captured_order.as_ref() == Some(order),
+            "installed query has incorrect authoritative ordering: expected seeded positions {:?}, captured {:?}; expected {} states, captured {}",
+            order.iter().map(|id| rows.iter().position(|row| row.id() == *id)).collect::<Vec<_>>(),
+            captured_order.iter().flatten().map(|id| rows.iter().position(|row| row.id() == *id)).collect::<Vec<_>>(),
+            expected.len(),
+            captured_states.len()
+        );
+    }
     anyhow::ensure!(
         captured_states.keys().copied().collect::<BTreeSet<_>>() == expected,
         "installed query has incorrect authoritative membership"
@@ -455,7 +533,8 @@ async fn sample(
         (std::mem::take(&mut meter.traffic), meter.local_result_capture_us)
     };
     let record = serde_json::json!({
-        "label":label, "entities":n, "cache":cache, "cached_entities":cached,
+        "label":label, "entities":n, "result_limit":limit, "expected_results":expected.len(), "selection":selection,
+            "cache":cache, "cached_entities":cached,
         "mode":mode, "bandwidth_bytes_per_second":bytes_per_second,
         "rtt_ms":rtt_ms, "elapsed_us":elapsed_us,
         "ready_us":ready_us, "local_result_installed_us":local_result_installed_us,
