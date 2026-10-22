@@ -70,6 +70,11 @@ impl Entity {
         Ok(ProtoEntityState { entity_id: self.id(), state: self.to_state()? })
     }
 
+    pub(crate) fn capture(&self) -> Result<super::CapturedEntity, StateError> {
+        let id = self.id();
+        self.with_state(|state| state.capture(id)).map_err(|_| StateError::TransactionClosed)?
+    }
+
     pub fn values(&self) -> Result<Vec<(PropertyId, Option<Value>)>, PropertyError> { self.with_state(EntityState::values) }
 
     pub fn property_value(&self, property: &PropertyId) -> Result<Option<Value>, PropertyError> {

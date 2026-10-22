@@ -954,7 +954,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert!(comparison.pending_repairs.is_empty());
         (comparison.snapshot.members(), comparison.offered.clone())
     };
-    for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.state.head }]] {
+    for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.state.head.clone() }]] {
         assert!(
             matches!(
                 continue_state(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, answers, vec![]).await?,

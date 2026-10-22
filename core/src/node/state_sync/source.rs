@@ -1,6 +1,8 @@
 //! Complete or explicitly limited resident coverage, maintained by commit publications.
+#[cfg(test)]
+use crate::entity::TemporaryEntity;
 use crate::{
-    entity::TemporaryEntity,
+    entity::CapturedEntity,
     node::{
         source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
         state_sync::{QueryTreeCache, Snapshot},
@@ -28,7 +30,7 @@ use tokio::sync::oneshot;
 
 const MAX_READ_ATTEMPTS: usize = 8;
 
-type Rows = IndexMap<proto::EntityId, Row>;
+type Rows = IndexMap<proto::EntityId, Arc<Row>>;
 
 /// Which selections the resident has actually captured. A limited result never
 /// proves complete admission for its TreeSpec's predicate.
@@ -68,9 +70,8 @@ impl Coverage {
 }
 type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
 
-#[derive(Clone)]
 struct Row {
-    state: Arc<proto::EntityState>,
+    state: Arc<CapturedEntity>,
     values: Vec<Option<Value>>,
     key: Vec<u8>,
     bytes: usize,
@@ -194,8 +195,8 @@ impl QueryProjection {
         Ok(())
     }
 
-    fn candidate(&self, state: Arc<proto::EntityState>) -> anyhow::Result<Option<Row>> {
-        let entity = TemporaryEntity::new(state.entity_id, &state.state)?;
+    fn candidate(&self, state: Arc<CapturedEntity>) -> anyhow::Result<Option<Arc<Row>>> {
+        let entity = state.read()?;
         if !evaluate_predicate(&entity, &self.selection.predicate)? {
             return Ok(None);
         }
@@ -204,8 +205,9 @@ impl QueryProjection {
         let bytes = (bincode::serialized_size(state.as_ref())? as usize)
             .saturating_mul(4)
             .saturating_add(key.len().saturating_mul(16))
-            .saturating_add(2048);
-        Ok(Some(Row { state, values, key, bytes }))
+            .saturating_add(2048)
+            .saturating_add(state.lookup_bytes());
+        Ok(Some(Arc::new(Row { state, values, key, bytes })))
     }
 
     async fn read<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<Rows>
@@ -217,7 +219,7 @@ impl QueryProjection {
         let states = node.storage.fetch_states(&self.selection).await?;
         let mut rows = Rows::new();
         for state in states {
-            if let Some(row) = self.candidate(Arc::new(state.payload))? {
+            if let Some(row) = self.candidate(Arc::new(CapturedEntity::new(state.payload)))? {
                 rows.insert(row.state.entity_id, row);
             }
         }
@@ -232,7 +234,7 @@ impl QueryProjection {
     fn authorized_rows<PA: PolicyAgent>(&self, policy: &ReadPolicy<'_, PA>) -> Rows {
         self.candidates
             .iter()
-            .filter(|(_, row)| policy.check_read(&row.state.entity_id, &row.state.state).is_ok())
+            .filter(|(_, row)| policy.check_read_captured(&row.state).is_ok())
             .map(|(id, row)| (*id, row.clone()))
             .collect()
     }
@@ -240,7 +242,7 @@ impl QueryProjection {
     fn fold<PA: PolicyAgent>(&mut self, policy: &ReadPolicy<'_, PA>, change: &SourceChange) -> anyhow::Result<()> {
         let id = change.state.entity_id;
         if let Some(row) = self.candidate(change.state.clone())? {
-            if policy.check_read(&id, &row.state.state).is_ok() {
+            if policy.check_read_captured(&row.state).is_ok() {
                 self.rows.insert(id, row.clone());
             } else {
                 self.rows.swap_remove(&id);
@@ -258,15 +260,21 @@ impl QueryProjection {
         Ok(())
     }
 
-    fn attested<SE, PA>(node: &Node<SE, PA>, row: &Row) -> (Attested<proto::EntityState>, Vec<Option<Value>>)
+    fn attested<SE, PA>(node: &Node<SE, PA>, row: &Row) -> (super::tree::SharedState, Vec<Option<Value>>)
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        (Attested::opt((*row.state).clone(), node.policy_agent.attest_state(node, &row.state)), row.values.clone())
+        (
+            super::tree::SharedState {
+                payload: row.state.clone(),
+                attestations: proto::AttestationSet(node.policy_agent.attest_state(node, &row.state).into_iter().collect()),
+            },
+            row.values.clone(),
+        )
     }
 
-    fn attested_rows<SE, PA>(&self, node: &Node<SE, PA>) -> Vec<(Attested<proto::EntityState>, Vec<Option<Value>>)>
+    fn attested_rows<SE, PA>(&self, node: &Node<SE, PA>) -> Vec<(super::tree::SharedState, Vec<Option<Value>>)>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -281,12 +289,12 @@ impl QueryProjection {
     {
         let entity_id = change.state.entity_id;
         let member = self.rows.get(&entity_id).map(|row| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() });
-        let delta = if policy.check_read(&entity_id, &change.state.state).is_ok() {
+        let delta = if policy.check_read_captured(&change.state).is_ok() {
             for event in &change.events {
-                policy.check_read_event(event, &change.state.state)?;
+                policy.check_read_captured_event(event, &change.state)?;
             }
             Some(proto::DeltaContent::StateAndEvents {
-                state: Attested::opt((*change.state).clone(), node.policy_agent.attest_state(node, &change.state)).into(),
+                state: Attested::opt(change.state.to_entity_state(), node.policy_agent.attest_state(node, &change.state)).into(),
                 events: change.events.iter().cloned().map(Into::into).collect(),
             })
         } else {
@@ -362,7 +370,7 @@ impl Route {
             for source in sources {
                 let id = source.state.entity_id;
                 let member = if let Some(row) = projection.rows.get(&id) {
-                    let entity = TemporaryEntity::new(id, &row.state.state)?;
+                    let entity = row.state.read()?;
                     evaluate_predicate(&entity, &self.selection.predicate)?
                         .then(|| proto::QueryMember { key: row.key.clone(), head: row.state.state.head.clone() })
                 } else {
@@ -395,7 +403,7 @@ impl Route {
                 let source = SourceChange { state: row.state.clone(), events: Vec::new() };
                 let mut change = projection.change(node, policy, &source)?;
                 change.member = member.clone();
-                entrants.push((change, TemporaryEntity::new(*id, &row.state.state)?));
+                entrants.push((change, row.state.read()?));
             } else {
                 removed.push(proto::QueryChange { entity_id: *id, member: None, delta: None });
             }
@@ -446,7 +454,7 @@ impl<CD: ContextData> QuerySource<CD> {
         // External policy changes have no source revision. Reopen rather than
         // authoring different membership at an already published revision.
         for (id, row) in &self.projection.candidates {
-            anyhow::ensure!(policy.check_read(id, &row.state.state).is_ok() == self.projection.rows.contains_key(id), SourceError::Changed);
+            anyhow::ensure!(policy.check_read_captured(&row.state).is_ok() == self.projection.rows.contains_key(id), SourceError::Changed);
         }
         Ok(())
     }

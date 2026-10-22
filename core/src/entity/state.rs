@@ -108,6 +108,12 @@ impl EntityState {
 
     pub(crate) fn to_state(&self) -> Result<State, StateError> { self.inner.read().unwrap().to_state() }
 
+    pub(super) fn capture(&self, entity_id: ankurah_proto::EntityId) -> Result<super::CapturedEntity, StateError> {
+        let state = self.inner.read().unwrap();
+        let data = ankurah_proto::EntityState { entity_id, state: state.to_state()? };
+        Ok(super::CapturedEntity::from_validated(data, state.backends.values().flat_map(|backend| backend.property_values())))
+    }
+
     pub(super) fn fork(&self) -> Self { Self::new(self.inner.read().unwrap().fork()) }
 
     pub(super) fn take(&self) -> EntityInnerState { std::mem::replace(&mut *self.inner.write().unwrap(), EntityInnerState::empty()) }

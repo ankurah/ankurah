@@ -13,7 +13,7 @@ use ankurah_digest_tree::{
 use ankurah_proto::{self as proto, Attested, EntityId, EntityState, TreeSpanDigest, TreeSpec};
 
 use crate::{
-    entity::TemporaryEntity,
+    entity::{CapturedEntity, TemporaryEntity},
     schema::catalog::CatalogManager,
     selection::{
         filter::{evaluate_predicate, ValueLookup},
@@ -22,7 +22,30 @@ use crate::{
     value::Value,
 };
 
-type States = BTreeMap<EntityId, Arc<Attested<EntityState>>>;
+/// A local attestation of a shared immutable capture. Only emission needs an
+/// owned protocol payload; the serialized representation is identical.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename = "Attested")]
+pub(crate) struct SharedState {
+    #[serde(serialize_with = "serialize_capture")]
+    pub payload: Arc<CapturedEntity>,
+    pub attestations: proto::AttestationSet,
+}
+impl SharedState {
+    pub fn to_owned(&self) -> Attested<EntityState> {
+        Attested { payload: self.payload.to_entity_state(), attestations: self.attestations.clone() }
+    }
+}
+impl From<Attested<EntityState>> for SharedState {
+    fn from(state: Attested<EntityState>) -> Self {
+        Self { payload: Arc::new(CapturedEntity::new(state.payload)), attestations: state.attestations }
+    }
+}
+fn serialize_capture<S: serde::Serializer>(state: &Arc<CapturedEntity>, serializer: S) -> Result<S::Ok, S::Error> {
+    serde::Serialize::serialize(state.as_ref(), serializer)
+}
+
+type States = BTreeMap<EntityId, Arc<SharedState>>;
 type Members = BTreeMap<Vec<u8>, EntityId>;
 type Cache = tokio::sync::Mutex<Option<Cached>>;
 
@@ -50,7 +73,7 @@ struct Cached {
 /// The key and serialized state are captured from the same entity version.
 struct CapturedRow {
     key: Vec<u8>,
-    state: Arc<Attested<EntityState>>,
+    state: Arc<SharedState>,
     missing_parts: Vec<usize>,
 }
 
@@ -157,11 +180,12 @@ impl QueryTreeCache {
     pub async fn refresh_captured(
         &self,
         spec: TreeSpec,
-        rows: Vec<(Attested<EntityState>, Vec<Option<Value>>)>,
+        rows: Vec<(impl Into<SharedState>, Vec<Option<Value>>)>,
     ) -> anyhow::Result<Snapshot> {
         let rows = rows
             .into_iter()
             .map(|(state, values)| {
+                let state = state.into();
                 let key = CanonicalCodec.encode_nullable(spec.key_spec(), &values)?;
                 let missing_parts = values.iter().enumerate().filter_map(|(index, value)| value.is_none().then_some(index)).collect();
                 Ok((state, key, missing_parts))
@@ -182,7 +206,7 @@ impl QueryTreeCache {
                     .enumerate()
                     .filter_map(|(index, part)| (part[0] == 0).then_some(index))
                     .collect();
-                Ok((state, key, missing_parts))
+                Ok((state.into(), key, missing_parts))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         self.refresh_keyed(spec, rows).await
@@ -192,7 +216,7 @@ impl QueryTreeCache {
     /// All encoding and tree work succeeds before the cached row set is replaced.
     pub async fn apply_captured(
         &self,
-        rows: Vec<(Attested<EntityState>, Vec<Option<Value>>)>,
+        rows: Vec<(impl Into<SharedState>, Vec<Option<Value>>)>,
         removed: Vec<EntityId>,
     ) -> anyhow::Result<()> {
         let mut cache = self.0.lock().await;
@@ -200,6 +224,7 @@ impl QueryTreeCache {
         let rows: BTreeMap<_, _> = rows
             .into_iter()
             .map(|(state, values)| {
+                let state = state.into();
                 let key = CanonicalCodec.encode_nullable(cached.spec.key_spec(), &values)?;
                 let missing_parts = values.iter().enumerate().filter_map(|(index, value)| value.is_none().then_some(index)).collect();
                 Ok((state.payload.entity_id, CapturedRow { key, state: Arc::new(state), missing_parts }))
@@ -286,7 +311,7 @@ impl QueryTreeCache {
         }
     }
 
-    async fn refresh_keyed(&self, spec: TreeSpec, rows: Vec<(Attested<EntityState>, Vec<u8>, Vec<usize>)>) -> anyhow::Result<Snapshot> {
+    async fn refresh_keyed(&self, spec: TreeSpec, rows: Vec<(SharedState, Vec<u8>, Vec<usize>)>) -> anyhow::Result<Snapshot> {
         let rows: BTreeMap<_, _> = rows
             .into_iter()
             .map(|(state, key, missing_parts)| (state.payload.entity_id, CapturedRow { key, state: Arc::new(state), missing_parts }))
@@ -424,8 +449,8 @@ impl Snapshot {
         }) {
             return Ok(false);
         }
-        for (id, state) in self.states.iter() {
-            let entity = TemporaryEntity::new(*id, &state.payload.state)?;
+        for state in self.states.values() {
+            let entity = state.payload.read()?;
             if descending.iter().any(|path| entity.value_at(path).is_none()) {
                 return Ok(true);
             }
@@ -439,7 +464,7 @@ impl Snapshot {
         // can race the source revision or block unrelated views of the tree.
         let mut rows = Vec::with_capacity(self.states.len());
         for (id, state) in self.states.iter() {
-            let entity = TemporaryEntity::new(*id, &state.payload.state)?;
+            let entity = state.payload.read()?;
             if self.physical_spec.predicate() == &selection.predicate || evaluate_predicate(&entity, &selection.predicate).unwrap_or(false)
             {
                 rows.push((*id, entity));
@@ -679,7 +704,7 @@ impl Snapshot {
             .collect()
     }
 
-    pub fn states_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (&[u8], &Attested<EntityState>)> {
+    pub fn states_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (&[u8], &SharedState)> {
         self.members
             .range((bounds.start.clone(), bounds.end.clone()))
             .take(limit)

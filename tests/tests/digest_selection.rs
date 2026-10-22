@@ -2,7 +2,7 @@
 mod common;
 use ankurah::signals::Signal;
 use ankurah::Mutable;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use common::*;
 use std::{
     sync::{Arc, Mutex},
@@ -152,8 +152,8 @@ async fn broad_fetch_tree_serves_narrow_fetch_and_distinct_live_scopes() -> Resu
 
     let first_two = reader.query::<PetView>(nocache("age > '07' ORDER BY age ASC LIMIT 2")?)?;
     let last_two = reader.query::<PetView>(nocache("age > '10' ORDER BY age DESC LIMIT 2")?)?;
-    tokio::time::timeout(Duration::from_secs(10), first_two.wait_durable_answered()).await??;
-    tokio::time::timeout(Duration::from_secs(10), last_two.wait_durable_answered()).await??;
+    tokio::time::timeout(Duration::from_secs(10), first_two.wait_durable_answered()).await.context("first_two initialization")??;
+    tokio::time::timeout(Duration::from_secs(10), last_two.wait_durable_answered()).await.context("last_two initialization")??;
     assert_eq!(first_two.ids(), [pets[0].id(), pets[1].id()]);
     assert_eq!(last_two.ids(), [pets[3].id(), pets[2].id()]);
     for query in [&first_two, &last_two] {
@@ -168,11 +168,13 @@ async fn broad_fetch_tree_serves_narrow_fetch_and_distinct_live_scopes() -> Resu
     pets[0].edit(&trx)?.age()?.replace("20")?;
     pets[2].edit(&trx)?.age()?.replace("06")?;
     trx.commit().await?;
-    wait_for(|| first_two.ids() == [pets[1].id(), pets[3].id()] && last_two.ids() == [pets[0].id(), pets[3].id()]).await?;
+    wait_for(|| first_two.ids() == [pets[1].id(), pets[3].id()] && last_two.ids() == [pets[0].id(), pets[3].id()])
+        .await
+        .with_context(|| format!("live membership after moves: first_two={:?}, last_two={:?}", first_two.ids(), last_two.ids()))?;
     assert_eq!(first_two.peek()[1].age()?, "15", "unchanged rank entrant arrives from the full resident tree");
     assert_eq!(last_two.peek()[0].age()?, "20");
-    tokio::time::timeout(Duration::from_secs(10), first_two.refresh()).await??;
-    tokio::time::timeout(Duration::from_secs(10), last_two.refresh()).await??;
+    tokio::time::timeout(Duration::from_secs(10), first_two.refresh()).await.context("first_two refresh")??;
+    tokio::time::timeout(Duration::from_secs(10), last_two.refresh()).await.context("last_two refresh")??;
     assert_eq!(first_two.ids(), [pets[1].id(), pets[3].id()]);
     assert_eq!(last_two.ids(), [pets[0].id(), pets[3].id()]);
     Ok(())

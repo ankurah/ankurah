@@ -70,7 +70,31 @@ async fn oversized_miss_does_not_evict_a_useful_small_entry() -> anyhow::Result<
     for value in ["01", "02", "03", "04"] {
         apply(&node, &genesis(value)?).await?;
     }
-    let cache = ResidentTrees::with_limits(2, 10_000);
+    let small = above("03", None);
+    let capture = capture_query(
+        &node,
+        small.clone(),
+        QueryTreeCache::spec(&small, &node.catalog),
+        vec![DEFAULT_CONTEXT],
+        Arc::new(QueryTreeCache::default()),
+    )
+    .await?;
+    assert_eq!(capture.projection.rows.len(), 1);
+    let small_bytes = QuerySource::from_capture(vec![DEFAULT_CONTEXT], capture).accounted_bytes();
+    let budget = small_bytes + 1;
+    assert!(small_bytes <= budget);
+    let all = selection(None);
+    let full_capture = capture_query(
+        &node,
+        all.clone(),
+        QueryTreeCache::spec(&all, &node.catalog),
+        vec![DEFAULT_CONTEXT],
+        Arc::new(QueryTreeCache::default()),
+    )
+    .await?;
+    assert_eq!(full_capture.projection.rows.len(), 4);
+    assert!(QuerySource::from_capture(vec![DEFAULT_CONTEXT], full_capture).accounted_bytes() > budget);
+    let cache = ResidentTrees::with_limits(2, budget);
     let resident = acquire(&cache, &node, above("03", None)).await?;
     let tree = resident.tree();
     drop(resident);

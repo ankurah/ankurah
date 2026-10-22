@@ -5,8 +5,9 @@
 //! to a fence. Complete residents fold that window. Limited residents validate
 //! an unchanged revision around their bounded read so unchanged rank replacements
 //! cannot be missed.
+use crate::entity::CapturedEntity;
 use crate::{changes::EntityChange, reactor::ChangeNotification};
-use ankurah_proto::{Attested, EntityState, Event};
+use ankurah_proto::{Attested, Event};
 use std::{
     collections::VecDeque,
     sync::{Arc, Mutex, Weak},
@@ -33,7 +34,7 @@ pub(crate) enum SourceError {
 /// read back through a live entity when a delayed reader consumes this record.
 #[derive(Debug, Clone)]
 pub(crate) struct SourceChange {
-    pub(crate) state: Arc<EntityState>,
+    pub(crate) state: Arc<CapturedEntity>,
     pub(crate) events: Vec<Attested<Event>>,
 }
 
@@ -166,7 +167,7 @@ impl SourceCommit {
             .iter()
             .map(|change| {
                 Ok(SourceChange {
-                    state: Arc::new(change.entity().to_entity_state()?),
+                    state: Arc::new(change.entity().capture()?),
                     events: if live_events { change.events().to_vec() } else { Vec::new() },
                 })
             })
@@ -177,7 +178,7 @@ impl SourceCommit {
         };
         let bytes = changes.iter().try_fold(0usize, |total, change| {
             let size = bincode::serialized_size(&(&*change.state, &change.events)).ok()?;
-            total.checked_add(usize::try_from(size).ok()?)
+            total.checked_add(usize::try_from(size).ok()?)?.checked_add(change.state.lookup_bytes())
         });
         let Some(bytes) = bytes else {
             drop(source);

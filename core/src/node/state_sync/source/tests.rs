@@ -17,6 +17,7 @@ use ankurah_core_types::PropertyPath;
 
 mod bounded;
 mod capture_retry;
+mod captured;
 mod resident;
 mod routes;
 mod view_isolation;
@@ -277,6 +278,7 @@ async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutati
 
 #[derive(Clone, Default)]
 struct RestrictedDiscovery {
+    retrieval: Option<Predicate<Resolved>>,
     denied_event: Option<proto::EventId>,
     read_allowed: Option<Arc<std::sync::atomic::AtomicBool>>,
     discover_all: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -318,7 +320,7 @@ impl PolicyAgent for RestrictedDiscovery {
         &self,
         _: &C,
     ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
-        Ok(Predicate::True)
+        Ok(self.retrieval.clone().unwrap_or(Predicate::True))
     }
     fn check_reads<C: crate::util::Iterable<Self::ContextData>>(
         &self,

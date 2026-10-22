@@ -871,9 +871,9 @@ async fn missing_key_counts_track_updates_removals_and_frozen_snapshots() -> any
     assert!(!present.has_descending_nulls(&selection)?);
     cache.apply_captured(vec![keyed_state(1, 2, None)?, keyed_state(3, 1, None)?], vec![]).await?;
     assert_eq!(cache.current_snapshot().await?.missing_counts, [2]);
-    cache.apply_captured(vec![], vec![numbered_state(1, 2).payload.entity_id]).await?;
+    cache.apply_captured(Vec::<(SharedState, Vec<Option<Value>>)>::new(), vec![numbered_state(1, 2).payload.entity_id]).await?;
     assert_eq!(cache.current_snapshot().await?.missing_counts, [1]);
-    cache.apply_captured(vec![], vec![numbered_state(3, 1).payload.entity_id]).await?;
+    cache.apply_captured(Vec::<(SharedState, Vec<Option<Value>>)>::new(), vec![numbered_state(3, 1).payload.entity_id]).await?;
     assert_eq!(cache.current_snapshot().await?.missing_counts, [0]);
     let rebuilt = cache.refresh_captured(spec, vec![keyed_state(4, 1, None)?]).await?;
     assert_eq!(rebuilt.missing_counts, [1]);

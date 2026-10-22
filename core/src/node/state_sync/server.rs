@@ -1255,12 +1255,18 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+    let owned;
     let state = match snapshot.and_then(|snapshot| snapshot.states.get(&entity_id)) {
-        Some(state) => (**state).clone(),
-        None => node_state(node, entity_id, &policy).await?.ok_or_else(|| anyhow::anyhow!("repair state unavailable"))?,
+        Some(state) => state.payload.as_ref(),
+        None => {
+            owned = crate::entity::CapturedEntity::new(
+                node_state(node, entity_id, &policy).await?.ok_or_else(|| anyhow::anyhow!("repair state unavailable"))?.payload,
+            );
+            &owned
+        }
     };
-    policy.check_read(&entity_id, &state.payload.state)?;
-    ensure!(!catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy), "repair is outside catalog scope");
+    policy.check_read_captured(state)?;
+    ensure!(!catalog || state.state.memberships.iter().any(crate::schema::reads_bypass_policy), "repair is outside catalog scope");
     ensure!(!target.is_empty(), "empty causal repair target");
     let mut pending = target.entries().iter().map(|(generation, id)| (id.clone(), *generation)).collect::<HashMap<_, _>>();
     let mut visited = HashSet::new();
@@ -1277,7 +1283,7 @@ where
             ensure!(batch.get(&id) == Some(&event.payload.generation()), "causal repair event or generation mismatch");
             ensure!(event.payload.entity_id == entity_id, "causal repair entity mismatch");
             event.payload.validate_structure()?;
-            policy.check_read_event(&event, &state.payload.state)?;
+            policy.check_read_captured_event(&event, state)?;
             if !visited.insert(id.clone()) {
                 continue;
             }
@@ -1616,7 +1622,7 @@ impl Comparison {
         let mut last = None;
         for (address, state) in rows.iter().take(super::MAX_SNAPSHOT_ROWS) {
             let id = state.payload.entity_id;
-            policy.check_read(&id, &state.payload.state)?;
+            policy.check_read_captured(&state.payload)?;
             ensure!(
                 !catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy),
                 "snapshot page is outside catalog scope"
@@ -1650,7 +1656,7 @@ impl Comparison {
             }
             bytes += size;
             last = Some(address.to_vec());
-            states.push((*state).clone());
+            states.push((*state).to_owned());
         }
         let end = if states.len() == rows.len() {
             bounds.end.clone()
@@ -1824,7 +1830,7 @@ impl Comparison {
                     }
                     let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
                     let state: Option<proto::Attested<proto::EntityState>> = match self.snapshot.states.get(&id) {
-                        Some(state) => Some((**state).clone()),
+                        Some(state) => Some(state.as_ref().to_owned()),
                         None => node_state(node, id, &policy).await?,
                     };
                     let Some(state) = state else { continue };
