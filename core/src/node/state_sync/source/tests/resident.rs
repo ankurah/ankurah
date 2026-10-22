@@ -477,7 +477,7 @@ async fn compatible_selections_share_full_resident_with_independent_scopes() -> 
 }
 
 #[tokio::test]
-async fn limited_creation_retains_full_admission_for_later_unlimited_use() -> anyhow::Result<()> {
+async fn limited_coverage_is_explicit_and_complete_coverage_is_preferred() -> anyhow::Result<()> {
     let node = node().await?;
     let mut events = Vec::new();
     for value in ["01", "02", "03"] {
@@ -489,15 +489,20 @@ async fn limited_creation_retains_full_admission_for_later_unlimited_use() -> an
     let tree = first.tree();
     let frozen = first.snapshot().await?.snapshot;
     assert_eq!(frozen.states.len(), 1);
-    assert_eq!(tree.current_snapshot().await?.states.len(), 3);
-    let all = acquire(&node.resident_trees, &node, selection(None)).await?;
-    assert!(Arc::ptr_eq(&tree, &all.tree()));
+    assert_eq!(tree.current_snapshot().await?.states.len(), 1);
+    let exact = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
+    assert!(Arc::ptr_eq(&tree, &exact.tree()));
+    let all = node.resident_trees.acquire(&node, selection(None), Some(frozen.spec.clone()), vec![DEFAULT_CONTEXT]).await?;
+    assert!(!Arc::ptr_eq(&tree, &all.tree()), "bounded coverage cannot satisfy the unlimited request");
+    let preferred = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
+    assert!(Arc::ptr_eq(&all.tree(), &preferred.tree()), "prefer a compatible complete resident");
     assert_eq!(all.snapshot().await?.snapshot.states.len(), 3);
     apply(&node, &update(&events[0], "09")?).await?;
     let after = first.snapshot().await?.snapshot;
     assert_eq!(after.states.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
     assert_eq!(frozen.states.keys().copied().collect::<Vec<_>>(), vec![events[0].entity_id]);
-    assert_eq!(node.resident_trees.len(), 1);
+    assert_eq!(tree.current_snapshot().await?.states.len(), 1);
+    assert_eq!(node.resident_trees.len(), 2);
     Ok(())
 }
 
@@ -535,5 +540,65 @@ async fn active_snapshot_lease_pins_tree_until_last_raii_owner_drops() -> anyhow
     assert_eq!(cache.len(), 1, "an active comparison owns a lease independent of its caller");
     drop(snapshot);
     assert_eq!(cache.len(), 0, "dropping the last lease automatically releases idle retention");
+    Ok(())
+}
+
+#[tokio::test]
+async fn cold_limit_bounds_physical_retention_and_zero_limit_reads_nothing() -> anyhow::Result<()> {
+    let node = node().await?;
+    for value in 0..128 {
+        apply(&node, &genesis(&format!("{value:03}"))?).await?;
+    }
+    let rows_read = node.storage.4.load(Ordering::Relaxed);
+    let limited = acquire(&node.resident_trees, &node, selection(Some(3))).await?;
+    assert_eq!(limited.snapshot().await?.snapshot.states.len(), 3);
+    assert_eq!(limited.tree().current_snapshot().await?.states.len(), 3, "the physical resident, not only its view, must be bounded");
+    assert_eq!(node.storage.4.load(Ordering::Relaxed) - rows_read, 3, "cold capture requests only the selected rows from storage");
+
+    let scans = node.storage.2.load(Ordering::Relaxed);
+    let rows_read = node.storage.4.load(Ordering::Relaxed);
+    let empty = acquire(&node.resident_trees, &node, selection(Some(0))).await?;
+    assert!(empty.snapshot().await?.snapshot.states.is_empty());
+    assert!(empty.tree().current_snapshot().await?.states.is_empty());
+    assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "LIMIT 0 must not start an application scan");
+    assert_eq!(node.storage.4.load(Ordering::Relaxed), rows_read);
+    Ok(())
+}
+
+#[tokio::test]
+async fn limited_coverage_rejects_other_selections_and_shares_exact_responder_requests() -> anyhow::Result<()> {
+    let node = node().await?;
+    for value in ["01", "02", "03"] {
+        apply(&node, &genesis(value)?).await?;
+    }
+    let selected = selection(Some(1));
+    let limited = acquire(&node.resident_trees, &node, selected.clone()).await?;
+    let tree = limited.tree();
+    let mut original = limited.snapshot().await?.snapshot;
+    let peer = proto::EntityId::from_bytes([90; 32]);
+    node.register_peer(
+        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
+        Box::new(Sender(peer)),
+    )
+    .await?;
+    let connection = node.peer_connections.get(&peer).unwrap();
+    let query = proto::QueryId::new();
+    connection
+        .subscription_handler
+        .subscribe_query(&node, proto::RequestId::new(), vec![], query, selected, Some(&DEFAULT_CONTEXT), 1, original.offer().await?)
+        .await?;
+    let (_, serving) = connection.subscription_handler.query_tree_for_test(query).await.unwrap();
+    assert!(Arc::ptr_eq(&tree, &serving), "requesting and serving use the same bounded resident");
+    let mut opposite = selection(Some(1));
+    opposite.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
+    let mut narrower = above("01", None);
+    narrower.limit = Some(1);
+    for other in [selection(None), selection(Some(2)), selection(Some(0)), opposite, narrower] {
+        let other = acquire(&node.resident_trees, &node, other).await?;
+        assert!(!Arc::ptr_eq(&tree, &other.tree()), "bounded coverage never proves another selection complete");
+    }
+    assert_eq!(tree.current_snapshot().await?.states.len(), 1);
+    connection.subscription_handler.remove_predicate(&node, query).await?;
+    node.deregister_peer(peer);
     Ok(())
 }

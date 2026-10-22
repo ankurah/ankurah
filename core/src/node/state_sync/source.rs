@@ -1,8 +1,8 @@
-//! A resident tree's complete admission, driven by immutable commit publications.
+//! Complete or explicitly limited resident coverage, maintained by commit publications.
 use crate::{
     entity::TemporaryEntity,
     node::{
-        source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError},
+        source_publications::{SourceBatch, SourceChange, SourceCursor, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
         state_sync::{QueryTreeCache, Snapshot},
         Node,
     },
@@ -26,7 +26,46 @@ use std::{
 #[cfg(test)]
 use tokio::sync::oneshot;
 
+const MAX_READ_ATTEMPTS: usize = 8;
+
 type Rows = IndexMap<proto::EntityId, Row>;
+
+/// Which selections the resident has actually captured. A limited result never
+/// proves complete admission for its TreeSpec's predicate.
+#[derive(Clone, PartialEq)]
+pub(super) enum Coverage {
+    Complete,
+    Limited(Selection<Resolved>),
+}
+impl Coverage {
+    pub(super) fn for_selection(selection: &Selection<Resolved>) -> Self {
+        if selection.limit.is_some() {
+            Self::Limited(selection.clone())
+        } else {
+            Self::Complete
+        }
+    }
+    pub(super) fn permits(&self, selection: &Selection<Resolved>) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Limited(captured) => captured == selection,
+        }
+    }
+    pub(super) async fn select(
+        &self,
+        snapshot: Snapshot,
+        selection: &Selection<Resolved>,
+        catalog: &crate::schema::catalog::CatalogManager,
+    ) -> anyhow::Result<Snapshot> {
+        match self {
+            Self::Complete => snapshot.select(selection, catalog).await,
+            Self::Limited(captured) => {
+                anyhow::ensure!(captured == selection, "limited resident does not cover this selection");
+                Ok(snapshot)
+            }
+        }
+    }
+}
 type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
 
 #[derive(Clone)]
@@ -46,6 +85,7 @@ pub(crate) struct CapturedQuery {
 }
 
 pub(crate) struct QueryProjection {
+    pub(super) coverage: Coverage,
     selection: Selection<Resolved>,
     spec: proto::TreeSpec,
     rows: Rows,
@@ -55,7 +95,7 @@ pub(crate) struct QueryProjection {
     pub(super) tree: Arc<QueryTreeCache>,
 }
 
-/// Test helper using the same full admission and query scope as the node LRU.
+/// Test helper for a complete resident with an independently selected query view.
 #[cfg(test)]
 pub(crate) async fn capture_query<SE, PA>(
     node: &Node<SE, PA>,
@@ -71,7 +111,7 @@ where
     node.system.require_system_ready()?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     let admission = Selection::from(policy.filter_predicate(spec.predicate().clone())?);
-    let mut captured = capture_filtered_query(node, admission, spec, credentials, tree).await?;
+    let mut captured = capture_filtered_query(node, admission, spec, credentials, tree, Coverage::Complete).await?;
     captured.snapshot = captured.snapshot.select(&selection, &node.catalog).await?;
     Ok(captured)
 }
@@ -82,26 +122,56 @@ pub(super) async fn capture_filtered_query<SE, PA>(
     spec: proto::TreeSpec,
     credentials: Vec<PA::ContextData>,
     tree: Arc<QueryTreeCache>,
+    coverage: Coverage,
 ) -> anyhow::Result<CapturedQuery>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    anyhow::ensure!(selection.limit.is_none() && selection.order_by.is_none(), "resident capture requires complete admission");
-    // Subscribe before the read, then fold every publication through a finite
-    // boundary. Queries apply their order and limit to this complete capture.
-    let (_, mut cursor) = node.source_publications.subscribe().await?;
-    let mut projection = QueryProjection { selection, spec, rows: Rows::new(), candidates: Rows::new(), candidate_bytes: 0, tree };
-    projection.replace_candidates(projection.read(node).await?);
-    projection.rows = projection.authorized_rows(&policy);
-    let window = cursor.fence().await?;
-    for batch in &window.batches {
-        projection.check_catalog(batch)?;
-        for change in &batch.changes {
-            projection.fold(&policy, change)?;
+    anyhow::ensure!(
+        match &coverage {
+            Coverage::Complete => selection.limit.is_none() && selection.order_by.is_none(),
+            Coverage::Limited(original) =>
+                original.limit.is_some() && selection.limit == original.limit && selection.order_by == original.order_by,
+        },
+        "resident capture does not match its declared coverage"
+    );
+    let (mut start, mut cursor) = node.source_publications.subscribe().await?;
+    let mut projection =
+        QueryProjection { coverage, selection, spec, rows: Rows::new(), candidates: Rows::new(), candidate_bytes: 0, tree };
+    let mut attempts = 0;
+    let window = loop {
+        attempts += 1;
+        anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
+        if projection.selection.limit != Some(0) {
+            projection.replace_candidates(projection.read(node).await?);
+            projection.rows = projection.authorized_rows(&policy);
         }
-    }
+        if matches!(projection.coverage, Coverage::Limited(_)) && projection.selection.limit != Some(0) {
+            match cursor.validate_limited_read(start).await {
+                Err(SourceError::Changed) => {
+                    let window = cursor.fence().await?;
+                    for batch in &window.batches {
+                        projection.check_catalog(batch)?;
+                    }
+                    start = window.revision;
+                }
+                result => break result?,
+            }
+        } else {
+            let window = cursor.fence().await?;
+            for batch in &window.batches {
+                projection.check_catalog(batch)?;
+                if projection.selection.limit != Some(0) {
+                    for change in &batch.changes {
+                        projection.fold(&policy, change)?;
+                    }
+                }
+            }
+            break window;
+        }
+    };
     let snapshot = projection.tree.refresh_captured(projection.spec.clone(), projection.attested_rows(node)).await?;
     #[cfg(not(test))]
     drop(snapshot);
@@ -285,7 +355,7 @@ impl Route {
         let mut updates = BTreeMap::new();
         if self.selection.limit.is_some() {
             let snapshot = projection.tree.current_snapshot().await?;
-            let snapshot = snapshot.select(&self.selection, &node.catalog).await?;
+            let snapshot = projection.coverage.select(snapshot, &self.selection, &node.catalog).await?;
             updates.extend(self.members.keys().map(|id| (*id, None)));
             updates.extend(snapshot.query_members().into_iter().map(|(id, member)| (id, Some(member))));
         } else {
@@ -435,11 +505,72 @@ impl<CD: ContextData> QuerySource<CD> {
     {
         self.projection.check_catalog(&batch)?;
         self.routes.retain(|route| route.owner.strong_count() != 0);
-        let changes = self.projection.apply(node, &self.credentials, &batch, !self.routes.is_empty()).await?;
-        if !changes.is_empty() {
-            self.deliver(node, batch.revision.0, changes).await;
+        if matches!(self.projection.coverage, Coverage::Limited(_)) {
+            if self.projection.selection.limit != Some(0) && self.relevant(&batch)? {
+                return self.refill(node, vec![batch]).await;
+            }
+        } else {
+            let changes = self.projection.apply(node, &self.credentials, &batch, !self.routes.is_empty()).await?;
+            if !changes.is_empty() {
+                self.deliver(node, batch.revision.0, changes).await;
+            }
         }
         self.revision = batch.revision.0;
+        Ok(())
+    }
+
+    fn relevant(&self, batch: &SourceBatch) -> anyhow::Result<bool> {
+        for change in &batch.changes {
+            if self.projection.candidates.contains_key(&change.state.entity_id)
+                || self.projection.candidate(change.state.clone())?.is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// A bounded resident must reread its rank cut when membership can change:
+    /// a departed row's unchanged replacement may never have been captured.
+    async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<Arc<SourceBatch>>) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        let mut bytes = pending.iter().map(|batch| batch.bytes).sum::<usize>();
+        let mut attempts = 0;
+        let (rows, revision) = loop {
+            attempts += 1;
+            anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
+            let window = self.cursor.fence().await?;
+            for batch in window.batches {
+                self.projection.check_catalog(&batch)?;
+                anyhow::ensure!(
+                    pending.len() < MAX_PENDING_BATCHES && batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes),
+                    SourceError::Lagged
+                );
+                bytes += batch.bytes;
+                pending.push(batch);
+            }
+            let rows = self.projection.read(node).await?;
+            match self.cursor.validate_limited_read(window.revision).await {
+                Err(SourceError::Changed) => continue,
+                result => break (rows, result?.revision.0),
+            }
+        };
+        self.projection.replace_candidates(rows);
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
+        let rows = self.projection.authorized_rows(&policy);
+        let previous = std::mem::replace(&mut self.projection.rows, rows);
+        self.projection.tree.refresh_captured(self.projection.spec.clone(), self.projection.attested_rows(node)).await?;
+        let sources = pending
+            .into_iter()
+            .flat_map(|batch| batch.changes.clone())
+            .filter(|change| previous.contains_key(&change.state.entity_id) || self.projection.rows.contains_key(&change.state.entity_id))
+            .collect();
+        // Even a window containing no carried events can change ranked membership.
+        self.deliver(node, revision, sources).await;
+        self.revision = revision;
         Ok(())
     }
 
@@ -449,11 +580,27 @@ impl<CD: ContextData> QuerySource<CD> {
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let window = self.cursor.fence().await?;
-        for batch in window.batches {
-            self.publish(node, batch).await?;
+        if matches!(self.projection.coverage, Coverage::Limited(_)) {
+            let mut relevant = false;
+            for batch in &window.batches {
+                self.projection.check_catalog(batch)?;
+                if self.projection.selection.limit != Some(0) {
+                    relevant |= self.relevant(batch)?;
+                }
+            }
+            if relevant {
+                // Refill may consume later batches too. Never overwrite its newer
+                // revision or replay the rest of this already-drained window.
+                self.refill(node, window.batches).await?;
+            } else {
+                self.revision = window.revision.0;
+            }
+        } else {
+            for batch in window.batches {
+                self.publish(node, batch).await?;
+            }
+            self.revision = window.revision.0;
         }
-        // An empty fence can still advance the source publication boundary.
-        self.revision = window.revision.0;
         self.projection.tree.current_snapshot().await
     }
 }

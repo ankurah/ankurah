@@ -2,8 +2,9 @@
 //!
 //! This is a source revision, not an atomic database snapshot. A query subscribes
 //! before reading, then reconciles its captured rows with the complete window up
-//! to a fence. Ordering and limits select views from that complete captured
-//! admission, including unchanged replacements when another row moves.
+//! to a fence. Complete residents fold that window. Limited residents validate
+//! an unchanged revision around their bounded read so unchanged rank replacements
+//! cannot be missed.
 use crate::{changes::EntityChange, reactor::ChangeNotification};
 use ankurah_proto::{Attested, EntityState, Event};
 use std::{
@@ -212,7 +213,15 @@ impl Drop for SourceCommit {
 
 impl SourceCursor {
     /// Close a finite read window. Publications after this fence remain queued.
-    pub(crate) async fn fence(&mut self) -> Result<SourceWindow, SourceError> {
+    pub(crate) async fn fence(&mut self) -> Result<SourceWindow, SourceError> { self.fence_inner(None).await }
+
+    /// A bounded read cannot reconstruct omitted rank replacements from changes
+    /// alone. Reject it if a commit crossed the read, leaving its window queued.
+    pub(crate) async fn validate_limited_read(&mut self, started: SourceRevision) -> Result<SourceWindow, SourceError> {
+        self.fence_inner(Some(started)).await
+    }
+
+    async fn fence_inner(&mut self, started: Option<SourceRevision>) -> Result<SourceWindow, SourceError> {
         let _gate = self.source.0.gate.lock().await;
         let source = self.source.0.state.lock().unwrap();
         if source.unavailable {
@@ -223,6 +232,9 @@ impl SourceCursor {
             return Err(error.clone());
         }
         let revision = SourceRevision(source.revision);
+        if started.is_some_and(|started| started != revision) {
+            return Err(SourceError::Changed);
+        }
         reader.bytes = 0;
         Ok(SourceWindow { revision, batches: reader.queue.drain(..).map(|(batch, _)| batch).collect() })
     }

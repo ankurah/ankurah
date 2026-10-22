@@ -93,7 +93,7 @@ async fn assert_recovers(client: &TestNode, query: &EntityLiveQuery, messages: &
 }
 
 #[tokio::test]
-async fn limited_query_folds_concurrent_capture_updates_without_refill_retries() -> anyhow::Result<()> {
+async fn limited_query_retries_a_raced_bounded_capture() -> anyhow::Result<()> {
     let (server, client, messages) = pair().await?;
     let mut latest = genesis("01")?;
     apply(&server, &latest).await?;

@@ -15,6 +15,7 @@ use crate::{
 use ankql::ast::{OrderByItem, OrderDirection, Predicate};
 use ankurah_core_types::PropertyPath;
 
+mod bounded;
 mod capture_retry;
 mod resident;
 mod routes;
@@ -29,6 +30,7 @@ struct OrderedStorage(
     std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     std::sync::atomic::AtomicUsize,
     std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    std::sync::atomic::AtomicUsize, // Rows returned to callers, after the storage LIMIT.
 );
 
 #[async_trait::async_trait]
@@ -62,12 +64,18 @@ impl StorageEngine for OrderedStorage {
         if let Some(order) = &selection.order_by {
             assert_eq!(order.len(), 1);
             assert_eq!(order[0].path.property_id(), property());
-            assert_eq!(order[0].direction, OrderDirection::Asc);
-            rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+            rows.sort_by(|a, b| {
+                let values = match order[0].direction {
+                    OrderDirection::Asc => a.0.cmp(&b.0),
+                    OrderDirection::Desc => b.0.cmp(&a.0),
+                };
+                values.then_with(|| a.1.cmp(&b.1))
+            });
         }
         if let Some(limit) = selection.limit {
             rows.truncate(limit as usize);
         }
+        self.4.fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
         Ok(rows.into_iter().map(|(_, _, state)| state).collect())
     }
     async fn get_events(&self, ids: Vec<proto::EventId>) -> Result<Vec<Attested<proto::Event>>, RetrievalError> {
@@ -426,6 +434,11 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
         Box::new(Sender(peer)),
     )
     .await?;
+    // Complete coverage can serve several limits without a bounded refill.
+    let _full = node
+        .resident_trees
+        .acquire(&node, selection(None), Some(QueryTreeCache::spec(&selection(Some(2)), &node.catalog)), vec![DEFAULT_CONTEXT])
+        .await?;
     let handler = crate::peer_subscription::SubscriptionHandler::new(peer);
     let query = proto::QueryId::new();
     handler

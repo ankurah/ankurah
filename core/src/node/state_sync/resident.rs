@@ -1,6 +1,6 @@
 //! One node-local LRU for every caller and responder using a digest tree.
 use super::{
-    source::{self, QuerySource, Route},
+    source::{self, Coverage, QuerySource, Route},
     QueryTreeCache, Snapshot,
 };
 use crate::{
@@ -27,6 +27,7 @@ const MAX_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Clone, PartialEq)]
 struct Identity<CD> {
+    coverage: Coverage,
     selection: Selection<Resolved>,
     filtered: Selection<Resolved>,
     retrieval: Arc<Predicate<Resolved>>,
@@ -314,7 +315,14 @@ impl<CD: ContextData> ResidentTrees<CD> {
         let wire_required = spec.is_some();
         let spec = spec.unwrap_or_else(|| QueryTreeCache::spec(&selection, &node.catalog));
         anyhow::ensure!(QueryTreeCache::serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
-        let requested = Identity { selection, filtered, retrieval: policy.retrieval_predicate(), spec, credentials };
+        let requested = Identity {
+            coverage: Coverage::for_selection(&selection),
+            selection,
+            filtered,
+            retrieval: policy.retrieval_predicate(),
+            spec,
+            credentials,
+        };
         if let Some(lease) = self.entries.lock().unwrap().get(&requested, &node.catalog, wire_required) {
             return Ok(lease);
         }
@@ -327,13 +335,16 @@ impl<CD: ContextData> ResidentTrees<CD> {
             filtered: requested.filtered.clone(),
             spec: requested.spec.clone(),
         });
-        // A resident contains the full admission predicate. ORDER BY and LIMIT
-        // belong to each view, never to the maintained membership.
-        // A peer's broader admission is not a request to load that broader
-        // result. On a miss, keep its layout but admit only this query predicate.
+        // A complete resident admits the whole predicate. A cold LIMIT keeps
+        // explicit bounded coverage; it cannot satisfy a different selection.
+        // The peer's layout does not require loading its broader predicate.
         let spec = TreeSpec::new(requested.spec.key_spec().clone(), requested.selection.predicate.clone());
-        let selection = Selection::from(requested.selection.predicate.clone());
-        let filtered = Selection::from(requested.filtered.predicate.clone());
+        let (selection, filtered) = match &requested.coverage {
+            Coverage::Complete => {
+                (Selection::from(requested.selection.predicate.clone()), Selection::from(requested.filtered.predicate.clone()))
+            }
+            Coverage::Limited(_) => (requested.selection.clone(), requested.filtered.clone()),
+        };
         let identity = Identity { selection, filtered, spec, ..requested };
         let tree = Arc::new(QueryTreeCache::default());
         let captured = source::capture_filtered_query(
@@ -342,6 +353,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
             identity.spec.clone(),
             identity.credentials.clone(),
             tree.clone(),
+            identity.coverage.clone(),
         )
         .await?;
         node.system.check_not_halted()?;
@@ -420,7 +432,8 @@ impl<CD: ContextData> Entries<CD> {
         self.entries.retain(|entry| entry.resident.alive.load(Ordering::Acquire));
         let compatible = |entry: &Entry<CD>| {
             let existing = &entry.identity;
-            existing.credentials == requested.credentials
+            existing.coverage.permits(&requested.selection)
+                && existing.credentials == requested.credentials
                 && existing.retrieval == requested.retrieval
                 && (!wire_required || existing.spec.key_spec() == requested.spec.key_spec())
                 && compatible_selection(&existing.spec, requested, catalog)
@@ -429,7 +442,8 @@ impl<CD: ContextData> Entries<CD> {
         let position = self
             .entries
             .iter()
-            .rposition(|entry| entry.identity.spec == requested.spec && compatible(entry))
+            .rposition(|entry| matches!(entry.identity.coverage, Coverage::Complete) && compatible(entry))
+            .or_else(|| self.entries.iter().rposition(|entry| entry.identity.spec == requested.spec && compatible(entry)))
             .or_else(|| self.entries.iter().rposition(compatible))?;
         let entry = self.entries.remove(position)?;
         let view = Arc::new(QueryView {
@@ -544,7 +558,7 @@ where
                     let view = command.view();
                     let policy = ContextPolicy::from_credentials(&node.policy_agent, &actor.credentials().to_vec());
                     anyhow::ensure!(policy.filter_predicate(view.selection.predicate.clone())? == view.filtered.predicate, SourceError::Changed);
-                    snapshot.select(&view.selection, &node.catalog).await?
+                    actor.projection.coverage.select(snapshot, &view.selection, &node.catalog).await?
                         .with_spec(view.spec.clone(), &view.selection, &node.catalog)
                 }.await;
                 let snapshot = match selected {

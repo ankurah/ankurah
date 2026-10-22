@@ -242,3 +242,17 @@ async fn an_unclassified_storage_error_requires_source_reconstruction() -> anyho
     assert!(matches!(node.source_publications.subscribe().await, Err(SourceError::Unavailable)));
     Ok(())
 }
+
+#[tokio::test]
+async fn limited_read_validation_preserves_crossing_publications_for_retry() -> anyhow::Result<()> {
+    let node = node().await?;
+    let (start, mut cursor) = node.source_publications.subscribe().await?;
+    apply(&node, &genesis(17), Delivery::Live).await?;
+    assert!(matches!(cursor.validate_limited_read(start).await, Err(SourceError::Changed)));
+    let window = cursor.fence().await?;
+    assert_eq!(window.batches.len(), 1);
+    let unchanged = cursor.validate_limited_read(window.revision).await?;
+    assert_eq!(unchanged.revision, window.revision);
+    assert!(unchanged.batches.is_empty());
+    Ok(())
+}
