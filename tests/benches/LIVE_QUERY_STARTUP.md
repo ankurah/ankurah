@@ -9,6 +9,11 @@ for measurements and immutable artifact pins. The [intermediate unlimited-only r
 [pre-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) reports remain historical;
 their source pins and measurements have not been relabelled.
 
+The [captured-state sharing follow-up](LIVE_QUERY_STARTUP_STATE_SHARING.md)
+records the newer implementation, final correctness checks and frozen measurement
+plan. Its performance run is pending a quiet host window; the existing measured
+reports still describe their older pinned artifacts.
+
 ```sh
 STARTUP_LABEL=candidate cargo bench -p ankurah-tests --bench live_query_startup
 ```
