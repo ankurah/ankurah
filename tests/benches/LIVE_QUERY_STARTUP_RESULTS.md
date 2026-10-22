@@ -4,7 +4,7 @@ The shared node-owned cache now reuses compatible complete trees, keeps bounded 
 
 All **420 primary measurements**, **56 separately planned native replication measurements**, and **51 browser functional checks** passed their correctness assertions. Core has 515 passing tests (one existing ignore), digest-tree has 149 plus two documentation tests, and 53 affected two-node integrations pass. The lead independently checked the 476 timing records, pairing, raw native output, arithmetic, source inputs and frozen artifact hashes.
 
-Large unlimited cold and warm results consistently improve initialization latency. Small and bounded results have modest central latency differences, but the original native membership tail and highly variable 16,384-row browser cold cases prevent an unqualified parity claim. The separately planned native replication did not reproduce the original median slowdown; every original slow observation remains below. A scratch-only timeline diagnostic is still being assessed and does not replace these measurements. Human review and landing remain pending.
+Large unlimited cold and warm results consistently improve initialization latency. Small and bounded results have modest central latency differences, but the original native membership tail and highly variable 16,384-row browser cold cases prevent an unqualified parity claim. The separately planned native replication did not reproduce the original median slowdown; every original slow observation remains below. A fixed twelve-run scratch-only timeline diagnostic also passed; it did not reproduce the original tail and does not replace these measurements. The implementation is ready for design/code review, with resource costs and tail-latency uncertainty explicit. Human review and landing remain pending.
 
 Resident maintenance is not free: native unlimited cold startup at 4,096 rows/50 ms RTT adds 112 ms endpoint CPU and 34.5 MiB whole-process peak RSS despite improving readiness by 101 ms. Browser readiness improves by 2.26 seconds with 13.9 MiB additional WASM capacity. Full-prefetch costs include making the initial complete resident; they are excluded from the later LIMIT10 cache-hit latency but included in whole-fixture CPU/memory.
 
@@ -76,7 +76,7 @@ The browser end snapshot at 02:17:58 UTC contains cargo at 0% reported CPU. Twen
 
 The browser N16,384 / zero-RTT cell includes a +1,365.8 ms paired outlier and substantial variability. A nearby process snapshot shows rust-analyzer, VSCode renderer, WindowServer, and unrelated resident test binaries consuming CPU; it does not prove causation or identify the outlier's database/worker cost. Whole-fixture browser CPU includes setup and excludes IndexedDB workers, so it cannot isolate endpoint CPU. All seven pairs and these limitations are recorded in browser-16384-zero-rtt-observation.md. The N16,384 / 50-ms cell also retains two large unfavorable deltas (+730.6 and +793.9 ms).
 
-All 420 primary samples and all 56 separately planned replication samples are retained. The replication changes the appraisal of the native variation without replacing the original rows: combined 14-pair median differences are −0.381 ms for N16,384 cold/50-ms and +0.291 ms for bounded warm membership, whose original +20.345 ms tail remains. Bounded warm-membership endpoint CPU is consistently higher across both sets (combined median +0.760 ms). A separate scratch-only diagnostic follows; its instrumentation does not change this performance evidence.
+All 420 primary samples and all 56 separately planned replication samples are retained. The replication changes the appraisal of the native variation without replacing the original rows: combined 14-pair median differences are −0.381 ms for N16,384 cold/50-ms and +0.291 ms for bounded warm membership, whose original +20.345 ms tail remains. Bounded warm-membership endpoint CPU is consistently higher across both sets (combined median +0.760 ms). The separate scratch-only diagnostic below used different, instrumented artifacts and does not change this performance evidence.
 
 Native endpoint process CPU includes both peers/background threads during the measured interval; whole-process CPU/RSS also include setup/prefetch/verification/teardown. Browser CDP task/script CPU covers the whole main-thread fixture and excludes IndexedDB worker CPU; WASM capacity is allocated linear memory, not peak RSS or live allocation. CPU phase intervals overlap and must not be summed.
 
@@ -123,7 +123,7 @@ Population 4,096, simulated RTT 50 ms. The empty cache label describes fixture s
 
 Returned-row counts measure states returned/hydrated, not every row the storage engine visits. Native cold LIMIT10 returns ten server rows on both arms, but the unchanged Sled engine may build an on-demand index by visiting the full population first. The N16,384 cold cases therefore include common index-construction work; equal returned-row counts alone do not establish equal CPU cost. Browser CPU excludes IndexedDB workers and cannot localize database waiting or index work.
 
-The native bounded warm-membership and larger-population cold measurements have unresolved variability/CPU differences. The separately predeclared 56-sample replication and scratch-only timeline diagnostic must remain distinct from this 420-sample qualification; no precise broad parity claim follows from these rows alone.
+The original native bounded warm-membership tail and larger-population browser cold measurements have unresolved variability. The separately predeclared 56-sample replication and scratch-only timeline diagnostic remain distinct from this 420-sample qualification; no precise broad parity or tail-latency claim follows from these rows alone.
 
 ## Separate native replication
 
@@ -148,6 +148,17 @@ Replication verified: 56/56.
 
 Full arm/pair distributions, process CPU, peak RSS, work and message counters, and raw-result hashes are in native-replication-summary.json. Timer/host noise is not a reason to discard an unfavorable sample; CPU/work differences must be considered alongside the endpoint measurements.
 
+
+## Narrow native timeline diagnostic
+
+A separately prepared, instrumented copy ran exactly six alternating main/candidate pairs of the native 4,096-row population, LIMIT10, warm-membership reconnect at 50 ms RTT. Every run used a fresh process and the unchanged first-installation membership, ordering, state and head oracle. Trace capture was disabled during setup, buffered during measurement, and flushed afterward. These twelve runs are diagnostic evidence, not replacement timing samples.
+
+All twelve passed. Candidate-minus-main activation differences were +0.261, +0.402, +0.241, +0.024, −0.159 and +1.541 ms. In every candidate run, the resident refill began 25–37 microseconds **after** the first loaded=true callback, returned ten rows in 41–57 microseconds, and required no validation retry. Response wake to readiness took 521–676 microseconds; commit-gate waits were 0–175 microseconds and observed index-lock waits approximately 0–1 microsecond.
+
+This confirms that resident refill is not a required initialization step in those runs. It does **not** establish the cause of the original slow observations, where bounded reads returned nine rows and then ten as entity commits progressed. The original counters cannot distinguish an accepted intermediate read from a read discarded by revision validation. Either case is valid maintenance, and no redundant work or safe corrective production change was established. The implementation remains unchanged; the original tail, shared-host limitations, higher native CPU and larger browser variability remain review considerations.
+
 ## Local evidence
 
 The full retained dataset is under `~/ak/research_notes/ankurah-replication/reviews/2026-10-21-compatible-reuse/attempt-6-lazy-bounded-view/`: `qualification-plan.json`, raw records/logs, `qualification-summary.json`, `replication-plan.json`, `native-replication-summary.json`, `root-independent-audit.json`, and `measurement-delivery.json`. The evidence includes source exports, complete patches, build manifests, runner hashes and process snapshots. Production source is frozen at `ec767596`; the candidate source-export fingerprint is `db233818433b`. The four public-API harness files are identical on both arms and are checkpointed with this report. Documentation changes do not relabel the measured artifacts.
+
+The diagnostic report is `warm-membership-diagnostic/report.txt` under that evidence directory (SHA256 `118cfc61eab4c788243cd5140a079823eda523d95c17e9b900cfb54b2e9657e6`); its `results/samples.json`, raw traces, instrumentation patches and `source-audit.json` preserve all twelve runs and verify that the measured artifacts and live runtime source remained unchanged.
