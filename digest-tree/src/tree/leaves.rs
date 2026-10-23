@@ -5,12 +5,12 @@ use std::collections::BTreeSet;
 
 use ankurah_core_types::EntityId;
 
-use super::TreeTransaction;
+use super::{TreeTransaction, PAGE};
 use crate::address::{leaf_address, TreeSpan};
-use crate::digest::{DecodeError, DigestGroup};
+use crate::digest::DigestGroup;
 use crate::error::TreeError;
 use crate::store::layout;
-use crate::store::{LeafRow, MapAccess, MapName, PreparedLeaf};
+use crate::store::{EncodedLeaf, LeafRow, MapAccess, MapName};
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// The leaf row of the entity `entity_id` filed under `key`.
@@ -48,9 +48,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// and list its key under its entity. [`TreeError::Conflict`] when
     /// another change got there first, and [`TreeError::Inconsistent`] when
     /// the lookup lists the key already, for a row that is not there.
-    pub(crate) async fn insert_leaf(&mut self, prepared: &PreparedLeaf<G>) -> Result<(), TreeError> {
-        let row = prepared.row();
-        self.transaction.insert(MapName::Leaves, &row.address(), prepared.value()).await?;
+    pub(crate) async fn insert_leaf(&mut self, leaf: &EncodedLeaf<G>) -> Result<(), TreeError> {
+        self.transaction.insert(MapName::Leaves, leaf.address(), leaf.value()).await?;
+        let row = leaf.row();
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if !keys.insert(row.key.clone()) {
             return Err(TreeError::Inconsistent("the lookup lists a leaf that is absent"));
@@ -61,20 +61,22 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         self.transaction.put_if(MapName::Lookup, &row.entity_id.to_bytes(), listed.as_deref(), &layout::lookup_value(&keys)).await
     }
 
-    /// Replace the leaf row at `new`'s address, which the transaction read as
-    /// `stored`, with `new`: a change to the entity's head alone, which keeps
+    /// Replace the leaf `old`, as the transaction read it, with `new`, filed
+    /// at the same address: a change to the entity's head alone, which keeps
     /// its key listed under it. [`TreeError::Conflict`] when the row there now
     /// is another.
-    pub(crate) async fn replace_leaf(&mut self, stored: &[u8], new: &PreparedLeaf<G>) -> Result<(), TreeError> {
-        self.transaction.put_if(MapName::Leaves, &new.row().address(), Some(stored), new.value()).await
+    pub(crate) async fn replace_leaf(&mut self, old: &EncodedLeaf<G>, new: &EncodedLeaf<G>) -> Result<(), TreeError> {
+        debug_assert_eq!(old.address(), new.address(), "a change of head alone keeps the leaf's address");
+        self.transaction.put_if(MapName::Leaves, new.address(), Some(old.value()), new.value()).await
     }
 
-    /// Remove the leaf row `row`, as the writer read it, and its key from
+    /// Remove the leaf `leaf`, as the transaction read it, and its key from
     /// under its entity. [`TreeError::Conflict`] when the row there now is
     /// another, or none, and [`TreeError::Inconsistent`] when the lookup does
     /// not list the row's key.
-    pub(crate) async fn delete_leaf(&mut self, row: &LeafRow<G>) -> Result<(), TreeError> {
-        self.transaction.delete_if(MapName::Leaves, &row.address(), &layout::leaf_value(row)).await?;
+    pub(crate) async fn delete_leaf(&mut self, leaf: &EncodedLeaf<G>) -> Result<(), TreeError> {
+        self.transaction.delete_if(MapName::Leaves, leaf.address(), leaf.value()).await?;
+        let row = leaf.row();
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if !keys.remove(&row.key) {
             return Err(TreeError::Inconsistent("the lookup does not list a leaf"));
@@ -90,18 +92,22 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
     }
 
-    pub(crate) async fn all_leaves(&mut self, span: &TreeSpan) -> Result<Vec<LeafRow<G>>, TreeError> {
-        let mut rows = Vec::new();
+    /// Every leaf in `span`, in address order, each with its address and the
+    /// bytes it is stored as, read a page at a time.
+    pub(crate) async fn all_leaves(&mut self, span: &TreeSpan) -> Result<Vec<EncodedLeaf<G>>, TreeError> {
+        let mut leaves = Vec::new();
         let mut remaining = span.clone();
         loop {
-            let page = self.leaves(&remaining, 1024).await?;
-            let done = page.len() < 1024;
-            if let Some(last) = page.last() {
-                remaining = remaining.after(&last.address());
+            let page = self.transaction.scan(MapName::Leaves, remaining.bounds(), PAGE).await?;
+            let done = page.len() < PAGE;
+            if let Some((last, _)) = page.last() {
+                remaining = remaining.after(last);
             }
-            rows.extend(page);
+            for (address, value) in page {
+                leaves.push(EncodedLeaf::decode(address, value)?);
+            }
             if done {
-                return Ok(rows);
+                return Ok(leaves);
             }
         }
     }
@@ -117,35 +123,26 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok((listed, keys))
     }
 
-    /// Lookup's empty key is a count of entities filed under multiple keys.
-    /// Entity lookup keys are always 32 bytes, so the metadata cannot collide.
+    /// How many entities are filed under more than one key: the count the
+    /// lookup keeps under its empty key.
     pub(crate) async fn multiple_key_entities(&mut self) -> Result<u64, TreeError> {
-        match self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await? {
-            Some(value) => {
-                let found = value.len();
-                let count =
-                    value.try_into().map_err(|_| TreeError::unreadable("multi-key count", DecodeError::Length { expected: 8, found }))?;
-                Ok(u64::from_be_bytes(count))
-            }
-            None => Ok(0),
-        }
+        let stored = self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await?;
+        layout::multiple_keys_count(stored.as_deref())
     }
 
+    /// Count one more entity filed under more than one key when `add`, and
+    /// one fewer otherwise, removing the count row when it reaches zero.
     async fn adjust_multiple_keys(&mut self, add: bool) -> Result<(), TreeError> {
         let stored = self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await?;
-        let count = self.multiple_key_entities().await?;
+        let count = layout::multiple_keys_count(stored.as_deref())?;
         let count = if add { count.checked_add(1) } else { count.checked_sub(1) }
             .ok_or(TreeError::Inconsistent("multi-key entity count out of range"))?;
-        if count == 0 {
-            self.transaction
-                .delete_if(
-                    MapName::Lookup,
-                    layout::MULTIPLE_KEYS,
-                    stored.as_deref().ok_or(TreeError::Inconsistent("missing multi-key entity count"))?,
-                )
-                .await
-        } else {
-            self.transaction.put_if(MapName::Lookup, layout::MULTIPLE_KEYS, stored.as_deref(), &count.to_be_bytes()).await
+        match stored {
+            Some(stored) if count == 0 => self.transaction.delete_if(MapName::Lookup, layout::MULTIPLE_KEYS, &stored).await,
+            stored => {
+                let value = layout::multiple_keys_value(count);
+                self.transaction.put_if(MapName::Lookup, layout::MULTIPLE_KEYS, stored.as_deref(), &value).await
+            }
         }
     }
 }

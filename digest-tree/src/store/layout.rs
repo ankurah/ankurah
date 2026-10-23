@@ -30,10 +30,6 @@
 
 use std::collections::BTreeSet;
 
-/// The empty lookup key holds a big-endian u64 count of entities with more
-/// than one leaf. All other lookup keys are 32-byte entity identities.
-pub(crate) const MULTIPLE_KEYS: &[u8] = b"";
-
 use ankurah_core_types::EntityId;
 
 use super::rows::LeafRow;
@@ -43,6 +39,11 @@ use crate::error::TreeError;
 
 const HEAD_LEN: usize = 32;
 const KEY_LEN_LEN: usize = 4;
+const COUNT_LEN: usize = 8;
+
+/// The empty lookup key holds a big-endian u64 count of entities with more
+/// than one leaf. All other lookup keys are 32-byte entity identities.
+pub(crate) const MULTIPLE_KEYS: &[u8] = b"";
 
 /// The length of a leaf row's value in the group `G`: the head hash and the
 /// leaf element's row bytes.
@@ -130,6 +131,17 @@ pub(crate) fn node_key(key: &[u8]) -> Result<NodeKey, TreeError> {
     let encoding = separator.map_or(key, |separator| &key[..separator]);
     let prefix = NodePrefix::from_bytes(encoding).map_err(|source| TreeError::unreadable("node key", source))?;
     Ok(if separator.is_some() { NodeKey::Delta(prefix) } else { NodeKey::Base(prefix) })
+}
+
+/// The value of the multi-key count row: the count of entities filed under
+/// more than one key.
+pub(crate) fn multiple_keys_value(count: u64) -> Vec<u8> { count.to_be_bytes().to_vec() }
+
+/// The count the multi-key count row holds; zero where there is no row.
+pub(crate) fn multiple_keys_count(value: Option<&[u8]>) -> Result<u64, TreeError> {
+    let Some(value) = value else { return Ok(0) };
+    let count = exact(value, COUNT_LEN).map_err(|source| TreeError::unreadable("multi-key count", source))?;
+    Ok(u64::from_be_bytes(count.try_into().expect("eight bytes")))
 }
 
 pub(crate) fn lookup_value(keys: &BTreeSet<Vec<u8>>) -> Vec<u8> {

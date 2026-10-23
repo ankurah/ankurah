@@ -42,8 +42,8 @@ mod memory;
 mod rows;
 
 pub use memory::{MemoryMaps, MemoryTransaction};
+pub(crate) use rows::EncodedLeaf;
 pub use rows::LeafRow;
-pub(crate) use rows::PreparedLeaf;
 
 /// The bounds of a range scan: a lower and an upper bound on the key, as
 /// [`std::ops::RangeBounds`] gives them.

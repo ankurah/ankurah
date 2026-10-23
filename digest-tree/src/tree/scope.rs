@@ -158,8 +158,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             }
             let children = self.child_prefixes(&prefix).await?;
             if children.is_empty() {
-                let rows = self.all_leaves(&bounds).await?;
-                span_digests.push(TreeSpanDigest { prefix, bounds, digest: rows.iter().map(|row| Digest::from(row.element)).sum() });
+                let leaves = self.all_leaves(&bounds).await?;
+                let digest = leaves.iter().map(|leaf| Digest::from(leaf.row().element)).sum();
+                span_digests.push(TreeSpanDigest { prefix, bounds, digest });
             } else {
                 span_digests.extend(empty_gaps(&prefix, &bounds, &children));
                 pending.extend(children.into_iter().rev());

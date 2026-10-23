@@ -84,22 +84,24 @@ async fn compare_prepared_build_to_serial<G: DigestGroup>() {
     prepared.build(leaves.clone()).await.unwrap();
     prepared.commit().await.unwrap();
 
-    // Oracle follows the original serial builder, including serial hashing
-    // and encoding inside put_leaf, rather than the prepared-value path.
+    // The oracle hashes, encodes and inserts each leaf by itself, then builds
+    // the tree nodes with `write_subtree`, apart from the build's batched
+    // preparation.
     let mut serial = TreeTransaction::<G, _>::bind(&spec, serial_maps.begin());
-    let rows = leaves
+    let encoded = leaves
         .iter()
         .map(|leaf| {
-            let row = leaf.row::<G>();
+            let row = leaf.clone().into_row::<G>();
             (row.address(), row)
         })
         .collect::<BTreeMap<_, _>>()
-        .into_values()
+        .into_iter()
+        .map(|(address, row)| EncodedLeaf::new(address, row))
         .collect::<Vec<_>>();
-    for row in &rows {
-        serial.insert_leaf(&PreparedLeaf::new(row.clone())).await.unwrap();
+    for leaf in &encoded {
+        serial.insert_leaf(leaf).await.unwrap();
     }
-    serial.write_subtree(&NodePrefix::root(), &rows).await.unwrap();
+    serial.write_subtree(&NodePrefix::root(), &encoded).await.unwrap();
     serial.commit().await.unwrap();
     for map in [MapName::Leaves, MapName::Lookup, MapName::Nodes] {
         let bounds = (Bound::Unbounded, Bound::Unbounded);

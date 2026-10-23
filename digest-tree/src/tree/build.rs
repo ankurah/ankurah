@@ -9,7 +9,7 @@ use super::TreeTransaction;
 use crate::address::{CanonicalCodec, NodePrefix, TreeSpan};
 use crate::digest::{Digest, DigestGroup};
 use crate::error::TreeError;
-use crate::store::{LeafRow, MapAccess, MapName, PreparedLeaf};
+use crate::store::{EncodedLeaf, MapAccess, MapName};
 
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_PREPARATION_MIN_LEAVES: usize = 1024;
@@ -30,16 +30,16 @@ fn preparation_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-fn prepare_leaves<G: DigestGroup>(leaves: Vec<LeafInput>) -> Vec<PreparedLeaf<G>> {
+fn prepare_leaves<G: DigestGroup>(leaves: Vec<(Vec<u8>, LeafInput)>) -> Vec<EncodedLeaf<G>> {
     #[cfg(not(target_arch = "wasm32"))]
     if leaves.len() >= PARALLEL_PREPARATION_MIN_LEAVES {
         use rayon::prelude::*;
 
         if let Some(pool) = preparation_pool() {
-            return pool.install(|| leaves.into_par_iter().map(|leaf| PreparedLeaf::new(leaf.row::<G>())).collect());
+            return pool.install(|| leaves.into_par_iter().map(|(address, leaf)| EncodedLeaf::new(address, leaf.into_row())).collect());
         }
     }
-    leaves.into_iter().map(|leaf| PreparedLeaf::new(leaf.row::<G>())).collect()
+    leaves.into_iter().map(|(address, leaf)| EncodedLeaf::new(address, leaf.into_row())).collect()
 }
 
 /// The target maximum number of leaves in a terminal bucket.
@@ -79,19 +79,19 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 self.transaction.delete_if(map, &key, &value).await?;
             }
         }
-        let mut admitted = admitted.into_values();
-        let mut rows = Vec::with_capacity(admitted.len());
+        let mut admitted = admitted.into_iter();
+        let mut encoded = Vec::with_capacity(admitted.len());
         while admitted.len() != 0 {
             let batch = admitted.by_ref().take(PREPARATION_BATCH_LEAVES).collect();
             let prepared = prepare_leaves::<G>(batch);
             for leaf in &prepared {
                 self.insert_leaf(leaf).await?;
             }
-            rows.extend(prepared.into_iter().map(PreparedLeaf::into_row));
+            encoded.extend(prepared);
         }
-        // These rows already contain the admitted leaf elements. Building the
+        // These leaves already hold the admitted leaf elements. Building the
         // summaries from them avoids reading and decoding our own writes.
-        self.write_subtree(&NodePrefix::root(), &rows).await
+        self.write_subtree(&NodePrefix::root(), &encoded).await
     }
 
     pub(super) async fn rebuild_subtree(&mut self, prefix: &NodePrefix) -> Result<(), TreeError> {
@@ -99,7 +99,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         self.write_subtree(prefix, &leaves).await
     }
 
-    async fn write_subtree(&mut self, prefix: &NodePrefix, leaves: &[LeafRow<G>]) -> Result<(), TreeError> {
+    async fn write_subtree(&mut self, prefix: &NodePrefix, leaves: &[EncodedLeaf<G>]) -> Result<(), TreeError> {
         // This fence is deliberately conservative: structural maintenance
         // retries after any intervening commit; ordinary leaf changes only
         // watch the topology and can append their deltas concurrently.
@@ -133,21 +133,21 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             };
             let rows = &leaves[from..to];
             if rows.len() <= BUCKET_CAPACITY {
-                let digest = rows.iter().map(|row| row.element).map(Digest::from).sum();
+                let digest = rows.iter().map(|leaf| Digest::from(leaf.row().element)).sum();
                 self.insert_node_base(&prefix, digest).await?;
                 completed.push(digest);
                 continue;
             }
-            let first = rows.first().unwrap().address();
-            let last = rows.last().unwrap().address();
-            let common = first.iter().zip(&last).take_while(|(a, b)| a == b).count();
+            let first = rows.first().expect("a split bucket holds leaves").address();
+            let last = rows.last().expect("a split bucket holds leaves").address();
+            let common = first.iter().zip(last).take_while(|(a, b)| a == b).count();
             if common == first.len().min(last.len()) {
                 return Err(TreeError::InvalidKey("leaf addresses must be prefix-free"));
             }
             let depth = (common * 8) as u32 + (first[common] ^ last[common]).leading_zeros();
-            let left = NodePrefix::of(&first, depth + 1);
-            let right = NodePrefix::of(&last, depth + 1);
-            let middle = from + rows.partition_point(|row| left.contains_address(&row.address()));
+            let left = NodePrefix::of(first, depth + 1);
+            let right = NodePrefix::of(last, depth + 1);
+            let middle = from + rows.partition_point(|leaf| left.contains_address(leaf.address()));
             // Sum each terminal bucket once, then combine its completed
             // children instead of summing all leaves again at every ancestor.
             pending.push(Step::Join(prefix));

@@ -1,6 +1,6 @@
 use super::*;
-use crate::store::{ByteBounds, Failure, MapTransaction, PreparedLeaf};
-use crate::tree::fixtures::{empty_tree, entity, in_each_group, prefix, row};
+use crate::store::{ByteBounds, Failure, MapTransaction};
+use crate::tree::fixtures::{empty_tree, encoded, entity, in_each_group, prefix, row};
 use crate::TreeSpan;
 use async_trait::async_trait;
 use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
@@ -229,8 +229,8 @@ async fn a_delta_without_its_base_is_not_a_subtree_summary<G: DigestGroup>() {
     let (a, b, c) = (row::<G>(b"", entity(0x01)), row::<G>(b"", entity(0x41)), row::<G>(b"", entity(0x02)));
     let (da, db, dc) = (Digest::from(a.element), Digest::from(b.element), Digest::from(c.element));
     let mut build = tree.begin();
-    build.insert_leaf(&PreparedLeaf::new(a)).await.unwrap();
-    build.insert_leaf(&PreparedLeaf::new(b)).await.unwrap();
+    build.insert_leaf(&encoded(a)).await.unwrap();
+    build.insert_leaf(&encoded(b)).await.unwrap();
     for (p, digest) in [(&root, da + db), (&parent, da + db), (&left, da), (&right, db)] {
         build.insert_node_base(p, digest).await.unwrap();
     }
@@ -238,7 +238,7 @@ async fn a_delta_without_its_base_is_not_a_subtree_summary<G: DigestGroup>() {
 
     let (mut deletion, mut append) = (tree.begin(), tree.begin());
     delete_node(&mut deletion, &parent).await.unwrap();
-    append.insert_leaf(&PreparedLeaf::new(c)).await.unwrap();
+    append.insert_leaf(&encoded(c)).await.unwrap();
     for p in [&root, &parent, &left] {
         append_delta(&mut append, p, dc).await.unwrap();
     }

@@ -1,7 +1,9 @@
 use super::*;
+use crate::store::layout;
 use crate::{DigestTree, Ristretto255, TreeSpec};
 use ankql::ast::Predicate;
 use ankurah_core_types::KeySpec;
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
@@ -44,7 +46,7 @@ async fn insert_and_remove_encode_one_delta_for_all_ancestors() {
     let mut encode_counts = Vec::new();
     for removing in [false, true] {
         let mut tx = TreeTransaction::<CountedEncode, _>::bind(&spec, maps.begin());
-        assert!(tx.path(&missing.row::<Ristretto255>().address()).await.unwrap().len() > 2);
+        assert!(tx.path(&missing.clone().into_row::<Ristretto255>().address()).await.unwrap().prefixes.len() > 2);
         let change = if removing {
             LeafChange { before: Some(missing.clone()), after: None }
         } else {
@@ -60,12 +62,12 @@ async fn insert_and_remove_encode_one_delta_for_all_ancestors() {
             topology(maps.begin().scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap()),
             initial_topology
         );
-        assert_eq!(check.leaf(&[], missing.entity_id).await.unwrap(), (!removing).then(|| missing.row::<Ristretto255>()));
+        assert_eq!(check.leaf(&[], missing.entity_id).await.unwrap(), (!removing).then(|| missing.clone().into_row::<Ristretto255>()));
         if removing {
             assert_eq!(check.node(&NodePrefix::root()).await.unwrap(), initial_root);
         }
     }
-    assert_eq!(encode_counts, [2, 2], "one leaf value and one delta, regardless of ancestor count");
+    assert_eq!(encode_counts, [2, 1], "an insertion encodes its leaf value and one delta, a removal one delta, however deep");
 }
 
 #[tokio::test]
@@ -89,11 +91,11 @@ async fn moves_give_shared_and_separate_ancestors_their_own_deltas() {
     for (to, far) in [(201, false), (1001, true)] {
         let (from, to) = (leaf(100, 200), leaf(100, to));
         let mut probe = tree.begin();
-        let from_path = probe.path(&from.row::<Ristretto255>().address()).await.unwrap();
-        let to_path = probe.path(&to.row::<Ristretto255>().address()).await.unwrap();
-        let shared = from_path.iter().zip(&to_path).take_while(|(a, b)| a == b).count();
+        let from_path = probe.path(&from.clone().into_row::<Ristretto255>().address()).await.unwrap();
+        let to_path = probe.path(&to.clone().into_row::<Ristretto255>().address()).await.unwrap();
+        let shared = from_path.prefixes.iter().zip(&to_path.prefixes).take_while(|(a, b)| a == b).count();
         if far {
-            assert!(shared < from_path.len().min(to_path.len()), "the far move leaves its own branch");
+            assert!(shared < from_path.prefixes.len().min(to_path.prefixes.len()), "the far move leaves its own branch");
         }
         for (before, after) in [(from.clone(), to.clone()), (to, from)] {
             let mut tx = tree.begin();
@@ -164,7 +166,7 @@ async fn counting_defers_neighbor_validation_but_leaf_reads_and_rebuilds_reject_
         setup.commit().await.unwrap();
         tree.begin().audit().await.unwrap();
         let mut corrupt = tree.begin();
-        let address = leaf(0).row::<Ristretto255>().address();
+        let address = leaf(0).into_row::<Ristretto255>().address();
         let old = corrupt.transaction.get(MapName::Leaves, &address).await.unwrap().unwrap();
         let mut invalid = old.clone();
         let start = invalid.len() - Ristretto255::ELEMENT_LEN;

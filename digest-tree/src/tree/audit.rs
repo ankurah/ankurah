@@ -11,7 +11,7 @@ use crate::address::{CanonicalCodec, NodePrefix, TreeSpan};
 use crate::digest::{Digest, DigestGroup, Leaf};
 use crate::error::TreeError;
 use crate::store::layout::{self, NodeKey};
-use crate::store::{MapAccess, MapName};
+use crate::store::{EncodedLeaf, MapAccess, MapName};
 
 /// Counts verified by a successful audit of one transaction's snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +31,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     pub async fn audit(&mut self) -> Result<AuditCounts, TreeError> {
         let leaves = self.all_leaves(&TreeSpan::all()).await?;
         let mut lookup: BTreeMap<EntityId, BTreeSet<Vec<u8>>> = BTreeMap::new();
-        for row in &leaves {
+        for row in leaves.iter().map(EncodedLeaf::row) {
             CanonicalCodec::split(self.spec.key_spec(), &row.key)?;
             if row.element != Leaf::new(&row.key, row.entity_id, row.head).element() {
                 return Err(TreeError::Inconsistent("leaf element differs from its inputs"));
@@ -59,13 +59,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
         for prefix in &prefixes {
             let digest = self.node(prefix).await?.ok_or(TreeError::Inconsistent("missing node"))?;
-            let beneath: Vec<_> = leaves.iter().filter(|row| prefix.contains_address(&row.address())).collect();
-            let expected: Digest<G> = beneath.iter().map(|row| Digest::from(row.element)).sum();
+            let beneath: Vec<_> = leaves.iter().filter(|leaf| prefix.contains_address(leaf.address())).collect();
+            let expected: Digest<G> = beneath.iter().map(|leaf| Digest::from(leaf.row().element)).sum();
             if digest != expected {
                 return Err(TreeError::Inconsistent("summary differs from leaves"));
             }
             let children = self.children(prefix).await?;
-            if !children.is_empty() && beneath.iter().any(|row| !children.iter().any(|(p, _)| p.contains_address(&row.address()))) {
+            if !children.is_empty() && beneath.iter().any(|leaf| !children.iter().any(|(child, _)| child.contains_address(leaf.address())))
+            {
                 return Err(TreeError::Inconsistent("children do not cover their parent's leaves"));
             }
         }
@@ -92,7 +93,7 @@ mod tests {
             let mut tx = tree.begin();
             let (map, key, value) = match kind {
                 0 => {
-                    let mut row = data.row::<Ristretto255>();
+                    let mut row = data.clone().into_row::<Ristretto255>();
                     row.head = HeadHash::of([[3; 32]]);
                     (MapName::Leaves, row.address(), layout::leaf_value(&row))
                 }
