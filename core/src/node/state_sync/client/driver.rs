@@ -132,7 +132,7 @@ struct Assembly {
     owner: Owner,
     id: proto::EntityId,
     target: proto::Clock,
-    bytes: Vec<u8>,
+    delta: proto::DeltaAssembler,
     member: Option<proto::QueryMember>,
     sender: tokio::sync::oneshot::Sender<proto::EntityDelta>,
 }
@@ -580,7 +580,6 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(!chunk.bytes.is_empty(), "empty delta chunk");
         let key = bincode::serialize(&(
             match owner {
                 Owner::Round(n) => (0, n),
@@ -593,8 +592,10 @@ impl Driver {
         if self.discarded_chunks.contains(&key) {
             return Ok(());
         }
-        if !self.assemblies.contains_key(&key) {
-            ensure!(self.assemblies.len() < MAX_ASSEMBLIES && chunk.offset == 0, "too many or out-of-order partial deltas");
+        if let Some(assembly) = self.assemblies.get(&key) {
+            ensure!(assembly.owner == owner && assembly.target == target && assembly.member == member, "invalid delta chunk sequence");
+        } else {
+            ensure!(self.assemblies.len() < MAX_ASSEMBLIES, "too many partial deltas");
             let (sender, receive) = tokio::sync::oneshot::channel();
             self.reserve_application(
                 node,
@@ -605,34 +606,27 @@ impl Driver {
                 (!matches!(owner, Owner::Live(_))).then(|| target.clone()),
                 Box::pin(async move { receive.await.ok() }),
             )?;
+            let delta = proto::DeltaAssembler::new(chunk.entity_id);
             self.assemblies.insert(
                 key.clone(),
-                Assembly { owner, id: chunk.entity_id, target: target.clone(), bytes: Vec::new(), member: member.clone(), sender },
+                Assembly { owner, id: chunk.entity_id, target: target.clone(), delta, member: member.clone(), sender },
             );
         }
-        let assembly = self.assemblies.get_mut(&key).unwrap();
-        ensure!(
-            assembly.owner == owner
-                && assembly.target == target
-                && assembly.member == member
-                && chunk.offset == assembly.bytes.len() as u64,
-            "invalid delta chunk sequence"
-        );
         ensure!(
             self.assembly_bytes + chunk.bytes.len() <= MAX_DELTA_BYTES
                 && self.application_bytes + self.assembly_bytes + chunk.bytes.len() <= MAX_QUEUED_DELTA_BYTES,
             "delta assembly exceeds limit"
         );
+        let entity_id = chunk.entity_id;
+        let assembled = self.assemblies[&key].delta.len() + chunk.bytes.len();
         self.assembly_bytes += chunk.bytes.len();
-        assembly.bytes.extend_from_slice(&chunk.bytes);
-        if chunk.last {
+        if let Some(content) = self.assemblies.get_mut(&key).unwrap().delta.push(chunk)? {
             let assembly = self.assemblies.remove(&key).unwrap();
-            let content = decode_delta(&assembly.bytes)?;
             if !matches!(owner, Owner::Live(_)) {
-                check_target(&assembly.target, &content)?;
+                content.check_target(&assembly.target)?;
             }
-            let delta = proto::EntityDelta { entity_id: chunk.entity_id, content };
-            self.assembly_bytes -= assembly.bytes.len();
+            let delta = proto::EntityDelta { entity_id, content };
+            self.assembly_bytes -= assembled;
             self.application_bytes += bincode::serialized_size(&delta)? as usize;
             ensure!(self.application_bytes + self.assembly_bytes <= MAX_QUEUED_DELTA_BYTES, "application byte queue exceeded limit");
             if matches!(owner, Owner::Live(_)) {
@@ -717,7 +711,7 @@ impl Driver {
     {
         match repair {
             RepairItem::Delta { target, delta } => {
-                check_target(&target, &delta.content)?;
+                delta.content.check_target(&target)?;
                 self.repair_arrived(delta.entity_id, &target);
                 self.add_goal(owner, delta.entity_id, target.clone())?;
                 self.enqueue(node, peer, credentials, owner, delta, Some(target))?;
@@ -758,14 +752,10 @@ impl Driver {
             self.add_goal(Owner::Live(revision), id, member.head.clone())?;
         }
         if let Some(content) = content {
-            let target = match content {
-                proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. } => {
-                    state.state.head.clone()
-                }
-                proto::DeltaContent::EventBridge { .. } => {
-                    member.as_ref().ok_or_else(|| anyhow::anyhow!("absent event bridge has no target"))?.head.clone()
-                }
-                _ => bail!("unsupported live delta"),
+            ensure!(!matches!(content, proto::DeltaContent::StateAndRelation { .. }), "unsupported live delta");
+            let target = match content.state_head() {
+                Some(head) => head.clone(),
+                None => member.as_ref().ok_or_else(|| anyhow::anyhow!("absent event bridge has no target"))?.head.clone(),
             };
             self.add_goal(Owner::Live(revision), id, target)?;
         }
@@ -1018,7 +1008,7 @@ impl Driver {
             .collect::<Vec<_>>();
         for key in covered {
             let assembly = self.assemblies.remove(&key).unwrap();
-            self.assembly_bytes -= assembly.bytes.len();
+            self.assembly_bytes -= assembly.delta.len();
             // Dropping sender resolves the reserved job. Ignore the remaining
             // bytes until this round retires; they no longer prove anything needed.
             self.discarded_chunks.insert(key);
@@ -1174,7 +1164,7 @@ impl Driver {
         self.clear_round_pins();
         self.assemblies.retain(|_, assembly| {
             if assembly.owner == Owner::Round(number) {
-                self.assembly_bytes -= assembly.bytes.len();
+                self.assembly_bytes -= assembly.delta.len();
                 false
             } else {
                 true

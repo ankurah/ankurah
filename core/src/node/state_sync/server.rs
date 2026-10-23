@@ -107,11 +107,10 @@ struct Retained {
     frame: Arc<StateFrame>,
     bytes: usize,
 }
-struct LiveAssembly {
+/// A live delta too large for one frame, sent as chunks across frames.
+struct LiveChunks {
     revision: u64,
-    entity_id: proto::EntityId,
-    bytes: Vec<u8>,
-    offset: usize,
+    chunks: proto::DeltaChunks,
     member: Option<proto::QueryMember>,
     complete: bool,
 }
@@ -143,7 +142,7 @@ struct Stream {
     feedback: VecDeque<(proto::RequestId, Vec<u8>)>,
     feedback_bytes: usize,
     retired_feedback: HashSet<proto::RequestId>,
-    live_chunk: Option<LiveAssembly>,
+    live_chunk: Option<LiveChunks>,
     live_targets: VecDeque<LiveTargetRef>,
     live_target_index: HashMap<Arc<[u8]>, LiveTarget>,
     target_bytes: usize,
@@ -266,7 +265,7 @@ enum Work {
     Item(StateItem),
     Repair(proto::EntityId, Option<proto::Clock>),
     History { entity_id: proto::EntityId, target: proto::Clock },
-    Chunks { entity_id: proto::EntityId, target: proto::Clock, bytes: Vec<u8>, offset: usize },
+    Chunks { target: proto::Clock, chunks: proto::DeltaChunks },
 }
 
 struct InitialHeads {
@@ -285,6 +284,12 @@ struct Comparison {
     repair_attempts: HashMap<Vec<u8>, usize>,
     complete: bool,
     unavailable: bool,
+}
+/// The next chunk of a split delta, and the work that sends the rest.
+fn next_repair_chunk(target: proto::Clock, mut chunks: proto::DeltaChunks) -> (RepairItem, Option<Work>) {
+    let chunk = chunks.next().expect("split work keeps its unsent chunks");
+    let rest = (!chunk.last).then(|| Work::Chunks { target: target.clone(), chunks });
+    (RepairItem::Chunk { target, chunk }, rest)
 }
 fn target_id(entity: proto::EntityId, head: &proto::Clock) -> Vec<u8> {
     bincode::serialize(&(entity, head)).expect("causal target serializes")
@@ -334,9 +339,9 @@ impl Stream {
         }
         // Absent can still carry readable state and events. Its data may need
         // connecting history even though it no longer belongs to the query.
-        if let Some(proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. }) = &item.delta {
-            if !heads.contains(&&state.state.head) {
-                heads.push(&state.state.head);
+        if let Some(head) = item.delta.as_ref().and_then(proto::DeltaContent::state_head) {
+            if !heads.contains(&head) {
+                heads.push(head);
             }
         }
         for head in heads {
@@ -390,22 +395,11 @@ impl Stream {
     }
 
     fn next_live(&mut self, live: &Mutex<LiveQueue>) -> anyhow::Result<Option<StateFrameBody>> {
-        if let Some(assembly) = self.live_chunk.as_mut() {
-            let end = (assembly.offset + DELTA_CHUNK_BYTES).min(assembly.bytes.len());
-            let last = end == assembly.bytes.len();
-            let complete = last && assembly.complete;
-            let body = StateFrameBody::LiveChunk {
-                revision: assembly.revision,
-                member: assembly.member.clone(),
-                chunk: proto::EntityDeltaChunk {
-                    entity_id: assembly.entity_id,
-                    offset: assembly.offset as u64,
-                    bytes: assembly.bytes[assembly.offset..end].to_vec().into(),
-                    last,
-                },
-                complete,
-            };
-            assembly.offset = end;
+        if let Some(live) = self.live_chunk.as_mut() {
+            let chunk = live.chunks.next().expect("a live delta keeps its unsent chunks");
+            let last = chunk.last;
+            let body =
+                StateFrameBody::LiveChunk { revision: live.revision, member: live.member.clone(), chunk, complete: last && live.complete };
             if last {
                 self.live_chunk = None;
             }
@@ -438,14 +432,14 @@ impl Stream {
                 queue.bytes -= size;
                 self.offer_live_target(revision, &item)?;
                 let content = item.delta.ok_or_else(|| anyhow::anyhow!("oversized live membership metadata"))?;
-                let bytes = bincode::serialize(&content)?;
-                ensure!(bytes.len() <= MAX_DELTA_BYTES, "live delta exceeds assembly limit");
+                let payload = content.encode_payload()?;
+                ensure!(payload.len() <= MAX_DELTA_BYTES, "live delta exceeds assembly limit");
                 let complete = queue.publications.front().unwrap().items.is_empty();
                 if complete {
                     queue.publications.pop_front();
                 }
-                self.live_chunk =
-                    Some(LiveAssembly { revision, entity_id: item.entity_id, bytes, offset: 0, member: item.member, complete });
+                let chunks = proto::EntityDeltaChunk::split(item.entity_id, payload, DELTA_CHUNK_BYTES);
+                self.live_chunk = Some(LiveChunks { revision, chunks, member: item.member, complete });
                 drop(queue);
                 return self.next_live(live);
             }
@@ -504,9 +498,10 @@ impl Stream {
             Work::History { entity_id, target } => match target_history(node, entity_id, &target, credentials, catalog).await {
                 Ok(events) => {
                     let content = proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() };
-                    let bytes = bincode::serialize(&content)?;
-                    if bytes.len() > DELTA_CHUNK_BYTES {
-                        self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
+                    let payload = content.encode_payload()?;
+                    if payload.len() > DELTA_CHUNK_BYTES {
+                        let chunks = proto::EntityDeltaChunk::split(entity_id, payload, DELTA_CHUNK_BYTES);
+                        self.live_repairs.push_front(Work::Chunks { target, chunks });
                         return Box::pin(self.next_live_repair(node, credentials, catalog)).await;
                     }
                     RepairItem::Delta { target, delta: proto::EntityDelta { entity_id, content } }
@@ -516,19 +511,10 @@ impl Stream {
                     RepairItem::Unavailable { entity_id, target }
                 }
             },
-            Work::Chunks { entity_id, target, bytes, offset } => {
-                let end = (offset + DELTA_CHUNK_BYTES).min(bytes.len());
-                let item = RepairItem::Chunk {
-                    target: target.clone(),
-                    chunk: proto::EntityDeltaChunk {
-                        entity_id,
-                        offset: offset as u64,
-                        bytes: bytes[offset..end].to_vec().into(),
-                        last: end == bytes.len(),
-                    },
-                };
-                if end < bytes.len() {
-                    self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: end });
+            Work::Chunks { target, chunks } => {
+                let (item, rest) = next_repair_chunk(target, chunks);
+                if let Some(rest) = rest {
+                    self.live_repairs.push_front(rest);
                 }
                 item
             }
@@ -1669,9 +1655,10 @@ impl Comparison {
                             entity_id,
                             content: proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() },
                         };
-                        let bytes = bincode::serialize(&delta.content)?;
-                        if bytes.len() > DELTA_CHUNK_BYTES {
-                            self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
+                        let payload = delta.content.encode_payload()?;
+                        if payload.len() > DELTA_CHUNK_BYTES {
+                            let chunks = proto::EntityDeltaChunk::split(entity_id, payload, DELTA_CHUNK_BYTES);
+                            self.work.push_front(Work::Chunks { target, chunks });
                             None
                         } else {
                             Some(StateItem::Repair(RepairItem::Delta { target, delta }))
@@ -1808,29 +1795,21 @@ impl Comparison {
                     let item = StateItem::Repair(RepairItem::Delta { target: target.clone(), delta });
                     if bincode::serialized_size(&item)? as usize > DELTA_CHUNK_BYTES {
                         let StateItem::Repair(RepairItem::Delta { delta, .. }) = item else { unreachable!() };
-                        let bytes = bincode::serialize(&delta.content)?;
-                        ensure!(bytes.len() <= MAX_DELTA_BYTES, "entity repair exceeds transfer limit");
-                        self.work.push_front(Work::Chunks { entity_id: id, target, bytes, offset: 0 });
+                        let payload = delta.content.encode_payload()?;
+                        ensure!(payload.len() <= MAX_DELTA_BYTES, "entity repair exceeds transfer limit");
+                        let chunks = proto::EntityDeltaChunk::split(id, payload, DELTA_CHUNK_BYTES);
+                        self.work.push_front(Work::Chunks { target, chunks });
                         None
                     } else {
                         Some(item)
                     }
                 }
-                Work::Chunks { entity_id, target, bytes, offset } => {
-                    let end = (offset + DELTA_CHUNK_BYTES).min(bytes.len());
-                    let item = StateItem::Repair(RepairItem::Chunk {
-                        target: target.clone(),
-                        chunk: proto::EntityDeltaChunk {
-                            entity_id,
-                            offset: offset as u64,
-                            bytes: bytes[offset..end].to_vec().into(),
-                            last: end == bytes.len(),
-                        },
-                    });
-                    if end < bytes.len() {
-                        self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: end });
+                Work::Chunks { target, chunks } => {
+                    let (item, rest) = next_repair_chunk(target, chunks);
+                    if let Some(rest) = rest {
+                        self.work.push_front(rest);
                     }
-                    Some(item)
+                    Some(StateItem::Repair(item))
                 }
             };
             if let Some(item) = item {

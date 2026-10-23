@@ -1,11 +1,12 @@
 //! Entity payloads shared by query initialization, repair and live updates.
 
+use anyhow::{bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::{Attested, CausalAssertionFragment, EntityId, EntityState, Event, EventFragment, GetFailure, GetResult, StateFragment};
+use crate::{Attested, CausalAssertionFragment, Clock, EntityId, EntityState, Event, EventFragment, GetFailure, GetResult, StateFragment};
 
 mod chunk;
-pub use chunk::EntityDeltaChunk;
+pub use chunk::{DeltaAssembler, DeltaChunks, EntityDeltaChunk};
 
 /// Entity data shared by initial repair and ongoing updates.
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -14,10 +15,36 @@ pub enum DeltaContent {
     StateSnapshot { state: StateFragment },
     /// Events connecting a supplied entity clock to the repair target.
     EventBridge { events: Vec<EventFragment> },
-    /// State with a causal assertion relative to the supplied entity clock.
+    /// State with a causal assertion relative to the supplied entity clock. No node
+    /// produces it, and receivers refuse it.
     StateAndRelation { state: StateFragment, relation: CausalAssertionFragment },
     /// Snapshot plus connecting events; retain the events if the snapshot cannot apply.
     StateAndEvents { state: StateFragment, events: Vec<EventFragment> },
+}
+
+impl DeltaContent {
+    /// The head of the entity state this delta carries; an event bridge carries none.
+    pub fn state_head(&self) -> Option<&Clock> {
+        match self {
+            Self::StateSnapshot { state } | Self::StateAndEvents { state, .. } | Self::StateAndRelation { state, .. } => {
+                Some(&state.state.head)
+            }
+            Self::EventBridge { .. } => None,
+        }
+    }
+
+    /// Checks that this delta can bring its entity to `target`: state it carries
+    /// must have exactly that head, and an event bridge must carry events.
+    pub fn check_target(&self, target: &Clock) -> anyhow::Result<()> {
+        match self {
+            Self::StateAndRelation { .. } => bail!("StateAndRelation is not supported"),
+            Self::EventBridge { events } => ensure!(!events.is_empty(), "empty event bridge"),
+            Self::StateSnapshot { .. } | Self::StateAndEvents { .. } => {
+                ensure!(self.state_head() == Some(target), "snapshot does not match repair target")
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One entity payload, independent of initial/live delivery and query relevance.

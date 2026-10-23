@@ -4,7 +4,6 @@ use ankurah_proto::{
     self as proto, state_sync::limits::STREAM_TTL, ComparisonProgress, RepairItem, StateAnswer, StateFrameBody, StateItem,
 };
 use anyhow::{bail, ensure};
-use bincode::Options;
 use futures::FutureExt;
 
 use super::{feedback::Feedback, IncomingStream, Snapshot};
@@ -252,21 +251,6 @@ async fn state_deadline<T>(future: impl std::future::Future<Output = T>) -> Resu
         result = future => Ok(result),
         _ = timeout => Err(RequestError::ConnectionLost.into()),
     }
-}
-
-fn decode_delta(bytes: &[u8]) -> anyhow::Result<proto::DeltaContent> {
-    Ok(bincode::DefaultOptions::new().with_fixint_encoding().with_limit(bytes.len() as u64).reject_trailing_bytes().deserialize(bytes)?)
-}
-
-fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow::Result<()> {
-    match content {
-        proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. } => {
-            ensure!(state.state.head == *target, "snapshot does not match repair target")
-        }
-        proto::DeltaContent::EventBridge { events } => ensure!(!events.is_empty(), "empty event bridge"),
-        proto::DeltaContent::StateAndRelation { .. } => bail!("StateAndRelation is not supported"),
-    }
-    Ok(())
 }
 
 #[cfg(test)]

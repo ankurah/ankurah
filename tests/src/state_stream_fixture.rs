@@ -242,9 +242,7 @@ pub fn change(delta: proto::EntityDelta) -> proto::QueryChange {
             }
             head
         }
-        proto::DeltaContent::StateSnapshot { state }
-        | proto::DeltaContent::StateAndEvents { state, .. }
-        | proto::DeltaContent::StateAndRelation { state, .. } => state.state.head.clone(),
+        content => content.state_head().expect("every delta but an event bridge carries state").clone(),
     };
     proto::QueryChange { entity_id: delta.entity_id, member: Some(proto::QueryMember { key: vec![], head }), delta: Some(delta.content) }
 }
