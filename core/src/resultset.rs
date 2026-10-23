@@ -20,14 +20,14 @@ use std::{
 
 /// Efficient storage for sort keys - uses fixed array for small keys, Vec for larger ones
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum IVec {
+enum SortKey {
     /// Keys <= 16 bytes stored in zero-padded fixed array
     Small([u8; 16]),
     /// Keys > 16 bytes stored in Vec
     Large(Vec<u8>),
 }
 
-impl IVec {
+impl SortKey {
     /// Create from byte slice
     fn from_slice(bytes: &[u8]) -> Self {
         if bytes.len() <= 16 {
@@ -40,7 +40,7 @@ impl IVec {
     }
 }
 
-impl From<Vec<u8>> for IVec {
+impl From<Vec<u8>> for SortKey {
     fn from(vec: Vec<u8>) -> Self { Self::from_slice(&vec) }
 }
 
@@ -87,7 +87,7 @@ struct State<E: AbstractEntity> {
 #[derive(Debug, Clone)]
 struct EntityEntry<E: AbstractEntity> {
     entity: E,
-    sort_key: Option<IVec>,
+    sort_key: Option<SortKey>,
     dirty: bool,
 }
 // TODO - figure out how to maintain ordering of entities
@@ -313,7 +313,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     }
 
     /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &KeySpec<PropertyId>) -> IVec {
+    fn compute_sort_key(entity: &E, key_spec: &KeySpec<PropertyId>) -> SortKey {
         let mut values = Vec::new();
 
         // Extract values for each key part
@@ -325,13 +325,13 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
                 values.push(v);
             } else {
                 // Skip this entity for now if any field is NULL
-                return IVec::from_slice(&[]); // Empty key sorts first
+                return SortKey::from_slice(&[]); // Empty key sorts first
             }
         }
 
         // Encode the tuple - if this fails, return empty key (will sort first)
         let encoded = encode_tuple_values_with_key_spec(&values, key_spec).unwrap_or_default();
-        IVec::from(encoded)
+        SortKey::from(encoded)
     }
 
     /// Set the loaded flag as part of this write transaction.
@@ -757,50 +757,50 @@ mod tests {
     }
 
     #[test]
-    fn test_ivec_small_keys() {
+    fn test_sort_key_small_keys() {
         // Test that small keys (<=16 bytes) use the Small variant
-        let small_key = IVec::from_slice(b"hello");
-        let another_small = IVec::from_slice(b"world");
-        let empty_key = IVec::from_slice(b"");
+        let small_key = SortKey::from_slice(b"hello");
+        let another_small = SortKey::from_slice(b"world");
+        let empty_key = SortKey::from_slice(b"");
 
         // Verify ordering works correctly with zero padding
         assert!(small_key < another_small); // "hello" < "world"
         assert!(empty_key < small_key); // empty sorts first
 
         // Test that zero padding doesn't affect comparison
-        let key_ab = IVec::from_slice(b"ab");
-        let key_abc = IVec::from_slice(b"abc");
+        let key_ab = SortKey::from_slice(b"ab");
+        let key_abc = SortKey::from_slice(b"abc");
         assert!(key_ab < key_abc); // "ab" < "abc" even with zero padding
     }
 
     #[test]
-    fn test_ivec_large_keys() {
+    fn test_sort_key_large_keys() {
         // Test that large keys (>16 bytes) use the Large variant
-        let large_key = IVec::from_slice(&[1u8; 20]); // 20 bytes
-        let small_key = IVec::from_slice(&[1u8; 10]); // 10 bytes
+        let large_key = SortKey::from_slice(&[1u8; 20]); // 20 bytes
+        let small_key = SortKey::from_slice(&[1u8; 10]); // 10 bytes
 
         // Verify they can be compared
         assert!(small_key < large_key); // smaller array should sort first
     }
 
     #[test]
-    fn test_ivec_boundary() {
+    fn test_sort_key_boundary() {
         // Test the 16-byte boundary
-        let exactly_16 = IVec::from_slice(&[1u8; 16]);
-        let exactly_17 = IVec::from_slice(&[1u8; 17]);
+        let exactly_16 = SortKey::from_slice(&[1u8; 16]);
+        let exactly_17 = SortKey::from_slice(&[1u8; 17]);
 
         // Both should work and be comparable
         assert!(exactly_16 < exactly_17);
 
         // Verify 16-byte keys use Small variant (this is implicit in the implementation)
         match exactly_16 {
-            IVec::Small(_) => (), // Expected
-            IVec::Large(_) => panic!("16-byte key should use Small variant"),
+            SortKey::Small(_) => (), // Expected
+            SortKey::Large(_) => panic!("16-byte key should use Small variant"),
         }
 
         match exactly_17 {
-            IVec::Large(_) => (), // Expected
-            IVec::Small(_) => panic!("17-byte key should use Large variant"),
+            SortKey::Large(_) => (), // Expected
+            SortKey::Small(_) => panic!("17-byte key should use Large variant"),
         }
     }
 }
