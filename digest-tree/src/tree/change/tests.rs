@@ -3,7 +3,8 @@ use crate::store::layout;
 use crate::{DigestTree, Ristretto255, TreeSpec};
 use ankql::ast::Predicate;
 use ankurah_core_types::KeySpec;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]
@@ -195,6 +196,116 @@ async fn counting_defers_neighbor_validation_but_leaf_reads_and_rebuilds_reject_
     }
 }
 
+/// The leaf of the entity numbered `n` filed under `key`, at `version`.
+fn numbered(n: u32, key: Vec<u8>, version: u8) -> LeafInput {
+    let mut id = [0; EntityId::BYTE_LEN];
+    id[..4].copy_from_slice(&n.to_be_bytes());
+    LeafInput { key, entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
+}
+
+/// Every key of the nodes map is a base row's: no tree node carries a delta
+/// row.
+async fn only_base_rows<G: DigestGroup, T: MapAccess>(tree: &mut TreeTransaction<G, T>) -> bool {
+    let rows = tree.transaction.scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap();
+    rows.iter().all(|(key, _)| matches!(layout::node_key(key).unwrap(), layout::NodeKey::Base(_)))
+}
+
+/// A batch of changes folds every difference it makes, and every delta row
+/// an earlier change appended to a tree node it touches, into base rows, and
+/// leaves the tree a build from the same leaves gives: what a tree's only
+/// writer publishes after each batch. A transaction begun before still reads
+/// the tree it began with.
+#[tokio::test]
+async fn a_batch_folds_its_differences_and_earlier_deltas_into_base_rows() {
+    let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
+    let tree = DigestTree::<Ristretto255>::new(spec.clone());
+    let mut versions: BTreeMap<u32, u8> = (0..1024).map(|n| (n, 1)).collect();
+    let leaves = |versions: &BTreeMap<u32, u8>| versions.iter().map(|(&n, &version)| numbered(n, vec![], version)).collect::<Vec<_>>();
+    let mut setup = tree.begin();
+    setup.build(leaves(&versions)).await.unwrap();
+    setup.commit().await.unwrap();
+    let mut original = tree.begin();
+    let original_root = original.node(&NodePrefix::root()).await.unwrap();
+
+    for version in 2..80 {
+        let mut tx = tree.begin();
+        tx.apply_change(LeafChange { before: Some(numbered(50, vec![], version - 1)), after: Some(numbered(50, vec![], version)) })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    versions.insert(50, 79);
+    assert!(!only_base_rows(&mut tree.begin()).await, "single changes append delta rows");
+    let changes: Vec<LeafChange> =
+        (0..160).map(|n| LeafChange { before: Some(numbered(n, vec![], versions[&n])), after: Some(numbered(n, vec![], 99)) }).collect();
+    versions.extend((0..160).map(|n| (n, 99)));
+    let mut tx = tree.begin();
+    tx.apply_changes(changes).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let mut current = tree.begin();
+    assert!(only_base_rows(&mut current).await, "the batch leaves no delta row");
+    current.audit().await.unwrap();
+    let rebuilt = DigestTree::<Ristretto255>::new(spec);
+    let mut build = rebuilt.begin();
+    build.build(leaves(&versions)).await.unwrap();
+    build.commit().await.unwrap();
+    assert_eq!(current.node(&NodePrefix::root()).await.unwrap(), rebuilt.begin().node(&NodePrefix::root()).await.unwrap());
+    assert_eq!(original.node(&NodePrefix::root()).await.unwrap(), original_root, "a transaction begun before reads its own tree");
+}
+
+/// A batch whose changes split buckets, merge subtrees, insert branches and
+/// move leaves between them leaves every tree node holding what the same
+/// changes applied one at a time leave there, and no delta row.
+#[tokio::test]
+async fn a_batch_that_changes_the_topology_matches_its_changes_one_at_a_time() {
+    use ankurah_core_types::{IndexKeyPart, PropertyId, Value, ValueType};
+
+    let property = PropertyId::EntityId(EntityId::from_bytes([7; 32]));
+    let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property, ValueType::I64)]), Predicate::True);
+    let key = |value: i64| CanonicalCodec::encode_prefix(spec.key_spec(), &[Value::I64(value)]).unwrap();
+    let initial: Vec<LeafInput> = (0..100).map(|n| numbered(n, key(i64::from(n)), 1)).collect();
+    let mut changes = Vec::new();
+    // Insertions past every key, which insert branches and then split buckets.
+    changes.extend((100..250).map(|n| LeafChange { before: None, after: Some(numbered(n, key(1_000 + i64::from(n)), 1)) }));
+    // Removals of most of the first keys, which merge their subtrees.
+    changes.extend((10..90).map(|n| LeafChange { before: Some(numbered(n, key(i64::from(n)), 1)), after: None }));
+    // Moves to keys far away, and head changes in place.
+    changes.extend(
+        (0..5).map(|n| LeafChange {
+            before: Some(numbered(n, key(i64::from(n)), 1)),
+            after: Some(numbered(n, key(5_000 + i64::from(n)), 1)),
+        }),
+    );
+    changes.extend(
+        (90..95).map(|n| LeafChange { before: Some(numbered(n, key(i64::from(n)), 1)), after: Some(numbered(n, key(i64::from(n)), 2)) }),
+    );
+
+    let (batched, one_at_a_time) = (DigestTree::<Ristretto255>::new(spec.clone()), DigestTree::<Ristretto255>::new(spec.clone()));
+    for tree in [&batched, &one_at_a_time] {
+        let mut setup = tree.begin();
+        setup.build(initial.clone()).await.unwrap();
+        setup.commit().await.unwrap();
+    }
+    let mut tx = batched.begin();
+    tx.apply_changes(changes.clone()).await.unwrap();
+    tx.commit().await.unwrap();
+    for change in changes {
+        let mut tx = one_at_a_time.begin();
+        tx.apply_change(change).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    let (mut batched, mut one_at_a_time) = (batched.begin(), one_at_a_time.begin());
+    assert!(only_base_rows(&mut batched).await);
+    assert_eq!(batched.audit().await.unwrap(), one_at_a_time.audit().await.unwrap());
+    let rows = batched.transaction.scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap();
+    for (key, _) in rows {
+        let prefix = layout::node_key(&key).unwrap().into_prefix();
+        assert_eq!(batched.node(&prefix).await.unwrap(), one_at_a_time.node(&prefix).await.unwrap(), "{prefix:?}");
+    }
+}
+
 /// What a change costs in operations on the maps, counted by an adapter around
 /// the memory maps, independently of an engine's timing or caches.
 mod map_costs {
@@ -360,6 +471,25 @@ mod map_costs {
         assert_eq!(measured[MapName::Leaves as usize].deletes, 0);
         assert_eq!(measured[MapName::Nodes as usize].puts, 0);
         assert_eq!(measured[MapName::Nodes as usize].deletes, 0);
+        tx.commit().await.unwrap();
+        begin(&maps, &counts).audit().await.unwrap();
+    }
+
+    /// A batch writes each tree node it touches once, and appends no delta
+    /// row.
+    #[tokio::test]
+    async fn a_batch_writes_each_tree_node_it_touches_once() {
+        let (maps, counts) = populated(4096).await;
+        let mut tx = begin(&maps, &counts);
+        let mut touched = BTreeSet::new();
+        for n in 100..110 {
+            touched.extend(tx.path(&leaf(n, 0).into_row::<Ristretto255>().address()).await.unwrap().prefixes);
+        }
+        reset(&counts);
+        tx.apply_changes((100..110).map(|n| LeafChange { before: Some(leaf(n, 0)), after: Some(leaf(n, 1)) })).await.unwrap();
+        let measured = counts.lock().unwrap().clone();
+        assert_eq!(measured[MapName::Nodes as usize].appends, 0, "no delta rows");
+        assert_eq!(measured[MapName::Nodes as usize].puts, touched.len(), "one base write per tree node touched");
         tx.commit().await.unwrap();
         begin(&maps, &counts).audit().await.unwrap();
     }

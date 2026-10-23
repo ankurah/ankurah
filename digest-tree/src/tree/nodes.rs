@@ -160,6 +160,32 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(())
     }
 
+    /// Fold `difference` and every delta of the tree node at `prefix` into its
+    /// base row, removing the deltas: one base write however many changes
+    /// the tree node gathered. The base is written only if it is still the
+    /// one read, and each delta removed only if it is still there:
+    /// [`TreeError::Conflict`] otherwise. [`TreeError::IncompleteNode`] when
+    /// the tree node has no base.
+    pub(crate) async fn fold_into_base(&mut self, prefix: &NodePrefix, difference: Digest<G>) -> Result<(), TreeError> {
+        let base = self.base(prefix).await?.ok_or_else(|| TreeError::IncompleteNode(prefix.clone()))?;
+        let mut digest = base.digest.checked_add(difference)?;
+        let mut deltas = DeltaPages::of(prefix);
+        loop {
+            let page = deltas.next(&mut self.transaction).await?;
+            if page.is_empty() {
+                break;
+            }
+            for (key, value) in page {
+                digest = digest.checked_add(layout::digest("delta value", &value)?)?;
+                self.transaction.delete_if(MapName::Nodes, &key, &value).await?;
+            }
+        }
+        if digest == base.digest {
+            return Ok(());
+        }
+        self.transaction.put_if(MapName::Nodes, &prefix.to_bytes(), Some(&base.value), &layout::digest_value(&digest)).await
+    }
+
     /// Fold up to [`COMPACTION_BATCH`] of the tree node's deltas, the first in
     /// key order, into its base row and remove them, so that reads sum fewer
     /// rows. Deltas without a base report [`TreeError::IncompleteNode`]

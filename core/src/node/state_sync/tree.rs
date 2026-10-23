@@ -1,8 +1,4 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::Bound,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, ops::Bound, sync::Arc};
 
 use ankql::ast::{Resolved, Selection};
 use ankurah_core_types::{KeySpec, PropertyPath, ValueType};
@@ -25,7 +21,6 @@ const OFFER_BYTES: u64 = 16 * 1024;
 const OFFER_SPANS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
-const COMPACT_AFTER_CHANGES: usize = 128;
 
 /// The entity metadata retained with a leaf. Payloads remain in entity/storage ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,17 +249,13 @@ impl Index {
             return Ok(());
         }
         let mut tx = self.tree.begin();
-        let mut addresses = BTreeSet::new();
-        for (index, (id, after)) in changes.iter().enumerate() {
-            let before = self.entries.get(id);
-            addresses.extend(before.into_iter().chain(after.iter()).map(TreeEntry::address));
-            tx.apply_change(LeafChange { before: before.map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) }).await?;
-            if (index + 1) % COMPACT_AFTER_CHANGES == 0 {
-                compact_paths(&mut tx, &addresses).await?;
-                addresses.clear();
-            }
-        }
-        compact_paths(&mut tx, &addresses).await?;
+        let entries = &self.entries;
+        tx.apply_changes(
+            changes
+                .iter()
+                .map(|(id, after)| LeafChange { before: entries.get(id).map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) }),
+        )
+        .await?;
         // Memory commit has no suspension after publication; metadata is replaced
         // under the same owner lock before another reader can capture the index.
         tx.commit().await?;
@@ -300,24 +291,6 @@ impl Index {
             missing_counts: self.missing_counts.clone(),
         }
     }
-}
-
-/// Resident memory trees serialize their writes, so compact touched paths before
-/// publishing instead of retaining an ever-growing history of digest deltas.
-async fn compact_paths(tree: &mut TreeTransaction, addresses: &BTreeSet<Vec<u8>>) -> anyhow::Result<()> {
-    if addresses.is_empty() {
-        return Ok(());
-    }
-    let mut pending = vec![NodePrefix::root()];
-    while let Some(prefix) = pending.pop() {
-        anyhow::ensure!(!tree.compact_node(&prefix).await?, "resident digest compaction exceeded its maintenance batch");
-        for child in tree.child_prefixes(&prefix).await? {
-            if addresses.iter().any(|address| child.contains_address(address)) {
-                pending.push(child);
-            }
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

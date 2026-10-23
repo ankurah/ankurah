@@ -2,6 +2,7 @@
 //! node above the leaf maintained, bucket splits and merges included.
 
 use std::collections::BTreeMap;
+use std::mem;
 use std::ops::Bound;
 
 use ankurah_core_types::EntityId;
@@ -42,6 +43,18 @@ pub struct LeafChange {
     pub after: Option<LeafInput>,
 }
 
+/// Where a change records the difference it makes to each tree node above
+/// its leaf.
+enum NodeDifferences<G: DigestGroup> {
+    /// Appended as a delta row for each tree node, so that concurrent changes
+    /// never conflict on a base row.
+    Appended,
+    /// Summed for each tree node in memory, and folded into its base row,
+    /// with any delta rows there, when the batch ends or before the topology
+    /// changes, since a topology change reads and writes base rows.
+    Summed(BTreeMap<NodePrefix, Digest<G>>),
+}
+
 /// The tree nodes from the root down to the deepest one whose prefix an
 /// address begins with, and each one's children, as one walk read them.
 #[derive(Default)]
@@ -64,11 +77,38 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     pub async fn apply_change(&mut self, change: LeafChange) -> Result<(), TreeError> {
         self.generation += 1;
         let mut guard = self.mutation_guard();
-        let result = guard.change_leaf(change).await;
+        let result = guard.change_leaf(change, &mut NodeDifferences::Appended).await;
         guard.finish(result)
     }
 
-    async fn change_leaf(&mut self, change: LeafChange) -> Result<(), TreeError> {
+    /// Apply a batch of leaf changes, each as [`TreeTransaction::apply_change`]
+    /// applies it, and leave no delta row on any tree node they touched: each
+    /// tree node's differences are summed in memory and written to its base
+    /// row once, with any delta rows there folded in. The base writes make
+    /// two such batches over one tree node conflict, so this suits a tree's
+    /// only writer; changes from writers that run at once go through
+    /// [`TreeTransaction::apply_change`]. A failed or cancelled batch poisons
+    /// the transaction.
+    pub async fn apply_changes(&mut self, changes: impl IntoIterator<Item = LeafChange>) -> Result<(), TreeError> {
+        self.generation += 1;
+        let mut guard = self.mutation_guard();
+        let result = guard.change_leaves(changes).await;
+        guard.finish(result)
+    }
+
+    async fn change_leaves(&mut self, changes: impl IntoIterator<Item = LeafChange>) -> Result<(), TreeError> {
+        // Collected before the first await, so that a caller's iterator, which
+        // may borrow from it, is not held across awaits: a future that holds
+        // one cannot always be proven `Send` (rust-lang/rust#100013).
+        let changes: Vec<LeafChange> = changes.into_iter().collect();
+        let mut differences = NodeDifferences::Summed(BTreeMap::new());
+        for change in changes {
+            self.change_leaf(change, &mut differences).await?;
+        }
+        self.settle(&mut differences).await
+    }
+
+    async fn change_leaf(&mut self, change: LeafChange, differences: &mut NodeDifferences<G>) -> Result<(), TreeError> {
         self.transaction.watch_structure();
         for leaf in change.before.iter().chain(change.after.iter()) {
             CanonicalCodec::split(self.spec.key_spec(), &leaf.key)?;
@@ -97,10 +137,44 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 let path = self.path(&address).await?;
                 let difference = Digest::from(row.element) - Digest::from(before.row().element);
                 self.replace_leaf(&before, &EncodedLeaf::new(address, row)).await?;
-                self.append_node_deltas(&path.prefixes, difference).await
+                self.record(differences, &path.prefixes, difference).await
             }
-            (before, after) => self.refile_leaf(before, after.map(|(address, row)| EncodedLeaf::new(address, row))).await,
+            (before, after) => self.refile_leaf(before, after.map(|(address, row)| EncodedLeaf::new(address, row)), differences).await,
         }
+    }
+
+    /// Record that a change moved the digest of the leaves beneath each of
+    /// `prefixes` by `difference`, as `differences` records it.
+    async fn record(
+        &mut self,
+        differences: &mut NodeDifferences<G>,
+        prefixes: &[NodePrefix],
+        difference: Digest<G>,
+    ) -> Result<(), TreeError> {
+        match differences {
+            NodeDifferences::Appended => self.append_node_deltas(prefixes, difference).await,
+            NodeDifferences::Summed(sums) => {
+                if difference != Digest::empty() {
+                    for prefix in prefixes {
+                        let sum = sums.entry(prefix.clone()).or_default();
+                        *sum = sum.checked_add(difference)?;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Write every summed difference into its tree node's base row, which
+    /// leaves no difference pending: before the topology changes, and when a
+    /// batch ends.
+    async fn settle(&mut self, differences: &mut NodeDifferences<G>) -> Result<(), TreeError> {
+        if let NodeDifferences::Summed(sums) = differences {
+            for (prefix, sum) in mem::take(sums) {
+                self.fold_into_base(&prefix, sum).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The leaf `expected` names, as stored: [`TreeError::Conflict`] when no
@@ -135,7 +209,12 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// every tree node above either right: its summary, and the topology,
     /// splitting a bucket grown past its capacity, merging a subtree shrunk
     /// to half of it, and inserting a branch where no child holds the new leaf.
-    async fn refile_leaf(&mut self, before: Option<EncodedLeaf<G>>, after: Option<EncodedLeaf<G>>) -> Result<(), TreeError> {
+    async fn refile_leaf(
+        &mut self,
+        before: Option<EncodedLeaf<G>>,
+        after: Option<EncodedLeaf<G>>,
+        differences: &mut NodeDifferences<G>,
+    ) -> Result<(), TreeError> {
         // Ancestors of only the removed leaf lose its contribution and
         // ancestors of only the added leaf gain its contribution. The
         // ancestors a move shares, a run down from the root, receive the
@@ -157,9 +236,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         if let Some(leaf) = &after {
             self.insert_leaf(leaf).await?;
         }
-        self.append_node_deltas(&removed_path.prefixes[..shared], removal + addition).await?;
-        self.append_node_deltas(&removed_path.prefixes[shared..], removal).await?;
-        self.append_node_deltas(&added_path.prefixes[shared..], addition).await?;
+        self.record(differences, &removed_path.prefixes[..shared], removal + addition).await?;
+        self.record(differences, &removed_path.prefixes[shared..], removal).await?;
+        self.record(differences, &added_path.prefixes[shared..], addition).await?;
         let removed_address = before.as_ref().map(EncodedLeaf::address);
         let added = after.as_ref().map(|leaf| (leaf.address(), leaf.row().element));
         // The children each path's walk read stay right until a rebuild,
@@ -174,6 +253,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             let added_beneath = added.filter(|(address, _)| prefix.contains_address(address));
             match added_beneath {
                 Some((address, element)) if !children.is_empty() && !children.iter().any(|child| child.contains_address(address)) => {
+                    self.settle(differences).await?;
                     self.insert_branch(&prefix, &children, address, element).await?;
                 }
                 Some(_) if children.is_empty() && !removed_beneath => {
@@ -181,6 +261,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                     let leaves =
                         self.transaction.count_up_to(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY + 1).await?;
                     if leaves > BUCKET_CAPACITY {
+                        self.settle(differences).await?;
                         self.rebuild_subtree(&prefix).await?;
                     }
                 }
@@ -188,6 +269,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                     let leaves =
                         self.transaction.count_up_to(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY / 2 + 1).await?;
                     if leaves <= BUCKET_CAPACITY / 2 {
+                        self.settle(differences).await?;
                         self.rebuild_subtree(&prefix).await?;
                     }
                 }

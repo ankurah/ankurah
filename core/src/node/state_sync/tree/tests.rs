@@ -767,33 +767,3 @@ fn compatible_offered_spec_accepts_broader_admission_but_rejects_invalid_keys() 
     assert!(!QueryTree::serves(&TreeSpec::new(KeySpec::new(vec![invalid]), Predicate::True), &selection, &catalog));
     Ok(())
 }
-
-#[tokio::test]
-async fn repeated_sparse_updates_compact_touched_paths_before_publication() -> anyhow::Result<()> {
-    let tree = QueryTree::default();
-    tree.refresh(spec(), (0..1024).map(|id| numbered_state(id, 1)).collect()).await?;
-    let mut original = tree.current_snapshot().await?;
-    let original_digest = original.span_digest(super::super::whole()).await?;
-    for version in 2..80 {
-        let state = numbered_state(50, version);
-        tree.apply_entries(vec![entry_from_state(&spec(), &state)?], Vec::new()).await?;
-    }
-    // More than one compaction chunk, but below the dense-replacement threshold.
-    let changed = (0..160).map(|id| entry_from_state(&spec(), &numbered_state(id, 99))).collect::<anyhow::Result<_>>()?;
-    tree.apply_entries(changed, Vec::new()).await?;
-    let mut current = tree.current_snapshot().await?;
-    let mut prefixes = vec![NodePrefix::root()];
-    while let Some(prefix) = prefixes.pop() {
-        assert_eq!(
-            current.tree.node_base(&prefix).await?,
-            current.tree.node(&prefix).await?,
-            "committed nodes contain no pending digest deltas"
-        );
-        prefixes.extend(current.tree.children(&prefix).await?.into_iter().map(|(child, _)| child));
-    }
-    let expected = QueryTree::default();
-    let mut expected = expected.refresh(spec(), (0..1024).map(|id| numbered_state(id, if id < 160 { 99 } else { 1 })).collect()).await?;
-    assert_eq!(current.span_digest(super::super::whole()).await?, expected.span_digest(super::super::whole()).await?);
-    assert_eq!(original.span_digest(super::super::whole()).await?, original_digest);
-    Ok(())
-}
