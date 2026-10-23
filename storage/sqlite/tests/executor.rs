@@ -4,7 +4,10 @@
 mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{exec::Behavior, SqliteStorageEngine, SqliteValue, SqliteValueRef};
+use ankurah_storage_sqlite::{
+    exec::{Behavior, SqliteExecutor},
+    SqliteError, SqliteStorageEngine, SqliteValue, SqliteValueRef,
+};
 use anyhow::Result;
 use common::{session_settings, LockHolder, Stopwatch, TempDb};
 use serde::{Deserialize, Serialize};
@@ -166,6 +169,32 @@ async fn rows_lend_their_text_and_blob_values() -> Result<()> {
     let row = storage.with_executor(|executor| Ok(executor.query_row("SELECT 'text', x'0102'", &[])?.expect("one row"))).await?;
     assert!(std::ptr::eq(row.text(0)?, row.text(0)?));
     assert!(std::ptr::eq(row.blob(1)?, row.blob(1)?));
+    Ok(())
+}
+
+/// A statement read again after the schema changes reads as the schema now
+/// stands, though the node executor keeps the reader it prepared for the
+/// statement: `SELECT *` gains the column its table gained, and a TEMP table
+/// of the same name takes the table's place.
+#[engine_test]
+async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
+    fn width_of_every_column(executor: &dyn SqliteExecutor) -> Result<usize, SqliteError> {
+        Ok(executor.query_row("SELECT * FROM things", &[])?.expect("one row").values().len())
+    }
+    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let widths = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (a)", &[])?;
+            executor.execute("INSERT INTO things (a) VALUES (1)", &[])?;
+            let before = width_of_every_column(executor)?;
+            executor.execute("ALTER TABLE things ADD COLUMN b", &[])?;
+            let gained = width_of_every_column(executor)?;
+            executor.execute("CREATE TEMP TABLE things (a, b, c)", &[])?;
+            executor.execute("INSERT INTO temp.things VALUES (1, 2, 3)", &[])?;
+            Ok([before, gained, width_of_every_column(executor)?])
+        })
+        .await?;
+    assert_eq!(widths, [1, 2, 3]);
     Ok(())
 }
 

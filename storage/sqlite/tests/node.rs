@@ -157,11 +157,24 @@ fn refusal(tamper: &str) -> String {
 }
 
 /// An INTEGER handed over as a number cannot be told from a REAL, so such a
-/// database is refused rather than read by guesswork.
+/// database is refused rather than read by guesswork. The first INTEGER it
+/// reads is the schema version the kept typed readers are checked against.
 #[wasm_bindgen_test]
 fn refuses_a_database_that_hands_an_integer_over_as_a_number() {
     let error =
         refusal("return new Proxy(statement, { get: (target, name) => name === 'setReadBigInts' ? () => {} : forward(target, name) });");
+    assert!(error.contains("expected an INTEGER as a BigInt, found JsValue(0)"), "{error}");
+}
+
+/// A row whose INTEGER arrives as a number is refused, the storage class the
+/// typed reader reports for it standing against the number.
+#[wasm_bindgen_test]
+fn refuses_a_row_whose_integer_arrives_as_a_number() {
+    let error = refusal(
+        "return new Proxy(statement, { get: (target, name) => name === 'all'
+             ? (...params) => target.all(...params).map((row) => row.map((value) => typeof value === 'bigint' ? Number(value) : value))
+             : forward(target, name) });",
+    );
     assert!(error.contains("storage class integer that arrived as Real(1.0)"), "{error}");
 }
 

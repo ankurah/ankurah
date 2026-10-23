@@ -22,7 +22,7 @@
 //! of a BLOB, and decodes them as strictly as rusqlite does (see
 //! `typed_reader`).
 
-use std::path::Path;
+use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc};
 
 use js_sys::{Array, BigInt, Function, Reflect, Uint8Array};
 use send_wrapper::SendWrapper;
@@ -79,11 +79,41 @@ impl SqliteStorageEngine {
     pub fn database(&self) -> &JsValue { self.pool().connection().database() }
 }
 
-/// One `DatabaseSync`-shaped database. Clones share the same JavaScript object.
+/// One `DatabaseSync`-shaped database. Clones share the same JavaScript
+/// object and the same kept typed readers.
 #[derive(Clone)]
 pub struct NodeConnection {
-    // The JavaScript handle is bound to the thread that made it; WASM has one.
+    // The JavaScript handles are bound to the thread that made them; WASM has one.
     database: SendWrapper<JsValue>,
+    readers: SendWrapper<Rc<RefCell<Readers>>>,
+}
+
+/// How many typed readers a connection keeps prepared.
+const KEPT_READERS: usize = 64;
+
+/// The typed readers a connection has prepared, by the SQL text of the
+/// statement each reads, so that a query run again skips both prepares,
+/// which cost a point lookup several times what reading its row does. At
+/// most [`KEPT_READERS`] are kept, the least recently used leaving first.
+/// SQLite prepares a kept statement again when the schema changes, but a
+/// typed reader names its statement's columns, which a `SELECT *` may have
+/// gained or lost; so every kept reader is dropped when the schema version
+/// of main or temp changes.
+#[derive(Default)]
+struct Readers {
+    /// `PRAGMA main.schema_version` and `PRAGMA temp.schema_version`, prepared once.
+    version_statements: Option<[JsValue; 2]>,
+    /// The schema versions the kept readers were prepared at.
+    versions: Option<[i64; 2]>,
+    kept: HashMap<String, KeptReader>,
+    /// Counts the uses of kept readers, to find the least recently used.
+    clock: u64,
+}
+
+struct KeptReader {
+    statement: JsValue,
+    width: usize,
+    used: u64,
 }
 
 impl NodeConnection {
@@ -98,7 +128,7 @@ impl NodeConnection {
         }
         method(&database, "prepare")?;
         method(&database, "exec")?;
-        let connection = Self { database: SendWrapper::new(database) };
+        let connection = Self { database: SendWrapper::new(database), readers: SendWrapper::new(Rc::default()) };
         // A database whose statements do not hand rows over as the executor
         // reads them is refused here rather than at its first query.
         let probe = connection.query("SELECT 1", &[])?;
@@ -164,6 +194,62 @@ impl NodeConnection {
         f(self)
     }
 
+    /// The typed reader kept for `sql` and its statement's width, once every
+    /// kept reader has been dropped if the schema changed since they were
+    /// prepared.
+    fn kept_reader(&self, sql: &str) -> Result<Option<(JsValue, usize)>, SqliteError> {
+        let versions = self.schema_versions()?;
+        let mut readers = self.readers.borrow_mut();
+        if readers.versions != Some(versions) {
+            readers.kept.clear();
+            readers.versions = Some(versions);
+        }
+        readers.clock += 1;
+        let clock = readers.clock;
+        Ok(readers.kept.get_mut(sql).map(|reader| {
+            reader.used = clock;
+            (reader.statement.clone(), reader.width)
+        }))
+    }
+
+    /// Keep a typed reader just prepared for `sql`, making room by dropping
+    /// the least recently used one.
+    fn keep_reader(&self, sql: &str, statement: &JsValue, width: usize) {
+        let mut readers = self.readers.borrow_mut();
+        if readers.kept.len() >= KEPT_READERS {
+            let oldest = readers.kept.iter().min_by_key(|(_, reader)| reader.used).map(|(sql, _)| sql.clone());
+            if let Some(oldest) = oldest {
+                readers.kept.remove(&oldest);
+            }
+        }
+        readers.clock += 1;
+        let used = readers.clock;
+        readers.kept.insert(sql.to_owned(), KeptReader { statement: statement.clone(), width, used });
+    }
+
+    /// The schema versions of main and temp, which change whenever their schemas do.
+    fn schema_versions(&self) -> Result<[i64; 2], SqliteError> {
+        let prepared = self.readers.borrow().version_statements.clone();
+        let statements = match prepared {
+            Some(statements) => statements,
+            None => {
+                let statements = [self.prepare("PRAGMA main.schema_version")?, self.prepare("PRAGMA temp.schema_version")?];
+                self.readers.borrow_mut().version_statements = Some(statements.clone());
+                statements
+            }
+        };
+        let mut versions = [0; 2];
+        for (version, statement) in versions.iter_mut().zip(&statements) {
+            let row: Array = statement_method(statement, "get")?
+                .call0(statement)
+                .map_err(js_error)?
+                .dyn_into()
+                .map_err(|row| SqliteError::Node(format!("`PRAGMA schema_version` returned {row:?}, not a row")))?;
+            *version = integer_from_js(&row.get(0))?;
+        }
+        Ok(versions)
+    }
+
     /// Prepare a statement that hands rows over as the executor reads them.
     fn prepare(&self, sql: &str) -> Result<JsValue, SqliteError> {
         let statement = method(&self.database, "prepare")?.call1(&self.database, &sql.into()).map_err(js_error)?;
@@ -220,6 +306,9 @@ impl SqliteExecutor for NodeConnection {
     }
 
     fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
+        if let Some((reader, width)) = self.kept_reader(sql)? {
+            return all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect();
+        }
         let statement = self.prepare(sql)?;
         let width = width(&statement)?;
         if width == 0 {
@@ -229,7 +318,10 @@ impl SqliteExecutor for NodeConnection {
         }
         let source = source(&statement)?;
         match self.prepare(&typed_reader(&source, width)) {
-            Ok(reader) => all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect(),
+            Ok(reader) => {
+                self.keep_reader(sql, &reader, width);
+                all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect()
+            }
             // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
             // in a WITH clause. A PRAGMA or an EXPLAIN is read as node:sqlite
             // hands it over, with its TEXT refused. Any other statement that
