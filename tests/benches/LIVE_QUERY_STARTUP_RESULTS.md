@@ -5,7 +5,9 @@
 > current implementation retains only keys, IDs, cloned Clocks and digests,
 > maintains every resident tree through the reactor, and reads payloads from
 > entity/storage ownership when sending. These timings do **not** qualify that
-> revised implementation; fresh paired performance measurements remain required.
+> revised implementation. The [maintained-tree qualification](LIVE_QUERY_STARTUP_MAINTAINED.md)
+> records fresh measurements at `10c98fb5`, remaining costs and the unfinished
+> follow-up optimization; performance acceptance remains open.
 
 The final production source is `034735dd` (captured-state sharing `db6fcc28`
 plus the catalog retry repair). All **420 ordinary main/candidate observations**,

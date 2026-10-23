@@ -452,6 +452,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn insert_and_remove_encode_one_delta_for_all_ancestors() {
+        static ENCODES: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct CountedEncode;
+        impl DigestGroup for CountedEncode {
+            type Element = <Ristretto255 as DigestGroup>::Element;
+            const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
+            const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
+            fn zero() -> Self::Element { Ristretto255::zero() }
+            fn add(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::add(sum, other); }
+            fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
+            fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
+            fn hash_leaf(bytes: &[u8]) -> Self::Element { Ristretto255::hash_leaf(bytes) }
+            fn encode(element: &Self::Element, bytes: &mut [u8]) {
+                ENCODES.fetch_add(1, Ordering::Relaxed);
+                Ristretto255::encode(element, bytes);
+            }
+            fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> { Ristretto255::decode(bytes) }
+        }
+        let leaf = |n: u64| {
+            let mut id = [0; EntityId::BYTE_LEN];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+        };
+        let maps = crate::MemoryMaps::new();
+        let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
+        let missing = leaf(200);
+        let mut setup = TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin());
+        setup.build((0..512).filter(|&n| n != 200).map(leaf)).await.unwrap();
+        setup.commit().await.unwrap();
+        let mut initial = TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin());
+        let initial_root = initial.node(&NodePrefix::root()).await.unwrap();
+        let topology = |rows: Vec<(Vec<u8>, Vec<u8>)>| {
+            rows.into_iter().map(|(key, _)| layout::node_key_prefix(&key).unwrap()).collect::<BTreeSet<_>>()
+        };
+        let initial_topology = topology(maps.begin().scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap());
+        let mut encode_counts = Vec::new();
+        for removing in [false, true] {
+            let mut tx = TreeTransaction::<CountedEncode, _>::bind(&spec, maps.begin());
+            assert!(tx.path(&missing.row::<Ristretto255>().address()).await.unwrap().len() > 2);
+            let change = if removing {
+                LeafChange { before: Some(missing.clone()), after: None }
+            } else {
+                LeafChange { before: None, after: Some(missing.clone()) }
+            };
+            ENCODES.store(0, Ordering::Relaxed);
+            tx.apply_change(change).await.unwrap();
+            encode_counts.push(ENCODES.load(Ordering::Relaxed));
+            tx.commit().await.unwrap();
+            let mut check = TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin());
+            assert_eq!(check.audit().await.unwrap().leaves, if removing { 511 } else { 512 });
+            assert_eq!(
+                topology(maps.begin().scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap()),
+                initial_topology
+            );
+            assert_eq!(check.leaf(&[], missing.entity_id).await.unwrap(), (!removing).then(|| missing.row::<Ristretto255>()));
+            if removing {
+                assert_eq!(check.node(&NodePrefix::root()).await.unwrap(), initial_root);
+            }
+        }
+        assert_eq!(encode_counts, [2, 2], "one leaf value and one delta, regardless of ancestor count");
+    }
+
+    #[tokio::test]
     async fn topology_counts_do_not_decode_neighboring_leaves() {
         static DECODES: AtomicUsize = AtomicUsize::new(0);
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]

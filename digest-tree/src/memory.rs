@@ -156,6 +156,20 @@ impl MapAccess for MemoryTransaction {
         Ok(overlay(began_with, written, true).take(limit).map(|(key, value)| (key.clone(), value.clone())).collect())
     }
 
+    async fn count_up_to(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<usize, TreeError> {
+        let inverted = match bounds {
+            (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+            (Bound::Excluded(start), Bound::Excluded(end)) => start >= end,
+            (Bound::Included(start) | Bound::Excluded(start), Bound::Included(end) | Bound::Excluded(end)) => start > end,
+        };
+        if inverted || limit == 0 {
+            return Ok(0);
+        }
+        let began_with = self.began_with.0[map as usize].range::<[u8], _>(bounds);
+        let written = self.writes[map as usize].range::<[u8], _>(bounds);
+        Ok(overlay(began_with, written, false).take(limit).count())
+    }
+
     async fn insert(&mut self, map: MapName, key: &[u8], value: &[u8]) -> Result<(), TreeError> { self.write(map, key, None, Some(value)) }
 
     async fn put_if(&mut self, map: MapName, key: &[u8], expected: Option<&[u8]>, value: &[u8]) -> Result<(), TreeError> {
@@ -404,5 +418,53 @@ mod tests {
         assert_eq!(keys(map.scan(Leaves, (Included(b"d"), Excluded(b"b")), usize::MAX).await.unwrap()), [] as [&str; 0]);
         assert_eq!(keys(map.scan(Leaves, (Excluded(b"b"), Excluded(b"b")), usize::MAX).await.unwrap()), [] as [&str; 0]);
         assert_eq!(keys(map.scan(Leaves, (Included(b"b"), Included(b"b")), usize::MAX).await.unwrap()), ["b"]);
+    }
+
+    #[tokio::test]
+    async fn bounded_counts_match_scans_with_own_writes_and_borrowed_views() {
+        async fn borrowed_count<T: MapAccess>(mut transaction: T, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> usize {
+            transaction.count_up_to(map, bounds, limit).await.unwrap()
+        }
+        let maps = MemoryMaps::new();
+        let mut setup = maps.begin();
+        for map in [Leaves, Lookup, Nodes] {
+            for key in [b"a", b"c", b"e"] {
+                setup.insert(map, key, key).await.unwrap();
+            }
+        }
+        setup.commit().await.unwrap();
+        let mut reader = maps.begin();
+        let mut later = maps.begin();
+        for map in [Leaves, Lookup, Nodes] {
+            later.insert(map, b"z", b"later").await.unwrap();
+            reader.insert(map, b"b", b"new").await.unwrap();
+            reader.put_if(map, b"a", Some(b"a"), b"changed").await.unwrap();
+            reader.delete_if(map, b"c", b"c").await.unwrap();
+            reader.insert(map, b"d", b"temporary").await.unwrap();
+            reader.delete_if(map, b"d", b"temporary").await.unwrap();
+        }
+        later.commit().await.unwrap();
+        let bounds: &[ByteBounds<'_>] = &[
+            (Unbounded, Unbounded),
+            (Included(b"a"), Excluded(b"e")),
+            (Excluded(b"a"), Included(b"e")),
+            (Included(b"bb"), Unbounded),
+            (Included(b"b"), Included(b"b")),
+            (Excluded(b"b"), Excluded(b"b")),
+            (Included(b"e"), Excluded(b"a")),
+            (Included(b"c"), Included(b"d")),
+            (Included(b"z"), Unbounded),
+        ];
+        for map in [Leaves, Lookup, Nodes] {
+            assert_eq!(reader.count_up_to(map, (Unbounded, Unbounded), usize::MAX).await.unwrap(), 3);
+            for &bounds in bounds {
+                for limit in [0, 1, 2, 3, usize::MAX] {
+                    let scanned = reader.scan(map, bounds, limit).await.unwrap().len();
+                    assert_eq!(reader.count_up_to(map, bounds, limit).await.unwrap(), scanned, "{map:?} {bounds:?} {limit}");
+                    assert_eq!(borrowed_count(&mut reader, map, bounds, limit).await, scanned, "borrowed {map:?} {bounds:?} {limit}");
+                }
+            }
+        }
+        assert_eq!(maps.begin().count_up_to(Leaves, (Unbounded, Unbounded), usize::MAX).await.unwrap(), 4);
     }
 }

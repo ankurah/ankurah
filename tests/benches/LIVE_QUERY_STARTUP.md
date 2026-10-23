@@ -3,15 +3,18 @@
 `live_query_startup` exercises two real nodes, Sled, two Tokio workers and
 serialized protocol messages. The current qualification compares the shared
 resident-tree implementation with main `b5fcfd3eac3ea4247c4bd7613c439393beb42aad`,
-using identical public-API fixtures. See [the current report](LIVE_QUERY_STARTUP_RESULTS.md)
-for measurements and immutable artifact pins. The [pre-state-sharing report](LIVE_QUERY_STARTUP_RESULTS_PRE_STATE_SHARING.md) preserves the previous candidate's measurements. The [intermediate unlimited-only reuse report](LIVE_QUERY_STARTUP_RESULTS_UNLIMITED_REUSE.md) is pinned before the bounded-coverage fix. The [pre-reuse](LIVE_QUERY_STARTUP_RESULTS_PRE_REUSE.md),
+using identical public-API fixtures. See [the maintained-tree report](LIVE_QUERY_STARTUP_MAINTAINED.md)
+for current measurements and immutable artifact pins. [Captured-state results](LIVE_QUERY_STARTUP_RESULTS.md)
+are historical and do not qualify the maintained-tree implementation. The [pre-state-sharing report](LIVE_QUERY_STARTUP_RESULTS_PRE_STATE_SHARING.md) preserves the previous candidate's measurements. The [intermediate unlimited-only reuse report](LIVE_QUERY_STARTUP_RESULTS_UNLIMITED_REUSE.md) is pinned before the bounded-coverage fix. The [pre-reuse](LIVE_QUERY_STARTUP_RESULTS_PRE_REUSE.md),
 [post-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_ONGOING.md) and
 [pre-#526](LIVE_QUERY_STARTUP_RESULTS_PRE_526.md) reports remain historical;
 their source pins and measurements have not been relabelled.
 
 The [captured-state sharing follow-up](LIVE_QUERY_STARTUP_STATE_SHARING.md)
-records the newer implementation, correctness checks, direct optimization
-comparison and separate CPU, allocation and browser tracing evidence. Historical
+records a superseded implementation, its correctness checks, direct optimization
+comparison and separate CPU, allocation and browser tracing evidence. That implementation
+retained entity state; the current tree retains metadata only and reads current payloads
+from canonical resident entities or storage. Historical
 reports retain their original source pins and measurements.
 
 ```sh
@@ -37,10 +40,15 @@ resident trees too: report it as **cached startup**, not a tree-free cold start.
 With `cache=half`, the narrower prefetch tree cannot serve the wider subscription.
 With `STARTUP_LIMIT=10`, the Selection is `body >= 'row-' ORDER BY body ASC LIMIT 10`, using the existing zero-padded `row-00000000` strings; population and expected result count are recorded separately. The normal `all` prefetch uses this same bounded Selection. The separate `full` diagnostic prefetches `body >= 'row-'` without ordering or a limit, allowing the subsequent limited query to reuse a complete resident. This is a cache-hit cost experiment, not cold startup. Limited cases verify ordered IDs as well as membership, full state and heads. Bounded warm edits change a selected row's nonsort `position` payload, leaving its body key unchanged. Membership changes set the first row's body to `excluded` and add a correctly padded row at position N; the result must include the unchanged row just beyond its previous limit. Zero-result cases do not run warm mutation fixtures.
 The attempted numeric-order fixture failed its strict oracle on both arms and is preserved separately. The existing Sled numeric ORDER BY defect (fwd `wJfo-978`, GitHub #210) is outside this branch; string-order qualification must not be presented as numeric-order correctness. An exploratory body-suffix edit passed main but failed the candidate, exposing the existing Small/Large sort-key comparator defect (fwd `JTAKZLw2`) through fresh result installation. Checkpoint `fcd05988` fixes that blocker by comparing actual bytes and preserving inline lengths. Separate ASC/DESC reconnect tests failed before the fix and pass afterward, checking the first installed result. Timed payload-edit cases still edit the nonsort field, as intended by that workload. No result-order, membership, state or head assertion is disabled for the replacement fixture.
-The complete-resident-to-LIMIT experiment exposed eager full-digest construction in `fcd05988`. Checkpoint `ec767596` resolves spans from the maintained address index and keeps narrow digests lazy; unchanged captures share an immutable state map, and a narrowed view retains only its selected rows. The original slow measurements remain separate from the new artifact’s qualification.
+The complete-resident-to-LIMIT experiment exposed eager full-digest construction in `fcd05988`. The historical checkpoint `ec767596` resolved spans from an address index and kept narrow digests lazy, while sharing captured entity state. The maintained-tree correction at `eb0ff74d` removes that state cache; resident trees contain only keys, IDs, cloned Clocks and digests, and every resident has reactor maintenance. Narrow captures contain selected metadata, and current payloads are read on demand. Measurements remain attached to their original source revisions.
 
 Node creation, catalog negotiation, server population and prefetch are excluded
-from latency.
+from latency. The ordinary fixture retains its application-created server views
+through measurement. A separate diagnostic inserts only `rows.clear()` immediately
+before the measurement marker in both native/browser fixtures and both revisions.
+This releases those application handles without forcing eviction or changing node
+ownership. It exercises storage fallback where handles no longer keep entities resident;
+it does not assert that every entity is nonresident. Report these observations separately.
 `ready_us` starts immediately before `query_wait` and ends after
 `wait_durable_answered`: the durable response and local application must finish.
 After state verification, one transport drain checks subscription delivery and
@@ -58,9 +66,8 @@ prefetches every entity. Optional `half_blocks` prefetches alternating blocks of
 batches outside timing (at most 16 intervals or 32 scalar comparisons per request),
 identically on baseline/candidate. Their actual `cached_entities` coverage is
 reported; small results under 256 rows fit entirely in the first block, so use
-4096-row block diagnostics for partial coverage. This preserves first digest construction after lazy cold
-transfer inside the measured refresh rather than warming it up with an earlier
-refresh. `warm_refresh` keeps
+4096-row block diagnostics for partial coverage. This measures the first refresh after initial transfer, including any outstanding
+reactor maintenance, rather than warming it up with an earlier refresh. `warm_refresh` keeps
 the connection and calls `update_selection_wait` with the same selection, then
 `wait_durable_answered`; the new version gives a portable applied `ready_us`.
 This does not measure the new same-stream `refresh()` API. Query identity is

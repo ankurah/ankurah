@@ -85,6 +85,13 @@ pub trait MapAccess: Send {
     /// reads them all.
     async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError>;
 
+    /// Count entries within `bounds`, stopping at `limit`. This observes the
+    /// same transaction view as [`Self::scan`], including earlier writes.
+    /// Adapters may override the scan-based default to avoid copying row data.
+    async fn count_up_to(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<usize, TreeError> {
+        Ok(self.scan(map, bounds, limit).await?.len())
+    }
+
     /// The last `limit` entries within `bounds`, in descending key order.
     async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError>;
 
@@ -129,6 +136,10 @@ impl<T: MapAccess + ?Sized> MapAccess for &mut T {
 
     async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
         (**self).scan(map, bounds, limit).await
+    }
+
+    async fn count_up_to(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<usize, TreeError> {
+        (**self).count_up_to(map, bounds, limit).await
     }
 
     async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
