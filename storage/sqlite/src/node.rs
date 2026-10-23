@@ -41,17 +41,21 @@ pub(crate) use NodeConnection as PooledConnection;
 /// The engine's pool on Node.
 pub(crate) type Pool = NodePool;
 
-/// Session settings that make a Node connection behave like a native one:
-/// connection.rs's pragmas, plus the 5000 ms busy timeout rusqlite gives every
-/// connection it opens (node:sqlite's default is 0), so that a writer waits
-/// for another's lock instead of failing at once.
+/// The 5000 ms busy timeout rusqlite sets on every connection as it opens
+/// it, before the connection runs any statement (node:sqlite's default is
+/// 0): a connection then waits for another's lock instead of failing at
+/// once, and on a file in a rollback journal even preparing `SELECT 1`
+/// takes a lock.
+const BUSY_TIMEOUT: &str = "PRAGMA busy_timeout=5000;";
+
+/// connection.rs's session pragmas, which make a Node connection behave like
+/// a native one.
 const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
      PRAGMA synchronous=NORMAL;
      PRAGMA foreign_keys=ON;
      PRAGMA cache_size=-64000;
      PRAGMA mmap_size=268435456;
-     PRAGMA temp_store=MEMORY;
-     PRAGMA busy_timeout=5000;";
+     PRAGMA temp_store=MEMORY;";
 
 /// The pool behind `SqliteStorageEngine::open`.
 pub(crate) async fn file_pool(path: &Path) -> anyhow::Result<Pool> {
@@ -132,7 +136,11 @@ impl NodeConnection {
             .dyn_into()
             .map_err(|_| SqliteError::Node("`node:sqlite` exports no DatabaseSync constructor".into()))?;
         let database = Reflect::construct(&constructor, &Array::of1(&path.into())).map_err(js_error)?;
+        // The busy timeout comes before any other statement, as rusqlite sets
+        // it at open, since from_database's checks already read the file.
+        method(&database, "exec")?.call1(&database, &BUSY_TIMEOUT.into()).map_err(js_error)?;
         let connection = Self::from_database(database)?;
+        // Only a database the executor accepts is switched to WAL.
         connection.exec(SESSION_PRAGMAS)?;
         Ok(connection)
     }
