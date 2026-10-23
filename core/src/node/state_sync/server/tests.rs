@@ -604,15 +604,9 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
     assert!(connection.state_streams.replay_initial(&origin, &[12], &[]).is_err());
     drop(guard);
     apply_state_feedback(&node, peer, proto::RequestId::new(), initial.frame.stream, None, 0, None, vec![], vec![]).await?;
-    assert!(matches!(
-        connection.state_streams.replay_initial(&origin, &[11], &[])?,
-        Some(proto::NodeResponseBody::StateStreamUnavailable { .. })
-    ));
+    assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
     abandon_state_stream(&node, peer, initial.frame.stream).await;
-    assert!(matches!(
-        connection.state_streams.replay_initial(&origin, &[11], &[])?,
-        Some(proto::NodeResponseBody::StateStreamUnavailable { .. })
-    ));
+    assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
     Ok(())
 }
 
@@ -646,7 +640,7 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             vec![]
         )
         .await?,
-        proto::NodeResponseBody::StateStreamUnavailable { .. }
+        proto::NodeResponseBody::StateStreamUnavailable
     ));
     Ok(())
 }
@@ -716,9 +710,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
             .await?;
     }
     let connection = node.peer_connections.get(&peer).unwrap();
-    assert!(
-        matches!(connection.state_streams.replay_initial(&first, &[], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable { stream: comparison }) if Some(comparison) == first_id)
-    );
+    assert!(matches!(connection.state_streams.replay_initial(&first, &[], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
     assert!(start_state_stream(&node, peer, first, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await.is_err());
     Ok(())
 }
@@ -1571,7 +1563,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
                 .unwrap();
             assert_eq!(matches!(response, proto::NodeResponseBody::Success), succeeds);
             if !succeeds {
-                assert!(matches!(response, proto::NodeResponseBody::StateStreamUnavailable { stream: comparison } if *comparison == id));
+                assert!(matches!(response, proto::NodeResponseBody::StateStreamUnavailable));
             }
         }
     }

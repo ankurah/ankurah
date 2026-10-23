@@ -699,7 +699,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                 }
             )
             .await?,
-        NodeResponseBody::StateStreamUnavailable { .. }
+        NodeResponseBody::StateStreamUnavailable
     ));
     Ok(())
 }
@@ -826,15 +826,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
             request: proto::NodeRequest { id: origin, from: client.id, to: server.id, body },
         })
         .await?;
-    wait_for(|| {
-        trace
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|body| matches!(body, NodeResponseBody::StateStreamUnavailable { stream: id } if *id == comparison))
-    })
-    .await;
+    wait_for(|| trace.0.lock().unwrap().iter().any(|body| matches!(body, NodeResponseBody::StateStreamUnavailable))).await;
     server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     Ok(())
 }
@@ -1058,7 +1050,7 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
                 }
             )
             .await?,
-        NodeResponseBody::StateStreamUnavailable { .. }
+        NodeResponseBody::StateStreamUnavailable
     ));
     server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     let trx = writer.begin();

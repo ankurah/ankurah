@@ -54,7 +54,7 @@ async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> a
     assert!(session.upgrade().is_none(), "unsubscribe must release the frozen snapshot and its timer");
     assert!(matches!(
         state_sync::apply_state_feedback(&node, peer, proto::RequestId::new(), comparison, None, 0, None, vec![], vec![]).await?,
-        proto::NodeResponseBody::StateStreamUnavailable { .. }
+        proto::NodeResponseBody::StateStreamUnavailable
     ));
     Ok(())
 }

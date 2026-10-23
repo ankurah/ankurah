@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 mod inventory;
+mod validation;
 pub use inventory::{
     ClockRef, EntityHead, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
 };
@@ -75,7 +76,6 @@ pub struct StateRound {
 /// before frame zero and every subsequent live publication in this stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReply {
-    pub spec: TreeSpec,
     pub round: StateRound,
     pub frame: StateFrame,
 }

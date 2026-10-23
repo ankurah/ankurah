@@ -669,7 +669,7 @@ where
         .await?;
         let state = match response {
             proto::NodeResponseBody::QuerySubscribed { query_id: response_query, state } if response_query == query_id => state,
-            proto::NodeResponseBody::StateStreamUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
+            proto::NodeResponseBody::StateStreamUnavailable => return Err(RequestError::ConnectionLost.into()),
             proto::NodeResponseBody::StateSnapshotBusy => return Err(RequestError::StateSnapshotBusy.into()),
             proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
             other => return Err(RequestError::UnexpectedResponse(other).into()),

@@ -197,9 +197,7 @@ pub enum NodeResponseBody {
     StateSnapshotBusy,
     /// The state stream expired or was invalidated. Restart the original Fetch or
     /// SubscribeQuery; previously received pages cannot complete a new comparison.
-    StateStreamUnavailable {
-        stream: StateStreamId,
-    },
+    StateStreamUnavailable,
 }
 
 /// A known-ID read reports denial separately from absence, without returning denied state.
@@ -306,7 +304,7 @@ impl std::fmt::Display for NodeResponseBody {
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
             NodeResponseBody::StateSnapshotBusy => write!(f, "StateSnapshotBusy"),
-            NodeResponseBody::StateStreamUnavailable { stream } => write!(f, "StateStreamUnavailable {stream}"),
+            NodeResponseBody::StateStreamUnavailable => write!(f, "StateStreamUnavailable"),
         }
     }
 }

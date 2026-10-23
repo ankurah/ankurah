@@ -79,15 +79,15 @@ where
     let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
     stream.bind(stream_id, catalog, connection.outgoing_state_streams.clone());
     drop(connection);
-    if initial.spec != snapshot.spec || initial.frame.sequence != 0 || initial.round.number != 0 {
+    if let Err(error) = initial.validate() {
         let _ = abandon_current_state(node, peer, stream_id, &stream);
-        return Err(RetrievalError::Other("invalid initial state stream metadata".into()));
+        return Err(RetrievalError::Other(error.to_string()));
     }
     if let Err(error) = stream.inbox.insert(initial.frame) {
         let _ = abandon_current_state(node, peer, stream_id, &stream);
         return Err(error.into());
     }
-    let mut driver = driver::Driver::new(snapshot, initial.round, stream, stream_id)?;
+    let mut driver = driver::Driver::new(snapshot, initial.round, stream, stream_id);
     let result = async {
         driver.prepare(node, query).await?;
         driver.drive(node.weak(), peer, credentials, query, true).await
@@ -221,7 +221,7 @@ where
     // Live feedback still needs the catalog bypass after snapshot release.
     match state_deadline(node.request(peer, credentials, proto::NodeRequestBody::FinishStateRound { stream, round, outcome })).await?? {
         proto::NodeResponseBody::Success => Ok(()),
-        proto::NodeResponseBody::StateStreamUnavailable { .. } => Err(RequestError::ConnectionLost.into()),
+        proto::NodeResponseBody::StateStreamUnavailable => Err(RequestError::ConnectionLost.into()),
         proto::NodeResponseBody::Error(error) => Err(RequestError::ServerError(error).into()),
         other => Err(RequestError::UnexpectedResponse(other).into()),
     }

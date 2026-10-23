@@ -198,19 +198,14 @@ impl<CD: ContextData> StateStreams<CD> {
         fingerprint: &[u8],
         credentials: &[CD],
     ) -> anyhow::Result<Option<proto::NodeResponseBody>> {
-        let session = self
-            .sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .find_map(|(id, session)| (&session.initial_request == request).then_some((*id, session.clone())));
-        if let Some((id, session)) = session {
+        let session = self.sessions.lock().unwrap().values().find(|session| &session.initial_request == request).cloned();
+        if let Some(session) = session {
             ensure!(session.fingerprint == fingerprint && session.permits(credentials), "initial retry changed its request");
             let initial = session.initial.lock().unwrap();
             let Some(initial) = initial.as_ref() else {
-                return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: id }));
+                return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable));
             };
-            let reply = proto::StateReply { spec: session.spec.clone(), round: session.initial_round, frame: (**initial).clone() };
+            let reply = proto::StateReply { round: session.initial_round, frame: (**initial).clone() };
             return Ok(Some(match session.query {
                 Some((query_id, _)) => proto::NodeResponseBody::QuerySubscribed { query_id, state: reply },
                 None => proto::NodeResponseBody::Fetch(reply),
@@ -221,10 +216,10 @@ impl<CD: ContextData> StateStreams<CD> {
                 origin.fingerprint == fingerprint && same_credentials(&origin.credentials, credentials),
                 "retired initial retry changed its request"
             );
-            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: origin.id }));
+            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable));
         }
-        if let Some(id) = self.origins.lock().unwrap().get(request) {
-            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: *id }));
+        if self.origins.lock().unwrap().contains_key(request) {
+            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable));
         }
         Ok(None)
     }
@@ -600,7 +595,7 @@ impl<CD: ContextData> PendingStateStream<CD> {
         *self.session.initial.lock().unwrap() = Some(Arc::new(frame.clone()));
         self.session.initialized.store(true, Ordering::Release);
         self.armed = false;
-        Ok(proto::StateReply { spec: self.session.spec.clone(), round, frame })
+        Ok(proto::StateReply { round, frame })
     }
 }
 impl<CD: ContextData> Drop for PendingStateStream<CD> {
@@ -755,7 +750,7 @@ where
         return Ok(if answers.is_empty() && connection.state_streams.permits_retired_receipt(id, processed_through, &credentials) {
             proto::NodeResponseBody::Success
         } else {
-            proto::NodeResponseBody::StateStreamUnavailable { stream: id }
+            proto::NodeResponseBody::StateStreamUnavailable
         });
     };
     ensure!(session.permits(&credentials), "state stream credentials changed");
@@ -768,11 +763,11 @@ where
     );
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
-        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable);
     }
     if state.failed {
         if !answers.is_empty() {
-            return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+            return Ok(proto::NodeResponseBody::StateStreamUnavailable);
         }
         state.acknowledge(processed_through)?;
         if processed_through == state.last_sent {
@@ -785,7 +780,7 @@ where
         return Ok(proto::NodeResponseBody::Success);
     }
     if state.retired_feedback.contains(&request) {
-        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable);
     }
     ensure!(state.retired_feedback.len() < MAX_FEEDBACK_IDS, "stream exhausted control replay history");
     state.acknowledge(processed_through)?;
@@ -837,13 +832,13 @@ where
         return Ok(if connection.state_streams.was_closed(&id) {
             proto::NodeResponseBody::Success
         } else {
-            proto::NodeResponseBody::StateStreamUnavailable { stream: id }
+            proto::NodeResponseBody::StateStreamUnavailable
         });
     };
     ensure!(session.permits(&credentials), "state stream credentials changed");
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) || state.failed {
-        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable);
     }
     if state.retired_round == Some((round, outcome)) {
         return Ok(proto::NodeResponseBody::Success);

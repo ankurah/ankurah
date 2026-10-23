@@ -261,7 +261,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { state, .. } => format!("subscribed {}", state_descriptor(state)),
-        proto::NodeResponseBody::StateStreamUnavailable { .. } => "state stream unavailable".into(),
+        proto::NodeResponseBody::StateStreamUnavailable => "state stream unavailable".into(),
         proto::NodeResponseBody::StateSnapshotBusy => "state snapshot busy".into(),
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
@@ -270,9 +270,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
     }
 }
 
-fn state_descriptor(state: &proto::StateReply) -> String {
-    format!("{} {}", payload_digest(&(&state.spec, state.round)), frame_descriptor(&state.frame))
-}
+fn state_descriptor(state: &proto::StateReply) -> String { format!("{} {}", payload_digest(&state.round), frame_descriptor(&state.frame)) }
 
 fn frame_descriptor(frame: &proto::StateFrame) -> String {
     let body = match &frame.body {

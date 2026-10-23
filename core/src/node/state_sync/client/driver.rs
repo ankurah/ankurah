@@ -173,17 +173,11 @@ pub(super) struct Driver {
 }
 
 impl Driver {
-    pub fn new(
-        snapshot: Snapshot,
-        round: proto::StateRound,
-        stream: IncomingStream,
-        stream_id: proto::StateStreamId,
-    ) -> anyhow::Result<Self> {
-        ensure!(round.number == 0, "initial round number is not zero");
+    pub fn new(snapshot: Snapshot, round: proto::StateRound, stream: IncomingStream, stream_id: proto::StateStreamId) -> Self {
         let spec = snapshot.spec.clone();
         let observed = snapshot.entries.iter().map(|(id, entry)| (*id, entry.head.clone())).collect();
         let (tx, refresh_rx) = tokio::sync::mpsc::channel(2);
-        Ok(Self {
+        Self {
             resident: snapshot.resident.clone(),
             projection: Projection::new(Round::new(round, snapshot)),
             spec,
@@ -224,7 +218,7 @@ impl Driver {
             membership_dirty: false,
             partial_removals: HashSet::new(),
             baseline_installed: false,
-        })
+        }
     }
 
     pub async fn prepare<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<()>

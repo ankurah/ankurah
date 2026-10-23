@@ -53,6 +53,13 @@ impl ScriptedConnection {
         let (server, receiver, routes) = (source.clone(), client.clone(), streams.clone());
         let source_task = tokio::spawn(async move {
             while let Some(message) = source_rx.recv().await {
+                if let proto::NodeMessage::Request {
+                    request: proto::NodeRequest { body: proto::NodeRequestBody::SubscribeQuery { known_state, .. }, .. },
+                    ..
+                } = &message
+                {
+                    assert!(known_state.spec.key_spec().keyparts.is_empty(), "script fixture requires the entity-ID query key");
+                }
                 if let proto::NodeMessage::AbandonStateStream { stream, .. } = &message {
                     let mut routes = routes.lock().unwrap();
                     if let Some(route) = routes.get_mut(stream).filter(|route| route.scripted) {
@@ -95,7 +102,6 @@ impl ScriptedConnection {
                     match &message {
                         proto::NodeMessage::Response(response) => {
                             if let proto::NodeResponseBody::QuerySubscribed { query_id, state } = &response.body {
-                                assert!(state.spec.key_spec().keyparts.is_empty(), "script fixture requires the entity-ID query key");
                                 routes.insert(
                                     state.frame.stream,
                                     Stream {

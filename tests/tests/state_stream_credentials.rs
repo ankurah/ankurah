@@ -450,7 +450,7 @@ async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_anothe
                     },
                 )
                 .await?;
-            if matches!(result, proto::NodeResponseBody::StateStreamUnavailable { stream: found } if found == comparison) {
+            if matches!(result, proto::NodeResponseBody::StateStreamUnavailable) {
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;
@@ -561,7 +561,7 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
                     },
                 )
                 .await?;
-            if matches!(response, proto::NodeResponseBody::StateStreamUnavailable { stream: found } if found == comparison) {
+            if matches!(response, proto::NodeResponseBody::StateStreamUnavailable) {
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;

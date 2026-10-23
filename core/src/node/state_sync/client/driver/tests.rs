@@ -15,7 +15,7 @@ async fn fixture(
     let snapshot = super::super::super::QueryTree::default().refresh(spec, rows).await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), None, None)?;
-    Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new())?, registry))
+    Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new()), registry))
 }
 
 #[tokio::test]
@@ -335,7 +335,7 @@ async fn bind_query_driver(
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), Some((query.query_id(), 1)), None)?;
     query.weak().stream_bound(1, stream.request.clone(), Arc::new(|| false));
-    let mut driver = Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new())?;
+    let mut driver = Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new());
     driver.prepare(node, Some((query.query_id(), 1))).await?;
     Ok((driver, registry, query))
 }
