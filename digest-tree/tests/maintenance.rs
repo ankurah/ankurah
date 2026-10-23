@@ -13,7 +13,7 @@ async fn check<G: DigestGroup>(tree: &DigestTree<G>, expected: &BTreeMap<u16, Le
     let mut tx = tree.begin();
     assert_eq!(tx.audit().await.unwrap().leaves, expected.len());
     let digest: Digest<G> = expected.values().map(|v| Digest::from(Leaf::new(&v.key, v.entity_id, v.head).element())).sum();
-    assert_eq!(tx.node(&NodePrefix::root()).await.unwrap().unwrap().digest, digest);
+    assert_eq!(tx.node(&NodePrefix::root()).await.unwrap().unwrap(), digest);
 }
 async fn maintenance<G: DigestGroup>() {
     let tree = empty_tree::<G>();

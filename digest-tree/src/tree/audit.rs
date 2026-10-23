@@ -57,10 +57,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             return Err(TreeError::Audit("leaves exist without a root summary"));
         }
         for prefix in &prefixes {
-            let node = self.node(prefix).await?.ok_or(TreeError::Audit("missing node"))?;
+            let digest = self.node(prefix).await?.ok_or(TreeError::Audit("missing node"))?;
             let beneath: Vec<_> = leaves.iter().filter(|row| prefix.contains_address(&row.address())).collect();
             let expected: Digest<G> = beneath.iter().map(|row| Digest::from(row.element)).sum();
-            if node.digest != expected {
+            if digest != expected {
                 return Err(TreeError::Audit("summary differs from leaves"));
             }
             let children = self.children(prefix).await?;

@@ -8,7 +8,7 @@ use crate::address::NodePrefix;
 use crate::digest::{Digest, DigestGroup};
 use crate::error::TreeError;
 use crate::store::layout;
-use crate::store::{MapAccess, MapName, NodeRow};
+use crate::store::{MapAccess, MapName};
 
 /// How many deltas one compaction folds at most, so that the rows it reads and
 /// the writes it buffers stay bounded however many deltas a tree node gathers.
@@ -60,7 +60,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// changes do not summarize the leaves still beneath the prefix.
     /// An empty baseline must be stored explicitly before appending
     /// changes to it. `None` means no stored summary, not an empty subtree.
-    pub async fn node(&mut self, prefix: &NodePrefix) -> Result<Option<NodeRow<G>>, TreeError> {
+    pub async fn node(&mut self, prefix: &NodePrefix) -> Result<Option<Digest<G>>, TreeError> {
         let base = self.base(prefix).await?;
         let exists = base.is_some();
         let mut digest = base.map_or(Digest::empty(), |base| base.digest);
@@ -68,7 +68,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         loop {
             let page = deltas.next(&mut self.transaction).await?;
             if page.is_empty() {
-                return Ok(exists.then_some(NodeRow { digest }));
+                return Ok(exists.then_some(digest));
             }
             if !exists {
                 return Err(TreeError::IncompleteNode(prefix.clone()));
@@ -81,8 +81,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     /// The stored baseline without subsequent deltas; `None` where absent.
     /// Use [`TreeTransaction::node`] for the complete current summary.
-    pub async fn node_base(&mut self, prefix: &NodePrefix) -> Result<Option<NodeRow<G>>, TreeError> {
-        Ok(self.base(prefix).await?.map(|base| NodeRow { digest: base.digest }))
+    pub async fn node_base(&mut self, prefix: &NodePrefix) -> Result<Option<Digest<G>>, TreeError> {
+        Ok(self.base(prefix).await?.map(|base| base.digest))
     }
 
     /// The nearest existing tree nodes beneath `prefix`, in prefix order:
@@ -96,7 +96,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// on a whole byte of its encoding, which follow everything beneath that
     /// tree node. After each child the scan resumes past the child's own keys,
     /// not at the next prefix, so it also detects deltas whose base is missing.
-    pub async fn children(&mut self, prefix: &NodePrefix) -> Result<Vec<(NodePrefix, NodeRow<G>)>, TreeError> {
+    pub async fn children(&mut self, prefix: &NodePrefix) -> Result<Vec<(NodePrefix, Digest<G>)>, TreeError> {
         let mut children = Vec::new();
         for prefix in self.child_prefixes(prefix).await? {
             let node = self.node(&prefix).await?.ok_or_else(|| TreeError::IncompleteNode(prefix.clone()))?;
@@ -136,27 +136,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(children)
     }
 
-    /// Write the tree node's base row for a build: inserted when `expected`
-    /// is `None`, replaced when it is the base the writer read with
-    /// [`TreeTransaction::node_base`]. Deltas appended to the tree node stay;
-    /// a rebuild of the tree node alone deletes it first.
-    /// [`TreeError::Conflict`] when the base there now is another.
-    pub(crate) async fn put_node_base(
-        &mut self,
-        prefix: &NodePrefix,
-        expected: Option<&NodeRow<G>>,
-        node: NodeRow<G>,
-    ) -> Result<(), TreeError> {
-        let (key, value) = (prefix.to_bytes(), layout::digest_value(&node.digest));
-        match expected {
-            None => self.transaction.insert(MapName::Nodes, &key, &value).await,
-            Some(expected) => self.transaction.put_if(MapName::Nodes, &key, Some(&layout::digest_value(&expected.digest)), &value).await,
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn append_node_delta(&mut self, prefix: &NodePrefix, delta: Digest<G>) -> Result<(), TreeError> {
-        self.append_node_deltas(std::slice::from_ref(prefix), delta).await
+    /// Insert the tree node's base row, holding `digest`, where the
+    /// transaction sees none: [`TreeError::Conflict`] when a base is there.
+    pub(crate) async fn insert_node_base(&mut self, prefix: &NodePrefix, digest: Digest<G>) -> Result<(), TreeError> {
+        self.transaction.insert(MapName::Nodes, &prefix.to_bytes(), &layout::digest_value(&digest)).await
     }
 
     /// Record that a change moved the digest of the leaves beneath each of
@@ -216,27 +199,6 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             self.transaction.delete_if(MapName::Nodes, &key, &value).await?;
         }
         Ok(remain)
-    }
-
-    /// Remove the tree node: its base row and every delta, each only if still
-    /// as read, [`TreeError::Conflict`] otherwise. Its descendants stay. A
-    /// delta appended after the deletion read stays too: see
-    /// [`TreeTransaction::node`].
-    #[cfg(test)]
-    pub(crate) async fn delete_node(&mut self, prefix: &NodePrefix) -> Result<(), TreeError> {
-        if let Some(base) = self.base(prefix).await? {
-            self.transaction.delete_if(MapName::Nodes, &prefix.to_bytes(), &base.value).await?;
-        }
-        let mut deltas = DeltaPages::of(prefix);
-        loop {
-            let page = deltas.next(&mut self.transaction).await?;
-            if page.is_empty() {
-                return Ok(());
-            }
-            for (key, value) in page {
-                self.transaction.delete_if(MapName::Nodes, &key, &value).await?;
-            }
-        }
     }
 
     /// The tree node's base row.

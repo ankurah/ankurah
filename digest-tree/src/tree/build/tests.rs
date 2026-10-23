@@ -97,7 +97,7 @@ async fn compare_prepared_build_to_serial<G: DigestGroup>() {
         .into_values()
         .collect::<Vec<_>>();
     for row in &rows {
-        serial.put_leaf(row.clone(), None).await.unwrap();
+        serial.insert_leaf(&PreparedLeaf::new(row.clone())).await.unwrap();
     }
     serial.write_subtree(&NodePrefix::root(), &rows).await.unwrap();
     serial.commit().await.unwrap();

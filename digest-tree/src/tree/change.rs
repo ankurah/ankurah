@@ -12,7 +12,7 @@ use crate::address::{CanonicalCodec, NodePrefix, TreeSpan};
 use crate::digest::{Digest, DigestGroup, HeadHash, Leaf};
 use crate::error::TreeError;
 use crate::store::layout;
-use crate::store::{LeafRow, MapAccess, MapName, NodeRow};
+use crate::store::{LeafRow, MapAccess, MapName, PreparedLeaf};
 
 /// The inputs of one leaf, before hashing it into the tree's digest group.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,13 +94,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             {
                 return Err(TreeError::Audit("tree rows exist without a root summary"));
             }
-            self.put_node_base(&root, None, NodeRow { digest: Digest::empty() }).await?;
+            self.insert_node_base(&root, Digest::empty()).await?;
         }
         if let Some((old, new)) = before.as_ref().zip(after.as_ref()).filter(|(a, b)| a.address() == b.address()) {
             // Changing only the head preserves both the lookup and topology.
             let address = new.address();
             let path = self.path(&address).await?;
-            self.transaction.put_if(MapName::Leaves, &address, before_value.as_deref(), &layout::leaf_value(new)).await?;
+            let stored = before_value.as_deref().expect("a change of head reads the row it replaces");
+            self.replace_leaf(stored, &PreparedLeaf::new(new.clone())).await?;
             return self.append_node_deltas(&path, Digest::from(new.element) - Digest::from(old.element)).await;
         }
         // Ancestors of only the removed leaf lose its contribution and
@@ -122,7 +123,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             self.delete_leaf(row).await?;
         }
         if let Some(row) = &after {
-            self.put_leaf(row.clone(), None).await?;
+            self.insert_leaf(&PreparedLeaf::new(row.clone())).await?;
         }
         self.append_node_deltas(&removed_path[..shared], removal + addition).await?;
         self.append_node_deltas(&removed_path[shared..], removal).await?;
@@ -184,9 +185,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let contribution = Digest::from(leaf.element);
         // The parent's pending delta already includes the new leaf. Its
         // other contribution is exactly the retained branch's summary.
-        let digest = self.node(parent).await?.ok_or_else(|| TreeError::IncompleteNode(parent.clone()))?.digest;
-        self.put_node_base(&retained, None, NodeRow { digest: digest.checked_sub(contribution)? }).await?;
-        self.put_node_base(&added, None, NodeRow { digest: contribution }).await
+        let digest = self.node(parent).await?.ok_or_else(|| TreeError::IncompleteNode(parent.clone()))?;
+        self.insert_node_base(&retained, digest.checked_sub(contribution)?).await?;
+        self.insert_node_base(&added, contribution).await
     }
 
     async fn path(&mut self, address: &[u8]) -> Result<Vec<NodePrefix>, TreeError> {

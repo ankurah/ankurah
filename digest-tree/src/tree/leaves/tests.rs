@@ -38,23 +38,26 @@ async fn a_leaf_is_written_against_the_row_the_writer_read<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let first = row::<G>(b"blue\0", entity(1));
     let mut maps = tree.begin();
-    maps.put_leaf(first.clone(), None).await.unwrap();
+    maps.insert_leaf(&PreparedLeaf::new(first.clone())).await.unwrap();
     assert_eq!(maps.leaf(b"blue\0", entity(1)).await.unwrap(), Some(first.clone()));
     assert_eq!(maps.leaf(b"blue\0", entity(2)).await.unwrap(), None);
     assert_eq!(maps.leaf(b"red\0", entity(1)).await.unwrap(), None);
     maps.commit().await.unwrap();
-    assert!(matches!(tree.begin().put_leaf(first.clone(), None).await, Err(TreeError::Conflict)), "a row is there now");
+    assert!(matches!(tree.begin().insert_leaf(&PreparedLeaf::new(first.clone())).await, Err(TreeError::Conflict)), "a row is there now");
 
     // The next change to the entity replaces the row it read; a change
     // that read an older row conflicts.
     let later = changed(&first);
     let mut maps = tree.begin();
-    maps.put_leaf(later.clone(), Some(&first)).await.unwrap();
+    maps.replace_leaf(&layout::leaf_value(&first), &PreparedLeaf::new(later.clone())).await.unwrap();
     maps.commit().await.unwrap();
     let mut maps = tree.begin();
     assert_eq!(maps.leaf(b"blue\0", entity(1)).await.unwrap(), Some(later.clone()));
     assert_eq!(maps.leaves(&TreeSpan::all(), usize::MAX).await.unwrap(), std::slice::from_ref(&later));
-    assert!(matches!(maps.put_leaf(changed(&later), Some(&first)).await, Err(TreeError::Conflict)), "stale");
+    assert!(
+        matches!(maps.replace_leaf(&layout::leaf_value(&first), &PreparedLeaf::new(changed(&later))).await, Err(TreeError::Conflict)),
+        "stale"
+    );
 
     assert!(matches!(tree.begin().delete_leaf(&first).await, Err(TreeError::Conflict)), "stale");
     let mut maps = tree.begin();
@@ -75,9 +78,9 @@ async fn the_leaves_of_one_entity_follow_its_keys<G: DigestGroup>() {
     let mut maps = tree.begin();
     assert_eq!(maps.entity_leaves(moved).await.unwrap(), []);
     for key in [b"ab".as_slice(), b"abc", b"a"] {
-        maps.put_leaf(row(key, moved), None).await.unwrap();
+        maps.insert_leaf(&PreparedLeaf::new(row(key, moved))).await.unwrap();
     }
-    maps.put_leaf(row(b"ab", entity(2)), None).await.unwrap();
+    maps.insert_leaf(&PreparedLeaf::new(row(b"ab", entity(2)))).await.unwrap();
     maps.commit().await.unwrap();
 
     let mut maps = tree.begin();
@@ -89,12 +92,12 @@ async fn the_leaves_of_one_entity_follow_its_keys<G: DigestGroup>() {
 
     // A change under a key the entity already has leaves the lookup as it is.
     let under_a = row(b"a", moved);
-    maps.put_leaf(changed(&under_a), Some(&under_a)).await.unwrap();
+    maps.replace_leaf(&layout::leaf_value(&under_a), &PreparedLeaf::new(changed(&under_a))).await.unwrap();
     assert_eq!(maps.entity_leaves(moved).await.unwrap().len(), 3);
 
     // Moving the entity from one key to another.
     maps.delete_leaf(&row(b"ab", moved)).await.unwrap();
-    maps.put_leaf(row(b"zz", moved), None).await.unwrap();
+    maps.insert_leaf(&PreparedLeaf::new(row(b"zz", moved))).await.unwrap();
     let keys: Vec<Vec<u8>> = maps.entity_leaves(moved).await.unwrap().into_iter().map(|row| row.key).collect();
     assert_eq!(keys, [b"abc".to_vec(), b"a".to_vec(), b"zz".to_vec()]);
     assert_eq!(maps.entity_leaves(entity(2)).await.unwrap(), [row(b"ab", entity(2))], "another entity's rows are its own");
@@ -116,7 +119,7 @@ async fn a_missing_leaf_in_the_lookup_is_an_error<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let leaf = row::<G>(b"blue", entity(1));
     let mut maps = tree.begin();
-    maps.put_leaf(leaf.clone(), None).await.unwrap();
+    maps.insert_leaf(&PreparedLeaf::new(leaf.clone())).await.unwrap();
     maps.commit().await.unwrap();
     let mut damaged = tree.begin();
     damaged.transaction.delete_if(MapName::Leaves, &leaf.address(), &layout::leaf_value(&leaf)).await.unwrap();
@@ -130,7 +133,7 @@ async fn leaves_are_read_by_span_a_page_at_a_time<G: DigestGroup>() {
     let rows: Vec<LeafRow<G>> = (1..=6).map(|n| row(&[n], entity(n))).collect();
     let mut maps = tree.begin();
     for row in rows.iter().rev() {
-        maps.put_leaf(row.clone(), None).await.unwrap();
+        maps.insert_leaf(&PreparedLeaf::new(row.clone())).await.unwrap();
     }
     maps.commit().await.unwrap();
 
@@ -150,7 +153,7 @@ async fn the_span_under_a_prefix_reads_its_leaves<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let mut maps = tree.begin();
     for n in [0x00, 0x3f, 0x40, 0x7f, 0x80, 0xff] {
-        maps.put_leaf(row(&[n], entity(n)), None).await.unwrap();
+        maps.insert_leaf(&PreparedLeaf::new(row(&[n], entity(n)))).await.unwrap();
     }
     maps.commit().await.unwrap();
 
@@ -170,8 +173,8 @@ async fn competing_lookup_updates_for_one_entity_leave_no_orphaned_row<G: Digest
     let filed = entity(7);
     let (blue, red) = (row::<G>(b"blue\0", filed), row::<G>(b"red\0", filed));
     let (mut first, mut second) = (tree.begin(), tree.begin());
-    first.put_leaf(blue.clone(), None).await.unwrap();
-    second.put_leaf(red.clone(), None).await.unwrap();
+    first.insert_leaf(&PreparedLeaf::new(blue.clone())).await.unwrap();
+    second.insert_leaf(&PreparedLeaf::new(red.clone())).await.unwrap();
     first.commit().await.unwrap();
     assert!(matches!(second.commit().await, Err(TreeError::Conflict)), "it expected no lookup");
 
@@ -180,7 +183,7 @@ async fn competing_lookup_updates_for_one_entity_leave_no_orphaned_row<G: Digest
     assert_eq!(maps.leaf(b"red\0", filed).await.unwrap(), None, "no orphaned row");
 
     let mut retry = tree.begin();
-    retry.put_leaf(red.clone(), None).await.unwrap();
+    retry.insert_leaf(&PreparedLeaf::new(red.clone())).await.unwrap();
     retry.commit().await.unwrap();
     assert_eq!(tree.begin().entity_leaves(filed).await.unwrap(), [blue, red]);
 }

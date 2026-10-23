@@ -11,7 +11,7 @@ use ankurah_core_types::EntityId;
 
 use super::layout;
 use crate::address::leaf_address;
-use crate::digest::{Digest, DigestGroup, HeadHash, LeafElement, Ristretto255};
+use crate::digest::{DigestGroup, HeadHash, LeafElement, Ristretto255};
 
 /// The tree's record of one leaf, so that the next change to the entity
 /// knows what to subtract: the inputs of the leaf and its element.
@@ -38,14 +38,6 @@ pub struct LeafRow<G: DigestGroup = Ristretto255> {
 impl<G: DigestGroup> LeafRow<G> {
     /// Where the row is filed: see [`leaf_address`].
     pub fn address(&self) -> Vec<u8> { leaf_address(&self.key, self.entity_id) }
-}
-
-/// A tree node's summary of the leaves beneath it, so that one comparison can
-/// stand for them all.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NodeRow<G: DigestGroup = Ristretto255> {
-    /// The sum of the leaf elements beneath the tree node, with their count.
-    pub digest: Digest<G>,
 }
 
 // Its bytes can only be made from the row they accompany.

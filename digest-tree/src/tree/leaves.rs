@@ -44,19 +44,12 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         rows.iter().map(|(address, value)| layout::leaf_row(address, value)).collect()
     }
 
-    /// Write the leaf row at its address, if the row there now is `expected`,
-    /// the one the writer read at that address (`None`: no row), and list its
-    /// key under its entity. [`TreeError::Conflict`] when another change got
-    /// there first.
-    pub(crate) async fn put_leaf(&mut self, row: LeafRow<G>, expected: Option<&LeafRow<G>>) -> Result<(), TreeError> {
-        self.put_prepared_leaf(&PreparedLeaf::new(row), expected).await
-    }
-
-    pub(crate) async fn put_prepared_leaf(&mut self, prepared: &PreparedLeaf<G>, expected: Option<&LeafRow<G>>) -> Result<(), TreeError> {
+    /// Insert the leaf row at its address, where the transaction sees no row,
+    /// and list its key under its entity. [`TreeError::Conflict`] when
+    /// another change got there first.
+    pub(crate) async fn insert_leaf(&mut self, prepared: &PreparedLeaf<G>) -> Result<(), TreeError> {
         let row = prepared.row();
-        debug_assert!(expected.is_none_or(|expected| expected.address() == row.address()), "the expectation is for the row's own address");
-        let expected = expected.map(layout::leaf_value);
-        self.transaction.put_if(MapName::Leaves, &row.address(), expected.as_deref(), prepared.value()).await?;
+        self.transaction.insert(MapName::Leaves, &row.address(), prepared.value()).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
         if keys.insert(row.key.clone()) {
             if keys.len() == 2 {
@@ -65,6 +58,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             self.transaction.put_if(MapName::Lookup, &row.entity_id.to_bytes(), listed.as_deref(), &layout::lookup_value(&keys)).await?;
         }
         Ok(())
+    }
+
+    /// Replace the leaf row at `new`'s address, which the transaction read as
+    /// `stored`, with `new`: a change to the entity's head alone, which keeps
+    /// its key listed under it. [`TreeError::Conflict`] when the row there now
+    /// is another.
+    pub(crate) async fn replace_leaf(&mut self, stored: &[u8], new: &PreparedLeaf<G>) -> Result<(), TreeError> {
+        self.transaction.put_if(MapName::Leaves, &new.row().address(), Some(stored), new.value()).await
     }
 
     /// Remove the leaf row `row`, as the writer read it, and its key from

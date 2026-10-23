@@ -147,11 +147,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 continue;
             };
             if entire.is_subset_of(span) {
-                if let Some(node) = self.node(&prefix).await? {
-                    if node.digest.count() < 0 {
+                if let Some(digest) = self.node(&prefix).await? {
+                    if digest.count() < 0 {
                         return Err(TreeError::Audit("negative node count"));
                     }
-                    span_digests.push(TreeSpanDigest { prefix, bounds, digest: node.digest });
+                    span_digests.push(TreeSpanDigest { prefix, bounds, digest });
                     continue;
                 }
             }

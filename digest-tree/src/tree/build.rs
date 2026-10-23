@@ -9,7 +9,7 @@ use super::TreeTransaction;
 use crate::address::{CanonicalCodec, NodePrefix, TreeSpan};
 use crate::digest::{Digest, DigestGroup};
 use crate::error::TreeError;
-use crate::store::{LeafRow, MapAccess, MapName, NodeRow, PreparedLeaf};
+use crate::store::{LeafRow, MapAccess, MapName, PreparedLeaf};
 
 #[cfg(not(target_arch = "wasm32"))]
 const PARALLEL_PREPARATION_MIN_LEAVES: usize = 1024;
@@ -85,7 +85,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             let batch = admitted.by_ref().take(PREPARATION_BATCH_LEAVES).collect();
             let prepared = prepare_leaves::<G>(batch);
             for leaf in &prepared {
-                self.put_prepared_leaf(leaf, None).await?;
+                self.insert_leaf(leaf).await?;
             }
             rows.extend(prepared.into_iter().map(PreparedLeaf::into_row));
         }
@@ -126,7 +126,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                     let right = completed.pop().expect("right subtree completed before join");
                     let left = completed.pop().expect("left subtree completed before join");
                     let digest = left + right;
-                    self.put_node_base(&prefix, None, NodeRow { digest }).await?;
+                    self.insert_node_base(&prefix, digest).await?;
                     completed.push(digest);
                     continue;
                 }
@@ -134,7 +134,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             let rows = &leaves[from..to];
             if rows.len() <= BUCKET_CAPACITY {
                 let digest = rows.iter().map(|row| row.element).map(Digest::from).sum();
-                self.put_node_base(&prefix, None, NodeRow { digest }).await?;
+                self.insert_node_base(&prefix, digest).await?;
                 completed.push(digest);
                 continue;
             }
