@@ -99,6 +99,31 @@ async fn text_from_a_statement_sqlite_cannot_nest_is_refused() -> Result<()> {
     Ok(())
 }
 
+/// A statement SQLite cannot nest that is neither a PRAGMA nor an EXPLAIN,
+/// such as one with a RETURNING clause, is refused before it runs, so that
+/// it writes nothing it could not then report.
+#[wasm_bindgen_test]
+async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
+    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let (refusals, count) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (v TEXT)", &[])?;
+            let refusals = [
+                "INSERT INTO things (v) VALUES ('x') RETURNING v",
+                "/* a comment */ WITH value (v) AS (VALUES ('y')) INSERT INTO things (v) SELECT v FROM value RETURNING rowid",
+            ]
+            .map(|sql| executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| error.to_string()));
+            Ok((refusals, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
+        })
+        .await?;
+    for refusal in refusals {
+        let refusal = refusal.expect_err("a RETURNING statement is refused on Node");
+        assert!(refusal.contains("so it is not run"), "{refusal}");
+    }
+    assert_eq!(count, 0, "neither insert ran");
+    Ok(())
+}
+
 #[wasm_bindgen_test]
 fn refuses_a_utf16_database() {
     let database = host_database(":memory:");

@@ -227,15 +227,45 @@ impl SqliteExecutor for NodeConnection {
             all(&statement, params, 0)?;
             return Ok(Vec::new());
         }
-        match self.prepare(&typed_reader(&source(&statement)?, width)) {
+        let source = source(&statement)?;
+        match self.prepare(&typed_reader(&source, width)) {
             Ok(reader) => all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect(),
             // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
-            // in a WITH clause; any other statement that yields rows, such as
-            // a PRAGMA, an EXPLAIN or one with a RETURNING clause, is read as
-            // node:sqlite hands it over, with its TEXT refused.
-            Err(nesting) => all(&statement, params, width)?.into_iter().map(|row| plain_row(row, &nesting)).collect(),
+            // in a WITH clause. A PRAGMA or an EXPLAIN is read as node:sqlite
+            // hands it over, with its TEXT refused. Any other statement that
+            // yields rows, such as one with a RETURNING clause, could write
+            // before a TEXT value in its rows were refused, so it is refused
+            // before it runs.
+            Err(nesting) => {
+                if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| first_keyword(&source).eq_ignore_ascii_case(keyword)) {
+                    return Err(SqliteError::Node(format!(
+                        "the node executor reads rows exactly only from a query SQLite can nest in a WITH clause, which this \
+                         statement is not ({nesting}); a statement such as one with a RETURNING clause could write before a \
+                         value of its rows were refused, so it is not run: write with `execute` and read with a query"
+                    )));
+                }
+                all(&statement, params, width)?.into_iter().map(|row| plain_row(row, &nesting)).collect()
+            }
         }
     }
+}
+
+/// The first keyword of a statement's SQL, past the whitespace and comments
+/// SQLite skips before it.
+fn first_keyword(sql: &str) -> &str {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        if let Some(comment) = rest.strip_prefix("--") {
+            rest = comment.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            rest = comment.split_once("*/").map_or("", |(_, after)| after);
+        } else {
+            break;
+        }
+    }
+    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
+    &rest[..end]
 }
 
 /// The SQL of a typed reader for `statement`, whose rows have `width`
@@ -303,10 +333,10 @@ fn typed_row(row: Array) -> Result<Row, SqliteError> {
         .map(Row::new)
 }
 
-/// A row of a statement SQLite would not nest in a typed reader, read as
-/// node:sqlite hands it over. Its TEXT arrives only as a JavaScript string
-/// that may have lost bytes, so a TEXT value is refused, naming why the
-/// statement could not be nested.
+/// A row of a PRAGMA or an EXPLAIN, which SQLite would not nest in a typed
+/// reader, read as node:sqlite hands it over. Its TEXT arrives only as a
+/// JavaScript string that may have lost bytes, so a TEXT value is refused,
+/// naming why the statement could not be nested.
 fn plain_row(row: Array, nesting: &SqliteError) -> Result<Row, SqliteError> {
     row.iter()
         .enumerate()
