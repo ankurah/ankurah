@@ -4,7 +4,10 @@
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
 
-use crate::digest::{DigestGroup, HeadHash, Leaf};
+use std::fmt;
+use std::marker::PhantomData;
+
+use crate::digest::{DecodeError, DigestGroup, HeadHash, Leaf, Ristretto255};
 use crate::store::EncodedLeaf;
 use crate::{DigestTree, LeafRow, NodePrefix, TreeSpec};
 
@@ -41,3 +44,42 @@ macro_rules! in_each_group {
     };
 }
 pub(crate) use in_each_group;
+
+/// What a test counts or faults in a [`Hooked`] group: each hook runs before
+/// the ristretto255 operation it names, and does nothing unless a test says.
+pub(crate) trait Hook: Copy + Eq + fmt::Debug + Send + Sync + 'static {
+    fn add() {}
+    fn hash_leaf(_encoded_leaf: &[u8]) {}
+    fn encode() {}
+    fn decode() {}
+}
+
+/// Ristretto255 with a hook before some of its operations, to count or fault
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Hooked<H: Hook>(PhantomData<H>);
+
+impl<H: Hook> DigestGroup for Hooked<H> {
+    type Element = <Ristretto255 as DigestGroup>::Element;
+    const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
+    const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
+    fn zero() -> Self::Element { Ristretto255::zero() }
+    fn add(sum: &mut Self::Element, other: &Self::Element) {
+        H::add();
+        Ristretto255::add(sum, other);
+    }
+    fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
+    fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
+    fn hash_leaf(encoded_leaf: &[u8]) -> Self::Element {
+        H::hash_leaf(encoded_leaf);
+        Ristretto255::hash_leaf(encoded_leaf)
+    }
+    fn encode(element: &Self::Element, out: &mut [u8]) {
+        H::encode();
+        Ristretto255::encode(element, out);
+    }
+    fn decode(bytes: &[u8]) -> Result<Self::Element, DecodeError> {
+        H::decode();
+        Ristretto255::decode(bytes)
+    }
+}

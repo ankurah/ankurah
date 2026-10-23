@@ -231,31 +231,18 @@ impl Index {
         if changes.is_empty() {
             return Ok(());
         }
-        if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= self.entries.len().div_ceil(4) {
-            let mut entries = (*self.entries).clone();
-            for (id, after) in changes {
-                match after {
-                    Some(entry) => {
-                        entries.insert(id, entry);
-                    }
-                    None => {
-                        entries.remove(&id);
-                    }
-                }
-            }
-            // Construct the new maps before publishing them. No reader can observe
-            // a digest whose metadata belongs to another version, including cancellation.
-            *self = Self::build(self.tree.spec().clone(), entries).await?;
-            return Ok(());
-        }
-        let mut tx = self.tree.begin();
         let entries = &self.entries;
-        tx.apply_changes(
-            changes
-                .iter()
-                .map(|(id, after)| LeafChange { before: entries.get(id).map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) }),
-        )
-        .await?;
+        let leaf_changes = changes
+            .iter()
+            .map(|(id, after)| LeafChange { before: entries.get(id).map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) });
+        let mut tx = self.tree.begin();
+        if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= entries.len().div_ceil(4) {
+            // A batch this large costs less to fold in by rebuilding every
+            // tree node from the stored leaves than change by change.
+            tx.rebuild_with_changes(leaf_changes).await?;
+        } else {
+            tx.apply_changes(leaf_changes).await?;
+        }
         // Memory commit has no suspension after publication; metadata is replaced
         // under the same owner lock before another reader can capture the index.
         tx.commit().await?;

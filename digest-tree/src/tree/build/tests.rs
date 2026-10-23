@@ -1,5 +1,6 @@
 use super::*;
 use crate::digest::HeadHash;
+use crate::tree::fixtures::{Hook, Hooked};
 use crate::{LeafChange, Ristretto255, TreeSpec};
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
@@ -216,4 +217,64 @@ fn later_preparation_panic_poisons_prior_buffered_batches() {
         assert!(matches!(tx.commit().await, Err(TreeError::Poisoned)));
         assert_eq!(TreeTransaction::<LaterBatchPanic, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, 1);
     });
+}
+
+/// A rebuild after a batch of changes leaves the maps a build of the
+/// resulting leaves leaves, and hashes only the leaves the batch files: every
+/// other leaf's element is decoded from its row. A change it finds stale fails
+/// the transaction, as one applied alone does.
+#[tokio::test]
+async fn a_rebuild_with_changes_hashes_only_the_leaves_the_batch_files() {
+    static HASHES: AtomicUsize = AtomicUsize::new(0);
+    static DECODES: AtomicUsize = AtomicUsize::new(0);
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct CountHashesAndDecodes;
+    impl Hook for CountHashesAndDecodes {
+        fn hash_leaf(_encoded_leaf: &[u8]) { HASHES.fetch_add(1, Ordering::Relaxed); }
+        fn decode() { DECODES.fetch_add(1, Ordering::Relaxed); }
+    }
+    type Counted = Hooked<CountHashesAndDecodes>;
+
+    let leaf = |n: u64, version: u8| {
+        let mut id = [0; EntityId::BYTE_LEN];
+        id[..8].copy_from_slice(&n.to_be_bytes());
+        LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
+    };
+    let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
+    let maps = crate::MemoryMaps::new();
+    let mut setup = TreeTransaction::<Counted, _>::bind(&spec, maps.begin());
+    setup.build((0..512).map(|n| leaf(n, 1))).await.unwrap();
+    setup.commit().await.unwrap();
+    // Fifty head changes, twenty-five removals and twenty-five insertions.
+    let changes: Vec<LeafChange> = (0..50)
+        .map(|n| LeafChange { before: Some(leaf(n, 1)), after: Some(leaf(n, 2)) })
+        .chain((50..75).map(|n| LeafChange { before: Some(leaf(n, 1)), after: None }))
+        .chain((512..537).map(|n| LeafChange { before: None, after: Some(leaf(n, 1)) }))
+        .collect();
+
+    let mut tx = TreeTransaction::<Counted, _>::bind(&spec, maps.begin());
+    HASHES.store(0, Ordering::Relaxed);
+    DECODES.store(0, Ordering::Relaxed);
+    tx.rebuild_with_changes(changes).await.unwrap();
+    assert_eq!(HASHES.load(Ordering::Relaxed), 75, "only the leaves the batch files are hashed");
+    assert_eq!(DECODES.load(Ordering::Relaxed), 75 + 437, "the leaves the changes expect, then every leaf the batch did not write");
+    tx.commit().await.unwrap();
+
+    let built = crate::MemoryMaps::new();
+    let mut build = TreeTransaction::<Counted, _>::bind(&spec, built.begin());
+    build.build((0..50).map(|n| leaf(n, 2)).chain((75..537).map(|n| leaf(n, 1)))).await.unwrap();
+    build.commit().await.unwrap();
+    for map in [MapName::Leaves, MapName::Lookup, MapName::Nodes] {
+        let bounds = (Bound::Unbounded, Bound::Unbounded);
+        assert_eq!(
+            maps.begin().scan(map, bounds, usize::MAX).await.unwrap(),
+            built.begin().scan(map, bounds, usize::MAX).await.unwrap(),
+            "{map:?}"
+        );
+    }
+
+    let mut stale = TreeTransaction::<Counted, _>::bind(&spec, maps.begin());
+    let missing = LeafChange { before: Some(leaf(9_999, 1)), after: None };
+    assert!(matches!(stale.rebuild_with_changes([missing]).await, Err(TreeError::Conflict)));
+    assert!(matches!(stale.commit().await, Err(TreeError::Conflict)));
 }

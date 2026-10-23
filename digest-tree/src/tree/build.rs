@@ -4,9 +4,9 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use super::change::LeafInput;
+use super::change::{LeafChange, LeafInput};
 use super::TreeTransaction;
-use crate::address::{CanonicalCodec, NodePrefix, TreeSpan};
+use crate::address::{leaf_address, CanonicalCodec, NodePrefix, TreeSpan};
 use crate::digest::{Digest, DigestGroup};
 use crate::error::TreeError;
 use crate::store::{EncodedLeaf, MapAccess, MapName};
@@ -92,6 +92,45 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         // These leaves already hold the admitted leaf elements. Building the
         // summaries from them avoids reading and decoding our own writes.
         self.write_subtree(&NodePrefix::root(), &encoded).await
+    }
+
+    /// Apply a batch of leaf changes to the leaves and the entity lookup, each
+    /// checked as [`TreeTransaction::apply_change`] checks it, then rebuild
+    /// every tree node from the leaves stored: each leaf the batch did not
+    /// write is decoded from its row rather than hashed again. When a batch
+    /// changes a large share of a tree, this costs less than maintaining the
+    /// tree nodes change by change. Failure or cancellation prevents this
+    /// transaction from committing.
+    pub async fn rebuild_with_changes(&mut self, changes: impl IntoIterator<Item = LeafChange>) -> Result<(), TreeError> {
+        self.generation += 1;
+        let mut guard = self.mutation_guard();
+        let result = guard.change_leaves_and_rebuild(changes).await;
+        guard.finish(result)
+    }
+
+    async fn change_leaves_and_rebuild(&mut self, changes: impl IntoIterator<Item = LeafChange>) -> Result<(), TreeError> {
+        self.transaction.change_structure();
+        // The new leaves are hashed together, as a build hashes its leaves,
+        // before the first await, so that the caller's iterator is not held
+        // across awaits.
+        let changes: Vec<LeafChange> = changes.into_iter().collect();
+        let after =
+            changes.iter().filter_map(|change| change.after.clone()).map(|input| (leaf_address(&input.key, input.entity_id), input));
+        let mut encoded = prepare_leaves::<G>(after.collect()).into_iter();
+        let mut written = BTreeMap::new();
+        for change in changes {
+            let after = change.after.is_some().then(|| encoded.next().expect("a leaf was prepared for every change that files one"));
+            let Some(resolved) = self.resolve(change.before, after).await? else { continue };
+            self.write_leaves(&resolved).await?;
+            if let Some(leaf) = resolved.before {
+                written.remove(leaf.address());
+            }
+            if let Some(leaf) = resolved.after {
+                written.insert(leaf.address().to_vec(), leaf);
+            }
+        }
+        let leaves = self.all_leaves_reusing(&TreeSpan::all(), &mut written).await?;
+        self.write_subtree(&NodePrefix::root(), &leaves).await
     }
 
     pub(super) async fn rebuild_subtree(&mut self, prefix: &NodePrefix) -> Result<(), TreeError> {

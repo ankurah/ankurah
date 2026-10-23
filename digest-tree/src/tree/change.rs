@@ -31,6 +31,12 @@ impl LeafInput {
         let element = Leaf::new(&self.key, self.entity_id, self.head).element();
         LeafRow { key: self.key, entity_id: self.entity_id, head: self.head, element }
     }
+
+    /// The leaf these inputs make, filed at its address and encoded.
+    pub(super) fn encode<G: DigestGroup>(self) -> EncodedLeaf<G> {
+        let address = leaf_address(&self.key, self.entity_id);
+        EncodedLeaf::new(address, self.into_row())
+    }
 }
 
 /// Insert, remove, move, or replace a leaf. `before` must match the current
@@ -41,6 +47,13 @@ pub struct LeafChange {
     pub before: Option<LeafInput>,
     /// The replacement leaf; absent for removal.
     pub after: Option<LeafInput>,
+}
+
+/// A change checked against the stored leaves: the leaf it removes or
+/// replaces, as stored, and the leaf it files in its place.
+pub(super) struct ResolvedChange<G: DigestGroup> {
+    pub(super) before: Option<EncodedLeaf<G>>,
+    pub(super) after: Option<EncodedLeaf<G>>,
 }
 
 /// Where a change records the difference it makes to each tree node above
@@ -110,36 +123,65 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     async fn change_leaf(&mut self, change: LeafChange, differences: &mut NodeDifferences<G>) -> Result<(), TreeError> {
         self.transaction.watch_structure();
-        for leaf in change.before.iter().chain(change.after.iter()) {
-            CanonicalCodec::split(self.spec.key_spec(), &leaf.key)?;
+        let Some(change) = self.resolve(change.before, change.after.map(LeafInput::encode)).await? else { return Ok(()) };
+        self.ensure_root().await?;
+        self.write_leaves(&change).await?;
+        match (&change.before, &change.after) {
+            (Some(before), Some(after)) if before.address() == after.address() => {
+                // Changing only the head preserves both the lookup and topology.
+                let path = self.path(after.address()).await?;
+                let difference = Digest::from(after.row().element) - Digest::from(before.row().element);
+                self.record(differences, &path.prefixes, difference).await
+            }
+            _ => self.refile_nodes(&change, differences).await,
         }
-        let before = match change.before {
+    }
+
+    /// Check a change against the stored leaves: `before` must name the leaf
+    /// stored at its address, with its head, and `after` must find its
+    /// address free unless it replaces `before` there:
+    /// [`TreeError::Conflict`] otherwise. `None` for a change that changes
+    /// nothing.
+    pub(super) async fn resolve(
+        &mut self,
+        before: Option<LeafInput>,
+        after: Option<EncodedLeaf<G>>,
+    ) -> Result<Option<ResolvedChange<G>>, TreeError> {
+        let keys = before.iter().map(|input| &input.key).chain(after.iter().map(|leaf| &leaf.row().key));
+        for key in keys {
+            CanonicalCodec::split(self.spec.key_spec(), key)?;
+        }
+        let before = match before {
             Some(expected) => Some(self.expected_leaf(expected).await?),
             None => None,
         };
-        let after = change.after.map(|input| {
-            let address = leaf_address(&input.key, input.entity_id);
-            (address, input.into_row::<G>())
-        });
-        if let Some((address, _)) = &after {
-            let replaces = before.as_ref().is_some_and(|before| before.address() == address.as_slice());
-            if !replaces && self.transaction.get(MapName::Leaves, address).await?.is_some() {
+        if let Some(after) = &after {
+            let replaces = before.as_ref().is_some_and(|before| before.address() == after.address());
+            if !replaces && self.transaction.get(MapName::Leaves, after.address()).await?.is_some() {
                 return Err(TreeError::Conflict);
             }
         }
-        if before.as_ref().map(EncodedLeaf::row) == after.as_ref().map(|(_, row)| row) {
-            return Ok(());
+        if before.as_ref().map(EncodedLeaf::row) == after.as_ref().map(EncodedLeaf::row) {
+            return Ok(None);
         }
-        self.ensure_root().await?;
-        match (before, after) {
-            (Some(before), Some((address, row))) if before.address() == address.as_slice() => {
-                // Changing only the head preserves both the lookup and topology.
-                let path = self.path(&address).await?;
-                let difference = Digest::from(row.element) - Digest::from(before.row().element);
-                self.replace_leaf(&before, &EncodedLeaf::new(address, row)).await?;
-                self.record(differences, &path.prefixes, difference).await
+        Ok(Some(ResolvedChange { before, after }))
+    }
+
+    /// Write a change's leaves: the new leaf over the stored one where the
+    /// change keeps its address, and otherwise the stored leaf removed and
+    /// the new one inserted, with the entity lookup kept in step.
+    pub(super) async fn write_leaves(&mut self, change: &ResolvedChange<G>) -> Result<(), TreeError> {
+        match (&change.before, &change.after) {
+            (Some(before), Some(after)) if before.address() == after.address() => self.replace_leaf(before, after).await,
+            (before, after) => {
+                if let Some(leaf) = before {
+                    self.delete_leaf(leaf).await?;
+                }
+                if let Some(leaf) = after {
+                    self.insert_leaf(leaf).await?;
+                }
+                Ok(())
             }
-            (before, after) => self.refile_leaf(before, after.map(|(address, row)| EncodedLeaf::new(address, row)), differences).await,
         }
     }
 
@@ -205,16 +247,12 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         self.insert_node_base(&root, Digest::empty()).await
     }
 
-    /// Remove `before`, as the transaction read it, insert `after`, and keep
-    /// every tree node above either right: its summary, and the topology,
-    /// splitting a bucket grown past its capacity, merging a subtree shrunk
-    /// to half of it, and inserting a branch where no child holds the new leaf.
-    async fn refile_leaf(
-        &mut self,
-        before: Option<EncodedLeaf<G>>,
-        after: Option<EncodedLeaf<G>>,
-        differences: &mut NodeDifferences<G>,
-    ) -> Result<(), TreeError> {
+    /// Keep every tree node above a removed leaf and an inserted one right,
+    /// once the leaves are written: its summary, and the topology, splitting
+    /// a bucket grown past its capacity, merging a subtree shrunk to half of
+    /// it, and inserting a branch where no child holds the new leaf.
+    async fn refile_nodes(&mut self, change: &ResolvedChange<G>, differences: &mut NodeDifferences<G>) -> Result<(), TreeError> {
+        let ResolvedChange { before, after } = change;
         // Ancestors of only the removed leaf lose its contribution and
         // ancestors of only the added leaf gain its contribution. The
         // ancestors a move shares, a run down from the root, receive the
@@ -230,12 +268,6 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let shared = removed_path.prefixes.iter().zip(&added_path.prefixes).take_while(|(removed, added)| removed == added).count();
         let removal = before.as_ref().map_or(Digest::empty(), |leaf| -Digest::from(leaf.row().element));
         let addition = after.as_ref().map_or(Digest::empty(), |leaf| Digest::from(leaf.row().element));
-        if let Some(leaf) = &before {
-            self.delete_leaf(leaf).await?;
-        }
-        if let Some(leaf) = &after {
-            self.insert_leaf(leaf).await?;
-        }
         self.record(differences, &removed_path.prefixes[..shared], removal + addition).await?;
         self.record(differences, &removed_path.prefixes[shared..], removal).await?;
         self.record(differences, &added_path.prefixes[shared..], addition).await?;

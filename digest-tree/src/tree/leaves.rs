@@ -1,7 +1,7 @@
 //! The leaf rows and the entity lookup: reading leaves by address, by span
 //! or by entity, and writing and removing them with the lookup kept in step.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ankurah_core_types::EntityId;
 
@@ -95,6 +95,17 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Every leaf in `span`, in address order, each with its address and the
     /// bytes it is stored as, read a page at a time.
     pub(crate) async fn all_leaves(&mut self, span: &TreeSpan) -> Result<Vec<EncodedLeaf<G>>, TreeError> {
+        self.all_leaves_reusing(span, &mut BTreeMap::new()).await
+    }
+
+    /// Every leaf in `span`, as [`Self::all_leaves`] reads them, except that
+    /// a leaf `known` holds under its address, written by this transaction,
+    /// is taken from `known` rather than decoded again.
+    pub(crate) async fn all_leaves_reusing(
+        &mut self,
+        span: &TreeSpan,
+        known: &mut BTreeMap<Vec<u8>, EncodedLeaf<G>>,
+    ) -> Result<Vec<EncodedLeaf<G>>, TreeError> {
         let mut leaves = Vec::new();
         let mut remaining = span.clone();
         loop {
@@ -104,7 +115,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 remaining = remaining.after(last);
             }
             for (address, value) in page {
-                leaves.push(EncodedLeaf::decode(address, value)?);
+                let leaf = match known.remove(&address) {
+                    Some(leaf) => {
+                        debug_assert_eq!(leaf.value(), value.as_slice(), "the known leaf is the one stored");
+                        leaf
+                    }
+                    None => EncodedLeaf::decode(address, value)?,
+                };
+                leaves.push(leaf);
             }
             if done {
                 return Ok(leaves);
