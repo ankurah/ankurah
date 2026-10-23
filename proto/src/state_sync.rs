@@ -22,7 +22,7 @@ use ulid::Ulid;
 
 mod inventory;
 pub use inventory::{
-    ClockRef, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
+    ClockRef, EntityHead, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
 };
 
 use crate::{Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId};

@@ -1,5 +1,6 @@
+use super::codec::{MAX_BYTES, MAX_ROWS, PLAIN, PLAIN_FIXED, PREFIX, PREFIX_FIXED};
 use super::*;
-use crate::{SpanContent, StateAnswer, StateItem, TreeSpan, TreeSpanInventory};
+use crate::{EventId, SpanContent, StateAnswer, StateItem, TreeSpan, TreeSpanInventory};
 use std::ops::Bound;
 
 fn rows(keys: &[Vec<u8>], tips: usize) -> Vec<KeyedEntityHead> {
