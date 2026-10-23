@@ -19,6 +19,22 @@ use crate::{
 /// caller's TEXT and BLOB are not copied to be bound. A
 /// [`SqliteValueRef::Jsonb`] parameter is bound as its JSON text, because the
 /// SQL that carries one always wraps its placeholder in `jsonb(?)`.
+///
+/// # Where the node executor differs from the native one
+///
+/// - A query's rows are read on Node through a typed reader that nests the
+///   query in a WITH clause, and a compound SELECT nested there takes the
+///   affinity SQLite gives the nested column, its first SELECT's. So a value
+///   from a top-level compound SELECT can read in another storage class than
+///   natively: where the first SELECT's column is a REAL column, an INTEGER 2
+///   from a later SELECT reads as the REAL 2.0. No statement of the engine's
+///   own is a compound SELECT.
+/// - On node:sqlite a positional parameter the caller did not pass binds
+///   NULL, where rusqlite refuses a statement given too few parameters:
+///   node:sqlite does not report how many parameters a statement takes.
+/// - On Node a query that SQLite cannot nest in a WITH clause is refused,
+///   before it runs, unless it is a PRAGMA or an EXPLAIN, and TEXT in the
+///   rows of a PRAGMA or an EXPLAIN is refused.
 pub trait SqliteExecutor {
     /// Run one statement that yields no rows; returns the number of rows it changed.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError>;
