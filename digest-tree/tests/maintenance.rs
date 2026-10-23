@@ -92,32 +92,52 @@ async fn concurrent_updates_commute_but_rebuilds_and_stale_changes_retry() {
     assert!(tree.begin().entity_leaves(leaf(100, 1).entity_id).await.unwrap().is_empty());
 }
 
+/// A bucket split, a merge, and a branch inserted above compressed children
+/// each conflict with a concurrent head update in either commit order, and
+/// the loser's retry from fresh reads lands.
 #[tokio::test]
-async fn split_and_merge_conflict_with_updates_in_both_commit_orders() {
-    for split in [true, false] {
+async fn structural_changes_conflict_with_updates_in_both_commit_orders() {
+    for structural in ["split", "merge", "branch"] {
         for structural_first in [true, false] {
             let tree = empty_tree::<ankurah_digest_tree::Ristretto255>();
-            let initial = if split { 64 } else { 65 };
+            let initial = if structural == "split" { 64 } else { 65 };
             let mut setup = tree.begin();
             setup.build((0..initial).map(|n| leaf(n, 1))).await.unwrap();
             setup.commit().await.unwrap();
+            let structural_changes: Vec<LeafChange> = match structural {
+                "split" => vec![LeafChange { before: None, after: Some(leaf(64, 1)) }],
+                "merge" => (32..65).map(|n| LeafChange { before: Some(leaf(n, 1)), after: None }).collect(),
+                // The root's children hold the addresses beginning 0x00; this
+                // one begins 0xff, beneath neither of them.
+                _ => vec![LeafChange { before: None, after: Some(leaf(0xff00, 1)) }],
+            };
+            let head_update = LeafChange { before: Some(leaf(1, 1)), after: Some(leaf(1, 2)) };
             let (mut structure, mut update) = (tree.begin(), tree.begin());
-            if split {
-                structure.apply_change(LeafChange { before: None, after: Some(leaf(64, 1)) }).await.unwrap();
-            } else {
-                for n in 32..65 {
-                    structure.apply_change(LeafChange { before: Some(leaf(n, 1)), after: None }).await.unwrap();
-                }
+            for change in structural_changes.clone() {
+                structure.apply_change(change).await.unwrap();
             }
-            update.apply_change(LeafChange { before: Some(leaf(1, 1)), after: Some(leaf(1, 2)) }).await.unwrap();
-            if structural_first {
+            update.apply_change(head_update.clone()).await.unwrap();
+            let retry = if structural_first {
                 structure.commit().await.unwrap();
-                assert!(matches!(update.commit().await, Err(TreeError::Conflict)));
+                assert!(matches!(update.commit().await, Err(TreeError::Conflict)), "{structural}");
+                vec![head_update]
             } else {
                 update.commit().await.unwrap();
-                assert!(matches!(structure.commit().await, Err(TreeError::Conflict)));
+                assert!(matches!(structure.commit().await, Err(TreeError::Conflict)), "{structural}");
+                structural_changes
+            };
+            let mut tx = tree.begin();
+            for change in retry {
+                tx.apply_change(change).await.unwrap();
             }
-            tree.begin().audit().await.unwrap();
+            tx.commit().await.unwrap();
+            let expected = match structural {
+                "split" => 65,
+                "merge" => 32,
+                _ => 66,
+            };
+            assert_eq!(tree.begin().audit().await.unwrap().leaves, expected, "{structural}");
+            assert_eq!(tree.begin().leaf(&[], leaf(1, 2).entity_id).await.unwrap().unwrap().head, leaf(1, 2).head);
         }
     }
 }

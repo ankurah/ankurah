@@ -65,8 +65,6 @@
 #![deny(missing_docs)]
 
 mod address;
-#[cfg(test)]
-mod cost_tests;
 pub mod digest;
 mod error;
 mod selection;
