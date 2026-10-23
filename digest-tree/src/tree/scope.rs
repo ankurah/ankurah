@@ -114,7 +114,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Exact leaf count; Selection scopes require one leaf per entity.
     pub async fn count(&mut self, scope: &TreeScope) -> Result<u64, TreeError> {
         let digest = self.digest(scope).await?;
-        u64::try_from(digest.count()).map_err(|_| TreeError::Audit("negative scoped count"))
+        u64::try_from(digest.count()).map_err(|_| TreeError::Inconsistent("negative scoped count"))
     }
 
     /// Sum the exact span digests of a scope.
@@ -125,7 +125,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Refine a span digest into the nearest cached descendants, keeping its address
     /// clip. At a terminal bucket, returns its exact clipped span digest again.
     pub async fn refine(&mut self, span_digest: &TreeSpanDigest<G>) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
-        let bounds = TreeSpan::under(&span_digest.prefix).intersect(&span_digest.bounds).ok_or(TreeError::InvalidKey("empty tree span"))?;
+        let bounds =
+            TreeSpan::under(&span_digest.prefix).intersect(&span_digest.bounds).ok_or(TreeError::InvalidSpan("empty tree span"))?;
         let children = self.child_prefixes(&span_digest.prefix).await?;
         if children.is_empty() {
             return self.span_digests_in(&span_digest.prefix, &bounds).await;
@@ -149,7 +150,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             if entire.is_subset_of(span) {
                 if let Some(digest) = self.node(&prefix).await? {
                     if digest.count() < 0 {
-                        return Err(TreeError::Audit("negative node count"));
+                        return Err(TreeError::Inconsistent("negative node count"));
                     }
                     span_digests.push(TreeSpanDigest { prefix, bounds, digest });
                     continue;
@@ -173,7 +174,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     pub async fn page(&mut self, scope: &TreeScope, cursor: Option<&LeafCursor>, limit: usize) -> Result<LeafPage<G>, TreeError> {
         self.check_scope(scope)?;
         if limit == 0 {
-            return Err(TreeError::InvalidKey("page size must be positive"));
+            return Err(TreeError::InvalidSpan("page size must be positive"));
         }
         let spans = if let Some(cursor) = cursor {
             self.check_scope(&cursor.scope)?;

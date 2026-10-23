@@ -158,7 +158,7 @@ fn large_build_admission_preserves_first_error_and_poisons_the_transaction() {
             let error = tx.build(input).await.unwrap_err();
             assert!(if duplicate_first { matches!(error, TreeError::DuplicateLeaf) } else { matches!(error, TreeError::InvalidKey(_)) });
             tx.apply_change(LeafChange { before: None, after: None }).await.unwrap();
-            assert!(matches!(tx.commit().await, Err(TreeError::Conflict)));
+            assert!(matches!(tx.commit().await, Err(TreeError::Poisoned)));
             assert_eq!(TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, 1);
         }
     });
@@ -211,7 +211,7 @@ fn later_preparation_panic_poisons_prior_buffered_batches() {
         // The first batch was written before the later hash panicked.
         assert_eq!(tx.leaves(&TreeSpan::all(), usize::MAX).await.unwrap().len(), 1024);
         tx.apply_change(LeafChange { before: None, after: None }).await.unwrap();
-        assert!(matches!(tx.commit().await, Err(TreeError::Conflict)));
+        assert!(matches!(tx.commit().await, Err(TreeError::Poisoned)));
         assert_eq!(TreeTransaction::<LaterBatchPanic, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, 1);
     });
 }

@@ -17,7 +17,7 @@ use std::marker::PhantomData;
 use crate::digest::{DigestGroup, Ristretto255};
 use crate::error::TreeError;
 use crate::selection::TreeSpec;
-use crate::store::{MapAccess, MapTransaction, MemoryMaps, MemoryTransaction};
+use crate::store::{Failure, MapAccess, MapTransaction, MemoryMaps, MemoryTransaction};
 
 mod audit;
 mod build;
@@ -81,26 +81,29 @@ pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction>
 }
 
 impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
-    /// Commit the owned maps together, if every condition still holds.
-    /// Failure publishes nothing. Borrowed map views have no commit method.
-    pub async fn commit(self) -> Result<(), TreeError> {
-        if self.failed {
-            return Err(TreeError::Conflict);
-        }
-        self.transaction.commit().await
-    }
+    /// Commit the owned maps together, if every condition still holds and
+    /// no operation failed. Failure publishes nothing. Borrowed map views
+    /// have no commit method.
+    pub async fn commit(self) -> Result<(), TreeError> { self.transaction.commit().await }
 }
 
 /// Keeps partial work from escaping through an outer transaction's commit,
 /// including when a mutation's future is dropped before returning a result.
 pub(crate) struct MutationGuard<'a, G: DigestGroup, T: MapAccess> {
     tree: &'a mut TreeTransaction<G, T>,
-    completed: bool,
+    /// How the mutation failed, which poisons the transaction when the guard
+    /// drops: `None` once it succeeds, and poisoned until it finishes, so that
+    /// cancellation and panics poison too.
+    failure: Option<Failure>,
 }
 
 impl<G: DigestGroup, T: MapAccess> MutationGuard<'_, G, T> {
     pub(crate) fn finish<R>(mut self, result: Result<R, TreeError>) -> Result<R, TreeError> {
-        self.completed = result.is_ok();
+        self.failure = match &result {
+            Ok(_) => None,
+            Err(TreeError::Conflict) => Some(Failure::Conflict),
+            Err(_) => Some(Failure::Poisoned),
+        };
         result
     }
 }
@@ -116,9 +119,9 @@ impl<G: DigestGroup, T: MapAccess> std::ops::DerefMut for MutationGuard<'_, G, T
 
 impl<G: DigestGroup, T: MapAccess> Drop for MutationGuard<'_, G, T> {
     fn drop(&mut self) {
-        if !self.completed {
+        if let Some(failure) = self.failure {
             self.tree.failed = true;
-            self.tree.transaction.poison();
+            self.tree.transaction.poison(failure);
         }
     }
 }
@@ -165,5 +168,31 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Self { transaction: maps, group: PhantomData, spec: spec.clone(), failed: false, generation: 0, view: std::sync::Arc::new(()) }
     }
 
-    pub(crate) fn mutation_guard(&mut self) -> MutationGuard<'_, G, T> { MutationGuard { tree: self, completed: false } }
+    pub(crate) fn mutation_guard(&mut self) -> MutationGuard<'_, G, T> { MutationGuard { tree: self, failure: Some(Failure::Poisoned) } }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::fixtures::empty_tree;
+    use crate::{HeadHash, LeafChange, LeafInput};
+    use ankurah_core_types::EntityId;
+
+    fn input(n: u8) -> LeafInput { LeafInput { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[n; 32]]) } }
+
+    /// A commit reports why its transaction cannot commit: a conflict when an
+    /// operation found what it expected changed, after which the writer
+    /// retries from fresh reads, and otherwise a poisoned transaction, whose
+    /// failure a retry can meet again.
+    #[tokio::test]
+    async fn a_commit_tells_a_conflict_from_other_failures() {
+        let tree = empty_tree::<Ristretto255>();
+        let mut stale = tree.begin();
+        assert!(matches!(stale.apply_change(LeafChange { before: Some(input(1)), after: None }).await, Err(TreeError::Conflict)));
+        assert!(matches!(stale.commit().await, Err(TreeError::Conflict)));
+
+        let mut duplicate = tree.begin();
+        assert!(matches!(duplicate.build([input(1), input(1)]).await, Err(TreeError::DuplicateLeaf)));
+        assert!(matches!(duplicate.commit().await, Err(TreeError::Poisoned)));
+    }
 }

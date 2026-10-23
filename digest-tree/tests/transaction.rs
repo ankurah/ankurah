@@ -8,7 +8,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
 use ankurah_digest_tree::{
-    ByteBounds, HeadHash, LeafChange, LeafInput, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodePrefix,
+    ByteBounds, Failure, HeadHash, LeafChange, LeafInput, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodePrefix,
     Ristretto255, TreeError, TreeSpan, TreeSpec, TreeTransaction, BUCKET_CAPACITY,
 };
 use async_trait::async_trait;
@@ -69,7 +69,7 @@ impl Transaction {
 
     async fn after_write(&mut self) -> Result<(), TreeError> {
         match self.fault.take() {
-            Some(Fault::Error) => Err(TreeError::Audit("injected write failure")),
+            Some(Fault::Error) => Err(TreeError::Inconsistent("injected write failure")),
             Some(Fault::Suspend) => std::future::pending().await,
             None => Ok(()),
         }
@@ -105,7 +105,7 @@ impl<O: BorrowMut<Transaction> + Send> TreeMaps<O> {
 
 #[async_trait]
 impl<O: BorrowMut<Transaction> + Send> MapAccess for TreeMaps<O> {
-    fn poison(&mut self) { self.owner.borrow_mut().maps.poison(); }
+    fn poison(&mut self, failure: Failure) { self.owner.borrow_mut().maps.poison(failure); }
     fn watch_structure(&mut self) { self.owner.borrow_mut().maps.watch_structure(); }
     fn change_structure(&mut self) { self.owner.borrow_mut().maps.change_structure(); }
 
@@ -265,7 +265,7 @@ async fn fail<T: MapAccess>(tree: &mut TreeTransaction<Ristretto255, T>, operati
         }
     };
     match fault {
-        Fault::Error => assert!(matches!(work.await, Err(TreeError::Audit("injected write failure")))),
+        Fault::Error => assert!(matches!(work.await, Err(TreeError::Inconsistent("injected write failure")))),
         Fault::Suspend => cancel_after_yield(work),
     }
 }
@@ -296,7 +296,7 @@ async fn failure_and_cancellation_poison_the_owner_whether_the_view_borrows_or_o
                     tx.tree(FIRST, &spec).apply_change(LeafChange { before: None, after: None }).await.unwrap();
                     tx.commit().await
                 };
-                assert!(matches!(committed, Err(TreeError::Conflict)), "owned {owned}, {fault:?}: {operation}");
+                assert!(matches!(committed, Err(TreeError::Poisoned)), "owned {owned}, {fault:?}: {operation}");
                 assert_eq!(store.rows().await, before, "owned {owned}, {fault:?}: {operation}");
             }
         }

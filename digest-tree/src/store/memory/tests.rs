@@ -202,3 +202,24 @@ async fn bounded_counts_match_scans_with_own_writes_and_borrowed_views() {
     }
     assert_eq!(maps.begin().count_up_to(Leaves, (Unbounded, Unbounded), usize::MAX).await.unwrap(), 4);
 }
+
+/// A commit reports the first failure its transaction met: a failed condition
+/// as a conflict, even when an operation poisons the transaction after it,
+/// and a poisoned operation as poisoned, even when a condition fails after it.
+#[tokio::test]
+async fn a_commit_reports_the_first_failure_its_transaction_met() {
+    let maps = MemoryMaps::new();
+    let mut setup = maps.begin();
+    setup.insert(Leaves, b"k", b"v").await.unwrap();
+    setup.commit().await.unwrap();
+
+    let mut conflicted = maps.begin();
+    assert!(matches!(conflicted.insert(Leaves, b"k", b"again").await, Err(TreeError::Conflict)));
+    conflicted.poison(Failure::Poisoned);
+    assert!(matches!(conflicted.commit().await, Err(TreeError::Conflict)));
+
+    let mut poisoned = maps.begin();
+    poisoned.poison(Failure::Poisoned);
+    assert!(matches!(poisoned.insert(Leaves, b"k", b"again").await, Err(TreeError::Conflict)));
+    assert!(matches!(poisoned.commit().await, Err(TreeError::Poisoned)));
+}

@@ -92,7 +92,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             if !self.leaves(&TreeSpan::all(), 1).await?.is_empty()
                 || !self.transaction.scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), 1).await?.is_empty()
             {
-                return Err(TreeError::Audit("tree rows exist without a root summary"));
+                return Err(TreeError::Inconsistent("tree rows exist without a root summary"));
             }
             self.insert_node_base(&root, Digest::empty()).await?;
         }
@@ -173,14 +173,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 let value = address.get((bit / 8) as usize).map(|byte| byte & (0x80 >> (bit % 8)) != 0);
                 value != Some(child.bit(bit))
             })
-            .ok_or(TreeError::Audit("new branch overlaps an existing child"))?;
+            .ok_or(TreeError::Inconsistent("new branch overlaps an existing child"))?;
         if depth as usize >= address.len() * 8 {
             return Err(TreeError::InvalidKey("leaf addresses must be prefix-free"));
         }
         let added = NodePrefix::of(&address, depth + 1);
         let retained = NodePrefix::of(&address, depth).child(child.bit(depth));
         if !children.iter().all(|child| retained.contains(child)) {
-            return Err(TreeError::Audit("compressed children do not share one branch"));
+            return Err(TreeError::Inconsistent("compressed children do not share one branch"));
         }
         let contribution = Digest::from(leaf.element);
         // The parent's pending delta already includes the new leaf. Its

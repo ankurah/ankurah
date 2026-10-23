@@ -186,7 +186,7 @@ async fn counting_defers_neighbor_validation_but_leaf_reads_and_rebuilds_reject_
             assert!(tree.begin().audit().await.is_err());
         } else {
             assert!(matches!(tx.apply_change(change).await, Err(TreeError::Unreadable { what: "leaf value", .. })));
-            assert!(matches!(tx.commit().await, Err(TreeError::Conflict)), "failed rebuild cannot publish partial changes");
+            assert!(matches!(tx.commit().await, Err(TreeError::Poisoned)), "failed rebuild cannot publish partial changes");
             assert_eq!(tree.begin().node(&NodePrefix::root()).await.unwrap(), before);
         }
     }
@@ -196,7 +196,7 @@ async fn counting_defers_neighbor_validation_but_leaf_reads_and_rebuilds_reject_
 /// the memory maps, independently of an engine's timing or caches.
 mod map_costs {
     use super::*;
-    use crate::store::{ByteBounds, MapTransaction};
+    use crate::store::{ByteBounds, Failure, MapTransaction};
     use crate::{MemoryMaps, MemoryTransaction};
     use ankurah_core_types::{IndexKeyPart, PropertyId, Value, ValueType};
     use async_trait::async_trait;
@@ -230,7 +230,7 @@ mod map_costs {
     }
     #[async_trait]
     impl MapAccess for Counted {
-        fn poison(&mut self) { self.inner.poison(); }
+        fn poison(&mut self, failure: Failure) { self.inner.poison(failure); }
 
         fn watch_structure(&mut self) { self.inner.watch_structure(); }
         fn change_structure(&mut self) { self.inner.change_structure(); }

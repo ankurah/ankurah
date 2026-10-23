@@ -252,7 +252,7 @@ impl<G: DigestGroup> TreeSpanDigest<G> {
             .deserialize(bytes)
             .map_err(|e| TreeError::unreadable("tree span digest", e))?;
         if version != 1 {
-            return Err(TreeError::InvalidKey("unknown tree span digest version"));
+            return Err(TreeError::InvalidSpan("unknown tree span digest version"));
         }
         let prefix = NodePrefix::from_bytes(&prefix).map_err(|e| TreeError::unreadable("span digest prefix", e))?;
         let bounds = TreeSpan::new(start, end);
@@ -266,7 +266,7 @@ impl<G: DigestGroup> TreeSpanDigest<G> {
     /// Prefix and group encodings are already checked by their constructors.
     pub fn validate(&self) -> Result<(), TreeError> {
         if self.bounds.is_empty() || !self.bounds.is_subset_of(&TreeSpan::under(&self.prefix)) || self.digest.count() < 0 {
-            return Err(TreeError::InvalidKey("invalid tree span digest bounds or count"));
+            return Err(TreeError::InvalidSpan("invalid tree span digest bounds or count"));
         }
         Ok(())
     }

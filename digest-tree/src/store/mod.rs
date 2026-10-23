@@ -64,6 +64,27 @@ pub enum MapName {
     Nodes,
 }
 
+/// Why a transaction can no longer commit, which its commit reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// A write's condition failed, or an operation found what it expected
+    /// changed: the commit reports [`TreeError::Conflict`], and the writer
+    /// retries from fresh reads.
+    Conflict,
+    /// An operation failed for another reason, or was cancelled or panicked
+    /// before it finished: the commit reports [`TreeError::Poisoned`].
+    Poisoned,
+}
+
+impl From<Failure> for TreeError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Conflict => TreeError::Conflict,
+            Failure::Poisoned => TreeError::Poisoned,
+        }
+    }
+}
+
 /// Access to one tree's three maps within a transaction.
 ///
 /// An adapter may borrow an outer transaction containing other trees and
@@ -72,10 +93,11 @@ pub enum MapName {
 /// [`MapTransaction`] additionally owns the right to commit.
 #[async_trait]
 pub trait MapAccess: Send {
-    /// Permanently prevent the owning transaction from committing any writes.
-    /// A borrowed adapter must forward this to its owner, so dropping the
-    /// adapter or opening another view cannot clear a failed operation.
-    fn poison(&mut self);
+    /// Permanently prevent the owning transaction from committing any writes,
+    /// its commit reporting the first failure recorded. A borrowed adapter
+    /// must forward this to its owner, so dropping the adapter or opening
+    /// another view cannot clear a failed operation.
+    fn poison(&mut self, failure: Failure);
 
     /// Keep the tree topology this transaction read valid until commit.
     /// Ordinary leaf changes may still commit concurrently.
@@ -136,7 +158,7 @@ pub trait MapTransaction: MapAccess {
 
 #[async_trait]
 impl<T: MapAccess + ?Sized> MapAccess for &mut T {
-    fn poison(&mut self) { (**self).poison(); }
+    fn poison(&mut self, failure: Failure) { (**self).poison(failure); }
     fn watch_structure(&mut self) { (**self).watch_structure(); }
     fn change_structure(&mut self) { (**self).change_structure(); }
 

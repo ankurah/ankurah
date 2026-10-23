@@ -7,7 +7,7 @@ use ankurah_core_types::EntityId;
 
 use super::TreeTransaction;
 use crate::address::{leaf_address, TreeSpan};
-use crate::digest::DigestGroup;
+use crate::digest::{DecodeError, DigestGroup};
 use crate::error::TreeError;
 use crate::store::layout;
 use crate::store::{LeafRow, MapAccess, MapName, PreparedLeaf};
@@ -120,7 +120,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     pub(crate) async fn multiple_key_entities(&mut self) -> Result<u64, TreeError> {
         match self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await? {
             Some(value) => {
-                Ok(u64::from_be_bytes(value.as_slice().try_into().map_err(|_| TreeError::Audit("invalid multi-key entity count"))?))
+                let found = value.len();
+                let count =
+                    value.try_into().map_err(|_| TreeError::unreadable("multi-key count", DecodeError::Length { expected: 8, found }))?;
+                Ok(u64::from_be_bytes(count))
             }
             None => Ok(0),
         }
@@ -129,14 +132,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     async fn adjust_multiple_keys(&mut self, add: bool) -> Result<(), TreeError> {
         let stored = self.transaction.get(MapName::Lookup, layout::MULTIPLE_KEYS).await?;
         let count = self.multiple_key_entities().await?;
-        let count =
-            if add { count.checked_add(1) } else { count.checked_sub(1) }.ok_or(TreeError::Audit("invalid multi-key entity count"))?;
+        let count = if add { count.checked_add(1) } else { count.checked_sub(1) }
+            .ok_or(TreeError::Inconsistent("multi-key entity count out of range"))?;
         if count == 0 {
             self.transaction
                 .delete_if(
                     MapName::Lookup,
                     layout::MULTIPLE_KEYS,
-                    stored.as_deref().ok_or(TreeError::Audit("missing multi-key entity count"))?,
+                    stored.as_deref().ok_or(TreeError::Inconsistent("missing multi-key entity count"))?,
                 )
                 .await
         } else {

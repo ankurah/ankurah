@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 
-use super::{ByteBounds, MapAccess, MapName, MapTransaction};
+use super::{ByteBounds, Failure, MapAccess, MapName, MapTransaction};
 use crate::error::TreeError;
 
 /// A tree's three maps in memory, behind one lock, and the transactions over
@@ -56,7 +56,7 @@ impl MemoryMaps {
             shared: self.shared.clone(),
             began_with: shared.committed.clone(),
             writes: Default::default(),
-            failed: false,
+            failure: None,
             revision: shared.revision,
             structure: shared.structure,
             watches_structure: false,
@@ -73,8 +73,9 @@ pub struct MemoryTransaction {
     began_with: Arc<Maps>,
     /// The transaction's writes, by map and key, for its commit to apply.
     writes: [BTreeMap<Vec<u8>, Write>; 3],
-    /// A failed condition or poisoned tree operation prevents commit.
-    failed: bool,
+    /// The first failure the transaction met, a failed condition or a failed
+    /// tree operation, which prevents its commit.
+    failure: Option<Failure>,
     revision: u64,
     structure: u64,
     watches_structure: bool,
@@ -105,7 +106,7 @@ impl MemoryTransaction {
     /// which fails the commit too.
     fn write(&mut self, map: MapName, key: &[u8], expected: Option<&[u8]>, value: Option<&[u8]>) -> Result<(), TreeError> {
         if self.seen(map, key) != expected {
-            self.failed = true;
+            self.poison(Failure::Conflict);
             return Err(TreeError::Conflict);
         }
         let value = value.map(<[u8]>::to_vec);
@@ -123,7 +124,7 @@ impl MemoryTransaction {
 
 #[async_trait]
 impl MapAccess for MemoryTransaction {
-    fn poison(&mut self) { self.failed = true; }
+    fn poison(&mut self, failure: Failure) { self.failure.get_or_insert(failure); }
 
     fn watch_structure(&mut self) { self.watches_structure = true; }
 
@@ -181,9 +182,9 @@ impl MapAccess for MemoryTransaction {
 #[async_trait]
 impl MapTransaction for MemoryTransaction {
     async fn commit(self) -> Result<(), TreeError> {
-        let MemoryTransaction { shared, began_with, writes, failed, revision, structure, watches_structure, changes_structure } = self;
-        if failed {
-            return Err(TreeError::Conflict);
+        let MemoryTransaction { shared, began_with, writes, failure, revision, structure, watches_structure, changes_structure } = self;
+        if let Some(failure) = failure {
+            return Err(failure.into());
         }
         // Letting go of the maps it began with lets a commit change them in
         // place when no other transaction holds them.

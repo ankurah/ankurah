@@ -1,5 +1,5 @@
 use super::*;
-use crate::store::{ByteBounds, MapTransaction, PreparedLeaf};
+use crate::store::{ByteBounds, Failure, MapTransaction, PreparedLeaf};
 use crate::tree::fixtures::{empty_tree, entity, in_each_group, prefix, row};
 use crate::TreeSpan;
 use async_trait::async_trait;
@@ -69,7 +69,7 @@ struct Interleaved<T> {
 
 #[async_trait]
 impl<T: MapAccess> MapAccess for Interleaved<T> {
-    fn poison(&mut self) { self.inner.poison(); }
+    fn poison(&mut self, failure: Failure) { self.inner.poison(failure); }
     fn watch_structure(&mut self) { self.inner.watch_structure(); }
     fn change_structure(&mut self) { self.inner.change_structure(); }
     async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
@@ -254,7 +254,7 @@ async fn a_delta_without_its_base_is_not_a_subtree_summary<G: DigestGroup>() {
     assert!(matches!(maps.node(&parent).await, Err(TreeError::IncompleteNode(p)) if p == parent));
     assert!(matches!(maps.children(&root).await, Err(TreeError::IncompleteNode(p)) if p == parent));
     assert!(matches!(maps.compact_node(&parent).await, Err(TreeError::IncompleteNode(p)) if p == parent));
-    assert!(matches!(maps.commit().await, Err(TreeError::Conflict)));
+    assert!(matches!(maps.commit().await, Err(TreeError::Poisoned)));
     let mut maps = tree.begin();
     assert_eq!(maps.node_base(&parent).await.unwrap(), None, "compaction wrote no base");
     assert_eq!(delta_count(&mut maps, &parent).await, 1, "compaction consumed no delta");

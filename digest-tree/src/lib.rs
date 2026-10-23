@@ -75,5 +75,5 @@ pub use address::{leaf_address, CanonicalCodec, NodePrefix, NodePrefixError, Tre
 pub use digest::{Digest, DigestGroup, HeadHash, Leaf, LeafElement, LtHash16, Ristretto255};
 pub use error::TreeError;
 pub use selection::{PropertyTypes, TreeMatch, TreeRequest, TreeSpec};
-pub use store::{ByteBounds, LeafRow, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction};
+pub use store::{ByteBounds, Failure, LeafRow, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction};
 pub use tree::{AuditCounts, DigestTree, LeafChange, LeafCursor, LeafInput, LeafPage, TreeScope, TreeTransaction, BUCKET_CAPACITY};
