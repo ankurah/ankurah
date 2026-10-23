@@ -141,42 +141,36 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
         if let Some((old, new)) = before.as_ref().zip(after.as_ref()).filter(|(a, b)| a.address() == b.address()) {
             // Changing only the head preserves both the lookup and topology.
-            // Encode the common difference once for all ancestors.
             let address = new.address();
             let path = self.path(&address).await?;
             self.transaction.put_if(MapName::Leaves, &address, before_value.as_deref(), &layout::leaf_value(new)).await?;
-            let delta = layout::digest_value(&(Digest::from(new.element) - Digest::from(old.element)));
-            for prefix in path {
-                let (key_prefix, _) = layout::delta_key_bounds(&prefix);
-                self.transaction.append(MapName::Nodes, &key_prefix, &delta).await?;
-            }
-            return Ok(());
+            return self.append_node_deltas(&path, Digest::from(new.element) - Digest::from(old.element)).await;
         }
-        // A move may share some ancestors. Combine contributions before
-        // writing so each affected node receives one delta.
-        let mut deltas: BTreeMap<NodePrefix, Digest<G>> = BTreeMap::new();
-        let mut affected = BTreeSet::new();
-        for (row, removing) in [(&before, true), (&after, false)] {
-            if let Some(row) = row {
-                let contribution = Digest::from(row.element);
-                let contribution = if removing { -contribution } else { contribution };
-                for prefix in self.path(&row.address()).await? {
-                    *deltas.entry(prefix.clone()).or_default() += contribution;
-                    affected.insert(prefix);
-                }
-            }
-        }
+        // Ancestors of only the removed leaf lose its contribution and
+        // ancestors of only the added leaf gain its contribution. The
+        // ancestors a move shares, a run down from the root, receive the
+        // difference. Each of these deltas is encoded once, however deep.
+        let removed_path = match &before {
+            Some(row) => self.path(&row.address()).await?,
+            None => Vec::new(),
+        };
+        let added_path = match &after {
+            Some(row) => self.path(&row.address()).await?,
+            None => Vec::new(),
+        };
+        let shared = removed_path.iter().zip(&added_path).take_while(|(removed, added)| removed == added).count();
+        let removal = before.as_ref().map_or(Digest::empty(), |row| -Digest::from(row.element));
+        let addition = after.as_ref().map_or(Digest::empty(), |row| Digest::from(row.element));
         if let Some(row) = &before {
             self.delete_leaf(row).await?;
         }
         if let Some(row) = &after {
             self.put_leaf(row.clone(), None).await?;
         }
-        for (prefix, delta) in deltas {
-            if delta != Digest::empty() {
-                self.append_node_delta(&prefix, delta).await?;
-            }
-        }
+        self.append_node_deltas(&removed_path[..shared], removal + addition).await?;
+        self.append_node_deltas(&removed_path[shared..], removal).await?;
+        self.append_node_deltas(&added_path[shared..], addition).await?;
+        let affected: BTreeSet<NodePrefix> = removed_path.into_iter().chain(added_path).collect();
         // Ancestors precede descendants. A rebuilt ancestor may have removed
         // old descendants; skip those when reaching them.
         for prefix in affected {
@@ -195,13 +189,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 self.insert_branch(&prefix, &children, after.as_ref().expect("the insertion is uncovered")).await?;
             } else if children.is_empty() && added && !removed {
                 // Topology depends on row count; reading or rebuilding a leaf validates its contents.
-                let sample = self.transaction.scan(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY + 1).await?;
-                if sample.len() > BUCKET_CAPACITY {
+                let leaves = self.transaction.count_up_to(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY + 1).await?;
+                if leaves > BUCKET_CAPACITY {
                     self.rebuild_subtree(&prefix).await?;
                 }
             } else if !children.is_empty() && removed && !added {
-                let sample = self.transaction.scan(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY / 2 + 1).await?;
-                if sample.len() <= BUCKET_CAPACITY / 2 {
+                let leaves =
+                    self.transaction.count_up_to(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY / 2 + 1).await?;
+                if leaves <= BUCKET_CAPACITY / 2 {
                     self.rebuild_subtree(&prefix).await?;
                 }
             }
@@ -513,6 +508,43 @@ mod tests {
             }
         }
         assert_eq!(encode_counts, [2, 2], "one leaf value and one delta, regardless of ancestor count");
+    }
+
+    #[tokio::test]
+    async fn moves_give_shared_and_separate_ancestors_their_own_deltas() {
+        use ankurah_core_types::{IndexKeyPart, PropertyId, Value, ValueType};
+
+        let property = PropertyId::EntityId(EntityId::from_bytes([7; 32]));
+        let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property, ValueType::I64)]), Predicate::True);
+        let leaf = |n: u64, key: i64| {
+            let mut id = [0; EntityId::BYTE_LEN];
+            id[..8].copy_from_slice(&n.to_be_bytes());
+            let key = CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(key)]).unwrap();
+            LeafData { key, entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+        };
+        let tree = DigestTree::<Ristretto255>::new(spec.clone());
+        let mut setup = tree.begin();
+        setup.build((0..512).map(|n| leaf(n, n as i64 * 2))).await.unwrap();
+        setup.commit().await.unwrap();
+        let initial_root = tree.begin().node(&NodePrefix::root()).await.unwrap();
+        // To a neighboring key, then to one far across the tree.
+        for (to, far) in [(201, false), (1001, true)] {
+            let (from, to) = (leaf(100, 200), leaf(100, to));
+            let mut probe = tree.begin();
+            let from_path = probe.path(&from.row::<Ristretto255>().address()).await.unwrap();
+            let to_path = probe.path(&to.row::<Ristretto255>().address()).await.unwrap();
+            let shared = from_path.iter().zip(&to_path).take_while(|(a, b)| a == b).count();
+            if far {
+                assert!(shared < from_path.len().min(to_path.len()), "the far move leaves its own branch");
+            }
+            for (before, after) in [(from.clone(), to.clone()), (to, from)] {
+                let mut tx = tree.begin();
+                tx.apply_change(LeafChange { before: Some(before), after: Some(after) }).await.unwrap();
+                tx.commit().await.unwrap();
+                assert_eq!(tree.begin().audit().await.unwrap().leaves, 512, "every summary matches the leaves beneath it");
+            }
+            assert_eq!(tree.begin().node(&NodePrefix::root()).await.unwrap(), initial_root);
+        }
     }
 
     #[tokio::test]

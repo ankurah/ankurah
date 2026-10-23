@@ -392,13 +392,26 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
     }
 
-    /// Record that a change moved the digest of the leaves beneath `prefix`
-    /// by `delta`: a delta row is appended under a key of its own and the
-    /// base row is left alone, so changes neither contend on it nor conflict
-    /// with each other.
+    #[cfg(test)]
     pub(crate) async fn append_node_delta(&mut self, prefix: &NodePrefix, delta: Digest<G>) -> Result<(), TreeError> {
-        let (key_prefix, _) = layout::delta_key_bounds(prefix);
-        self.transaction.append(MapName::Nodes, &key_prefix, &layout::digest_value(&delta)).await
+        self.append_node_deltas(std::slice::from_ref(prefix), delta).await
+    }
+
+    /// Record that a change moved the digest of the leaves beneath each of
+    /// `prefixes` by the same `delta`, encoded once for all of them: a delta
+    /// row is appended under a key of its own and the base row is left alone,
+    /// so changes neither contend on it nor conflict with each other. An empty
+    /// delta moves nothing and appends no row.
+    pub(crate) async fn append_node_deltas(&mut self, prefixes: &[NodePrefix], delta: Digest<G>) -> Result<(), TreeError> {
+        if prefixes.is_empty() || delta == Digest::empty() {
+            return Ok(());
+        }
+        let value = layout::digest_value(&delta);
+        for prefix in prefixes {
+            let (key_prefix, _) = layout::delta_key_bounds(prefix);
+            self.transaction.append(MapName::Nodes, &key_prefix, &value).await?;
+        }
+        Ok(())
     }
 
     /// Fold up to [`COMPACTION_BATCH`] of the tree node's deltas, the first in

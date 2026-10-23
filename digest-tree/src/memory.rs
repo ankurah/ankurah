@@ -132,13 +132,7 @@ impl MapAccess for MemoryTransaction {
     async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> { Ok(self.seen(map, key).map(<[u8]>::to_vec)) }
 
     async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
-        // `BTreeMap::range` panics on an inverted range; such a range holds nothing.
-        let inverted = match bounds {
-            (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
-            (Bound::Excluded(start), Bound::Excluded(end)) => start >= end,
-            (Bound::Included(start) | Bound::Excluded(start), Bound::Included(end) | Bound::Excluded(end)) => start > end,
-        };
-        if inverted {
+        if inverted(bounds) {
             return Ok(Vec::new());
         }
         let began_with = self.began_with.0[map as usize].range::<[u8], _>(bounds);
@@ -157,12 +151,7 @@ impl MapAccess for MemoryTransaction {
     }
 
     async fn count_up_to(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<usize, TreeError> {
-        let inverted = match bounds {
-            (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
-            (Bound::Excluded(start), Bound::Excluded(end)) => start >= end,
-            (Bound::Included(start) | Bound::Excluded(start), Bound::Included(end) | Bound::Excluded(end)) => start > end,
-        };
-        if inverted || limit == 0 {
+        if inverted(bounds) {
             return Ok(0);
         }
         let began_with = self.began_with.0[map as usize].range::<[u8], _>(bounds);
@@ -227,6 +216,16 @@ impl MapTransaction for MemoryTransaction {
             }
         }
         Ok(())
+    }
+}
+
+/// Whether `bounds` are inverted, holding nothing. `BTreeMap::range` panics on
+/// such a range, so scans and counts return nothing for it instead.
+fn inverted(bounds: ByteBounds<'_>) -> bool {
+    match bounds {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Excluded(start), Bound::Excluded(end)) => start >= end,
+        (Bound::Included(start) | Bound::Excluded(start), Bound::Included(end) | Bound::Excluded(end)) => start > end,
     }
 }
 

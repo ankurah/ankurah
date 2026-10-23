@@ -2,12 +2,11 @@
 
 All 448 ordinary observations at `10c98fb5` passed their strict result checks.
 The browser traces and a separate native operation diagnostic are complete.
-A follow-up optimization was stopped mid-implementation for the requested handoff.
-Its WIP checkpoint includes a deliberately red operation-count regression test:
-insertion and removal each encode five times, versus the intended two. The
-bounded-count adapter is written but not yet used by topology maintenance; its
-focused test has not been run. There are no post-optimization measurements, and
-this WIP checkpoint must not be described as green or performance-qualified.
+A later checkpoint adds two narrow maintenance optimizations. A leaf change
+encodes each distinct ancestor delta once: in the regression tree, insertion and
+removal now encode twice instead of five times. The split and merge capacity
+checks count leaf rows without copying them. Its correctness checks pass; it has
+not yet been remeasured, so every table below describes `10c98fb5` only.
 These measurements replace the
 captured-entity-state implementation's performance claims; the historical reports
 retain their original revisions and results. Performance acceptance remains open.
@@ -264,6 +263,13 @@ The final projector fix passes 542 core tests (one existing ignore), eight
 bridge-policy tests, four stream-credential tests and nine targeted JWT tests.
 The raw-count change passes 151 digest tests and two documentation examples.
 Formatting and diff checks pass.
+
+The later maintenance optimizations pass 154 digest tests and two documentation
+examples, 542 core tests (one existing ignore), 45 focused multi-node integration
+tests and nine targeted JWT tests. The operation-count regression failed on the
+previous code with five encodes for each of insertion and removal. A new move
+test checks the summaries of shared and separate ancestors after moves between
+nearby and distant keys; it fails when the shared ancestors receive the wrong delta.
 
 Regression evidence includes old-code failures for the arbitrary publication
 limit, unnecessary candidate-state reads and missing-baseline event retrieval.
