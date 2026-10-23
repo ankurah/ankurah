@@ -239,11 +239,11 @@ impl<'de, G: DigestGroup> Deserialize<'de> for TreeSpanDigest<G> {
 }
 impl<G: DigestGroup> TreeSpanDigest<G> {
     /// Encode a versioned span digest for a peer, independent of a local snapshot.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(&(1u8, self.prefix.to_bytes(), &self.bounds.start, &self.bounds.end, self.digest.to_row_bytes())).unwrap()
     }
     /// Decode a span digest and validate its prefix, bounds, count and group encoding.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, TreeError> {
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, TreeError> {
         use bincode::Options;
         type EncodedSpanDigest = (u8, Vec<u8>, std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>, Vec<u8>);
         let (version, prefix, start, end, digest): EncodedSpanDigest = bincode::DefaultOptions::new()
@@ -276,6 +276,8 @@ impl<G: DigestGroup> TreeSpanDigest<G> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::digest::{HeadHash, Leaf, LtHash16};
+    use ankurah_core_types::EntityId;
     use rand::{rngs::SmallRng, Rng, SeedableRng};
 
     #[test]
@@ -356,5 +358,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn typed_and_decoded_span_digests_reject_the_same_invalid_bounds_and_counts() {
+        let prefix = NodePrefix::of(&[0x80], 1);
+        let valid = TreeSpanDigest::<Ristretto255> { prefix: prefix.clone(), bounds: TreeSpan::under(&prefix), digest: Digest::empty() };
+        valid.validate().unwrap();
+        assert_eq!(TreeSpanDigest::from_bytes(&valid.to_bytes()).unwrap(), valid);
+        let leaf = Digest::from(Leaf::new(&[], EntityId::from_bytes([1; 32]), HeadHash::of([[1; 32]])).element());
+        let invalid = [
+            TreeSpanDigest { bounds: TreeSpan::new(Bound::Excluded(vec![0x80]), Bound::Included(vec![0x80])), ..valid.clone() },
+            TreeSpanDigest { bounds: TreeSpan::new(Bound::Included(vec![0x90]), Bound::Included(vec![0x80])), ..valid.clone() },
+            TreeSpanDigest { bounds: TreeSpan::all(), ..valid.clone() },
+            TreeSpanDigest { digest: -leaf, ..valid },
+        ];
+        for span_digest in invalid {
+            assert!(span_digest.validate().is_err());
+            assert!(TreeSpanDigest::<Ristretto255>::from_bytes(&span_digest.to_bytes()).is_err());
+        }
+    }
+
+    /// A span digest that crosses the wire is validated as it decodes: an
+    /// unknown version, a prefix that does not decode, a negative count, a
+    /// digest of another group, empty bounds, bounds outside the prefix and
+    /// trailing bytes are each refused.
+    #[test]
+    fn span_digest_deserialization_preserves_the_tree_crates_validation() {
+        let root = NodePrefix::root();
+        let bounds = TreeSpan::under(&NodePrefix::root());
+        let mut negative = Digest::<Ristretto255>::empty().to_row_bytes();
+        let count_offset = negative.len() - 8;
+        negative[count_offset..].copy_from_slice(&(-1i64).to_be_bytes());
+        let encode = |version, prefix: Vec<u8>, bounds: &TreeSpan, digest| {
+            bincode::serialize(&(version, prefix, &bounds.start, &bounds.end, digest)).unwrap()
+        };
+        let empty_digest = Digest::<Ristretto255>::empty().to_row_bytes();
+        let valid = encode(1u8, root.to_bytes(), &bounds, empty_digest.clone());
+        let mut trailing = valid.clone();
+        trailing.push(0);
+        for bytes in [
+            encode(2u8, root.to_bytes(), &bounds, empty_digest.clone()),
+            encode(1u8, vec![255], &bounds, empty_digest.clone()),
+            encode(1u8, root.to_bytes(), &bounds, negative),
+            encode(1u8, root.to_bytes(), &bounds, Digest::<LtHash16>::empty().to_row_bytes()),
+            encode(1u8, root.to_bytes(), &TreeSpan::new(Bound::Included(vec![2]), Bound::Excluded(vec![1])), empty_digest.clone()),
+            encode(1u8, NodePrefix::of(&[0], 1).to_bytes(), &bounds, empty_digest),
+            trailing,
+        ] {
+            let framed = bincode::serialize(&bytes).unwrap();
+            assert!(bincode::deserialize::<TreeSpanDigest>(&framed).is_err());
+        }
+        let decoded: TreeSpanDigest = bincode::deserialize(&bincode::serialize(&valid).unwrap()).unwrap();
+        assert_eq!(decoded.digest.count(), 0);
+        assert_eq!(decoded.bounds, bounds);
     }
 }

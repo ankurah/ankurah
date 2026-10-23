@@ -12,7 +12,7 @@ use crate::store::{MapAccess, MapName};
 
 /// How many deltas one compaction folds at most, so that the rows it reads and
 /// the writes it buffers stay bounded however many deltas a tree node gathers.
-pub const COMPACTION_BATCH: usize = 1024;
+const COMPACTION_BATCH: usize = 1024;
 
 /// A read of a tree node's delta rows a page at a time, in key order, so that
 /// no read holds them all at once: where the next page starts.
@@ -79,24 +79,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
     }
 
-    /// The stored baseline without subsequent deltas; `None` where absent.
-    /// Use [`TreeTransaction::node`] for the complete current summary.
-    pub async fn node_base(&mut self, prefix: &NodePrefix) -> Result<Option<Digest<G>>, TreeError> {
-        Ok(self.base(prefix).await?.map(|base| base.digest))
-    }
-
-    /// The nearest existing tree nodes beneath `prefix`, in prefix order:
-    /// every tree node `prefix` properly contains with no existing tree node
-    /// between them, so that no two overlap. Where path compression skipped
-    /// levels, a child lies several levels down. Deltas without a base report
-    /// [`TreeError::IncompleteNode`], as in [`TreeTransaction::node`].
-    ///
-    /// The scan over the subtree's keys meets delta rows too: the tree node's
-    /// own, which are stepped over, and those of a tree node whose prefix ends
-    /// on a whole byte of its encoding, which follow everything beneath that
-    /// tree node. After each child the scan resumes past the child's own keys,
-    /// not at the next prefix, so it also detects deltas whose base is missing.
-    pub async fn children(&mut self, prefix: &NodePrefix) -> Result<Vec<(NodePrefix, Digest<G>)>, TreeError> {
+    /// The tree nodes [`Self::child_prefixes`] finds beneath `prefix`, each
+    /// with its digest.
+    pub(crate) async fn children(&mut self, prefix: &NodePrefix) -> Result<Vec<(NodePrefix, Digest<G>)>, TreeError> {
         let mut children = Vec::new();
         for prefix in self.child_prefixes(prefix).await? {
             let node = self.node(&prefix).await?.ok_or_else(|| TreeError::IncompleteNode(prefix.clone()))?;
@@ -105,9 +90,19 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(children)
     }
 
-    /// The nearest stored descendants, in the same prefix order as [`Self::children`],
-    /// without decoding or summing their digests. Includes pending topology changes
-    /// and still rejects descendant delta rows whose base is missing.
+    /// The nearest existing tree nodes beneath `prefix`, in prefix order:
+    /// every tree node `prefix` properly contains with no existing tree node
+    /// between them, so that no two overlap, found without reading their
+    /// digests. Where path compression skipped levels, a child lies several
+    /// levels down. This transaction's own writes count. Deltas without a
+    /// base report [`TreeError::IncompleteNode`], as in
+    /// [`TreeTransaction::node`].
+    ///
+    /// The scan over the subtree's keys meets delta rows too: the tree node's
+    /// own, which are stepped over, and those of a tree node whose prefix ends
+    /// on a whole byte of its encoding, which follow everything beneath that
+    /// tree node. After each child the scan resumes past the child's own keys,
+    /// not at the next prefix, so it also detects deltas whose base is missing.
     pub async fn child_prefixes(&mut self, prefix: &NodePrefix) -> Result<Vec<NodePrefix>, TreeError> {
         let (encoding, end) = prefix.subtree_keys();
         let (own_deltas_first, own_deltas_past) = layout::delta_key_bounds(&encoding);
@@ -186,8 +181,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         self.transaction.put_if(MapName::Nodes, &prefix.to_bytes(), Some(&base.value), &layout::digest_value(&digest)).await
     }
 
-    /// Fold up to [`COMPACTION_BATCH`] of the tree node's deltas, the first in
-    /// key order, into its base row and remove them, so that reads sum fewer
+    /// Fold the tree node's first deltas in key order, a batch of at most
+    /// 1,024, into its base row and remove them, so that reads sum fewer
     /// rows. Deltas without a base report [`TreeError::IncompleteNode`]
     /// without changing any rows. Returns whether deltas
     /// remain beyond the batch, which a later compaction, in a transaction of

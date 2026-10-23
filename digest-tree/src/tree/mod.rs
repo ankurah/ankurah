@@ -68,8 +68,8 @@ impl<G: DigestGroup> DigestTree<G> {
 /// A borrowed view leaves commit to its outer owner.
 /// A [`TreeError::Conflict`] from any operation or from the commit
 /// fails the transaction whole, and the caller retries from fresh reads in a
-/// new one. The operations below are the only writers of the maps' contents;
-/// the layouts of the keys and values are in [`layout`].
+/// new one. The tree's operations are the only writers of the maps' contents,
+/// every key and value in the tree's own byte layout.
 #[derive(Debug)]
 pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction> {
     pub(crate) transaction: T,

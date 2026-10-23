@@ -47,10 +47,10 @@ pub(crate) const MULTIPLE_KEYS: &[u8] = b"";
 
 /// The length of a leaf row's value in the group `G`: the head hash and the
 /// leaf element's row bytes.
-pub const fn leaf_value_len<G: DigestGroup>() -> usize { HEAD_LEN + LeafElement::<G>::ROW_LEN }
+pub(crate) const fn leaf_value_len<G: DigestGroup>() -> usize { HEAD_LEN + LeafElement::<G>::ROW_LEN }
 
 /// The byte between a prefix's encoding and the suffix in a delta key.
-pub const DELTA_SEPARATOR: u8 = 0xff;
+pub(crate) const DELTA_SEPARATOR: u8 = 0xff;
 
 /// The key and the entity id an address is made of.
 fn split_address<'a>(what: &'static str, address: &'a [u8]) -> Result<(&'a [u8], EntityId), TreeError> {

@@ -4,7 +4,7 @@
 //! Rows carry typed values: the head hash, the leaf element and the digest as
 //! the [`digest`](crate::digest) module defines them, in the group the tree
 //! sums in (ristretto255 unless the tree names another). The maps hold their
-//! bytes in the layouts of [`layout`](crate::layout), which the tree encodes
+//! bytes in the layouts of the `layout` module, which the tree encodes
 //! and decodes, so the maps hold bytes and nothing else.
 
 use ankurah_core_types::EntityId;

@@ -173,3 +173,25 @@ fn equal_specs_find_one_tree_in_a_map() {
     let another = TreeSpec::new(by_name(), rating_above(Value::I64(4)));
     assert_eq!(trees.get(&another), None, "the predicate is part of the spec");
 }
+
+/// A spec decoded from the wire, in either encoding, is built again by
+/// [`TreeSpec::new`], so it keeps the canonical ascending key layout whatever
+/// directions and nulls placements the sender wrote.
+#[test]
+fn deserializing_a_spec_keeps_its_canonical_ascending_key_layout() {
+    #[derive(serde::Serialize)]
+    struct UnnormalizedSpec {
+        key_spec: KeySpec<PropertyId>,
+        predicate: Predicate<Resolved>,
+    }
+    let mut part = IndexKeyPart::desc(property(1), ValueType::I64);
+    part.nulls = Some(NullsOrder::Last);
+    let input = UnnormalizedSpec { key_spec: KeySpec::new(vec![part]), predicate: Predicate::True };
+    let decoded: TreeSpec = bincode::deserialize(&bincode::serialize(&input).unwrap()).unwrap();
+    assert_eq!(decoded.key_spec().keyparts[0].direction, IndexDirection::Asc);
+    assert_eq!(decoded.key_spec().keyparts[0].nulls, None);
+    assert_eq!(bincode::deserialize::<TreeSpec>(&bincode::serialize(&decoded).unwrap()).unwrap(), decoded);
+    assert_eq!(serde_json::from_value::<TreeSpec>(serde_json::to_value(&decoded).unwrap()).unwrap(), decoded);
+    let from_json: TreeSpec = serde_json::from_value(serde_json::to_value(&input).unwrap()).unwrap();
+    assert_eq!(from_json, decoded);
+}

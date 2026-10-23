@@ -66,7 +66,7 @@ pub enum TreeError {
     /// leaves, so it is rebuilt from them.
     #[error("a stored {what} does not decode")]
     Unreadable {
-        /// Which key or value, as the [`layout`](crate::layout) names them:
+        /// Which key or value, as the tree's layout of its rows names them:
         /// "leaf value", "node key" and so on.
         what: &'static str,
         /// What was wrong with the bytes, when a decoder said.

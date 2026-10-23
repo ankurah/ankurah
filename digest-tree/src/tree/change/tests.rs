@@ -311,6 +311,7 @@ async fn a_batch_that_changes_the_topology_matches_its_changes_one_at_a_time() {
 mod map_costs {
     use super::*;
     use crate::store::{ByteBounds, Failure, MapTransaction};
+    use crate::tree::fixtures::node_base;
     use crate::{MemoryMaps, MemoryTransaction};
     use ankurah_core_types::{IndexKeyPart, PropertyId, Value, ValueType};
     use async_trait::async_trait;
@@ -440,14 +441,14 @@ mod map_costs {
         for size in [256, 4096] {
             let (maps, counts) = populated(size).await;
             let mut tx = begin(&maps, &counts);
-            let root = tx.node_base(&NodePrefix::root()).await.unwrap();
+            let root = node_base(&mut tx, &NodePrefix::root()).await;
             reset(&counts);
             tx.apply_change(LeafChange { before: None, after: Some(leaf(1_000_000, 0)) }).await.unwrap();
             let measured = counts.lock().unwrap().clone();
             assert_eq!(measured[MapName::Leaves as usize].read_rows, 0, "a new branch does not read existing leaves");
             assert_eq!(measured[MapName::Nodes as usize].deletes, 0, "existing summaries stay in place");
             assert!(measured[MapName::Nodes as usize].puts <= 2, "only the new branches need baselines");
-            assert_eq!(tx.node_base(&NodePrefix::root()).await.unwrap(), root);
+            assert_eq!(node_base(&mut tx, &NodePrefix::root()).await, root);
             tx.commit().await.unwrap();
             assert_eq!(begin(&maps, &counts).audit().await.unwrap().leaves, size as usize + 1);
         }

@@ -8,8 +8,8 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::digest::{DecodeError, DigestGroup, HeadHash, Leaf, Ristretto255};
-use crate::store::EncodedLeaf;
-use crate::{DigestTree, LeafRow, NodePrefix, TreeSpec};
+use crate::store::{layout, EncodedLeaf, MapAccess, MapName};
+use crate::{Digest, DigestTree, LeafRow, NodePrefix, TreeSpec, TreeTransaction};
 
 pub(crate) fn entity(n: u8) -> EntityId { EntityId::from_bytes([n; 32]) }
 
@@ -21,6 +21,13 @@ pub(crate) fn row<G: DigestGroup>(key: &[u8], entity: EntityId) -> LeafRow<G> {
 
 /// `row` with its address and value encoded, as a write stores it.
 pub(crate) fn encoded<G: DigestGroup>(row: LeafRow<G>) -> EncodedLeaf<G> { EncodedLeaf::new(row.address(), row) }
+
+/// The digest of the tree node's base row alone, without the deltas appended
+/// since; `None` where it has no base.
+pub(crate) async fn node_base<G: DigestGroup, T: MapAccess>(tree: &mut TreeTransaction<G, T>, prefix: &NodePrefix) -> Option<Digest<G>> {
+    let value = tree.transaction.get(MapName::Nodes, &prefix.to_bytes()).await.unwrap()?;
+    Some(layout::digest("node value", &value).unwrap())
+}
 
 /// The prefix spelled by `text`, one character per bit.
 pub(crate) fn prefix(text: &str) -> NodePrefix { text.chars().fold(NodePrefix::root(), |prefix, bit| prefix.child(bit == '1')) }

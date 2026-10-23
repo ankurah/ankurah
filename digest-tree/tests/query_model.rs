@@ -194,34 +194,5 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
     for child in children {
         let subset = tx.scope_spans([child.bounds.clone()]);
         assert_eq!(tx.digest(&subset).await.unwrap(), child.digest);
-        let mut invalid = child.to_bytes();
-        invalid.push(0);
-        assert!(ankurah_digest_tree::TreeSpanDigest::<ankurah_digest_tree::Ristretto255>::from_bytes(&invalid).is_err());
-    }
-}
-
-#[test]
-fn typed_and_decoded_span_digests_reject_the_same_invalid_bounds_and_counts() {
-    use ankurah_digest_tree::{NodePrefix, TreeSpan, TreeSpanDigest};
-    use std::ops::Bound::{Excluded, Included};
-
-    let prefix = NodePrefix::of(&[0x80], 1);
-    let valid = TreeSpanDigest::<ankurah_digest_tree::Ristretto255> {
-        prefix: prefix.clone(),
-        bounds: TreeSpan::under(&prefix),
-        digest: Digest::empty(),
-    };
-    valid.validate().unwrap();
-    assert_eq!(TreeSpanDigest::from_bytes(&valid.to_bytes()).unwrap(), valid);
-    let leaf = Digest::from(Leaf::new(&[], entity(1), HeadHash::of([[1; 32]])).element());
-    let invalid = [
-        TreeSpanDigest { bounds: TreeSpan::new(Excluded(vec![0x80]), Included(vec![0x80])), ..valid.clone() },
-        TreeSpanDigest { bounds: TreeSpan::new(Included(vec![0x90]), Included(vec![0x80])), ..valid.clone() },
-        TreeSpanDigest { bounds: TreeSpan::all(), ..valid.clone() },
-        TreeSpanDigest { digest: -leaf, ..valid },
-    ];
-    for span_digest in invalid {
-        assert!(span_digest.validate().is_err());
-        assert!(TreeSpanDigest::<ankurah_digest_tree::Ristretto255>::from_bytes(&span_digest.to_bytes()).is_err());
     }
 }

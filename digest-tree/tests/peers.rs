@@ -66,7 +66,8 @@ async fn differences<G: DigestGroup>(
     while let Some(span_digest) = pending.pop() {
         comparisons += 1;
         assert!(comparisons < 10_000, "descent must make progress");
-        let span_digest = TreeSpanDigest::<G>::from_bytes(&span_digest.to_bytes()).unwrap();
+        // Each span digest crosses to the other peer on the wire.
+        let span_digest: TreeSpanDigest<G> = bincode::deserialize(&bincode::serialize(&span_digest).unwrap()).unwrap();
         let sa = a.scope_spans([span_digest.bounds.clone()]);
         let sb = b.scope_spans([span_digest.bounds.clone()]);
         if a.digest(&sa).await.unwrap() == b.digest(&sb).await.unwrap() {

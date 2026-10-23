@@ -4,7 +4,7 @@
 //!
 //! A tree keeps its rows in the three maps a [`MapName`] names, and reads and
 //! writes them through [`MapAccess`] within a transaction. The tree encodes
-//! every key and value itself ([`layout`](crate::layout)), so the maps hold
+//! every key and value itself, in the `layout` module's layouts, so the maps hold
 //! bytes and nothing else.
 //!
 //! A transaction is the unit of consistency. Every read within it observes one
@@ -50,7 +50,7 @@ pub use rows::LeafRow;
 pub type ByteBounds<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 
 /// The three maps that hold a tree's rows, each an ordered map of byte keys to
-/// byte values in the layout [`layout`](crate::layout) gives.
+/// byte values in the layout the tree gives them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MapName {
     /// The leaf rows, by leaf address.

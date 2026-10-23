@@ -1,6 +1,6 @@
 use super::*;
 use crate::store::{ByteBounds, Failure, MapTransaction};
-use crate::tree::fixtures::{empty_tree, encoded, entity, in_each_group, prefix, row};
+use crate::tree::fixtures::{empty_tree, encoded, entity, in_each_group, node_base, prefix, row};
 use crate::TreeSpan;
 use async_trait::async_trait;
 use rand::{rngs::SmallRng, seq::SliceRandom, SeedableRng};
@@ -138,7 +138,7 @@ async fn a_node_is_its_base_plus_its_deltas<G: DigestGroup>() {
     let summed = maps.node(&bucket).await.unwrap().unwrap();
     assert_eq!(summed, leaf(2) + leaf(3));
     assert_eq!(summed.count(), 2);
-    assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(node(2)), "the base alone");
+    assert_eq!(node_base(&mut maps, &bucket).await, Some(node(2)), "the base alone");
     assert_eq!(node_keys(&mut maps).await, 3, "the base and two deltas");
 
     // An empty baseline is explicit.
@@ -146,7 +146,7 @@ async fn a_node_is_its_base_plus_its_deltas<G: DigestGroup>() {
     maps.insert_node_base(&fresh, node(0)).await.unwrap();
     append_delta(&mut maps, &fresh, leaf(5)).await.unwrap();
     assert_eq!(maps.node(&fresh).await.unwrap(), Some(leaf(5)));
-    assert_eq!(maps.node_base(&fresh).await.unwrap(), Some(node(0)));
+    assert_eq!(node_base(&mut maps, &fresh).await, Some(node(0)));
     maps.commit().await.unwrap();
 }
 
@@ -167,7 +167,7 @@ async fn compaction_folds_the_deltas_it_read_into_the_base<G: DigestGroup>() {
     maps.commit().await.unwrap();
     let mut maps = tree.begin();
     assert_eq!(maps.node(&bucket).await.unwrap(), before);
-    assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(node(5)));
+    assert_eq!(node_base(&mut maps, &bucket).await, Some(node(5)));
     assert_eq!(node_keys(&mut maps).await, 1, "the base alone");
     assert!(!maps.compact_node(&bucket).await.unwrap());
     assert_eq!(node_keys(&mut maps).await, 1, "nothing to fold");
@@ -179,7 +179,7 @@ async fn compaction_folds_the_deltas_it_read_into_the_base<G: DigestGroup>() {
     maps.compact_node(&fresh).await.unwrap();
     maps.commit().await.unwrap();
     let mut maps = tree.begin();
-    assert_eq!(maps.node_base(&fresh).await.unwrap(), Some(leaf(6)));
+    assert_eq!(node_base(&mut maps, &fresh).await, Some(leaf(6)));
     assert_eq!(node_keys(&mut maps).await, 2);
 }
 
@@ -201,7 +201,7 @@ async fn compaction_leaves_a_late_delta_and_fails_whole_on_a_removed_one<G: Dige
     late.commit().await.unwrap();
     compactor.commit().await.unwrap();
     let mut maps = tree.begin();
-    assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(node(3)), "what compaction read");
+    assert_eq!(node_base(&mut maps, &bucket).await, Some(node(3)), "what compaction read");
     assert_eq!(delta_count(&mut maps, &bucket).await, 1, "the late delta stays");
     assert_eq!(maps.node(&bucket).await.unwrap(), Some(node(4)));
 
@@ -215,7 +215,7 @@ async fn compaction_leaves_a_late_delta_and_fails_whole_on_a_removed_one<G: Dige
     remover.commit().await.unwrap();
     assert!(matches!(compactor.commit().await, Err(TreeError::Conflict)));
     let mut maps = tree.begin();
-    assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(node(3)), "the base as it was");
+    assert_eq!(node_base(&mut maps, &bucket).await, Some(node(3)), "the base as it was");
     assert_eq!(delta_count(&mut maps, &bucket).await, 0, "as the remover left it");
     assert_eq!(maps.node(&bucket).await.unwrap(), Some(node(3)));
 }
@@ -256,7 +256,7 @@ async fn a_delta_without_its_base_is_not_a_subtree_summary<G: DigestGroup>() {
     assert!(matches!(maps.compact_node(&parent).await, Err(TreeError::IncompleteNode(p)) if p == parent));
     assert!(matches!(maps.commit().await, Err(TreeError::Poisoned)));
     let mut maps = tree.begin();
-    assert_eq!(maps.node_base(&parent).await.unwrap(), None, "compaction wrote no base");
+    assert_eq!(node_base(&mut maps, &parent).await, None, "compaction wrote no base");
     assert_eq!(delta_count(&mut maps, &parent).await, 1, "compaction consumed no delta");
 }
 
@@ -388,7 +388,7 @@ async fn more_deltas_than_a_page_in_any_suffix_order_read_and_compact_whole<G: D
     maps.commit().await.unwrap();
     let mut maps = tree.begin();
     assert_eq!(delta_count(&mut maps, &bucket).await, 0);
-    assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(expected + late_delta));
+    assert_eq!(node_base(&mut maps, &bucket).await, Some(expected + late_delta));
 }
 
 /// Two compactions of one tree node read the same deltas: the first folds
@@ -411,7 +411,7 @@ async fn competing_compactors_fold_each_delta_once<G: DigestGroup>() {
 
     let mut maps = tree.begin();
     assert_eq!(maps.node(&bucket).await.unwrap(), Some(node(5)));
-    assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(node(5)));
+    assert_eq!(node_base(&mut maps, &bucket).await, Some(node(5)));
     assert_eq!(delta_count(&mut maps, &bucket).await, 0);
 }
 
@@ -437,6 +437,6 @@ async fn a_reader_crossing_a_compaction_sees_the_node_whole<G: DigestGroup + 'st
     assert_eq!(reader.node(&bucket).await.unwrap(), Some(node(3)), "the base and the delta it began with");
 
     let mut maps = tree.begin();
-    assert_eq!(maps.node_base(&bucket).await.unwrap(), Some(node(3)), "the compaction landed");
+    assert_eq!(node_base(&mut maps, &bucket).await, Some(node(3)), "the compaction landed");
     assert_eq!(maps.node(&bucket).await.unwrap(), Some(node(3)));
 }
