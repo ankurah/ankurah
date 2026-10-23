@@ -547,8 +547,7 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
     let source = states(1, 10);
     let id = source[0].payload.entity_id;
     let mut comparison = Comparison::new(stored_snapshot(&node, source.clone()).await?, unknown())?;
-    let clock =
-        proto::PackedHeads::from_rows(std::iter::once((&[][..], id, &source[0].payload.state.head))).cursor().next_clock().unwrap().1;
+    let clock = proto::PackedHeads::encode(std::iter::once((&[][..], id, &source[0].payload.state.head))).cursor().next_clock().unwrap().1;
     comparison.known_clocks.insert(id, clock);
     let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state frame") };
     assert_eq!(progress, ComparisonProgress::Complete);

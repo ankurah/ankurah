@@ -464,7 +464,7 @@ impl Snapshot {
                 return None;
             }
         }
-        let heads = proto::PackedHeads::from_rows(
+        let heads = proto::PackedHeads::encode(
             self.members.iter().map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), *id, &self.entries[id].head)),
         );
         let inventory = proto::KnownState {
@@ -502,7 +502,7 @@ impl Snapshot {
             count += 1;
         }
         let end = if count == rows.len() { bounds.end } else { Bound::Included(rows[count - 1].0.clone()) };
-        let heads = proto::PackedHeads::from_rows(
+        let heads = proto::PackedHeads::encode(
             rows.iter()
                 .take(count)
                 .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), **id, &self.entries[*id].head)),

@@ -1,4 +1,4 @@
-//! Borrowed traversal of a packed inventory: a lending cursor and the row views it lends.
+//! Borrowed traversal of a packed inventory: a lending cursor and the head views it lends.
 
 use bytes::Bytes;
 use serde::{ser::SerializeSeq, Serialize, Serializer};
@@ -38,20 +38,20 @@ impl HeadCursor {
             return None;
         }
         let mut reader = Reader { bytes: &self.bytes, offset: self.offset };
-        let row = reader.row(self.prefix, self.fixed, &mut self.key).expect("constructed or validated inventory");
+        let head = reader.head(self.prefix, self.fixed, &mut self.key).expect("constructed or validated inventory");
         self.offset = reader.offset;
         self.remaining -= 1;
-        Some(KeyedEntityHeadRef::from_row(row, self.fixed))
+        Some(KeyedEntityHeadRef::from_encoded(head, self.fixed))
     }
 
     /// Retain a clock for later repair selection without allocating its entries.
     /// The returned slice shares this inventory's backing buffer.
     pub fn next_clock(&mut self) -> Option<(EntityId, InventoryClock)> {
         let bytes = self.bytes.clone();
-        let row = self.next()?;
+        let head = self.next()?;
         Some((
-            row.entity.entity_id,
-            InventoryClock { bytes: bytes.slice_ref(row.entity.head.bytes), count: row.entity.head.count, fixed: row.entity.head.fixed },
+            head.entity.entity_id,
+            InventoryClock { bytes: bytes.slice_ref(head.entity.head.bytes), count: head.entity.head.count, fixed: head.entity.head.fixed },
         ))
     }
 }
@@ -75,10 +75,10 @@ pub struct KeyedEntityHeadRef<'a> {
 }
 
 impl<'a> KeyedEntityHeadRef<'a> {
-    pub(super) fn from_row(row: codec::Row<'a, 'a>, fixed: bool) -> Self {
+    pub(super) fn from_encoded(head: codec::EncodedHead<'a, 'a>, fixed: bool) -> Self {
         Self {
-            key: row.key,
-            entity: EntityHeadRef { entity_id: row.entity_id, head: ClockRef { bytes: row.clock, count: row.tips, fixed } },
+            key: head.key,
+            entity: EntityHeadRef { entity_id: head.entity_id, head: ClockRef { bytes: head.clock, count: head.tips, fixed } },
         }
     }
 

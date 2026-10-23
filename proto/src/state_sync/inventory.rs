@@ -34,11 +34,11 @@ impl TreeSpanInventory {
         let mut previous = Vec::new();
         let mut address = Vec::new();
         let mut cursor = self.heads.cursor();
-        while let Some(leaf) = cursor.next() {
-            CanonicalCodec.split(spec.key_spec(), leaf.key)?;
+        while let Some(head) = cursor.next() {
+            CanonicalCodec.split(spec.key_spec(), head.key)?;
             address.clear();
-            address.extend_from_slice(leaf.key);
-            address.extend_from_slice(&leaf.entity.entity_id.to_bytes());
+            address.extend_from_slice(head.key);
+            address.extend_from_slice(&head.entity.entity_id.to_bytes());
             if !self.bounds.contains(&address) || address <= previous {
                 return Err(TreeError::InvalidKey("invalid inventory address order or bounds"));
             }
@@ -87,19 +87,19 @@ impl std::fmt::Debug for PackedHeads {
 }
 
 impl Default for PackedHeads {
-    fn default() -> Self { Self::from_rows(std::iter::empty()) }
+    fn default() -> Self { Self::encode(std::iter::empty()) }
 }
 
 impl From<Vec<KeyedEntityHead>> for PackedHeads {
     fn from(heads: Vec<KeyedEntityHead>) -> Self {
-        Self::from_rows(heads.iter().map(|leaf| (leaf.key.as_slice(), leaf.entity.entity_id, &leaf.entity.head)))
+        Self::encode(heads.iter().map(|head| (head.key.as_slice(), head.entity.entity_id, &head.entity.head)))
     }
 }
 
 impl PackedHeads {
-    /// Encode borrowed source rows directly, without cloning their keys or clocks.
+    /// Encode borrowed keyed entity heads directly, without cloning their keys or clocks.
     /// The repeatable iterator is scanned for exact size before one buffer is built.
-    pub fn from_rows<'a>(rows: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> Self { codec::write(rows) }
+    pub fn encode<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> Self { codec::write(heads) }
 
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
@@ -108,14 +108,14 @@ impl PackedHeads {
     /// work independently of the compressed wire size, including across pages.
     pub fn prefix_savings(&self) -> usize { self.plain_size.saturating_sub(self.bytes.len()) }
 
-    /// Explicitly materialize owned rows when a caller needs independent values.
+    /// Explicitly materialize owned heads when a caller needs independent values.
     pub fn to_vec(&self) -> Vec<KeyedEntityHead> {
-        let mut rows = Vec::with_capacity(self.len);
+        let mut heads = Vec::with_capacity(self.len);
         let mut cursor = self.cursor();
-        while let Some(row) = cursor.next() {
-            rows.push(row.to_owned());
+        while let Some(head) = cursor.next() {
+            heads.push(head.to_owned());
         }
-        rows
+        heads
     }
 
     /// A lending cursor: a reconstructed key remains valid until the next advance.
@@ -134,11 +134,11 @@ impl PackedHeads {
         let (prefix, fixed) = reader.mode()?;
         reader.uint()?;
         let mut key = Vec::new();
-        let mut rows = Vec::with_capacity(len);
+        let mut heads = Vec::with_capacity(len);
         for _ in 0..len {
-            rows.push(KeyedEntityHeadRef::from_row(reader.row(prefix, fixed, &mut key)?, fixed).to_owned());
+            heads.push(KeyedEntityHeadRef::from_encoded(reader.head(prefix, fixed, &mut key)?, fixed).to_owned());
         }
-        Ok(rows.into())
+        Ok(heads.into())
     }
 }
 
@@ -150,8 +150,8 @@ impl Serialize for PackedHeads {
         if serializer.is_human_readable() {
             let mut seq = serializer.serialize_seq(Some(self.len))?;
             let mut cursor = self.cursor();
-            while let Some(row) = cursor.next() {
-                seq.serialize_element(&row)?;
+            while let Some(head) = cursor.next() {
+                seq.serialize_element(&head)?;
             }
             seq.end()
         } else {
@@ -163,8 +163,8 @@ impl Serialize for PackedHeads {
 impl<'de> Deserialize<'de> for PackedHeads {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
-            let rows = Vec::<KeyedEntityHead>::deserialize(deserializer)?;
-            let packed = Self::from(rows);
+            let heads = Vec::<KeyedEntityHead>::deserialize(deserializer)?;
+            let packed = Self::from(heads);
             codec::validate(&packed.bytes).map_err(serde::de::Error::custom)?;
             Ok(packed)
         } else {

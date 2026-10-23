@@ -1,4 +1,4 @@
-//! Payload: encoding tag, row count, then key, entity ID and clock for each row.
+//! Payload: encoding tag, head count, then key, entity ID and clock for each head.
 //! Counts/lengths use unsigned little-endian bincode varints. Prefix modes add
 //! the shared-byte count before each key suffix. Fixed modes store generations
 //! as four little-endian bytes; other modes use varints. IDs are always 32 bytes.
@@ -44,9 +44,9 @@ pub(super) fn put_uint(out: &mut Vec<u8>, value: usize) {
 
 pub(super) fn common_prefix(a: &[u8], b: &[u8]) -> usize { a.iter().zip(b).take_while(|(a, b)| a == b).count() }
 
-/// Encode borrowed source rows directly, without cloning their keys or clocks.
+/// Encode borrowed keyed entity heads directly, without cloning their keys or clocks.
 /// The repeatable iterator is scanned for exact size before one buffer is built.
-pub(super) fn write<'a>(rows: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> PackedHeads {
+pub(super) fn write<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> PackedHeads {
     let mut count = 0;
     let mut plain = 0;
     let mut compressed = 0;
@@ -54,7 +54,7 @@ pub(super) fn write<'a>(rows: impl Iterator<Item = (&'a [u8], EntityId, &'a Cloc
     let mut generations = 0;
     let mut tips = 0;
     let mut previous = &[][..];
-    for (key, _, head) in rows.clone() {
+    for (key, _, head) in heads.clone() {
         count += 1;
         let shared = common_prefix(previous, key);
         let generation_size = head.entries().iter().map(|(g, _)| uint_size(*g as usize)).sum::<usize>();
@@ -81,7 +81,7 @@ pub(super) fn write<'a>(rows: impl Iterator<Item = (&'a [u8], EntityId, &'a Cloc
     });
     put_uint(&mut bytes, count);
     previous = &[];
-    for (key, id, head) in rows {
+    for (key, id, head) in heads {
         let shared = if prefix { common_prefix(previous, key) } else { 0 };
         if prefix {
             put_uint(&mut bytes, shared);
@@ -103,9 +103,9 @@ pub(super) fn write<'a>(rows: impl Iterator<Item = (&'a [u8], EntityId, &'a Cloc
     PackedHeads { bytes: bytes.into(), len: count, expanded_size, plain_size: 1 + uint_size(count) + plain }
 }
 
-/// One row as it lies in the payload: its reconstructed key, its entity, and
-/// the bytes and tip count of its clock.
-pub(super) struct Row<'k, 'a> {
+/// One keyed entity head as it lies in the payload: its reconstructed key, its
+/// entity, and the bytes and tip count of its clock.
+pub(super) struct EncodedHead<'k, 'a> {
     pub key: &'k [u8],
     pub entity_id: EntityId,
     pub clock: &'a [u8],
@@ -154,7 +154,7 @@ impl<'a> Reader<'a> {
             _ => Err("unsupported inventory encoding"),
         }
     }
-    pub fn row<'k>(&mut self, prefix: bool, fixed: bool, key: &'k mut Vec<u8>) -> Result<Row<'k, 'a>>
+    pub fn head<'k>(&mut self, prefix: bool, fixed: bool, key: &'k mut Vec<u8>) -> Result<EncodedHead<'k, 'a>>
     where 'a: 'k {
         let shared = if prefix { self.uint()? } else { 0 };
         if shared > key.len() {
@@ -180,11 +180,11 @@ impl<'a> Reader<'a> {
             self.generation(fixed)?;
             self.take(32)?;
         }
-        Ok(Row { key: full_key, entity_id, clock: &self.bytes[start..self.offset], tips })
+        Ok(EncodedHead { key: full_key, entity_id, clock: &self.bytes[start..self.offset], tips })
     }
 }
 
-/// The (generation, event) tips of a clock that `Reader::row` already validated.
+/// The (generation, event) tips of a clock that `Reader::head` already validated.
 pub(super) fn tips(clock: &[u8], count: usize, fixed: bool) -> impl Iterator<Item = (u32, EventId)> + '_ {
     let mut reader = Reader::new(clock);
     (0..count).map(move |_| {
@@ -204,22 +204,22 @@ pub(super) fn validate(bytes: &[u8]) -> Result<(usize, u64, usize, bool)> {
     let (prefix, fixed) = reader.mode()?;
     let count = reader.uint()?;
     if count > MAX_ROWS {
-        return Err("packed inventory exceeds row limit");
+        return Err("packed inventory exceeds head limit");
     }
     let mut plain_size = 1 + uint_size(count);
     let mut expanded_size = 8;
     let mut canonical = true;
     let mut key = Vec::new();
     for _ in 0..count {
-        let row = reader.row(prefix, fixed, &mut key)?;
-        plain_size += uint_size(row.key.len()) + row.key.len() + 32 + uint_size(row.tips) + row.clock.len();
+        let head = reader.head(prefix, fixed, &mut key)?;
+        plain_size += uint_size(head.key.len()) + head.key.len() + 32 + uint_size(head.tips) + head.clock.len();
         if plain_size > MAX_BYTES {
             return Err("expanded inventory exceeds byte limit");
         }
-        expanded_size += 8 + row.key.len() as u64 + 32 + 8 + 36 * row.tips as u64;
-        let ordered = tips(row.clock, row.tips, fixed).map(|(_, id)| id).is_sorted_by(|a, b| a < b);
+        expanded_size += 8 + head.key.len() as u64 + 32 + 8 + 36 * head.tips as u64;
+        let ordered = tips(head.clock, head.tips, fixed).map(|(_, id)| id).is_sorted_by(|a, b| a < b);
         if !ordered {
-            Clock::new(tips(row.clock, row.tips, fixed).collect::<Vec<_>>()).map_err(|_| "invalid clock annotations")?;
+            Clock::new(tips(head.clock, head.tips, fixed).collect::<Vec<_>>()).map_err(|_| "invalid clock annotations")?;
             canonical = false;
         }
     }

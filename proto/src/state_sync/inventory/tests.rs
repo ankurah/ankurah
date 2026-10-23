@@ -3,7 +3,7 @@ use super::*;
 use crate::{EventId, SpanContent, StateAnswer, StateItem, TreeSpan, TreeSpanInventory};
 use std::ops::Bound;
 
-fn rows(keys: &[Vec<u8>], tips: usize) -> Vec<KeyedEntityHead> {
+fn keyed_heads(keys: &[Vec<u8>], tips: usize) -> Vec<KeyedEntityHead> {
     keys.iter()
         .enumerate()
         .map(|(n, key)| KeyedEntityHead {
@@ -36,10 +36,10 @@ fn verify(original: Vec<KeyedEntityHead>) {
     let json: PackedHeads = serde_json::from_value(expected.clone()).unwrap();
     assert_eq!(serde_json::to_value(&json).unwrap(), expected);
     let mut cursor = decoded.cursor();
-    for row in json.to_vec() {
+    for head in json.to_vec() {
         let view = cursor.next().unwrap();
-        assert_eq!(view.key, row.key);
-        assert!(view.entity.head.equals(&row.entity.head));
+        assert_eq!(view.key, head.key);
+        assert!(view.entity.head.equals(&head.entity.head));
     }
     assert!(cursor.next().is_none());
 }
@@ -48,19 +48,19 @@ fn verify(original: Vec<KeyedEntityHead>) {
 fn full_keys_ids_and_clocks_round_trip_in_both_encodings() {
     for tips in [0, 1, 6, 256] {
         for keys in [vec![], vec![vec![]], vec![vec![], vec![1, 0, 255]], vec![vec![42; 4096]; 8]] {
-            verify(rows(&keys, tips));
+            verify(keyed_heads(&keys, tips));
         }
     }
-    verify(rows(&(0..2048).map(|n| format!("acme/projects/{n:08}").into_bytes()).collect::<Vec<_>>(), 1));
+    verify(keyed_heads(&(0..2048).map(|n| format!("acme/projects/{n:08}").into_bytes()).collect::<Vec<_>>(), 1));
 }
 
 #[test]
 fn plain_fallback_and_prefix_choice_use_actual_encoded_size() {
     for keys in [vec![], vec![vec![]; 128], vec![b"one".to_vec()]] {
-        let packed: PackedHeads = rows(&keys, 1).into();
+        let packed: PackedHeads = keyed_heads(&keys, 1).into();
         assert_eq!(packed.bytes[0], PLAIN);
     }
-    let packed: PackedHeads = rows(&[b"a long shared prefix/one".to_vec(), b"a long shared prefix/two".to_vec()], 1).into();
+    let packed: PackedHeads = keyed_heads(&[b"a long shared prefix/one".to_vec(), b"a long shared prefix/two".to_vec()], 1).into();
     assert_eq!(packed.bytes[0], PREFIX);
     assert!(packed.bytes.len() < packed.plain_size);
     let clone = packed.clone();
@@ -75,7 +75,7 @@ fn plain_fallback_and_prefix_choice_use_actual_encoded_size() {
 fn initial_and_followup_inventories_use_the_same_encoding_and_absolute_bounds() {
     for start in [Bound::Unbounded, Bound::Included(vec![]), Bound::Excluded(vec![0; 251])] {
         for end in [Bound::Unbounded, Bound::Included(vec![255]), Bound::Excluded(vec![255; 251])] {
-            let page = TreeSpanInventory { bounds: TreeSpan::new(start.clone(), end), heads: rows(&[vec![1], vec![2]], 6).into() };
+            let page = TreeSpanInventory { bounds: TreeSpan::new(start.clone(), end), heads: keyed_heads(&[vec![1], vec![2]], 6).into() };
             let initial = bincode::serialize(&SpanContent::Heads(page.clone())).unwrap();
             assert_eq!(initial, bincode::serialize(&StateItem::Heads(page.clone())).unwrap());
             assert_eq!(initial, bincode::serialize(&StateAnswer::Heads(page.clone())).unwrap());
@@ -117,7 +117,7 @@ fn noncanonical_clocks_are_normalized_once_and_invalid_annotations_fail() {
 #[test]
 fn rejects_malformed_payloads_before_any_cursor_can_observe_them() {
     for keys in [vec![vec![]; 2], vec![b"shared-prefix-one".to_vec(), b"shared-prefix-two".to_vec()]] {
-        let page: PackedHeads = rows(&keys, 1).into();
+        let page: PackedHeads = keyed_heads(&keys, 1).into();
         for n in 0..page.bytes.len() {
             assert!(PackedHeads::decode(&page.bytes[..n]).is_err());
         }
@@ -137,20 +137,20 @@ fn rejects_malformed_payloads_before_any_cursor_can_observe_them() {
 }
 
 #[test]
-fn compression_cannot_bypass_expanded_work_or_row_limits() {
-    let expanded: PackedHeads = rows(&vec![vec![42; 4096]; 128], 1).into();
+fn compression_cannot_bypass_expanded_work_or_head_limits() {
+    let expanded: PackedHeads = keyed_heads(&vec![vec![42; 4096]; 128], 1).into();
     assert!(expanded.bytes.len() < MAX_BYTES);
     assert!(PackedHeads::decode(&expanded.bytes).is_err());
     assert!(bincode::serialize(&expanded).is_err());
-    let rows: PackedHeads = rows(&vec![vec![]; MAX_ROWS + 1], 0).into();
-    assert!(PackedHeads::decode(&rows.bytes).is_err());
-    assert!(bincode::serialize(&rows).is_err());
+    let too_many: PackedHeads = keyed_heads(&vec![vec![]; MAX_ROWS + 1], 0).into();
+    assert!(PackedHeads::decode(&too_many.bytes).is_err());
+    assert!(bincode::serialize(&too_many).is_err());
     assert!(PackedHeads::decode(&vec![PLAIN; MAX_BYTES + 1]).is_err());
 }
 
 #[test]
 fn expanded_size_preserves_the_old_fixed_width_work_budget() {
-    let owned = rows(&[vec![], vec![2; 251], vec![3; 4096]], 6);
+    let owned = keyed_heads(&[vec![], vec![2; 251], vec![3; 4096]], 6);
     let size = bincode::serialized_size(&owned).unwrap();
     let packed: PackedHeads = owned.into();
     assert_eq!(packed.expanded_size(), size);
@@ -158,7 +158,7 @@ fn expanded_size_preserves_the_old_fixed_width_work_budget() {
 
 #[test]
 fn retained_clocks_share_the_inventory_and_survive_cursor_drop() {
-    let packed: PackedHeads = rows(&[b"shared-prefix-a".to_vec(), b"shared-prefix-b".to_vec()], 6).into();
+    let packed: PackedHeads = keyed_heads(&[b"shared-prefix-a".to_vec(), b"shared-prefix-b".to_vec()], 6).into();
     let expected = packed.to_vec();
     let mut cursor = packed.cursor();
     let (id, clock) = cursor.next_clock().unwrap();
@@ -173,16 +173,16 @@ fn retained_clocks_share_the_inventory_and_survive_cursor_drop() {
 
 #[test]
 fn fixed_generations_keep_previously_valid_large_clock_pages_within_budget() {
-    let mut source = rows(&[vec![]], 1818);
+    let mut source = keyed_heads(&[vec![]], 1818);
     source[0].entity.head = Clock::new(source[0].entity.head.ids().map(|id| (u32::MAX, id.clone())).collect::<Vec<_>>()).unwrap();
     let page = TreeSpanInventory { bounds: TreeSpan::all(), heads: source.clone().into() };
     assert_eq!(page.heads.bytes[0], PLAIN_FIXED);
     assert!(4 + page.expanded_size() <= 64 * 1024);
     assert!(bincode::serialized_size(&StateItem::Heads(page)).unwrap() <= 64 * 1024);
     verify(source);
-    let mut source = rows(&vec![b"shared-prefix-and-key".to_vec(); 8], 6);
-    for row in &mut source {
-        row.entity.head = Clock::new(row.entity.head.ids().map(|id| (u32::MAX, id.clone())).collect::<Vec<_>>()).unwrap();
+    let mut source = keyed_heads(&vec![b"shared-prefix-and-key".to_vec(); 8], 6);
+    for head in &mut source {
+        head.entity.head = Clock::new(head.entity.head.ids().map(|id| (u32::MAX, id.clone())).collect::<Vec<_>>()).unwrap();
     }
     let packed: PackedHeads = source.clone().into();
     assert_eq!(packed.bytes[0], PREFIX_FIXED);
@@ -199,7 +199,7 @@ fn inventory_validation_checks_bounds_order_duplicates_and_canonical_keys() {
     use std::ops::Bound::{Excluded, Included};
 
     let spec = TreeSpec::new(KeySpec::new(vec![]), ankql::ast::Predicate::True);
-    let heads = rows(&[vec![], vec![], vec![]], 1);
+    let heads = keyed_heads(&[vec![], vec![], vec![]], 1);
     let address = |index: usize| leaf_address(&heads[index].key, heads[index].entity.entity_id);
     for bounds in [TreeSpan::all(), TreeSpan::new(Included(address(0)), Included(address(2)))] {
         let inventory = TreeSpanInventory { bounds, heads: heads.clone().into() };
@@ -215,7 +215,7 @@ fn inventory_validation_checks_bounds_order_duplicates_and_canonical_keys() {
         TreeSpanInventory { bounds: TreeSpan::new(Included(address(0)), Excluded(address(2))), heads: heads.clone().into() },
         TreeSpanInventory { bounds: TreeSpan::all(), heads: vec![heads[1].clone(), heads[0].clone()].into() },
         TreeSpanInventory { bounds: TreeSpan::all(), heads: vec![heads[0].clone(), heads[0].clone()].into() },
-        TreeSpanInventory { bounds: TreeSpan::all(), heads: rows(&[vec![1]], 1).into() },
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: keyed_heads(&[vec![1]], 1).into() },
     ];
     for inventory in invalid {
         assert!(inventory.validate(&spec).is_err(), "{inventory:?}");
