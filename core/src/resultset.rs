@@ -803,6 +803,7 @@ mod tests {
 
     #[test]
     fn string_order_survives_sort_key_growth_across_inline_boundary() {
+        let grown_name = "row-00000005-with-a-longer-key";
         for direction in [IndexDirection::Asc, IndexDirection::Desc] {
             let key_spec = KeySpec {
                 keyparts: vec![IndexKeyPart {
@@ -816,22 +817,29 @@ mod tests {
             };
             let mut entities =
                 (0..10u8).map(|id| TestEntity::new(id, [(prop("name"), Value::String(format!("row-{id:08}")))].into())).collect::<Vec<_>>();
+            let mut expected = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
+            if direction.is_desc() {
+                expected.reverse();
+            }
+
             let resultset = EntityResultSet::empty();
             resultset.order_by(Some(key_spec.clone()));
             resultset.write().replace_all(entities.clone());
-            let expected = resultset.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>();
+            assert_eq!(resultset.keys().collect::<Vec<_>>(), expected, "{direction:?}");
+
             let short = encode_tuple_values_with_key_spec(&[Value::String("row-00000005".into())], &key_spec).unwrap();
-            let long = encode_tuple_values_with_key_spec(&[Value::String("row-00000005-offline-edit".into())], &key_spec).unwrap();
+            let long = encode_tuple_values_with_key_spec(&[Value::String(grown_name.into())], &key_spec).unwrap();
             assert!(short.len() <= 16 && long.len() > 16, "fixture must cross the inline-key boundary");
-            entities[5].properties.insert(prop("name"), Value::String("row-00000005-offline-edit".into()));
+            entities[5].properties.insert(prop("name"), Value::String(grown_name.into()));
             resultset.write().replace_all(entities.clone());
-            assert_eq!(resultset.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>(), expected, "{direction:?}");
+            assert_eq!(resultset.keys().collect::<Vec<_>>(), expected, "{direction:?}");
+
             let added = EntityResultSet::empty();
             added.order_by(Some(key_spec));
             for entity in entities.into_iter().rev() {
                 added.write().add(entity);
             }
-            assert_eq!(added.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>(), expected, "{direction:?}");
+            assert_eq!(added.keys().collect::<Vec<_>>(), expected, "{direction:?}");
         }
     }
 
