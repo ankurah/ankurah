@@ -1118,7 +1118,7 @@ where
         if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
             break;
         }
-        if matches!(frame.body, StateFrameBody::BeginRound(_) | StateFrameBody::State { progress: ComparisonProgress::Complete, .. }) {
+        if matches!(frame.body, StateFrameBody::BeginRound(_) | StateFrameBody::Round { progress: ComparisonProgress::Complete, .. }) {
             // Applied covers the finite enumeration. Later requested history may
             // become unnecessary because another live update covers the target;
             // those frames still need wire credit, not another readiness fence.
@@ -1865,7 +1865,7 @@ impl Comparison {
         let finished = self.work.is_empty() && self.summaries.is_empty() && self.head_requests.is_empty();
         let first_complete = finished && !self.complete;
         self.complete |= finished;
-        Ok(StateFrameBody::State {
+        Ok(StateFrameBody::Round {
             round,
             items,
             progress: if first_complete { ComparisonProgress::Complete } else { ComparisonProgress::Continue },

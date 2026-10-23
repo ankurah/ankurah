@@ -298,7 +298,7 @@ mod tests {
         StateFrame {
             stream: stream_id,
             sequence,
-            body: proto::StateFrameBody::State { round: 0, items: Vec::new(), progress: proto::ComparisonProgress::Continue },
+            body: proto::StateFrameBody::Round { round: 0, items: Vec::new(), progress: proto::ComparisonProgress::Continue },
         }
     }
 

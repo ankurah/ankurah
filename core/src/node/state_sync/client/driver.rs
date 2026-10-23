@@ -826,7 +826,7 @@ impl Driver {
                 self.goals = Goals::default();
                 self.round_jobs = 0;
             }
-            StateFrameBody::State { round, items, progress } => {
+            StateFrameBody::Round { round, items, progress } => {
                 if round == self.round_number && self.projection.round.is_some() {
                     answers = self.items(node, peer, credentials, Owner::Round(round), items).await?;
                     answer_round = Some(round);

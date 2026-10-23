@@ -127,7 +127,7 @@ async fn cancelled_fetch_with_metadata_queued_in_its_waiter_abandons_the_stream(
     let (origin, state) = fetch_reply(&messages.lock().unwrap()).unwrap();
     let connection = client.peer_connections.get(&server.id).unwrap();
     until(|| !connection.pending_requests.contains_key(&origin)).await;
-    assert!(matches!(state.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }));
+    assert!(matches!(state.frame.body, proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Complete, .. }));
     assert!(!connection.outgoing_state_streams.contains_key(&state.frame.stream), "metadata has not been consumed");
     drop(fetch);
     assert_released_with_live_query(&server, &client, &query, &messages, origin, state).await?;
@@ -168,7 +168,7 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     )
     .await?;
     let proto::NodeResponseBody::Fetch(state) = response else { panic!("Fetch metadata") };
-    assert!(matches!(state.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Continue, .. }));
+    assert!(matches!(state.frame.body, proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Continue, .. }));
     let origin = stream.request.clone();
     let comparison = state.frame.stream;
     let mut receive = Box::pin(receive_state(&client, server.id, &credentials, snapshot, state.clone(), false, None, stream));

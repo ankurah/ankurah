@@ -67,7 +67,7 @@ fn comparison_digest_tracks_repair_content_but_not_session_ids() {
                 frame: proto::StateFrame {
                     stream: proto::StateStreamId::new(),
                     sequence: 1,
-                    body: proto::StateFrameBody::State {
+                    body: proto::StateFrameBody::Round {
                         round: 0,
                         items: vec![proto::StateItem::Repair {
                             target: proto::Clock::singleton(&event),

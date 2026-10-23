@@ -35,7 +35,7 @@ pub(super) fn answers_bytes(answers: &[StateAnswer]) -> bincode::Result<u64> {
 
 pub(super) fn frame_expansion(frame: &StateFrame) -> bincode::Result<u64> {
     let items = match &frame.body {
-        StateFrameBody::State { items, .. } | StateFrameBody::LiveRepair { items } => items,
+        StateFrameBody::Round { items, .. } | StateFrameBody::LiveRepair { items } => items,
         _ => return Ok(0),
     };
     // Snapshot/repair payloads do not compress here; avoid serializing those

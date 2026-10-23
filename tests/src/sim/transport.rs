@@ -285,7 +285,7 @@ fn state_descriptor(state: &proto::StateReply) -> String {
 fn frame_descriptor(frame: &proto::StateFrame) -> String {
     let body = match &frame.body {
         proto::StateFrameBody::BeginRound(round) => format!("begin {}", payload_digest(round)),
-        proto::StateFrameBody::State { round, items, progress } => format!("state {}", payload_digest(&(round, items, progress))),
+        proto::StateFrameBody::Round { round, items, progress } => format!("state {}", payload_digest(&(round, items, progress))),
         proto::StateFrameBody::Live { revision, items, complete } => format!("live {}", payload_digest(&(revision, items, complete))),
         proto::StateFrameBody::LiveChunk { revision, chunk, member, complete } => {
             format!("livechunk {}", payload_digest(&(revision, chunk, member, complete)))

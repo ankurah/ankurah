@@ -65,7 +65,7 @@ fn states(count: usize, payload: usize) -> Vec<proto::Attested<proto::EntityStat
         .collect()
 }
 fn state_items(frame: &StateFrame) -> (&[StateItem], ComparisonProgress) {
-    let StateFrameBody::State { items, progress, .. } = &frame.body else { panic!("state frame") };
+    let StateFrameBody::Round { items, progress, .. } = &frame.body else { panic!("state frame") };
     (items, *progress)
 }
 fn live_item(bytes: usize) -> proto::QueryChange {
@@ -133,7 +133,7 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
             );
         }
         let mut comparison = Comparison::new(snapshot, unknown())?;
-        let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
         let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count();
         assert!(repairs > PAGE_WORK, "resident snapshots must not stop at the storage/history work cap");
@@ -179,7 +179,7 @@ async fn storage_and_possible_history_repairs_keep_the_work_cap() -> anyhow::Res
         }
         let mut comparison = Comparison::new(snapshot, unknown())?;
         comparison.work = source.iter().map(|state| Work::Repair(state.payload.entity_id, known_head.clone())).collect();
-        let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
         assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), PAGE_WORK);
         assert_eq!(comparison.repaired.len(), PAGE_WORK);
@@ -205,7 +205,7 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
     assert!(known.spans.len() > 1);
     let mut equal = Comparison::new(stored_snapshot(&node, source.clone()).await?, known.clone())?;
     assert!(matches!(equal.work.front(), Some(Work::CompareFrontier(_))));
-    let StateFrameBody::State { items, progress, .. } = equal.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+    let StateFrameBody::Round { items, progress, .. } = equal.reply(&node, &vec![], false, 0).await? else { panic!("state") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(items.is_empty(), "equal captured results need no response items");
 
@@ -243,7 +243,7 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     let new_id = added.payload.entity_id;
     current.push(added);
     let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, known)?;
-    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+    let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
     assert!(matches!(items.as_slice(), [StateItem::NeedHeads(bounds)] if *bounds == super::super::whole()));
     comparison.answer(vec![StateAnswer::Heads(requester.page(super::super::whole())?)])?;
     let Some(Work::AnswerHeads { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
@@ -347,7 +347,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, proto::KnownState { spec: spec(), spans })?;
     let mut answers = Vec::new();
     while !comparison.work.is_empty() {
-        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         for item in items {
             let StateItem::NeedHeads(bounds) = item else { panic!("each changed supplied region must ask for leaves directly") };
             answers.push(StateAnswer::Heads(requester.page(bounds)?));
@@ -362,7 +362,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     assert_eq!(comparison.work.len(), 32, "one bounded work item must represent each accepted answer");
     let mut repaired = HashSet::new();
     while !comparison.complete {
-        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         for item in items {
             if let StateItem::Repair { delta, .. } = item {
@@ -412,7 +412,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     for _ in 0..64 {
         let body = comparison.reply(&node, &vec![], false, 0).await?;
         assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
-        let StateFrameBody::State { items, progress, .. } = body else { panic!("state frame") };
+        let StateFrameBody::Round { items, progress, .. } = body else { panic!("state frame") };
         let mut answers = Vec::new();
         for item in items {
             match item {
@@ -498,7 +498,7 @@ async fn inventories_tile_the_captured_membership_while_current_payloads_are_chu
     while !comparison.complete {
         let body = comparison.reply(&node, &vec![], false, 0).await?;
         assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
-        let StateFrameBody::State { items, .. } = body else { panic!("state frame") };
+        let StateFrameBody::Round { items, .. } = body else { panic!("state frame") };
         for item in items {
             match item {
                 StateItem::Heads(page) => {
@@ -550,7 +550,7 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
     let clock =
         proto::PackedHeads::from_rows(std::iter::once((&[][..], id, &source[0].payload.state.head))).cursor().next_clock().unwrap().1;
     comparison.known_clocks.insert(id, clock);
-    let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state frame") };
+    let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state frame") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items.as_slice(), [StateItem::Heads(page)] if page.heads.to_vec()[0].entity.entity_id == id));
     assert!(comparison.offered.contains(&target_id(id, &source[0].payload.state.head)), "membership still offers its captured target");
@@ -565,7 +565,7 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
         .unwrap();
     *node.storage.reject_state_read.lock().unwrap() = Some(id);
     let mut comparison = Comparison::new(stored_snapshot(&node, source).await?, unknown())?;
-    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], true, 0).await? else { panic!("state") };
+    let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], true, 0).await? else { panic!("state") };
     assert!(
         items.iter().any(|item| matches!(item, StateItem::RepairUnavailable { entity_id, .. } if *entity_id == id)),
         "a captured member cannot authorize an out-of-scope current payload"
@@ -928,9 +928,9 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
         .collect::<Vec<_>>();
     let first_live = bodies.iter().position(|body| matches!(body, StateFrameBody::Live { .. })).unwrap();
     let last_live = bodies.iter().rposition(|body| matches!(body, StateFrameBody::Live { .. })).unwrap();
-    assert!(bodies[..first_live].iter().any(|body| matches!(body, StateFrameBody::State { .. })));
+    assert!(bodies[..first_live].iter().any(|body| matches!(body, StateFrameBody::Round { .. })));
     assert!(
-        bodies[first_live + 1..last_live].iter().any(|body| matches!(body, StateFrameBody::State { .. })),
+        bodies[first_live + 1..last_live].iter().any(|body| matches!(body, StateFrameBody::Round { .. })),
         "a live backlog cannot starve baseline work"
     );
     let live_count = bodies.iter().filter(|body| matches!(body, StateFrameBody::Live { .. })).count();
@@ -1285,7 +1285,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
                 StateFrame {
                     stream: id,
                     sequence,
-                    body: StateFrameBody::State { round: 0, items: vec![], progress: ComparisonProgress::Continue },
+                    body: StateFrameBody::Round { round: 0, items: vec![], progress: ComparisonProgress::Continue },
                 },
                 false,
             )?;
@@ -1621,7 +1621,7 @@ async fn initial_items(node: &TestNode, comparison: &mut Comparison) -> anyhow::
         if comparison.complete {
             return Ok(all);
         }
-        let StateFrameBody::State { items, .. } = comparison.reply(node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, .. } = comparison.reply(node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         assert!(bincode::serialized_size(&items)? <= PAGE_BYTES as u64);
         assert!(!items.iter().any(|item| matches!(item, StateItem::NeedHeads(_) | StateItem::Digest(_))));
@@ -2199,7 +2199,7 @@ async fn registered_stream_queues_live_changes_before_initial_frame_is_ready() -
     let initial = pending.initialize(&node).await?;
     assert_eq!(initial.frame.sequence, 0);
     assert_eq!(initial.round.revision, 10);
-    assert!(matches!(initial.frame.body, StateFrameBody::State { progress: ComparisonProgress::Complete, .. }));
+    assert!(matches!(initial.frame.body, StateFrameBody::Round { progress: ComparisonProgress::Complete, .. }));
     session.pumping.store(true, Ordering::Release);
     pump_state_stream(&node, peer, id).await?;
     assert!(messages.lock().unwrap().iter().any(|message| matches!(

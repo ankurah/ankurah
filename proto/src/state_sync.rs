@@ -94,7 +94,7 @@ pub enum StateFrameBody {
     /// Accept the requester's already-frozen offer for the next round. This marker
     /// precedes its questions/pages and every live publication after its revision.
     BeginRound(StateRound),
-    State {
+    Round {
         round: u64,
         items: Vec<StateItem>,
         progress: ComparisonProgress,

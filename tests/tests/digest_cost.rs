@@ -161,7 +161,7 @@ impl Meter {
     }
     fn observe_frame(&mut self, frame: &proto::StateFrame) {
         self.traffic.frames += 1;
-        if let proto::StateFrameBody::State { items, .. } = &frame.body {
+        if let proto::StateFrameBody::Round { items, .. } = &frame.body {
             self.traffic.max_reply_items = self.traffic.max_reply_items.max(items.len());
             let bytes = items.iter().map(|item| bincode::serialized_size(item).unwrap() as usize).sum();
             self.traffic.max_reply_item_bytes = self.traffic.max_reply_item_bytes.max(bytes);

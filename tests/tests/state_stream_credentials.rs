@@ -324,7 +324,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     .await?;
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = &response.body else { unreachable!() };
     let comparison = state.frame.stream;
-    let proto::StateFrameBody::State { items, .. } = &state.frame.body else { unreachable!() };
+    let proto::StateFrameBody::Round { items, .. } = &state.frame.body else { unreachable!() };
     assert!(
         items.iter().any(|item| matches!(item, proto::StateItem::Repair { target, delta }
         if delta.entity_id == id && *target == captured_target && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))),

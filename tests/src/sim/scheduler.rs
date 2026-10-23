@@ -184,7 +184,7 @@ impl Scheduler {
             }
             proto::NodeMessage::AbandonStateStream { stream, .. } => self.catalog_comparisons.contains(stream),
             proto::NodeMessage::Update(update) => matches!(&update.body, proto::NodeUpdateBody::StateFrame { request_id, frame }
-                if matches!(frame.body, proto::StateFrameBody::State { .. })
+                if matches!(frame.body, proto::StateFrameBody::Round { .. })
                     && (self.catalog_requests.contains(request_id) || self.catalog_comparisons.contains(&frame.stream))),
             _ => false,
         }

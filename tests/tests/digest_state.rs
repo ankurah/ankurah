@@ -44,7 +44,7 @@ impl Trace {
             .chain(pushed.iter())
             .filter(|frame| comparisons.contains(&frame.stream))
             .flat_map(|frame| match &frame.body {
-                proto::StateFrameBody::State { items, .. } => items.clone(),
+                proto::StateFrameBody::Round { items, .. } => items.clone(),
                 _ => vec![],
             })
             .collect()
@@ -158,7 +158,7 @@ async fn fetch_initial_inventory_omits_equal_heads_and_sends_only_the_changed_ta
     assert!(
         trace.0.lock().unwrap().iter().any(|body| matches!(body,
         NodeResponseBody::Fetch(state) if matches!(state.frame.body,
-            proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))),
+            proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Complete, .. }))),
         "empty comparison output must still finish with Complete"
     );
 
@@ -1202,7 +1202,7 @@ async fn head_inventory_preserves_captured_keys_while_repair_joins_a_concurrent_
         move |message| {
             trace.record(message);
             if let NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
-                if matches!(&frame.body, proto::StateFrameBody::State { items, .. } if bridge_for(items, record_id)) {
+                if matches!(&frame.body, proto::StateFrameBody::Round { items, .. } if bridge_for(items, record_id)) {
                     repair_parked.store(true, Ordering::Release);
                     return true;
                 }
@@ -1380,7 +1380,7 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
                 _ => None,
             };
             let repair = frame.is_some_and(|frame| match &frame.body {
-                proto::StateFrameBody::State { items, .. } => bridge_for(items, concurrent_id),
+                proto::StateFrameBody::Round { items, .. } => bridge_for(items, concurrent_id),
                 _ => false,
             });
             if repair {

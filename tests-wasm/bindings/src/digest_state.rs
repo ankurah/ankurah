@@ -128,14 +128,14 @@ fn frames(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::St
 fn completed(responses: &Responses, query: Option<proto::QueryId>) -> bool {
     frames(responses, query)
         .iter()
-        .any(|frame| matches!(&frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))
+        .any(|frame| matches!(&frame.body, proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Complete, .. }))
 }
 
 fn items(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::StateItem> {
     frames(responses, query)
         .into_iter()
         .flat_map(|frame| match frame.body {
-            proto::StateFrameBody::State { items, .. } => items,
+            proto::StateFrameBody::Round { items, .. } => items,
             _ => vec![],
         })
         .collect()

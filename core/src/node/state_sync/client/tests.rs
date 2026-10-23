@@ -19,7 +19,7 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
     let frame = proto::StateFrame {
         stream: proto::StateStreamId::new(),
         sequence: 0,
-        body: proto::StateFrameBody::State {
+        body: proto::StateFrameBody::Round {
             round: 0,
             items: vec![proto::StateItem::Heads(page.clone()), proto::StateItem::Heads(page)],
             progress: proto::ComparisonProgress::Continue,
@@ -419,7 +419,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     )
     .await?;
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = response else { panic!("expected query metadata") };
-    assert!(matches!(state.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Continue, .. }));
+    assert!(matches!(state.frame.body, proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Continue, .. }));
     let comparison = state.frame.stream;
     let peer = server.peer_connections.get(&client.id).unwrap();
     let (_, original_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
