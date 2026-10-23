@@ -57,9 +57,8 @@ struct LinkState {
     /// When each direction's serializer finishes the messages queued on it.
     requester_free_at: Option<Instant>,
     responder_free_at: Option<Instant>,
-    /// `QuerySubscribed` responses the nodes handled: in total, and by query.
-    subscriptions_handled: usize,
-    query_subscriptions_handled: HashMap<proto::QueryId, usize>,
+    /// `QuerySubscribed` responses the nodes handled, by query.
+    subscriptions_handled: HashMap<proto::QueryId, usize>,
     /// Whether sends count toward `traffic`.
     measuring: bool,
     traffic: Traffic,
@@ -104,18 +103,18 @@ impl Link {
         client.deregister_peer(server.id);
     }
 
-    /// Waits until no message is in flight, the nodes have handled at least `subscriptions`
-    /// `QuerySubscribed` responses (and `query_subscription.1` of them for query
-    /// `query_subscription.0`), and the link has been quiet for 2 ms. Returns the time of the last
-    /// link activity, which leaves out the 2 ms confirmation.
-    pub async fn settle(&self, subscriptions: usize, query_subscription: Option<(proto::QueryId, usize)>) -> anyhow::Result<Instant> {
+    /// Waits until no message is in flight, the link has been quiet for 2 ms, and, when `subscribed`
+    /// names a query and a count, that query has handled at least that many `QuerySubscribed`
+    /// responses. Returns the time of the last link activity, which leaves out the 2 ms
+    /// confirmation.
+    pub async fn settle(&self, subscribed: Option<(proto::QueryId, usize)>) -> anyhow::Result<Instant> {
         let waiting_since = Instant::now();
         loop {
             {
                 let state = self.state.lock().unwrap();
                 state.check_errors()?;
-                let query_handled = query_subscription.is_none_or(|(query, count)| state.query_subscriptions_handled(query) >= count);
-                if state.in_flight == 0 && state.subscriptions_handled >= subscriptions && query_handled {
+                let subscribed = subscribed.is_none_or(|(query, count)| state.subscriptions_handled(query) >= count);
+                if state.in_flight == 0 && subscribed {
                     let last = state.last_activity.unwrap_or_else(Instant::now);
                     if last.max(waiting_since).elapsed() >= QUIET {
                         return Ok(last);
@@ -126,11 +125,8 @@ impl Link {
         }
     }
 
-    /// How many `QuerySubscribed` responses the nodes have handled: in total, and for `query`.
-    pub fn subscriptions_handled(&self, query: Option<proto::QueryId>) -> (usize, Option<usize>) {
-        let state = self.state.lock().unwrap();
-        (state.subscriptions_handled, query.map(|query| state.query_subscriptions_handled(query)))
-    }
+    /// How many `QuerySubscribed` responses `query` has handled.
+    pub fn subscriptions_handled(&self, query: proto::QueryId) -> usize { self.state.lock().unwrap().subscriptions_handled(query) }
 
     /// Starts counting the measured interval's traffic. Fails if a node already reported an error.
     pub fn start_measuring(&self) -> anyhow::Result<()> {
@@ -213,8 +209,7 @@ impl Link {
                     Err(error) => state.errors.push(error.to_string()),
                     Ok(()) => {
                         if let Some(query) = subscribed {
-                            state.subscriptions_handled += 1;
-                            *state.query_subscriptions_handled.entry(query).or_default() += 1;
+                            *state.subscriptions_handled.entry(query).or_default() += 1;
                         }
                     }
                 }
@@ -231,9 +226,7 @@ impl LinkState {
         Ok(())
     }
 
-    fn query_subscriptions_handled(&self, query: proto::QueryId) -> usize {
-        self.query_subscriptions_handled.get(&query).copied().unwrap_or(0)
-    }
+    fn subscriptions_handled(&self, query: proto::QueryId) -> usize { self.subscriptions_handled.get(&query).copied().unwrap_or(0) }
 }
 
 impl Traffic {

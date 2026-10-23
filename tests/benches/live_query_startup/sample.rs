@@ -37,10 +37,7 @@ pub async fn run(case: &Case<'_>) -> anyhow::Result<()> {
     fixture.server.storage.take_reads();
     fixture.client.storage.take_reads();
     let probe = retained.as_ref().filter(|_| case.mode.reconnects()).map(|query| InstallationProbe::watch(query, &fixture.link, ordered));
-    let (subscriptions_before, query_subscriptions_before) =
-        fixture.link.subscriptions_handled(retained.as_ref().map(|query| query.query_id()));
-    let required_query_subscription =
-        retained.as_ref().map(|query| query.query_id()).zip(query_subscriptions_before).map(|(query, count)| (query, count + 1));
+    let subscriptions_before = retained.as_ref().map_or(0, |query| fixture.link.subscriptions_handled(query.query_id()));
     fixture.link.start_measuring()?;
 
     phase("measure");
@@ -76,8 +73,9 @@ pub async fn run(case: &Case<'_>) -> anyhow::Result<()> {
     let verified = Landmark::reached(start)?;
     let endpoint = ready.or(installed).expect("every scenario reaches the durable-answer or installation endpoint");
 
-    // The activation's subscription response and a quiet link confirm the result already verified.
-    let settled_at = fixture.link.settle(subscriptions_before + 1, required_query_subscription).await?;
+    // The measured query's own subscription response and a quiet link confirm the activation whose
+    // result was already verified.
+    let settled_at = fixture.link.settle(Some((query.query_id(), subscriptions_before + 1))).await?;
     let settled = Landmark { us: settled_at.duration_since(start).as_micros(), cpu: ProcessCpu::now()? };
     // Work the nodes do after the link settles still counts; only the verifier's own point reads
     // of each expected entity are left out.

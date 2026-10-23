@@ -107,24 +107,24 @@ impl Fixture {
             Cache::Full => (self.reader.fetch::<StartupRowView>(case.predicate()).await?.len(), case.entities),
         };
         anyhow::ensure!(cached == coverage, "prefetch coverage: fetched {cached} rows, expected {coverage}");
-        self.link.settle(0, None).await?;
+        self.link.settle(None).await?;
         Ok(cached)
     }
 
     /// Opens the live query a warm scenario retains, waits for its durable answer, and settles the
-    /// link.
+    /// link once the query's subscription response has been handled.
     pub async fn open_query(&self, selection: &str) -> anyhow::Result<LiveQuery<StartupRowView>> {
         phase("initial-query");
         let query = self.reader.query_wait::<StartupRowView>(selection).await?;
         query.wait_durable_answered().await?;
-        self.link.settle(1, None).await?;
+        self.link.settle(Some((query.query_id(), 1))).await?;
         Ok(query)
     }
 
     /// Disconnects the client and waits for the messages still in flight to be dropped.
     pub async fn go_offline(&self) -> anyhow::Result<()> {
         self.link.disconnect(&self.server, &self.client);
-        self.link.settle(0, None).await?;
+        self.link.settle(None).await?;
         Ok(())
     }
 
