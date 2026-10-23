@@ -1,9 +1,12 @@
 //! What every executor must agree on where values cross the driver boundary,
 //! checked natively on rusqlite and on wasm32 on node:sqlite.
 
+mod common;
+
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{SqliteStorageEngine, SqliteValue, SqliteValueRef};
+use ankurah_storage_sqlite::{exec::Behavior, SqliteStorageEngine, SqliteValue, SqliteValueRef};
 use anyhow::Result;
+use common::{session_settings, LockHolder, Stopwatch, TempDb};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 // The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
@@ -114,5 +117,149 @@ async fn duplicate_column_names_keep_both_positions() -> Result<()> {
     assert_eq!(row.values().len(), 2);
     assert_eq!(row.integer(0)?, 1);
     assert_eq!(row.integer(1)?, 2);
+    Ok(())
+}
+
+/// TEXT crosses the boundary as its bytes: a NUL inside it is kept, and TEXT
+/// whose bytes are not UTF-8 is refused, in rusqlite's words, on every
+/// driver. (node:sqlite's own strings would cut the first value at its NUL
+/// and turn the second into U+FFFD.)
+#[engine_test]
+async fn text_keeps_an_embedded_nul_and_refuses_bytes_that_are_not_utf8() -> Result<()> {
+    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let (bound, cast, stored, length, replacement) = storage
+        .with_executor(|executor| {
+            let row = executor
+                .query_row("SELECT ?1, CAST(x'610062' AS TEXT), length(CAST(?1 AS BLOB))", &[SqliteValueRef::Text("a\0b")])?
+                .expect("one row");
+            executor.execute("CREATE TABLE texts (t TEXT)", &[])?;
+            executor.execute("INSERT INTO texts (t) VALUES (?)", &[SqliteValueRef::Text("a\0b")])?;
+            let stored = executor.query_row("SELECT t FROM texts", &[])?.expect("one row");
+            let replacement = executor.query_row("SELECT ?", &[SqliteValueRef::Text("\u{FFFD}")])?.expect("one row");
+            Ok((
+                row.text(0)?.to_owned(),
+                row.text(1)?.to_owned(),
+                stored.text(0)?.to_owned(),
+                row.integer(2)?,
+                replacement.text(0)?.to_owned(),
+            ))
+        })
+        .await?;
+    assert_eq!([bound.as_str(), cast.as_str(), stored.as_str()], ["a\0b"; 3]);
+    assert_eq!(length, 3, "the NUL is stored");
+    assert_eq!(replacement, "\u{FFFD}", "a U+FFFD that is really there reads as itself");
+
+    let error =
+        storage.with_executor(|executor| executor.query("SELECT 'ok', CAST(x'ff41' AS TEXT)", &[])).await.expect_err("0xff is not UTF-8");
+    assert!(
+        error.to_string().ends_with("Conversion error from type Text at index: 1, invalid utf-8 sequence of 1 bytes from index 0"),
+        "{error}"
+    );
+    Ok(())
+}
+
+/// A row lends its TEXT and BLOB values, each read pointing at the one copy
+/// the row holds rather than at a fresh one.
+#[engine_test]
+async fn rows_lend_their_text_and_blob_values() -> Result<()> {
+    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let row = storage.with_executor(|executor| Ok(executor.query_row("SELECT 'text', x'0102'", &[])?.expect("one row"))).await?;
+    assert!(std::ptr::eq(row.text(0)?, row.text(0)?));
+    assert!(std::ptr::eq(row.blob(1)?, row.blob(1)?));
+    Ok(())
+}
+
+/// `execute` runs a statement for its effect, and refuses one whose first
+/// step yields a row, as rusqlite's does, so a query cannot pass for a write.
+#[engine_test]
+async fn execute_refuses_a_statement_that_yields_a_row() -> Result<()> {
+    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let outcomes = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY)", &[])?;
+            Ok([
+                "SELECT 1",
+                "PRAGMA busy_timeout",
+                "INSERT INTO things (k) VALUES (1) RETURNING k",
+                "SELECT 1 WHERE 0",
+                "INSERT INTO things (k) VALUES (2), (3)",
+            ]
+            .map(|sql| executor.execute(sql, &[]).map_err(|error| error.to_string())))
+        })
+        .await?;
+    for refused in &outcomes[..3] {
+        let error = refused.as_ref().expect_err("a statement that yields a row is refused");
+        assert!(error.ends_with("Execute returned results - did you mean to call query?"), "{error}");
+    }
+    assert!(outcomes[3].is_ok(), "a statement whose step yields no row runs: {:?}", outcomes[3]);
+    assert_eq!(outcomes[4], Ok(2));
+    Ok(())
+}
+
+/// An error SQLite raises carries its extended result code on rusqlite and
+/// on node:sqlite alike.
+#[engine_test]
+async fn errors_carry_sqlite_s_extended_result_code() -> Result<()> {
+    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let codes = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY, v TEXT UNIQUE)", &[])?;
+            executor.execute("INSERT INTO things (k, v) VALUES (1, 'a')", &[])?;
+            let key = executor.execute("INSERT INTO things (k, v) VALUES (1, 'b')", &[]).expect_err("a duplicate key is refused");
+            let unique = executor.execute("INSERT INTO things (k, v) VALUES (2, 'a')", &[]).expect_err("a duplicate value is refused");
+            let syntax = executor.query("SELEC 1", &[]).expect_err("a misspelt statement is refused");
+            let row = executor.query_row("SELECT 'text'", &[])?.expect("one row").integer(0).expect_err("TEXT is not an INTEGER");
+            Ok([key, unique, syntax, row].map(|error| error.sqlite_code()))
+        })
+        .await?;
+    // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR, and
+    // no code for an error SQLite did not raise.
+    assert_eq!(codes, [Some(1555), Some(2067), Some(1), None]);
+    Ok(())
+}
+
+/// A connection the engine opens on a file takes the session settings
+/// connection.rs gives a native one, on every driver.
+#[engine_test]
+async fn a_connection_on_a_file_takes_the_session_settings() -> Result<()> {
+    let db = TempDb::new("settings");
+    let storage = SqliteStorageEngine::open(db.path()).await?;
+    assert_eq!(session_settings(&storage).await?, (5000, "wal".to_owned(), 1, 1, -64000, 268_435_456, 2));
+    Ok(())
+}
+
+/// How long the other connection in the lock tests holds its lock: long
+/// enough for a wait to show, and well inside the 5000 ms busy timeout.
+const HOLD_MS: u64 = 400;
+
+/// A writer waits for another connection's write lock on the same file and
+/// takes it once released, rather than failing at once.
+#[engine_test]
+async fn a_writer_waits_for_another_connection_s_lock() -> Result<()> {
+    let db = TempDb::new("writer_waits");
+    let storage = SqliteStorageEngine::open(db.path()).await?;
+    let holder = LockHolder::take(&db, "BEGIN IMMEDIATE", HOLD_MS).await;
+    let waited = Stopwatch::start();
+    storage.with_executor(|executor| executor.begin(Behavior::Immediate)?.commit()).await?;
+    let waited = waited.elapsed_ms();
+    holder.released().await;
+    assert!(waited >= HOLD_MS as f64 / 2.0, "the writer took the lock after {waited} ms, before it was released");
+    Ok(())
+}
+
+/// Opening a store waits for a lock another connection holds on its file
+/// rather than failing at once: the busy timeout is set before any statement
+/// that needs the file.
+#[engine_test]
+async fn opening_a_store_waits_for_a_lock_on_its_file() -> Result<()> {
+    let db = TempDb::new("open_waits");
+    // EXCLUSIVE in the file's first, rollback journal keeps out readers too.
+    let holder = LockHolder::take(&db, "BEGIN EXCLUSIVE", HOLD_MS).await;
+    let waited = Stopwatch::start();
+    let storage = SqliteStorageEngine::open(db.path()).await?;
+    let waited = waited.elapsed_ms();
+    holder.released().await;
+    assert!(waited >= HOLD_MS as f64 / 2.0, "the store opened after {waited} ms, before the lock was released");
+    assert_eq!(session_settings(&storage).await?.1, "wal");
     Ok(())
 }
