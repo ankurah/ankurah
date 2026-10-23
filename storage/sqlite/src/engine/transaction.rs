@@ -49,11 +49,11 @@ pub(super) fn insert_events(conn: &dyn SqliteExecutor, events: &[EventRow]) -> R
                 VALUES (?, ?, ?, ?, ?) ON CONFLICT ("id") DO NOTHING"#
             ),
             &[
-                SqliteValue::Text(event.id.clone()),
-                SqliteValue::Text(event.entity_id.clone()),
-                SqliteValue::Blob(event.body.clone()),
-                SqliteValue::Text(event.parent.clone()),
-                SqliteValue::Blob(event.attestations.clone()),
+                SqliteValueRef::Text(&event.id),
+                SqliteValueRef::Text(&event.entity_id),
+                SqliteValueRef::Blob(&event.body),
+                SqliteValueRef::Text(&event.parent),
+                SqliteValueRef::Blob(&event.attestations),
             ],
         )?;
     }
@@ -131,7 +131,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
                         r#"SELECT "id", "state_buffer", "head", "attestations"
                                FROM "{ENTITY_TABLE}" WHERE "id" = ?"#
                     ),
-                    &[SqliteValue::Text(entity_key.clone())],
+                    &[SqliteValueRef::Text(&entity_key)],
                 )?;
                 let current = current_row
                     .map(|row| {
@@ -161,12 +161,13 @@ impl StorageTransaction for SqliteTransaction<'_> {
                     )));
                 }
                 for model in target {
+                    let model_key = bincode::serialize(model)?;
                     tx.execute(
                         &format!(
                             r#"INSERT OR IGNORE INTO "{ENTITY_MODEL_TABLE}" ("entity_id", "model_key")
                                VALUES (?, ?)"#
                         ),
-                        &[SqliteValue::Text(entity_key.clone()), SqliteValue::Blob(bincode::serialize(model)?)],
+                        &[SqliteValueRef::Text(&entity_key), SqliteValueRef::Blob(&model_key)],
                     )?;
                 }
             }
@@ -185,10 +186,10 @@ impl StorageTransaction for SqliteTransaction<'_> {
                                "attestations" = excluded."attestations""#
                     ),
                     &[
-                        SqliteValue::Text(write.entity_key.clone()),
-                        SqliteValue::Blob(write.state_buffers.clone()),
-                        SqliteValue::Text(serde_json::to_string(&write.head)?),
-                        SqliteValue::Blob(write.attestations.clone()),
+                        SqliteValueRef::Text(&write.entity_key),
+                        SqliteValueRef::Blob(&write.state_buffers),
+                        SqliteValueRef::Text(&serde_json::to_string(&write.head)?),
+                        SqliteValueRef::Blob(&write.attestations),
                     ],
                 )?;
                 for projection in &write.materializations {

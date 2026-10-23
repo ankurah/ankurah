@@ -31,7 +31,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use crate::{
     error::SqliteError,
     exec::{Row, SqliteExecutor},
-    value::SqliteValue,
+    value::{SqliteValue, SqliteValueRef},
     SqliteStorageEngine,
 };
 
@@ -194,7 +194,7 @@ impl SqliteExecutor for NodeConnection {
     /// statement when that step yields a row, since a statement that returns
     /// rows belongs to `query`. node:sqlite's `run` takes the step and
     /// discards the row.
-    fn execute(&self, sql: &str, params: &[SqliteValue]) -> Result<usize, SqliteError> {
+    fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
         let statement = self.prepare(sql)?;
         if width(&statement)? == 0 {
             // A statement without columns yields no row.
@@ -219,7 +219,7 @@ impl SqliteExecutor for NodeConnection {
         }
     }
 
-    fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError> {
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
         let statement = self.prepare(sql)?;
         let width = width(&statement)?;
         if width == 0 {
@@ -379,7 +379,7 @@ fn width(statement: &JsValue) -> Result<usize, SqliteError> {
 
 /// Run a statement and take every row it yields, refusing any row that is
 /// not an array of `width` values before a value of it is read.
-fn all(statement: &JsValue, params: &[SqliteValue], width: usize) -> Result<Vec<Array>, SqliteError> {
+fn all(statement: &JsValue, params: &[SqliteValueRef<'_>], width: usize) -> Result<Vec<Array>, SqliteError> {
     let rows: Array = statement_method(statement, "all")?
         .apply(statement, &js_params(params))
         .map_err(js_error)?
@@ -410,18 +410,18 @@ fn changed_rows(result: &JsValue) -> Result<usize, SqliteError> {
     usize::try_from(count).map_err(|_| SqliteError::Node(format!("`run()` reported {count} changed rows")))
 }
 
-fn js_params(params: &[SqliteValue]) -> Array { params.iter().map(js_param).collect() }
+fn js_params(params: &[SqliteValueRef<'_>]) -> Array { params.iter().map(js_param).collect() }
 
-fn js_param(value: &SqliteValue) -> JsValue {
-    match value {
-        SqliteValue::Text(text) => JsValue::from_str(text),
+fn js_param(value: &SqliteValueRef<'_>) -> JsValue {
+    match *value {
+        SqliteValueRef::Text(text) => JsValue::from_str(text),
         // BigInt binds as INTEGER exactly; a JavaScript number would bind as REAL.
-        SqliteValue::Integer(integer) => BigInt::from(*integer).into(),
-        SqliteValue::Real(real) => JsValue::from_f64(*real),
-        SqliteValue::Blob(bytes) => Uint8Array::from(bytes.as_slice()).into(),
+        SqliteValueRef::Integer(integer) => BigInt::from(integer).into(),
+        SqliteValueRef::Real(real) => JsValue::from_f64(real),
+        SqliteValueRef::Blob(bytes) => Uint8Array::from(bytes).into(),
         // The SQL wraps this placeholder in jsonb(?), so the text form binds.
-        SqliteValue::Jsonb(json) => JsValue::from_str(&json.to_string()),
-        SqliteValue::Null => JsValue::NULL,
+        SqliteValueRef::Jsonb(json) => JsValue::from_str(&json.to_string()),
+        SqliteValueRef::Null => JsValue::NULL,
     }
 }
 

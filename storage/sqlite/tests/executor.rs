@@ -2,7 +2,7 @@
 //! checked natively on rusqlite and on wasm32 on node:sqlite.
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{SqliteStorageEngine, SqliteValue};
+use ankurah_storage_sqlite::{SqliteStorageEngine, SqliteValue, SqliteValueRef};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -96,8 +96,9 @@ async fn integer_results_preserve_all_bits() -> Result<()> {
         .with_executor(|executor| {
             executor.execute("CREATE TABLE exact_integers (value INTEGER)", &[])?;
             for value in [i64::MIN, -9_007_199_254_740_993, 9_007_199_254_740_993, i64::MAX] {
-                executor.execute("INSERT INTO exact_integers VALUES (?)", &[SqliteValue::Integer(value)])?;
-                let row = executor.query_row("SELECT value FROM exact_integers WHERE value = ?", &[SqliteValue::Integer(value)])?.unwrap();
+                executor.execute("INSERT INTO exact_integers VALUES (?)", &[SqliteValueRef::Integer(value)])?;
+                let row =
+                    executor.query_row("SELECT value FROM exact_integers WHERE value = ?", &[SqliteValueRef::Integer(value)])?.unwrap();
                 assert_eq!(row.integer(0)?, value);
             }
             Ok(())

@@ -48,6 +48,33 @@ impl SqliteValue {
     }
 }
 
+/// A parameter the executor binds by reference, as rusqlite's `ValueRef` is
+/// to its `Value`: TEXT and BLOB stay with their owner instead of being
+/// copied into a [`SqliteValue`] for the length of one statement.
+#[derive(Debug, Clone, Copy)]
+pub enum SqliteValueRef<'a> {
+    Text(&'a str),
+    Integer(i64),
+    Real(f64),
+    Blob(&'a [u8]),
+    /// JSON, bound as its text for the `jsonb(?)` that wraps its placeholder.
+    Jsonb(&'a serde_json::Value),
+    Null,
+}
+
+impl<'a> From<&'a SqliteValue> for SqliteValueRef<'a> {
+    fn from(value: &'a SqliteValue) -> Self {
+        match value {
+            SqliteValue::Text(text) => SqliteValueRef::Text(text),
+            SqliteValue::Integer(integer) => SqliteValueRef::Integer(*integer),
+            SqliteValue::Real(real) => SqliteValueRef::Real(*real),
+            SqliteValue::Blob(bytes) => SqliteValueRef::Blob(bytes),
+            SqliteValue::Jsonb(json) => SqliteValueRef::Jsonb(json),
+            SqliteValue::Null => SqliteValueRef::Null,
+        }
+    }
+}
+
 impl From<Value> for SqliteValue {
     fn from(value: Value) -> Self {
         match value {

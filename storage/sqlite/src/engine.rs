@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use crate::driver::{self, Pool, PooledConnection};
 use crate::error::SqliteError;
 use crate::exec::{Behavior, Row, SqliteExecutor};
-use crate::value::SqliteValue;
+use crate::value::{SqliteValue, SqliteValueRef};
 
 mod materialization;
 mod query;
@@ -58,7 +58,7 @@ fn reserved_system_table_names() -> Vec<String> {
 }
 
 fn table_exists(conn: &dyn SqliteExecutor, table: &str) -> Result<bool, SqliteError> {
-    Ok(conn.query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", &[SqliteValue::Text(table.to_owned())])?.is_some())
+    Ok(conn.query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", &[SqliteValueRef::Text(table)])?.is_some())
 }
 
 /// SQLite storage engine
@@ -80,9 +80,9 @@ impl SqliteStorageEngine {
             }
             c.query_row(
                 &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}" WHERE "model_key" = ?"#),
-                &[SqliteValue::Blob(model_key)],
+                &[SqliteValueRef::Blob(&model_key)],
             )?
-            .map(|row| row.text(0))
+            .map(|row| row.text(0).map(str::to_owned))
             .transpose()
         })
         .await
@@ -124,19 +124,19 @@ impl SqliteStorageEngine {
             )?;
             if let Some(row) = tx.query_row(
                 &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}" WHERE "model_key" = ?"#),
-                &[SqliteValue::Blob(model_key.clone())],
+                &[SqliteValueRef::Blob(&model_key)],
             )? {
-                let name = row.text(0)?;
+                let name = row.text(0)?.to_owned();
                 tx.commit()?;
                 return Ok(name);
             }
 
             let mut taken = std::collections::HashSet::new();
             for row in tx.query(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#), &[])? {
-                taken.insert(row.text(0)?);
+                taken.insert(row.text(0)?.to_owned());
             }
             for row in tx.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'", &[])? {
-                taken.insert(row.text(0)?);
+                taken.insert(row.text(0)?.to_owned());
             }
             taken.extend(FIXED_STORAGE_TABLES.iter().map(|name| (*name).to_owned()));
             let is_taken =
@@ -159,7 +159,7 @@ impl SqliteStorageEngine {
             };
             tx.execute(
                 &format!(r#"INSERT INTO "{MODEL_MAP_TABLE}" ("model_key", "materialization_table_name") VALUES (?, ?)"#),
-                &[SqliteValue::Blob(model_key), SqliteValue::Text(materialization_table_name.clone())],
+                &[SqliteValueRef::Blob(&model_key), SqliteValueRef::Text(&materialization_table_name)],
             )?;
             tx.commit()?;
             Ok(materialization_table_name)
@@ -265,12 +265,12 @@ impl SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         conn.with_executor(|c| {
             let rows = c.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &[])?;
-            let tables: Vec<String> = rows.iter().filter_map(|row| row.text(0).ok()).collect();
-            let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(&table.as_str()));
+            let tables: Vec<&str> = rows.iter().filter_map(|row| row.text(0).ok()).collect();
+            let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(table));
 
-            let recorded: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
+            let recorded: Option<String> = if tables.contains(&META_TABLE) {
                 c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])?
-                    .map(|row| row.text(0))
+                    .map(|row| row.text(0).map(str::to_owned))
                     .transpose()?
             } else {
                 None
@@ -286,18 +286,18 @@ impl SqliteStorageEngine {
                     c.execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), &[])?;
                     c.execute(
                         &format!(r#"INSERT OR IGNORE INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', ?)"#),
-                        &[SqliteValue::Text(expected.clone())],
+                        &[SqliteValueRef::Text(&expected)],
                     )?;
                     // Re-read: if another process recorded between our scan and
                     // our insert, the store must still match this binary.
                     let reread = c
                         .query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])?
-                        .ok_or_else(|| SqliteError::CorruptRecord("the protocol version record vanished after it was written".into()))?
-                        .text(0)?;
+                        .ok_or_else(|| SqliteError::CorruptRecord("the protocol version record vanished after it was written".into()))?;
+                    let reread = reread.text(0)?;
                     if reread == expected {
                         Ok(())
                     } else {
-                        Err(SqliteError::ProtocolVersionMismatch { found: reread, expected: PROTOCOL_VERSION })
+                        Err(SqliteError::ProtocolVersionMismatch { found: reread.to_owned(), expected: PROTOCOL_VERSION })
                     }
                 }
             }
@@ -329,20 +329,25 @@ impl StorageEngine for SqliteStorageEngine {
         }
         let conn = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         self.ensure_shared_tables(&conn).await?;
-        let event_ids: Vec<SqliteValue> = event_ids.into_iter().map(|id| SqliteValue::Text(id.to_base64())).collect();
-        let events = conn
+        let event_ids: Vec<String> = event_ids.into_iter().map(|id| id.to_base64()).collect();
+        let rows = conn
             .with_executor(move |c| {
                 let placeholders = (0..event_ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-                let rows = c.query(
+                let event_ids: Vec<SqliteValueRef> = event_ids.iter().map(|id| SqliteValueRef::Text(id)).collect();
+                c.query(
                     &format!(
                         r#"SELECT "entity_id", "body", "parent", "attestations"
                    FROM "{EVENT_TABLE}" WHERE "id" IN ({placeholders})"#
                     ),
                     &event_ids,
-                )?;
-                rows.iter().map(event_from_sqlite_row).collect::<Result<Vec<_>, _>>()
+                )
             })
             .await
+            .map_err(RetrievalError::storage)?;
+        let events = rows
+            .iter()
+            .map(event_from_sqlite_row)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(RetrievalError::storage)?
             .into_iter()
             .map(decode_event_row)
@@ -354,21 +359,25 @@ impl StorageEngine for SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         self.ensure_shared_tables(&conn).await?;
         let entity_id = entity_id.to_base64();
-        conn.with_executor(move |c| {
-            let rows = c.query(
-                &format!(
-                    r#"SELECT "entity_id", "body", "parent", "attestations"
+        let rows = conn
+            .with_executor(move |c| {
+                c.query(
+                    &format!(
+                        r#"SELECT "entity_id", "body", "parent", "attestations"
                    FROM "{EVENT_TABLE}" WHERE "entity_id" = ?"#
-                ),
-                &[SqliteValue::Text(entity_id)],
-            )?;
-            rows.iter().map(event_from_sqlite_row).collect::<Result<Vec<_>, _>>()
-        })
-        .await
-        .map_err(RetrievalError::storage)?
-        .into_iter()
-        .map(decode_event_row)
-        .collect()
+                    ),
+                    &[SqliteValueRef::Text(&entity_id)],
+                )
+            })
+            .await
+            .map_err(RetrievalError::storage)?;
+        rows.iter()
+            .map(event_from_sqlite_row)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(RetrievalError::storage)?
+            .into_iter()
+            .map(decode_event_row)
+            .collect()
     }
 
     fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) {
@@ -384,18 +393,23 @@ impl StorageEngine for SqliteStorageEngine {
             // durable model map. Arbitrary tables may belong to the embedding
             // application and must survive an Ankurah reset.
             let rows = c.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &[])?;
-            let existing: BTreeSet<String> = rows.iter().map(|row| row.text(0)).collect::<Result<_, _>>()?;
+            let existing: BTreeSet<&str> = rows.iter().map(|row| row.text(0)).collect::<Result<_, _>>()?;
 
             let mut owned: BTreeSet<String> = FIXED_STORAGE_TABLES
                 .iter()
                 .copied()
-                .filter(|name| *name != META_TABLE && existing.contains(*name))
+                .filter(|name| *name != META_TABLE && existing.contains(name))
                 .map(str::to_owned)
                 .collect();
             if existing.contains(MODEL_MAP_TABLE) {
                 let rows = c.query(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#), &[])?;
                 owned.extend(
-                    rows.iter().map(|row| row.text(0)).collect::<Result<Vec<_>, _>>()?.into_iter().filter(|name| existing.contains(name)),
+                    rows.iter()
+                        .map(|row| row.text(0))
+                        .collect::<Result<Vec<_>, _>>()?
+                        .into_iter()
+                        .filter(|name| existing.contains(name))
+                        .map(str::to_owned),
                 );
             }
 
@@ -423,7 +437,7 @@ impl StorageEngine for SqliteStorageEngine {
                 let rows = c.query(&format!(r#"SELECT "model_key" FROM "{MODEL_MAP_TABLE}""#), &[])?;
                 let models = rows
                     .iter()
-                    .map(|row| row.blob(0).and_then(|bytes| bincode::deserialize(&bytes).map_err(SqliteError::from)))
+                    .map(|row| row.blob(0).and_then(|bytes| bincode::deserialize(bytes).map_err(SqliteError::from)))
                     .collect::<Result<Vec<ModelId>, SqliteError>>()?;
                 Ok(models)
             })
@@ -432,25 +446,28 @@ impl StorageEngine for SqliteStorageEngine {
     }
 }
 
-type RawStateRow = (String, Vec<u8>, String, Vec<u8>);
+/// A state row's columns, lent from the row they were read into.
+type RawStateRow<'a> = (&'a str, &'a [u8], &'a str, &'a [u8]);
 
-fn raw_state_from_sqlite_row(row: &Row) -> Result<RawStateRow, SqliteError> { Ok((row.text(0)?, row.blob(1)?, row.text(2)?, row.blob(3)?)) }
+fn raw_state_from_sqlite_row(row: &Row) -> Result<RawStateRow<'_>, SqliteError> {
+    Ok((row.text(0)?, row.blob(1)?, row.text(2)?, row.blob(3)?))
+}
 
 fn decode_state_row(
-    (id, state_buffer, head, attestations): RawStateRow,
+    (id, state_buffer, head, attestations): RawStateRow<'_>,
     memberships: BTreeSet<ModelId>,
 ) -> Result<Attested<EntityState>, SqliteError> {
-    let entity_id = EntityId::from_base64(&id).map_err(|error| SqliteError::CorruptRecord(format!("invalid entity id {id:?}: {error}")))?;
+    let entity_id = EntityId::from_base64(id).map_err(|error| SqliteError::CorruptRecord(format!("invalid entity id {id:?}: {error}")))?;
     Ok(Attested {
         payload: EntityState {
             entity_id,
             state: State {
-                state_buffers: StateBuffers(bincode::deserialize(&state_buffer)?),
+                state_buffers: StateBuffers(bincode::deserialize(state_buffer)?),
                 memberships,
-                head: serde_json::from_str(&head)?,
+                head: serde_json::from_str(head)?,
             },
         },
-        attestations: bincode::deserialize(&attestations)?,
+        attestations: bincode::deserialize(attestations)?,
     })
 }
 
@@ -467,19 +484,19 @@ fn load_states(snapshot: &dyn SqliteExecutor, ids: &[EntityId]) -> Result<Vec<At
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let id_strings: Vec<SqliteValue> = ids.iter().map(|id| SqliteValue::Text(id.to_base64())).collect();
+    let id_strings: Vec<String> = ids.iter().map(|id| id.to_base64()).collect();
     let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
     let rows = snapshot.query(
         &format!(
             r#"SELECT "id", "state_buffer", "head", "attestations"
            FROM "{ENTITY_TABLE}" WHERE "id" IN ({placeholders})"#
         ),
-        &id_strings,
+        &id_strings.iter().map(|id| SqliteValueRef::Text(id)).collect::<Vec<_>>(),
     )?;
     let mut by_id = BTreeMap::new();
     for row in &rows {
         let row = raw_state_from_sqlite_row(row)?;
-        let memberships = memberships_from_sqlite_connection(snapshot, &row.0)?;
+        let memberships = memberships_from_sqlite_connection(snapshot, row.0)?;
         let state = decode_state_row(row, memberships)?;
         by_id.insert(state.payload.entity_id, state);
     }
@@ -487,27 +504,26 @@ fn load_states(snapshot: &dyn SqliteExecutor, ids: &[EntityId]) -> Result<Vec<At
 }
 
 fn memberships_from_sqlite_connection(conn: &dyn SqliteExecutor, entity_id: &str) -> Result<BTreeSet<ModelId>, SqliteError> {
-    let rows = conn.query(
-        &format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ?"#),
-        &[SqliteValue::Text(entity_id.to_owned())],
-    )?;
+    let rows = conn
+        .query(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ?"#), &[SqliteValueRef::Text(entity_id)])?;
     let model_keys = rows.iter().map(|row| row.blob(0)).collect::<Result<Vec<_>, _>>()?;
-    model_keys.into_iter().map(|key| bincode::deserialize(&key).map_err(SqliteError::from)).collect()
+    model_keys.into_iter().map(|key| bincode::deserialize(key).map_err(SqliteError::from)).collect()
 }
 
-type RawEventRow = (String, Vec<u8>, String, Vec<u8>);
+/// An event row's columns, lent from the row they were read into.
+type RawEventRow<'a> = (&'a str, &'a [u8], &'a str, &'a [u8]);
 
-fn event_from_sqlite_row(row: &Row) -> Result<RawEventRow, SqliteError> { Ok((row.text(0)?, row.blob(1)?, row.text(2)?, row.blob(3)?)) }
+fn event_from_sqlite_row(row: &Row) -> Result<RawEventRow<'_>, SqliteError> { Ok((row.text(0)?, row.blob(1)?, row.text(2)?, row.blob(3)?)) }
 
-fn decode_event_row((entity_id, body, parent, attestations): RawEventRow) -> Result<Attested<Event>, RetrievalError> {
-    let entity_id = EntityId::from_base64(&entity_id).map_err(|error| RetrievalError::storage(std::io::Error::other(error)))?;
+fn decode_event_row((entity_id, body, parent, attestations): RawEventRow<'_>) -> Result<Attested<Event>, RetrievalError> {
+    let entity_id = EntityId::from_base64(entity_id).map_err(|error| RetrievalError::storage(std::io::Error::other(error)))?;
     Ok(Attested {
         payload: Event {
             entity_id,
-            body: bincode::deserialize::<EventBody>(&body).map_err(RetrievalError::storage)?,
-            parent: serde_json::from_str(&parent).map_err(RetrievalError::storage)?,
+            body: bincode::deserialize::<EventBody>(body).map_err(RetrievalError::storage)?,
+            parent: serde_json::from_str(parent).map_err(RetrievalError::storage)?,
         },
-        attestations: bincode::deserialize(&attestations).map_err(RetrievalError::storage)?,
+        attestations: bincode::deserialize(attestations).map_err(RetrievalError::storage)?,
     })
 }
 
@@ -757,9 +773,9 @@ mod tests {
                        WHERE "model_key" = ? AND "column_name" != 'id'
                        ORDER BY "column_name""#
                     ),
-                    &[SqliteValue::Blob(model_key)],
+                    &[SqliteValueRef::Blob(&model_key)],
                 )?;
-                let columns = rows.iter().map(|row| row.text(0)).collect::<Result<Vec<_>, _>>()?;
+                let columns = rows.iter().map(|row| row.text(0).map(str::to_owned)).collect::<Result<Vec<_>, _>>()?;
                 Ok(columns)
             })
             .await
@@ -873,7 +889,7 @@ mod tests {
         // jsonb() returns a BLOB (JSONB binary format), so we query it as BLOB
         let result = conn
             .with_executor(|c| {
-                let value: Vec<u8> = c.query_row("SELECT jsonb('{\"key\": \"value\"}')", &[])?.expect("one row").blob(0)?;
+                let value: Vec<u8> = c.query_row("SELECT jsonb('{\"key\": \"value\"}')", &[])?.expect("one row").blob(0)?.to_vec();
                 Ok(value)
             })
             .await?;
@@ -887,7 +903,8 @@ mod tests {
                 let value: String = c
                     .query_row(r#"SELECT json_extract(jsonb('{"territory": "US", "count": 10}'), '$.territory')"#, &[])?
                     .expect("one row")
-                    .text(0)?;
+                    .text(0)?
+                    .to_owned();
                 Ok(value)
             })
             .await?;
@@ -1044,7 +1061,7 @@ mod tests {
             let json_text = r#"{"territory": "US", "count": 10}"#;
             c.execute(
                 r#"INSERT INTO test_jsonb (id, data) VALUES (?, jsonb(?))"#,
-                &[SqliteValue::Text("1".into()), SqliteValue::Text(json_text.into())],
+                &[SqliteValueRef::Text("1"), SqliteValueRef::Text(json_text)],
             )?;
 
             // Verify data is stored
@@ -1052,21 +1069,19 @@ mod tests {
             assert_eq!(count, 1, "Should have 1 row");
 
             // Check what's in the data column
-            let data_type = c.query_row("SELECT typeof(data) FROM test_jsonb WHERE id = '1'", &[])?.expect("one row").text(0)?;
-            eprintln!("Data column type: {}", data_type);
+            let data_type = c.query_row("SELECT typeof(data) FROM test_jsonb WHERE id = '1'", &[])?.expect("one row");
+            eprintln!("Data column type: {}", data_type.text(0)?);
 
             // Check what json_extract returns
-            let extracted = c
-                .query_row(r#"SELECT json_extract(data, '$.territory') FROM test_jsonb WHERE id = '1'"#, &[])?
-                .expect("one row")
-                .text(0)?;
-            eprintln!("Extracted territory: '{}'", extracted);
+            let extracted =
+                c.query_row(r#"SELECT json_extract(data, '$.territory') FROM test_jsonb WHERE id = '1'"#, &[])?.expect("one row");
+            eprintln!("Extracted territory: '{}'", extracted.text(0)?);
 
             // Now try the parameterized query - THIS IS WHAT THE REAL CODE DOES
             let query_param = "US";
             let result = c.query_row(
                 r#"SELECT id FROM test_jsonb WHERE json_extract(data, '$.territory') = ?"#,
-                &[SqliteValue::Text(query_param.into())],
+                &[SqliteValueRef::Text(query_param)],
             );
             eprintln!("Query result: {:?}", result);
 

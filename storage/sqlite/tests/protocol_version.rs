@@ -97,9 +97,8 @@ async fn fresh_store_records_version_and_reopens() -> anyhow::Result<()> {
     // The record carries the running protocol version.
     {
         let conn = db.raw();
-        let value =
-            conn.query_row(r#"SELECT "value" FROM "_ankurah_meta" WHERE "key" = 'protocol_version'"#, &[])?.expect("a record").text(0)?;
-        assert_eq!(value, PROTOCOL_VERSION.to_string());
+        let record = conn.query_row(r#"SELECT "value" FROM "_ankurah_meta" WHERE "key" = 'protocol_version'"#, &[])?.expect("a record");
+        assert_eq!(record.text(0)?, PROTOCOL_VERSION.to_string());
     }
 
     // Reopening a store with the matching record proceeds.
@@ -122,8 +121,8 @@ async fn unrelated_tables_do_not_block_initialization_or_get_dropped() -> anyhow
     assert!(!engine.delete_all().await?, "unrelated tables do not count as Ankurah storage");
 
     let conn = db.raw();
-    let value = conn.query_row(r#"SELECT "value" FROM "application_data""#, &[])?.expect("the row survives").text(0)?;
-    assert_eq!(value, "keep me");
+    let row = conn.query_row(r#"SELECT "value" FROM "application_data""#, &[])?.expect("the row survives");
+    assert_eq!(row.text(0)?, "keep me");
     Ok(())
 }
 

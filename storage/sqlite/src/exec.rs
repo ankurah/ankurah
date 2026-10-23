@@ -7,24 +7,29 @@
 //! SQLite connection: `native.rs` over rusqlite, and on wasm32 `node.rs` over
 //! Node.js's built-in `node:sqlite` module.
 
-use crate::{error::SqliteError, value::SqliteValue, SqliteStorageEngine};
+use crate::{
+    error::SqliteError,
+    value::{SqliteValue, SqliteValueRef},
+    SqliteStorageEngine,
+};
 
 /// One SQLite connection, driven synchronously and in order.
 ///
-/// Parameters are positional `?` placeholders. A [`SqliteValue::Jsonb`]
-/// parameter is bound as its JSON text, because the SQL that carries one
-/// always wraps its placeholder in `jsonb(?)`.
+/// Parameters are positional `?` placeholders, bound by reference so that a
+/// caller's TEXT and BLOB are not copied to be bound. A
+/// [`SqliteValueRef::Jsonb`] parameter is bound as its JSON text, because the
+/// SQL that carries one always wraps its placeholder in `jsonb(?)`.
 pub trait SqliteExecutor {
     /// Run one statement that yields no rows; returns the number of rows it changed.
-    fn execute(&self, sql: &str, params: &[SqliteValue]) -> Result<usize, SqliteError>;
+    fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError>;
 
     /// Run one statement and collect every row it yields, in order.
-    fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError>;
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError>;
 }
 
 impl dyn SqliteExecutor + '_ {
     /// Run a statement and return its first row, if it yields one.
-    pub fn query_row(&self, sql: &str, params: &[SqliteValue]) -> Result<Option<Row>, SqliteError> {
+    pub fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
         Ok(self.query(sql, params)?.into_iter().next())
     }
 
@@ -75,9 +80,9 @@ impl Transaction<'_> {
 
 /// Statements run through the transaction execute inside it.
 impl SqliteExecutor for Transaction<'_> {
-    fn execute(&self, sql: &str, params: &[SqliteValue]) -> Result<usize, SqliteError> { self.executor.execute(sql, params) }
+    fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> { self.executor.execute(sql, params) }
 
-    fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError> { self.executor.query(sql, params) }
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> { self.executor.query(sql, params) }
 }
 
 impl<'e> std::ops::Deref for Transaction<'e> {
@@ -100,7 +105,10 @@ impl Drop for Transaction<'_> {
 ///
 /// The getters are strict: each accepts only its own SQLite storage class and
 /// refuses any other, as rusqlite's `String` and `Vec<u8>` reads do, so a
-/// value of the wrong type is an error rather than a conversion.
+/// value of the wrong type is an error rather than a conversion. TEXT and
+/// BLOB are lent from the row, which holds the one copy the driver made of
+/// them (TEXT already checked to be UTF-8); a caller that keeps one takes
+/// its own.
 #[derive(Debug, Clone)]
 pub struct Row(Vec<SqliteValue>);
 
@@ -116,15 +124,15 @@ impl Row {
     }
 
     /// A TEXT column.
-    pub fn text(&self, index: usize) -> Result<String, SqliteError> {
+    pub fn text(&self, index: usize) -> Result<&str, SqliteError> {
         match self.get(index)? {
-            SqliteValue::Text(text) => Ok(text.clone()),
+            SqliteValue::Text(text) => Ok(text),
             other => Err(mismatch(index, other, "TEXT")),
         }
     }
 
     /// A TEXT column that may be NULL.
-    pub fn opt_text(&self, index: usize) -> Result<Option<String>, SqliteError> {
+    pub fn opt_text(&self, index: usize) -> Result<Option<&str>, SqliteError> {
         match self.get(index)? {
             SqliteValue::Null => Ok(None),
             _ => self.text(index).map(Some),
@@ -132,9 +140,9 @@ impl Row {
     }
 
     /// A BLOB column.
-    pub fn blob(&self, index: usize) -> Result<Vec<u8>, SqliteError> {
+    pub fn blob(&self, index: usize) -> Result<&[u8], SqliteError> {
         match self.get(index)? {
-            SqliteValue::Blob(bytes) => Ok(bytes.clone()),
+            SqliteValue::Blob(bytes) => Ok(bytes),
             other => Err(mismatch(index, other, "BLOB")),
         }
     }

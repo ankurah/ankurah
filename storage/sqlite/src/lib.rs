@@ -72,4 +72,4 @@ pub use engine::{SqliteStorageEngine, SqliteTransaction};
 pub use error::SqliteError;
 #[cfg(all(target_arch = "wasm32", feature = "node"))]
 pub use node::{NodeConnection, NodePool};
-pub use value::SqliteValue;
+pub use value::{SqliteValue, SqliteValueRef};

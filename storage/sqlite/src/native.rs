@@ -2,8 +2,9 @@
 //!
 //! The bb8 pool, the `spawn_blocking` hop and the session pragmas stay in
 //! `connection.rs`; this file only lets the engine reach a pooled rusqlite
-//! connection through [`SqliteExecutor`], binding [`SqliteValue`] parameters
-//! and reading each column by its SQLite storage class, with no conversion.
+//! connection through [`SqliteExecutor`], binding [`SqliteValueRef`]
+//! parameters and reading each column by its SQLite storage class, with no
+//! conversion.
 
 use std::path::Path;
 
@@ -17,7 +18,7 @@ pub(crate) use crate::connection::PooledConnection;
 use crate::{
     error::SqliteError,
     exec::{Row, SqliteExecutor},
-    value::SqliteValue,
+    value::{SqliteValue, SqliteValueRef},
     SqliteConnectionManager,
 };
 
@@ -54,11 +55,11 @@ impl PooledConnection {
 }
 
 impl SqliteExecutor for Connection {
-    fn execute(&self, sql: &str, params: &[SqliteValue]) -> Result<usize, SqliteError> {
+    fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
         Ok(Connection::execute(self, sql, params_from_iter(params))?)
     }
 
-    fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError> {
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
         let mut statement = self.prepare(sql)?;
         let width = statement.column_count();
         let mut rows = statement.query(params_from_iter(params))?;
@@ -70,8 +71,9 @@ impl SqliteExecutor for Connection {
     }
 }
 
-/// A column as its storage class says it is. TEXT that is not UTF-8 fails
-/// with the error rusqlite gives a `String` read of it.
+/// A column as its storage class says it is, copied once out of SQLite's
+/// buffer: TEXT is checked to be UTF-8 where it lies, and fails with the
+/// error rusqlite gives a `String` read of it when it is not.
 fn value_from_ref(index: usize, value: ValueRef<'_>) -> Result<SqliteValue, SqliteError> {
     Ok(match value {
         ValueRef::Null => SqliteValue::Null,
@@ -86,17 +88,17 @@ fn value_from_ref(index: usize, value: ValueRef<'_>) -> Result<SqliteValue, Sqli
     })
 }
 
-/// Binds a parameter without copying it: TEXT and BLOB are borrowed, and a
+/// Binds a parameter without copying it: TEXT and BLOB stay borrowed, and a
 /// JSONB value binds as its JSON text for the `jsonb(?)` that wraps it.
-impl ToSql for SqliteValue {
+impl ToSql for SqliteValueRef<'_> {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(match self {
-            SqliteValue::Text(text) => ToSqlOutput::Borrowed(ValueRef::Text(text.as_bytes())),
-            SqliteValue::Integer(integer) => ToSqlOutput::Borrowed(ValueRef::Integer(*integer)),
-            SqliteValue::Real(real) => ToSqlOutput::Borrowed(ValueRef::Real(*real)),
-            SqliteValue::Blob(bytes) => ToSqlOutput::Borrowed(ValueRef::Blob(bytes)),
-            SqliteValue::Jsonb(json) => ToSqlOutput::Owned(rusqlite::types::Value::Text(json.to_string())),
-            SqliteValue::Null => ToSqlOutput::Borrowed(ValueRef::Null),
+        Ok(match *self {
+            SqliteValueRef::Text(text) => ToSqlOutput::Borrowed(ValueRef::Text(text.as_bytes())),
+            SqliteValueRef::Integer(integer) => ToSqlOutput::Borrowed(ValueRef::Integer(integer)),
+            SqliteValueRef::Real(real) => ToSqlOutput::Borrowed(ValueRef::Real(real)),
+            SqliteValueRef::Blob(bytes) => ToSqlOutput::Borrowed(ValueRef::Blob(bytes)),
+            SqliteValueRef::Jsonb(json) => ToSqlOutput::Owned(rusqlite::types::Value::Text(json.to_string())),
+            SqliteValueRef::Null => ToSqlOutput::Borrowed(ValueRef::Null),
         })
     }
 }

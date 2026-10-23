@@ -12,7 +12,7 @@ use crate::{
     error::SqliteError,
     exec::{Behavior, SqliteExecutor},
     sql_builder::{split_predicate_for_sqlite, SqlBuilder},
-    value::SqliteValue,
+    value::{SqliteValue, SqliteValueRef},
 };
 
 /// A selection over joined materializations, with any unsupported predicate retained for Rust.
@@ -65,8 +65,8 @@ impl Query {
     }
 
     fn read_ids(&self, snapshot: &dyn SqliteExecutor) -> Result<Vec<EntityId>, SqliteError> {
-        let rows = snapshot.query(&self.sql, &self.params)?;
-        rows.iter().map(|row| EntityId::from_base64(&row.text(0)?).map_err(|error| SqliteError::CorruptRecord(error.to_string()))).collect()
+        let rows = snapshot.query(&self.sql, &self.params.iter().map(SqliteValueRef::from).collect::<Vec<_>>())?;
+        rows.iter().map(|row| EntityId::from_base64(row.text(0)?).map_err(|error| SqliteError::CorruptRecord(error.to_string()))).collect()
     }
 
     pub async fn states(self, engine: &SqliteStorageEngine) -> Result<Vec<Attested<EntityState>>, RetrievalError> {

@@ -13,7 +13,7 @@ use crate::{
     driver::{Pool, PooledConnection},
     error::SqliteError,
     exec::SqliteExecutor,
-    value::SqliteValue,
+    value::{SqliteValue, SqliteValueRef},
 };
 
 fn create_materialization_table(conn: &dyn SqliteExecutor, table_name: &str) -> Result<(), SqliteError> {
@@ -95,12 +95,12 @@ pub(super) struct PreparedMaterialization {
 
 impl PreparedMaterialization {
     pub(super) fn write(&self, transaction: &dyn SqliteExecutor) -> Result<(), SqliteError> {
-        let mut columns = vec!["id".to_owned()];
-        let mut values = vec![SqliteValue::Text(self.entity_id.clone())];
+        let mut columns = vec!["id"];
+        let mut values = vec![SqliteValueRef::Text(&self.entity_id)];
         let mut placeholder_is_jsonb = vec![false];
         for (name, value, is_jsonb) in &self.materialized {
-            columns.push(name.clone());
-            values.push(value.clone());
+            columns.push(name);
+            values.push(value.into());
             placeholder_is_jsonb.push(*is_jsonb);
         }
         let columns_str = columns.iter().map(|column| format!(r#""{column}""#)).collect::<Vec<_>>().join(", ");
@@ -142,7 +142,7 @@ impl Materialization {
                     r#"INSERT OR IGNORE INTO "{COLUMN_MAP_TABLE}"
                        ("model_key", "property_key", "column_name") VALUES (?, ?, 'id')"#
                 ),
-                &[SqliteValue::Blob(model_key), SqliteValue::Text(id_pin_key)],
+                &[SqliteValueRef::Blob(&model_key), SqliteValueRef::Text(&id_pin_key)],
             )?;
             Ok(())
         })
@@ -179,9 +179,12 @@ impl Materialization {
             .with_executor(move |c| {
                 let rows = c.query(
                     r#"SELECT "property_key", "column_name" FROM "_ankurah_sqlite_column_map" WHERE "model_key" = ?"#,
-                    &[SqliteValue::Blob(model_key)],
+                    &[SqliteValueRef::Blob(&model_key)],
                 )?;
-                let rows = rows.iter().map(|row| Ok((row.text(0)?, row.text(1)?))).collect::<Result<Vec<_>, SqliteError>>()?;
+                let rows = rows
+                    .iter()
+                    .map(|row| Ok((row.text(0)?.to_owned(), row.text(1)?.to_owned())))
+                    .collect::<Result<Vec<_>, SqliteError>>()?;
                 Ok(rows)
             })
             .await?;
@@ -312,13 +315,13 @@ impl Materialization {
                 .with_executor(move |c| {
                     c.execute(
                         r#"INSERT OR IGNORE INTO "_ankurah_sqlite_column_map" ("model_key", "property_key", "column_name") VALUES (?, ?, ?)"#,
-                        &[SqliteValue::Blob(model_key.clone()), SqliteValue::Text(property_key.clone()), SqliteValue::Text(candidate)],
+                        &[SqliteValueRef::Blob(&model_key), SqliteValueRef::Text(&property_key), SqliteValueRef::Text(&candidate)],
                     )?;
                     c.query_row(
                         r#"SELECT "column_name" FROM "_ankurah_sqlite_column_map" WHERE "model_key" = ? AND "property_key" = ?"#,
-                        &[SqliteValue::Blob(model_key), SqliteValue::Text(property_key)],
+                        &[SqliteValueRef::Blob(&model_key), SqliteValueRef::Text(&property_key)],
                     )?
-                    .map(|row| row.text(0))
+                    .map(|row| row.text(0).map(str::to_owned))
                     .transpose()
                 })
                 .await?;
@@ -369,9 +372,11 @@ impl Materialization {
             .with_executor(move |c| {
                 // PRAGMA table_info's rows, through its table-valued function:
                 // the node executor reads TEXT exactly only from a query.
-                let rows = c.query("SELECT * FROM pragma_table_info(?)", &[SqliteValue::Text(table_name)])?;
-                let columns: Vec<SqliteColumn> =
-                    rows.iter().filter_map(|row| Some(SqliteColumn { name: row.text(1).ok()?, data_type: row.text(2).ok()? })).collect();
+                let rows = c.query("SELECT * FROM pragma_table_info(?)", &[SqliteValueRef::Text(&table_name)])?;
+                let columns: Vec<SqliteColumn> = rows
+                    .iter()
+                    .filter_map(|row| Some(SqliteColumn { name: row.text(1).ok()?.to_owned(), data_type: row.text(2).ok()?.to_owned() }))
+                    .collect();
                 Ok(columns)
             })
             .await?;

@@ -14,7 +14,7 @@ use crate::{
     driver::Pool,
     engine::{ENTITY_MODEL_TABLE, ENTITY_TABLE, EVENT_TABLE},
     exec::{Behavior, SqliteExecutor},
-    value::SqliteValue,
+    value::SqliteValueRef,
     SqliteError, SqliteStorageEngine,
 };
 
@@ -76,13 +76,13 @@ impl SqliteDumpCursor {
 }
 
 fn event_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<String>, Vec<StorageDumpItem>), SqliteError> {
-    let (query, arguments): (String, Vec<SqliteValue>) = if let Some(after) = after {
+    let (query, arguments) = if let Some(after) = after {
         (
             format!(
                 r#"SELECT "id", "entity_id", "body", "parent", "attestations"
                    FROM "{EVENT_TABLE}" WHERE "id" > ? ORDER BY "id" LIMIT ?"#
             ),
-            vec![SqliteValue::Text(after.to_owned()), SqliteValue::Integer(PAGE_SIZE)],
+            vec![SqliteValueRef::Text(after), SqliteValueRef::Integer(PAGE_SIZE)],
         )
     } else {
         (
@@ -90,7 +90,7 @@ fn event_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
                 r#"SELECT "id", "entity_id", "body", "parent", "attestations"
                    FROM "{EVENT_TABLE}" ORDER BY "id" LIMIT ?"#
             ),
-            vec![SqliteValue::Integer(PAGE_SIZE)],
+            vec![SqliteValueRef::Integer(PAGE_SIZE)],
         )
     };
     let rows = conn.query(&query, &arguments)?;
@@ -98,29 +98,29 @@ fn event_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
     let mut page = Vec::new();
     for row in &rows {
         let stored_id = row.text(0)?;
-        let declared_id = EventId::from_base64(&stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
+        let declared_id = EventId::from_base64(stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let entity_id = EntityId::from_base64(row.text(1)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
-        let body = bincode::deserialize::<EventBody>(&row.blob(2)?)?;
-        let parent = serde_json::from_str::<Clock>(&row.text(3)?)?;
-        let attestations = bincode::deserialize::<AttestationSet>(&row.blob(4)?)?;
+        let body = bincode::deserialize::<EventBody>(row.blob(2)?)?;
+        let parent = serde_json::from_str::<Clock>(row.text(3)?)?;
+        let attestations = bincode::deserialize::<AttestationSet>(row.blob(4)?)?;
         let event = Attested { payload: Event { entity_id, body, parent }, attestations };
         if event.payload.id() != declared_id {
             return Err(SqliteError::Dump(format!("stored event id does not match payload for {declared_id}")));
         }
-        last = Some(stored_id);
+        last = Some(stored_id.to_owned());
         page.push(StorageDumpItem::Event(event));
     }
     Ok((last, page))
 }
 
 fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<String>, Vec<StorageDumpItem>), SqliteError> {
-    let (query, arguments): (String, Vec<SqliteValue>) = if let Some(after) = after {
+    let (query, arguments) = if let Some(after) = after {
         (
             format!(
                 r#"SELECT "id", "state_buffer", "head", "attestations"
                    FROM "{ENTITY_TABLE}" WHERE "id" > ? ORDER BY "id" LIMIT ?"#
             ),
-            vec![SqliteValue::Text(after.to_owned()), SqliteValue::Integer(PAGE_SIZE)],
+            vec![SqliteValueRef::Text(after), SqliteValueRef::Integer(PAGE_SIZE)],
         )
     } else {
         (
@@ -128,7 +128,7 @@ fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
                 r#"SELECT "id", "state_buffer", "head", "attestations"
                    FROM "{ENTITY_TABLE}" ORDER BY "id" LIMIT ?"#
             ),
-            vec![SqliteValue::Integer(PAGE_SIZE)],
+            vec![SqliteValueRef::Integer(PAGE_SIZE)],
         )
     };
     // One read snapshot for the page, so each state's memberships are read as
@@ -139,22 +139,22 @@ fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
     let mut page = Vec::new();
     for row in &rows {
         let stored_id = row.text(0)?;
-        let entity_id = EntityId::from_base64(&stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
-        let state_buffers = bincode::deserialize::<StateBuffers>(&row.blob(1)?)?;
-        let head = serde_json::from_str::<Clock>(&row.text(2)?)?;
-        let attestations = bincode::deserialize::<AttestationSet>(&row.blob(3)?)?;
+        let entity_id = EntityId::from_base64(stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
+        let state_buffers = bincode::deserialize::<StateBuffers>(row.blob(1)?)?;
+        let head = serde_json::from_str::<Clock>(row.text(2)?)?;
+        let attestations = bincode::deserialize::<AttestationSet>(row.blob(3)?)?;
         let mut memberships = std::collections::BTreeSet::new();
         let keys = snapshot.query(
             &format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ? ORDER BY "model_key""#),
-            &[SqliteValue::Text(stored_id.clone())],
+            &[SqliteValueRef::Text(stored_id)],
         )?;
         let keys = keys.iter().map(|row| row.blob(0)).collect::<Result<Vec<_>, _>>()?;
         for key in keys {
-            memberships.insert(bincode::deserialize::<ModelId>(&key)?);
+            memberships.insert(bincode::deserialize::<ModelId>(key)?);
         }
         let state = State { state_buffers, memberships, head };
         page.push(StorageDumpItem::State(Attested { payload: EntityState { entity_id, state }, attestations }));
-        last = Some(stored_id);
+        last = Some(stored_id.to_owned());
     }
     Ok((last, page))
 }
