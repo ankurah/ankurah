@@ -40,9 +40,11 @@ pub(super) async fn filter<Ev: ReactorEvent>(
             delivered = head;
         } else {
             let history = history.ok_or_else(|| RetrievalError::Other("event delivery requires local causal history".into()))?;
-            match compare(history, &delivered, &head, DEFAULT_BUDGET).await?.relation {
-                AbstractCausalRelation::Equal | AbstractCausalRelation::StrictDescends { .. } => continue,
-                AbstractCausalRelation::StrictAscends => delivered = head,
+            // Trace the incoming event back to the delivered frontier. An
+            // initial snapshot can establish that frontier without its payloads.
+            match compare(history, &head, &delivered, DEFAULT_BUDGET).await?.relation {
+                AbstractCausalRelation::Equal | AbstractCausalRelation::StrictAscends => continue,
+                AbstractCausalRelation::StrictDescends { .. } => delivered = head,
                 AbstractCausalRelation::DivergedSince { .. } => {
                     // Retain concurrent tips while removing only proven ancestors.
                     let mut concurrent = Vec::new();
@@ -75,6 +77,35 @@ mod tests {
         test_utils::TestStorage,
     };
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn descendant_notification_needs_connecting_history_but_not_the_baseline_event() -> anyhow::Result<()> {
+        let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, proto::OperationSet::default());
+        let baseline = proto::Clock::singleton(&genesis);
+        let parent = proto::Event::update(genesis.entity_id, baseline.clone(), proto::AuthorId::Unknown, proto::OperationSet::default());
+        let child = proto::Event::update(
+            genesis.entity_id,
+            proto::Clock::singleton(&parent),
+            proto::AuthorId::Unknown,
+            proto::OperationSet::default(),
+        );
+        let storage = Arc::new(TestStorage::default());
+        let mut transaction = storage.transaction();
+        transaction.add_events(&[parent.clone().into(), child.clone().into()]).await?;
+        transaction.commit().await?.committed()?;
+        // An initial snapshot establishes the baseline clock without supplying
+        // its event payload. The later live child supplies the connecting history.
+        assert!(storage.get_events(vec![genesis.id()]).await?.is_empty());
+        let history = LocalEventGetter::new(storage, false);
+        let (frontier, accepted) = filter(Some(&history), baseline, &[proto::Attested::from(child.clone())]).await?;
+        assert_eq!(frontier, proto::Clock::singleton(&child));
+        assert_eq!(accepted.len(), 1);
+        let (frontier, accepted) =
+            filter(Some(&history), frontier, &[proto::Attested::from(parent), proto::Attested::from(child.clone())]).await?;
+        assert_eq!(frontier, proto::Clock::singleton(&child));
+        assert!(accepted.is_empty(), "connecting history and duplicate live events remain silent");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn concurrent_notifications_keep_a_minimal_frontier_and_suppress_ancestor_replays() -> anyhow::Result<()> {
