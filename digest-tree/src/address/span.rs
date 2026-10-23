@@ -27,8 +27,9 @@ impl TreeSpan {
     /// The span between two bounds.
     pub fn new(start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Self { Self { start, end } }
 
-    /// Every address.
-    pub fn all() -> Self { Self::new(Bound::Unbounded, Bound::Unbounded) }
+    /// Every address: the span under the root prefix, from the empty byte
+    /// string on, which a span digest at the root carries.
+    pub fn all() -> Self { Self::under(&NodePrefix::root()) }
 
     /// Every address beneath `prefix`: the leaves of a bucket, or of any tree
     /// node.
@@ -288,6 +289,15 @@ mod tests {
             assert_eq!(excluded.contains(&address), inside, "{address:?} within the open span");
             assert!(TreeSpan::all().contains(&address));
         }
+    }
+
+    /// The span of every address is the span under the root prefix, so a
+    /// span digest at the root carries it.
+    #[test]
+    fn every_address_is_the_span_under_the_root() {
+        assert_eq!(TreeSpan::all(), TreeSpan::under(&NodePrefix::root()));
+        let root = TreeSpanDigest::<Ristretto255> { prefix: NodePrefix::root(), bounds: TreeSpan::all(), digest: Digest::empty() };
+        root.validate().unwrap();
     }
 
     #[test]
