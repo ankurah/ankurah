@@ -4,7 +4,7 @@ use std::error::Error;
 
 use ankurah_core_types::EntityId;
 
-use crate::prefix::NodePrefix;
+use crate::address::NodePrefix;
 
 /// Why an operation on a tree could not read or write.
 #[derive(Debug, thiserror::Error)]

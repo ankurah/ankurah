@@ -41,21 +41,19 @@
 //!
 //! # Modules
 //!
-//! - [`tree`]: the [`DigestTree`] and the [`TreeTransaction`] that carries
-//!   the tree's operations.
-//! - [`spec`]: the [`TreeSpec`], what defines a tree.
+//! - `tree`: the [`DigestTree`] and the [`TreeTransaction`] that carries the
+//!   tree's operations: leaf rows, tree node rows, changes, builds, audits and
+//!   scoped reads.
+//! - `selection`: the [`TreeSpec`], what defines a tree, the [`TreeRequest`] a
+//!   Selection makes of one, and whether and how a tree serves it.
 //! - [`digest`]: the [`Leaf`], the [`DigestGroup`] a tree sums leaves in, its
 //!   two groups, and the [`Digest`].
-//! - [`prefix`]: the [`NodePrefix`], the name of a tree node.
-//! - [`rows`]: the rows a tree keeps, the [`LeafRow`] per leaf and the
-//!   [`NodeRow`] per tree node, with the [leaf address](leaf_address) they are
-//!   filed under.
-//! - [`map`]: [`MapAccess`] to the three maps a [`MapName`] names, with
-//!   consistent reads and conditional writes; [`MapTransaction`] owns commit.
-//! - [`layout`]: the byte layout of every key and value in the maps.
-//! - [`memory`]: the [`MemoryMaps`] that hold a tree in memory, and their
-//!   [`MemoryTransaction`].
-//! - [`error`]: the [`TreeError`].
+//! - `address`: the [`CanonicalCodec`], the [leaf address](leaf_address), the
+//!   [`NodePrefix`] that names a tree node and the [`TreeSpan`] that names a
+//!   run of leaves.
+//! - `store`: [`MapAccess`] to the three maps a [`MapName`] names, the byte
+//!   layout of their rows, and the [`MemoryMaps`] that hold a tree in memory.
+//! - `error`: the [`TreeError`].
 //!
 //! [`TreeTransaction::apply_change`] maintains leaves, entity lookups and
 //! ancestor summaries together, including bucket splits and merges. Build and
@@ -66,32 +64,18 @@
 
 #![deny(missing_docs)]
 
-mod bounds;
+mod address;
 #[cfg(test)]
 mod cost_tests;
 pub mod digest;
-pub mod error;
-pub mod key;
-pub mod layout;
-pub mod maintain;
-pub mod map;
-pub mod memory;
-pub mod prefix;
-pub mod request;
-pub mod rows;
-pub mod scope;
-pub mod spec;
-pub mod tree;
+mod error;
+mod selection;
+mod store;
+mod tree;
 
+pub use address::{leaf_address, CanonicalCodec, NodePrefix, NodePrefixError, TreeSpan, TreeSpanDigest};
 pub use digest::{Digest, DigestGroup, HeadHash, Leaf, LeafElement, LtHash16, Ristretto255};
 pub use error::TreeError;
-pub use key::{CanonicalCodec, PropertyTypes};
-pub use maintain::{Audit, LeafChange, LeafData, BUCKET_CAPACITY};
-pub use map::{ByteBounds, MapAccess, MapName, MapTransaction};
-pub use memory::{MemoryMaps, MemoryTransaction};
-pub use prefix::{NodePrefix, NodePrefixError};
-pub use request::{TreeMatch, TreeRequest};
-pub use rows::{leaf_address, LeafRow, NodeRow, TreeSpan};
-pub use scope::{LeafCursor, LeafPage, TreeScope, TreeSpanDigest};
-pub use spec::TreeSpec;
-pub use tree::{DigestTree, TreeTransaction};
+pub use selection::{PropertyTypes, TreeMatch, TreeRequest, TreeSpec};
+pub use store::{ByteBounds, LeafRow, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodeRow};
+pub use tree::{Audit, DigestTree, LeafChange, LeafCursor, LeafData, LeafPage, TreeScope, TreeTransaction, BUCKET_CAPACITY};

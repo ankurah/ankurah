@@ -36,10 +36,10 @@ pub(crate) const MULTIPLE_KEYS: &[u8] = b"";
 
 use ankurah_core_types::EntityId;
 
+use super::rows::LeafRow;
+use crate::address::NodePrefix;
 use crate::digest::{DecodeError, Digest, DigestGroup, HeadHash, LeafElement};
 use crate::error::TreeError;
-use crate::prefix::NodePrefix;
-use crate::rows::LeafRow;
 
 const HEAD_LEN: usize = 32;
 const KEY_LEN_LEN: usize = 4;

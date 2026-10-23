@@ -37,6 +37,14 @@ use async_trait::async_trait;
 
 use crate::error::TreeError;
 
+pub(crate) mod layout;
+mod memory;
+mod rows;
+
+pub use memory::{MemoryMaps, MemoryTransaction};
+pub(crate) use rows::PreparedLeaf;
+pub use rows::{LeafRow, NodeRow};
+
 /// The bounds of a range scan: a lower and an upper bound on the key, as
 /// [`std::ops::RangeBounds`] gives them.
 pub type ByteBounds<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);

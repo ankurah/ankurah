@@ -1,26 +1,9 @@
 //! Canonical, ascending key encoding. Every part is self-delimiting, including
 //! strings containing NUL, so a tuple prefix names one contiguous address range.
 
-use crate::TreeError;
-use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
-use std::collections::HashMap;
+use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
 
-/// Resolve the type of an exact property path without a node or a catalog.
-pub trait PropertyTypes {
-    /// The type at this path, or `None` when it is unknown.
-    fn value_type(&self, path: &PropertyPath) -> Option<ValueType>;
-}
-impl PropertyTypes for HashMap<PropertyId, ValueType> {
-    fn value_type(&self, path: &PropertyPath) -> Option<ValueType> {
-        if !path.subpath.is_empty() {
-            return None;
-        }
-        if path.property_id() == PropertyId::Id {
-            return Some(ValueType::EntityId);
-        }
-        self.get(&path.property_id()).copied()
-    }
-}
+use crate::error::TreeError;
 
 /// The standalone crate's canonical codec. Missing values sort before present
 /// ones and do not change admission. NaNs and JSON ordering are unsupported;
@@ -187,16 +170,4 @@ fn variable_len(bytes: &[u8]) -> Result<usize, TreeError> {
         i += 1;
     }
     Err(TreeError::InvalidKey("unterminated variable-length part"))
-}
-
-/// First byte string after every string starting with `prefix`.
-pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(byte) = end.pop() {
-        if byte != 255 {
-            end.push(byte + 1);
-            return Some(end);
-        }
-    }
-    None
 }
