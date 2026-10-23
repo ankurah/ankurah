@@ -4,10 +4,10 @@ use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 
 use ankql::ast::{Predicate, Resolved, Selection};
-use ankurah_core_types::{IndexDirection, KeySpec, PropertyId, PropertyPath};
+use ankurah_core_types::{IndexDirection, IndexKeyPart, KeySpec, PropertyId, PropertyPath};
 use serde::{Deserialize, Serialize};
 
-use super::request::{part, path, PropertyTypes, TreeRequest};
+use super::request::{PropertyTypes, TreeRequest};
 use crate::error::TreeError;
 
 /// What defines a tree: the leaves it admits and the order it keeps them in.
@@ -122,7 +122,7 @@ impl TreeSpec {
             request.types.keys().filter(|p| p.property_id() != PropertyId::Id && request.pinned(p).is_some()).cloned().collect();
         if request.limit.is_some() {
             for key in &request.order.keyparts {
-                let path = path(key);
+                let path = key.path();
                 if path == PropertyPath::id() {
                     break;
                 }
@@ -138,12 +138,12 @@ impl TreeSpec {
                 .filter(|p| p.property_id() != PropertyId::Id && !paths.contains(p))
                 .cloned()
                 .collect();
-            let ordered = request.order.keyparts.iter().map(path).find(|p| ranges.contains(p));
+            let ordered = request.order.keyparts.iter().map(IndexKeyPart::path).find(|p| ranges.contains(p));
             if let Some(range) = ordered.or_else(|| ranges.into_iter().next()) {
                 paths.push(range);
             }
         }
-        let parts = paths.iter().map(|p| part(p, request.types[p])).collect();
+        let parts = paths.iter().map(|p| IndexKeyPart::asc_on(p, request.types[p])).collect();
         Ok(Self::new(KeySpec::new(parts), selection.predicate.clone()))
     }
 
@@ -159,18 +159,24 @@ impl TreeSpec {
     /// Identity ignores display labels but preserves predicate structure and
     /// literal bits. The stored predicate retains its labels for diagnostics.
     fn identity_bytes(key_spec: &KeySpec<PropertyId>, predicate: &Predicate<Resolved>) -> Vec<u8> {
-        let predicate = ankql::selection::map_references::<Resolved, Resolved>(
-            &Selection::from(predicate.clone()),
-            &|path| {
-                let mut reference = PropertyPath::from(path.property_id());
-                reference.subpath = path.subpath.clone();
-                reference
-            },
-            &|model| *model,
-        )
-        .predicate;
-        bincode::serialize(&(key_spec, predicate)).expect("a tree spec serializes")
+        bincode::serialize(&(key_spec, unlabeled(predicate))).expect("a tree spec serializes")
     }
+}
+
+/// `predicate` with each property path's display label replaced by its
+/// property's identity, so that predicates differing only in labels compare
+/// equal byte for byte.
+pub(super) fn unlabeled(predicate: &Predicate<Resolved>) -> Predicate<Resolved> {
+    ankql::selection::map_references::<Resolved, Resolved>(
+        &Selection::from(predicate.clone()),
+        &|path| {
+            let mut reference = PropertyPath::from(path.property_id());
+            reference.subpath = path.subpath.clone();
+            reference
+        },
+        &|model| *model,
+    )
+    .predicate
 }
 
 /// Two specs are equal when their identity bytes agree. Display labels do not

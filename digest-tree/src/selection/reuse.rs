@@ -7,7 +7,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use ankurah_core_types::{IndexDirection, IndexKeyPart, KeySpec, PropertyId, PropertyPath, ValueType};
 
-use super::request::{clauses, path, Clause, TreeRequest};
+use super::request::{clauses, Clause, TreeRequest};
 use super::TreeSpec;
 use crate::address::span::prefix_end;
 use crate::address::{validate_part, TreeSpan};
@@ -47,10 +47,10 @@ impl TreeSpec {
         let mut types = request.types.clone();
         for key in &self.key_spec().keyparts {
             validate_part(key).ok()?;
-            if types.get(&path(key)).is_some_and(|t| *t != key.value_type) {
+            if types.get(&key.path()).is_some_and(|t| *t != key.value_type) {
                 return None;
             }
-            types.insert(path(key), key.value_type);
+            types.insert(key.path(), key.value_type);
         }
         let admission = clauses(self.predicate(), &types).ok()?;
         if !implies(&request.clauses, &admission) {
@@ -68,19 +68,19 @@ impl TreeSpec {
         let mut directions = vec![IndexDirection::Asc; self.key_spec().keyparts.len()];
         let mut id_direction = IndexDirection::Asc;
         if request.limit.is_some() {
-            let mut order = request.order.keyparts.iter().filter(|p| request.pinned(&path(p)).is_none());
+            let mut order = request.order.keyparts.iter().filter(|p| request.pinned(&p.path()).is_none());
             for (i, key) in self.key_spec().keyparts.iter().enumerate() {
-                if request.pinned(&path(key)).is_some() {
+                if request.pinned(&key.path()).is_some() {
                     continue;
                 }
                 let requested = order.next()?;
-                if path(key) != path(requested) || key.value_type != requested.value_type {
+                if key.path() != requested.path() || key.value_type != requested.value_type {
                     return None;
                 }
                 directions[i] = requested.direction;
             }
             if let Some(last) = order.next() {
-                if path(last) != PropertyPath::id() {
+                if last.path() != PropertyPath::id() {
                     return None;
                 }
                 id_direction = last.direction;
@@ -120,7 +120,7 @@ fn clause_span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) 
     let mut parts = key.keyparts.clone();
     parts.push(IndexKeyPart::asc(PropertyId::Id, ValueType::EntityId));
     for (index, keypart) in parts.into_iter().enumerate() {
-        let path = path(&keypart);
+        let path = keypart.path();
         let implicit_id = index == key.keyparts.len();
         let Some(domain) = query.fields.get(&path) else { break };
         required.remove(&path);

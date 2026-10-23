@@ -38,7 +38,7 @@ use ankurah_core_types::EntityId;
 
 use super::rows::LeafRow;
 use crate::address::NodePrefix;
-use crate::digest::{DecodeError, Digest, DigestGroup, HeadHash, LeafElement};
+use crate::digest::{exact, DecodeError, Digest, DigestGroup, HeadHash, LeafElement};
 use crate::error::TreeError;
 
 const HEAD_LEN: usize = 32;
@@ -50,13 +50,6 @@ pub const fn leaf_value_len<G: DigestGroup>() -> usize { HEAD_LEN + LeafElement:
 
 /// The byte between a prefix's encoding and the suffix in a delta key.
 pub const DELTA_SEPARATOR: u8 = 0xff;
-
-fn exact<'a>(what: &'static str, bytes: &'a [u8], len: usize) -> Result<&'a [u8], TreeError> {
-    match bytes.len() == len {
-        true => Ok(bytes),
-        false => Err(TreeError::unreadable(what, DecodeError::Length { expected: len, found: bytes.len() })),
-    }
-}
 
 /// The key and the entity id an address is made of.
 fn split_address<'a>(what: &'static str, address: &'a [u8]) -> Result<(&'a [u8], EntityId), TreeError> {
@@ -77,7 +70,7 @@ pub(crate) fn leaf_value<G: DigestGroup>(row: &LeafRow<G>) -> Vec<u8> {
 /// The leaf row filed at `address` with `value`.
 pub(crate) fn leaf_row<G: DigestGroup>(address: &[u8], value: &[u8]) -> Result<LeafRow<G>, TreeError> {
     let (key, entity_id) = split_address("leaf address", address)?;
-    let value = exact("leaf value", value, leaf_value_len::<G>())?;
+    let value = exact(value, leaf_value_len::<G>()).map_err(|source| TreeError::unreadable("leaf value", source))?;
     let (head, element) = value.split_at(HEAD_LEN);
     Ok(LeafRow {
         key: key.to_vec(),

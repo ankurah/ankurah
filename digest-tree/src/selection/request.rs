@@ -8,6 +8,7 @@ use std::ops::Bound::{self, Excluded, Included, Unbounded};
 use ankql::ast::{ComparisonOperator as Op, Expr, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core_types::{IndexDirection, IndexKeyPart, KeySpec, PropertyId, PropertyPath, ValueType};
 
+use super::spec::unlabeled;
 use crate::address::encode_part;
 use crate::address::TreeSpan;
 use crate::error::TreeError;
@@ -65,7 +66,7 @@ impl TreeRequest {
         let mut seen = BTreeSet::new();
         for item in selection.order_by.iter().flatten() {
             if seen.insert(item.path.clone()) {
-                let mut part = part(&item.path, resolved[&item.path]);
+                let mut part = IndexKeyPart::asc_on(&item.path, resolved[&item.path]);
                 part.direction = match item.direction {
                     OrderDirection::Asc => IndexDirection::Asc,
                     OrderDirection::Desc => IndexDirection::Desc,
@@ -80,17 +81,6 @@ impl TreeRequest {
         let value = self.clauses.first()?.fields.get(path)?.single()?;
         self.clauses.iter().all(|c| c.fields.get(path).and_then(TreeSpan::single) == Some(value)).then_some(value)
     }
-}
-
-pub(crate) fn path(part: &IndexKeyPart<PropertyId>) -> PropertyPath {
-    let mut path = PropertyPath::from(part.key);
-    path.subpath = part.sub_path.clone().unwrap_or_default();
-    path
-}
-pub(super) fn part(path: &PropertyPath, value_type: ValueType) -> IndexKeyPart<PropertyId> {
-    let mut part = IndexKeyPart::asc(path.property_id(), value_type);
-    part.sub_path = (!path.subpath.is_empty()).then(|| path.subpath.clone());
-    part
 }
 
 pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<PropertyPath, ValueType>) -> Result<Vec<Clause>, TreeError> {
@@ -156,7 +146,7 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
                 ),
                 _ => return Ok(opaque_clause(predicate)),
             };
-            let part = part(path, *types.get(path).ok_or(TreeError::InvalidKey("unknown predicate type"))?);
+            let part = IndexKeyPart::asc_on(path, *types.get(path).ok_or(TreeError::InvalidKey("unknown predicate type"))?);
             let encode = |expr: &Expr<Resolved>| match expr {
                 Expr::Literal(v) => encode_part(&part, Some(v)),
                 _ => Err(TreeError::UnsupportedSelection),
@@ -214,16 +204,8 @@ fn field_clause(path: &PropertyPath, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>)
     Clause { fields: BTreeMap::from([(path.clone(), TreeSpan::new(start, end))]), opaque: BTreeSet::new() }
 }
 fn opaque_clause(predicate: &Predicate<Resolved>) -> Vec<Clause> {
-    let normalized = ankql::selection::map_references::<Resolved, Resolved>(
-        &Selection::from(predicate.clone()),
-        &|p| {
-            let mut path = PropertyPath::from(p.property_id());
-            path.subpath = p.subpath.clone();
-            path
-        },
-        &|id| *id,
-    );
-    vec![Clause { fields: BTreeMap::new(), opaque: BTreeSet::from([bincode::serialize(&normalized.predicate).unwrap()]) }]
+    let opaque = bincode::serialize(&unlabeled(predicate)).expect("a predicate serializes");
+    vec![Clause { fields: BTreeMap::new(), opaque: BTreeSet::from([opaque]) }]
 }
 fn collect_paths(predicate: &Predicate<Resolved>, out: &mut BTreeSet<PropertyPath>) {
     match predicate {

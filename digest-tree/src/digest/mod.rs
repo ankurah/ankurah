@@ -99,6 +99,7 @@ use std::fmt;
 use std::iter::Sum;
 use std::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
+pub(crate) use codec::exact;
 pub use codec::DecodeError;
 pub use group::DigestGroup;
 pub use leaf::{HeadHash, Leaf, HEAD_TAG};
