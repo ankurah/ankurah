@@ -16,7 +16,7 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
         })
         .collect::<Vec<_>>();
     let page = proto::TreeSpanInventory { bounds: super::super::whole(), heads: rows.into() };
-    assert!(page.expanded_size() < MAX_PAGE_BYTES as u64);
+    assert!(page.work_bytes().unwrap() < MAX_PAGE_BYTES as u64);
     let frame = proto::StateFrame {
         stream: proto::StateStreamId::new(),
         sequence: 0,
@@ -28,7 +28,7 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
     };
     assert!(bincode::serialized_size(&frame).unwrap() < MAX_FRAME_BYTES as u64);
     let inbox = super::super::Inbox::default();
-    assert!(inbox.insert(frame).unwrap_err().to_string().contains("decoded-work limit"));
+    assert!(inbox.insert(frame).unwrap_err().to_string().contains("work limit"));
 }
 
 // An empty compiled model keeps this lifecycle fixture independent of derives

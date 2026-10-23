@@ -1,7 +1,6 @@
-use super::codec::{PLAIN, PLAIN_FIXED, PREFIX, PREFIX_FIXED};
+use super::codec::{PLAIN, PREFIX};
 use super::*;
-use crate::{EventId, SpanContent, StateAnswer, StateItem, TreeSpan, TreeSpanInventory};
-use std::ops::Bound;
+use crate::{EventId, TreeSpan, TreeSpanInventory};
 
 fn keyed_heads(keys: &[Vec<u8>], tips: usize) -> Vec<KeyedEntityHead> {
     keys.iter()
@@ -62,28 +61,13 @@ fn plain_fallback_and_prefix_choice_use_actual_encoded_size() {
     }
     let packed: PackedHeads = keyed_heads(&[b"a long shared prefix/one".to_vec(), b"a long shared prefix/two".to_vec()], 1).into();
     assert_eq!(packed.bytes[0], PREFIX);
-    assert!(packed.bytes.len() < packed.plain_size);
+    assert!(packed.bytes.len() < packed.unshared_bytes);
     let clone = packed.clone();
     assert_eq!(packed.bytes.as_ptr(), clone.bytes.as_ptr(), "clones share their buffer");
     let mut cursor = packed.cursor();
     drop(packed);
     assert_eq!(cursor.next().unwrap().key, b"a long shared prefix/one");
     assert_eq!(cursor.next().unwrap().key, b"a long shared prefix/two");
-}
-
-#[test]
-fn initial_and_followup_inventories_use_the_same_encoding_and_absolute_bounds() {
-    for start in [Bound::Unbounded, Bound::Included(vec![]), Bound::Excluded(vec![0; 251])] {
-        for end in [Bound::Unbounded, Bound::Included(vec![255]), Bound::Excluded(vec![255; 251])] {
-            let page = TreeSpanInventory { bounds: TreeSpan::new(start.clone(), end), heads: keyed_heads(&[vec![1], vec![2]], 6).into() };
-            let initial = bincode::serialize(&SpanContent::Heads(page.clone())).unwrap();
-            assert_eq!(initial, bincode::serialize(&StateItem::Heads(page.clone())).unwrap());
-            assert_eq!(initial, bincode::serialize(&StateAnswer::Heads(page.clone())).unwrap());
-            let SpanContent::Heads(decoded) = bincode::deserialize(&initial).unwrap() else { panic!("heads") };
-            assert_eq!(decoded.bounds, page.bounds);
-            assert_eq!(serde_json::to_value(decoded.heads).unwrap(), serde_json::to_value(page.heads).unwrap());
-        }
-    }
 }
 
 fn raw_clock(entries: &[(usize, u8)], mode: u8) -> Vec<u8> {
@@ -107,7 +91,7 @@ fn noncanonical_clocks_are_normalized_once_and_invalid_annotations_fail() {
         let packed = PackedHeads::decode(&raw_clock(&[(7, 2), (1, 1), (1, 1)], mode)).unwrap();
         let expected = Clock::new(vec![(1, EventId::from_bytes([1; 32])), (7, EventId::from_bytes([2; 32]))]).unwrap();
         assert!(packed.cursor().next().unwrap().entity.head.equals(&expected));
-        assert!(codec::validate(&packed.bytes).unwrap().3);
+        assert!(codec::validate(&packed.bytes).unwrap().canonical);
         for entries in [vec![(0, 1)], vec![(1, 1), (2, 1)]] {
             assert!(PackedHeads::decode(&raw_clock(&entries, mode)).is_err());
         }
@@ -137,11 +121,11 @@ fn rejects_malformed_payloads_before_any_cursor_can_observe_them() {
 }
 
 #[test]
-fn compression_cannot_bypass_expanded_work_or_head_limits() {
-    let expanded: PackedHeads = keyed_heads(&vec![vec![42; 4096]; 128], 1).into();
-    assert!(expanded.bytes.len() < MAX_OFFER_BYTES);
-    assert!(PackedHeads::decode(&expanded.bytes).is_err());
-    assert!(bincode::serialize(&expanded).is_err());
+fn compression_cannot_bypass_the_unshared_size_or_head_limits() {
+    let repeated: PackedHeads = keyed_heads(&vec![vec![42; 4096]; 128], 1).into();
+    assert!(repeated.bytes.len() < MAX_OFFER_BYTES);
+    assert!(PackedHeads::decode(&repeated.bytes).is_err());
+    assert!(bincode::serialize(&repeated).is_err());
     let too_many: PackedHeads = keyed_heads(&vec![vec![]; MAX_OFFER_HEADS + 1], 0).into();
     assert!(PackedHeads::decode(&too_many.bytes).is_err());
     assert!(bincode::serialize(&too_many).is_err());
@@ -149,11 +133,18 @@ fn compression_cannot_bypass_expanded_work_or_head_limits() {
 }
 
 #[test]
-fn expanded_size_preserves_the_old_fixed_width_work_budget() {
-    let owned = keyed_heads(&[vec![], vec![2; 251], vec![3; 4096]], 6);
-    let size = bincode::serialized_size(&owned).unwrap();
-    let packed: PackedHeads = owned.into();
-    assert_eq!(packed.expanded_size(), size);
+fn prefix_sharing_saves_wire_bytes_but_not_work() -> bincode::Result<()> {
+    let text = b"a long key text".as_slice();
+    let shared: Vec<_> = (0..64u8).map(|n| [text, &[n]].concat()).collect();
+    let unshared: Vec<_> = (0..64u8).map(|n| [&[n], text].concat()).collect();
+    let inventory = |keys: &[Vec<u8>]| TreeSpanInventory { bounds: TreeSpan::all(), heads: keyed_heads(keys, 1).into() };
+    let (shared, unshared) = (inventory(&shared), inventory(&unshared));
+    assert_eq!(shared.heads.bytes[0], PREFIX);
+    assert_eq!(unshared.heads.bytes[0], PLAIN);
+    assert!(bincode::serialized_size(&shared)? < bincode::serialized_size(&unshared)?);
+    assert_eq!(shared.work_bytes()?, unshared.work_bytes()?, "equal key lengths describe equal work");
+    assert_eq!(unshared.work_bytes()?, bincode::serialized_size(&unshared)?, "plain keys share nothing");
+    Ok(())
 }
 
 #[test]
@@ -172,23 +163,15 @@ fn retained_clocks_share_the_inventory_and_survive_cursor_drop() {
 }
 
 #[test]
-fn fixed_generations_keep_previously_valid_large_clock_pages_within_budget() {
-    let mut source = keyed_heads(&[vec![]], 1818);
-    source[0].entity.head = Clock::new(source[0].entity.head.ids().map(|id| (u32::MAX, id.clone())).collect::<Vec<_>>()).unwrap();
-    let page = TreeSpanInventory { bounds: TreeSpan::all(), heads: source.clone().into() };
-    assert_eq!(page.heads.bytes[0], PLAIN_FIXED);
-    assert!(4 + page.expanded_size() <= 64 * 1024);
-    assert!(bincode::serialized_size(&StateItem::Heads(page)).unwrap() <= 64 * 1024);
-    verify(source);
-    let mut source = keyed_heads(&vec![b"shared-prefix-and-key".to_vec(); 8], 6);
-    for head in &mut source {
-        head.entity.head = Clock::new(head.entity.head.ids().map(|id| (u32::MAX, id.clone())).collect::<Vec<_>>()).unwrap();
-    }
-    let packed: PackedHeads = source.clone().into();
-    assert_eq!(packed.bytes[0], PREFIX_FIXED);
-    verify(source);
-    for n in 0..packed.bytes.len() {
-        assert!(PackedHeads::decode(&packed.bytes[..n]).is_err());
+fn only_the_plain_and_prefix_encodings_are_accepted() {
+    // One head whose generation is written as four bytes, under tags other than the two defined ones.
+    for tag in [0, 3, 4, 255] {
+        let mut payload = vec![tag, 1, 0];
+        payload.extend_from_slice(&[9; 32]);
+        payload.push(1);
+        payload.extend_from_slice(&u32::MAX.to_le_bytes());
+        payload.extend_from_slice(&[7; 32]);
+        assert!(PackedHeads::decode(&payload).is_err(), "tag {tag}");
     }
 }
 

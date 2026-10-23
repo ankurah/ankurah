@@ -23,6 +23,7 @@ use ulid::Ulid;
 mod inventory;
 pub mod limits;
 mod validation;
+mod work;
 pub use inventory::{
     ClockRef, EntityHead, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
 };

@@ -49,10 +49,6 @@ impl TreeSpanInventory {
         }
         Ok(())
     }
-
-    /// Uncompressed logical size, including fixed-width lengths and generations.
-    /// Compression must not bypass the comparison's decoded-work budget.
-    pub fn expanded_size(&self) -> u64 { bincode::serialized_size(&self.bounds).expect("bounds serialize") + self.heads.expanded_size() }
 }
 
 /// An entity's identity and causal frontier.
@@ -79,8 +75,7 @@ pub struct KeyedEntityHead {
 pub struct PackedHeads {
     bytes: Bytes,
     len: usize,
-    expanded_size: u64,
-    plain_size: usize,
+    unshared_bytes: usize,
 }
 
 impl std::fmt::Debug for PackedHeads {
@@ -106,10 +101,16 @@ impl PackedHeads {
 
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
-    pub fn expanded_size(&self) -> u64 { self.expanded_size }
-    /// Key bytes saved by prefix coding. Counting these again bounds traversal
-    /// work independently of the compressed wire size, including across pages.
-    pub fn prefix_savings(&self) -> usize { self.plain_size.saturating_sub(self.bytes.len()) }
+
+    /// The bytes these heads would occupy with every key written whole: the work
+    /// they describe, whatever prefix sharing saved on the wire.
+    pub fn unshared_bytes(&self) -> usize { self.unshared_bytes }
+
+    /// The bytes prefix sharing saved on the wire.
+    pub(crate) fn shared_prefix_bytes(&self) -> u64 { (self.unshared_bytes - self.bytes.len()) as u64 }
+
+    /// The work one head adds to an inventory, for filling a page head by head.
+    pub fn head_work_bytes(key_len: usize, head: &Clock) -> usize { codec::plain_head_size(key_len, head) }
 
     /// Explicitly materialize owned heads when a caller needs independent values.
     pub fn to_vec(&self) -> Vec<KeyedEntityHead> {
@@ -126,20 +127,20 @@ impl PackedHeads {
     pub fn cursor(&self) -> HeadCursor { HeadCursor::new(self.bytes.clone()) }
 
     fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
-        let (len, expanded_size, plain_size, canonical) = codec::validate(bytes)?;
-        if canonical {
-            return Ok(Self { bytes: Bytes::copy_from_slice(bytes), len, expanded_size, plain_size });
+        let validated = codec::validate(bytes)?;
+        if validated.canonical {
+            return Ok(Self { bytes: Bytes::copy_from_slice(bytes), len: validated.heads, unshared_bytes: validated.unshared_bytes });
         }
         // Rare noncanonical clocks retain Clock's sorting/deduplication semantics.
         // Validate the entire bounded payload before normalizing it once, so all
         // later cursors see canonical clocks and never allocate per-head clocks.
         let mut reader = codec::Reader::new(bytes);
-        let (prefix, fixed) = reader.mode()?;
+        let encoding = reader.key_encoding()?;
         reader.uint()?;
         let mut key = Vec::new();
-        let mut heads = Vec::with_capacity(len);
-        for _ in 0..len {
-            heads.push(KeyedEntityHeadRef::from_encoded(reader.head(prefix, fixed, &mut key)?, fixed).to_owned());
+        let mut heads = Vec::with_capacity(validated.heads);
+        for _ in 0..validated.heads {
+            heads.push(KeyedEntityHeadRef::from_encoded(reader.head(encoding, &mut key)?).to_owned());
         }
         Ok(heads.into())
     }
@@ -147,7 +148,7 @@ impl PackedHeads {
 
 impl Serialize for PackedHeads {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.bytes.len() > MAX_OFFER_BYTES || self.plain_size > MAX_OFFER_BYTES || self.len > MAX_OFFER_HEADS {
+        if self.bytes.len() > MAX_OFFER_BYTES || self.unshared_bytes > MAX_OFFER_BYTES || self.len > MAX_OFFER_HEADS {
             return Err(serde::ser::Error::custom("inventory exceeds codec limits"));
         }
         if serializer.is_human_readable() {

@@ -687,7 +687,7 @@ impl Driver {
                     answers.push(StateAnswer::Heads(self.projection.round.as_ref().unwrap().snapshot.page(bounds)?));
                 }
                 StateItem::Heads(page) => {
-                    ensure!(4 + page.expanded_size() <= MAX_PAGE_BYTES as u64, "peer head inventory exceeds decoded-work budget");
+                    ensure!(page.work_bytes()? <= MAX_PAGE_BYTES as u64, "peer head inventory exceeds its work limit");
                     ensure!(page.heads.len() <= MAX_PAGE_HEADS, "peer sent too many heads");
                     page.validate(&self.spec)?;
                     let mut cursor = page.heads.cursor();

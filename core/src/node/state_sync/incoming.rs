@@ -227,10 +227,7 @@ impl Inbox {
     pub fn insert(&self, frame: StateFrame) -> anyhow::Result<()> {
         let encoded = bincode::serialize(&frame)?;
         ensure!(encoded.len() <= MAX_FRAME_BYTES, "state frame exceeds limit");
-        ensure!(
-            encoded.len() as u64 + super::budget::frame_expansion(&frame)? <= MAX_FRAME_BYTES as u64,
-            "state frame exceeds decoded-work limit"
-        );
+        ensure!(frame.work_bytes()? <= MAX_FRAME_BYTES as u64, "state frame exceeds its work limit");
         let mut state = self.state.lock().unwrap();
         ensure!(!state.closed, "state stream closed");
         ensure!(state.stream_id.is_none_or(|id| id == frame.stream), "state stream changed its identity");

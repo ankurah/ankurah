@@ -4,7 +4,7 @@ use bytes::Bytes;
 use serde::{ser::SerializeSeq, Serialize, Serializer};
 
 use super::{
-    codec::{self, Reader},
+    codec::{self, KeyEncoding, Reader},
     EntityHead, KeyedEntityHead,
 };
 use crate::{Clock, EntityId, EventId};
@@ -15,8 +15,7 @@ pub struct HeadCursor {
     bytes: Bytes,
     offset: usize,
     remaining: usize,
-    prefix: bool,
-    fixed: bool,
+    encoding: KeyEncoding,
     key: Vec<u8>,
 }
 
@@ -24,10 +23,10 @@ impl HeadCursor {
     /// A cursor over a payload that `codec::write` produced or `codec::validate` accepted.
     pub(super) fn new(bytes: Bytes) -> Self {
         let mut reader = Reader::new(&bytes);
-        let (prefix, fixed) = reader.mode().expect("constructed or validated inventory");
+        let encoding = reader.key_encoding().expect("constructed or validated inventory");
         let remaining = reader.uint().expect("constructed or validated inventory");
         let offset = reader.offset;
-        Self { bytes, offset, remaining, prefix, fixed, key: Vec::new() }
+        Self { bytes, offset, remaining, encoding, key: Vec::new() }
     }
 
     pub fn len(&self) -> usize { self.remaining }
@@ -38,10 +37,10 @@ impl HeadCursor {
             return None;
         }
         let mut reader = Reader { bytes: &self.bytes, offset: self.offset };
-        let head = reader.head(self.prefix, self.fixed, &mut self.key).expect("constructed or validated inventory");
+        let head = reader.head(self.encoding, &mut self.key).expect("constructed or validated inventory");
         self.offset = reader.offset;
         self.remaining -= 1;
-        Some(KeyedEntityHeadRef::from_encoded(head, self.fixed))
+        Some(KeyedEntityHeadRef::from_encoded(head))
     }
 
     /// Retain a clock for later repair selection without allocating its entries.
@@ -49,10 +48,7 @@ impl HeadCursor {
     pub fn next_clock(&mut self) -> Option<(EntityId, InventoryClock)> {
         let bytes = self.bytes.clone();
         let head = self.next()?;
-        Some((
-            head.entity.entity_id,
-            InventoryClock { bytes: bytes.slice_ref(head.entity.head.bytes), count: head.entity.head.count, fixed: head.entity.head.fixed },
-        ))
+        Some((head.entity.entity_id, InventoryClock { bytes: bytes.slice_ref(head.entity.head.bytes), count: head.entity.head.count }))
     }
 }
 
@@ -61,11 +57,10 @@ impl HeadCursor {
 pub struct InventoryClock {
     pub(super) bytes: Bytes,
     count: usize,
-    fixed: bool,
 }
 
 impl InventoryClock {
-    pub fn to_owned(&self) -> Clock { ClockRef { bytes: &self.bytes, count: self.count, fixed: self.fixed }.to_owned() }
+    pub fn to_owned(&self) -> Clock { ClockRef { bytes: &self.bytes, count: self.count }.to_owned() }
 }
 
 #[derive(Debug, Serialize)]
@@ -75,11 +70,8 @@ pub struct KeyedEntityHeadRef<'a> {
 }
 
 impl<'a> KeyedEntityHeadRef<'a> {
-    pub(super) fn from_encoded(head: codec::EncodedHead<'a, 'a>, fixed: bool) -> Self {
-        Self {
-            key: head.key,
-            entity: EntityHeadRef { entity_id: head.entity_id, head: ClockRef { bytes: head.clock, count: head.tips, fixed } },
-        }
+    pub(super) fn from_encoded(head: codec::EncodedHead<'a, 'a>) -> Self {
+        Self { key: head.key, entity: EntityHeadRef { entity_id: head.entity_id, head: ClockRef { bytes: head.clock, count: head.tips } } }
     }
 
     pub fn to_owned(&self) -> KeyedEntityHead { KeyedEntityHead { key: self.key.to_vec(), entity: self.entity.to_owned() } }
@@ -99,13 +91,12 @@ impl EntityHeadRef<'_> {
 pub struct ClockRef<'a> {
     bytes: &'a [u8],
     count: usize,
-    fixed: bool,
 }
 
 impl ClockRef<'_> {
     pub fn len(&self) -> usize { self.count }
     pub fn is_empty(&self) -> bool { self.count == 0 }
-    pub fn entries(&self) -> impl Iterator<Item = (u32, EventId)> + '_ { codec::tips(self.bytes, self.count, self.fixed) }
+    pub fn entries(&self) -> impl Iterator<Item = (u32, EventId)> + '_ { codec::tips(self.bytes, self.count) }
     pub fn to_owned(&self) -> Clock { Clock::new(self.entries().collect::<Vec<_>>()).expect("validated clock") }
     pub fn equals(&self, clock: &Clock) -> bool {
         self.count == clock.len()

@@ -137,14 +137,14 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
         assert_eq!(progress, ComparisonProgress::Continue);
         let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count();
         assert!(repairs > MAX_FRAME_TREE_WORK, "resident snapshots must not stop at the storage/history work cap");
-        let sizes = items.iter().map(super::super::budget::item_bytes).collect::<Result<Vec<_>, _>>()?;
+        let sizes = items.iter().map(StateItem::work_bytes).collect::<Result<Vec<_>, _>>()?;
         let bytes: u64 = sizes.iter().sum();
         assert!(bytes <= MAX_PAGE_BYTES as u64);
         if payload == 8 {
             assert_eq!(repairs, MAX_FRAME_STEPS - 1, "one head page plus repairs fills the step budget");
         } else {
             assert!(
-                bytes + super::super::budget::item_bytes(items.last().unwrap())? > MAX_PAGE_BYTES as u64,
+                bytes + items.last().unwrap().work_bytes()? > MAX_PAGE_BYTES as u64,
                 "another same-sized repair would exceed the byte budget"
             );
         }
@@ -609,6 +609,39 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
     assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
     abandon_state_stream(&node, peer, initial.frame.stream).await;
     assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn feedback_answers_beyond_one_page_of_work_are_refused() -> anyhow::Result<()> {
+    let (node, peer, _) = node().await?;
+    let initial =
+        start_state_stream(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown())
+            .await?;
+    let target = |tips: u32| {
+        proto::Clock::new(
+            (0..tips)
+                .map(|n| {
+                    let mut id = [0; 32];
+                    id[..4].copy_from_slice(&n.to_be_bytes());
+                    (1, proto::EventId::from_bytes(id))
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    // 128 requests for 13-tip targets fill one page of work exactly; one larger target exceeds it.
+    let mut answers = Vec::new();
+    for n in 0..MAX_FEEDBACK_ANSWERS {
+        let target = target(if n == 0 { 14 } else { 13 })?;
+        answers.push(StateAnswer::NeedRepair(proto::RepairRequest { entity_id: proto::EntityId::from_bytes([n as u8; 32]), target }));
+    }
+    let answers = proto::FeedbackAnswers::Round { round: 0, answers };
+    assert!(answers.work_bytes()? > MAX_PAGE_BYTES as u64);
+    assert!(bincode::serialized_size(&answers)? + 64 < MAX_FRAME_BYTES as u64, "the whole feedback fits one frame");
+    let error = apply_state_feedback(&node, peer, proto::RequestId::new(), initial.frame.stream, 0, None, Some(answers), vec![])
+        .await
+        .expect_err("answers beyond one page of work");
+    assert!(error.to_string().contains("work limit"), "{error}");
     Ok(())
 }
 

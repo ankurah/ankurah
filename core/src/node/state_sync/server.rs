@@ -767,11 +767,8 @@ where
     ensure!(answers.as_ref().is_none_or(|answers| answers.len() <= MAX_FEEDBACK_ANSWERS), "too many comparison answers");
     let encoded = bincode::serialize(&(processed_through, applied_through, &answers))?;
     ensure!(encoded.len() <= MAX_FRAME_BYTES, "state feedback exceeds limit");
-    let expansion = match &answers {
-        Some(proto::FeedbackAnswers::Round { answers, .. }) => super::budget::answers_bytes(answers)? - bincode::serialized_size(answers)?,
-        _ => 0,
-    };
-    ensure!(encoded.len() as u64 + expansion <= MAX_FRAME_BYTES as u64, "state feedback exceeds decoded-work limit");
+    let work = answers.as_ref().map(proto::FeedbackAnswers::work_bytes).transpose()?.unwrap_or(0);
+    ensure!(work <= MAX_PAGE_BYTES as u64, "state feedback answers exceed their work limit");
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(proto::NodeResponseBody::StateStreamUnavailable);
@@ -1356,10 +1353,7 @@ impl Comparison {
             unavailable: false,
         };
         ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
-        ensure!(
-            known.spans.len() <= MAX_OFFER_SPANS && super::budget::offer_bytes(&known)? as usize <= MAX_OFFER_BYTES,
-            "initial inventory exceeds limit"
-        );
+        ensure!(known.spans.len() <= MAX_OFFER_SPANS && known.work_bytes()? <= MAX_OFFER_BYTES as u64, "initial inventory exceeds limit");
         let mut spans = known.spans;
         spans.sort_by(|a, b| {
             fn bounds(span: &proto::SpanContent) -> &TreeSpan {
@@ -1449,7 +1443,7 @@ impl Comparison {
                 }
                 StateAnswer::Heads(page) => {
                     ensure!(page.heads.len() <= MAX_PAGE_HEADS, "too many heads in one page");
-                    ensure!(4 + page.expanded_size() <= MAX_PAGE_BYTES as u64, "head inventory exceeds decoded-work budget");
+                    ensure!(page.work_bytes()? <= MAX_PAGE_BYTES as u64, "head inventory exceeds its work limit");
                     let index = self
                         .head_requests
                         .iter()
@@ -1837,7 +1831,7 @@ impl Comparison {
                 }
             };
             if let Some(item) = item {
-                let size = super::budget::item_bytes(&item)? as usize;
+                let size = item.work_bytes()? as usize;
                 if !items.is_empty() && bytes + size > MAX_PAGE_BYTES {
                     self.work.push_front(Work::Item(item));
                     break;

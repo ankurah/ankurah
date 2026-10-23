@@ -250,7 +250,7 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
     loop {
         let page = old.page(remaining.clone())?;
         assert_eq!(page.bounds.start, remaining.start);
-        assert!(bincode::serialized_size(&proto::StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64);
+        assert!(page.work_bytes()? <= MAX_PAGE_BYTES as u64);
         ids.extend(page.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id));
         let complete = page.bounds.end == super::super::whole().end;
         if !complete {
@@ -274,6 +274,27 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
     let changed = (0..32).map(|id| keyed_state(id as u32, 2, Some(Value::String("changed".into())))).collect::<anyhow::Result<Vec<_>>>()?;
     query.replace_values(wide_spec, changed).await?;
     assert_eq!(bincode::serialize(&old.page(super::super::whole())?)?, bincode::serialize(&pages[0])?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_page_fills_to_the_work_of_its_whole_keys() -> anyhow::Result<()> {
+    // Each head counts its 436-byte key, entity ID and one-tip clock as the codec
+    // writes them unshared, so a full page of them fits.
+    let spec = TreeSpec::new(
+        KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(
+            proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN])),
+            ValueType::String,
+        )]),
+        ankql::ast::Predicate::True,
+    );
+    let rows = (0..MAX_PAGE_HEADS as u32)
+        .map(|id| keyed_state(id, 1, Some(Value::String("k".repeat(433)))))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let snapshot = QueryTree::default().replace_values(spec, rows).await?;
+    let page = snapshot.page(super::super::whole())?;
+    assert_eq!(page.heads.len(), MAX_PAGE_HEADS);
+    assert!(page.work_bytes()? <= MAX_PAGE_BYTES as u64);
     Ok(())
 }
 

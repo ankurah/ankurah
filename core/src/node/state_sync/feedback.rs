@@ -36,8 +36,8 @@ enum PendingAnswer {
 impl PendingAnswer {
     fn bytes(&self) -> bincode::Result<u64> {
         match self {
-            Self::Round(_, answer) => super::budget::answer_bytes(answer),
-            Self::LiveRepair(request) => bincode::serialized_size(request),
+            Self::Round(_, answer) => answer.work_bytes(),
+            Self::LiveRepair(request) => request.work_bytes(),
         }
     }
 }
