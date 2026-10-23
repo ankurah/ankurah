@@ -39,8 +39,8 @@ pub struct InstallationProbe {
 
 impl InstallationProbe {
     /// Clears the query's loaded flag and listens for it to be set again. The result is captured
-    /// inside that notification with `link` paused, so no message delivered after the installation
-    /// can repair the result before verification reads it.
+    /// inside that notification, with `link` paused so that no later delivery can change it while
+    /// it is being captured.
     pub fn watch(query: &LiveQuery<StartupRowView>, link: &Link, ordered: bool) -> Self {
         let resultset = query.resultset();
         resultset.set_loaded(false);

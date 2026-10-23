@@ -45,6 +45,7 @@ pub struct Link {
     bytes_per_second: u64,
 }
 
+/// What both ends of the link share: the connection, each direction's serializer, and the counters.
 #[derive(Default)]
 struct LinkState {
     connected: bool,
@@ -74,6 +75,7 @@ enum Direction {
 }
 
 impl Link {
+    /// A disconnected link with the given round trip and per-direction bandwidth.
     pub fn new(rtt_ms: u64, bytes_per_second: u64) -> Self {
         Self { state: Arc::default(), one_way: Duration::from_micros(rtt_ms * 500), bytes_per_second }
     }
