@@ -4,8 +4,8 @@
 //! Code extension host, an Electron main process, a JavaScript CLI) and no
 //! native library either, but Node.js ships SQLite as `node:sqlite`. The
 //! engine reaches it through a `DatabaseSync`-shaped JavaScript object:
-//! `prepare(sql)` giving statements with `run(...params)` and
-//! `all(...params)`, plus `exec(sql)`. Node's own `DatabaseSync` has that
+//! `prepare(sql)` giving statements with `run(...params)`, `all(...params)`
+//! and `columns()`, plus `exec(sql)`. Node's own `DatabaseSync` has that
 //! shape (Node.js 22.16 or later). Compatible drivers must also support
 //! positional rows and BigInt INTEGER results; the adapter recognizes
 //! better-sqlite3's `raw` and `safeIntegers` methods for these capabilities.
@@ -87,9 +87,12 @@ impl NodeConnection {
         method(&database, "prepare")?;
         method(&database, "exec")?;
         let connection = Self { database: SendWrapper::new(database) };
-        // A database that cannot return rows as arrays is refused here rather
-        // than at its first query.
-        return_arrays(&connection.prepare("SELECT 1")?)?;
+        // A database whose statements do not hand rows over as the executor
+        // reads them is refused here rather than at its first query.
+        let probe = connection.query("SELECT 1", &[])?;
+        if !matches!(probe.as_slice(), [row] if matches!(row.values(), [SqliteValue::Integer(1)])) {
+            return Err(SqliteError::Node(format!("`SELECT 1` read back as {probe:?}, not as one row holding the INTEGER 1")));
+        }
         Ok(connection)
     }
 
@@ -135,8 +138,14 @@ impl NodeConnection {
         f(self)
     }
 
+    /// Prepare a statement that hands rows over as the executor reads them.
     fn prepare(&self, sql: &str) -> Result<JsValue, SqliteError> {
-        method(&self.database, "prepare")?.call1(&self.database, &sql.into()).map_err(js_error)
+        let statement = method(&self.database, "prepare")?.call1(&self.database, &sql.into()).map_err(js_error)?;
+        return_arrays(&statement)?;
+        // INTEGERs as BigInt, so that each storage class arrives as a
+        // JavaScript type of its own and a value past 2^53 arrives exactly.
+        read_big_ints(&statement)?;
+        Ok(statement)
     }
 }
 
@@ -157,28 +166,19 @@ impl NodePool {
 impl SqliteExecutor for NodeConnection {
     fn execute(&self, sql: &str, params: &[SqliteValue]) -> Result<usize, SqliteError> {
         let statement = self.prepare(sql)?;
-        let result = method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
-        let changes = Reflect::get(&result, &"changes".into()).map_err(js_error)?;
-        Ok(integer_from_js(&changes)?.max(0) as usize)
+        let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
+        changed_rows(&result)
     }
 
     fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError> {
         let statement = self.prepare(sql)?;
-        return_arrays(&statement)?;
-        // INTEGERs as BigInt, so that a value past 2^53 comes back instead of throwing.
-        if let Ok(set_read_big_ints) = method(&statement, "setReadBigInts") {
-            set_read_big_ints.call1(&statement, &JsValue::TRUE).map_err(js_error)?;
-        } else if let Ok(safe_integers) = method(&statement, "safeIntegers") {
-            safe_integers.call1(&statement, &JsValue::TRUE).map_err(js_error)?;
-        } else {
-            return Err(SqliteError::Node("exact INTEGER results require setReadBigInts or safeIntegers".into()));
-        }
-        let rows: Array = method(&statement, "all")?
-            .apply(&statement, &js_params(params))
-            .map_err(js_error)?
-            .dyn_into()
-            .map_err(|_| SqliteError::Node("`all()` did not return an array".into()))?;
-        rows.iter().map(row_from_js).collect()
+        let width = width(&statement)?;
+        all(&statement, params, width)?
+            .iter()
+            .map(|row| {
+                row.iter().enumerate().map(|(index, value)| value_from_js(index, value)).collect::<Result<Vec<_>, _>>().map(Row::new)
+            })
+            .collect()
     }
 }
 
@@ -186,21 +186,81 @@ impl SqliteExecutor for NodeConnection {
 /// position in the statement: node:sqlite's `setReturnArrays`, or
 /// better-sqlite3's `raw`. Their default, objects keyed by column name,
 /// cannot: a name that reads as an integer moves ahead of the others, and two
-/// columns of one name collapse into one.
+/// columns of one name collapse into one. better-sqlite3 refuses `raw` on a
+/// statement that yields no rows, which has none to hand over.
 fn return_arrays(statement: &JsValue) -> Result<(), SqliteError> {
     if let Ok(set_return_arrays) = method(statement, "setReturnArrays") {
         set_return_arrays.call1(statement, &JsValue::TRUE).map_err(js_error)?;
     } else if let Ok(raw) = method(statement, "raw") {
-        raw.call1(statement, &JsValue::TRUE).map_err(js_error)?;
+        if yields_rows(statement)? {
+            raw.call1(statement, &JsValue::TRUE).map_err(js_error)?;
+        }
     } else {
         return Err(SqliteError::Node("positional rows require setReturnArrays (Node.js 22.16+) or raw".into()));
     }
     Ok(())
 }
 
-fn row_from_js(row: JsValue) -> Result<Row, SqliteError> {
-    let values = row.dyn_into::<Array>().map_err(|_| SqliteError::Node("expected a positional row array".into()))?;
-    values.iter().map(value_from_js).collect::<Result<Vec<_>, _>>().map(Row::new)
+/// Ask a statement for its INTEGERs as BigInt: node:sqlite's
+/// `setReadBigInts`, or better-sqlite3's `safeIntegers`.
+fn read_big_ints(statement: &JsValue) -> Result<(), SqliteError> {
+    if let Ok(set_read_big_ints) = method(statement, "setReadBigInts") {
+        set_read_big_ints.call1(statement, &JsValue::TRUE).map_err(js_error)?;
+    } else if let Ok(safe_integers) = method(statement, "safeIntegers") {
+        safe_integers.call1(statement, &JsValue::TRUE).map_err(js_error)?;
+    } else {
+        return Err(SqliteError::Node("exact INTEGER results require setReadBigInts or safeIntegers".into()));
+    }
+    Ok(())
+}
+
+/// Whether a statement can yield rows, as better-sqlite3 reports it in
+/// `reader`. node:sqlite's statements have no `reader`, and are taken to.
+fn yields_rows(statement: &JsValue) -> Result<bool, SqliteError> {
+    Ok(Reflect::get(statement, &"reader".into()).map_err(js_error)?.as_bool() != Some(false))
+}
+
+/// How many columns each row of a statement holds.
+fn width(statement: &JsValue) -> Result<usize, SqliteError> {
+    let columns: Array = statement_method(statement, "columns")?
+        .call0(statement)
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(|_| SqliteError::Node("`columns()` did not return an array".into()))?;
+    Ok(columns.length() as usize)
+}
+
+/// Run a statement and take every row it yields, refusing any row that is
+/// not an array of `width` values before a value of it is read.
+fn all(statement: &JsValue, params: &[SqliteValue], width: usize) -> Result<Vec<Array>, SqliteError> {
+    let rows: Array = statement_method(statement, "all")?
+        .apply(statement, &js_params(params))
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(|_| SqliteError::Node("`all()` did not return an array".into()))?;
+    rows.iter()
+        .map(|row| {
+            let row: Array =
+                row.dyn_into().map_err(|row| SqliteError::Node(format!("a statement returned a row that is not an array: {row:?}")))?;
+            if row.length() as usize != width {
+                return Err(SqliteError::Node(format!("a statement of {width} columns returned a row of {}", row.length())));
+            }
+            Ok(row)
+        })
+        .collect()
+}
+
+/// The count of rows `run()` reports it changed, which must fit a usize: a
+/// BigInt from node:sqlite, whose statements here read BigInts, or a number
+/// from better-sqlite3, which counts changes as a number whatever its
+/// statements read.
+fn changed_rows(result: &JsValue) -> Result<usize, SqliteError> {
+    let changes = Reflect::get(result, &"changes".into()).map_err(js_error)?;
+    let count = match changes.as_f64() {
+        Some(count) if count.fract() == 0.0 => count as i64,
+        _ => integer_from_js(&changes)?,
+    };
+    usize::try_from(count).map_err(|_| SqliteError::Node(format!("`run()` reported {count} changed rows")))
 }
 
 fn js_params(params: &[SqliteValue]) -> Array { params.iter().map(js_param).collect() }
@@ -218,38 +278,33 @@ fn js_param(value: &SqliteValue) -> JsValue {
     }
 }
 
-/// INTEGERs arrive as BigInt, so Number values remain REAL even when integral.
-fn value_from_js(value: JsValue) -> Result<SqliteValue, SqliteError> {
-    if value.is_null() || value.is_undefined() {
-        return Ok(SqliteValue::Null);
+/// The value in column `index` of a row, as node:sqlite hands each storage
+/// class over to a statement reading BigInts: NULL as null, INTEGER as
+/// BigInt, REAL as number (2.0 included), TEXT as string, BLOB as
+/// Uint8Array. Anything else, `undefined` among it, is refused rather than
+/// read as the nearest storage class.
+fn value_from_js(index: usize, value: JsValue) -> Result<SqliteValue, SqliteError> {
+    if value.is_null() {
+        Ok(SqliteValue::Null)
+    } else if value.is_bigint() {
+        integer_from_js(&value).map(SqliteValue::Integer)
+    } else if let Some(real) = value.as_f64() {
+        Ok(SqliteValue::Real(real))
+    } else if let Some(text) = value.as_string() {
+        Ok(SqliteValue::Text(text))
+    } else if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
+        Ok(SqliteValue::Blob(bytes.to_vec()))
+    } else {
+        Err(SqliteError::Node(format!("column {index} holds {value:?}, which node:sqlite hands over for no SQLite storage class")))
     }
-    if let Some(text) = value.as_string() {
-        return Ok(SqliteValue::Text(text));
-    }
-    if value.is_bigint() {
-        return Ok(SqliteValue::Integer(integer_from_js(&value)?));
-    }
-    if let Some(number) = value.as_f64() {
-        return Ok(SqliteValue::Real(number));
-    }
-    if value.is_instance_of::<Uint8Array>() {
-        return Ok(SqliteValue::Blob(value.unchecked_into::<Uint8Array>().to_vec()));
-    }
-    if let Some(buffer) = value.dyn_ref::<js_sys::ArrayBuffer>() {
-        return Ok(SqliteValue::Blob(Uint8Array::new(buffer).to_vec()));
-    }
-    Err(SqliteError::Node(format!("unsupported column value {value:?}")))
 }
 
+/// An INTEGER, which node:sqlite hands over as a BigInt.
 fn integer_from_js(value: &JsValue) -> Result<i64, SqliteError> {
-    if value.is_bigint() {
-        let big: BigInt = value.clone().unchecked_into();
-        return i64::try_from(big).map_err(|_| SqliteError::Node("INTEGER does not fit in 64 bits".into()));
+    if !value.is_bigint() {
+        return Err(SqliteError::Node(format!("expected an INTEGER as a BigInt, found {value:?}")));
     }
-    match value.as_f64() {
-        Some(number) if number.fract() == 0.0 => Ok(number as i64),
-        _ => Err(SqliteError::Node(format!("expected an integer, found {value:?}"))),
-    }
+    i64::try_from(value.clone().unchecked_into::<BigInt>()).map_err(|_| SqliteError::Node(format!("{value:?} does not fit in 64 bits")))
 }
 
 fn method(target: &JsValue, name: &str) -> Result<Function, SqliteError> {
@@ -257,6 +312,17 @@ fn method(target: &JsValue, name: &str) -> Result<Function, SqliteError> {
         .map_err(js_error)?
         .dyn_into::<Function>()
         .map_err(|_| SqliteError::Node(format!("the database object has no `{name}` method")))
+}
+
+/// A method of a statement the database prepared. node:sqlite's statements
+/// have every method the executor calls from Node.js 22.16.
+fn statement_method(statement: &JsValue, name: &str) -> Result<Function, SqliteError> {
+    Reflect::get(statement, &name.into()).map_err(js_error)?.dyn_into::<Function>().map_err(|_| {
+        SqliteError::Node(format!(
+            "the database's statements have no `{name}` method, which the node executor needs; node:sqlite's statements have \
+             every method it calls from Node.js 22.16"
+        ))
+    })
 }
 
 fn js_error(value: JsValue) -> SqliteError {
