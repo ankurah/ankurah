@@ -2,11 +2,11 @@
 
 All 448 ordinary observations at `10c98fb5` passed their strict result checks.
 The browser traces and a separate native operation diagnostic are complete.
-A later checkpoint adds two narrow maintenance optimizations. A leaf change
-encodes each distinct ancestor delta once: in the regression tree, insertion and
-removal now encode twice instead of five times. The split and merge capacity
-checks count leaf rows without copying them. Its correctness checks pass; it has
-not yet been remeasured, so every table below describes `10c98fb5` only.
+A later checkpoint, `1a7c0064`, adds two narrow maintenance optimizations and
+was measured with a fixed seven-case follow-up plan. Neither optimization changed
+any case materially; the remaining native costs come from building and
+maintaining digests that small exchanges never read (see the follow-up section).
+The `10c98fb5` tables keep their original pin.
 These measurements replace the
 captured-entity-state implementation's performance claims; the historical reports
 retain their original revisions and results. Performance acceptance remains open.
@@ -88,6 +88,80 @@ Seven pairs do not establish p95/p99 performance. These fixtures do not qualify
 million-row scale, sustained concurrent churn, or numeric ORDER BY (whose
 preexisting storage defect is separately tracked). Bounded cases use padded
 string ORDER BY with LIMIT10 over 4,096 and 16,384 rows.
+
+## Follow-up at `1a7c0064`
+
+A leaf change now encodes each distinct ancestor delta once: in the regression
+tree, insertion and removal encode twice instead of five times. The split and
+merge capacity checks count leaf rows without copying them. Main stays pinned at
+`b5fcfd3e`; candidate artifacts were rebuilt from the exact `1a7c0064` source
+with the same compiler, profiles and fixtures. The fixed plan
+(`runner/maintenance-followup-plan.json`) has seven cases, seven alternating
+pairs each, on both platforms: 196 observations, all passing the strict result
+oracle. Host monitoring flagged no busy starts and no sample at or above 80%.
+
+### Native Sled
+
+| Case | Main median ms | Candidate median ms | Paired delta ms [range] | Slower pairs |
+|---|---:|---:|---|---:|
+| `unlimited-cold-256-half-50ms` | 71.789 | 88.300 | +17.557 [+0.443, +21.162] | 7/7 |
+| `unlimited-cold-4096-empty-50ms` | 465.588 | 378.750 | -71.063 [-101.202, -4.433] | 0/7 |
+| `unlimited-warm_refresh-4096-empty-50ms` | 138.215 | 79.045 | -60.436 [-69.472, -56.744] | 0/7 |
+| `unlimited-warm_edit-4096-all-50ms` | 170.555 | 134.391 | -32.726 [-44.095, -29.425] | 0/7 |
+| `limit10-cold-4096-empty-50ms` | 67.077 | 68.095 | +1.366 [-1.008, +2.999] | 5/7 |
+| `limit10-cold-16384-empty-0ms` | 64.394 | 64.100 | -2.224 [-10.864, +24.296] | 3/7 |
+| `limit10-cold-4096-full-0ms` | 0.535 | 15.218 | +14.683 [-0.061, +19.147] | 6/7 |
+
+Paired median endpoint CPU / peak RSS changes: half-cached 256 +18.05 ms /
++3.36 MiB; cold 4,096 +233.69 ms / +13.16 MiB; first refresh -66.72 ms /
++11.48 MiB; warm edits -84.37 ms / +6.52 MiB; broad-prefetch-to-LIMIT10
++14.87 ms / +22.33 MiB.
+
+### Browser IndexedDB
+
+| Case | Main median ms | Candidate median ms | Paired delta ms [range] | Slower pairs |
+|---|---:|---:|---|---:|
+| `unlimited-cold-256-half-50ms` | 152.700 | 140.500 | -11.700 [-15.200, -4.900] | 0/7 |
+| `unlimited-cold-4096-empty-50ms` | 4521.400 | 2485.300 | -2058.600 [-2305.300, -1864.000] | 0/7 |
+| `unlimited-warm_refresh-4096-empty-50ms` | 849.800 | 87.900 | -764.000 [-810.700, -744.000] | 0/7 |
+| `unlimited-warm_edit-4096-all-50ms` | 768.400 | 146.700 | -621.200 [-723.400, -552.700] | 0/7 |
+| `limit10-cold-4096-empty-50ms` | 258.500 | 262.300 | +5.700 [-125.400, +147.300] | 6/7 |
+| `limit10-cold-16384-empty-0ms` | 801.500 | 816.600 | +19.900 [-452.500, +368.900] | 5/7 |
+| `limit10-cold-4096-full-0ms` | 4.500 | 3.100 | -1.500 [-1.900, -0.600] | 0/7 |
+
+Paired median fixture task CPU changes: half-cached 256 +43.08 ms; cold 4,096
+-164.53 ms; broad-prefetch-to-LIMIT10 +235.25 ms, which includes maintaining the
+4,096-row prefetch. WASM capacity changes stay within +2.19 MiB.
+
+Twelve separate browser trace captures (two pairs each of cold 4,096,
+half-cached 256 and broad-prefetch-to-LIMIT10) passed the result oracle, and
+every capture's CPU samples bracket both endpoint markers with no reported
+trace data loss. They are not pooled with the timings above.
+
+### Where the remaining native cost comes from
+
+When the requester's local matches fit an initial head inventory (at most 2,048
+heads and 256 KiB), neither node reads a digest during the initial exchange:
+the requester offers heads, and the responder compares them entry by entry.
+Both nodes still build and maintain the full digest hierarchy meanwhile.
+
+- Half-cached 256: the `10c98fb5` diagnostic measured two builds (8.14 ms) and a
+  121-insert update (7.99 ms) inside the window, about the size of the +17.6 ms
+  gap. Its scopes overlap and include waits, so this sizes the work rather than
+  proving that all of it is on the waiting path.
+- Broad prefetch to LIMIT10: the snapshot waits for the prefetch's maintenance
+  batch; the LIMIT10 offer itself is a ten-head inventory.
+- Cold 4,096: one private instrumented observation (the `10c98fb5` diagnostic
+  build; tree maintenance code is unchanged in `1a7c0064`) found ten tree builds
+  inside the window. The responder built 4,096 leaves once. The requester, which
+  offered an empty inventory, rebuilt its whole tree eight times as batches
+  arrived (128, 298, 493, 718, 978, 1,318, 2,148 and 4,015 leaves), because a
+  bulk refresh rebuilds every leaf rather than reusing unchanged ones. The window
+  contains 15,280 leaf hashes for a 4,096-row result.
+
+The two optimizations in `1a7c0064` reduce work per changed leaf, so they cannot
+remove work done for leaves whose digests nobody reads. Performance acceptance
+remains open.
 
 ## Ordinary results at `10c98fb5`
 
@@ -287,6 +361,12 @@ build logs; `runner/final-qualification-plan.json` and `runner/projector-trace-p
 fix the observation plans before timing. `maintenance-lifecycle/validation-summary.json`,
 `validation-credential-history/summary.json` and
 `validation-projector-proof/summary.json` index correctness logs.
+
+The `1a7c0064` follow-up is under `qualification-commondelta/` (manifests and
+build logs), `commondelta-results/` (ordinary observations, analysis and host
+summary), `commondelta-traces/` (browser captures) and
+`diagnostic-10c-cold4096/` (the private cold 4,096 observation);
+`validation-common-delta/summary.json` indexes its correctness logs.
 
 Earlier exploratory runs, failed attempts, private attribution builds and the
 rejected lower-rebuild-threshold experiments remain separately recorded. Their
