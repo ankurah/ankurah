@@ -12,6 +12,13 @@ pub enum SqliteError {
     #[error("node:sqlite error: {0}")]
     Node(String),
 
+    /// SQLite refused a statement run through node:sqlite. `code` is SQLite's
+    /// extended result code, which rusqlite's `SqliteFailure` carries
+    /// natively; [`SqliteError::sqlite_code`] reads it from either.
+    #[cfg(all(target_arch = "wasm32", feature = "node"))]
+    #[error("node:sqlite error: {message}")]
+    NodeSqlite { code: i32, message: String },
+
     #[error("Connection pool error: {0}")]
     Pool(String),
 
@@ -44,6 +51,27 @@ pub enum SqliteError {
 
     #[error("store has existing ankurah tables but no recorded protocol version (pre-{expected} store); reset your development database (or migrate the store) before opening it with this binary")]
     UnversionedStore { expected: u32 },
+}
+
+impl SqliteError {
+    /// SQLite's extended result code when SQLite itself refused a statement,
+    /// such as 1555 for a duplicate primary key or 5 for a lock held past the
+    /// busy timeout, read the same way whether rusqlite or node:sqlite ran the
+    /// statement; `None` for every other error. better-sqlite3 hands the code
+    /// over only by name, which is not read, so its refusals have `None` too.
+    pub fn sqlite_code(&self) -> Option<i32> {
+        match self {
+            // rusqlite reports a statement SQLite could not parse as an
+            // SqlInputError, which carries the same code as a SqliteFailure.
+            #[cfg(not(target_arch = "wasm32"))]
+            SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(error, _) | rusqlite::Error::SqlInputError { error, .. }) => {
+                Some(error.extended_code)
+            }
+            #[cfg(all(target_arch = "wasm32", feature = "node"))]
+            SqliteError::NodeSqlite { code, .. } => Some(*code),
+            _ => None,
+        }
+    }
 }
 
 impl From<SqliteError> for ankurah_core::error::RetrievalError {

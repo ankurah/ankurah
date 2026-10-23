@@ -4,12 +4,12 @@
 //! Code extension host, an Electron main process, a JavaScript CLI) and no
 //! native library either, but Node.js ships SQLite as `node:sqlite`. The
 //! engine reaches it through a `DatabaseSync`-shaped JavaScript object:
-//! `prepare(sql)` giving statements with `run(...params)`, `all(...params)`,
-//! `columns()` and `sourceSQL`, plus `exec(sql)`. Node's own `DatabaseSync`
-//! has that shape (Node.js 22.16 or later). Compatible drivers must also
-//! support positional rows and BigInt INTEGER results; the adapter recognizes
-//! better-sqlite3's `raw` and `safeIntegers` methods for these capabilities,
-//! and its `source` for `sourceSQL`.
+//! `prepare(sql)` giving statements with `run(...params)`, `get(...params)`,
+//! `all(...params)`, `columns()` and `sourceSQL`, plus `exec(sql)`. Node's
+//! own `DatabaseSync` has that shape (Node.js 22.16 or later). Compatible
+//! drivers must also support positional rows and BigInt INTEGER results; the
+//! adapter recognizes better-sqlite3's `raw` and `safeIntegers` methods for
+//! these capabilities, and its `source` for `sourceSQL`.
 //! Hosts can adopt an existing database with [`SqliteStorageEngine::from_database`];
 //! [`NodeConnection::open`] constructs Node's directly through
 //! `process.getBuiltinModule`. Every call is synchronous, which suits the
@@ -190,10 +190,33 @@ impl NodePool {
 }
 
 impl SqliteExecutor for NodeConnection {
+    /// Runs a statement as rusqlite's `execute` does: one step, refusing the
+    /// statement when that step yields a row, since a statement that returns
+    /// rows belongs to `query`. node:sqlite's `run` takes the step and
+    /// discards the row.
     fn execute(&self, sql: &str, params: &[SqliteValue]) -> Result<usize, SqliteError> {
         let statement = self.prepare(sql)?;
-        let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
-        changed_rows(&result)
+        if width(&statement)? == 0 {
+            // A statement without columns yields no row.
+            let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
+            return changed_rows(&result);
+        }
+        // `get` takes one step and resets the statement, returning the row
+        // the step yielded, or undefined when it finished the statement.
+        let row = statement_method(&statement, "get")?.apply(&statement, &js_params(params)).map_err(js_error)?;
+        if !row.is_undefined() {
+            // rusqlite's words for the same refusal.
+            return Err(SqliteError::Node("Execute returned results - did you mean to call query?".into()));
+        }
+        // rusqlite then reports the connection's count of changed rows, which
+        // a statement that yields rows leaves as the last change set it.
+        match self.query("SELECT changes()", &[])?.as_slice() {
+            [row] => {
+                let changes = row.integer(0)?;
+                usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
+            }
+            rows => Err(SqliteError::Node(format!("`SELECT changes()` returned {} rows", rows.len()))),
+        }
     }
 
     fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError> {
@@ -340,8 +363,12 @@ fn yields_rows(statement: &JsValue) -> Result<bool, SqliteError> {
     Ok(Reflect::get(statement, &"reader".into()).map_err(js_error)?.as_bool() != Some(false))
 }
 
-/// How many columns each row of a statement holds.
+/// How many columns each row of a statement holds: none for a statement
+/// better-sqlite3 reports yields no rows, whose `columns()` it refuses.
 fn width(statement: &JsValue) -> Result<usize, SqliteError> {
+    if !yields_rows(statement)? {
+        return Ok(0);
+    }
     let columns: Array = statement_method(statement, "columns")?
         .call0(statement)
         .map_err(js_error)?
@@ -445,13 +472,25 @@ fn statement_method(statement: &JsValue, name: &str) -> Result<Function, SqliteE
     })
 }
 
+/// A JavaScript exception as an error. One that node:sqlite raises for SQLite
+/// carries SQLite's extended result code as `errcode`, which is kept, as
+/// rusqlite keeps it natively. better-sqlite3's errors carry no `errcode`,
+/// only the code's name as `code`, which is deliberately not read, since
+/// turning a name back into its number takes a table of SQLite's codes: on
+/// better-sqlite3 an error SQLite raised has no [`SqliteError::sqlite_code`].
 fn js_error(value: JsValue) -> SqliteError {
-    let text = if let Some(error) = value.dyn_ref::<js_sys::Error>() {
+    let message = if let Some(error) = value.dyn_ref::<js_sys::Error>() {
         String::from(error.message())
     } else if let Some(text) = value.as_string() {
         text
     } else {
         format!("{value:?}")
     };
-    SqliteError::Node(text)
+    let code = if value.is_object() { Reflect::get(&value, &"errcode".into()).ok().and_then(|code| code.as_f64()) } else { None };
+    match code {
+        Some(code) if code.fract() == 0.0 && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&code) => {
+            SqliteError::NodeSqlite { code: code as i32, message }
+        }
+        _ => SqliteError::Node(message),
+    }
 }
