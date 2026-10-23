@@ -1,5 +1,14 @@
-//! Leaf changes: applying one to a tree, with the entity lookup and every tree
-//! node above the leaf maintained, bucket splits and merges included.
+//! Leaf changes: applying one or a batch to a tree, with the entity lookup and
+//! every tree node above each leaf maintained, bucket splits and merges
+//! included.
+//!
+//! A change decodes the leaf it expects, encodes the leaf it files, and walks
+//! the topology above both without decoding a tree node's digest. Applied
+//! alone, it appends one delta, encoded once, under every ancestor whose sum
+//! it changes; in a batch, each tree node's differences are summed in memory
+//! and its base written once. An insertion, removal or move may also split a
+//! bucket or merge a subtree, which reads the bounded set of leaves beneath
+//! it, or insert a branch, which reads its parent's summary.
 
 use std::collections::BTreeMap;
 use std::mem;

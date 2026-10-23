@@ -24,7 +24,7 @@ const LANES: usize = 1024;
 /// a digest's count records 65,536 leaves: 65,536 copies of one leaf and
 /// 65,536 copies of another have equal digests, zero lanes and equal counts.
 /// A tree's sums never meet this, because a tree never repeats a leaf; the
-/// crate documentation explains why the guarantee is for sets.
+/// [module documentation](super) explains why the guarantee is for sets.
 ///
 /// A leaf's element is BLAKE3 in its key derivation mode, under
 /// [`LTHASH16_LEAF_CONTEXT`], over the encoded leaf: 2,048 bytes of its

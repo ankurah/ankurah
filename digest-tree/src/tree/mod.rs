@@ -6,11 +6,13 @@
 //! second meets [`TreeError::Conflict`], which fails its transaction whole, and
 //! retries from fresh reads.
 //!
-//! A tree node's base row is written when the tree is built. Every later
-//! change to the tree node is a delta row appended beside it, under a key of
-//! its own, which readers sum, so no change rewrites a hot tree node's row and
-//! changes do not serialize on the root; compaction folds the deltas into the
-//! base, a bounded batch per transaction.
+//! A tree node's base row is written where the topology is made: by a build
+//! or a rebuild, a bucket split or merge, and a branch insertion. A single
+//! change appends a delta row beside each base it changes instead, under a key
+//! of its own, which readers sum, so changes running at once neither rewrite a
+//! hot tree node's row nor serialize on the root. The delta rows stay until
+//! [`TreeTransaction::compact_node`] folds them into the base, or a batch of
+//! changes, which writes each base it changes, folds them on the way.
 
 use std::marker::PhantomData;
 use std::sync::Arc;

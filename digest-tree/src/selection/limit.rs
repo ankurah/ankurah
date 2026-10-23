@@ -76,11 +76,17 @@ pub(crate) struct TierWalk<'a> {
     seen: usize,
     tiers: Vec<Tier>,
 }
+/// The spans of one key part's tier still to walk, the part's depth, and
+/// the place of the next span to walk among them.
 struct Tier {
     spans: Vec<TreeSpan>,
     depth: usize,
     next: usize,
 }
+
+/// One scan a walk asks for: a span, the direction to read it in, how many
+/// entries to read, and whether they are the leaves the walk selects or only
+/// the first entry, which names the next tier.
 pub(crate) struct TierScan {
     pub(crate) bounds: TreeSpan,
     pub(crate) direction: IndexDirection,
@@ -309,7 +315,7 @@ mod tests {
         let mut empty: crate::TreeTransaction = DigestTree::new(tree.spec().clone()).begin();
         let empty_spans = tree.spec().selected_spans(&request, &BTreeMap::<Vec<u8>, ()>::new()).unwrap();
         assert_eq!(empty_spans, empty.scope(&request).await.unwrap().spans());
-        assert_eq!(empty_spans, vec![TreeSpan::all()], "an empty local capture must allow missing peer members");
+        assert_eq!(empty_spans, vec![TreeSpan::all()], "an empty local tree must allow missing peer members");
         let incompatible = TreeRequest::for_selection(&selection("project = 'acme' ORDER BY bar LIMIT 1"), &types()).unwrap();
         assert!(matches!(tree.spec().selected_spans(&incompatible, &addresses), Err(TreeError::UnsupportedSelection)));
     }

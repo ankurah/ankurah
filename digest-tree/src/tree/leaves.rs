@@ -19,11 +19,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         self.transaction.get(MapName::Leaves, &address).await?.map(|value| layout::leaf_row(&address, &value)).transpose()
     }
 
-    /// Every leaf row of an entity, one per key it is filed under, in address
-    /// order: how a change to the entity finds the leaves it must subtract or
-    /// move, since the change names only the entity. A missing leaf named by
-    /// the lookup is an error: omitting it would lose the old contribution
-    /// that a change must subtract.
+    /// Every leaf row of an entity, one per key the entity lookup lists for
+    /// it, in address order. A listed key whose leaf row is missing is
+    /// [`TreeError::MissingLeaf`]: the rows are damaged.
     pub async fn entity_leaves(&mut self, entity_id: EntityId) -> Result<Vec<LeafRow<G>>, TreeError> {
         let (_, keys) = self.keys_of(entity_id).await?;
         let mut rows = Vec::new();

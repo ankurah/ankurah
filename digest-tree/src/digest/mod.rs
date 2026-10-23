@@ -55,38 +55,24 @@
 //! behind the group's codec version byte: see [`Digest::to_row_bytes`] and
 //! [`LeafElement::to_row_bytes`].
 //!
-//! The other candidate for ristretto255's rows was the curve library's internal
-//! coordinates, copied as they lie in memory. With them a tree node update
-//! costs what adding a difference in memory costs, about 70 ns in this
-//! module's benchmark, where the canonical encoding costs about 4.9 µs: 2.4 µs
-//! to decompress, the addition, and 2.4 µs to compress. But curve25519-dalek
-//! keeps those coordinates private and lays them out differently on 32-bit and
-//! 64-bit targets, so storing them would mean unsafe copies of a private layout
-//! that any release of the library may change, and a damaged row could be
-//! caught only by an audit. The canonical encoding is portable across targets
-//! and library versions, keeps a digest row at 41 bytes rather than 169, and
-//! rejects invalid encodings on read, since decompression accepts only
-//! canonical encodings of group elements. A damaged row whose bytes are still
-//! valid, such as one with a changed count byte or with another valid element
-//! in place of the right one, decodes all the same, so the audit, which
-//! recomputes a tree from its leaves, remains what catches it.
+//! The canonical encoding is portable across targets and library versions,
+//! keeps a ristretto255 digest row at 41 bytes, and is refused on read when it
+//! is invalid, since decompression accepts only canonical encodings of group
+//! elements. Its cost, by the digest benchmark, is about 2.4 µs to decompress
+//! an element and 2.4 µs to compress one, where adding two in memory takes
+//! about 70 ns and hashing a leaf to its element about 5 µs. A damaged row
+//! whose bytes are still valid, such as one with a changed count byte or with
+//! another valid element in place of the right one, decodes all the same, so
+//! the audit, which recomputes a tree from its leaves, is what catches it.
 //!
 //! LtHash16's canonical encoding is its lanes as a little-endian target holds
 //! them, so its codec costs a copy, but nothing validates it: every 2,048 bytes
 //! are an element, so only the audit catches a damaged LtHash16 row. Its digest
 //! rows are 2,057 bytes against ristretto255's 41.
 //!
-//! A head-only change decodes the old leaf's stored element and encodes two:
-//! the new leaf's element for its leaf row, and one difference reused under
-//! each ancestor prefix. It reads topology keys without decoding tree node
-//! digests. An insertion, removal or key move may also split or merge buckets;
-//! that work reads bounded leaf sets or a parent summary to establish the new
-//! summaries. Readers and compaction decode tree node rows, a tree
-//! node's base row and each delta appended since: reading a tree node with
-//! eight deltas costs about 20 µs in ristretto255 in this module's benchmark,
-//! and about 1 µs in LtHash16. If measurements call for a faster layout, it
-//! takes a new version byte; a tree is derived from its leaves, so a tree whose
-//! rows carry a version this build cannot read is rebuilt from them.
+//! Another row layout takes another version byte; a tree is derived from its
+//! leaves, so a tree whose rows carry a version this build cannot read is
+//! rebuilt from them.
 
 mod codec;
 mod group;

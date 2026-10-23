@@ -134,8 +134,8 @@ fn address_bounds_at_the_edges() {
     let zeros = |n: usize| vec![0u8; n];
 
     check(NodePrefix::root(), (vec![], None), &[vec![], hex("ff"), vec![0xFF; 33]], &[]);
-    // The review's counterexamples: a carry used to leave a zero byte in
-    // the end bound, admitting shorter addresses.
+    // A carry must not leave a zero byte at the end of the bound, which
+    // would admit shorter addresses.
     check(
         bits("0000 0000 1"),
         (hex("00 80"), Some(hex("01"))),

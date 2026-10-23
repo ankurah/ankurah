@@ -21,8 +21,8 @@ type CountedGroup = Hooked<CountAdds>;
 
 #[tokio::test]
 async fn builder_preserves_encoded_nodes_with_linear_group_additions() {
-    // These hashes freeze the original builder's canonical node rows,
-    // including its empty root, first bucket split, and deeper topology.
+    // These hashes pin the canonical node rows of an empty root, a first
+    // bucket split and a deeper topology.
     for (size, expected) in [
         (0, "9d1fb3c08105018833a285df8382c1b95ada371c03a625f76e70d64aa37e1c89"),
         (65, "3e9e30d9298023b788cf142a439538682f21ee3839345f640112058151c0f333"),
@@ -44,7 +44,7 @@ async fn builder_preserves_encoded_nodes_with_linear_group_additions() {
         assert!(additions <= size + rows.len(), "aggregate each leaf once and combine completed children: {additions} additions");
         let encoded = bincode::serialize(&rows).unwrap();
         let hash = Sha256::digest(encoded).iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-        assert_eq!(hash, expected, "node topology and every digest must retain the original encoding");
+        assert_eq!(hash, expected, "the node topology and every digest keep their pinned bytes");
         assert_eq!(TreeTransaction::<CountedGroup, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, size);
     }
 }
@@ -113,7 +113,7 @@ async fn compare_prepared_build_to_serial<G: DigestGroup>() {
     let mut replacement = TreeTransaction::<G, _>::bind(&spec, prepared_maps.begin());
     replacement.build(changed).await.unwrap();
     replacement.commit().await.unwrap();
-    assert_eq!(old.node(&NodePrefix::root()).await.unwrap(), old_root, "replacement must not mutate a captured snapshot");
+    assert_eq!(old.node(&NodePrefix::root()).await.unwrap(), old_root, "replacement must not change an earlier snapshot");
     assert_ne!(TreeTransaction::<G, _>::bind(&spec, prepared_maps.begin()).node(&NodePrefix::root()).await.unwrap(), old_root);
 }
 

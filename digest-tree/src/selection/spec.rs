@@ -15,14 +15,10 @@ use crate::error::TreeError;
 /// A tree spec is the resolved, canonical description of a tree, so that two
 /// trees can be checked to use the same admission and addressing rules before
 /// their digests are compared. Spec equality does not establish equal content,
-/// and a compatible scope can reuse a tree with a different admission predicate.
-/// One spec stands behind every use of a tree: an index's tree, a partial
-/// replica's scope, a live query's result (where the tree is the matched set,
-/// each entity with its head), a durable subscription, a fetch. What a use
-/// compares is its scope, which the use keeps and the spec does not carry: the
-/// spans of the tree it reads, as a list of span digests with tree node prefixes with key
-/// bounds where a span cuts a tree node, the order it walks them in, and the
-/// count it takes under a limit.
+/// and a request can read a tree whose admission predicate is not its own:
+/// see [`TreeSpec::serves`]. What a use of a tree compares is its scope, which
+/// the use keeps and the spec does not carry: the spans of the tree it reads,
+/// the order it walks them in, and the count it takes under a limit.
 ///
 /// Its two fields divide into ordering and admission.
 ///
@@ -41,37 +37,16 @@ use crate::error::TreeError;
 /// digest, only which leaves fall under a limit's cut, and that cut is a few
 /// spans of the one tree: the tiers before the cut whole, then within the
 /// cut's tier the leaves past the cut value in the walk's direction, then
-/// within the cut's own value the entity ids up to it. The default key for a
-/// new Selection tree uses equality-pinned parts in canonical order, followed
-/// by nonconstant ORDER BY parts under a limit (entity-id order when omitted).
-/// Without a limit, it adds one constrained range part if available, using a
-/// matching ORDER BY part to choose among several, then a canonical tie-break.
-/// This is a creation policy; reuse considers the existing tree's layout.
-/// Thus `project = 'acme' AND foo > 7` uses (project, foo), with or without
-/// `ORDER BY foo`. The range predicate supplies foo; ordering is not needed
-/// to make narrower foo ranges addressable. The entity-id tree has the
-/// empty key spec, so its address is the entity id alone.
+/// within the cut's own value the entity ids up to it. The entity-id tree has
+/// the empty key spec, so its address is the entity id alone.
 ///
 /// The predicate is the admission. It chooses which entities file a leaf,
 /// never where they file: the Selection's whole predicate, resolved to
-/// property ids, membership in a component included as a term of it.
-/// Missing key parts require an explicit encoding or admission policy: a key
-/// choice must not silently exclude entities the predicate admits.
-/// A filtered tree can also serve a narrower
-/// Selection when it admits every entity the Selection requires and the
-/// remaining restriction is exactly expressed by bounds in that tree's key
-/// order. Stored bucket boundaries need not coincide with those bounds: a
-/// partial tree node must be descended or its qualifying leaves read, never
-/// included with its whole digest. For example,
-/// the tree admitting `project = 'acme' AND foo > 7`, keyed by (project, foo),
-/// serves `project = 'acme' AND foo > 10` as a span. The requesting predicate
-/// need not equal the tree's admission predicate. Both uses read the same
-/// leaves at the same addresses; reuse creates no second tree.
-///
-/// Whoever feeds the tree decides admission against entity state and derives
-/// keys with the canonical codec. The reuse planner analyzes predicates to
-/// prove coverage and exact bounds, but does not load or evaluate entity state.
-/// Whether a tree is an index tree is a fact about its owner, not its spec.
+/// property ids, membership in a component included as a term of it. Whoever
+/// feeds the tree decides admission against entity state and derives keys
+/// with [`CanonicalCodec`](crate::CanonicalCodec), which files an entity
+/// missing a key part under that part's null encoding, so a key never leaves
+/// out an entity the predicate admits.
 #[derive(Clone, Serialize)]
 pub struct TreeSpec {
     key_spec: KeySpec<PropertyId>,
@@ -113,9 +88,16 @@ impl TreeSpec {
         Self { key_spec, predicate, identity }
     }
 
-    /// Choose a new layout: equality-pinned paths first; under a limit, the
-    /// nonconstant ordering paths; otherwise one constrained range path, with
-    /// ORDER BY breaking ties. Entity identity is always the final address part.
+    /// The spec of a new tree for `selection`, its key chosen by this policy:
+    /// the parts the Selection pins by equality first, in canonical order;
+    /// then, under a limit, its nonconstant ORDER BY parts, up to the entity
+    /// id if the order names it; and otherwise one part the Selection bounds
+    /// by a range, the first ORDER BY part among them when there are several.
+    /// The entity id always ends the address. So `project = 'acme' AND foo >
+    /// 7` gets the key (project, foo) with or without `ORDER BY foo`: the
+    /// range supplies foo, and a narrower range of foo is then a span of the
+    /// tree. This policy only makes new trees: whether an existing tree serves
+    /// a Selection is [`TreeSpec::serves`]'s question, whatever its key.
     pub fn for_selection(selection: &Selection<Resolved>, types: &impl PropertyTypes) -> Result<Self, TreeError> {
         let request = TreeRequest::for_selection(selection, types)?;
         let mut paths: Vec<_> =
@@ -147,13 +129,11 @@ impl TreeSpec {
         Ok(Self::new(KeySpec::new(parts), selection.predicate.clone()))
     }
 
-    /// The ordering: the parts that address the leaves, every one ascending.
-    /// Empty for the entity-id tree. A predicate's range part can be present
-    /// without an ORDER BY, allowing narrower selections to use key bounds.
+    /// The ordering: the parts that address the leaves, every one ascending;
+    /// empty for the entity-id tree.
     pub fn key_spec(&self) -> &KeySpec<PropertyId> { &self.key_spec }
 
     /// The admission: the Selection's whole predicate, resolved.
-    /// Key availability must not silently add another membership restriction.
     pub fn predicate(&self) -> &Predicate<Resolved> { &self.predicate }
 
     /// Identity ignores display labels but preserves predicate structure and

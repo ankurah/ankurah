@@ -21,6 +21,9 @@ pub enum TreeMatch {
     Span,
 }
 
+/// How a tree serves a request: whole or as spans, the spans that select the
+/// request's members, and the direction the request walks each key part and
+/// the entity id in.
 pub(crate) struct ReusePlan {
     pub kind: TreeMatch,
     pub spans: Vec<TreeSpan>,
@@ -33,6 +36,16 @@ impl TreeSpec {
     /// address bounds and, under a limit, the requested order can select them.
     /// `None` includes cases the conservative implication proof cannot establish.
     /// Selection scopes additionally check that each entity has only one leaf.
+    ///
+    /// A tree serves a narrower request when it admits every entity the
+    /// request asks for and the rest of the request is exactly a set of bounds
+    /// in the tree's key order: the tree admitting `project = 'acme' AND foo >
+    /// 7`, keyed by (project, foo), serves `project = 'acme' AND foo > 10` as
+    /// a span. Both read the same leaves at the same addresses, so serving the
+    /// narrower request makes no second tree. The tree's nodes need not end at
+    /// the bounds: a tree node a span cuts is descended into, or its leaves
+    /// within the span read, never counted whole. The proof reads the
+    /// predicates alone, never entity state.
     pub fn serves(&self, request: &TreeRequest) -> Option<TreeMatch> { self.plan(request).map(|plan| plan.kind) }
 
     pub(crate) fn plan(&self, request: &TreeRequest) -> Option<ReusePlan> {

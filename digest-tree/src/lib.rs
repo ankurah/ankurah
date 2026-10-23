@@ -1,66 +1,59 @@
-//! Digest trees for Ankurah: one tree over any set of leaves.
+//! Digest trees: comparing two sets of leaves by comparing sums, and
+//! descending only where the sums differ.
 //!
-//! A digest tree summarizes a set of leaves so that two trees over the same
-//! leaf set can find the leaves they hold differently by comparing digests
-//! instead of leaves. Each leaf is filed at an address, its canonical key
-//! followed by its entity id, and the tree groups the leaves by the leading
-//! bits of their addresses: a tree node, named by a prefix of those bits,
-//! holds the digest of every leaf beneath it, so equal digests let a
-//! comparison skip the tree node's whole subtree. The leaf set may be the
-//! entries of a query index, which gives the index tree, or the leaves a
-//! Selection admits, which give a tree of its own: a tree whose spec carries a
-//! predicate, derived from the Selection alone. The tree is the same either
-//! way.
+//! A leaf is one entity filed under one key, with the hash of its head. A
+//! digest tree sums its leaves' elements, each a cryptographic hash of one
+//! leaf into a group from the [`digest`] module, so that two trees over the
+//! same leaves hold the same sums, and trees whose sums differ hold different
+//! leaves. Each leaf is filed at an address, its canonical key
+//! ([`CanonicalCodec`]) followed by its entity id, and the tree groups the
+//! leaves by the leading bits of their addresses: a tree node, named by a
+//! [`NodePrefix`], holds the digest of every leaf beneath it. Two peers
+//! compare a span of addresses by its digest ([`TreeSpanDigest`]), refine a
+//! span whose digests differ into the spans of the tree nodes beneath it, and
+//! exchange leaves only where the narrowest spans still differ.
 //!
-//! A [`DigestTree`] is the spec that defines it ([`TreeSpec`]) and the
-//! memory-resident maps that hold its rows ([`MemoryMaps`]), with its leaves
-//! summed in a group from the [`digest`] module, its type parameter:
-//! ristretto255 unless the tree names another, such as LtHash16. Its
+//! A [`DigestTree`] is defined by its [`TreeSpec`]: the predicate that admits
+//! its leaves and the key that orders them. The request a Selection makes
+//! ([`TreeRequest`]) reads any tree whose spec [serves](TreeSpec::serves) it,
+//! as spans of that tree's leaves, so compatible Selections share one tree.
+//! Callers evaluate admission against their entity state and supply
+//! canonical keys and head hashes; the crate depends on no Ankurah node or
+//! storage engine.
+//!
+//! A tree's rows live in three ordered byte maps ([`MapName`]), in memory
+//! ([`MemoryMaps`]) or in any store that implements [`MapAccess`]. Its
 //! operations run in transactions: [`DigestTree::begin`] gives a
 //! [`TreeTransaction`], whose reads observe one consistent state of the maps
 //! and its own writes, and whose writes, each conditional on what it read,
 //! land together when it commits, or not at all, with [`TreeError::Conflict`],
-//! after which the writer retries from fresh reads.
-//!
-//! A tree node's base row is written when the tree is built or restructured;
-//! ordinary changes append a delta row beside it under a key of
-//! its own, which readers sum and compaction folds into the base from time to
-//! time, so no change rewrites a hot tree node's row and no two changes
-//! conflict on one. A structural change retries after any intervening write,
-//! and writers using the previous topology retry after it changes.
-//! Every stored element and digest carries its group's codec
-//! version byte, so a row written in another group does not decode.
-//! Deltas without a base cannot establish a subtree's total: reads and
-//! compaction report [`TreeError::IncompleteNode`] instead of assuming zero.
-//!
-//! Callers evaluate admission against their entity state and supply canonical
-//! keys and head hashes. [`CanonicalCodec`] encodes those keys; [`TreeRequest`]
-//! and [`TreeSpec::serves`] prove supported predicate implications. A
-//! Selection compares a scope over its tree using [`TreeSpanDigest`] values:
-//! each carries an exact [`TreeSpan`], its digest and a prefix for refinement.
+//! after which the writer retries from fresh reads. A change applied alone
+//! appends a delta row beside each tree node's base row it changes, so
+//! changes running at once never conflict on a base row, and the writer folds
+//! the deltas into the bases with [`TreeTransaction::compact_node`]. A batch
+//! of changes ([`TreeTransaction::apply_changes`]), the path for a tree's only
+//! writer, writes each base row once and leaves no delta behind. Every stored
+//! element and digest carries its group's codec version byte, so a row
+//! written in another group does not decode, and deltas without a base report
+//! [`TreeError::IncompleteNode`] rather than stand for a sum.
 //!
 //! # Modules
 //!
-//! - `tree`: the [`DigestTree`] and the [`TreeTransaction`] that carries the
-//!   tree's operations: leaf rows, tree node rows, changes, builds, audits and
+//! - `address`: where a tree files each leaf, and how runs of leaves are
+//!   named: the [`CanonicalCodec`], the [leaf address](leaf_address), the
+//!   [`NodePrefix`], and the [`TreeSpan`] with its [`TreeSpanDigest`].
+//! - `selection`: whether and how a tree serves a Selection: the
+//!   [`TreeSpec`], the [`TreeRequest`], the proof that a tree serves a
+//!   request, and the spans a request's limit selects.
+//! - `store`: the bytes a tree keeps and the transactions over them:
+//!   [`MapAccess`], [`MapTransaction`], the [`MemoryMaps`], and the layout of
+//!   every key and value.
+//! - `tree`: the [`DigestTree`] and the [`TreeTransaction`] that carries its
+//!   operations: leaf rows, tree node rows, changes, builds, audits and
 //!   scoped reads.
-//! - `selection`: the [`TreeSpec`], what defines a tree, the [`TreeRequest`] a
-//!   Selection makes of one, and whether and how a tree serves it.
-//! - [`digest`]: the [`Leaf`], the [`DigestGroup`] a tree sums leaves in, its
-//!   two groups, and the [`Digest`].
-//! - `address`: the [`CanonicalCodec`], the [leaf address](leaf_address), the
-//!   [`NodePrefix`] that names a tree node and the [`TreeSpan`] that names a
-//!   run of leaves.
-//! - `store`: [`MapAccess`] to the three maps a [`MapName`] names, the byte
-//!   layout of their rows, and the [`MemoryMaps`] that hold a tree in memory.
+//! - [`digest`]: the cryptography: the [`Leaf`], the [`DigestGroup`] a tree
+//!   sums leaves in, its two groups, and the [`Digest`].
 //! - `error`: the [`TreeError`].
-//!
-//! [`TreeTransaction::apply_change`] maintains leaves, entity lookups and
-//! ancestor summaries together, including bucket splits and merges. Build and
-//! audit operate on admitted leaves. Selection scopes resolve exact bounds and
-//! limits within one snapshot, and expose counts, digests, clipped span digests and
-//! paginated leaves. Direct address scopes also support multi-key leaf sets.
-//! This crate has no Ankurah node or storage-engine dependency.
 
 #![deny(missing_docs)]
 

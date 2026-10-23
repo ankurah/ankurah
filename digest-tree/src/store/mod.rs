@@ -27,9 +27,10 @@
 //! [`append`](MapAccess::append), under a key no other append takes, so
 //! that appends never conflict.
 //!
-//! [`MemoryTransaction`](crate::MemoryTransaction) implements both traits
-//! today, and other storage can implement them later. Map access is async
-//! for that storage's sake; in memory the operations complete at once.
+//! A storage engine implements both traits to keep a tree in its own store;
+//! access is async so that such an implementation can await I/O.
+//! [`MemoryTransaction`](crate::MemoryTransaction) implements them in memory,
+//! where every operation completes at once.
 
 use std::ops::Bound;
 
@@ -55,9 +56,12 @@ pub type ByteBounds<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 pub enum MapName {
     /// The leaf rows, by leaf address.
     Leaves,
-    /// The keys each entity is filed under, by entity id, so that a change,
-    /// which names only the entity, finds the leaves it must subtract or
-    /// move. Its reserved empty key counts entities with multiple keys.
+    /// The keys each entity is filed under, by entity id: what
+    /// [`TreeTransaction::entity_leaves`](crate::TreeTransaction::entity_leaves)
+    /// reads, what keeps the count of entities filed under more than one key,
+    /// which a Selection's scope requires to be zero, and what an audit checks
+    /// against the leaves. Every leaf insertion and removal keeps it in step.
+    /// Its reserved empty key holds that count.
     Lookup,
     /// The tree node rows, by prefix: a base row per tree node and the delta
     /// rows appended since its base was last compacted.

@@ -34,6 +34,9 @@ pub struct TreeRequest {
     pub(crate) limit: Option<u64>,
 }
 
+/// One alternative of a predicate in disjunctive form: the conjunction of a
+/// range of encoded values for each property it bounds and of the terms it
+/// cannot bound, each kept whole as label-free bytes to compare.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Clause {
     pub(super) fields: BTreeMap<PropertyPath, TreeSpan>,

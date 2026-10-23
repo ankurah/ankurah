@@ -10,7 +10,10 @@
 //!   bytes in all.
 //! - lookup: the key is the entity id (32 bytes); the value is every key the
 //!   entity is filed under, each preceded by its length as an unsigned 32-bit
-//!   big-endian integer, in ascending order and each once.
+//!   big-endian integer, in ascending order and each once. Under the empty
+//!   key, which no entity id can be, the value is the count of entities filed
+//!   under more than one key, an unsigned 64-bit big-endian integer, and the
+//!   row is present only while the count is not zero.
 //! - nodes: a tree node's base row is keyed by its prefix's encoding
 //!   ([`NodePrefix::to_bytes`]) and holds the digest in the row codec
 //!   ([`Digest::ROW_LEN`] bytes); each of its delta rows is keyed by the

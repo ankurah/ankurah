@@ -1,11 +1,11 @@
-//! The rows a tree keeps: one leaf row per leaf, filed by leaf address, and
-//! one tree node row per stored prefix.
+//! The typed leaf rows a tree keeps: one per leaf, filed by leaf address,
+//! alone or with the bytes it is stored as.
 //!
-//! Rows carry typed values: the head hash, the leaf element and the digest as
-//! the [`digest`](crate::digest) module defines them, in the group the tree
-//! sums in (ristretto255 unless the tree names another). The maps hold their
-//! bytes in the layouts of the `layout` module, which the tree encodes
-//! and decodes, so the maps hold bytes and nothing else.
+//! Rows carry typed values: the head hash and the leaf element as the
+//! [`digest`](crate::digest) module defines them, in the group the tree sums
+//! in (ristretto255 unless the tree names another). The maps hold their bytes
+//! in the layouts of the `layout` module, which the tree encodes and decodes,
+//! so the maps hold bytes and nothing else.
 
 use ankurah_core_types::EntityId;
 

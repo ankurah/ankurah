@@ -1,5 +1,9 @@
 //! The tree node rows: a base row per tree node and the delta rows appended
 //! beside it, which readers sum and compaction folds into the base.
+//!
+//! A read decodes the base and every delta: by the digest benchmark, about
+//! 20 µs for a tree node with eight deltas in ristretto255 and about 1 µs in
+//! LtHash16, so compaction keeps reads short.
 
 use std::ops::Bound;
 
