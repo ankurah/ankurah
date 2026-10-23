@@ -54,7 +54,7 @@ fn fixture(kind: &str, count: usize, tips: usize, clipped: bool) -> Fixture {
             "nullable" => vec![if n % 8 == 0 { None } else { Some(Value::String(format!("a\0{:02}/{}", n % 16, "z".repeat(n % 20)))) }],
             _ => panic!("unknown fixture"),
         };
-        let key = CanonicalCodec.encode_nullable(&spec, &value).unwrap();
+        let key = CanonicalCodec::encode_nullable(&spec, &value).unwrap();
         let head = Clock::new(
             (0..tips)
                 .map(|tip| {
@@ -184,7 +184,7 @@ fn main() {
     let mut cases = Vec::new();
     for fixture in fixtures() {
         for leaf in &fixture.page.leaves {
-            CanonicalCodec.split(&fixture.spec, &leaf.key).unwrap();
+            CanonicalCodec::split(&fixture.spec, &leaf.key).unwrap();
         }
         let current = bincode::serialize(&SpanContent::Heads(fixture.page.clone())).unwrap();
         let SpanContent::Heads(baseline) = bincode::deserialize(&current).unwrap() else { panic!("inventory") };

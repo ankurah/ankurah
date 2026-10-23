@@ -58,7 +58,7 @@ fn entries(spec: &TreeSpec, rows: Vec<(Attested<EntityState>, Vec<Option<Value>>
         .map(|(state, values)| {
             Ok(TreeEntry {
                 entity_id: state.payload.entity_id,
-                key: CanonicalCodec.encode_nullable(spec.key_spec(), &values)?,
+                key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?,
                 head: state.payload.state.head,
             })
         })

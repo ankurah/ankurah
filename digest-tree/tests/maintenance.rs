@@ -159,7 +159,7 @@ async fn seeded_updates_moves_and_deletes_match_an_independent_model() {
         let before = model.get(&n).cloned();
         let after = rng.gen_bool(0.8).then(|| {
             let mut row = leaf(n, rng.gen());
-            row.key = CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::I64(rng.gen_range(-50..50))]).unwrap();
+            row.key = CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::I64(rng.gen_range(-50..50))]).unwrap();
             row
         });
         let mut tx = tree.begin();

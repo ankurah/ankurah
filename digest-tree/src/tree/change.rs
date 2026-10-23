@@ -60,7 +60,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     async fn change_leaf(&mut self, change: LeafChange) -> Result<(), TreeError> {
         self.transaction.watch_structure();
         for leaf in change.before.iter().chain(change.after.iter()) {
-            CanonicalCodec.split(self.spec.key_spec(), &leaf.key)?;
+            CanonicalCodec::split(self.spec.key_spec(), &leaf.key)?;
         }
         let mut before_value = None;
         let before = match &change.before {

@@ -72,7 +72,7 @@ async fn compare_prepared_build_to_serial<G: DigestGroup>() {
             let mut id = [0; EntityId::BYTE_LEN];
             id[..8].copy_from_slice(&(n / 2).to_be_bytes());
             LeafInput {
-                key: CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(n as i64)]).unwrap(),
+                key: CanonicalCodec::encode_prefix(spec.key_spec(), &[Value::I64(n as i64)]).unwrap(),
                 entity_id: EntityId::from_bytes(id),
                 head: HeadHash::of([id, [3; 32]]),
             }

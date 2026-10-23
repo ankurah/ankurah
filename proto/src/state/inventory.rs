@@ -34,7 +34,7 @@ impl TreeSpanInventory {
         let mut address = Vec::new();
         let mut cursor = self.heads.cursor();
         while let Some(leaf) = cursor.next() {
-            CanonicalCodec.split(spec.key_spec(), leaf.key)?;
+            CanonicalCodec::split(spec.key_spec(), leaf.key)?;
             address.clear();
             address.extend_from_slice(leaf.key);
             address.extend_from_slice(&leaf.entity.entity_id.to_bytes());

@@ -153,7 +153,7 @@ impl<'a> TierWalk<'a> {
 
 fn address_parts<'a>(spec: &KeySpec<PropertyId>, address: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
     let key_len = address.len().checked_sub(EntityId::BYTE_LEN).ok_or(TreeError::InvalidKey("truncated leaf address"))?;
-    CanonicalCodec.split(spec, &address[..key_len])
+    CanonicalCodec::split(spec, &address[..key_len])
 }
 
 // A lexicographic cut has one interval for each earlier differing tuple part
@@ -238,7 +238,7 @@ mod tests {
         let model: Vec<_> = (0..90u8)
             .map(|n| {
                 let (foo, bar) = (i64::from(n % 5), i64::from(n / 5 % 3));
-                let key = CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::from("acme"), Value::I64(foo), Value::I64(bar)]).unwrap();
+                let key = CanonicalCodec::encode_prefix(spec.key_spec(), &[Value::from("acme"), Value::I64(foo), Value::I64(bar)]).unwrap();
                 (foo, bar, LeafInput { key, entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[n; 32]]) })
             })
             .collect();
@@ -322,7 +322,7 @@ mod tests {
         for malformed in [vec![0], vec![1; 33], vec![0xff; 64]] {
             assert!(matches!(spec.selected_spans(&request, &BTreeMap::from([(malformed, ())])), Err(TreeError::InvalidKey(_))));
         }
-        let key = CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(0)]).unwrap();
+        let key = CanonicalCodec::encode_prefix(spec.key_spec(), &[Value::I64(0)]).unwrap();
         let address = leaf_address(&key, EntityId::from_bytes([0; 32]));
         let mut addresses = BTreeMap::from([(address.clone(), ()), (vec![0xff; 64], ())]);
         assert!(spec.selected_spans(&request, &addresses).unwrap().iter().any(|span| span.contains(&address)));

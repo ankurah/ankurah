@@ -5,18 +5,16 @@ use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, Value, Val
 
 use crate::error::TreeError;
 
-/// The standalone crate's canonical codec. Missing values sort before present
+/// This crate's canonical key codec. Missing values sort before present
 /// ones and do not change admission. NaNs and JSON ordering are unsupported;
 /// floating zero has one encoding, and strings use UTF-8 byte order.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CanonicalCodec;
+///
+/// The type has no values: it names the codec its functions belong to.
+pub enum CanonicalCodec {}
 
 impl CanonicalCodec {
-    /// Encoding version, to negotiate before comparing keys across versions.
-    pub const VERSION: u8 = 1;
-
     /// Encode a tuple prefix, explicitly representing missing/null values.
-    pub fn encode_nullable(&self, spec: &KeySpec<PropertyId>, values: &[Option<Value>]) -> Result<Vec<u8>, TreeError> {
+    pub fn encode_nullable(spec: &KeySpec<PropertyId>, values: &[Option<Value>]) -> Result<Vec<u8>, TreeError> {
         if values.len() > spec.keyparts.len() {
             return Err(TreeError::InvalidKey("too many tuple parts"));
         }
@@ -27,7 +25,7 @@ impl CanonicalCodec {
         Ok(bytes)
     }
     /// Encode the first `values.len()` parts of a key spec.
-    pub fn encode_prefix(&self, spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
+    pub fn encode_prefix(spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
         if values.len() > spec.keyparts.len() {
             return Err(TreeError::InvalidKey("too many tuple parts"));
         }
@@ -39,7 +37,7 @@ impl CanonicalCodec {
     }
     /// Split a complete key into its self-delimiting encoded parts, rejecting
     /// malformed, noncanonical or trailing bytes.
-    pub fn split<'a>(&self, spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
+    pub fn split<'a>(spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
         let mut parts = Vec::new();
         let mut rest = key;
         for part in &spec.keyparts {

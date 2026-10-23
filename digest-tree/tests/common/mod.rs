@@ -52,7 +52,7 @@ pub async fn populated_tree(selection: &Selection<Resolved>) -> DigestTree<Ristr
     let tree = DigestTree::new(TreeSpec::for_selection(selection, &types()).unwrap());
     let mut tx = tree.begin();
     for (n, (project, foo)) in [("acme", 9), ("acme", 10), ("acme", 12), ("acme", 15)].into_iter().enumerate() {
-        let key = CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::String(project.into()), Value::I64(foo)]).unwrap();
+        let key = CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::String(project.into()), Value::I64(foo)]).unwrap();
         let leaf = LeafInput { key, entity_id: entity(n as u8), head: HeadHash::of([[0x80 + n as u8; 32]]) };
         tx.apply_change(LeafChange { before: None, after: Some(leaf) }).await.unwrap();
     }

@@ -732,7 +732,7 @@ impl Driver {
         content: Option<&proto::DeltaContent>,
     ) -> anyhow::Result<()> {
         if let Some(member) = member {
-            CanonicalCodec.split(self.spec.key_spec(), &member.key)?;
+            CanonicalCodec::split(self.spec.key_spec(), &member.key)?;
             self.add_goal(Owner::Live(revision), id, member.head.clone())?;
         }
         if let Some(content) = content {

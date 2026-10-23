@@ -115,7 +115,7 @@ impl QueryTree {
     pub fn serves(spec: &TreeSpec, selection: &Selection<Resolved>, catalog: &CatalogManager) -> bool {
         let types = CatalogTypes(catalog);
         if Self::key_paths(spec).iter().zip(&spec.key_spec().keyparts).any(|(path, part)| types.value_type(path) != Some(part.value_type))
-            || CanonicalCodec.encode_nullable(spec.key_spec(), &vec![None; spec.key_spec().keyparts.len()]).is_err()
+            || CanonicalCodec::encode_nullable(spec.key_spec(), &vec![None; spec.key_spec().keyparts.len()]).is_err()
         {
             return false;
         }
@@ -201,15 +201,14 @@ impl QueryTree {
 fn checked_entries(spec: &TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Entries> {
     let mut checked = Entries::new();
     for entry in entries {
-        CanonicalCodec.split(spec.key_spec(), &entry.key)?;
+        CanonicalCodec::split(spec.key_spec(), &entry.key)?;
         anyhow::ensure!(checked.insert(entry.entity_id, entry).is_none(), "duplicate tree entity");
     }
     Ok(checked)
 }
 
 fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
-    CanonicalCodec
-        .split(spec.key_spec(), &entry.key)
+    CanonicalCodec::split(spec.key_spec(), &entry.key)
         .expect("tree entries have validated canonical keys")
         .iter()
         .enumerate()
@@ -327,7 +326,7 @@ fn entry_from_state(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::R
     let values = QueryTree::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
     Ok(TreeEntry {
         entity_id: state.payload.entity_id,
-        key: CanonicalCodec.encode_nullable(spec.key_spec(), &values)?,
+        key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?,
         head: state.payload.state.head.clone(),
     })
 }
@@ -573,7 +572,7 @@ impl Snapshot {
         for range in ranges.iter().filter(|range| !range.is_empty()) {
             for (_, id) in self.members.range((range.start.clone(), range.end.clone())) {
                 let entry = &self.entries[id];
-                let parts = if order.is_empty() { Vec::new() } else { CanonicalCodec.split(self.physical_spec.key_spec(), &entry.key)? };
+                let parts = if order.is_empty() { Vec::new() } else { CanonicalCodec::split(self.physical_spec.key_spec(), &entry.key)? };
                 rows.push((*id, parts));
             }
         }

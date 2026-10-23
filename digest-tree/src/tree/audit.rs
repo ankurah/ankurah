@@ -32,7 +32,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let leaves = self.all_leaves(&TreeSpan::all()).await?;
         let mut lookup: BTreeMap<EntityId, BTreeSet<Vec<u8>>> = BTreeMap::new();
         for row in &leaves {
-            CanonicalCodec.split(self.spec.key_spec(), &row.key)?;
+            CanonicalCodec::split(self.spec.key_spec(), &row.key)?;
             if row.element != Leaf::new(&row.key, row.entity_id, row.head).element() {
                 return Err(TreeError::Audit("leaf element differs from its inputs"));
             }

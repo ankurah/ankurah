@@ -67,7 +67,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         // workers perform the independent hashing and row encoding.
         let mut admitted = BTreeMap::new();
         for leaf in leaves {
-            CanonicalCodec.split(self.spec.key_spec(), &leaf.key)?;
+            CanonicalCodec::split(self.spec.key_spec(), &leaf.key)?;
             let address = crate::leaf_address(&leaf.key, leaf.entity_id);
             if admitted.insert(address, leaf).is_some() {
                 return Err(TreeError::DuplicateLeaf);

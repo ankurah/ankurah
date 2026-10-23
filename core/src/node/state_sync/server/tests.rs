@@ -1945,7 +1945,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let mut duplicate = keyed.offer().await?;
     let proto::SpanContent::Heads(first) = &mut duplicate.spans[0] else { unreachable!() };
     let mut second = first.clone();
-    let key = CanonicalCodec.encode_prefix(position_spec().key_spec(), &[ankurah_core_types::Value::I64(10001)])?;
+    let key = CanonicalCodec::encode_prefix(position_spec().key_spec(), &[ankurah_core_types::Value::I64(10001)])?;
     let mut rows = second.heads.to_vec();
     rows[0].key = key;
     let addr = leaf_address(&rows[0].key, rows[0].entity.entity_id);

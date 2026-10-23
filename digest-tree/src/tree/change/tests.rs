@@ -76,7 +76,7 @@ async fn moves_give_shared_and_separate_ancestors_their_own_deltas() {
     let leaf = |n: u64, key: i64| {
         let mut id = [0; EntityId::BYTE_LEN];
         id[..8].copy_from_slice(&n.to_be_bytes());
-        let key = CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(key)]).unwrap();
+        let key = CanonicalCodec::encode_prefix(spec.key_spec(), &[Value::I64(key)]).unwrap();
         LeafInput { key, entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
     };
     let tree = DigestTree::<Ristretto255>::new(spec.clone());
@@ -302,7 +302,7 @@ mod map_costs {
         let mut id = [0; 32];
         id[..8].copy_from_slice(&value.to_be_bytes());
         LeafInput {
-            key: CanonicalCodec.encode_prefix(spec().key_spec(), &[Value::I64(value)]).unwrap(),
+            key: CanonicalCodec::encode_prefix(spec().key_spec(), &[Value::I64(value)]).unwrap(),
             entity_id: EntityId::from_bytes(id),
             head: HeadHash::of([[version; 32]]),
         }

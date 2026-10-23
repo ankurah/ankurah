@@ -12,7 +12,7 @@ use ankurah_digest_tree::{
 
 fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([1; 32])) }
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property(), ValueType::I64)]), Predicate::True) }
-fn key(value: i64) -> Vec<u8> { CanonicalCodec.encode_prefix(spec().key_spec(), &[Value::I64(value)]).unwrap() }
+fn key(value: i64) -> Vec<u8> { CanonicalCodec::encode_prefix(spec().key_spec(), &[Value::I64(value)]).unwrap() }
 fn leaf(value: i64, version: u8) -> LeafInput {
     let mut id = [0; 32];
     id[..8].copy_from_slice(&value.to_be_bytes());

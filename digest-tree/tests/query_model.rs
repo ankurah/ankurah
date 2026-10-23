@@ -13,12 +13,11 @@ async fn mixed_directions_limits_and_pages_match_a_sorted_model() {
         IndexKeyPart::asc(property("bar"), ValueType::I64),
     ]);
     let tree = DigestTree::new(TreeSpec::new(key, admission.predicate.clone()));
-    let codec = CanonicalCodec;
     let mut model = Vec::new();
     let mut build = tree.begin();
     for n in 0..150u8 {
         let (foo, bar) = (i64::from(n % 7), i64::from((n / 7) % 5));
-        let key = codec.encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(foo), Value::I64(bar)]).unwrap();
+        let key = CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(foo), Value::I64(bar)]).unwrap();
         model.push((foo, bar, LeafInput { key, entity_id: entity(n), head: HeadHash::of([[n; 32]]) }));
     }
     build.build(model.iter().map(|(_, _, leaf)| leaf.clone())).await.unwrap();
@@ -80,7 +79,7 @@ async fn disjunctions_nulls_and_embedded_nuls_have_exact_bounds() {
         .iter()
         .enumerate()
         .map(|(n, value)| LeafInput {
-            key: CanonicalCodec.encode_nullable(tree.spec().key_spec(), &[value.map(Value::from)]).unwrap(),
+            key: CanonicalCodec::encode_nullable(tree.spec().key_spec(), &[value.map(Value::from)]).unwrap(),
             entity_id: entity(n as u8),
             head: HeadHash::of([[n as u8; 32]]),
         })
@@ -126,7 +125,7 @@ async fn scope_lifetime_and_multiplicity_are_checked() {
     let other_scope = other.scope(&request).await.unwrap();
     assert_eq!(other.count(&other_scope).await.unwrap(), 2);
     let duplicate = LeafInput {
-        key: CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(20)]).unwrap(),
+        key: CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(20)]).unwrap(),
         entity_id: entity(3),
         head: HeadHash::of([[1; 32]]),
     };
@@ -143,7 +142,7 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
         .map(|n| {
             let value = i64::from(n) - 100;
             let row = LeafInput {
-                key: CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::I64(value)]).unwrap(),
+                key: CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::I64(value)]).unwrap(),
                 entity_id: entity(n),
                 head: HeadHash::of([[n; 32]]),
             };

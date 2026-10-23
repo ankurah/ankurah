@@ -153,7 +153,7 @@ where
                     let values = subscribed_paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
                     Some(TreeEntry {
                         entity_id,
-                        key: CanonicalCodec.encode_nullable(subscribed_spec.key_spec(), &values)?,
+                        key: CanonicalCodec::encode_nullable(subscribed_spec.key_spec(), &values)?,
                         head: entity.head().clone(),
                     })
                 } else {
@@ -276,7 +276,7 @@ impl QueryProjection {
                     id,
                     TreeEntry {
                         entity_id: id,
-                        key: CanonicalCodec.encode_nullable(self.spec.key_spec(), &values)?,
+                        key: CanonicalCodec::encode_nullable(self.spec.key_spec(), &values)?,
                         head: state.payload.state.head,
                     },
                 );
