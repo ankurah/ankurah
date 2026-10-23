@@ -8,23 +8,16 @@ use sha2::{Digest as _, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static GROUP_ADDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Counts the group's additions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CountedGroup;
-impl DigestGroup for CountedGroup {
-    type Element = <Ristretto255 as DigestGroup>::Element;
-    const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
-    const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
-    fn zero() -> Self::Element { Ristretto255::zero() }
-    fn add(sum: &mut Self::Element, other: &Self::Element) {
-        GROUP_ADDS.fetch_add(1, Ordering::Relaxed);
-        Ristretto255::add(sum, other);
-    }
-    fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
-    fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
-    fn hash_leaf(bytes: &[u8]) -> Self::Element { Ristretto255::hash_leaf(bytes) }
-    fn encode(element: &Self::Element, bytes: &mut [u8]) { Ristretto255::encode(element, bytes); }
-    fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> { Ristretto255::decode(bytes) }
+struct CountAdds;
+
+impl Hook for CountAdds {
+    fn add() { GROUP_ADDS.fetch_add(1, Ordering::Relaxed); }
 }
+
+type CountedGroup = Hooked<CountAdds>;
 
 #[tokio::test]
 async fn builder_preserves_encoded_nodes_with_linear_group_additions() {
@@ -163,25 +156,19 @@ fn large_build_admission_preserves_first_error_and_poisons_the_transaction() {
     });
 }
 
+/// Panics hashing the leaf of the entity numbered 2047, in a build's second
+/// batch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LaterBatchPanic;
+struct PanicOnLeaf2047;
 
-impl DigestGroup for LaterBatchPanic {
-    type Element = <Ristretto255 as DigestGroup>::Element;
-    const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
-    const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
-    fn zero() -> Self::Element { Ristretto255::zero() }
-    fn add(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::add(sum, other); }
-    fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
-    fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
-    fn hash_leaf(bytes: &[u8]) -> Self::Element {
+impl Hook for PanicOnLeaf2047 {
+    fn hash_leaf(encoded_leaf: &[u8]) {
         // Empty key: two length fields precede the entity's bytes.
-        assert_ne!(bytes.get(16..24), Some(2047u64.to_be_bytes().as_slice()), "injected later-batch hash panic");
-        Ristretto255::hash_leaf(bytes)
+        assert_ne!(encoded_leaf.get(16..24), Some(2047u64.to_be_bytes().as_slice()), "injected later-batch hash panic");
     }
-    fn encode(element: &Self::Element, bytes: &mut [u8]) { Ristretto255::encode(element, bytes); }
-    fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> { Ristretto255::decode(bytes) }
 }
+
+type LaterBatchPanic = Hooked<PanicOnLeaf2047>;
 
 #[test]
 fn later_preparation_panic_poisons_prior_buffered_batches() {

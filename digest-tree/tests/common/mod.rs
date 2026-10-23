@@ -41,9 +41,18 @@ fn property_entity(name: &str) -> EntityId {
     }
 }
 
+/// The value type of each whole property a test names.
+pub struct Types(pub HashMap<PropertyId, ValueType>);
+
+impl PropertyTypes for Types {
+    fn value_type(&self, path: &PropertyPath) -> Option<ValueType> {
+        path.subpath.is_empty().then(|| self.0.get(&path.property_id()).copied()).flatten()
+    }
+}
+
 /// The value type of each property: project a string, foo and bar numbers.
-pub fn types() -> impl PropertyTypes {
-    HashMap::from([(property("project"), ValueType::String), (property("foo"), ValueType::I64), (property("bar"), ValueType::I64)])
+pub fn types() -> Types {
+    Types(HashMap::from([(property("project"), ValueType::String), (property("foo"), ValueType::I64), (property("bar"), ValueType::I64)]))
 }
 
 /// Four acme entities with foo 9, 10, 12, 15, each at its own head.

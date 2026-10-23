@@ -1,5 +1,6 @@
 use super::*;
 use crate::store::layout;
+use crate::tree::fixtures::{Hook, Hooked};
 use crate::{DigestTree, Ristretto255, TreeSpec};
 use ankql::ast::Predicate;
 use ankurah_core_types::KeySpec;
@@ -11,22 +12,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 async fn insert_and_remove_encode_one_delta_for_all_ancestors() {
     static ENCODES: AtomicUsize = AtomicUsize::new(0);
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct CountedEncode;
-    impl DigestGroup for CountedEncode {
-        type Element = <Ristretto255 as DigestGroup>::Element;
-        const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
-        const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
-        fn zero() -> Self::Element { Ristretto255::zero() }
-        fn add(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::add(sum, other); }
-        fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
-        fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
-        fn hash_leaf(bytes: &[u8]) -> Self::Element { Ristretto255::hash_leaf(bytes) }
-        fn encode(element: &Self::Element, bytes: &mut [u8]) {
-            ENCODES.fetch_add(1, Ordering::Relaxed);
-            Ristretto255::encode(element, bytes);
-        }
-        fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> { Ristretto255::decode(bytes) }
+    struct CountEncodes;
+    impl Hook for CountEncodes {
+        fn encode() { ENCODES.fetch_add(1, Ordering::Relaxed); }
     }
+    type CountedEncode = Hooked<CountEncodes>;
     let leaf = |n: u64| {
         let mut id = [0; EntityId::BYTE_LEN];
         id[..8].copy_from_slice(&n.to_be_bytes());
@@ -112,22 +102,11 @@ async fn moves_give_shared_and_separate_ancestors_their_own_deltas() {
 async fn topology_counts_do_not_decode_neighboring_leaves() {
     static DECODES: AtomicUsize = AtomicUsize::new(0);
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    struct CountedDecode;
-    impl DigestGroup for CountedDecode {
-        type Element = <Ristretto255 as DigestGroup>::Element;
-        const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
-        const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
-        fn zero() -> Self::Element { Ristretto255::zero() }
-        fn add(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::add(sum, other); }
-        fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
-        fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
-        fn hash_leaf(bytes: &[u8]) -> Self::Element { Ristretto255::hash_leaf(bytes) }
-        fn encode(element: &Self::Element, bytes: &mut [u8]) { Ristretto255::encode(element, bytes); }
-        fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> {
-            DECODES.fetch_add(1, Ordering::Relaxed);
-            Ristretto255::decode(bytes)
-        }
+    struct CountDecodes;
+    impl Hook for CountDecodes {
+        fn decode() { DECODES.fetch_add(1, Ordering::Relaxed); }
     }
+    type CountedDecode = Hooked<CountDecodes>;
     let leaf = |n: u8| LeafInput { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
     for removing in [false, true] {
         let maps = crate::MemoryMaps::new();

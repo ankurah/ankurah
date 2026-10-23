@@ -739,7 +739,16 @@ fn range_request(lower: i64, limit: Option<u64>, descending: bool) -> TreeReques
         order_by: Some(vec![OrderByItem { path, direction: if descending { OrderDirection::Desc } else { OrderDirection::Asc } }]),
         limit,
     };
-    TreeRequest::for_selection(&selection, &std::collections::HashMap::from([(property, ValueType::I64)])).unwrap()
+    TreeRequest::for_selection(&selection, &PropertyType(property, ValueType::I64)).unwrap()
+}
+
+/// The value type of the one property a test selects on.
+struct PropertyType(proto::PropertyId, ValueType);
+
+impl PropertyTypes for PropertyType {
+    fn value_type(&self, path: &PropertyPath) -> Option<ValueType> {
+        (path.subpath.is_empty() && path.property_id() == self.0).then_some(self.1)
+    }
 }
 
 #[test]

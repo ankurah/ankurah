@@ -1,12 +1,11 @@
 //! Key specs: the ordered parts an index sorts entities by, each with a
-//! direction and a place for nulls. A walk over a digest tree follows one too.
+//! direction and a place for nulls.
 
 use crate::{PropertyId, PropertyPath, ValueType};
 use serde::{Deserialize, Serialize};
 
-/// The composite key an index orders entities by, and the order a walk over
-/// a digest tree follows: its parts in order, each with its direction and
-/// where its nulls go.
+/// The composite key an index orders entities by: its parts in order, each
+/// with its direction and where its nulls go.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeySpec<K> {
     /// The parts, most significant first.

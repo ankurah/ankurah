@@ -197,6 +197,7 @@ pub(crate) fn order_cut(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PropertyTypes;
     use crate::{leaf_address, DigestTree, HeadHash, LeafInput};
     use ankql::ast::{Resolved, Selection};
     use ankurah_core_types::{IndexKeyPart, ModelId, PropertyPath, Value, ValueType};
@@ -220,8 +221,22 @@ mod tests {
         )
     }
 
-    fn types() -> HashMap<PropertyId, ValueType> {
-        HashMap::from([(property("project"), ValueType::String), (property("foo"), ValueType::I64), (property("bar"), ValueType::I64)])
+    /// The value type of each whole property: project a string, foo and bar
+    /// numbers.
+    struct Types(HashMap<PropertyId, ValueType>);
+
+    impl PropertyTypes for Types {
+        fn value_type(&self, path: &PropertyPath) -> Option<ValueType> {
+            path.subpath.is_empty().then(|| self.0.get(&path.property_id()).copied()).flatten()
+        }
+    }
+
+    fn types() -> Types {
+        Types(HashMap::from([
+            (property("project"), ValueType::String),
+            (property("foo"), ValueType::I64),
+            (property("bar"), ValueType::I64),
+        ]))
     }
 
     #[tokio::test]

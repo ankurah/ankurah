@@ -2,7 +2,7 @@
 //! encoded property values, its order and its limit, and the property types
 //! that resolve them.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound::{self, Excluded, Included, Unbounded};
 
 use ankql::ast::{ComparisonOperator as Op, Expr, OrderDirection, Predicate, Resolved, Selection};
@@ -18,17 +18,11 @@ pub trait PropertyTypes {
     /// The type at this path, or `None` when it is unknown.
     fn value_type(&self, path: &PropertyPath) -> Option<ValueType>;
 }
-impl PropertyTypes for HashMap<PropertyId, ValueType> {
-    fn value_type(&self, path: &PropertyPath) -> Option<ValueType> {
-        if !path.subpath.is_empty() {
-            return None;
-        }
-        if path.property_id() == PropertyId::Id {
-            return Some(ValueType::EntityId);
-        }
-        self.get(&path.property_id()).copied()
-    }
-}
+
+/// The most clauses a predicate's analysis keeps: an AND multiplies out the
+/// clauses of its two sides, so a predicate that would need more is refused as
+/// unsupported rather than analyzed at a cost that grows with the product.
+const MAX_CLAUSES: usize = 256;
 
 /// One selection's membership, ordering, and optional limit. It does not
 /// prescribe the layout of a tree that might already serve it.
@@ -89,7 +83,7 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
         Predicate::False => Ok(vec![]),
         Predicate::And(a, b) => {
             let (a, b) = (clauses(a, types)?, clauses(b, types)?);
-            if a.len().saturating_mul(b.len()) > 256 {
+            if a.len().saturating_mul(b.len()) > MAX_CLAUSES {
                 return Err(TreeError::UnsupportedSelection);
             }
             let mut out = Vec::new();
@@ -123,7 +117,7 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
         Predicate::Or(a, b) => {
             let mut out = clauses(a, types)?;
             out.extend(clauses(b, types)?);
-            if out.len() > 256 {
+            if out.len() > MAX_CLAUSES {
                 return Err(TreeError::UnsupportedSelection);
             }
             Ok(out)
@@ -159,7 +153,7 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
                         let bytes = encode(value)?;
                         out.push(field_clause(path, Included(bytes.clone()), Included(bytes)));
                     }
-                    if out.len() > 256 {
+                    if out.len() > MAX_CLAUSES {
                         return Err(TreeError::UnsupportedSelection);
                     }
                     return Ok(out);

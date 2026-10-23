@@ -3,6 +3,7 @@
 //! digests, refines where they differ, and repairs the leaves in the spans
 //! that still differ. Comparison and repair are tested here, not how events
 //! resolve conflicts.
+mod common;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included};
 
@@ -12,6 +13,7 @@ use ankurah_digest_tree::{
     leaf_address, CanonicalCodec, DigestGroup, DigestTree, HeadHash, LeafChange, LeafInput, LtHash16, Ristretto255, TreeMatch, TreeRequest,
     TreeSpan, TreeSpanDigest, TreeSpec, TreeTransaction,
 };
+use common::Types;
 
 fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([1; 32])) }
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property(), ValueType::I64)]), Predicate::True) }
@@ -170,7 +172,7 @@ fn limited_request(direction: OrderDirection, limit: u64) -> TreeRequest {
             order_by: Some(vec![OrderByItem { path: PropertyPath::from(property()), direction }]),
             limit: Some(limit),
         },
-        &HashMap::from([(property(), ValueType::I64)]),
+        &Types(HashMap::from([(property(), ValueType::I64)])),
     )
     .unwrap()
 }
@@ -221,7 +223,7 @@ async fn peers_with_different_admissions_compare_a_proven_common_selection() {
             right: Box::new(Expr::Literal(Value::I64(threshold))),
         })
     };
-    let types = HashMap::from([(property(), ValueType::I64)]);
+    let types = Types(HashMap::from([(property(), ValueType::I64)]));
     let broad: DigestTree = DigestTree::new(TreeSpec::for_selection(&selection(7), &types).unwrap());
     let narrow: DigestTree = DigestTree::new(TreeSpec::for_selection(&selection(10), &types).unwrap());
     assert_eq!(broad.spec().key_spec(), narrow.spec().key_spec());
