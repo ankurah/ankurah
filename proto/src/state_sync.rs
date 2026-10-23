@@ -107,7 +107,7 @@ pub enum StateFrameBody {
         items: Vec<QueryChange>,
         complete: bool,
     },
-    /// Same entity encoding as RepairChunk. The membership decision stays fixed
+    /// Same entity encoding as RepairItem::Chunk. The membership decision stays fixed
     /// across fragments. `complete` requires the final fragment and finishes this
     /// whole publication, not merely this entity. Comparison frames may interleave.
     LiveChunk {
@@ -116,10 +116,9 @@ pub enum StateFrameBody {
         chunk: EntityDeltaChunk,
         complete: bool,
     },
-    /// Connecting data for previously offered live targets. Only Repair,
-    /// RepairChunk and RepairUnavailable items are permitted; none authors membership.
+    /// Connecting data for previously offered live targets; none authors membership.
     LiveRepair {
-        items: Vec<StateItem>,
+        items: Vec<RepairItem>,
     },
     /// Mark this generation unavailable and restart; never claim completion.
     RestartRequired,
@@ -171,18 +170,24 @@ pub enum StateItem {
     Heads(TreeSpanInventory),
     /// Enumerate the requester's heads within these bounds, in bounded pages.
     NeedHeads(TreeSpan),
+    Repair(RepairItem),
+}
+
+/// Entity data toward one causal target, in a round or a LiveRepair frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RepairItem {
     /// Apply through the normal attestation and causal validation path.
     /// `target` is the captured sender head covered by this delta. Application
     /// may retain newer or concurrent local state; sending is not acknowledgment.
-    Repair { target: Clock, delta: EntityDelta },
+    Delta { target: Clock, delta: EntityDelta },
     /// A fragment of a repair too large for one reply. Target stays fixed for its
     /// assembly. Complete cannot leave a partial repair; late requested repairs
     /// may span Continue frames, but every required assembly must finish before Applied.
-    RepairChunk { target: Clock, chunk: EntityDeltaChunk },
+    Chunk { target: Clock, chunk: EntityDeltaChunk },
     /// Causal repair cannot be supplied within policy/history/work limits.
     /// Fail while this target remains required and uncovered. A retired round or
     /// independently covered target does not become unavailable retroactively.
-    RepairUnavailable { entity_id: EntityId, target: Clock },
+    Unavailable { entity_id: EntityId, target: Clock },
 }
 
 /// Answers for any subset of the outstanding spans/entities in a comparison.
@@ -193,7 +198,7 @@ pub enum StateAnswer {
     Heads(TreeSpanInventory),
     /// An already offered snapshot did not incorporate target into local state.
     /// Only the exact offered entity/target is admissible, including after Complete.
-    /// Answer with bounded connecting events or RepairUnavailable, never the same snapshot.
+    /// Answer with bounded connecting events or RepairItem::Unavailable, never the same snapshot.
     NeedRepair {
         entity_id: EntityId,
         target: Clock,

@@ -3,7 +3,7 @@ mod common;
 use ankurah::Mutable;
 use anyhow::Result;
 use common::*;
-use proto::{NodeMessage, NodeResponseBody, StateItem};
+use proto::{NodeMessage, NodeResponseBody, RepairItem, StateItem};
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
@@ -71,13 +71,13 @@ async fn wait_for_named(description: &str, mut condition: impl FnMut() -> bool) 
 }
 fn bridge_for(items: &[StateItem], id: EntityId) -> bool {
     items.iter().any(|item| {
-        matches!(item, StateItem::Repair { delta, .. }
+        matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. })
         if delta.entity_id == id && matches!(delta.content, proto::DeltaContent::EventBridge { .. }))
     })
 }
 fn offers_target(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool {
     items.iter().any(|item| match item {
-        StateItem::Repair { target, delta } => delta.entity_id == id && target == head,
+        StateItem::Repair(RepairItem::Delta { target, delta }) => delta.entity_id == id && target == head,
         _ => false,
     })
 }
@@ -146,7 +146,7 @@ async fn fetch_initial_inventory_omits_equal_heads_and_sends_only_the_changed_ta
     assert_eq!(cold.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum::<usize>(), 256);
     assert_eq!(
         cold.iter()
-            .filter(|item| matches!(item, StateItem::Repair { delta, .. }
+            .filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. })
         if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })))
             .count(),
         256
@@ -183,9 +183,9 @@ async fn fetch_initial_inventory_omits_equal_heads_and_sends_only_the_changed_ta
     assert_eq!(heads.len(), 1);
     assert_eq!(heads[0].entity.entity_id, pets[117].id());
     assert_eq!(heads[0].entity.head, pets[117].entity().head());
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 1);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), 1);
     assert!(
-        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
+        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair(RepairItem::Delta { .. }))),
         "only the changed target needs output: {items:?}"
     );
     Ok(())
@@ -268,7 +268,7 @@ async fn empty_query_inventory_sends_snapshots_without_asserting_global_entity_a
         items
             .iter()
             .filter(
-                |item| matches!(item, StateItem::Repair { delta, .. } if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))
+                |item| matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. }) if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))
             )
             .count(),
         192
@@ -305,7 +305,7 @@ async fn fetch_falls_back_to_snapshot_when_event_bridge_exceeds_work_budget() ->
     assert_eq!(fetched[0].entity().head(), pet.entity().head());
     assert!(trace.items(None).iter().any(|item| matches!(
         item,
-        StateItem::Repair { delta, .. }
+        StateItem::Repair(RepairItem::Delta { delta, .. })
             if delta.entity_id == pet.id() && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
     )));
     Ok(())
@@ -334,8 +334,10 @@ async fn large_snapshot_is_chunked_and_applied_before_fetch_returns() -> Result<
     assert_eq!(fetched[0].id(), id);
     assert_eq!(fetched[0].title()?, payload);
     let items = trace.items(None);
-    let chunks: Vec<_> =
-        items.iter().filter_map(|item| if let StateItem::RepairChunk { chunk, .. } = item { Some(chunk) } else { None }).collect();
+    let chunks: Vec<_> = items
+        .iter()
+        .filter_map(|item| if let StateItem::Repair(RepairItem::Chunk { chunk, .. }) = item { Some(chunk) } else { None })
+        .collect();
     assert!(chunks.len() >= 5);
     assert_eq!(chunks[0].offset, 0);
     for pair in chunks.windows(2) {
@@ -1100,7 +1102,8 @@ async fn pushed_chunks_can_outrun_metadata_and_arrive_out_of_order_without_early
     *target.lock().unwrap() = Some(query.query_id());
     wait_for(|| {
         parked.load(Ordering::Acquire)
-            && trace.items(Some(query.query_id())).iter().filter(|item| matches!(item, StateItem::RepairChunk { .. })).count() >= 5
+            && trace.items(Some(query.query_id())).iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Chunk { .. }))).count()
+                >= 5
     })
     .await;
     gate.release_last(&client, 1).await;
@@ -1146,7 +1149,7 @@ async fn byte_smaller_snapshot_advances_a_retained_older_entity_truthfully() -> 
     assert_eq!(retained.title()?, value);
     assert_eq!(retained.artist()?, "retained");
     assert_eq!(retained.entity().head(), record.entity().head());
-    assert!(trace.items(None).iter().any(|item| matches!(item, StateItem::Repair { delta, .. }
+    assert!(trace.items(None).iter().any(|item| matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. })
         if delta.entity_id == record.id() && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))));
     Ok(())
 }
@@ -1263,7 +1266,7 @@ async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branche
 
 fn snapshot_offer(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool {
     items.iter().any(|item| match item {
-        StateItem::Repair { target, delta } => {
+        StateItem::Repair(RepairItem::Delta { target, delta }) => {
             delta.entity_id == id && target == head && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
         }
         _ => false,

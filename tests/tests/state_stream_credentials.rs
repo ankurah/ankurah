@@ -317,7 +317,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     let comparison = state.frame.stream;
     let proto::StateFrameBody::Round { items, .. } = &state.frame.body else { unreachable!() };
     assert!(
-        items.iter().any(|item| matches!(item, proto::StateItem::Repair { target, delta }
+        items.iter().any(|item| matches!(item, proto::StateItem::Repair(proto::RepairItem::Delta { target, delta })
         if delta.entity_id == id && *target == captured_target && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))),
         "the stock initial producer must offer the exact captured snapshot"
     );

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrameBody, StateItem};
+use ankurah_proto::{self as proto, ComparisonProgress, RepairItem, StateAnswer, StateFrameBody, StateItem};
 use anyhow::{bail, ensure};
 use bincode::Options;
 use futures::FutureExt;

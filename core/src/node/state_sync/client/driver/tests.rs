@@ -32,7 +32,7 @@ async fn malformed_inventories_do_not_change_the_round_projection() -> anyhow::R
         }),
     ];
     for item in invalid {
-        assert!(driver.items(&node, id(90), &[], Owner::Round(0), vec![item]).await.is_err());
+        assert!(driver.round_items(&node, id(90), &[], 0, vec![item]).await.is_err());
         assert_eq!(driver.projection.round.as_ref().unwrap().members, original);
         assert!(driver.goals.rows.is_empty());
         assert!(driver.jobs.is_empty());
@@ -732,7 +732,7 @@ async fn live_coverage_can_finish_round_with_queued_repair_and_ignore_late_unava
     // answer is still outstanding. The actual head, not its revision, covers R.
     driver.observe(&node, Applied { owner: Owner::Live(11), id: id(1), head: Some(head(1)), change: None, bytes: 0, repair: None }).await?;
     assert!(driver.complete_round(&node, None).await?);
-    driver.items(&node, id(90), &[], Owner::Repair, vec![StateItem::RepairUnavailable { entity_id: id(1), target: head(1) }]).await?;
+    driver.receive_repair(&node, id(90), &[], Owner::Repair, RepairItem::Unavailable { entity_id: id(1), target: head(1) }).await?;
     assert!(driver.projection.members.contains_key(&id(1)));
     let mut required = Goals::default();
     required.add(id(2), head(2), false)?;
@@ -748,7 +748,7 @@ async fn live_coverage_can_finish_round_with_queued_repair_and_ignore_late_unava
     });
     assert!(
         driver
-            .items(&node, id(90), &[], Owner::Repair, vec![StateItem::RepairUnavailable { entity_id: id(2), target: head(2) }])
+            .receive_repair(&node, id(90), &[], Owner::Repair, RepairItem::Unavailable { entity_id: id(2), target: head(2) })
             .await
             .is_err(),
         "an actually uncovered target still fails"

@@ -9,7 +9,9 @@ use crate::{
     storage::StorageEngine,
 };
 use ankurah_digest_tree::{leaf_address, NodePrefix};
-use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan};
+use ankurah_proto::{
+    self as proto, ComparisonProgress, RepairItem, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan,
+};
 use anyhow::{bail, ensure};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -499,16 +501,16 @@ impl Stream {
                         self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
                         return Box::pin(self.next_live_repair(node, credentials, catalog)).await;
                     }
-                    StateItem::Repair { target, delta: proto::EntityDelta { entity_id, content } }
+                    RepairItem::Delta { target, delta: proto::EntityDelta { entity_id, content } }
                 }
                 Err(error) => {
                     tracing::debug!(%entity_id, %error, "live causal repair unavailable");
-                    StateItem::RepairUnavailable { entity_id, target }
+                    RepairItem::Unavailable { entity_id, target }
                 }
             },
             Work::Chunks { entity_id, target, bytes, offset } => {
                 let end = (offset + PAGE_BYTES / 2).min(bytes.len());
-                let item = StateItem::RepairChunk {
+                let item = RepairItem::Chunk {
                     target: target.clone(),
                     chunk: proto::EntityDeltaChunk {
                         entity_id,
@@ -525,9 +527,9 @@ impl Stream {
             _ => unreachable!("only causal repair work enters the live repair queue"),
         };
         let finished = match &item {
-            StateItem::Repair { target, delta } => Some((delta.entity_id, target)),
-            StateItem::RepairChunk { target, chunk } if chunk.last => Some((chunk.entity_id, target)),
-            StateItem::RepairUnavailable { entity_id, target } => Some((*entity_id, target)),
+            RepairItem::Delta { target, delta } => Some((delta.entity_id, target)),
+            RepairItem::Chunk { target, chunk } if chunk.last => Some((chunk.entity_id, target)),
+            RepairItem::Unavailable { entity_id, target } => Some((*entity_id, target)),
             _ => None,
         };
         if let Some((id, target)) = finished {
@@ -1665,12 +1667,12 @@ impl Comparison {
                             self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
                             None
                         } else {
-                            Some(StateItem::Repair { target, delta })
+                            Some(StateItem::Repair(RepairItem::Delta { target, delta }))
                         }
                     }
                     Err(error) => {
                         tracing::debug!(%entity_id, %error, "required causal repair unavailable");
-                        Some(StateItem::RepairUnavailable { entity_id, target })
+                        Some(StateItem::Repair(RepairItem::Unavailable { entity_id, target }))
                     }
                 },
                 Work::CompareFrontier(frontier) => {
@@ -1774,7 +1776,10 @@ impl Comparison {
                     });
                     if !allowed {
                         if let Some(entry) = self.snapshot.entries.get(&id) {
-                            self.work.push_front(Work::Item(StateItem::RepairUnavailable { entity_id: id, target: entry.head.clone() }));
+                            self.work.push_front(Work::Item(StateItem::Repair(RepairItem::Unavailable {
+                                entity_id: id,
+                                target: entry.head.clone(),
+                            })));
                         }
                         continue;
                     }
@@ -1793,9 +1798,9 @@ impl Comparison {
                             }
                         }
                     }
-                    let item = StateItem::Repair { target: target.clone(), delta };
+                    let item = StateItem::Repair(RepairItem::Delta { target: target.clone(), delta });
                     if bincode::serialized_size(&item)? as usize > PAGE_BYTES / 2 {
-                        let StateItem::Repair { delta, .. } = item else { unreachable!() };
+                        let StateItem::Repair(RepairItem::Delta { delta, .. }) = item else { unreachable!() };
                         let bytes = bincode::serialize(&delta.content)?;
                         ensure!(bytes.len() <= super::MAX_REPAIR_BYTES, "entity repair exceeds transfer limit");
                         self.work.push_front(Work::Chunks { entity_id: id, target, bytes, offset: 0 });
@@ -1806,7 +1811,7 @@ impl Comparison {
                 }
                 Work::Chunks { entity_id, target, bytes, offset } => {
                     let end = (offset + PAGE_BYTES / 2).min(bytes.len());
-                    let item = StateItem::RepairChunk {
+                    let item = StateItem::Repair(RepairItem::Chunk {
                         target: target.clone(),
                         chunk: proto::EntityDeltaChunk {
                             entity_id,
@@ -1814,7 +1819,7 @@ impl Comparison {
                             bytes: bytes[offset..end].to_vec().into(),
                             last: end == bytes.len(),
                         },
-                    };
+                    });
                     if end < bytes.len() {
                         self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: end });
                     }
@@ -1835,19 +1840,19 @@ impl Comparison {
                             self.offered.insert(target_id(leaf.entity.entity_id, &leaf.entity.head.to_owned()));
                         }
                     }
-                    StateItem::Repair { target, delta } => {
+                    StateItem::Repair(RepairItem::Delta { target, delta }) => {
                         let key = target_id(delta.entity_id, target);
                         self.offered.insert(key.clone());
                         self.pending_repairs.remove(&key);
                     }
-                    StateItem::RepairChunk { target, chunk } => {
+                    StateItem::Repair(RepairItem::Chunk { target, chunk }) => {
                         let key = target_id(chunk.entity_id, target);
                         self.offered.insert(key.clone());
                         if chunk.last {
                             self.pending_repairs.remove(&key);
                         }
                     }
-                    StateItem::RepairUnavailable { entity_id, target } => {
+                    StateItem::Repair(RepairItem::Unavailable { entity_id, target }) => {
                         self.unavailable = true;
                         self.pending_repairs.remove(&target_id(*entity_id, target));
                     }

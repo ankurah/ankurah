@@ -156,7 +156,7 @@ impl Meter {
             for item in items {
                 match item {
                     proto::StateItem::Heads(page) => self.traffic.leaves += page.heads.len(),
-                    proto::StateItem::Repair { delta, .. } => {
+                    proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) => {
                         self.traffic.repairs += 1;
                         if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }) {
                             self.traffic.snapshots += 1;

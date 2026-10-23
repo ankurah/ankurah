@@ -63,13 +63,13 @@ fn comparison_digest_tracks_repair_content_but_not_session_ids() {
             sequence: 1,
             body: proto::StateFrameBody::Round {
                 round: 0,
-                items: vec![proto::StateItem::Repair {
+                items: vec![proto::StateItem::Repair(proto::RepairItem::Delta {
                     target: proto::Clock::singleton(&event),
                     delta: proto::EntityDelta {
                         entity_id: event.entity_id,
                         content: proto::DeltaContent::EventBridge { events: vec![model::attest(event).into()] },
                     },
-                }],
+                })],
                 progress: proto::ComparisonProgress::Complete,
             },
         },

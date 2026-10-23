@@ -135,7 +135,7 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
         let mut comparison = Comparison::new(snapshot, unknown())?;
         let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
-        let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count();
+        let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count();
         assert!(repairs > PAGE_WORK, "resident snapshots must not stop at the storage/history work cap");
         let sizes = items.iter().map(super::super::budget::item_bytes).collect::<Result<Vec<_>, _>>()?;
         let bytes: u64 = sizes.iter().sum();
@@ -181,7 +181,7 @@ async fn storage_and_possible_history_repairs_keep_the_work_cap() -> anyhow::Res
         comparison.work = source.iter().map(|state| Work::Repair(state.payload.entity_id, known_head.clone())).collect();
         let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
-        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), PAGE_WORK);
+        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), PAGE_WORK);
         assert_eq!(comparison.repaired.len(), PAGE_WORK);
         let Some(Work::Repair(deferred, _)) = comparison.work.front() else { panic!("deferred repair") };
         assert!(!comparison.repaired.contains(deferred), "budget deferral must not mark an unsent repair as complete");
@@ -365,7 +365,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
         let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         for item in items {
-            if let StateItem::Repair { delta, .. } = item {
+            if let StateItem::Repair(RepairItem::Delta { delta, .. }) = item {
                 assert!(repaired.insert(delta.entity_id));
             }
         }
@@ -425,7 +425,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
                     leaf_pages += 1;
                     answers.push(StateAnswer::Heads(requester.page(bounds)?));
                 }
-                StateItem::Repair { delta, .. } => repairs.push(delta.entity_id),
+                StateItem::Repair(RepairItem::Delta { delta, .. }) => repairs.push(delta.entity_id),
                 StateItem::Heads(_) => {}
                 other => panic!("unexpected frontier comparison item: {other:?}"),
             }
@@ -471,7 +471,7 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
         let transferred = items
             .iter()
             .map(|item| match item {
-                StateItem::Repair { .. } => 1,
+                StateItem::Repair(RepairItem::Delta { .. }) => 1,
                 _ => 0,
             })
             .sum::<usize>();
@@ -506,14 +506,14 @@ async fn inventories_tile_the_captured_membership_while_current_payloads_are_chu
                     start = opposite(&page.bounds.end);
                     members.extend(page.heads.to_vec().iter().map(|head| head.entity.entity_id));
                 }
-                StateItem::Repair { target, delta } => {
+                StateItem::Repair(RepairItem::Delta { target, delta }) => {
                     let expected = source.iter().find(|state| state.payload.entity_id == delta.entity_id).unwrap();
                     assert_eq!(target, expected.payload.state.head);
                     let proto::DeltaContent::StateSnapshot { state } = delta.content else { panic!("current snapshot") };
                     assert_eq!(state.state, expected.payload.state);
                     assert!(received.insert(delta.entity_id));
                 }
-                StateItem::RepairChunk { target, chunk } => {
+                StateItem::Repair(RepairItem::Chunk { target, chunk }) => {
                     assert_eq!(chunk.entity_id, large.payload.entity_id);
                     assert_eq!(target, large.payload.state.head);
                     assert_eq!(chunk.offset as usize, chunks.len());
@@ -566,7 +566,7 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
     let mut comparison = Comparison::new(stored_snapshot(&node, source).await?, unknown())?;
     let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], true, 0).await? else { panic!("state") };
     assert!(
-        items.iter().any(|item| matches!(item, StateItem::RepairUnavailable { entity_id, .. } if *entity_id == id)),
+        items.iter().any(|item| matches!(item, StateItem::Repair(RepairItem::Unavailable { entity_id, .. }) if *entity_id == id)),
         "a captured member cannot authorize an out-of-scope current payload"
     );
     let error = target_history(&node, id, &proto::Clock::default(), &vec![], true).await.unwrap_err();
@@ -1280,7 +1280,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
             _ => None,
         })
         .expect("causal repair must use the reserved lane without ordinary frame credit");
-    let [StateItem::Repair { target: received, delta }] = repair.as_slice() else { panic!("connecting event repair") };
+    let [RepairItem::Delta { target: received, delta }] = repair.as_slice() else { panic!("connecting event repair") };
     assert_eq!(received, &target);
     assert_eq!(delta.entity_id, genesis.entity_id);
     let proto::DeltaContent::EventBridge { events } = &delta.content else { panic!("event bridge") };
@@ -1362,7 +1362,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let last = {
         let state = session.state.lock().await;
         let frame = &state.retained.back().unwrap().frame;
-        assert!(state_items(frame).0.iter().any(|item| matches!(item, StateItem::RepairUnavailable { .. })));
+        assert!(state_items(frame).0.iter().any(|item| matches!(item, StateItem::Repair(RepairItem::Unavailable { .. }))));
         assert_eq!(state.required_through, 0, "late repair must not move the finite enumeration boundary");
         assert!(state.last_sent > 0);
         state.last_sent
@@ -1461,7 +1461,7 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&initial.frame.stream).unwrap();
     let state = session.state.lock().await;
     let items = state_items(&state.retained.back().unwrap().frame).0;
-    let StateItem::Repair { delta, .. } = &items[0] else { panic!("history repair") };
+    let StateItem::Repair(RepairItem::Delta { delta, .. }) = &items[0] else { panic!("history repair") };
     let proto::DeltaContent::EventBridge { events } = &delta.content else { panic!("must not resend snapshot") };
     assert_eq!(events.len(), 3);
     assert!(events[0].parent.is_empty());
@@ -1623,7 +1623,7 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
     let mut comparison = Comparison::new(stored_snapshot(&node, after.clone()).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert!(
-        matches!(items.as_slice(), [StateItem::Heads(page), StateItem::Repair { target, delta }] if page.heads.to_vec()[0].entity.head == after[17].payload.state.head && delta.entity_id == after[17].payload.entity_id && *target == after[17].payload.state.head)
+        matches!(items.as_slice(), [StateItem::Heads(page), StateItem::Repair(RepairItem::Delta { target, delta })] if page.heads.to_vec()[0].entity.head == after[17].payload.state.head && delta.entity_id == after[17].payload.entity_id && *target == after[17].payload.state.head)
     );
     Ok(())
 }
@@ -1683,7 +1683,7 @@ async fn captured_membership_and_current_payload_keep_both_targets_across_moves_
         *node.storage.reject_state_read.lock().unwrap() = Some(id);
         let mut comparison = Comparison::new(snapshot, proto::KnownState { spec: spec.clone(), spans: vec![] })?;
         let items = initial_items(&node, &mut comparison).await?;
-        let [StateItem::Heads(page), StateItem::Repair { target, delta }] = items.as_slice() else {
+        let [StateItem::Heads(page), StateItem::Repair(RepairItem::Delta { target, delta })] = items.as_slice() else {
             panic!("metadata plus current data: {items:?}")
         };
         let head = &page.heads.to_vec()[0];
@@ -1720,7 +1720,9 @@ async fn changed_head_at_the_same_key_sends_captured_metadata_before_newer_paylo
     node.storage.set_state(current.clone());
     let mut comparison = Comparison::new(snapshot, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
-    let [StateItem::Heads(page), StateItem::Repair { target, .. }] = items.as_slice() else { panic!("metadata and repair") };
+    let [StateItem::Heads(page), StateItem::Repair(RepairItem::Delta { target, .. })] = items.as_slice() else {
+        panic!("metadata and repair")
+    };
     assert_eq!(page.heads.to_vec()[0].entity.head, captured.payload.state.head);
     assert_eq!(target, &current.payload.state.head);
     assert_ne!(page.heads.to_vec()[0].entity.head, *target);
@@ -1773,7 +1775,7 @@ async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs
                     members.insert(leaf_address(&leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
                 }
             }
-            StateItem::Repair { target, delta } => {
+            StateItem::Repair(RepairItem::Delta { target, delta }) => {
                 assert!(repairs.insert(delta.entity_id, target).is_none());
             }
             other => panic!("unexpected diff item: {other:?}"),
@@ -1801,7 +1803,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     let items = initial_items(&node, &mut comparison).await?;
     let mut incoming = HashSet::new();
     for item in items {
-        if let StateItem::Repair { delta, .. } = item {
+        if let StateItem::Repair(RepairItem::Delta { delta, .. }) = item {
             incoming.insert(delta.entity_id);
         }
     }
@@ -1818,7 +1820,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 16);
     assert_eq!(
-        items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(),
+        items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(),
         2048,
         "coalescing must preserve every actual former clock repair"
     );
@@ -1848,7 +1850,7 @@ async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::
         Work::InitialHeads(rest) if rest.heads.len() == 2048 - HEAD_PAGE)));
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 2048);
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 2048);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), 2048);
     Ok(())
 }
 
@@ -1902,11 +1904,11 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let items = initial_items(&node, &mut exact).await?;
     assert!(exact.complete);
     assert!(
-        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
+        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair(RepairItem::Delta { .. }))),
         "unknown gaps require both membership and current state"
     );
     assert_eq!(items.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum::<usize>(), 2047);
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 2047);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), 2047);
     known.spans.push(known.spans[0].clone());
     assert!(
         Comparison::new(stored_snapshot(&node, before.clone()).await?, known).is_err(),

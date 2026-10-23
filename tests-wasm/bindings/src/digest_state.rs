@@ -173,7 +173,7 @@ async fn run(db_prefix: &str) -> anyhow::Result<()> {
     let fetched = reader.fetch::<TestUserView>("true").await?;
     anyhow::ensure!(fetched.iter().any(|user| user.name().as_deref() == Ok("changed")), "sparse Fetch repair");
     anyhow::ensure!(items(&responses, None).iter().any(|item| matches!(item,
-        proto::StateItem::Repair { delta, .. } if delta.entity_id == users[17].id() && matches!(delta.content, proto::DeltaContent::EventBridge { .. })
+        proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) if delta.entity_id == users[17].id() && matches!(delta.content, proto::DeltaContent::EventBridge { .. })
     )), "sparse Fetch should bridge the known clock");
 
     let query = reader.query_wait::<TestUserView>("true").await?;

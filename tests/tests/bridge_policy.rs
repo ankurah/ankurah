@@ -107,7 +107,7 @@ async fn current_snapshot_repairs_validate_received_state_attestations_before_fe
             };
             if let Some(proto::StateFrame { body: proto::StateFrameBody::Round { items, .. }, .. }) = frame {
                 for item in items {
-                    if let proto::StateItem::Repair { delta, .. } = item {
+                    if let proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) = item {
                         if let proto::DeltaContent::StateSnapshot { state } = &delta.content {
                             pages.lock().unwrap().push((delta.entity_id, state.clone()));
                         }
@@ -412,7 +412,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                         let sequence = frame.sequence;
                         let proto::StateFrameBody::Round { items, progress, .. } = frame.body else { panic!("expected catalog state") };
                         for item in items {
-                            if let proto::StateItem::Repair { delta, .. } = item {
+                            if let proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) = item {
                                 if delta.entity_id == entity_id {
                                     assert!(
                                         matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1),
@@ -549,7 +549,8 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 
     assert!(
         frames.lock().unwrap().iter().any(|frame| match &frame.body {
-            proto::StateFrameBody::Round { items, .. } => items.iter().any(|item| matches!(item, proto::StateItem::Repair { delta, .. }
+            proto::StateFrameBody::Round { items, .. } =>
+                items.iter().any(|item| matches!(item, proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. })
             if delta.entity_id == pet_id && matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 2))),
             _ => false,
         }),

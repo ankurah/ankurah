@@ -650,12 +650,13 @@ impl Driver {
         Ok(())
     }
 
-    async fn items<SE, PA>(
+    /// Answers a round's questions, stages its membership pages and receives its repairs.
+    async fn round_items<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
         peer: proto::EntityId,
         credentials: &[PA::ContextData],
-        owner: Owner,
+        round: u64,
         items: Vec<StateItem>,
     ) -> anyhow::Result<Vec<StateAnswer>>
     where
@@ -663,20 +664,18 @@ impl Driver {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         ensure!(items.len() <= 128, "state item limit exceeded");
+        let owner = Owner::Round(round);
         let mut answers = Vec::new();
         for item in items {
             match item {
                 StateItem::Digest(head) => {
-                    ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
                     head.validate()?;
                     answers.push(StateAnswer::Digest(self.projection.round.as_mut().unwrap().snapshot.span_digest(head.bounds).await?));
                 }
                 StateItem::NeedHeads(bounds) => {
-                    ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
                     answers.push(StateAnswer::Heads(self.projection.round.as_ref().unwrap().snapshot.page(bounds)?));
                 }
                 StateItem::Heads(page) => {
-                    ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
                     ensure!(4 + page.expanded_size() <= super::super::PAGE_BYTES as u64, "peer head inventory exceeds decoded-work budget");
                     ensure!(page.heads.len() <= super::super::HEAD_PAGE, "peer sent too many heads");
                     page.validate(&self.spec)?;
@@ -686,36 +685,54 @@ impl Driver {
                     }
                     self.projection.round.as_mut().unwrap().replace(page);
                 }
-                StateItem::Repair { target, delta } => {
-                    check_target(&target, &delta.content)?;
-                    self.repair_arrived(delta.entity_id, &target);
-                    self.add_goal(owner, delta.entity_id, target.clone())?;
-                    self.enqueue(node, peer, credentials, owner, delta, Some(target))?;
-                }
-                StateItem::RepairChunk { target, chunk } => {
-                    self.add_goal(owner, chunk.entity_id, target.clone())?;
-                    self.chunk(node, peer, credentials, owner, target, None, chunk)?;
-                }
-                StateItem::RepairUnavailable { entity_id, target } => {
-                    let required = |goals: &Goals| {
-                        goals.rows.get(&entity_id).is_some_and(|rows| rows.values().any(|goal| goal.head == target && !goal.covered))
-                    };
-                    if !required(&self.goals) && !self.publications.iter().any(|publication| required(&publication.goals)) {
-                        continue;
-                    }
-                    let actual =
-                        self.observed.get(&entity_id).cloned().or_else(|| node.entities.get(&entity_id).map(|entity| entity.head()));
-                    if let Some(head) = actual {
-                        if covers_target(node, &head, &target).await? {
-                            self.observe_head(node, entity_id, head).await?;
-                            continue;
-                        }
-                    }
-                    bail!("peer cannot repair required state for {entity_id}");
-                }
+                StateItem::Repair(repair) => self.receive_repair(node, peer, credentials, owner, repair).await?,
             }
         }
         Ok(answers)
+    }
+
+    /// Receives data toward one causal target of a round or of a live publication.
+    async fn receive_repair<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        peer: proto::EntityId,
+        credentials: &[PA::ContextData],
+        owner: Owner,
+        repair: RepairItem,
+    ) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        match repair {
+            RepairItem::Delta { target, delta } => {
+                check_target(&target, &delta.content)?;
+                self.repair_arrived(delta.entity_id, &target);
+                self.add_goal(owner, delta.entity_id, target.clone())?;
+                self.enqueue(node, peer, credentials, owner, delta, Some(target))?;
+            }
+            RepairItem::Chunk { target, chunk } => {
+                self.add_goal(owner, chunk.entity_id, target.clone())?;
+                self.chunk(node, peer, credentials, owner, target, None, chunk)?;
+            }
+            RepairItem::Unavailable { entity_id, target } => {
+                let required = |goals: &Goals| {
+                    goals.rows.get(&entity_id).is_some_and(|rows| rows.values().any(|goal| goal.head == target && !goal.covered))
+                };
+                if !required(&self.goals) && !self.publications.iter().any(|publication| required(&publication.goals)) {
+                    return Ok(());
+                }
+                let actual = self.observed.get(&entity_id).cloned().or_else(|| node.entities.get(&entity_id).map(|entity| entity.head()));
+                if let Some(head) = actual {
+                    if covers_target(node, &head, &target).await? {
+                        self.observe_head(node, entity_id, head).await?;
+                        return Ok(());
+                    }
+                }
+                bail!("peer cannot repair required state for {entity_id}");
+            }
+        }
+        Ok(())
     }
 
     fn add_live_delta_targets(
@@ -822,7 +839,7 @@ impl Driver {
             }
             StateFrameBody::Round { round, items, progress } => {
                 if round == self.round_number && self.projection.round.is_some() {
-                    answers = self.items(node, peer, credentials, Owner::Round(round), items).await?;
+                    answers = self.round_items(node, peer, credentials, round, items).await?;
                     answer_round = Some(round);
                     if progress == ComparisonProgress::Complete {
                         self.projection.round.as_mut().unwrap().complete = true;
@@ -845,7 +862,10 @@ impl Driver {
                 }
             }
             StateFrameBody::LiveRepair { items } => {
-                self.items(node, peer, credentials, Owner::Repair, items).await?;
+                ensure!(items.len() <= 128, "state item limit exceeded");
+                for repair in items {
+                    self.receive_repair(node, peer, credentials, Owner::Repair, repair).await?;
+                }
             }
             StateFrameBody::RestartRequired => return Err(RequestError::ConnectionLost.into()),
             StateFrameBody::SourceUnavailable => {
