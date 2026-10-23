@@ -189,6 +189,20 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         std::collections::HashMap::new()
     }
 
+    /// Optional current proof that these credentials may read every entity state:
+    /// the retrieval predicate permits all states and `check_reads` denies none.
+    /// Return false unless both are guaranteed together at this call, including
+    /// any expiry, revocation or other mutable policy inputs. False asks core to
+    /// evaluate the ordinary state-based checks; it does not deny access.
+    ///
+    /// Core evaluates this proof afresh, never caches it, and still requires an
+    /// unrestricted retrieval predicate. Discovery, event permissions and
+    /// attestation checks are unaffected.
+    fn allows_unrestricted_state_reads<C>(&self, _data: &C) -> bool
+    where C: Iterable<Self::ContextData> {
+        false
+    }
+
     /// Additional event restrictions after the entity passes the retrieval predicate.
     fn check_read_event<C>(&self, _data: &C, _event: &Attested<proto::Event>) -> Result<(), AccessDenied>
     where C: Iterable<Self::ContextData> {
@@ -229,6 +243,11 @@ impl PermissiveAgent {
 #[async_trait]
 impl PolicyAgent for PermissiveAgent {
     type ContextData = &'static DefaultContext;
+
+    fn allows_unrestricted_state_reads<C>(&self, _data: &C) -> bool
+    where C: Iterable<Self::ContextData> {
+        true
+    }
 
     /// Create relevant auth data for a given request
     fn sign_request<SE: StorageEngine, C>(

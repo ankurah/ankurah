@@ -115,6 +115,20 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
             || entity.to_state().ok().is_some_and(|state| self.check_read_state(&entity.id(), &state).is_ok())
     }
 
+    /// A fresh universal grant can validate maintained membership without
+    /// materializing entity states. Use one credential snapshot for both checks;
+    /// the operation's cached retrieval predicate is not a policy-change signal.
+    pub(crate) fn allows_unrestricted_state_reads(&self) -> bool {
+        match &self.auth {
+            ContextAuth::Privileged => true,
+            ContextAuth::Sessions(_) => {
+                let credentials = self.credentials();
+                matches!(self.agent.retrieval_predicate(&credentials), Ok(Predicate::True))
+                    && self.agent.allows_unrestricted_state_reads(&credentials)
+            }
+        }
+    }
+
     /// Apply the retrieval predicate and additional read checks to an entity already available locally.
     pub fn check_read(&self, id: &EntityId, state: &State) -> Result<(), AccessDenied> {
         if state.memberships.iter().any(crate::schema::reads_bypass_policy) {

@@ -178,14 +178,8 @@ async fn unchanged_replacements_follow_query_order_after_commit_changes() -> any
     for event in &events[2..] {
         apply(&node, &update(event, "00")?).await?;
     }
-    let first = capture.cursor.next().await?;
-    let second = capture.cursor.next().await?;
-    let batch = SourceBatch {
-        revision: second.revision,
-        changes: first.changes.iter().chain(&second.changes).cloned().collect(),
-        bytes: first.bytes + second.bytes,
-        catalog_changed: first.catalog_changed || second.catalog_changed,
-    };
+    let batch = capture.cursor.next().await?;
+    assert_eq!(batch.changes.iter().map(|change| change.entity_id).collect::<Vec<_>>(), vec![events[2].entity_id, events[3].entity_id]);
     let sources = capture.projection.apply(&batch, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     let changes = route.changes(&node, &capture.projection, &policy, &sources).await?;

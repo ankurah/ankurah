@@ -2,6 +2,12 @@ use super::*;
 use crate::node::state_sync::ResidentTrees;
 use std::sync::atomic::Ordering;
 
+#[path = "resident_burst.rs"]
+mod burst;
+
+#[path = "resident_authorization.rs"]
+mod authorization;
+
 async fn acquire<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
     cache: &ResidentTrees<PA::ContextData>,
     node: &Node<OrderedStorage, PA>,

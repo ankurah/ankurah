@@ -14,7 +14,7 @@ use crate::{
 };
 use ankurah_proto::{self as proto, Attested, AuthorId, EntityId, Event, Membership, ModelId, Operation, OperationSet};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Head {
     id: EntityId,
     head: proto::Clock,
@@ -109,7 +109,10 @@ async fn maintenance_projects_committed_metadata_before_public_notifications_wit
     assert_eq!(subsequent.changes[0].head, proto::Clock::singleton(&b));
     assert!(subsequent.changes[0].events.is_empty(), "initial application must not become a live event update");
     let second_window = second.fence().await?;
-    assert_eq!(second_window.batches.len(), 2, "one reader cannot consume another reader's bootstrap window");
+    assert_eq!(second_window.batches.len(), 1);
+    assert_eq!(second_window.batches[0].changes.len(), 2, "one reader cannot consume another reader's bootstrap window");
+    assert_eq!(second_window.batches[0].changes[0].events, vec![a.id()]);
+    assert!(second_window.batches[0].changes[1].events.is_empty());
     Ok(())
 }
 
@@ -156,6 +159,7 @@ async fn cancellation_before_commit_does_not_invalidate_source() -> anyhow::Resu
 async fn cancellation_after_storage_commit_invalidates_existing_and_new_subscriptions() -> anyhow::Result<()> {
     let node = node().await?;
     let (_, mut cursor) = subscribe(&node).await?;
+    apply(&node, &genesis(13), Delivery::Live).await?;
     let event = genesis(4);
     let (entered, wait) = tokio::sync::oneshot::channel();
     let (_release, resume) = tokio::sync::oneshot::channel();
@@ -191,18 +195,129 @@ async fn definite_storage_rejection_does_not_poison_source() -> anyhow::Result<(
 #[tokio::test]
 async fn lagged_reader_fails_without_invalidating_an_independent_reader() -> anyhow::Result<()> {
     let node = node().await?;
-    let (_, mut slow) = subscribe(&node).await?;
+    let (_, mut slow) = node
+        .reactor
+        .subscribe_maintenance(|change, live| {
+            let mut projected = project(change, live)?;
+            projected.bytes = MAX_PENDING_BYTES / 2;
+            Ok(projected)
+        })
+        .await?;
     let (_, mut current) = subscribe(&node).await?;
     let mut event = genesis(5);
-    for _ in 0..=MAX_PENDING_BATCHES {
-        apply(&node, &event, Delivery::Initial).await?;
-        let batch = current.next().await?;
-        assert_eq!(batch.changes[0].head, proto::Clock::singleton(&event));
-        event = Event::update(event.entity_id, proto::Clock::singleton(&event), AuthorId::Unknown, OperationSet(vec![]));
+    for count in [2, 3] {
+        for _ in 0..count {
+            apply(&node, &event, Delivery::Initial).await?;
+            let batch = current.next().await?;
+            assert_eq!(batch.changes[0].head, proto::Clock::singleton(&event));
+            event = Event::update(event.entity_id, proto::Clock::singleton(&event), AuthorId::Unknown, OperationSet(vec![]));
+        }
+        if count == 2 {
+            let window = slow.fence().await?;
+            assert_eq!(window.batches.iter().map(|batch| batch.bytes).sum::<usize>(), MAX_PENDING_BYTES);
+            assert_eq!(window.batches.iter().map(|batch| batch.changes.len()).sum::<usize>(), 2);
+        }
     }
     assert!(matches!(slow.fence().await, Err(SourceError::Lagged)));
+    assert!(matches!(slow.next().await, Err(SourceError::Lagged)));
     assert!(current.fence().await?.batches.is_empty());
     subscribe(&node).await?;
+    Ok(())
+}
+
+async fn head_change(node: &Node<TestStorage, PermissiveAgent>, event: &Event, model: ModelId) -> anyhow::Result<EntityChange> {
+    let (_, entity) = node
+        .entities
+        .with_state(
+            &LocalStateGetter::new(node.storage.clone()),
+            &LocalEventGetter::new(node.storage.clone(), false),
+            event.entity_id,
+            proto::State { memberships: [model].into_iter().collect(), head: proto::Clock::singleton(event), ..Default::default() },
+        )
+        .await?;
+    Ok(EntityChange::new(entity, vec![Attested::from(event.clone())]))
+}
+
+#[tokio::test]
+async fn one_commit_and_4096_separate_commits_preserve_the_same_bounded_metadata_window() -> anyhow::Result<()> {
+    let node = node().await?;
+    let one = crate::reactor::Reactor::new(ankurah_signals::Mut::new(true));
+    let many = crate::reactor::Reactor::new(ankurah_signals::Mut::new(true));
+    let (one_start, mut one_cursor) = one.subscribe_maintenance(project).await?;
+    let (many_start, mut many_cursor) = many.subscribe_maintenance(project).await?;
+    let model = ModelId::EntityId(EntityId::from_bytes([7; 32]));
+    let mut changes = Vec::new();
+    for _ in 0..4096 {
+        let event = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+        changes.push(head_change(&node, &event, model).await?);
+    }
+    one.begin_commit().await.publish(&changes, true);
+    for change in &changes {
+        many.begin_commit().await.publish(std::slice::from_ref(change), true);
+    }
+    let one_window = one_cursor.fence().await?;
+    let many_window = many_cursor.fence().await?;
+    assert_eq!(one_window.revision.0, one_start.0 + 1);
+    assert_eq!(many_window.revision.0, many_start.0 + 4096);
+    assert_eq!(one_window.batches.len(), 1);
+    assert_eq!(many_window.batches.len(), 1);
+    let one_batch = &one_window.batches[0];
+    let many_batch = &many_window.batches[0];
+    assert_eq!(many_batch.revision, many_window.revision, "the coalesced window ends at its newest publication");
+    assert_eq!(many_batch.changes.len(), 4096);
+    assert_eq!(one_batch.changes, many_batch.changes, "entity heads and event IDs retain publication order");
+    assert_eq!(one_batch.bytes, many_batch.bytes);
+    assert!(many_batch.bytes < MAX_PENDING_BYTES);
+    assert_eq!(
+        many_batch.changes.iter().map(|head| head.events[0].clone()).collect::<Vec<_>>(),
+        changes.iter().map(|change| change.events()[0].payload.id()).collect::<Vec<_>>()
+    );
+    drop(changes);
+    assert!(many_batch.changes.iter().all(|head| node.entities.get(&head.id).is_none()), "the pending window must not pin entities");
+    Ok(())
+}
+
+#[tokio::test]
+async fn next_detaches_a_window_before_later_publications() -> anyhow::Result<()> {
+    let node = node().await?;
+    let (_, mut cursor) = subscribe(&node).await?;
+    let first = genesis(61);
+    let second = Event::update(first.entity_id, proto::Clock::singleton(&first), AuthorId::Unknown, OperationSet::default());
+    apply(&node, &first, Delivery::Live).await?;
+    apply(&node, &second, Delivery::Live).await?;
+    let detached = cursor.next().await?;
+    let later = Event::update(first.entity_id, proto::Clock::singleton(&second), AuthorId::Unknown, OperationSet::default());
+    apply(&node, &later, Delivery::Live).await?;
+    let next = cursor.fence().await?;
+    assert_eq!(detached.changes.iter().flat_map(|head| head.events.clone()).collect::<Vec<_>>(), vec![first.id(), second.id()]);
+    assert_eq!(next.batches.len(), 1);
+    assert_eq!(next.batches[0].changes.len(), 1);
+    assert_eq!(next.batches[0].changes[0].events, vec![later.id()]);
+    assert!(next.revision > detached.revision);
+    Ok(())
+}
+
+#[tokio::test]
+async fn coalescing_preserves_catalog_invalidation_before_later_ordinary_changes() -> anyhow::Result<()> {
+    let node = node().await?;
+    let (_, mut cursor) = subscribe(&node).await?;
+    let first = genesis(62);
+    apply(&node, &first, Delivery::Live).await?;
+    let model = crate::schema::CATALOG_MODELS[0];
+    let catalog = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+    let change = head_change(&node, &catalog, model).await?;
+    node.reactor.begin_commit().await.publish(&[change], false);
+    let later = genesis(63);
+    apply(&node, &later, Delivery::Live).await?;
+    let window = cursor.fence().await?;
+    assert_eq!(window.batches.len(), 1);
+    let batch = &window.batches[0];
+    assert!(batch.catalog_changed);
+    assert_eq!(batch.revision, window.revision);
+    assert_eq!(batch.changes.iter().map(|head| head.id).collect::<Vec<_>>(), vec![first.entity_id, catalog.entity_id, later.entity_id]);
+    assert_eq!(batch.changes[0].events, vec![first.id()]);
+    assert!(batch.changes[1].events.is_empty());
+    assert_eq!(batch.changes[2].events, vec![later.id()]);
     Ok(())
 }
 

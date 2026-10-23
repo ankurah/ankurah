@@ -4,7 +4,7 @@ use crate::{
     livequery::{EntityLiveQuery, QueryResolution},
     node::CachePolicy,
     peer_subscription::Status,
-    reactor::maintenance::MAX_PENDING_BATCHES,
+    reactor::maintenance::MAX_PENDING_BYTES,
 };
 
 type Messages = Arc<std::sync::Mutex<Vec<proto::NodeMessage>>>;
@@ -33,7 +33,7 @@ impl PeerSender for WireSender {
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-async fn pair() -> anyhow::Result<(TestNode, TestNode, Messages)> {
+pub(super) async fn pair() -> anyhow::Result<(TestNode, TestNode, Messages)> {
     let server = node().await?;
     let client = Node::new(Arc::new(OrderedStorage::default()), PermissiveAgent::new());
     let messages = Messages::default();
@@ -182,17 +182,28 @@ async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() 
 
 async fn assert_recovers(client: &TestNode, query: &EntityLiveQuery, messages: &Messages, expected: &proto::Event) -> anyhow::Result<()> {
     let relay = client.subscription_relay.as_ref().unwrap();
-    until(|| matches!(relay.get_status(query.query_id()), Some(Status::PendingRemote))).await;
+    until(|| responses(messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)) != 0 || query.error().value().is_some())
+        .await;
     assert_eq!(responses(messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 1);
     assert!(query.error().value().is_none(), "a busy capture cannot permanently fail the query");
-    assert!(!query.resultset().is_loaded());
-    // Exercise the existing five-second retry task, not a manual new registration.
+    // Exercise the existing periodic retry task, not a manual new registration.
+    // A due retry may already have completed before this observer resumes.
     tokio::time::timeout(std::time::Duration::from_secs(7), query.wait_durable_answered()).await??;
     let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id(), expected.entity_id);
     assert_eq!(rows[0].head(), proto::Clock::singleton(expected));
     assert!(matches!(relay.get_status(query.query_id()), Some(Status::Established(_, 1))));
+    let attempts = messages
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|message| {
+            matches!(message, proto::NodeMessage::Request { request, .. }
+                if matches!(&request.body, proto::NodeRequestBody::SubscribeQuery { query_id, version: 1, .. } if query_id == &query.query_id()))
+        })
+        .count();
+    assert_eq!(attempts, 2, "the same subscription retries once after its busy response");
     Ok(())
 }
 
@@ -226,17 +237,40 @@ async fn lagged_initial_capture_retries_with_a_fresh_source_window() -> anyhow::
     let mut latest = genesis("01")?;
     apply(&server, &latest).await?;
     let (entered, release) = hold_fetch(&server);
-    let query = query(&client, selection(None))?;
+    let query = query(&client, keyed_selection(None))?;
     tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
-    for n in 0..=MAX_PENDING_BATCHES {
-        latest = update(&latest, &format!("01-{n}"))?;
-        apply(&server, &latest).await?;
-    }
+    overflow_maintenance_bytes(&server, &mut latest).await?;
     release.send(()).unwrap();
     assert_recovers(&client, &query, &messages, &latest).await?;
     drop(query);
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
+    Ok(())
+}
+
+fn keyed_selection(limit: Option<u64>) -> Selection<Resolved> {
+    let mut selected = selection(limit);
+    selected.predicate = Predicate::And(
+        Box::new(selected.predicate),
+        Box::new(Predicate::Comparison {
+            left: Box::new(ankql::ast::Expr::Path(PropertyPath::from(property()))),
+            operator: ankql::ast::ComparisonOperator::GreaterThanOrEqual,
+            right: Box::new(ankql::ast::Expr::Literal(Value::String("0".into()))),
+        }),
+    );
+    selected
+}
+
+async fn overflow_maintenance_bytes(node: &TestNode, latest: &mut proto::Event) -> anyhow::Result<()> {
+    // A few large indexed keys exceed the unchanged byte budget regardless of
+    // commit grouping. Restore a small value before reopening the held scan.
+    let large = format!("01-{}", "x".repeat(MAX_PENDING_BYTES / 4));
+    for _ in 0..4 {
+        *latest = update(latest, &large)?;
+        apply(node, latest).await?;
+    }
+    *latest = update(latest, "01")?;
+    apply(node, latest).await?;
     Ok(())
 }
 
@@ -247,13 +281,10 @@ async fn fetch_bounds_busy_retries_and_can_be_retried_after_quiescence() -> anyh
     apply(&server, &latest).await?;
     let (mut entered, mut release) = hold_fetch(&server);
     let fetcher = client.clone();
-    let fetch = tokio::spawn(async move { fetcher.fetch_from_peer(selection(Some(1)), &vec![DEFAULT_CONTEXT]).await });
+    let fetch = tokio::spawn(async move { fetcher.fetch_from_peer(keyed_selection(Some(1)), &vec![DEFAULT_CONTEXT]).await });
     for attempt in 0..2 {
         tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
-        for change in 0..=MAX_PENDING_BATCHES {
-            latest = update(&latest, &format!("01-{attempt}-{change}"))?;
-            apply(&server, &latest).await?;
-        }
+        overflow_maintenance_bytes(&server, &mut latest).await?;
         if attempt + 1 == 2 {
             release.send(()).unwrap();
             break;
@@ -265,7 +296,7 @@ async fn fetch_bounds_busy_retries_and_can_be_retried_after_quiescence() -> anyh
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), fetch).await??;
     assert!(matches!(result, Err(RetrievalError::RequestError(RequestError::StateCaptureBusy))));
     assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 2);
-    let rows = client.fetch_from_peer(selection(Some(1)), &vec![DEFAULT_CONTEXT]).await?;
+    let rows = client.fetch_from_peer(keyed_selection(Some(1)), &vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].head(), proto::Clock::singleton(&latest));
     client.deregister_peer(server.id);

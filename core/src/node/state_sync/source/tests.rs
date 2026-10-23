@@ -32,6 +32,7 @@ struct OrderedStorage(
     std::sync::atomic::AtomicUsize,
     std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     std::sync::atomic::AtomicUsize, // Rows returned to callers, after the storage LIMIT.
+    std::sync::atomic::AtomicUsize, // Individual state reads, including default get_states calls.
 );
 
 #[async_trait::async_trait]
@@ -39,7 +40,10 @@ impl StorageEngine for OrderedStorage {
     type Value = Value;
     type Transaction<'a> = TestStorageTransaction<'a>;
     fn transaction(&self) -> Self::Transaction<'_> { self.0.transaction() }
-    async fn get_state(&self, id: proto::EntityId) -> Result<Attested<proto::EntityState>, RetrievalError> { self.0.get_state(id).await }
+    async fn get_state(&self, id: proto::EntityId) -> Result<Attested<proto::EntityState>, RetrievalError> {
+        self.5.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.0.get_state(id).await
+    }
     async fn fetch_states(&self, selection: &Selection<Resolved>) -> Result<Vec<Attested<proto::EntityState>>, RetrievalError> {
         self.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pause = self.1.lock().unwrap().take();
@@ -283,10 +287,23 @@ struct RestrictedDiscovery {
     read_allowed: Option<Arc<std::sync::atomic::AtomicBool>>,
     discover_all: Option<Arc<std::sync::atomic::AtomicBool>>,
     deny_empty: bool,
+    state_free_reads: bool,
+    state_free_proofs: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    retrieval_error: bool,
 }
 #[async_trait::async_trait]
 impl PolicyAgent for RestrictedDiscovery {
     type ContextData = &'static crate::policy::DefaultContext;
+    fn allows_unrestricted_state_reads<C: crate::util::Iterable<Self::ContextData>>(&self, data: &C) -> bool {
+        if let Some(calls) = &self.state_free_proofs {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.state_free_reads
+            && !self.retrieval_error
+            && self.retrieval.as_ref().is_none_or(|predicate| *predicate == Predicate::True)
+            && !(self.deny_empty && data.iterable().next().is_none())
+            && self.read_allowed.as_ref().is_none_or(|allowed| allowed.load(std::sync::atomic::Ordering::SeqCst))
+    }
     fn sign_request<SE: StorageEngine, C: crate::util::Iterable<Self::ContextData>>(
         &self,
         _: &crate::node::NodeInner<SE, Self>,
@@ -320,6 +337,9 @@ impl PolicyAgent for RestrictedDiscovery {
         &self,
         _: &C,
     ) -> Result<Predicate<Resolved>, crate::policy::AccessDenied> {
+        if self.retrieval_error {
+            return Err(crate::policy::AccessDenied::ByPolicy("fixture retrieval denied"));
+        }
         Ok(self.retrieval.clone().unwrap_or(Predicate::True))
     }
     fn check_reads<C: crate::util::Iterable<Self::ContextData>>(

@@ -8,7 +8,7 @@ use crate::{
     },
     policy::{ContextPolicy, PolicyAgent},
     reactor::{
-        maintenance::{MaintenanceSubscription, ProjectedChange, SourceBatch, SourceError, MAX_PENDING_BATCHES, MAX_PENDING_BYTES},
+        maintenance::{MaintenanceSubscription, ProjectedChange, SourceBatch, SourceError, MAX_PENDING_BYTES},
         ChangeNotification,
     },
     selection::filter::{evaluate_predicate, ValueLookup},
@@ -444,6 +444,12 @@ impl<CD: ContextData> QuerySource<CD> {
     {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
         let snapshot = self.projection.tree.current_snapshot().await?;
+        if policy.allows_unrestricted_state_reads() {
+            // A new grant must also admit candidates previously denied by policy.
+            // Returning the old subset would silently lose newly readable rows.
+            anyhow::ensure!(snapshot.entries.keys().eq(self.projection.candidates.iter()), SourceError::Changed);
+            return Ok(());
+        }
         for id in &self.projection.candidates {
             let state = current_state(node, *id).await?.ok_or(SourceError::Changed)?;
             anyhow::ensure!(policy.check_read(id, &state.state).is_ok() == snapshot.entries.contains_key(id), SourceError::Changed);
@@ -535,7 +541,6 @@ impl<CD: ContextData> QuerySource<CD> {
     {
         let mut bytes = 0usize;
         let mut changes = Vec::new();
-        anyhow::ensure!(pending.len() <= MAX_PENDING_BATCHES, SourceError::Lagged);
         for batch in pending {
             self.projection.check_catalog(&batch)?;
             anyhow::ensure!(batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes), SourceError::Lagged);
@@ -571,10 +576,7 @@ impl<CD: ContextData> QuerySource<CD> {
             let window = self.cursor.fence().await?;
             for batch in window.batches {
                 self.projection.check_catalog(&batch)?;
-                anyhow::ensure!(
-                    pending.len() < MAX_PENDING_BATCHES && batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes),
-                    SourceError::Lagged
-                );
+                anyhow::ensure!(batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes), SourceError::Lagged);
                 bytes += batch.bytes;
                 pending.push(batch);
             }

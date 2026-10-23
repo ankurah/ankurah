@@ -7,13 +7,12 @@ use crate::changes::EntityChange;
 use ankql::ast::{Predicate, Resolved};
 use ankurah_proto::{EntityId, QueryId};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::BTreeMap,
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 
 pub(crate) const MAX_PENDING_BYTES: usize = 8 * 1024 * 1024;
-pub(crate) const MAX_PENDING_BATCHES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct SourceRevision(pub(crate) u64);
@@ -84,13 +83,12 @@ struct Reader<T> {
 }
 
 struct ReaderState<T> {
-    queue: VecDeque<Arc<SourceBatch<T>>>,
-    bytes: usize,
+    pending: Option<SourceBatch<T>>,
     error: Option<SourceError>,
 }
 
 impl<T> Default for ReaderState<T> {
-    fn default() -> Self { Self { queue: VecDeque::new(), bytes: 0, error: None } }
+    fn default() -> Self { Self { pending: None, error: None } }
 }
 
 /// RAII registration; its lifetime is the lifetime of the resident index.
@@ -177,19 +175,26 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
                 tracing::debug!(%error, "reactor index projection failed");
                 Some(SourceError::Changed)
             }
-            Ok(()) if state.queue.len() >= MAX_PENDING_BATCHES || bytes > MAX_PENDING_BYTES.saturating_sub(state.bytes) => {
+            Ok(()) if bytes > MAX_PENDING_BYTES.saturating_sub(state.pending.as_ref().map_or(0, |batch| batch.bytes)) => {
                 Some(SourceError::Lagged)
             }
             Ok(()) => None,
         };
         if let Some(error) = error {
-            state.queue.clear();
-            state.bytes = 0;
+            state.pending = None;
             state.error = Some(error);
             watchers.clear();
         } else {
-            state.bytes += bytes;
-            state.queue.push_back(Arc::new(SourceBatch { revision, changes: values, catalog_changed, bytes }));
+            // Commit boundaries do not change index work. Coalesce only the
+            // unconsumed window; next()/fence() detach it before later commits.
+            if let Some(pending) = &mut state.pending {
+                pending.revision = revision;
+                pending.changes.extend(values);
+                pending.catalog_changed |= catalog_changed;
+                pending.bytes += bytes;
+            } else {
+                state.pending = Some(SourceBatch { revision, changes: values, catalog_changed, bytes });
+            }
         }
         self.notify.notify_one();
         watchers
@@ -197,8 +202,7 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
 
     fn fail(&self, error: SourceError) {
         let mut state = self.state.lock().unwrap();
-        state.queue.clear();
-        state.bytes = 0;
+        state.pending = None;
         state.error = Some(error);
         self.notify.notify_one();
     }
@@ -281,8 +285,7 @@ impl<T> MaintenanceSubscription<T> {
         if started.is_some_and(|started| started != revision) {
             return Err(SourceError::Changed);
         }
-        reader.bytes = 0;
-        Ok(SourceWindow { revision, batches: reader.queue.drain(..).collect() })
+        Ok(SourceWindow { revision, batches: reader.pending.take().map(Arc::new).into_iter().collect() })
     }
 
     /// Narrow the bootstrap watch only when the supplied membership includes
@@ -323,9 +326,8 @@ impl<T> MaintenanceSubscription<T> {
                 if let Some(error) = &reader.error {
                     return Err(error.clone());
                 }
-                if let Some(batch) = reader.queue.pop_front() {
-                    reader.bytes -= batch.bytes;
-                    return Ok(batch);
+                if let Some(batch) = reader.pending.take() {
+                    return Ok(Arc::new(batch));
                 }
             }
             notified.await;
