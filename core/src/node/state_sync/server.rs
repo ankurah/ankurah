@@ -463,9 +463,8 @@ impl Stream {
             || live.lock().unwrap().publications.front().is_some_and(|publication| publication.revision <= revision)
     }
 
-    fn request_live_repairs(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
-        for answer in answers {
-            let StateAnswer::NeedRepair { entity_id, target } = answer else { bail!("live feedback cannot answer round questions") };
+    fn request_live_repairs(&mut self, requests: Vec<proto::RepairRequest>) -> anyhow::Result<()> {
+        for proto::RepairRequest { entity_id, target } in requests {
             let key = bincode::serialize(&(entity_id, &target))?;
             let offered =
                 self.live_target_index.get_mut(key.as_slice()).ok_or_else(|| anyhow::anyhow!("unsolicited live repair target"))?;
@@ -737,10 +736,9 @@ pub(crate) async fn apply_state_feedback<SE, PA>(
     peer: proto::EntityId,
     request: proto::RequestId,
     id: StateStreamId,
-    round: Option<u64>,
     processed_through: u64,
     applied_through: Option<u64>,
-    answers: Vec<StateAnswer>,
+    answers: Option<proto::FeedbackAnswers>,
     credentials: Vec<PA::ContextData>,
 ) -> anyhow::Result<proto::NodeResponseBody>
 where
@@ -748,27 +746,29 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let has_answers = answers.as_ref().is_some_and(|answers| !answers.is_empty());
     let Some(session) = connection.state_streams.get(&id) else {
-        return Ok(if answers.is_empty() && connection.state_streams.permits_retired_receipt(id, processed_through, &credentials) {
+        return Ok(if !has_answers && connection.state_streams.permits_retired_receipt(id, processed_through, &credentials) {
             proto::NodeResponseBody::Success
         } else {
             proto::NodeResponseBody::StateStreamUnavailable
         });
     };
     ensure!(session.permits(&credentials), "state stream credentials changed");
-    ensure!(answers.len() <= 128, "too many comparison answers");
-    let encoded = bincode::serialize(&(round, processed_through, applied_through, &answers))?;
+    ensure!(answers.as_ref().is_none_or(|answers| answers.len() <= 128), "too many comparison answers");
+    let encoded = bincode::serialize(&(processed_through, applied_through, &answers))?;
     ensure!(encoded.len() <= FRAME_BYTES, "state feedback exceeds limit");
-    ensure!(
-        encoded.len() as u64 + super::budget::answers_bytes(&answers)? - bincode::serialized_size(&answers)? <= FRAME_BYTES as u64,
-        "state feedback exceeds decoded-work limit"
-    );
+    let expansion = match &answers {
+        Some(proto::FeedbackAnswers::Round { answers, .. }) => super::budget::answers_bytes(answers)? - bincode::serialized_size(answers)?,
+        _ => 0,
+    };
+    ensure!(encoded.len() as u64 + expansion <= FRAME_BYTES as u64, "state feedback exceeds decoded-work limit");
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(proto::NodeResponseBody::StateStreamUnavailable);
     }
     if state.failed {
-        if !answers.is_empty() {
+        if has_answers {
             return Ok(proto::NodeResponseBody::StateStreamUnavailable);
         }
         state.acknowledge(processed_through)?;
@@ -787,20 +787,21 @@ where
     ensure!(state.retired_feedback.len() < MAX_FEEDBACK_IDS, "stream exhausted control replay history");
     state.acknowledge(processed_through)?;
     session.initial.lock().unwrap().take();
-    match round {
-        Some(number) => {
-            ensure!(number <= state.round.number, "feedback names a future round");
+    match answers {
+        Some(proto::FeedbackAnswers::Round { round, answers }) => {
+            ensure!(round <= state.round.number, "feedback names a future round");
             // A delayed repair question may arrive after live application covered
             // its target and Applied retired the round. It cannot author current
             // membership, and retaining the old snapshot merely to reject it
             // would make round retirement race normal application progress.
-            if number == state.round.number {
+            if round == state.round.number {
                 if let Some(comparison) = state.comparison.as_mut() {
                     comparison.answer(answers)?;
                 }
             }
         }
-        None => state.request_live_repairs(answers)?,
+        Some(proto::FeedbackAnswers::LiveRepair { requests }) => state.request_live_repairs(requests)?,
+        None => {}
     }
     if let Some(revision) = applied_through {
         state.acknowledge_live(revision)?;
@@ -1418,7 +1419,7 @@ impl Comparison {
         ensure!(answers.len() <= 128, "too many comparison answers");
         for answer in answers {
             match answer {
-                StateAnswer::NeedRepair { entity_id, target } => {
+                StateAnswer::NeedRepair(proto::RepairRequest { entity_id, target }) => {
                     let key = target_id(entity_id, &target);
                     ensure!(self.offered.contains(&key), "unsolicited causal repair target");
                     if self.pending_repairs.contains(&key) {

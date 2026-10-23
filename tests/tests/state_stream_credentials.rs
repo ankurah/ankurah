@@ -354,8 +354,8 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     let feedback = agent.feedback.lock().unwrap();
     assert!(
         feedback.iter().any(|(_, request)| matches!(&request.body,
-        proto::NodeRequestBody::StateFeedback { stream: found, answers, .. } if *found == comparison && answers.iter().any(|answer|
-            matches!(answer, proto::StateAnswer::NeedRepair { entity_id, target } if *entity_id == id && *target == captured_target)))),
+        proto::NodeRequestBody::StateFeedback { stream: found, answers: Some(proto::FeedbackAnswers::Round { answers, .. }), .. } if *found == comparison && answers.iter().any(|answer|
+            matches!(answer, proto::StateAnswer::NeedRepair(proto::RepairRequest { entity_id, target }) if *entity_id == id && *target == captured_target)))),
         "the uncovered initial snapshot must actually request connecting history"
     );
     for (credentials, request) in feedback.iter().filter(|(_, request)| {
@@ -443,10 +443,9 @@ async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_anothe
                     &vec![Credential(1)],
                     proto::NodeRequestBody::StateFeedback {
                         stream: comparison,
-                        round: Some(0),
                         processed_through: u64::MAX,
                         applied_through: None,
-                        answers: vec![],
+                        answers: None,
                     },
                 )
                 .await?;
@@ -554,10 +553,9 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
                     &vec![Credential(1)],
                     proto::NodeRequestBody::StateFeedback {
                         stream: comparison,
-                        round: Some(0),
                         processed_through: u64::MAX,
                         applied_through: None,
-                        answers: vec![],
+                        answers: None,
                     },
                 )
                 .await?;

@@ -229,8 +229,8 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
         proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
-        proto::NodeRequestBody::StateFeedback { round, processed_through, applied_through, answers, .. } => {
-            format!("continue {}", payload_digest(&(round, processed_through, applied_through, answers)))
+        proto::NodeRequestBody::StateFeedback { processed_through, applied_through, answers, .. } => {
+            format!("feedback {}", payload_digest(&(processed_through, applied_through, answers)))
         }
         proto::NodeRequestBody::RefreshState { round, known_state, .. } => format!("refresh {}", payload_digest(&(round, known_state))),
         proto::NodeRequestBody::FinishStateRound { round, outcome, .. } => format!("finish round {round} {outcome:?}"),

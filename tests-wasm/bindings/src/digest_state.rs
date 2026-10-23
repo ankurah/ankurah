@@ -37,7 +37,7 @@ impl FeedbackGate {
         self.armed.load(Ordering::Acquire)
             && matches!(message,
             proto::NodeMessage::Request { request: proto::NodeRequest {
-                body: proto::NodeRequestBody::StateFeedback { round: Some(0), answers, .. }, ..
+                body: proto::NodeRequestBody::StateFeedback { answers: Some(proto::FeedbackAnswers::Round { round: 0, answers }), .. }, ..
             }, .. } if !answers.is_empty())
     }
 

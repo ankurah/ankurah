@@ -535,8 +535,10 @@ async fn inventories_tile_the_captured_membership_while_current_payloads_are_chu
     for state in &source {
         assert!(comparison.offered.contains(&target_id(state.payload.entity_id, &state.payload.state.head)));
     }
-    comparison
-        .answer(vec![StateAnswer::NeedRepair { entity_id: source[0].payload.entity_id, target: source[0].payload.state.head.clone() }])?;
+    comparison.answer(vec![StateAnswer::NeedRepair(proto::RepairRequest {
+        entity_id: source[0].payload.entity_id,
+        target: source[0].payload.state.head.clone(),
+    })])?;
     assert!(comparison.pending_repairs.contains(&target_id(source[0].payload.entity_id, &source[0].payload.state.head)));
     Ok(())
 }
@@ -603,7 +605,7 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
     assert_eq!(bincode::serialize(&state)?, bincode::serialize(&initial)?);
     assert!(connection.state_streams.replay_initial(&origin, &[12], &[]).is_err());
     drop(guard);
-    apply_state_feedback(&node, peer, proto::RequestId::new(), initial.frame.stream, None, 0, None, vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), initial.frame.stream, 0, None, None, vec![]).await?;
     assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
     abandon_state_stream(&node, peer, initial.frame.stream).await;
     assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
@@ -618,13 +620,13 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             .await?;
     let id = initial.frame.stream;
     let request = proto::RequestId::new();
-    apply_state_feedback(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
-    apply_state_feedback(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
-    assert!(apply_state_feedback(&node, peer, request, id, None, 1, None, vec![], vec![]).await.is_err());
-    assert!(apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, 1, None, vec![], vec![]).await.is_err());
+    apply_state_feedback(&node, peer, request.clone(), id, 0, None, None, vec![]).await?;
+    apply_state_feedback(&node, peer, request.clone(), id, 0, None, None, vec![]).await?;
+    assert!(apply_state_feedback(&node, peer, request, id, 1, None, None, vec![]).await.is_err());
+    assert!(apply_state_feedback(&node, peer, proto::RequestId::new(), id, 1, None, None, vec![]).await.is_err());
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     assert!(matches!(
-        apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, 0, None, vec![], vec![]).await?,
+        apply_state_feedback(&node, peer, proto::RequestId::new(), id, 0, None, None, vec![]).await?,
         proto::NodeResponseBody::Success
     ));
     assert!(matches!(
@@ -633,10 +635,12 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             peer,
             proto::RequestId::new(),
             id,
-            Some(0),
             0,
             None,
-            vec![StateAnswer::Heads(proto::TreeSpanInventory { bounds: super::super::whole(), heads: vec![].into() })],
+            Some(proto::FeedbackAnswers::Round {
+                round: 0,
+                answers: vec![StateAnswer::Heads(proto::TreeSpanInventory { bounds: super::super::whole(), heads: vec![].into() })]
+            }),
             vec![]
         )
         .await?,
@@ -680,7 +684,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         if done {
             break;
         }
-        apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
+        apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, None, None, vec![]).await?;
         pump_state_stream(&node, peer, id).await?;
     }
     let sequences = messages
@@ -1066,10 +1070,20 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert!(comparison.pending_repairs.is_empty());
         (comparison.snapshot.members(), comparison.offered.clone())
     };
-    for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.head.clone() }]] {
+    for answers in [vec![], vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: old.entity_id, target: old.head.clone() })]] {
         assert!(
             matches!(
-                apply_state_feedback(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, answers, vec![]).await?,
+                apply_state_feedback(
+                    &node,
+                    peer,
+                    proto::RequestId::new(),
+                    id,
+                    0,
+                    None,
+                    Some(proto::FeedbackAnswers::Round { round: 0, answers: answers }),
+                    vec![]
+                )
+                .await?,
                 proto::NodeResponseBody::Success
             ),
             "late round-zero feedback must be harmless after a newer live decision covered its target"
@@ -1082,7 +1096,18 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
     }
     assert!(
-        apply_state_feedback(&node, peer, proto::RequestId::new(), id, Some(2), 0, None, vec![], vec![]).await.is_err(),
+        apply_state_feedback(
+            &node,
+            peer,
+            proto::RequestId::new(),
+            id,
+            0,
+            None,
+            Some(proto::FeedbackAnswers::Round { round: 2, answers: vec![] }),
+            vec![]
+        )
+        .await
+        .is_err(),
         "future-round feedback is invalid"
     );
     let last = session.state.lock().await.required_through;
@@ -1143,21 +1168,21 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
         assert_eq!(state.live_targets.len(), 2);
     }
     let last = session.state.lock().await.last_sent;
-    apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, None, None, vec![]).await?;
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: last }, vec![]).await?;
     {
         let mut state = session.state.lock().await;
         assert_eq!(state.live_targets.len(), 2);
-        state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: first.entity_id, target: first.member.unwrap().head }])?;
+        state.request_live_repairs(vec![proto::RepairRequest { entity_id: first.entity_id, target: first.member.unwrap().head }])?;
         assert_eq!(state.live_repairs.len(), 1, "receipt alone must leave repair admissible");
     }
-    apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, Some(1), vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, Some(1), None, vec![]).await?;
     {
         let state = session.state.lock().await;
         assert_eq!(state.live_targets.len(), 1);
         assert_eq!(state.live_targets.front().unwrap().revision, 3);
     }
-    apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, Some(3), vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, Some(3), None, vec![]).await?;
     let state = session.state.lock().await;
     assert!(state.live_targets.is_empty());
     assert_eq!(state.target_bytes, 0);
@@ -1269,7 +1294,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
             )?;
         }
         assert!(state.room(true));
-        state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: genesis.entity_id, target: target.clone() }])?;
+        state.request_live_repairs(vec![proto::RepairRequest { entity_id: genesis.entity_id, target: target.clone() }])?;
     }
     pump_state_stream(&node, peer, id).await?;
     let frames = messages.lock().unwrap();
@@ -1351,10 +1376,12 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
         peer,
         proto::RequestId::new(),
         id,
-        Some(0),
         0,
         None,
-        vec![StateAnswer::NeedRepair { entity_id: entity.entity_id, target: entity.state.head.clone() }],
+        Some(proto::FeedbackAnswers::Round {
+            round: 0,
+            answers: vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: entity.entity_id, target: entity.state.head.clone() })],
+        }),
         vec![],
     )
     .await?;
@@ -1387,10 +1414,12 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
         peer,
         proto::RequestId::new(),
         id,
-        Some(0),
         last,
         None,
-        vec![StateAnswer::NeedRepair { entity_id: entity.entity_id, target: entity.state.head.clone() }],
+        Some(proto::FeedbackAnswers::Round {
+            round: 0,
+            answers: vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: entity.entity_id, target: entity.state.head.clone() })],
+        }),
         vec![],
     )
     .await?;
@@ -1450,10 +1479,12 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
         peer,
         proto::RequestId::new(),
         initial.frame.stream,
-        Some(0),
         0,
         None,
-        vec![StateAnswer::NeedRepair { entity_id: genesis.entity_id, target }],
+        Some(proto::FeedbackAnswers::Round {
+            round: 0,
+            answers: vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: genesis.entity_id, target })],
+        }),
         vec![],
     )
     .await?;
@@ -1528,13 +1559,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
         )
         .await?;
         let id = initial.frame.stream;
-        let receipt = || proto::NodeRequestBody::StateFeedback {
-            stream: id,
-            round: None,
-            applied_through: None,
-            processed_through: 0,
-            answers: vec![],
-        };
+        let receipt = || proto::NodeRequestBody::StateFeedback { stream: id, applied_through: None, processed_through: 0, answers: None };
         assert_eq!(state_stream_bypasses_policy(&node, peer, &receipt(), false), catalog);
         let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
         assert!(session.permits(&credentials));
@@ -1569,10 +1594,9 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
     }
     let unknown = proto::NodeRequestBody::StateFeedback {
         stream: proto::StateStreamId::new(),
-        round: None,
         applied_through: None,
         processed_through: 0,
-        answers: vec![],
+        answers: None,
     };
     assert!(!state_stream_bypasses_policy(&node, peer, &unknown, false), "unknown controls must pass through policy");
     Ok(())
@@ -1696,13 +1720,14 @@ async fn captured_membership_and_current_payload_keep_both_targets_across_moves_
         let new_key = target_id(id, &current.payload.state.head);
         assert!(comparison.offered.contains(&old_key) && comparison.offered.contains(&new_key));
         comparison.answer(vec![
-            StateAnswer::NeedRepair { entity_id: id, target: captured.payload.state.head.clone() },
-            StateAnswer::NeedRepair { entity_id: id, target: current.payload.state.head.clone() },
+            StateAnswer::NeedRepair(proto::RepairRequest { entity_id: id, target: captured.payload.state.head.clone() }),
+            StateAnswer::NeedRepair(proto::RepairRequest { entity_id: id, target: current.payload.state.head.clone() }),
         ])?;
         assert_eq!(comparison.pending_repairs.len(), 2, "the current payload does not retire the captured head's proof obligation");
         assert_eq!(comparison.repair_attempts[&old_key], 1);
         assert_eq!(comparison.repair_attempts[&new_key], 1);
-        comparison.answer(vec![StateAnswer::NeedRepair { entity_id: id, target: captured.payload.state.head.clone() }])?;
+        comparison
+            .answer(vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: id, target: captured.payload.state.head.clone() })])?;
         assert_eq!(comparison.repair_attempts[&old_key], 1, "pending retries are idempotent for this exact target");
     }
     Ok(())
@@ -2110,11 +2135,11 @@ async fn shared_live_target_survives_until_every_offering_publication_is_applied
     state.acknowledge(2)?;
     state.acknowledge_live(1)?;
     assert_eq!(state.live_target_index.get(key.as_slice()).unwrap().publications, 1);
-    state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: item.entity_id, target: head.clone() }])?;
+    state.request_live_repairs(vec![proto::RepairRequest { entity_id: item.entity_id, target: head.clone() }])?;
     state.acknowledge_live(2)?;
     assert!(state.live_target_index.is_empty() && state.live_targets.is_empty());
     assert_eq!(state.target_bytes, 0);
-    assert!(state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: item.entity_id, target: head }]).is_err());
+    assert!(state.request_live_repairs(vec![proto::RepairRequest { entity_id: item.entity_id, target: head }]).is_err());
     Ok(())
 }
 

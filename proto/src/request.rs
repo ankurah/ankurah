@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventId,
-    KnownState, RegisterModel, RegisteredModel, StateAnswer, StateReply, StateRoundOutcome, StateStreamId,
+    FeedbackAnswers, KnownState, RegisterModel, RegisteredModel, StateReply, StateRoundOutcome, StateStreamId,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -132,15 +132,13 @@ pub enum NodeRequestBody {
     /// explicit pending NeedRepair; it is not the global Applied acknowledgment.
     StateFeedback {
         stream: StateStreamId,
-        /// Answers belong to this round; None addresses live-target repair.
-        /// Credit-only feedback needs no active round.
-        round: Option<u64>,
         processed_through: u64,
         /// Actual causal coverage and local publication through a complete live
         /// revision, distinct from frame receipt credit. Releases retained live
         /// repair targets.
         applied_through: Option<u64>,
-        answers: Vec<StateAnswer>,
+        /// Answers, if any, named by what they respond to.
+        answers: Option<FeedbackAnswers>,
     },
     /// Compare another frozen offer on the standing stream. One round at a time;
     /// the number must be the previous round plus one. The responder sends an
@@ -273,7 +271,7 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
             NodeRequestBody::StateFeedback { stream, processed_through, answers, .. } => {
-                write!(f, "StateFeedback {stream} through:{processed_through} answers:{}", answers.len())
+                write!(f, "StateFeedback {stream} through:{processed_through} answers:{}", answers.as_ref().map_or(0, FeedbackAnswers::len))
             }
             NodeRequestBody::RefreshState { stream, round, known_state } => {
                 write!(f, "RefreshState {stream} round:{round} spans:{}", known_state.spans.len())

@@ -199,10 +199,37 @@ pub enum StateAnswer {
     /// An already offered snapshot did not incorporate target into local state.
     /// Only the exact offered entity/target is admissible, including after Complete.
     /// Answer with bounded connecting events or RepairItem::Unavailable, never the same snapshot.
-    NeedRepair {
-        entity_id: EntityId,
-        target: Clock,
-    },
+    NeedRepair(RepairRequest),
+}
+
+/// A requester's request for data connecting its copy of an entity to `target`,
+/// a head the responder offered for that entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairRequest {
+    pub entity_id: EntityId,
+    pub target: Clock,
+}
+
+/// The answers one StateFeedback carries, named by what they respond to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FeedbackAnswers {
+    /// Answers to this round's questions, including requests to repair the targets
+    /// it offered. Answers to a retired round are dropped; a future round is refused.
+    Round { round: u64, answers: Vec<StateAnswer> },
+    /// Requests for connecting history toward targets of live publications.
+    LiveRepair { requests: Vec<RepairRequest> },
+}
+
+impl FeedbackAnswers {
+    /// How many answers or requests this carries.
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Round { answers, .. } => answers.len(),
+            Self::LiveRepair { requests } => requests.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

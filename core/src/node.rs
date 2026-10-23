@@ -552,13 +552,12 @@ where
                     .subscribe_query(self, request.id, fingerprint, query_id, selection, cdata, version, known_state)
                     .await
             }
-            proto::NodeRequestBody::StateFeedback { stream: stream_id, round, processed_through, applied_through, answers } => {
+            proto::NodeRequestBody::StateFeedback { stream: stream_id, processed_through, applied_through, answers } => {
                 state_sync::apply_state_feedback(
                     self,
                     request.from,
                     request.id,
                     stream_id,
-                    round,
                     processed_through,
                     applied_through,
                     answers,

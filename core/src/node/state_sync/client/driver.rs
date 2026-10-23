@@ -821,8 +821,7 @@ impl Driver {
     {
         ensure!(frame.stream == self.stream_id, "state stream identity changed");
         self.through = frame.sequence;
-        let mut answers = Vec::new();
-        let mut answer_round = None;
+        let mut answers = None;
         match frame.body {
             StateFrameBody::BeginRound(descriptor) => {
                 ensure!(!self.publications.back().is_some_and(|publication| !publication.complete), "round split a publication");
@@ -839,8 +838,8 @@ impl Driver {
             }
             StateFrameBody::Round { round, items, progress } => {
                 if round == self.round_number && self.projection.round.is_some() {
-                    answers = self.round_items(node, peer, credentials, round, items).await?;
-                    answer_round = Some(round);
+                    let round_answers = self.round_items(node, peer, credentials, round, items).await?;
+                    answers = Some(proto::FeedbackAnswers::Round { round, answers: round_answers });
                     if progress == ComparisonProgress::Complete {
                         self.projection.round.as_mut().unwrap().complete = true;
                     }
@@ -874,17 +873,7 @@ impl Driver {
             }
         }
         self.check_retained()?;
-        self.feedback.queue(
-            node,
-            peer,
-            credentials,
-            self.stream_id,
-            self.through,
-            answer_round,
-            self.applied_through,
-            answers,
-            &self.stream.inbox,
-        )?;
+        self.feedback.queue(node, peer, credentials, self.stream_id, self.through, self.applied_through, answers, &self.stream.inbox)?;
         Ok(())
     }
 
@@ -942,7 +931,7 @@ impl Driver {
             }
         }
         for (round, goals) in groups {
-            let mut answers = Vec::new();
+            let mut requests = Vec::new();
             for goal in goals.values_mut().filter(|goal| !goal.covered) {
                 if !self.observed.contains_key(&goal.id) {
                     let actual = match node.entities.get(&goal.id) {
@@ -975,18 +964,23 @@ impl Driver {
                 ensure!(goal.attempts < 2, "connecting history failed to cover target");
                 goal.attempts += 1;
                 goal.requested = true;
-                answers.push(StateAnswer::NeedRepair { entity_id: goal.id, target: goal.head.clone() });
+                requests.push(proto::RepairRequest { entity_id: goal.id, target: goal.head.clone() });
             }
-            if !answers.is_empty() {
+            if !requests.is_empty() {
+                let answers = match round {
+                    Some(round) => {
+                        proto::FeedbackAnswers::Round { round, answers: requests.into_iter().map(StateAnswer::NeedRepair).collect() }
+                    }
+                    None => proto::FeedbackAnswers::LiveRepair { requests },
+                };
                 self.feedback.queue(
                     node,
                     peer,
                     credentials,
                     self.stream_id,
                     self.through,
-                    round,
                     self.applied_through,
-                    answers,
+                    Some(answers),
                     &self.stream.inbox,
                 )?;
             }
@@ -1285,9 +1279,8 @@ impl Driver {
                     credentials,
                     self.stream_id,
                     self.through,
-                    None,
                     self.applied_through,
-                    vec![],
+                    None,
                     &self.stream.inbox,
                 )?;
             }
