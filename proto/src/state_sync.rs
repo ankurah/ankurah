@@ -2,7 +2,7 @@
 //!
 //! The initial response carries metadata and frame zero. Later frames are pushed
 //! through NodeUpdate, correlated with the originating request and stream.
-//! ContinueState acknowledges a processed prefix and supplies bounded answers;
+//! StateFeedback acknowledges a processed prefix and supplies bounded answers;
 //! it returns Success rather than carrying another frame. Responders choose
 //! byte/work/window limits beneath the protocol's hard resource caps.
 //!

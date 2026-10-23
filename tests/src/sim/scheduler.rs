@@ -160,7 +160,7 @@ impl Scheduler {
                         selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy)
                     }
                     proto::NodeRequestBody::SubscribeQuery { .. } => true,
-                    proto::NodeRequestBody::ContinueState { stream: comparison, .. }
+                    proto::NodeRequestBody::StateFeedback { stream: comparison, .. }
                     | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => self.catalog_comparisons.contains(comparison),
                     _ => return false,
                 };

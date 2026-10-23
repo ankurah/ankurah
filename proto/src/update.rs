@@ -9,7 +9,7 @@ pub struct UpdateId(Ulid);
 pub enum NodeUpdateBody {
     /// Continuation of Fetch or SubscribeQuery; route by the original request
     /// even if this frame outruns its metadata response. Apply only after frame 0
-    /// validates. UpdateAck is routing receipt here; ContinueState returns credit.
+    /// validates. UpdateAck is routing receipt here; StateFeedback returns credit.
     StateFrame { request_id: RequestId, frame: StateFrame },
 }
 

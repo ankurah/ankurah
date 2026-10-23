@@ -105,7 +105,7 @@ impl Feedback {
                         .request(
                             peer,
                             &credentials,
-                            proto::NodeRequestBody::ContinueState { stream: stream_id, round, processed_through, applied_through, answers },
+                            proto::NodeRequestBody::StateFeedback { stream: stream_id, round, processed_through, applied_through, answers },
                         )
                         .fuse();
                     let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(120)).fuse();

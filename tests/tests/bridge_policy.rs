@@ -430,7 +430,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                                 .request(
                                     server.id,
                                     &credentials,
-                                    proto::NodeRequestBody::ContinueState {
+                                    proto::NodeRequestBody::StateFeedback {
                                         stream: comparison,
                                         round: None,
                                         processed_through: sequence,

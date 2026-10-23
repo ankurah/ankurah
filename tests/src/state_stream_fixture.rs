@@ -62,13 +62,13 @@ impl ScriptedConnection {
                 }
                 let response = if let proto::NodeMessage::Request { request, .. } = &message {
                     let comparison = match &request.body {
-                        proto::NodeRequestBody::ContinueState { stream: comparison, .. }
+                        proto::NodeRequestBody::StateFeedback { stream: comparison, .. }
                         | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => Some(*comparison),
                         _ => None,
                     };
                     let mut routes = routes.lock().unwrap();
                     comparison.and_then(|id| routes.get_mut(&id)).filter(|stream| stream.scripted).map(|stream| {
-                        if let proto::NodeRequestBody::ContinueState { applied_through: Some(revision), .. } = request.body {
+                        if let proto::NodeRequestBody::StateFeedback { applied_through: Some(revision), .. } = request.body {
                             stream.applied = Some(revision);
                         }
                         proto::NodeMessage::Response(proto::NodeResponse {

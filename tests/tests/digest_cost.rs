@@ -109,7 +109,7 @@ impl Meter {
                     proto::NodeRequestBody::Fetch { selection, .. } | proto::NodeRequestBody::SubscribeQuery { selection, .. } => {
                         self.model.is_some_and(|model| selection.predicate.referenced_models().contains(&model))
                     }
-                    proto::NodeRequestBody::ContinueState { stream: comparison, .. }
+                    proto::NodeRequestBody::StateFeedback { stream: comparison, .. }
                     | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => self.comparisons.contains(comparison),
                     _ => false,
                 };

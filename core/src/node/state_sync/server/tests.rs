@@ -604,7 +604,7 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
     assert_eq!(bincode::serialize(&state)?, bincode::serialize(&initial)?);
     assert!(connection.state_streams.replay_initial(&origin, &[12], &[]).is_err());
     drop(guard);
-    continue_state(&node, peer, proto::RequestId::new(), initial.frame.stream, None, 0, None, vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), initial.frame.stream, None, 0, None, vec![], vec![]).await?;
     assert!(matches!(
         connection.state_streams.replay_initial(&origin, &[11], &[])?,
         Some(proto::NodeResponseBody::StateStreamUnavailable { .. })
@@ -625,17 +625,17 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             .await?;
     let id = initial.frame.stream;
     let request = proto::RequestId::new();
-    continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
-    continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
-    assert!(continue_state(&node, peer, request, id, None, 1, None, vec![], vec![]).await.is_err());
-    assert!(continue_state(&node, peer, proto::RequestId::new(), id, None, 1, None, vec![], vec![]).await.is_err());
+    apply_state_feedback(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
+    assert!(apply_state_feedback(&node, peer, request, id, None, 1, None, vec![], vec![]).await.is_err());
+    assert!(apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, 1, None, vec![], vec![]).await.is_err());
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     assert!(matches!(
-        continue_state(&node, peer, proto::RequestId::new(), id, None, 0, None, vec![], vec![]).await?,
+        apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, 0, None, vec![], vec![]).await?,
         proto::NodeResponseBody::Success
     ));
     assert!(matches!(
-        continue_state(
+        apply_state_feedback(
             &node,
             peer,
             proto::RequestId::new(),
@@ -687,7 +687,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         if done {
             break;
         }
-        continue_state(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
+        apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
         pump_state_stream(&node, peer, id).await?;
     }
     let sequences = messages
@@ -1091,7 +1091,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.head.clone() }]] {
         assert!(
             matches!(
-                continue_state(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, answers, vec![]).await?,
+                apply_state_feedback(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, answers, vec![]).await?,
                 proto::NodeResponseBody::Success
             ),
             "late round-zero feedback must be harmless after a newer live decision covered its target"
@@ -1104,7 +1104,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
     }
     assert!(
-        continue_state(&node, peer, proto::RequestId::new(), id, Some(2), 0, None, vec![], vec![]).await.is_err(),
+        apply_state_feedback(&node, peer, proto::RequestId::new(), id, Some(2), 0, None, vec![], vec![]).await.is_err(),
         "future-round feedback is invalid"
     );
     let last = session.state.lock().await.required_through;
@@ -1165,7 +1165,7 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
         assert_eq!(state.live_targets.len(), 2);
     }
     let last = session.state.lock().await.last_sent;
-    continue_state(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: last }, vec![]).await?;
     {
         let mut state = session.state.lock().await;
@@ -1173,13 +1173,13 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
         state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: first.entity_id, target: first.member.unwrap().head }])?;
         assert_eq!(state.live_repairs.len(), 1, "receipt alone must leave repair admissible");
     }
-    continue_state(&node, peer, proto::RequestId::new(), id, None, last, Some(1), vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, Some(1), vec![], vec![]).await?;
     {
         let state = session.state.lock().await;
         assert_eq!(state.live_targets.len(), 1);
         assert_eq!(state.live_targets.front().unwrap().revision, 3);
     }
-    continue_state(&node, peer, proto::RequestId::new(), id, None, last, Some(3), vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, None, last, Some(3), vec![], vec![]).await?;
     let state = session.state.lock().await;
     assert!(state.live_targets.is_empty());
     assert_eq!(state.target_bytes, 0);
@@ -1371,7 +1371,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     let entity = &source[0].payload;
-    continue_state(
+    apply_state_feedback(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1407,7 +1407,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let offer = empty.offer().await?;
     schedule_round(&node, peer, id, 1, 1, empty, offer).await?;
     pump_state_stream(&node, peer, id).await?;
-    continue_state(
+    apply_state_feedback(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1470,7 +1470,7 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
         unknown(),
     )
     .await?;
-    continue_state(
+    apply_state_feedback(
         &node,
         peer,
         proto::RequestId::new(),
@@ -1556,7 +1556,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
         )
         .await?;
         let id = initial.frame.stream;
-        let receipt = || proto::NodeRequestBody::ContinueState {
+        let receipt = || proto::NodeRequestBody::StateFeedback {
             stream: id,
             round: None,
             applied_through: None,
@@ -1595,7 +1595,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
             }
         }
     }
-    let unknown = proto::NodeRequestBody::ContinueState {
+    let unknown = proto::NodeRequestBody::StateFeedback {
         stream: proto::StateStreamId::new(),
         round: None,
         applied_through: None,

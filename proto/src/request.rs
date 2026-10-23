@@ -130,7 +130,7 @@ pub enum NodeRequestBody {
     /// Responses are Success; further numbered frames arrive as NodeUpdate.
     /// Retrying the same request id is idempotent. A processed prefix may contain
     /// explicit pending NeedRepair; it is not the global Applied acknowledgment.
-    ContinueState {
+    StateFeedback {
         stream: StateStreamId,
         /// Answers belong to this round; None addresses live-target repair.
         /// Credit-only feedback needs no active round.
@@ -273,8 +273,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
-            NodeRequestBody::ContinueState { stream, processed_through, answers, .. } => {
-                write!(f, "ContinueState {stream} through:{processed_through} answers:{}", answers.len())
+            NodeRequestBody::StateFeedback { stream, processed_through, answers, .. } => {
+                write!(f, "StateFeedback {stream} through:{processed_through} answers:{}", answers.len())
             }
             NodeRequestBody::RefreshState { stream, round, known_state } => {
                 write!(f, "RefreshState {stream} round:{round} spans:{}", known_state.spans.len())

@@ -606,8 +606,8 @@ where
                     .subscribe_query(self, request.id, fingerprint, query_id, selection, cdata, version, known_state)
                     .await
             }
-            proto::NodeRequestBody::ContinueState { stream: stream_id, round, processed_through, applied_through, answers } => {
-                state_sync::continue_state(
+            proto::NodeRequestBody::StateFeedback { stream: stream_id, round, processed_through, applied_through, answers } => {
+                state_sync::apply_state_feedback(
                     self,
                     request.from,
                     request.id,

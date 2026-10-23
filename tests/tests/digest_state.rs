@@ -371,7 +371,7 @@ async fn live_edits_cross_unfinished_comparison_then_reconnect_from_retained_sta
             if let NodeMessage::Request {
                 request:
                     proto::NodeRequest {
-                        body: proto::NodeRequestBody::ContinueState { stream: comparison, round: Some(0), answers, .. }, ..
+                        body: proto::NodeRequestBody::StateFeedback { stream: comparison, round: Some(0), answers, .. }, ..
                     },
                 ..
             } = message
@@ -635,7 +635,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &no_credentials,
-                proto::NodeRequestBody::ContinueState {
+                proto::NodeRequestBody::StateFeedback {
                     stream: comparison,
                     round: None,
                     processed_through: 0,
@@ -651,7 +651,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::ContinueState {
+                proto::NodeRequestBody::StateFeedback {
                     stream: comparison,
                     round: Some(0),
                     applied_through: None,
@@ -671,7 +671,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::ContinueState {
+                proto::NodeRequestBody::StateFeedback {
                     stream: comparison,
                     round: None,
                     processed_through: 0,
@@ -687,7 +687,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::ContinueState {
+                proto::NodeRequestBody::StateFeedback {
                     stream: comparison,
                     round: Some(0),
                     applied_through: None,
@@ -798,7 +798,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
     let initial = replies().remove(0);
     assert_eq!(bincode::serialize(&initial)?, bincode::serialize(&replies()[1])?);
     let comparison = initial.frame.stream;
-    let feedback = proto::NodeRequestBody::ContinueState {
+    let feedback = proto::NodeRequestBody::StateFeedback {
         stream: comparison,
         round: None,
         processed_through: 0,

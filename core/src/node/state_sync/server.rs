@@ -553,7 +553,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let id = match body {
-        proto::NodeRequestBody::ContinueState { stream, .. }
+        proto::NodeRequestBody::StateFeedback { stream, .. }
         | proto::NodeRequestBody::FinishStateRound { stream, .. }
         | proto::NodeRequestBody::RefreshState { stream, .. } => stream,
         _ => return crate::schema::request_bypasses_policy(body),
@@ -735,7 +735,7 @@ where
     Ok(pending)
 }
 
-pub(crate) async fn continue_state<SE, PA>(
+pub(crate) async fn apply_state_feedback<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     request: proto::RequestId,
