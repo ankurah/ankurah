@@ -191,9 +191,10 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
-    /// The initial Fetch or SubscribeQuery capture could not keep up with
-    /// concurrent source changes. No stream was created; retry after backoff.
-    StateCaptureBusy,
+    /// The responder could not take a stable snapshot of the query result for an
+    /// initial Fetch or SubscribeQuery while its source kept changing. No stream was
+    /// created; retry after backoff.
+    StateSnapshotBusy,
     /// The state stream expired or was invalidated. Restart the original Fetch or
     /// SubscribeQuery; previously received pages cannot complete a new comparison.
     StateStreamUnavailable {
@@ -304,7 +305,7 @@ impl std::fmt::Display for NodeResponseBody {
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
-            NodeResponseBody::StateCaptureBusy => write!(f, "StateCaptureBusy"),
+            NodeResponseBody::StateSnapshotBusy => write!(f, "StateSnapshotBusy"),
             NodeResponseBody::StateStreamUnavailable { stream } => write!(f, "StateStreamUnavailable {stream}"),
         }
     }

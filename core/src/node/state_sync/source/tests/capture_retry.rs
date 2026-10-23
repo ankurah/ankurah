@@ -121,7 +121,7 @@ async fn catalog_change_during_subscription_capture_reopens_the_source() -> anyh
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].id(), initial.entity_id);
     assert_eq!(rows[0].head(), proto::Clock::singleton(&initial));
-    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 0);
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
     drop(query);
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
@@ -182,9 +182,11 @@ async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() 
 
 async fn assert_recovers(client: &TestNode, query: &EntityLiveQuery, messages: &Messages, expected: &proto::Event) -> anyhow::Result<()> {
     let relay = client.subscription_relay.as_ref().unwrap();
-    until(|| responses(messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)) != 0 || query.error().value().is_some())
-        .await;
-    assert_eq!(responses(messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 1);
+    until(|| {
+        responses(messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)) != 0 || query.error().value().is_some()
+    })
+    .await;
+    assert_eq!(responses(messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 1);
     assert!(query.error().value().is_none(), "a busy capture cannot permanently fail the query");
     // Exercise the existing periodic retry task, not a manual new registration.
     // A due retry may already have completed before this observer resumes.
@@ -224,7 +226,7 @@ async fn limited_query_retries_a_raced_bounded_capture() -> anyhow::Result<()> {
     let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].head(), proto::Clock::singleton(&latest));
-    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 0);
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
     drop(query);
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
@@ -294,8 +296,8 @@ async fn fetch_bounds_busy_retries_and_can_be_retried_after_quiescence() -> anyh
         (entered, release) = next;
     }
     let result = tokio::time::timeout(std::time::Duration::from_secs(2), fetch).await??;
-    assert!(matches!(result, Err(RetrievalError::RequestError(RequestError::StateCaptureBusy))));
-    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 2);
+    assert!(matches!(result, Err(RetrievalError::RequestError(RequestError::StateSnapshotBusy))));
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 2);
     let rows = client.fetch_from_peer(keyed_selection(Some(1)), &vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].head(), proto::Clock::singleton(&latest));
@@ -315,7 +317,7 @@ async fn unavailable_source_is_terminal_for_initial_query_and_fetch() -> anyhow:
     assert!(matches!(client.subscription_relay.as_ref().unwrap().get_status(query.query_id()), Some(Status::Failed)));
     let error = client.fetch_from_peer(selection(None), &vec![DEFAULT_CONTEXT]).await.unwrap_err();
     assert!(matches!(error, RetrievalError::RequestError(RequestError::ServerError(_))));
-    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 0);
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
     drop(query);
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
@@ -334,7 +336,7 @@ async fn malformed_initial_offer_is_not_a_busy_capture() -> anyhow::Result<()> {
         let response = client.request(server.id, &vec![DEFAULT_CONTEXT], body).await?;
         assert!(matches!(response, proto::NodeResponseBody::Error(_)));
     }
-    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateCaptureBusy)), 0);
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
     Ok(())

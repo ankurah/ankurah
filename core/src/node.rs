@@ -475,7 +475,7 @@ where
                                         )
                                     ) =>
                             {
-                                proto::NodeResponseBody::StateCaptureBusy
+                                proto::NodeResponseBody::StateSnapshotBusy
                             }
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                         },
@@ -855,8 +855,8 @@ where
     }
 
     /// Compare a temporary result tree with a durable peer and apply its repairs before returning.
-    /// Retry once if the stream is lost or capture is busy; sustained capture
-    /// churn returns StateCaptureBusy so this finite call cannot retry forever.
+    /// Retry once if the stream is lost or the responder could not take a stable snapshot;
+    /// sustained source churn returns StateSnapshotBusy so this finite call cannot retry forever.
     pub(crate) async fn fetch_from_peer(
         &self,
         selection: ankql::ast::Selection<Resolved>,
@@ -877,12 +877,12 @@ where
             .await?;
             let state = match response {
                 proto::NodeResponseBody::Fetch(state) => state,
-                proto::NodeResponseBody::StateCaptureBusy if attempt == 0 => {
+                proto::NodeResponseBody::StateSnapshotBusy if attempt == 0 => {
                     drop(stream);
                     futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                proto::NodeResponseBody::StateCaptureBusy => return Err(RequestError::StateCaptureBusy.into()),
+                proto::NodeResponseBody::StateSnapshotBusy => return Err(RequestError::StateSnapshotBusy.into()),
                 proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
                 other => return Err(RequestError::UnexpectedResponse(other).into()),
             };
