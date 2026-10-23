@@ -28,17 +28,17 @@
 //!   client LiveQuery change notification firing, over a LocalProcessConnection.
 //! - `fresh_fetch_snapshot`: wall time for a FRESH client's first fetch of an
 //!   entity whose server-side history is 100 / 1000 / 5000 events deep. A fresh
-//!   fetch offers an empty tree and reports the entity unknown, so the server sends a full
-//!   StateSnapshot (unknown-entity snapshot path), never an EventBridge: depth
+//!   fetch offers no head for the entity, so the server answers with a full
+//!   StateSnapshot (no known head to bridge from), never an EventBridge: depth
 //!   affects only the excluded setup, and the measured region is snapshot
 //!   adoption. A lane guard asserts no events were committed locally.
 //! - `bridge_catchup`: the TRUE EventBridge lane, via the stale-client shape
 //!   (the only shape that produces DeltaContent::EventBridge): the client
 //!   fetches once so it holds the entity at a stale head, disconnects, the
 //!   server advances by GAP edits (32 / 100 / 200), then the client
-//!   reconnects and re-fetches. State comparison supplies the stale head, the
+//!   reconnects and re-fetches. The re-fetch offers the stale head, the
 //!   server builds the bridge from stale head to current
-//!   (known stale-head bridge path), and the client applies GAP events through
+//!   (generate_entity_delta Case 2), and the client applies GAP events through
 //!   the bridge arm. A lane guard asserts the client committed the gap events
 //!   locally (the bridge arm commits them; the snapshot arm does not).
 //! - `subscription_establishment`: wall time to establish and initialize a live
@@ -233,8 +233,8 @@ fn futures_noop_poll<F: std::future::Future>(fut: &mut std::pin::Pin<&mut F>) ->
 /// `depth` events deep. The server and all history are built OUTSIDE the timed
 /// region; the measured region is the client's fetch.
 ///
-/// LANE: a fresh client reports the entity unknown during comparison, so the server sends a
-/// full StateSnapshot (unknown-entity snapshot path), never an EventBridge. The
+/// LANE: a fresh client offers NO head for the entity, so the server answers with a
+/// full StateSnapshot (no known head to bridge from), never an EventBridge. The
 /// history depth therefore affects only the excluded setup; the measured region
 /// is one final-state snapshot adoption and is expected to be roughly FLAT in
 /// depth. This is still a useful number (fresh-client first-fetch latency), but
@@ -305,17 +305,17 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
 
 /// Time a STALE client catching up an entity the server advanced by `gap`
 /// events while the client was disconnected. This is the only shape that
-/// produces `DeltaContent::EventBridge`: the re-fetch's state comparison supplies
+/// produces `DeltaContent::EventBridge`: the re-fetch's offer carries
 /// the client's stale head, the server builds the bridge from stale head to
-/// current head (known stale-head bridge path), and the client applies the gap
+/// current head (generate_entity_delta Case 2), and the client applies the gap
 /// events through the bridge arm.
 ///
 /// Per iteration: (setup, excluded) server creates the entity; the client
 /// connects and fetches once so it persists the entity at that head, then
 /// DISCONNECTS (dropping the LocalProcessConnection deregisters the peers); the
 /// server advances by `gap` edits. (Measured) the client reconnects and fetches
-/// again; the measured region spans reconnect + re-fetch, including two peer
-/// registrations and the connector's spawned tasks.
+/// again; the measured region spans reconnect + re-fetch, and reconnect
+/// (two peer registrations and two task spawns) adds a fixed cost to every gap.
 ///
 /// Guards: the client must reach the final state, and a lane guard asserts the
 /// client committed at least `gap` events locally, which only the bridge arm
@@ -326,7 +326,8 @@ fn bench_bridge_catchup(c: &mut Criterion) {
     let mut group = c.benchmark_group("bridge_catchup");
     group.sample_size(10); // Deep-gap setup per iteration is expensive; keep samples modest.
 
-    // Larger gaps may use snapshots under the responder's 256-event work budget.
+    // The responder bridges at most 256 events and repairs a longer gap with a
+    // snapshot, which the lane guard below rejects.
     for gap in [32usize, 100, 200] {
         group.throughput(Throughput::Elements(gap as u64));
         group.bench_with_input(BenchmarkId::from_parameter(gap), &gap, |b, &gap| {
