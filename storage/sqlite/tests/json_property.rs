@@ -12,11 +12,12 @@
 //! This enables using JSONB functions (`jsonb()`, `->`, `->>`) for efficient path queries.
 //! SQLite 3.45.0+ is required for JSONB support.
 
+mod common;
+
 use ankurah::core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
 use ankurah::property::Json;
 use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Model, ModelId, Node, PermissiveAgent, PropertyId, ValueType};
 use ankurah_storage_sqlite::sql_builder::{split_predicate_for_sqlite, SplitPredicate};
-use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -76,7 +77,7 @@ pub struct Track {
 
 #[engine_test]
 async fn test_json_property_storage_and_simple_query() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -122,7 +123,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
     // Verify pushdown before running the actual query
     assert_fully_pushes_down("licensing.territory = 'US'");
 
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -166,7 +167,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
 
 #[engine_test]
 async fn test_json_path_query_numeric_comparison() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -197,7 +198,7 @@ async fn test_json_path_query_numeric_comparison() -> Result<()> {
 
 #[engine_test]
 async fn test_json_path_nested_query() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -238,7 +239,7 @@ async fn test_json_path_nested_query() -> Result<()> {
 
 #[engine_test]
 async fn test_json_path_combined_with_regular_field() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -262,7 +263,7 @@ async fn test_json_path_combined_with_regular_field() -> Result<()> {
 
 #[engine_test]
 async fn test_json_path_query_with_or() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -289,7 +290,7 @@ async fn test_json_path_query_with_or() -> Result<()> {
 
 #[engine_test]
 async fn test_json_path_query_numeric_ordering() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();

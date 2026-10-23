@@ -12,7 +12,8 @@
 //! - Cross-type comparisons behavior
 //! - Float/int comparisons work correctly within numeric family
 
-use ankurah_storage_sqlite::SqliteStorageEngine;
+mod common;
+
 use anyhow::Result;
 // The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
 #[cfg(not(target_arch = "wasm32"))]
@@ -22,7 +23,7 @@ use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
 /// Helper to run a SQL query that returns a boolean (0 or 1 in SQLite)
 async fn query_bool(sql: &str) -> Result<bool> {
-    let engine = SqliteStorageEngine::open_in_memory().await?;
+    let engine = common::open_in_memory().await?;
     let conn = engine.pool().get().await.map_err(|e| anyhow::anyhow!("{}", e))?;
 
     let sql = sql.to_owned();

@@ -1,0 +1,7 @@
+{
+  "name": "ankurah-storage-sqlite-tests",
+  "private": true,
+  "devDependencies": {
+    "better-sqlite3": "13.0.3"
+  }
+}

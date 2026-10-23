@@ -7,22 +7,11 @@ mod common;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_sqlite::{exec::SqliteExecutor, NodeConnection, SqliteStorageEngine};
 use anyhow::Result;
-use common::{Album, AlbumView};
-use js_sys::{Array, Function, Reflect};
+use common::{host_database, on_better_sqlite3, Album, AlbumView};
+use js_sys::{Function, Reflect};
 use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
-
-/// A `DatabaseSync` constructed by the host, the way an extension host or a
-/// server would build one before handing it to the engine.
-fn host_database(path: &str) -> JsValue {
-    let global = js_sys::global();
-    let process = Reflect::get(&global, &"process".into()).unwrap();
-    let get_builtin: Function = Reflect::get(&process, &"getBuiltinModule".into()).unwrap().dyn_into().unwrap();
-    let module = get_builtin.call1(&process, &"node:sqlite".into()).unwrap();
-    let constructor: Function = Reflect::get(&module, &"DatabaseSync".into()).unwrap().dyn_into().unwrap();
-    Reflect::construct(&constructor, &Array::of1(&path.into())).unwrap()
-}
 
 #[wasm_bindgen_test]
 async fn adopts_a_host_built_database() -> Result<()> {
@@ -47,8 +36,8 @@ async fn refuses_an_object_without_the_database_shape() {
     assert!(error.to_string().contains("prepare"), "the refusal names the shape it wanted: {error}");
 }
 
-// Hide one capability on an actual DatabaseSync statement to exercise older
-// or incompatible host drivers without substituting their SQL behavior.
+// Hide one capability on an actual statement of the run's driver to exercise
+// older or incompatible host drivers without substituting their SQL behavior.
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
 export function withoutStatementMethod(database, name) {
     return {
@@ -68,14 +57,16 @@ extern "C" {
 
 #[wasm_bindgen_test]
 async fn refuses_a_driver_without_positional_rows() {
-    let database = without_statement_method(host_database(":memory:"), "setReturnArrays");
+    let method = if on_better_sqlite3() { "raw" } else { "setReturnArrays" };
+    let database = without_statement_method(host_database(":memory:"), method);
     let error = SqliteStorageEngine::from_database(database).await.err().expect("object rows are not positional");
     assert!(error.to_string().contains("positional rows"), "{error}");
 }
 
 #[wasm_bindgen_test]
 async fn refuses_a_driver_without_exact_integers() {
-    let database = without_statement_method(host_database(":memory:"), "setReadBigInts");
+    let method = if on_better_sqlite3() { "safeIntegers" } else { "setReadBigInts" };
+    let database = without_statement_method(host_database(":memory:"), method);
     let error = SqliteStorageEngine::from_database(database).await.err().expect("Number cannot represent every INTEGER");
     assert!(error.to_string().contains("exact INTEGER"), "{error}");
 }
@@ -85,7 +76,7 @@ async fn refuses_a_driver_without_exact_integers() {
 /// function, while the PRAGMA's other storage classes read as ever.
 #[wasm_bindgen_test]
 async fn text_from_a_statement_sqlite_cannot_nest_is_refused() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let (table_info, timeout) = storage
         .with_executor(|executor| {
             let table_info =
@@ -104,7 +95,7 @@ async fn text_from_a_statement_sqlite_cannot_nest_is_refused() -> Result<()> {
 /// it writes nothing it could not then report.
 #[wasm_bindgen_test]
 async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let (refusals, count) = storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE things (v TEXT)", &[])?;
@@ -161,8 +152,10 @@ fn refusal(tamper: &str) -> String {
 /// reads is the schema version the kept typed readers are checked against.
 #[wasm_bindgen_test]
 fn refuses_a_database_that_hands_an_integer_over_as_a_number() {
-    let error =
-        refusal("return new Proxy(statement, { get: (target, name) => name === 'setReadBigInts' ? () => {} : forward(target, name) });");
+    let method = if on_better_sqlite3() { "safeIntegers" } else { "setReadBigInts" };
+    let error = refusal(&format!(
+        "return new Proxy(statement, {{ get: (target, name) => name === '{method}' ? () => {{}} : forward(target, name) }});"
+    ));
     assert!(error.contains("expected an INTEGER as a BigInt, found JsValue(0)"), "{error}");
 }
 

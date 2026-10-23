@@ -530,6 +530,7 @@ fn decode_event_row((entity_id, body, parent, attestations): RawEventRow<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_driver;
     use ankurah_core::{
         property::backend::{lww::LWWBackend, PropertyBackend},
         value::Value,
@@ -609,7 +610,7 @@ mod tests {
 
     #[engine_test]
     async fn fallback_names_survive_late_labels_and_engine_reopen() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = test_driver::open_in_memory().await.unwrap();
         let model = ModelId::EntityId(entity_id(0xe1));
         let property = PropertyId::EntityId(entity_id(0xe2));
         let entity = entity_id(0xe3);
@@ -704,14 +705,14 @@ mod tests {
 
     #[engine_test]
     async fn test_open_in_memory() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = test_driver::open_in_memory().await.unwrap();
         let all = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         assert!(engine.fetch_states(&all.clone().and_member_of(ModelId::System(SystemModel::System))).await.unwrap().is_empty());
     }
 
     #[engine_test]
     async fn test_list_models_reads_durable_registrations() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = test_driver::open_in_memory().await.unwrap();
         assert!(engine.list_materializations().await.unwrap().is_empty());
 
         let expected = [SystemModel::System, SystemModel::Model, SystemModel::Property].map(ModelId::System);
@@ -731,7 +732,7 @@ mod tests {
     /// normalized to lowercase.
     #[engine_test]
     async fn colliding_model_and_property_labels_get_distinct_lowercase_names() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = test_driver::open_in_memory().await.unwrap();
         let conn = engine.pool.get().await.unwrap();
         conn.with_executor(|connection| {
             connection.execute(r#"CREATE TABLE "sales_report" ("application_value" TEXT)"#, &[])?;
@@ -790,7 +791,7 @@ mod tests {
     /// canonical membership set.
     #[engine_test]
     async fn write_refreshes_every_canonical_membership_materialization() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = test_driver::open_in_memory().await.unwrap();
         let model_a = ModelId::EntityId(entity_id(0x61));
         let model_b = ModelId::EntityId(entity_id(0x62));
         let property_a = PropertyId::EntityId(entity_id(0x71));
@@ -823,7 +824,7 @@ mod tests {
 
     #[engine_test]
     async fn stale_head_rolls_back_the_complete_batch() {
-        let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
+        let engine = test_driver::open_in_memory().await.unwrap();
         let model_a = ModelId::EntityId(entity_id(0x81));
         let model_b = ModelId::EntityId(entity_id(0x82));
         let property = PropertyId::EntityId(entity_id(0x83));
@@ -882,7 +883,7 @@ mod tests {
     /// 4. JSONB storage and retrieval works correctly
     #[engine_test]
     async fn test_jsonb_function_availability() -> Result<(), SqliteError> {
-        let engine = SqliteStorageEngine::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
+        let engine = test_driver::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
         let conn = engine.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
         // Test 1: Verify jsonb() function exists and works
@@ -933,7 +934,7 @@ mod tests {
 
     #[engine_test]
     async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Result<()> {
-        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let engine = test_driver::open_in_memory().await?;
         let property = PropertyId::System(ankurah_proto::SystemProperty::Name);
         let initial = [
             state_with_strings(entity_id(0x91), 1, &[(property, "before")]),
@@ -1003,7 +1004,7 @@ mod tests {
 
     #[engine_test]
     async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result<()> {
-        let engine = SqliteStorageEngine::open_in_memory().await?;
+        let engine = test_driver::open_in_memory().await?;
         let entity = entity_id(0x51);
         let mut state = state_with_strings(entity, 1, &[(PropertyId::System(ankurah_proto::SystemProperty::Name), "value")]);
         // Synthetic tips with distinct generations: the engine must retain each association.
@@ -1050,7 +1051,7 @@ mod tests {
     /// This mimics exactly what the real code does.
     #[engine_test]
     async fn test_jsonb_storage_and_parameterized_query() -> Result<(), SqliteError> {
-        let engine = SqliteStorageEngine::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
+        let engine = test_driver::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
         let conn = engine.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
         conn.with_executor(|c| {

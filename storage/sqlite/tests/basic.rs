@@ -12,7 +12,6 @@ mod common;
 #[cfg(not(target_arch = "wasm32"))]
 use ankurah::signals::Subscribe;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
-use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
 #[cfg(not(target_arch = "wasm32"))]
 use common::TestWatcher;
@@ -26,7 +25,7 @@ use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
 #[engine_test]
 async fn test_sqlite_create_and_query() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -49,7 +48,7 @@ async fn test_sqlite_create_and_query() -> Result<()> {
 
 #[engine_test]
 async fn test_sqlite_update_entity() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -80,7 +79,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
 
 #[engine_test]
 async fn test_sqlite_state_change_detection() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -109,7 +108,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
 
 #[engine_test]
 async fn test_sqlite_multiple_updates() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -143,7 +142,7 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
 #[cfg(not(target_arch = "wasm32"))]
 #[tokio::test]
 async fn test_sqlite_query_with_subscription() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();

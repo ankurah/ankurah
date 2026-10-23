@@ -26,6 +26,13 @@ use std::{
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::Notify;
 
+pub mod driver;
+#[cfg(target_arch = "wasm32")]
+#[allow(unused)]
+pub use driver::host_database;
+#[allow(unused)]
+pub use driver::{on_better_sqlite3, open, open_in_memory};
+
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Album {
     pub name: String,
@@ -255,10 +262,15 @@ impl TempDb {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::exec::SqliteExecutor> { Box::new(rusqlite::Connection::open(&self.0).unwrap()) }
 
-    /// A second connection on the file, for edits behind the engine's back.
+    /// A second connection on the file, for edits behind the engine's back,
+    /// on the engine's driver (see [`LOCK_HOLDER`] for why).
     #[cfg(target_arch = "wasm32")]
     pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::exec::SqliteExecutor> {
-        Box::new(ankurah_storage_sqlite::NodeConnection::open(self.path_str()).unwrap())
+        Box::new(if driver::on_better_sqlite3() {
+            ankurah_storage_sqlite::NodeConnection::from_database(driver::host_database(self.path_str())).unwrap()
+        } else {
+            ankurah_storage_sqlite::NodeConnection::open(self.path_str()).unwrap()
+        })
     }
 }
 
@@ -312,12 +324,15 @@ pub struct LockHolder {
     exit: js_sys::Promise,
 }
 
-/// The worker's side of a [`LockHolder`] on Node.
+/// The worker's side of a [`LockHolder`] on Node. Its connection is on the
+/// driver the engine's is on, because two copies of SQLite in one process do
+/// not see each other's locks: the file locks they take belong to the
+/// process, so neither copy's locks keep out the other's connections.
 #[cfg(target_arch = "wasm32")]
 const LOCK_HOLDER: &str = r#"
 const { parentPort, workerData } = require('node:worker_threads');
-const { DatabaseSync } = require('node:sqlite');
-const database = new DatabaseSync(workerData.path);
+const Database = workerData.betterSqlite3 ? require(workerData.betterSqlite3) : require('node:sqlite').DatabaseSync;
+const database = new Database(workerData.path);
 database.exec(workerData.lock);
 parentPort.postMessage('locked');
 setTimeout(() => { database.exec('COMMIT'); database.close(); }, workerData.holdMs);
@@ -349,15 +364,17 @@ impl LockHolder {
         // can be missed; the exit's rejection, if the worker fails, is
         // reported where `released` awaits it.
         let start = js_sys::Function::new_with_args(
-            "source, path, lock, holdMs",
+            "source, path, lock, holdMs, betterSqlite3",
             "const { Worker } = process.getBuiltinModule('node:worker_threads');
              const { once } = process.getBuiltinModule('node:events');
-             const worker = new Worker(source, { eval: true, workerData: { path, lock, holdMs } });
+             const worker = new Worker(source, { eval: true, workerData: { path, lock, holdMs, betterSqlite3 } });
              const exit = once(worker, 'exit');
              exit.catch(() => {});
              return once(worker, 'message').then(() => ({ exit }));",
         );
-        let arguments = js_sys::Array::of4(&LOCK_HOLDER.into(), &db.path_str().into(), &lock.into(), &(hold_ms as f64).into());
+        let better_sqlite3 = if driver::on_better_sqlite3() { driver::better_sqlite3_entry().into() } else { wasm_bindgen::JsValue::NULL };
+        let arguments =
+            js_sys::Array::of5(&LOCK_HOLDER.into(), &db.path_str().into(), &lock.into(), &(hold_ms as f64).into(), &better_sqlite3);
         let started: js_sys::Promise = start.apply(&wasm_bindgen::JsValue::NULL, &arguments).unwrap().dyn_into().unwrap();
         let handle = wasm_bindgen_futures::JsFuture::from(started).await.expect("the other connection takes the lock");
         Self { exit: js_sys::Reflect::get(&handle, &"exit".into()).unwrap().dyn_into().unwrap() }

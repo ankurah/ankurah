@@ -27,7 +27,7 @@ async fn fresh_store_records_version_and_reopens() -> anyhow::Result<()> {
 
     // A fresh store records the version at engine construction.
     {
-        let engine = SqliteStorageEngine::open(db.path()).await?;
+        let engine = common::open(db.path()).await?;
         touch_system_materialization(&engine).await?;
     }
 
@@ -39,7 +39,7 @@ async fn fresh_store_records_version_and_reopens() -> anyhow::Result<()> {
     }
 
     // Reopening a store with the matching record proceeds.
-    let _engine = SqliteStorageEngine::open(db.path()).await?;
+    let _engine = common::open(db.path()).await?;
     Ok(())
 }
 
@@ -52,7 +52,7 @@ async fn unrelated_tables_do_not_block_initialization_or_get_dropped() -> anyhow
         conn.execute(r#"INSERT INTO "application_data" ("value") VALUES ('keep me')"#, &[])?;
     }
 
-    let engine = SqliteStorageEngine::open(db.path()).await?;
+    let engine = common::open(db.path()).await?;
     touch_system_materialization(&engine).await?;
     assert!(engine.delete_all().await?, "Ankurah-owned storage was deleted");
     assert!(!engine.delete_all().await?, "unrelated tables do not count as Ankurah storage");
@@ -67,7 +67,7 @@ async fn unrelated_tables_do_not_block_initialization_or_get_dropped() -> anyhow
 async fn mismatched_version_refuses() -> anyhow::Result<()> {
     let db = TempDb::new("mismatch");
     {
-        let _engine = SqliteStorageEngine::open(db.path()).await?;
+        let _engine = common::open(db.path()).await?;
     }
 
     // Rewrite the stored version out of band.
@@ -76,7 +76,7 @@ async fn mismatched_version_refuses() -> anyhow::Result<()> {
         conn.execute(r#"UPDATE "_ankurah_meta" SET "value" = '999' WHERE "key" = 'protocol_version'"#, &[])?;
     }
 
-    let err = match SqliteStorageEngine::open(db.path()).await {
+    let err = match common::open(db.path()).await {
         Ok(_) => panic!("expected the mismatched version to refuse the open"),
         Err(e) => e.to_string(),
     };
@@ -88,7 +88,7 @@ async fn mismatched_version_refuses() -> anyhow::Result<()> {
 async fn unversioned_store_with_data_refuses() -> anyhow::Result<()> {
     let db = TempDb::new("unversioned");
     {
-        let engine = SqliteStorageEngine::open(db.path()).await?;
+        let engine = common::open(db.path()).await?;
         touch_system_materialization(&engine).await?;
     }
 
@@ -99,7 +99,7 @@ async fn unversioned_store_with_data_refuses() -> anyhow::Result<()> {
         conn.execute(r#"DROP TABLE "_ankurah_meta""#, &[])?;
     }
 
-    let err = match SqliteStorageEngine::open(db.path()).await {
+    let err = match common::open(db.path()).await {
         Ok(_) => panic!("expected the unversioned store with existing data to refuse the open"),
         Err(e) => e.to_string(),
     };
@@ -111,7 +111,7 @@ async fn unversioned_store_with_data_refuses() -> anyhow::Result<()> {
 async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
     let db = TempDb::new("wipe");
     {
-        let engine = SqliteStorageEngine::open(db.path()).await?;
+        let engine = common::open(db.path()).await?;
         touch_system_materialization(&engine).await?;
         assert!(engine.delete_all().await?, "wiping existing storage reports true");
         // Only compatibility metadata remains.
@@ -119,6 +119,6 @@ async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
     }
 
     // The wiped store keeps its version record and reopens.
-    let _engine = SqliteStorageEngine::open(db.path()).await?;
+    let _engine = common::open(db.path()).await?;
     Ok(())
 }

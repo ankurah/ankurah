@@ -8,7 +8,6 @@
 mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
-use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -29,7 +28,7 @@ pub struct Task {
 /// Test that queries handle undefined columns in WHERE clause
 #[engine_test]
 async fn test_undefined_column_in_where() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -45,7 +44,7 @@ async fn test_undefined_column_in_where() -> Result<()> {
 /// Test that queries handle undefined columns in ORDER BY clause
 #[engine_test]
 async fn test_undefined_column_in_order_by() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -60,7 +59,7 @@ async fn test_undefined_column_in_order_by() -> Result<()> {
 /// Test WHERE on one missing column, ORDER BY on another (both handled upfront)
 #[engine_test]
 async fn test_undefined_columns_where_and_order_by() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -76,7 +75,7 @@ async fn test_undefined_columns_where_and_order_by() -> Result<()> {
 /// Test that after writing data, subsequent queries work
 #[engine_test]
 async fn test_columns_exist_after_write() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -98,7 +97,7 @@ async fn test_columns_exist_after_write() -> Result<()> {
 /// This validates that the schema cache gets refreshed when columns are added.
 #[engine_test]
 async fn test_cache_refresh_after_column_creation() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();

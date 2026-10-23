@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 
 # Script to run WASM tests for Ankurah project
-# Usage: ./scripts/run-wasm-tests.sh [package_name|storage_sqlite_node|--discover]
+# Usage: ./scripts/run-wasm-tests.sh [package_name|storage_sqlite_node|storage_sqlite_better_sqlite3|--discover]
 # If no package name is provided, runs tests for all discovered wasm packages
 # (in headless Chrome) and then ankurah-storage-sqlite's suite on node:sqlite (in Node)
+# storage_sqlite_better_sqlite3 runs that suite again on better-sqlite3, which
+# `npm ci` in storage/sqlite/tests installs
 # Use --discover to only show discovered packages without running tests
 
 set -e
@@ -131,6 +133,29 @@ run_node_sqlite_tests() {
     cd - > /dev/null
 }
 
+# The engine also adopts a better-sqlite3 database a host built, though it
+# never builds one itself, so the same suite runs again with better-sqlite3
+# building each database the tests build (see
+# storage/sqlite/tests/common/driver.rs). storage/sqlite/tests/package.json
+# pins the release.
+run_better_sqlite3_tests() {
+    if [ ! -d "$PROJECT_ROOT/storage/sqlite/tests/node_modules/better-sqlite3" ]; then
+        print_error "better-sqlite3 is not installed. Please install it first:"
+        print_error "  (cd storage/sqlite/tests && npm ci)"
+        exit 1
+    fi
+    print_status "Running WASM tests in Node for ankurah-storage-sqlite (node feature) on better-sqlite3..."
+    cd "$PROJECT_ROOT/storage/sqlite"
+    if ANKURAH_SQLITE_TEST_DRIVER=better-sqlite3 wasm-pack test --node -- --features node; then
+        print_status "✅ WASM tests passed for storage-sqlite on better-sqlite3"
+    else
+        print_error "❌ WASM tests failed for storage-sqlite on better-sqlite3"
+        cd - > /dev/null
+        exit 1
+    fi
+    cd - > /dev/null
+}
+
 # Main execution
 main() {
     local target_package="$1"
@@ -174,6 +199,12 @@ main() {
     
     if [ "$target_package" = "storage_sqlite_node" ]; then
         run_node_sqlite_tests
+        print_status "🎉 All WASM tests completed successfully!"
+        exit 0
+    fi
+
+    if [ "$target_package" = "storage_sqlite_better_sqlite3" ]; then
+        run_better_sqlite3_tests
         print_status "🎉 All WASM tests completed successfully!"
         exit 0
     fi

@@ -97,3 +97,14 @@ jobs:
         run: ./scripts/run-wasm-tests.sh
         env:
           RUST_BACKTRACE: 1
+
+      # ankurah-storage-sqlite's Node suite runs again on better-sqlite3, at the
+      # release storage/sqlite/tests/package.json pins.
+      - name: Install better-sqlite3
+        working-directory: storage/sqlite/tests
+        run: npm ci
+
+      - name: Run WASM tests on better-sqlite3
+        run: ./scripts/run-wasm-tests.sh storage_sqlite_better_sqlite3
+        env:
+          RUST_BACKTRACE: 1

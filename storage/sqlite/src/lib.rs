@@ -73,3 +73,13 @@ pub use error::SqliteError;
 #[cfg(all(target_arch = "wasm32", feature = "node"))]
 pub use node::{NodeConnection, NodePool};
 pub use value::{SqliteValue, SqliteValueRef};
+
+// The unit tests build their engines on the SQLite driver the run names,
+// through the file the integration tests use for it. That file names this
+// crate by its name, as an integration test must, so under test the crate
+// answers to its own name too.
+#[cfg(test)]
+extern crate self as ankurah_storage_sqlite;
+#[cfg(test)]
+#[path = "../tests/common/driver.rs"]
+mod test_driver;

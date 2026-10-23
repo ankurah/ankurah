@@ -1,5 +1,5 @@
 //! What every executor must agree on where values cross the driver boundary,
-//! checked natively on rusqlite and on wasm32 on node:sqlite.
+//! checked natively on rusqlite and on wasm32 on node:sqlite and better-sqlite3.
 
 mod common;
 
@@ -30,7 +30,7 @@ pub struct Stamp {
 /// and ordered exactly in SQL (on Node they cross the boundary as BigInt).
 #[engine_test]
 async fn integers_past_the_double_range_are_exact() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -71,7 +71,7 @@ async fn integers_past_the_double_range_are_exact() -> Result<()> {
 /// classes.
 #[engine_test]
 async fn integral_reals_read_as_reals() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let row = storage.with_executor(|executor| Ok(executor.query_row("SELECT 2.0, -0.0, 2", &[])?.expect("one row"))).await?;
     assert!(
         matches!(row.values(), [SqliteValue::Real(two), SqliteValue::Real(zero), SqliteValue::Integer(2)] if *two == 2.0 && *zero == 0.0),
@@ -87,6 +87,11 @@ async fn integral_reals_read_as_reals() -> Result<()> {
 /// session pragmas.
 #[engine_test]
 async fn connections_wait_five_seconds_for_a_lock() -> Result<()> {
+    // The engine opens no better-sqlite3 database, and one it adopts keeps
+    // the busy timeout its host set, so the better-sqlite3 run skips this.
+    if common::on_better_sqlite3() {
+        return Ok(());
+    }
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let timeout = storage.with_executor(|executor| executor.query_row("PRAGMA busy_timeout", &[])?.expect("one row").integer(0)).await?;
     assert_eq!(timeout, 5000);
@@ -97,7 +102,7 @@ async fn connections_wait_five_seconds_for_a_lock() -> Result<()> {
 /// would not detect a driver rounding its returned INTEGER values.
 #[engine_test]
 async fn integer_results_preserve_all_bits() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE exact_integers (value INTEGER)", &[])?;
@@ -115,7 +120,7 @@ async fn integer_results_preserve_all_bits() -> Result<()> {
 
 #[engine_test]
 async fn duplicate_column_names_keep_both_positions() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let row = storage.with_executor(|executor| Ok(executor.query_row("SELECT 1 AS x, 2 AS x", &[])?.unwrap())).await?;
     assert_eq!(row.values().len(), 2);
     assert_eq!(row.integer(0)?, 1);
@@ -129,12 +134,13 @@ async fn duplicate_column_names_keep_both_positions() -> Result<()> {
 /// and turn the second into U+FFFD.)
 #[engine_test]
 async fn text_keeps_an_embedded_nul_and_refuses_bytes_that_are_not_utf8() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let (bound, cast, stored, length, replacement) = storage
         .with_executor(|executor| {
-            let row = executor
-                .query_row("SELECT ?1, CAST(x'610062' AS TEXT), length(CAST(?1 AS BLOB))", &[SqliteValueRef::Text("a\0b")])?
-                .expect("one row");
+            // The text is bound twice, to bare `?` placeholders: better-sqlite3
+            // binds a positional value to no numbered one such as `?1`.
+            let text = SqliteValueRef::Text("a\0b");
+            let row = executor.query_row("SELECT ?, CAST(x'610062' AS TEXT), length(CAST(? AS BLOB))", &[text, text])?.expect("one row");
             executor.execute("CREATE TABLE texts (t TEXT)", &[])?;
             executor.execute("INSERT INTO texts (t) VALUES (?)", &[SqliteValueRef::Text("a\0b")])?;
             let stored = executor.query_row("SELECT t FROM texts", &[])?.expect("one row");
@@ -165,7 +171,7 @@ async fn text_keeps_an_embedded_nul_and_refuses_bytes_that_are_not_utf8() -> Res
 /// the row holds rather than at a fresh one.
 #[engine_test]
 async fn rows_lend_their_text_and_blob_values() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let row = storage.with_executor(|executor| Ok(executor.query_row("SELECT 'text', x'0102'", &[])?.expect("one row"))).await?;
     assert!(std::ptr::eq(row.text(0)?, row.text(0)?));
     assert!(std::ptr::eq(row.blob(1)?, row.blob(1)?));
@@ -181,7 +187,7 @@ async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
     fn width_of_every_column(executor: &dyn SqliteExecutor) -> Result<usize, SqliteError> {
         Ok(executor.query_row("SELECT * FROM things", &[])?.expect("one row").values().len())
     }
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let widths = storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE things (a)", &[])?;
@@ -202,7 +208,7 @@ async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
 /// step yields a row, as rusqlite's does, so a query cannot pass for a write.
 #[engine_test]
 async fn execute_refuses_a_statement_that_yields_a_row() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let outcomes = storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY)", &[])?;
@@ -226,10 +232,11 @@ async fn execute_refuses_a_statement_that_yields_a_row() -> Result<()> {
 }
 
 /// An error SQLite raises carries its extended result code on rusqlite and
-/// on node:sqlite alike.
+/// on node:sqlite alike, and none on better-sqlite3, which names the code
+/// without its number.
 #[engine_test]
 async fn errors_carry_sqlite_s_extended_result_code() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let codes = storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY, v TEXT UNIQUE)", &[])?;
@@ -243,7 +250,8 @@ async fn errors_carry_sqlite_s_extended_result_code() -> Result<()> {
         .await?;
     // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR, and
     // no code for an error SQLite did not raise.
-    assert_eq!(codes, [Some(1555), Some(2067), Some(1), None]);
+    let expected = if common::on_better_sqlite3() { [None; 4] } else { [Some(1555), Some(2067), Some(1), None] };
+    assert_eq!(codes, expected);
     Ok(())
 }
 
@@ -251,6 +259,11 @@ async fn errors_carry_sqlite_s_extended_result_code() -> Result<()> {
 /// connection.rs gives a native one, on every driver.
 #[engine_test]
 async fn a_connection_on_a_file_takes_the_session_settings() -> Result<()> {
+    // The engine opens no better-sqlite3 database, and one it adopts keeps
+    // the session settings its host chose, so the better-sqlite3 run skips this.
+    if common::on_better_sqlite3() {
+        return Ok(());
+    }
     let db = TempDb::new("settings");
     let storage = SqliteStorageEngine::open(db.path()).await?;
     assert_eq!(session_settings(&storage).await?, (5000, "wal".to_owned(), 1, 1, -64000, 268_435_456, 2));
@@ -266,7 +279,7 @@ const HOLD_MS: u64 = 400;
 #[engine_test]
 async fn a_writer_waits_for_another_connection_s_lock() -> Result<()> {
     let db = TempDb::new("writer_waits");
-    let storage = SqliteStorageEngine::open(db.path()).await?;
+    let storage = common::open(db.path()).await?;
     let holder = LockHolder::take(&db, "BEGIN IMMEDIATE", HOLD_MS).await;
     let waited = Stopwatch::start();
     storage.with_executor(|executor| executor.begin(Behavior::Immediate)?.commit()).await?;
@@ -281,6 +294,11 @@ async fn a_writer_waits_for_another_connection_s_lock() -> Result<()> {
 /// that needs the file.
 #[engine_test]
 async fn opening_a_store_waits_for_a_lock_on_its_file() -> Result<()> {
+    // The engine opens no better-sqlite3 database, and one it adopts keeps
+    // the busy timeout its host set, so the better-sqlite3 run skips this.
+    if common::on_better_sqlite3() {
+        return Ok(());
+    }
     let db = TempDb::new("open_waits");
     // EXCLUSIVE in the file's first, rollback journal keeps out readers too.
     let holder = LockHolder::take(&db, "BEGIN EXCLUSIVE", HOLD_MS).await;
