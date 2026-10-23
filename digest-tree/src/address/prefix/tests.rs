@@ -206,3 +206,27 @@ fn encodings_name_the_seven_level_walk() {
     assert_eq!(NodePrefix::from_bytes(&[254]), Err(NodePrefixError::InvalidByte(254)));
     assert_eq!(NodePrefix::from_bytes(&[0, 0]), Err(NodePrefixError::ShortChunkBeforeEnd));
 }
+
+/// A subtree's key end, made from the prefix's encoding alone, is one past
+/// the encoding of the last prefix beneath it within its last chunk: the
+/// prefix extended with ones to the chunk's end, its last byte raised by one.
+#[test]
+fn the_subtree_key_end_is_one_past_the_last_prefix_in_the_chunk() {
+    let mut prefixes = vec![NodePrefix::root()];
+    let mut next = 0;
+    while let Some(prefix) = prefixes.get(next).cloned() {
+        next += 1;
+        if prefix.bit_len() < 15 {
+            prefixes.extend([prefix.child(false), prefix.child(true)]);
+        }
+    }
+    for prefix in &prefixes[1..] {
+        let mut last = prefix.clone();
+        while !last.bit_len().is_multiple_of(CHUNK) {
+            last = last.child(true);
+        }
+        let mut expected = last.to_bytes();
+        *expected.last_mut().unwrap() += 1;
+        assert_eq!(prefix.subtree_key_end(), Some(expected), "{prefix:?}");
+    }
+}

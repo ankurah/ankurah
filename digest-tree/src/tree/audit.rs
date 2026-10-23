@@ -10,7 +10,7 @@ use super::TreeTransaction;
 use crate::address::{CanonicalCodec, NodePrefix, TreeSpan};
 use crate::digest::{Digest, DigestGroup, Leaf};
 use crate::error::TreeError;
-use crate::store::layout;
+use crate::store::layout::{self, NodeKey};
 use crate::store::{MapAccess, MapName};
 
 /// Counts verified by a successful audit of one transaction's snapshot.
@@ -52,7 +52,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             }
         }
         let entries = self.transaction.scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await?;
-        let prefixes: BTreeSet<_> = entries.iter().map(|(key, _)| layout::node_key_prefix(key)).collect::<Result<_, _>>()?;
+        let prefixes: BTreeSet<_> =
+            entries.iter().map(|(key, _)| layout::node_key(key).map(NodeKey::into_prefix)).collect::<Result<_, _>>()?;
         if (!leaves.is_empty() || !prefixes.is_empty()) && !prefixes.contains(&NodePrefix::root()) {
             return Err(TreeError::Inconsistent("leaves exist without a root summary"));
         }

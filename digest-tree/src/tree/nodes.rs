@@ -7,7 +7,7 @@ use super::{TreeTransaction, PAGE};
 use crate::address::NodePrefix;
 use crate::digest::{Digest, DigestGroup};
 use crate::error::TreeError;
-use crate::store::layout;
+use crate::store::layout::{self, NodeKey};
 use crate::store::{MapAccess, MapName};
 
 /// How many deltas one compaction folds at most, so that the rows it reads and
@@ -24,7 +24,7 @@ struct DeltaPages {
 
 impl DeltaPages {
     fn of(prefix: &NodePrefix) -> Self {
-        let (first, past) = layout::delta_key_bounds(prefix);
+        let (first, past) = layout::delta_key_bounds(&prefix.to_bytes());
         Self { start: Bound::Included(first), end: past.map_or(Bound::Unbounded, Bound::Excluded), exhausted: false }
     }
 
@@ -109,9 +109,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// without decoding or summing their digests. Includes pending topology changes
     /// and still rejects descendant delta rows whose base is missing.
     pub async fn child_prefixes(&mut self, prefix: &NodePrefix) -> Result<Vec<NodePrefix>, TreeError> {
-        let (own_deltas_first, own_deltas_past) = layout::delta_key_bounds(prefix);
-        let end = prefix.subtree_key_end();
-        let mut start = Bound::Excluded(prefix.to_bytes());
+        let (encoding, end) = prefix.subtree_keys();
+        let (own_deltas_first, own_deltas_past) = layout::delta_key_bounds(&encoding);
+        let mut start = Bound::Excluded(encoding);
         let mut children = Vec::new();
         loop {
             let bounds = (start.as_ref().map(Vec::as_slice), end.as_ref().map_or(Bound::Unbounded, |end| Bound::Excluded(end.as_slice())));
@@ -123,12 +123,13 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 }
                 continue;
             }
-            let child = layout::node_key_prefix(&key)?;
-            if key != child.to_bytes() {
-                return Err(TreeError::IncompleteNode(child));
-            }
-            children.push(child.clone());
-            match child.subtree_key_end() {
+            let child = match layout::node_key(&key)? {
+                NodeKey::Base(child) => child,
+                NodeKey::Delta(child) => return Err(TreeError::IncompleteNode(child)),
+            };
+            let past_child = child.subtree_key_end();
+            children.push(child);
+            match past_child {
                 Some(end) => start = Bound::Included(end),
                 None => break,
             }
@@ -153,7 +154,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
         let value = layout::digest_value(&delta);
         for prefix in prefixes {
-            let (key_prefix, _) = layout::delta_key_bounds(prefix);
+            let (key_prefix, _) = layout::delta_key_bounds(&prefix.to_bytes());
             self.transaction.append(MapName::Nodes, &key_prefix, &value).await?;
         }
         Ok(())
@@ -181,7 +182,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     }
 
     async fn fold_deltas(&mut self, prefix: &NodePrefix) -> Result<bool, TreeError> {
-        let (first, past) = layout::delta_key_bounds(prefix);
+        let (first, past) = layout::delta_key_bounds(&prefix.to_bytes());
         let bounds = (Bound::Included(first.as_slice()), past.as_deref().map_or(Bound::Unbounded, Bound::Excluded));
         let mut batch = self.transaction.scan(MapName::Nodes, bounds, COMPACTION_BATCH + 1).await?;
         let remain = batch.len() > COMPACTION_BATCH;

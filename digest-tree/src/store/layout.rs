@@ -89,13 +89,13 @@ pub(crate) fn digest<G: DigestGroup>(what: &'static str, value: &[u8]) -> Result
     Digest::from_row_bytes(value).map_err(|source| TreeError::unreadable(what, source))
 }
 
-/// The first key a delta of `prefix` can have, which its deltas are appended
-/// under, and the first key past them all (`None` when nothing follows, as
-/// for the root): the range its deltas fill, which no other tree node's rows
-/// enter.
-pub(crate) fn delta_key_bounds(prefix: &NodePrefix) -> (Vec<u8>, Option<Vec<u8>>) {
-    let mut encoding = prefix.to_bytes();
-    let first = [encoding.as_slice(), &[DELTA_SEPARATOR]].concat();
+/// The first key a delta of the prefix encoded as `encoding` can have, which
+/// its deltas are appended under, and the first key past them all (`None`
+/// when nothing follows, as for the root): the range its deltas fill, which
+/// no other tree node's rows enter.
+pub(crate) fn delta_key_bounds(encoding: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let first = [encoding, &[DELTA_SEPARATOR]].concat();
+    let mut encoding = encoding.to_vec();
     // Every key beginning with the encoding and the separator lies before the
     // encoding with its last byte raised by one; encoding bytes stop at 253.
     let past = encoding.pop().map(|last| {
@@ -105,11 +105,31 @@ pub(crate) fn delta_key_bounds(prefix: &NodePrefix) -> (Vec<u8>, Option<Vec<u8>>
     (first, past)
 }
 
-/// The prefix a key of the nodes map names, whether a base key or a delta
-/// key.
-pub(crate) fn node_key_prefix(key: &[u8]) -> Result<NodePrefix, TreeError> {
-    let encoding = key.iter().position(|byte| *byte == DELTA_SEPARATOR).map_or(key, |separator| &key[..separator]);
-    NodePrefix::from_bytes(encoding).map_err(|source| TreeError::unreadable("node key", source))
+/// What a key of the nodes map names: the base row of the tree node at a
+/// prefix, or one of its delta rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeKey {
+    /// The key is the prefix's encoding.
+    Base(NodePrefix),
+    /// The key is the prefix's encoding, the separator and a suffix.
+    Delta(NodePrefix),
+}
+
+impl NodeKey {
+    /// The prefix of the tree node whose row the key names.
+    pub(crate) fn into_prefix(self) -> NodePrefix {
+        match self {
+            NodeKey::Base(prefix) | NodeKey::Delta(prefix) => prefix,
+        }
+    }
+}
+
+/// What the key `key` of the nodes map names.
+pub(crate) fn node_key(key: &[u8]) -> Result<NodeKey, TreeError> {
+    let separator = key.iter().position(|byte| *byte == DELTA_SEPARATOR);
+    let encoding = separator.map_or(key, |separator| &key[..separator]);
+    let prefix = NodePrefix::from_bytes(encoding).map_err(|source| TreeError::unreadable("node key", source))?;
+    Ok(if separator.is_some() { NodeKey::Delta(prefix) } else { NodeKey::Base(prefix) })
 }
 
 pub(crate) fn lookup_value(keys: &BTreeSet<Vec<u8>>) -> Vec<u8> {
@@ -150,14 +170,14 @@ mod tests {
 
     /// A delta key of `prefix` with a suffix of one to sixteen random bytes.
     fn random_delta_key(rng: &mut SmallRng, prefix: &NodePrefix) -> Vec<u8> {
-        let (mut key, _) = delta_key_bounds(prefix);
+        let (mut key, _) = delta_key_bounds(&prefix.to_bytes());
         key.extend((0..rng.gen_range(1..=16)).map(|_| rng.gen::<u8>()));
         key
     }
 
     /// Whether `key` lies within the range of `prefix`'s delta keys.
     fn among_deltas_of(prefix: &NodePrefix, key: &[u8]) -> bool {
-        let (first, past) = delta_key_bounds(prefix);
+        let (first, past) = delta_key_bounds(&prefix.to_bytes());
         first.as_slice() <= key && past.is_none_or(|past| key < past.as_slice())
     }
 
@@ -189,11 +209,11 @@ mod tests {
             }
             assert!(!among_deltas_of(&descendant, &own_delta), "{descendant:?} against {prefix:?}");
 
-            assert_eq!(node_key_prefix(&prefix.to_bytes()).unwrap(), prefix);
-            assert_eq!(node_key_prefix(&own_delta).unwrap(), prefix);
-            assert_eq!(node_key_prefix(&descendant_delta).unwrap(), descendant);
+            assert_eq!(node_key(&prefix.to_bytes()).unwrap(), NodeKey::Base(prefix.clone()));
+            assert_eq!(node_key(&own_delta).unwrap(), NodeKey::Delta(prefix));
+            assert_eq!(node_key(&descendant_delta).unwrap(), NodeKey::Delta(descendant));
         }
-        assert_eq!(delta_key_bounds(&NodePrefix::root()), (vec![DELTA_SEPARATOR], None), "the root's deltas run to the end");
+        assert_eq!(delta_key_bounds(&NodePrefix::root().to_bytes()), (vec![DELTA_SEPARATOR], None), "the root's deltas run to the end");
     }
 
     /// In the group `G`, a leaf row's value and a digest's round-trip, and

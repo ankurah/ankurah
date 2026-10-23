@@ -19,7 +19,7 @@ async fn node_keys<G: DigestGroup, T: MapAccess>(maps: &mut TreeTransaction<G, T
 }
 
 async fn delta_count<G: DigestGroup, T: MapAccess>(maps: &mut TreeTransaction<G, T>, prefix: &NodePrefix) -> usize {
-    let (first, past) = layout::delta_key_bounds(prefix);
+    let (first, past) = layout::delta_key_bounds(&prefix.to_bytes());
     let bounds = (Bound::Included(first.as_slice()), past.as_deref().map_or(Bound::Unbounded, Bound::Excluded));
     maps.transaction.scan(MapName::Nodes, bounds, usize::MAX).await.unwrap().len()
 }
@@ -208,7 +208,7 @@ async fn compaction_leaves_a_late_delta_and_fails_whole_on_a_removed_one<G: Dige
     let mut compactor = tree.begin();
     compactor.compact_node(&bucket).await.unwrap();
     let mut remover = tree.begin();
-    let (first, past) = layout::delta_key_bounds(&bucket);
+    let (first, past) = layout::delta_key_bounds(&bucket.to_bytes());
     let bounds = (Bound::Included(first.as_slice()), past.as_deref().map_or(Bound::Unbounded, Bound::Excluded));
     let (key, value) = remover.transaction.scan(MapName::Nodes, bounds, 1).await.unwrap().remove(0);
     remover.transaction.delete_if(MapName::Nodes, &key, &value).await.unwrap();
@@ -351,7 +351,7 @@ async fn children_reject_missing_bases_at_fourteen_bits<G: DigestGroup>() {
 async fn more_deltas_than_a_page_in_any_suffix_order_read_and_compact_whole<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let bucket = prefix("0110");
-    let (first, _) = layout::delta_key_bounds(&bucket);
+    let (first, _) = layout::delta_key_bounds(&bucket.to_bytes());
     let delta_key = |suffix: &[u8]| [first.as_slice(), suffix].concat();
     let leaves: Vec<Digest<G>> = (1..=5).map(leaf).collect();
     let mut suffixes: Vec<u32> = (0..1100).collect();

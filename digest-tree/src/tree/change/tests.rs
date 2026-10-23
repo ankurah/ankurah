@@ -37,8 +37,9 @@ async fn insert_and_remove_encode_one_delta_for_all_ancestors() {
     setup.commit().await.unwrap();
     let mut initial = TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin());
     let initial_root = initial.node(&NodePrefix::root()).await.unwrap();
-    let topology =
-        |rows: Vec<(Vec<u8>, Vec<u8>)>| rows.into_iter().map(|(key, _)| layout::node_key_prefix(&key).unwrap()).collect::<BTreeSet<_>>();
+    let topology = |rows: Vec<(Vec<u8>, Vec<u8>)>| {
+        rows.into_iter().map(|(key, _)| layout::node_key(&key).unwrap().into_prefix()).collect::<BTreeSet<_>>()
+    };
     let initial_topology = topology(maps.begin().scan(MapName::Nodes, (Bound::Unbounded, Bound::Unbounded), usize::MAX).await.unwrap());
     let mut encode_counts = Vec::new();
     for removing in [false, true] {

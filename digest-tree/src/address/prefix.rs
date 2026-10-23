@@ -70,24 +70,42 @@ impl NodePrefix {
     /// When this prefix already holds `u32::MAX` bits, the most its length
     /// counts.
     pub fn child(&self, bit: bool) -> Self {
-        let len = self.len.checked_add(1).expect("a prefix holds at most u32::MAX bits");
         let mut child = self.clone();
-        if child.len.is_multiple_of(8) {
-            child.bits.push(0);
-        }
-        if bit {
-            child.bits[(child.len / 8) as usize] |= 0x80 >> (child.len % 8);
-        }
-        child.len = len;
+        child.push(bit);
         child
     }
 
+    /// Extend this prefix by one more bit, as [`NodePrefix::child`] does, in
+    /// place.
+    fn push(&mut self, bit: bool) {
+        let index = self.len;
+        self.len = index.checked_add(1).expect("a prefix holds at most u32::MAX bits");
+        if index.is_multiple_of(8) {
+            self.bits.push(0);
+        }
+        if bit {
+            self.bits[(index / 8) as usize] |= 0x80 >> (index % 8);
+        }
+    }
+
     /// Whether `other` is this prefix or lies beneath it.
-    pub fn contains(&self, other: &NodePrefix) -> bool { other.len >= self.len && Self::of(&other.bits, self.len) == *self }
+    pub fn contains(&self, other: &NodePrefix) -> bool { other.len >= self.len && self.begins(&other.bits) }
 
     /// Whether `address` begins with this prefix.
-    pub fn contains_address(&self, address: &[u8]) -> bool {
-        address.len() * 8 >= self.len as usize && Self::of(address, self.len) == *self
+    pub fn contains_address(&self, address: &[u8]) -> bool { address.len() * 8 >= self.len as usize && self.begins(address) }
+
+    /// Whether `bits`, which hold at least as many bits as this prefix, begin
+    /// with its bits.
+    fn begins(&self, bits: &[u8]) -> bool {
+        let whole = (self.len / 8) as usize;
+        self.bits[..whole] == bits[..whole]
+            && match self.len % 8 {
+                0 => true,
+                rest => {
+                    let mask = 0xFFu8 << (8 - rest);
+                    self.bits[whole] == bits[whole] & mask
+                }
+            }
     }
 
     /// The first prefix, in prefix order, after every prefix this one
@@ -107,20 +125,24 @@ impl NodePrefix {
     /// than the encoding of [`NodePrefix::after_subtree`], and can lie before
     /// it: a string that begins with an ancestor's encoding and continues with
     /// a byte no encoding holds, as a tree node's delta rows do, falls between.
-    pub fn subtree_key_end(&self) -> Option<Vec<u8>> {
+    pub fn subtree_key_end(&self) -> Option<Vec<u8>> { self.subtree_keys().1 }
+
+    /// The encoding of this prefix, where the keys of the subtree's rows
+    /// begin, and [`NodePrefix::subtree_key_end`], where they end, made from
+    /// one encoding.
+    pub(crate) fn subtree_keys(&self) -> (Vec<u8>, Option<Vec<u8>>) {
+        let encoding = self.to_bytes();
         if self.is_root() {
-            return None;
+            return (encoding, None);
         }
-        // Every prefix beneath this one encodes as bytes that begin before the
-        // end of the subtree's last prefix within this one's last chunk: this
-        // prefix extended with ones to the chunk's end.
-        let mut last = self.clone();
-        while !last.len.is_multiple_of(CHUNK) {
-            last = last.child(true);
-        }
-        let mut end = last.to_bytes();
-        *end.last_mut().expect("a prefix other than the root encodes as some bytes") += 1;
-        Some(end)
+        // The last byte is the place, in its chunk's walk, of the vertex this
+        // prefix ends at, and the vertices of that vertex's subtree, every
+        // prefix beneath this one within the chunk, follow it: the place past
+        // them all ends every key beneath this prefix.
+        let last_chunk = self.len - (self.len - 1) / CHUNK * CHUNK;
+        let mut end = encoding.clone();
+        *end.last_mut().expect("a prefix other than the root encodes as some bytes") += subtree_size(last_chunk) as u8;
+        (encoding, Some(end))
     }
 
     /// The least address this prefix contains, and the first address past
@@ -197,7 +219,7 @@ impl NodePrefix {
                 if right {
                     place -= subtree_size(level);
                 }
-                prefix = prefix.child(right);
+                prefix.push(right);
                 if place == 0 {
                     break;
                 }
