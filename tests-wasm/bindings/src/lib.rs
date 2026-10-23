@@ -72,5 +72,3 @@ pub async fn create_test_context(db_name: &str) -> Result<Context, JsValue> {
 pub async fn cleanup_test_db(db_name: &str) -> Result<(), JsValue> {
     IndexedDBStorageEngine::cleanup(db_name).await.map_err(|e| JsValue::from_str(&e.to_string()))
 }
-
-mod query_parity;
