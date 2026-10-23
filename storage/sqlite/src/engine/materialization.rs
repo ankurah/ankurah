@@ -367,7 +367,9 @@ impl Materialization {
         let table_name = self.table().to_owned();
         let new_columns = conn
             .with_executor(move |c| {
-                let rows = c.query(&format!("PRAGMA table_info(\"{}\")", table_name), &[])?;
+                // PRAGMA table_info's rows, through its table-valued function:
+                // the node executor reads TEXT exactly only from a query.
+                let rows = c.query("SELECT * FROM pragma_table_info(?)", &[SqliteValue::Text(table_name)])?;
                 let columns: Vec<SqliteColumn> =
                     rows.iter().filter_map(|row| Some(SqliteColumn { name: row.text(1).ok()?, data_type: row.text(2).ok()? })).collect();
                 Ok(columns)

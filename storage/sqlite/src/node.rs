@@ -4,15 +4,23 @@
 //! Code extension host, an Electron main process, a JavaScript CLI) and no
 //! native library either, but Node.js ships SQLite as `node:sqlite`. The
 //! engine reaches it through a `DatabaseSync`-shaped JavaScript object:
-//! `prepare(sql)` giving statements with `run(...params)`, `all(...params)`
-//! and `columns()`, plus `exec(sql)`. Node's own `DatabaseSync` has that
-//! shape (Node.js 22.16 or later). Compatible drivers must also support
-//! positional rows and BigInt INTEGER results; the adapter recognizes
-//! better-sqlite3's `raw` and `safeIntegers` methods for these capabilities.
+//! `prepare(sql)` giving statements with `run(...params)`, `all(...params)`,
+//! `columns()` and `sourceSQL`, plus `exec(sql)`. Node's own `DatabaseSync`
+//! has that shape (Node.js 22.16 or later). Compatible drivers must also
+//! support positional rows and BigInt INTEGER results; the adapter recognizes
+//! better-sqlite3's `raw` and `safeIntegers` methods for these capabilities,
+//! and its `source` for `sourceSQL`.
 //! Hosts can adopt an existing database with [`SqliteStorageEngine::from_database`];
 //! [`NodeConnection::open`] constructs Node's directly through
 //! `process.getBuiltinModule`. Every call is synchronous, which suits the
 //! single-threaded WASM host: the engine's closures simply run in place.
+//!
+//! node:sqlite hands TEXT over only as a JavaScript string, made by decoding
+//! the bytes up to the first NUL and replacing each byte that is not UTF-8
+//! with U+FFFD, where rusqlite hands over the bytes themselves. So a query
+//! reads its statement through a typed reader that takes TEXT as the bytes
+//! of a BLOB, and decodes them as strictly as rusqlite does (see
+//! `typed_reader`).
 
 use std::path::Path;
 
@@ -92,6 +100,16 @@ impl NodeConnection {
         let probe = connection.query("SELECT 1", &[])?;
         if !matches!(probe.as_slice(), [row] if matches!(row.values(), [SqliteValue::Integer(1)])) {
             return Err(SqliteError::Node(format!("`SELECT 1` read back as {probe:?}, not as one row holding the INTEGER 1")));
+        }
+        // The typed reader takes TEXT as the bytes SQLite stores, which are
+        // UTF-8 only in a UTF-8 database. rusqlite has SQLite convert the TEXT
+        // of a UTF-16 database to UTF-8; node:sqlite offers no way to, so a
+        // UTF-16 database is refused rather than misread.
+        let utf8 = connection.query("SELECT (SELECT encoding FROM pragma_encoding) = 'UTF-8'", &[])?;
+        if !matches!(utf8.as_slice(), [row] if matches!(row.values(), [SqliteValue::Integer(1)])) {
+            return Err(SqliteError::Node(
+                "the database's text encoding is not UTF-8, and the node executor reads TEXT as UTF-8 bytes".into(),
+            ));
         }
         Ok(connection)
     }
@@ -173,13 +191,107 @@ impl SqliteExecutor for NodeConnection {
     fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError> {
         let statement = self.prepare(sql)?;
         let width = width(&statement)?;
-        all(&statement, params, width)?
-            .iter()
-            .map(|row| {
-                row.iter().enumerate().map(|(index, value)| value_from_js(index, value)).collect::<Result<Vec<_>, _>>().map(Row::new)
-            })
-            .collect()
+        if width == 0 {
+            // A statement without columns yields no rows; it runs for its effect.
+            all(&statement, params, 0)?;
+            return Ok(Vec::new());
+        }
+        match self.prepare(&typed_reader(&source(&statement)?, width)) {
+            Ok(reader) => all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect(),
+            // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
+            // in a WITH clause; any other statement that yields rows, such as
+            // a PRAGMA, an EXPLAIN or one with a RETURNING clause, is read as
+            // node:sqlite hands it over, with its TEXT refused.
+            Err(nesting) => all(&statement, params, width)?.into_iter().map(|row| plain_row(row, &nesting)).collect(),
+        }
     }
+}
+
+/// The SQL of a typed reader for `statement`, whose rows have `width`
+/// columns: the statement nested in a WITH clause, and each of its columns
+/// read as two, the value's storage class from `typeof()` and the value
+/// itself, TEXT cast to the BLOB of its bytes. MATERIALIZED has SQLite
+/// compute each value once, so that the class and the value read are of the
+/// same one; SQLite keeps a nested ORDER BY when the query around it has
+/// none, and a materialized statement's rows are read in the order it
+/// yielded them.
+fn typed_reader(statement: &str, width: usize) -> String {
+    // A statement's source keeps the semicolon that ended it, which a nested
+    // statement cannot have.
+    let statement = statement.trim_end().strip_suffix(';').unwrap_or(statement);
+    let names = (0..width).map(|index| format!("c{index}")).collect::<Vec<_>>().join(", ");
+    let columns = (0..width)
+        .map(|index| format!("typeof(c{index}), CASE typeof(c{index}) WHEN 'text' THEN CAST(c{index} AS BLOB) ELSE c{index} END"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // The statement stands on lines of its own, so that a comment ending it
+    // cannot swallow the parenthesis that closes it.
+    format!("WITH _ankurah_typed_rows({names}) AS MATERIALIZED (\n{statement}\n) SELECT {columns} FROM _ankurah_typed_rows")
+}
+
+/// A statement's SQL, which is one statement alone: node:sqlite's
+/// `sourceSQL`, the first statement as SQLite compiled it, or
+/// better-sqlite3's `source`, the SQL it prepared, which it refuses to
+/// prepare when it holds more than one.
+fn source(statement: &JsValue) -> Result<String, SqliteError> {
+    for name in ["sourceSQL", "source"] {
+        if let Some(source) = Reflect::get(statement, &name.into()).map_err(js_error)?.as_string() {
+            return Ok(source);
+        }
+    }
+    Err(SqliteError::Node(
+        "the database's statements report no `sourceSQL` (better-sqlite3's `source`), which the node executor needs".into(),
+    ))
+}
+
+/// A row of a typed reader, a storage class and a value for each column of
+/// its statement, read as the statement's row. TEXT comes as its bytes and
+/// is decoded as strictly as rusqlite decodes it.
+fn typed_row(row: Array) -> Result<Row, SqliteError> {
+    (0..row.length() / 2)
+        .map(|column| {
+            let index = column as usize;
+            let class = row.get(2 * column);
+            let class =
+                class.as_string().ok_or_else(|| SqliteError::Node(format!("the storage class of column {index} arrived as {class:?}")))?;
+            match (class.as_str(), value_from_js(index, row.get(2 * column + 1))?) {
+                ("text", SqliteValue::Blob(bytes)) => String::from_utf8(bytes).map(SqliteValue::Text).map_err(|error| {
+                    // rusqlite's words for the same refusal.
+                    SqliteError::Node(format!("Conversion error from type Text at index: {index}, {}", error.utf8_error()))
+                }),
+                ("null", value @ SqliteValue::Null)
+                | ("integer", value @ SqliteValue::Integer(_))
+                | ("real", value @ SqliteValue::Real(_))
+                | ("blob", value @ SqliteValue::Blob(_)) => Ok(value),
+                (class, value) => {
+                    Err(SqliteError::Node(format!("column {index} holds a value of storage class {class} that arrived as {value:?}")))
+                }
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Row::new)
+}
+
+/// A row of a statement SQLite would not nest in a typed reader, read as
+/// node:sqlite hands it over. Its TEXT arrives only as a JavaScript string
+/// that may have lost bytes, so a TEXT value is refused, naming why the
+/// statement could not be nested.
+fn plain_row(row: Array, nesting: &SqliteError) -> Result<Row, SqliteError> {
+    row.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            if value.is_string() {
+                return Err(SqliteError::Node(format!(
+                    "column {index} is TEXT, which node:sqlite hands over only as a string cut at its first NUL and with every \
+                     byte that is not UTF-8 replaced; the node executor reads TEXT exactly only from a query SQLite can nest in \
+                     a WITH clause, which this statement is not ({nesting}), so select the value through a query instead, such \
+                     as a table-valued pragma function like pragma_table_info"
+                )));
+            }
+            value_from_js(index, value)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Row::new)
 }
 
 /// Ask a statement for its rows as arrays, which keep every column at its
@@ -279,10 +391,10 @@ fn js_param(value: &SqliteValue) -> JsValue {
 }
 
 /// The value in column `index` of a row, as node:sqlite hands each storage
-/// class over to a statement reading BigInts: NULL as null, INTEGER as
-/// BigInt, REAL as number (2.0 included), TEXT as string, BLOB as
-/// Uint8Array. Anything else, `undefined` among it, is refused rather than
-/// read as the nearest storage class.
+/// class but TEXT over to a statement reading BigInts: NULL as null, INTEGER
+/// as BigInt, REAL as number (2.0 included), BLOB as Uint8Array. A string,
+/// node:sqlite's lossy form of TEXT, is refused, and so is anything else,
+/// `undefined` among it, rather than read as the nearest storage class.
 fn value_from_js(index: usize, value: JsValue) -> Result<SqliteValue, SqliteError> {
     if value.is_null() {
         Ok(SqliteValue::Null)
@@ -290,10 +402,10 @@ fn value_from_js(index: usize, value: JsValue) -> Result<SqliteValue, SqliteErro
         integer_from_js(&value).map(SqliteValue::Integer)
     } else if let Some(real) = value.as_f64() {
         Ok(SqliteValue::Real(real))
-    } else if let Some(text) = value.as_string() {
-        Ok(SqliteValue::Text(text))
     } else if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
         Ok(SqliteValue::Blob(bytes.to_vec()))
+    } else if value.is_string() {
+        Err(SqliteError::Node(format!("column {index} holds TEXT as a string, which may have lost bytes, where its bytes were expected")))
     } else {
         Err(SqliteError::Node(format!("column {index} holds {value:?}, which node:sqlite hands over for no SQLite storage class")))
     }
