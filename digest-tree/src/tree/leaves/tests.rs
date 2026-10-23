@@ -18,8 +18,8 @@ in_each_group!(
     a_leaf_is_written_against_the_row_the_writer_read,
     the_leaves_of_one_entity_follow_its_keys,
     a_missing_leaf_in_the_lookup_is_an_error,
-    leaves_are_read_by_address_range_a_page_at_a_time,
-    the_range_under_a_prefix_reads_its_leaves,
+    leaves_are_read_by_span_a_page_at_a_time,
+    the_span_under_a_prefix_reads_its_leaves,
     competing_lookup_updates_for_one_entity_leave_no_orphaned_row,
 );
 
@@ -125,7 +125,7 @@ async fn a_missing_leaf_in_the_lookup_is_an_error<G: DigestGroup>() {
         Err(TreeError::MissingLeaf { entity_id, key }) if entity_id == leaf.entity_id && key == leaf.key));
 }
 
-async fn leaves_are_read_by_address_range_a_page_at_a_time<G: DigestGroup>() {
+async fn leaves_are_read_by_span_a_page_at_a_time<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let rows: Vec<LeafRow<G>> = (1..=6).map(|n| row(&[n], entity(n))).collect();
     let mut maps = tree.begin();
@@ -136,17 +136,17 @@ async fn leaves_are_read_by_address_range_a_page_at_a_time<G: DigestGroup>() {
 
     let mut maps = tree.begin();
     assert_eq!(maps.leaves(&TreeSpan::all(), usize::MAX).await.unwrap(), rows, "address order, not arrival order");
-    let range = TreeSpan::new(Bound::Included(vec![2]), Bound::Excluded(vec![6]));
-    let first_page = maps.leaves(&range, 2).await.unwrap();
+    let span = TreeSpan::new(Bound::Included(vec![2]), Bound::Excluded(vec![6]));
+    let first_page = maps.leaves(&span, 2).await.unwrap();
     assert_eq!(first_page, rows[1..3]);
-    let second_page = maps.leaves(&range.after(&first_page[1].address()), 2).await.unwrap();
+    let second_page = maps.leaves(&span.after(&first_page[1].address()), 2).await.unwrap();
     assert_eq!(second_page, rows[3..5]);
-    assert_eq!(maps.leaves(&range.after(&second_page[1].address()), 2).await.unwrap(), []);
+    assert_eq!(maps.leaves(&span.after(&second_page[1].address()), 2).await.unwrap(), []);
     assert_eq!(maps.leaves(&TreeSpan::all(), 0).await.unwrap(), []);
 }
 
-/// The range under a prefix reads the leaves beneath that tree node.
-async fn the_range_under_a_prefix_reads_its_leaves<G: DigestGroup>() {
+/// The span under a prefix reads the leaves beneath that tree node.
+async fn the_span_under_a_prefix_reads_its_leaves<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let mut maps = tree.begin();
     for n in [0x00, 0x3f, 0x40, 0x7f, 0x80, 0xff] {

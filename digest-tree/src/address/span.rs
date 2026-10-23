@@ -257,9 +257,9 @@ impl<G: DigestGroup> TreeSpanDigest<G> {
         let prefix = NodePrefix::from_bytes(&prefix).map_err(|e| TreeError::unreadable("span digest prefix", e))?;
         let bounds = TreeSpan::new(start, end);
         let digest = Digest::from_row_bytes(&digest).map_err(|e| TreeError::unreadable("span digest", e))?;
-        let head = Self { prefix, bounds, digest };
-        head.validate()?;
-        Ok(head)
+        let span_digest = Self { prefix, bounds, digest };
+        span_digest.validate()?;
+        Ok(span_digest)
     }
 
     /// Validate a typed span digest without encoding and decoding it again.
@@ -283,35 +283,35 @@ mod tests {
         let excluded = TreeSpan::new(Bound::Excluded(vec![2]), Bound::Excluded(vec![4]));
         for address in [vec![1], vec![2], vec![3], vec![4], vec![4, 0], vec![5]] {
             let inside = address >= vec![2] && address <= vec![4];
-            assert_eq!(included.contains(&address), inside, "{address:?} within the closed range");
+            assert_eq!(included.contains(&address), inside, "{address:?} within the closed span");
             let inside = address > vec![2] && address < vec![4];
-            assert_eq!(excluded.contains(&address), inside, "{address:?} within the open range");
+            assert_eq!(excluded.contains(&address), inside, "{address:?} within the open span");
             assert!(TreeSpan::all().contains(&address));
         }
     }
 
     #[test]
     fn the_next_page_starts_past_the_last_address_read_and_keeps_the_end() {
-        let range = TreeSpan::new(Bound::Included(vec![1]), Bound::Excluded(vec![9]));
-        let next = range.after(&[3]);
+        let span = TreeSpan::new(Bound::Included(vec![1]), Bound::Excluded(vec![9]));
+        let next = span.after(&[3]);
         assert_eq!(next, TreeSpan::new(Bound::Excluded(vec![3]), Bound::Excluded(vec![9])));
         assert_eq!(next.bounds(), (Bound::Excluded(&[3][..]), Bound::Excluded(&[9][..])));
         assert!(!next.contains(&[3]) && next.contains(&[3, 0]) && !next.contains(&[9]));
     }
 
-    /// The range under a prefix holds exactly the addresses that begin with
+    /// The span under a prefix holds exactly the addresses that begin with
     /// its bits, judged by the prefix itself.
     #[test]
-    fn the_range_under_a_prefix_holds_exactly_the_addresses_it_contains() {
+    fn the_span_under_a_prefix_holds_exactly_the_addresses_it_contains() {
         let mut rng = SmallRng::seed_from_u64(17);
         for _ in 0..200 {
             let len = rng.gen_range(0..=40);
             let from: Vec<u8> = (0..5).map(|_| rng.gen::<u8>() & 0xC3).collect();
             let prefix = NodePrefix::of(&from, len);
-            let range = TreeSpan::under(&prefix);
+            let span = TreeSpan::under(&prefix);
             for _ in 0..50 {
                 let address: Vec<u8> = (0..rng.gen_range(0..=6)).map(|_| rng.gen::<u8>() & 0xC3).collect();
-                assert_eq!(range.contains(&address), prefix.contains_address(&address), "{prefix:?} against {address:?}");
+                assert_eq!(span.contains(&address), prefix.contains_address(&address), "{prefix:?} against {address:?}");
             }
         }
         assert_eq!(TreeSpan::under(&NodePrefix::root()), TreeSpan::new(Bound::Included(vec![]), Bound::Unbounded));
@@ -324,23 +324,23 @@ mod tests {
             endpoints.push(Bound::Included(value.clone()));
             endpoints.push(Bound::Excluded(value));
         }
-        let ranges: Vec<_> = endpoints
+        let spans: Vec<_> = endpoints
             .iter()
             .flat_map(|start| endpoints.iter().map(move |end| TreeSpan::new(start.clone(), end.clone())))
-            .filter(|range| !range.is_empty())
+            .filter(|span| !span.is_empty())
             .collect();
         let samples = [vec![], vec![0], vec![1], vec![1, 0], vec![1, 0, 0], vec![1, 1], vec![2], vec![2, 0], vec![255]];
-        for range in &ranges {
-            for a in &ranges {
-                for b in &ranges {
+        for span in &spans {
+            for a in &spans {
+                for b in &spans {
                     let covered = TreeSpan::normalize(vec![a.clone(), b.clone()]);
-                    let missing = range.gaps(&covered);
+                    let missing = span.gaps(&covered);
                     for address in &samples {
-                        let uncovered = range.contains(address) && !covered.iter().any(|part| part.contains(address));
+                        let uncovered = span.contains(address) && !covered.iter().any(|part| part.contains(address));
                         assert_eq!(
                             missing.iter().filter(|part| part.contains(address)).count(),
                             usize::from(uncovered),
-                            "range={range:?}, covered={covered:?}, address={address:?}"
+                            "span={span:?}, covered={covered:?}, address={address:?}"
                         );
                     }
                 }

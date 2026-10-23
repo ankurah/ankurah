@@ -5,7 +5,7 @@
 use ankql::ast::{Parsed, Resolved, Selection};
 use ankurah_core_types::{EntityId, ModelId, PropertyId, PropertyPath, Value, ValueType};
 use ankurah_digest_tree::digest::HeadHash;
-use ankurah_digest_tree::{CanonicalCodec, DigestTree, LeafChange, LeafData, PropertyTypes, Ristretto255, TreeSpec};
+use ankurah_digest_tree::{CanonicalCodec, DigestTree, LeafChange, LeafInput, PropertyTypes, Ristretto255, TreeSpec};
 use std::collections::HashMap;
 
 /// `selection!` bound to the fixture's properties: project, foo and bar are properties 1, 2 and 3.
@@ -53,7 +53,7 @@ pub async fn populated_tree(selection: &Selection<Resolved>) -> DigestTree<Ristr
     let mut tx = tree.begin();
     for (n, (project, foo)) in [("acme", 9), ("acme", 10), ("acme", 12), ("acme", 15)].into_iter().enumerate() {
         let key = CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::String(project.into()), Value::I64(foo)]).unwrap();
-        let leaf = LeafData { key, entity_id: entity(n as u8), head: HeadHash::of([[0x80 + n as u8; 32]]) };
+        let leaf = LeafInput { key, entity_id: entity(n as u8), head: HeadHash::of([[0x80 + n as u8; 32]]) };
         tx.apply_change(LeafChange { before: None, after: Some(leaf) }).await.unwrap();
     }
     tx.commit().await.unwrap();

@@ -76,4 +76,4 @@ pub use digest::{Digest, DigestGroup, HeadHash, Leaf, LeafElement, LtHash16, Ris
 pub use error::TreeError;
 pub use selection::{PropertyTypes, TreeMatch, TreeRequest, TreeSpec};
 pub use store::{ByteBounds, LeafRow, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodeRow};
-pub use tree::{Audit, DigestTree, LeafChange, LeafCursor, LeafData, LeafPage, TreeScope, TreeTransaction, BUCKET_CAPACITY};
+pub use tree::{AuditCounts, DigestTree, LeafChange, LeafCursor, LeafInput, LeafPage, TreeScope, TreeTransaction, BUCKET_CAPACITY};

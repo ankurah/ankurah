@@ -15,7 +15,7 @@ use crate::store::{MapAccess, MapName};
 
 /// Counts verified by a successful audit of one transaction's snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Audit {
+pub struct AuditCounts {
     /// Number of leaves, which may exceed the number of entities.
     pub leaves: usize,
     /// Number of entities with at least one leaf.
@@ -28,7 +28,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Rehash every leaf, verify both directions of the entity lookup, and
     /// compare every stored summary against the leaves under its prefix.
     /// This checks the current snapshot without repairing or changing it.
-    pub async fn audit(&mut self) -> Result<Audit, TreeError> {
+    pub async fn audit(&mut self) -> Result<AuditCounts, TreeError> {
         let leaves = self.all_leaves(&TreeSpan::all()).await?;
         let mut lookup: BTreeMap<EntityId, BTreeSet<Vec<u8>>> = BTreeMap::new();
         for row in &leaves {
@@ -68,7 +68,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 return Err(TreeError::Audit("children do not cover their parent's leaves"));
             }
         }
-        Ok(Audit { leaves: leaves.len(), entities: lookup.len(), nodes: prefixes.len() })
+        Ok(AuditCounts { leaves: leaves.len(), entities: lookup.len(), nodes: prefixes.len() })
     }
 }
 
@@ -76,14 +76,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 mod tests {
     use super::*;
     use crate::digest::HeadHash;
-    use crate::{DigestTree, LeafData, Ristretto255, TreeSpec};
+    use crate::{DigestTree, LeafInput, Ristretto255, TreeSpec};
     use ankql::ast::Predicate;
     use ankurah_core_types::KeySpec;
 
     #[tokio::test]
     async fn audit_detects_each_kind_of_derived_data_corruption() {
         let tree = DigestTree::<Ristretto255>::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True));
-        let data = LeafData { key: vec![], entity_id: EntityId::from_bytes([1; 32]), head: HeadHash::of([[2; 32]]) };
+        let data = LeafInput { key: vec![], entity_id: EntityId::from_bytes([1; 32]), head: HeadHash::of([[2; 32]]) };
         let mut setup = tree.begin();
         setup.build([data.clone()]).await.unwrap();
         setup.commit().await.unwrap();

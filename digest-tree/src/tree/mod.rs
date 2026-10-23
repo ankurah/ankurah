@@ -28,9 +28,9 @@ mod leaves;
 mod nodes;
 mod scope;
 
-pub use audit::Audit;
+pub use audit::AuditCounts;
 pub use build::BUCKET_CAPACITY;
-pub use change::{LeafChange, LeafData};
+pub use change::{LeafChange, LeafInput};
 pub use scope::{LeafCursor, LeafPage, TreeScope};
 
 /// A digest tree: the spec that defines which leaves it admits and the order
@@ -76,7 +76,8 @@ pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction>
     pub(crate) spec: TreeSpec,
     pub(crate) failed: bool,
     pub(crate) generation: u64,
-    pub(crate) snapshot: std::sync::Arc<()>,
+    /// Identifies the transaction view a scope belongs to.
+    pub(crate) view: std::sync::Arc<()>,
 }
 
 impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
@@ -91,29 +92,29 @@ impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
 }
 
 /// Keeps partial work from escaping through an outer transaction's commit,
-/// including when a mutation future is dropped before returning a result.
-pub(crate) struct Mutation<'a, G: DigestGroup, T: MapAccess> {
+/// including when a mutation's future is dropped before returning a result.
+pub(crate) struct MutationGuard<'a, G: DigestGroup, T: MapAccess> {
     tree: &'a mut TreeTransaction<G, T>,
     completed: bool,
 }
 
-impl<G: DigestGroup, T: MapAccess> Mutation<'_, G, T> {
+impl<G: DigestGroup, T: MapAccess> MutationGuard<'_, G, T> {
     pub(crate) fn finish<R>(mut self, result: Result<R, TreeError>) -> Result<R, TreeError> {
         self.completed = result.is_ok();
         result
     }
 }
 
-impl<G: DigestGroup, T: MapAccess> std::ops::Deref for Mutation<'_, G, T> {
+impl<G: DigestGroup, T: MapAccess> std::ops::Deref for MutationGuard<'_, G, T> {
     type Target = TreeTransaction<G, T>;
     fn deref(&self) -> &Self::Target { self.tree }
 }
 
-impl<G: DigestGroup, T: MapAccess> std::ops::DerefMut for Mutation<'_, G, T> {
+impl<G: DigestGroup, T: MapAccess> std::ops::DerefMut for MutationGuard<'_, G, T> {
     fn deref_mut(&mut self) -> &mut Self::Target { self.tree }
 }
 
-impl<G: DigestGroup, T: MapAccess> Drop for Mutation<'_, G, T> {
+impl<G: DigestGroup, T: MapAccess> Drop for MutationGuard<'_, G, T> {
     fn drop(&mut self) {
         if !self.completed {
             self.tree.failed = true;
@@ -161,8 +162,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// # }
     /// ```
     pub fn bind(spec: &TreeSpec, maps: T) -> Self {
-        Self { transaction: maps, group: PhantomData, spec: spec.clone(), failed: false, generation: 0, snapshot: std::sync::Arc::new(()) }
+        Self { transaction: maps, group: PhantomData, spec: spec.clone(), failed: false, generation: 0, view: std::sync::Arc::new(()) }
     }
 
-    pub(crate) fn mutation(&mut self) -> Mutation<'_, G, T> { Mutation { tree: self, completed: false } }
+    pub(crate) fn mutation_guard(&mut self) -> MutationGuard<'_, G, T> { MutationGuard { tree: self, completed: false } }
 }

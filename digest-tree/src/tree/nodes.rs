@@ -43,9 +43,9 @@ impl DeltaPages {
     }
 }
 
-/// A digest row as read: its key, its bytes, which a conditional write
+/// A tree node's base row as read: its bytes, which a conditional write
 /// expects to find unchanged, and the digest they hold.
-struct DigestRow<G: DigestGroup> {
+struct StoredBase<G: DigestGroup> {
     value: Vec<u8>,
     digest: Digest<G>,
 }
@@ -192,12 +192,12 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// it.
     /// Failure or cancellation prevents this transaction from committing.
     pub async fn compact_node(&mut self, prefix: &NodePrefix) -> Result<bool, TreeError> {
-        let mut mutation = self.mutation();
-        let result = mutation.compact_node_inner(prefix).await;
-        mutation.finish(result)
+        let mut guard = self.mutation_guard();
+        let result = guard.fold_deltas(prefix).await;
+        guard.finish(result)
     }
 
-    async fn compact_node_inner(&mut self, prefix: &NodePrefix) -> Result<bool, TreeError> {
+    async fn fold_deltas(&mut self, prefix: &NodePrefix) -> Result<bool, TreeError> {
         let (first, past) = layout::delta_key_bounds(prefix);
         let bounds = (Bound::Included(first.as_slice()), past.as_deref().map_or(Bound::Unbounded, Bound::Excluded));
         let mut batch = self.transaction.scan(MapName::Nodes, bounds, COMPACTION_BATCH + 1).await?;
@@ -240,10 +240,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     }
 
     /// The tree node's base row.
-    async fn base(&mut self, prefix: &NodePrefix) -> Result<Option<DigestRow<G>>, TreeError> {
+    async fn base(&mut self, prefix: &NodePrefix) -> Result<Option<StoredBase<G>>, TreeError> {
         let key = prefix.to_bytes();
         let Some(value) = self.transaction.get(MapName::Nodes, &key).await? else { return Ok(None) };
-        Ok(Some(DigestRow { digest: layout::digest("node value", &value)?, value }))
+        Ok(Some(StoredBase { digest: layout::digest("node value", &value)?, value }))
     }
 }
 

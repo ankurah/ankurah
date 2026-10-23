@@ -40,7 +40,7 @@ async fn builder_preserves_encoded_nodes_with_linear_group_additions() {
         let leaves = (0..size).map(|n| {
             let mut id = [0; EntityId::BYTE_LEN];
             id[..8].copy_from_slice(&(n as u64).to_be_bytes());
-            LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+            LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
         });
         GROUP_ADDS.store(0, Ordering::Relaxed);
         tree.build(leaves).await.unwrap();
@@ -71,7 +71,7 @@ async fn compare_prepared_build_to_serial<G: DigestGroup>() {
         .map(|n| {
             let mut id = [0; EntityId::BYTE_LEN];
             id[..8].copy_from_slice(&(n / 2).to_be_bytes());
-            LeafData {
+            LeafInput {
                 key: CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(n as i64)]).unwrap(),
                 entity_id: EntityId::from_bytes(id),
                 head: HeadHash::of([id, [3; 32]]),
@@ -142,7 +142,7 @@ fn large_build_admission_preserves_first_error_and_poisons_the_transaction() {
             .map(|n| {
                 let mut id = [0; EntityId::BYTE_LEN];
                 id[..8].copy_from_slice(&n.to_be_bytes());
-                LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+                LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
             })
             .collect::<Vec<_>>();
         let mut setup = TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin());
@@ -192,7 +192,7 @@ fn later_preparation_panic_poisons_prior_buffered_batches() {
         .map(|n| {
             let mut id = [0; EntityId::BYTE_LEN];
             id[..8].copy_from_slice(&n.to_be_bytes());
-            LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+            LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
         })
         .collect::<Vec<_>>();
     without_runtime(async {

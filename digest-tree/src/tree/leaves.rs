@@ -36,11 +36,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(rows)
     }
 
-    /// The first `limit` leaf rows in `range`, in address order. Reading all
+    /// The first `limit` leaf rows in `span`, in address order. Reading all
     /// of them from some address on, a page at a time, walks the leaves in
     /// order.
-    pub async fn leaves(&mut self, range: &TreeSpan, limit: usize) -> Result<Vec<LeafRow<G>>, TreeError> {
-        let rows = self.transaction.scan(MapName::Leaves, range.bounds(), limit).await?;
+    pub async fn leaves(&mut self, span: &TreeSpan, limit: usize) -> Result<Vec<LeafRow<G>>, TreeError> {
+        let rows = self.transaction.scan(MapName::Leaves, span.bounds(), limit).await?;
         rows.iter().map(|(address, value)| layout::leaf_row(address, value)).collect()
     }
 
@@ -87,9 +87,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(())
     }
 
-    pub(crate) async fn all_leaves(&mut self, range: &TreeSpan) -> Result<Vec<LeafRow<G>>, TreeError> {
+    pub(crate) async fn all_leaves(&mut self, span: &TreeSpan) -> Result<Vec<LeafRow<G>>, TreeError> {
         let mut rows = Vec::new();
-        let mut remaining = range.clone();
+        let mut remaining = span.clone();
         loop {
             let page = self.leaves(&remaining, 1024).await?;
             let done = page.len() < 1024;

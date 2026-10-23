@@ -23,7 +23,7 @@ pub enum TreeMatch {
 
 pub(crate) struct ReusePlan {
     pub kind: TreeMatch,
-    pub ranges: Vec<TreeSpan>,
+    pub spans: Vec<TreeSpan>,
     pub directions: Vec<IndexDirection>,
     pub id_direction: IndexDirection,
 }
@@ -39,7 +39,7 @@ impl TreeSpec {
         if request.clauses.is_empty() || request.limit == Some(0) {
             return Some(ReusePlan {
                 kind: TreeMatch::Span,
-                ranges: vec![],
+                spans: vec![],
                 directions: vec![IndexDirection::Asc; self.key_spec().keyparts.len()],
                 id_direction: IndexDirection::Asc,
             });
@@ -57,12 +57,12 @@ impl TreeSpec {
             return None;
         }
         let whole = implies(&admission, &request.clauses);
-        let mut ranges = Vec::new();
+        let mut spans = Vec::new();
         if whole {
-            ranges.push(TreeSpan::all());
+            spans.push(TreeSpan::all());
         } else {
             for clause in &request.clauses {
-                ranges.push(span(self.key_spec(), clause, &admission)?);
+                spans.push(clause_span(self.key_spec(), clause, &admission)?);
             }
         }
         let mut directions = vec![IndexDirection::Asc; self.key_spec().keyparts.len()];
@@ -89,7 +89,7 @@ impl TreeSpec {
         }
         Some(ReusePlan {
             kind: if whole { TreeMatch::Whole } else { TreeMatch::Span },
-            ranges: TreeSpan::normalize(ranges),
+            spans: TreeSpan::normalize(spans),
             directions,
             id_direction,
         })
@@ -105,7 +105,7 @@ fn implies(left: &[Clause], right: &[Clause]) -> bool {
     })
 }
 
-fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Option<TreeSpan> {
+fn clause_span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Option<TreeSpan> {
     if query.opaque.iter().any(|term| !admission.iter().all(|c| c.opaque.contains(term))) {
         return None;
     }
@@ -116,7 +116,7 @@ fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Opti
         .map(|(path, _)| path.clone())
         .collect();
     let mut prefix = Vec::new();
-    let mut range = TreeSpan::all();
+    let mut span = TreeSpan::all();
     let mut parts = key.keyparts.clone();
     parts.push(IndexKeyPart::asc(PropertyId::Id, ValueType::EntityId));
     for (index, keypart) in parts.into_iter().enumerate() {
@@ -127,18 +127,18 @@ fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Opti
         if let Some(value) = domain.single() {
             // The implicit entity-id suffix has no nullable part marker.
             prefix.extend(if implicit_id { value.get(1..)? } else { value });
-            range = TreeSpan::starting_with(&prefix);
+            span = TreeSpan::starting_with(&prefix);
         } else {
-            range = part_range(&prefix, domain, implicit_id)?;
+            span = value_span(&prefix, domain, implicit_id)?;
             break;
         }
     }
-    required.is_empty().then_some(range)
+    required.is_empty().then_some(span)
 }
 // Convert a value interval into the addresses of all tuples with this
 // leading prefix. An inclusive upper value ends after every suffix of it;
 // an exclusive lower value starts there instead.
-fn part_range(prefix: &[u8], domain: &TreeSpan, implicit_id: bool) -> Option<TreeSpan> {
+fn value_span(prefix: &[u8], domain: &TreeSpan, implicit_id: bool) -> Option<TreeSpan> {
     let address = |value: &[u8]| -> Option<Vec<u8>> {
         let value = if implicit_id { value.get(1..)? } else { value };
         Some([prefix, value].concat())

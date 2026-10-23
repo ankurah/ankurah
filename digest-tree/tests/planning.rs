@@ -1,7 +1,7 @@
 mod common;
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
-use ankurah_digest_tree::{DigestTree, HeadHash, LeafData, TreeMatch, TreeRequest, TreeSpec};
+use ankurah_digest_tree::{DigestTree, HeadHash, LeafInput, TreeMatch, TreeRequest, TreeSpec};
 use common::{property, types};
 
 #[test]
@@ -48,7 +48,7 @@ async fn id_bounds_extremes_and_default_order_are_exact() {
     let tree: DigestTree = DigestTree::new(spec);
     let model: Vec<_> = [0, 1, 128, 255]
         .into_iter()
-        .map(|n| LeafData { key: vec![], entity_id: common::entity(n), head: HeadHash::of([[n; 32]]) })
+        .map(|n| LeafInput { key: vec![], entity_id: common::entity(n), head: HeadHash::of([[n; 32]]) })
         .collect();
     let mut build = tree.begin();
     build.build(model.clone()).await.unwrap();

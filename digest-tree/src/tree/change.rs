@@ -16,7 +16,7 @@ use crate::store::{LeafRow, MapAccess, MapName, NodeRow};
 
 /// The inputs of one leaf, before hashing it into the tree's digest group.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LeafData {
+pub struct LeafInput {
     /// Canonical key bytes, empty for an entity-id tree.
     pub key: Vec<u8>,
     /// The entity at this address.
@@ -25,7 +25,7 @@ pub struct LeafData {
     pub head: HeadHash,
 }
 
-impl LeafData {
+impl LeafInput {
     pub(super) fn row<G: DigestGroup>(&self) -> LeafRow<G> {
         LeafRow {
             key: self.key.clone(),
@@ -41,9 +41,9 @@ impl LeafData {
 #[derive(Debug, Clone)]
 pub struct LeafChange {
     /// The expected old leaf; absent for insertion.
-    pub before: Option<LeafData>,
+    pub before: Option<LeafInput>,
     /// The replacement leaf; absent for removal.
-    pub after: Option<LeafData>,
+    pub after: Option<LeafInput>,
 }
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
@@ -52,9 +52,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// buffered writes cannot accidentally be committed.
     pub async fn apply_change(&mut self, change: LeafChange) -> Result<(), TreeError> {
         self.generation += 1;
-        let mut mutation = self.mutation();
-        let result = mutation.change_leaf(change).await;
-        mutation.finish(result)
+        let mut guard = self.mutation_guard();
+        let result = guard.change_leaf(change).await;
+        guard.finish(result)
     }
 
     async fn change_leaf(&mut self, change: LeafChange) -> Result<(), TreeError> {
@@ -76,7 +76,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             }
             None => None,
         };
-        let after = change.after.as_ref().map(LeafData::row::<G>);
+        let after = change.after.as_ref().map(LeafInput::row::<G>);
         if let Some(row) = &after {
             let expected = before.as_ref().filter(|old| old.address() == row.address());
             if expected.is_none() && self.leaf(&row.key, row.entity_id).await?.is_some() {

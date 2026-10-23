@@ -7,7 +7,7 @@ use std::{
 use ankql::ast::{Resolved, Selection};
 use ankurah_core_types::{KeySpec, PropertyPath, ValueType};
 use ankurah_digest_tree::{
-    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafData, NodePrefix, PropertyTypes, TreeRequest,
+    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafInput, NodePrefix, PropertyTypes, TreeRequest,
     TreeTransaction,
 };
 use ankurah_proto::{self as proto, Clock, EntityId, TreeSpanDigest, TreeSpec};
@@ -38,8 +38,8 @@ pub(crate) struct TreeEntry {
 impl TreeEntry {
     fn address(&self) -> Vec<u8> { leaf_address(&self.key, self.entity_id) }
 
-    fn leaf(&self) -> LeafData {
-        LeafData { key: self.key.clone(), entity_id: self.entity_id, head: HeadHash::of(self.head.ids().map(|id| id.clone().to_bytes())) }
+    fn leaf(&self) -> LeafInput {
+        LeafInput { key: self.key.clone(), entity_id: self.entity_id, head: HeadHash::of(self.head.ids().map(|id| id.clone().to_bytes())) }
     }
 }
 
@@ -371,7 +371,7 @@ impl Snapshot {
     }
 
     async fn select_request(mut self, request: &TreeRequest) -> anyhow::Result<Self> {
-        let ranges = self.physical_spec.scope_addresses(request, &self.members)?;
+        let ranges = self.physical_spec.selected_spans(request, &self.members)?;
         self.restrict(ranges);
         Ok(self)
     }
@@ -406,7 +406,7 @@ impl Snapshot {
             return Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: Digest::empty() });
         }
         let tree = &mut self.tree;
-        let scope = tree.scope_ranges(ranges);
+        let scope = tree.scope_spans(ranges);
         Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
     }
 
@@ -553,7 +553,7 @@ impl Snapshot {
         let ranges = if self.physical_spec.predicate() == &membership.predicate {
             vec![super::whole()]
         } else {
-            self.physical_spec.scope_addresses(&QueryTree::request(&membership, catalog)?, &self.members)?
+            self.physical_spec.selected_spans(&QueryTree::request(&membership, catalog)?, &self.members)?
         };
         let paths = QueryTree::key_paths(&self.physical_spec);
         let order = selection

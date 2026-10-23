@@ -151,10 +151,10 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
                         Op::LessThanOrEqual => Op::GreaterThanOrEqual,
                         Op::Equal => Op::Equal,
                         Op::NotEqual => Op::NotEqual,
-                        _ => return Ok(opaque(predicate)),
+                        _ => return Ok(opaque_clause(predicate)),
                     },
                 ),
-                _ => return Ok(opaque(predicate)),
+                _ => return Ok(opaque_clause(predicate)),
             };
             let part = part(path, *types.get(path).ok_or(TreeError::InvalidKey("unknown predicate type"))?);
             let encode = |expr: &Expr<Resolved>| match expr {
@@ -167,7 +167,7 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
                     let mut out = Vec::new();
                     for value in values {
                         let bytes = encode(value)?;
-                        out.push(field(path, Included(bytes.clone()), Included(bytes)));
+                        out.push(field_clause(path, Included(bytes.clone()), Included(bytes)));
                     }
                     if out.len() > 256 {
                         return Err(TreeError::UnsupportedSelection);
@@ -182,35 +182,38 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
                     match op {
                         Op::Equal => TreeSpan::new(Included(bytes.clone()), Included(bytes)),
                         Op::NotEqual => {
-                            return Ok(vec![field(path, nonnull, Excluded(bytes.clone())), field(path, Excluded(bytes), Unbounded)])
+                            return Ok(vec![
+                                field_clause(path, nonnull, Excluded(bytes.clone())),
+                                field_clause(path, Excluded(bytes), Unbounded),
+                            ])
                         }
                         Op::GreaterThan => TreeSpan::new(Excluded(bytes), Unbounded),
                         Op::GreaterThanOrEqual => TreeSpan::new(Included(bytes), Unbounded),
                         Op::LessThan => TreeSpan::new(nonnull, Excluded(bytes)),
                         Op::LessThanOrEqual => TreeSpan::new(nonnull, Included(bytes)),
-                        _ => return Ok(opaque(predicate)),
+                        _ => return Ok(opaque_clause(predicate)),
                     }
                 }
-                _ => return Ok(opaque(predicate)),
+                _ => return Ok(opaque_clause(predicate)),
             };
             if domain.is_empty() {
                 Ok(vec![])
             } else {
-                Ok(vec![field(path, domain.start, domain.end)])
+                Ok(vec![field_clause(path, domain.start, domain.end)])
             }
         }
         Predicate::IsNull(expr) => match expr.as_ref() {
             Expr::Path(path) if *path == PropertyPath::id() => Ok(vec![]),
-            Expr::Path(path) => Ok(vec![field(path, Included(vec![0]), Included(vec![0]))]),
-            _ => Ok(opaque(predicate)),
+            Expr::Path(path) => Ok(vec![field_clause(path, Included(vec![0]), Included(vec![0]))]),
+            _ => Ok(opaque_clause(predicate)),
         },
-        _ => Ok(opaque(predicate)),
+        _ => Ok(opaque_clause(predicate)),
     }
 }
-fn field(path: &PropertyPath, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Clause {
+fn field_clause(path: &PropertyPath, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Clause {
     Clause { fields: BTreeMap::from([(path.clone(), TreeSpan::new(start, end))]), opaque: BTreeSet::new() }
 }
-fn opaque(predicate: &Predicate<Resolved>) -> Vec<Clause> {
+fn opaque_clause(predicate: &Predicate<Resolved>) -> Vec<Clause> {
     let normalized = ankql::selection::map_references::<Resolved, Resolved>(
         &Selection::from(predicate.clone()),
         &|p| {

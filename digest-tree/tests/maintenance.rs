@@ -1,15 +1,15 @@
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
-use ankurah_digest_tree::{Digest, DigestGroup, DigestTree, HeadHash, Leaf, LeafChange, LeafData, NodePrefix, TreeError, TreeSpec};
+use ankurah_digest_tree::{Digest, DigestGroup, DigestTree, HeadHash, Leaf, LeafChange, LeafInput, NodePrefix, TreeError, TreeSpec};
 use std::collections::BTreeMap;
 
 fn empty_tree<G: DigestGroup>() -> DigestTree<G> { DigestTree::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True)) }
-fn leaf(n: u16, version: u8) -> LeafData {
+fn leaf(n: u16, version: u8) -> LeafInput {
     let mut id = [0; 32];
     id[..2].copy_from_slice(&n.to_be_bytes());
-    LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
+    LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
 }
-async fn check<G: DigestGroup>(tree: &DigestTree<G>, expected: &BTreeMap<u16, LeafData>) {
+async fn check<G: DigestGroup>(tree: &DigestTree<G>, expected: &BTreeMap<u16, LeafInput>) {
     let mut tx = tree.begin();
     assert_eq!(tx.audit().await.unwrap().leaves, expected.len());
     let digest: Digest<G> = expected.values().map(|v| Digest::from(Leaf::new(&v.key, v.entity_id, v.head).element())).sum();

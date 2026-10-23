@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use super::change::LeafData;
+use super::change::LeafInput;
 use super::TreeTransaction;
 use crate::address::{CanonicalCodec, NodePrefix, TreeSpan};
 use crate::digest::{Digest, DigestGroup};
@@ -30,7 +30,7 @@ fn preparation_pool() -> Option<&'static rayon::ThreadPool> {
     .as_ref()
 }
 
-fn prepare_leaves<G: DigestGroup>(leaves: Vec<LeafData>) -> Vec<PreparedLeaf<G>> {
+fn prepare_leaves<G: DigestGroup>(leaves: Vec<LeafInput>) -> Vec<PreparedLeaf<G>> {
     #[cfg(not(target_arch = "wasm32"))]
     if leaves.len() >= PARALLEL_PREPARATION_MIN_LEAVES {
         use rayon::prelude::*;
@@ -54,14 +54,14 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// On native targets, large batches prepare leaf hashes and encodings on
     /// a shared pool of up to four workers; transaction writes stay serial.
     /// Builds fall back to serial preparation when workers are unavailable.
-    pub async fn build(&mut self, leaves: impl IntoIterator<Item = LeafData>) -> Result<(), TreeError> {
+    pub async fn build(&mut self, leaves: impl IntoIterator<Item = LeafInput>) -> Result<(), TreeError> {
         self.generation += 1;
-        let mut mutation = self.mutation();
-        let result = mutation.build_inner(leaves).await;
-        mutation.finish(result)
+        let mut guard = self.mutation_guard();
+        let result = guard.replace_leaves(leaves).await;
+        guard.finish(result)
     }
 
-    async fn build_inner(&mut self, leaves: impl IntoIterator<Item = LeafData>) -> Result<(), TreeError> {
+    async fn replace_leaves(&mut self, leaves: impl IntoIterator<Item = LeafInput>) -> Result<(), TreeError> {
         self.transaction.change_structure();
         // Preserve the first invalid key or duplicate in input order before
         // workers perform the independent hashing and row encoding.

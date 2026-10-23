@@ -8,7 +8,7 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
 use ankurah_digest_tree::{
-    ByteBounds, HeadHash, LeafChange, LeafData, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodePrefix,
+    ByteBounds, HeadHash, LeafChange, LeafInput, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodePrefix,
     Ristretto255, TreeError, TreeSpan, TreeSpec, TreeTransaction, BUCKET_CAPACITY,
 };
 use async_trait::async_trait;
@@ -56,7 +56,7 @@ impl Transaction {
         TreeTransaction::bind(spec, TreeMaps { owner: self, id })
     }
 
-    async fn set_state(&mut self, expected: Option<HeadHash>, leaf: &LeafData) -> Result<(), TreeError> {
+    async fn set_state(&mut self, expected: Option<HeadHash>, leaf: &LeafInput) -> Result<(), TreeError> {
         let key = [b"\0".as_slice(), &leaf.entity_id.to_bytes()].concat();
         self.maps.put_if(MapName::Leaves, &key, expected.as_ref().map(|head| head.as_bytes().as_slice()), leaf.head.as_bytes()).await
     }
@@ -158,13 +158,13 @@ impl MapTransaction for TreeMaps<Transaction> {
 
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![]), Predicate::True) }
 
-fn leaf(n: u32, version: u8) -> LeafData {
+fn leaf(n: u32, version: u8) -> LeafInput {
     let mut id = [0; 32];
     id[..4].copy_from_slice(&n.to_be_bytes());
-    LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
+    LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
 }
 
-async fn update(tx: &mut Transaction, spec: &TreeSpec, before: Option<LeafData>, after: LeafData) {
+async fn update(tx: &mut Transaction, spec: &TreeSpec, before: Option<LeafInput>, after: LeafInput) {
     tx.set_state(before.as_ref().map(|leaf| leaf.head), &after).await.unwrap();
     for id in [FIRST, SECOND] {
         tx.tree(id, spec).apply_change(LeafChange { before: before.clone(), after: Some(after.clone()) }).await.unwrap();
@@ -185,10 +185,10 @@ async fn populated(count: usize) -> (Store, TreeSpec) {
     (store, spec)
 }
 
-async fn assert_tree(tx: &mut Transaction, id: u8, spec: &TreeSpec, expected: &[LeafData]) {
+async fn assert_tree(tx: &mut Transaction, id: u8, spec: &TreeSpec, expected: &[LeafInput]) {
     let mut tree = tx.tree(id, spec);
     let rows = tree.leaves(&TreeSpan::all(), usize::MAX).await.unwrap();
-    let actual: Vec<_> = rows.into_iter().map(|row| LeafData { key: row.key, entity_id: row.entity_id, head: row.head }).collect();
+    let actual: Vec<_> = rows.into_iter().map(|row| LeafInput { key: row.key, entity_id: row.entity_id, head: row.head }).collect();
     assert_eq!(actual, expected);
     assert_eq!(tree.audit().await.unwrap().leaves, expected.len());
 }
@@ -237,11 +237,11 @@ async fn dropping_the_owner_rolls_back_successful_tree_and_entity_writes() {
 async fn scopes_cannot_cross_reopened_views_or_tree_namespaces() {
     let (store, spec) = populated(1).await;
     let mut tx = store.begin();
-    let old = tx.tree(FIRST, &spec).scope_ranges([TreeSpan::all()]);
+    let old = tx.tree(FIRST, &spec).scope_spans([TreeSpan::all()]);
     for id in [FIRST, SECOND] {
         let mut tree = tx.tree(id, &spec);
         assert!(matches!(tree.count(&old).await, Err(TreeError::StaleScope)));
-        let scope = tree.scope_ranges([TreeSpan::all()]);
+        let scope = tree.scope_spans([TreeSpan::all()]);
         assert_eq!(tree.count(&scope).await.unwrap(), 1);
     }
     tx.commit().await.unwrap();

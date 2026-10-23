@@ -13,25 +13,27 @@ use crate::selection::{order_cut, ReusePlan, TierWalk, TreeRequest};
 use crate::store::layout;
 use crate::store::{LeafRow, MapAccess, MapName};
 
-/// Exact disjoint address spans belonging to one transaction and its current
-/// leaf state. A mutation invalidates the scope; another transaction cannot use it.
+/// Exact disjoint address spans belonging to one transaction view and its
+/// current leaf state. A mutation invalidates the scope; another transaction cannot use it.
 #[derive(Debug, Clone)]
 pub struct TreeScope {
-    ranges: Vec<TreeSpan>,
+    spans: Vec<TreeSpan>,
     directions: Vec<IndexDirection>,
     id_direction: IndexDirection,
-    snapshot: Arc<()>,
+    /// The transaction view the scope belongs to.
+    view: Arc<()>,
     generation: u64,
 }
 impl TreeScope {
-    /// Disjoint address bounds after membership and limit have been applied.
+    /// The disjoint spans of leaf addresses left after membership and limit
+    /// have been applied.
     /// Constraints already guaranteed by the serving tree's admission may
     /// be absent here. Reusing these bounds on another tree requires proving
     /// that both trees describe the same admitted selection in these bounds.
-    pub fn ranges(&self) -> &[TreeSpan] { &self.ranges }
+    pub fn spans(&self) -> &[TreeSpan] { &self.spans }
 }
 
-/// An opaque continuation within a scope's order and snapshot.
+/// An opaque continuation within a scope's order and transaction view.
 #[derive(Debug, Clone)]
 pub struct LeafCursor {
     remaining: Vec<TreeSpan>,
@@ -47,50 +49,50 @@ pub struct LeafPage<G: DigestGroup = Ristretto255> {
 }
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
-    /// Read exact leaf-address ranges directly, including a subtree via
+    /// Read exact spans of leaf addresses directly, including a subtree via
     /// `TreeSpan::under`. Unlike Selection scopes these count leaves,
     /// including multiple keys for one entity, and walk in address order.
-    pub fn scope_ranges(&self, ranges: impl IntoIterator<Item = TreeSpan>) -> TreeScope {
+    pub fn scope_spans(&self, spans: impl IntoIterator<Item = TreeSpan>) -> TreeScope {
         TreeScope {
-            ranges: TreeSpan::normalize(ranges.into_iter().collect()),
+            spans: TreeSpan::normalize(spans.into_iter().collect()),
             directions: vec![IndexDirection::Asc; self.spec.key_spec().keyparts.len()],
             id_direction: IndexDirection::Asc,
-            snapshot: self.snapshot.clone(),
+            view: self.view.clone(),
             generation: self.generation,
         }
     }
 
-    /// Match a request and resolve its limit against this snapshot. An
+    /// Match a request and resolve its limit against this transaction view. An
     /// underfilled positive limit retains the membership bounds so a peer
     /// can supply the missing members, including when this tree is empty.
     /// Limited traversal walks each tuple tier in its requested direction; ties use
     /// ascending entity identity unless explicitly ordered otherwise.
     pub async fn scope(&mut self, request: &TreeRequest) -> Result<TreeScope, TreeError> {
         let spec = self.spec.clone();
-        let ReusePlan { mut ranges, directions, id_direction, .. } = spec.plan(request).ok_or(TreeError::UnsupportedSelection)?;
+        let ReusePlan { mut spans, directions, id_direction, .. } = spec.plan(request).ok_or(TreeError::UnsupportedSelection)?;
         // Selection counts are entity counts. Multi-key raw trees need a
         // distinct-entity projection before they can serve this scalar API.
-        if !ranges.is_empty() && self.multiple_key_entities().await? != 0 {
+        if !spans.is_empty() && self.multiple_key_entities().await? != 0 {
             return Err(TreeError::MultipleKeys);
         }
         if let Some(limit) = request.limit {
             let limit = usize::try_from(limit).unwrap_or(usize::MAX);
             if limit == 0 {
-                ranges.clear();
+                spans.clear();
             } else {
-                let rows = self.walk(&ranges, &directions, id_direction, limit).await?;
+                let rows = self.walk(&spans, &directions, id_direction, limit).await?;
                 if rows.len() == limit {
                     let last = rows.last().expect("a positive limit was filled");
                     let cut = order_cut(spec.key_spec(), &directions, id_direction, &last.address(), true)?;
-                    ranges = TreeSpan::intersect_all(&ranges, &cut);
+                    spans = TreeSpan::intersect_all(&spans, &cut);
                 }
             }
         }
-        Ok(TreeScope { ranges, directions, id_direction, snapshot: self.snapshot.clone(), generation: self.generation })
+        Ok(TreeScope { spans, directions, id_direction, view: self.view.clone(), generation: self.generation })
     }
 
     fn check_scope(&self, scope: &TreeScope) -> Result<(), TreeError> {
-        if self.failed || !Arc::ptr_eq(&scope.snapshot, &self.snapshot) || scope.generation != self.generation {
+        if self.failed || !Arc::ptr_eq(&scope.view, &self.view) || scope.generation != self.generation {
             return Err(TreeError::StaleScope);
         }
         Ok(())
@@ -102,11 +104,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// regions remain in the cover: a peer may have leaves there.
     pub async fn span_digests(&mut self, scope: &TreeScope) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         self.check_scope(scope)?;
-        let mut heads = Vec::new();
-        for range in &scope.ranges {
-            heads.extend(self.span_digests_in(&NodePrefix::root(), range).await?);
+        let mut span_digests = Vec::new();
+        for span in &scope.spans {
+            span_digests.extend(self.span_digests_in(&NodePrefix::root(), span).await?);
         }
-        Ok(heads)
+        Ok(span_digests)
     }
 
     /// Exact leaf count; Selection scopes require one leaf per entity.
@@ -117,53 +119,53 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     /// Sum the exact span digests of a scope.
     pub async fn digest(&mut self, scope: &TreeScope) -> Result<Digest<G>, TreeError> {
-        Digest::checked_sum(self.span_digests(scope).await?.iter().map(|head| head.digest)).map_err(Into::into)
+        Digest::checked_sum(self.span_digests(scope).await?.iter().map(|span_digest| span_digest.digest)).map_err(Into::into)
     }
 
     /// Refine a span digest into the nearest cached descendants, keeping its address
     /// clip. At a terminal bucket, returns its exact clipped span digest again.
-    pub async fn refine(&mut self, head: &TreeSpanDigest<G>) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
-        let bounds = TreeSpan::under(&head.prefix).intersect(&head.bounds).ok_or(TreeError::InvalidKey("empty tree span"))?;
-        let children = self.child_prefixes(&head.prefix).await?;
+    pub async fn refine(&mut self, span_digest: &TreeSpanDigest<G>) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
+        let bounds = TreeSpan::under(&span_digest.prefix).intersect(&span_digest.bounds).ok_or(TreeError::InvalidKey("empty tree span"))?;
+        let children = self.child_prefixes(&span_digest.prefix).await?;
         if children.is_empty() {
-            return self.span_digests_in(&head.prefix, &bounds).await;
+            return self.span_digests_in(&span_digest.prefix, &bounds).await;
         }
-        let mut heads = empty_gaps(&head.prefix, &bounds, &children);
+        let mut span_digests = empty_gaps(&span_digest.prefix, &bounds, &children);
         for prefix in children {
-            heads.extend(self.span_digests_in(&prefix, &bounds).await?);
+            span_digests.extend(self.span_digests_in(&prefix, &bounds).await?);
         }
-        heads.sort_by(|a, b| a.bounds.cmp_start(&b.bounds));
-        Ok(heads)
+        span_digests.sort_by(|a, b| a.bounds.cmp_start(&b.bounds));
+        Ok(span_digests)
     }
 
-    async fn span_digests_in(&mut self, prefix: &NodePrefix, range: &TreeSpan) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
+    async fn span_digests_in(&mut self, prefix: &NodePrefix, span: &TreeSpan) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         let mut pending = vec![prefix.clone()];
-        let mut heads = Vec::new();
+        let mut span_digests = Vec::new();
         while let Some(prefix) = pending.pop() {
             let entire = TreeSpan::under(&prefix);
-            let Some(bounds) = entire.intersect(range) else {
+            let Some(bounds) = entire.intersect(span) else {
                 continue;
             };
-            if entire.is_subset_of(range) {
+            if entire.is_subset_of(span) {
                 if let Some(node) = self.node(&prefix).await? {
                     if node.digest.count() < 0 {
                         return Err(TreeError::Audit("negative node count"));
                     }
-                    heads.push(TreeSpanDigest { prefix, bounds, digest: node.digest });
+                    span_digests.push(TreeSpanDigest { prefix, bounds, digest: node.digest });
                     continue;
                 }
             }
             let children = self.child_prefixes(&prefix).await?;
             if children.is_empty() {
                 let rows = self.all_leaves(&bounds).await?;
-                heads.push(TreeSpanDigest { prefix, bounds, digest: rows.iter().map(|row| Digest::from(row.element)).sum() });
+                span_digests.push(TreeSpanDigest { prefix, bounds, digest: rows.iter().map(|row| Digest::from(row.element)).sum() });
             } else {
-                heads.extend(empty_gaps(&prefix, &bounds, &children));
+                span_digests.extend(empty_gaps(&prefix, &bounds, &children));
                 pending.extend(children.into_iter().rev());
             }
         }
-        heads.sort_by(|a, b| a.bounds.cmp_start(&b.bounds));
-        Ok(heads)
+        span_digests.sort_by(|a, b| a.bounds.cmp_start(&b.bounds));
+        Ok(span_digests)
     }
 
     /// Read a page without restarting at earlier leaves. A cursor belongs to
@@ -173,9 +175,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         if limit == 0 {
             return Err(TreeError::InvalidKey("page size must be positive"));
         }
-        let ranges = if let Some(cursor) = cursor {
+        let spans = if let Some(cursor) = cursor {
             self.check_scope(&cursor.scope)?;
-            if cursor.scope.ranges != scope.ranges
+            if cursor.scope.spans != scope.spans
                 || cursor.scope.directions != scope.directions
                 || cursor.scope.id_direction != scope.id_direction
             {
@@ -183,15 +185,15 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             }
             &cursor.remaining
         } else {
-            &scope.ranges
+            &scope.spans
         };
-        let mut rows = self.walk(ranges, &scope.directions, scope.id_direction, limit.saturating_add(1)).await?;
+        let mut rows = self.walk(spans, &scope.directions, scope.id_direction, limit.saturating_add(1)).await?;
         let more = rows.len() > limit;
         rows.truncate(limit);
         let next = if more {
             let spec = &self.spec;
             let cut = order_cut(spec.key_spec(), &scope.directions, scope.id_direction, &rows.last().unwrap().address(), false)?;
-            Some(LeafCursor { remaining: TreeSpan::intersect_all(ranges, &cut), scope: scope.clone() })
+            Some(LeafCursor { remaining: TreeSpan::intersect_all(spans, &cut), scope: scope.clone() })
         } else {
             None
         };
@@ -200,13 +202,13 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     async fn walk(
         &mut self,
-        ranges: &[TreeSpan],
+        spans: &[TreeSpan],
         directions: &[IndexDirection],
         id_direction: IndexDirection,
         limit: usize,
     ) -> Result<Vec<LeafRow<G>>, TreeError> {
         let spec = self.spec.key_spec().clone();
-        let mut walk = TierWalk::new(&spec, directions, id_direction, limit, ranges);
+        let mut walk = TierWalk::new(&spec, directions, id_direction, limit, spans);
         let mut leaves = Vec::new();
         while let Some(scan) = walk.next_scan() {
             let rows = match scan.direction {

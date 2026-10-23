@@ -27,7 +27,7 @@ async fn insert_and_remove_encode_one_delta_for_all_ancestors() {
     let leaf = |n: u64| {
         let mut id = [0; EntityId::BYTE_LEN];
         id[..8].copy_from_slice(&n.to_be_bytes());
-        LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+        LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
     };
     let maps = crate::MemoryMaps::new();
     let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
@@ -77,7 +77,7 @@ async fn moves_give_shared_and_separate_ancestors_their_own_deltas() {
         let mut id = [0; EntityId::BYTE_LEN];
         id[..8].copy_from_slice(&n.to_be_bytes());
         let key = CanonicalCodec.encode_prefix(spec.key_spec(), &[Value::I64(key)]).unwrap();
-        LeafData { key, entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
+        LeafInput { key, entity_id: EntityId::from_bytes(id), head: HeadHash::of([[1; 32]]) }
     };
     let tree = DigestTree::<Ristretto255>::new(spec.clone());
     let mut setup = tree.begin();
@@ -124,7 +124,7 @@ async fn topology_counts_do_not_decode_neighboring_leaves() {
             Ristretto255::decode(bytes)
         }
     }
-    let leaf = |n: u8| LeafData { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
+    let leaf = |n: u8| LeafInput { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
     for removing in [false, true] {
         let maps = crate::MemoryMaps::new();
         let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
@@ -149,7 +149,7 @@ async fn topology_counts_do_not_decode_neighboring_leaves() {
 
 #[tokio::test]
 async fn counting_defers_neighbor_validation_but_leaf_reads_and_rebuilds_reject_corruption() {
-    let leaf = |n: u8| LeafData { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
+    let leaf = |n: u8| LeafInput { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
     // A plain insertion, an insertion causing a split, and a removal causing a merge.
     for (initial, removing) in [(32, false), (64, false), (65, true)] {
         let tree = DigestTree::<Ristretto255>::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True));
@@ -298,10 +298,10 @@ mod map_costs {
             Predicate::True,
         )
     }
-    fn leaf(value: i64, version: u8) -> LeafData {
+    fn leaf(value: i64, version: u8) -> LeafInput {
         let mut id = [0; 32];
         id[..8].copy_from_slice(&value.to_be_bytes());
-        LeafData {
+        LeafInput {
             key: CanonicalCodec.encode_prefix(spec().key_spec(), &[Value::I64(value)]).unwrap(),
             entity_id: EntityId::from_bytes(id),
             head: HeadHash::of([[version; 32]]),
@@ -366,7 +366,7 @@ mod map_costs {
         let (maps, counts) = populated(128).await;
         let range = TreeSpan::new(Included(leaf(0, 0).key), Excluded(leaf(2, 0).key));
         let mut tx = begin(&maps, &counts);
-        let scope = tx.scope_ranges([range.clone()]);
+        let scope = tx.scope_spans([range.clone()]);
         assert_eq!(tx.count(&scope).await.unwrap(), 2);
         let baseline = counts.lock().unwrap().clone();
         drop(tx);
@@ -376,7 +376,7 @@ mod map_costs {
         }
         tx.commit().await.unwrap();
         let mut tx = begin(&maps, &counts);
-        let scope = tx.scope_ranges([range]);
+        let scope = tx.scope_spans([range]);
         reset(&counts);
         assert_eq!(tx.count(&scope).await.unwrap(), 2);
         let measured = counts.lock().unwrap().clone();
