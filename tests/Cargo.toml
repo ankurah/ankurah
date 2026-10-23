@@ -57,7 +57,7 @@ bb8-postgres             = { version = "0.9", optional = true }
 tokio-postgres           = { version = "0.7", optional = true }
 
 [dev-dependencies]
-# Native public-API benchmark CPU snapshots; no runtime dependency.
+# The live_query_startup benchmark reads process CPU time with getrusage.
 libc = "0.2"
 # The simulator must wake catalog queries in subscription order on system readiness.
 ankurah-signals = { path = "../signals", version = "=0.10.0", features = ["deterministic"] }
@@ -88,4 +88,5 @@ harness = false
 
 [[bench]]
 name    = "live_query_startup"
+path    = "benches/live_query_startup/main.rs"
 harness = false
