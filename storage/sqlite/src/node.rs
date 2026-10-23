@@ -86,7 +86,11 @@ impl NodeConnection {
         }
         method(&database, "prepare")?;
         method(&database, "exec")?;
-        Ok(Self { database: SendWrapper::new(database) })
+        let connection = Self { database: SendWrapper::new(database) };
+        // A database that cannot return rows as arrays is refused here rather
+        // than at its first query.
+        return_arrays(&connection.prepare("SELECT 1")?)?;
+        Ok(connection)
     }
 
     /// Open a database through Node's built-in module; `":memory:"` for an
@@ -160,16 +164,8 @@ impl SqliteExecutor for NodeConnection {
 
     fn query(&self, sql: &str, params: &[SqliteValue]) -> Result<Vec<Row>, SqliteError> {
         let statement = self.prepare(sql)?;
-        // Rows as arrays keep the column order of the SELECT (`node:sqlite`,
-        // then better-sqlite3's spelling); INTEGERs as BigInt so a value past
-        // 2^53 comes back instead of throwing.
-        if let Ok(set_return_arrays) = method(&statement, "setReturnArrays") {
-            set_return_arrays.call1(&statement, &JsValue::TRUE).map_err(js_error)?;
-        } else if let Ok(raw) = method(&statement, "raw") {
-            raw.call1(&statement, &JsValue::TRUE).map_err(js_error)?;
-        } else {
-            return Err(SqliteError::Node("positional rows require setReturnArrays (Node.js 22.16+) or raw".into()));
-        }
+        return_arrays(&statement)?;
+        // INTEGERs as BigInt, so that a value past 2^53 comes back instead of throwing.
         if let Ok(set_read_big_ints) = method(&statement, "setReadBigInts") {
             set_read_big_ints.call1(&statement, &JsValue::TRUE).map_err(js_error)?;
         } else if let Ok(safe_integers) = method(&statement, "safeIntegers") {
@@ -184,6 +180,22 @@ impl SqliteExecutor for NodeConnection {
             .map_err(|_| SqliteError::Node("`all()` did not return an array".into()))?;
         rows.iter().map(row_from_js).collect()
     }
+}
+
+/// Ask a statement for its rows as arrays, which keep every column at its
+/// position in the statement: node:sqlite's `setReturnArrays`, or
+/// better-sqlite3's `raw`. Their default, objects keyed by column name,
+/// cannot: a name that reads as an integer moves ahead of the others, and two
+/// columns of one name collapse into one.
+fn return_arrays(statement: &JsValue) -> Result<(), SqliteError> {
+    if let Ok(set_return_arrays) = method(statement, "setReturnArrays") {
+        set_return_arrays.call1(statement, &JsValue::TRUE).map_err(js_error)?;
+    } else if let Ok(raw) = method(statement, "raw") {
+        raw.call1(statement, &JsValue::TRUE).map_err(js_error)?;
+    } else {
+        return Err(SqliteError::Node("positional rows require setReturnArrays (Node.js 22.16+) or raw".into()));
+    }
+    Ok(())
 }
 
 fn row_from_js(row: JsValue) -> Result<Row, SqliteError> {
