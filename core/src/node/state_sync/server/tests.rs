@@ -116,7 +116,7 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
 
     for payload in [8, 1024] {
         let (node, _, _) = node().await?;
-        let source = states(PAGE_STEPS * 2, payload);
+        let source = states(MAX_FRAME_STEPS * 2, payload);
         let ids: Vec<_> = source.iter().map(|state| state.payload.entity_id).collect();
         let snapshot = stored_snapshot(&node, source.clone()).await?;
         let mut residents = Vec::new();
@@ -136,15 +136,15 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
         let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
         let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count();
-        assert!(repairs > PAGE_WORK, "resident snapshots must not stop at the storage/history work cap");
+        assert!(repairs > MAX_FRAME_TREE_WORK, "resident snapshots must not stop at the storage/history work cap");
         let sizes = items.iter().map(super::super::budget::item_bytes).collect::<Result<Vec<_>, _>>()?;
         let bytes: u64 = sizes.iter().sum();
-        assert!(bytes <= PAGE_BYTES as u64);
+        assert!(bytes <= MAX_PAGE_BYTES as u64);
         if payload == 8 {
-            assert_eq!(repairs, PAGE_STEPS - 1, "one head page plus repairs fills the step budget");
+            assert_eq!(repairs, MAX_FRAME_STEPS - 1, "one head page plus repairs fills the step budget");
         } else {
             assert!(
-                bytes + super::super::budget::item_bytes(items.last().unwrap())? > PAGE_BYTES as u64,
+                bytes + super::super::budget::item_bytes(items.last().unwrap())? > MAX_PAGE_BYTES as u64,
                 "another same-sized repair would exceed the byte budget"
             );
         }
@@ -160,7 +160,7 @@ async fn storage_and_possible_history_repairs_keep_the_work_cap() -> anyhow::Res
 
     for known_head in [None, Some(proto::Clock::genesis(proto::EventId::from_bytes([9; 32])))] {
         let (node, _, _) = node().await?;
-        let source = states(PAGE_WORK * 2, 8);
+        let source = states(MAX_FRAME_TREE_WORK * 2, 8);
         let snapshot = stored_snapshot(&node, source.clone()).await?;
         let mut residents = Vec::new();
         if known_head.is_some() {
@@ -181,8 +181,8 @@ async fn storage_and_possible_history_repairs_keep_the_work_cap() -> anyhow::Res
         comparison.work = source.iter().map(|state| Work::Repair(state.payload.entity_id, known_head.clone())).collect();
         let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
-        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), PAGE_WORK);
-        assert_eq!(comparison.repaired.len(), PAGE_WORK);
+        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), MAX_FRAME_TREE_WORK);
+        assert_eq!(comparison.repaired.len(), MAX_FRAME_TREE_WORK);
         let Some(Work::Repair(deferred, _)) = comparison.work.front() else { panic!("deferred repair") };
         assert!(!comparison.repaired.contains(deferred), "budget deferral must not mark an unsent repair as complete");
         drop(residents);
@@ -296,7 +296,7 @@ async fn wider_responder_clocks_split_outbound_inventory_without_repairing_share
     let mut ids = Vec::new();
     for page in pages {
         assert_eq!(page.bounds.start, start);
-        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64);
         ids.extend(page.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id));
         start = opposite(&page.bounds.end);
     }
@@ -334,8 +334,8 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     let mut requester = snapshot(before).await?;
     let mut spans = Vec::new();
     let mut start = super::super::whole().start;
-    for (index, chunk) in current.chunks(HEAD_PAGE).enumerate() {
-        let end = if (index + 1) * HEAD_PAGE == current.len() {
+    for (index, chunk) in current.chunks(MAX_PAGE_HEADS).enumerate() {
+        let end = if (index + 1) * MAX_PAGE_HEADS == current.len() {
             super::super::whole().end
         } else {
             std::ops::Bound::Included(chunk.last().unwrap().payload.entity_id.to_bytes().to_vec())
@@ -356,7 +356,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     assert_eq!(answers.len(), 32, "all questions are legitimate bounded mismatch spans");
     // Several valid feedback requests can be accepted before the producer is polled.
     for batch in answers.chunks(4) {
-        assert!(bincode::serialized_size(&(0u64, batch))? <= FRAME_BYTES as u64);
+        assert!(bincode::serialized_size(&(0u64, batch))? <= MAX_FRAME_BYTES as u64);
         comparison.answer(batch.to_vec())?;
     }
     assert_eq!(comparison.work.len(), 32, "one bounded work item must represent each accepted answer");
@@ -389,7 +389,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let root = responder.span_digest(super::super::whole()).await?;
     let frontier = responder.refine(&root).await?;
     let original =
-        frontier.iter().find(|head| head.digest.count() > HEAD_PAGE as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
+        frontier.iter().find(|head| head.digest.count() > MAX_PAGE_HEADS as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
     let bounds = original.bounds.clone();
     let clipped = responder.span_digest(bounds.clone()).await?;
     let refined = responder.refine(&clipped).await?;
@@ -411,7 +411,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let mut finished = false;
     for _ in 0..64 {
         let body = comparison.reply(&node, &vec![], false, 0).await?;
-        assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
+        assert!(bincode::serialized_size(&body)? <= MAX_FRAME_BYTES as u64);
         let StateFrameBody::Round { items, progress, .. } = body else { panic!("state frame") };
         let mut answers = Vec::new();
         for item in items {
@@ -484,11 +484,11 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
 #[tokio::test]
 async fn inventories_tile_the_captured_membership_while_current_payloads_are_chunked() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
-    let mut source = states(5, PAGE_BYTES / 4);
+    let mut source = states(5, MAX_PAGE_BYTES / 4);
     for (index, state) in source.iter_mut().enumerate() {
         state.payload.entity_id = proto::EntityId::from_bytes([index as u8 + 1; 32]);
     }
-    source[2].payload.state.state_buffers = states(1, PAGE_BYTES * 2).pop().unwrap().payload.state.state_buffers;
+    source[2].payload.state.state_buffers = states(1, MAX_PAGE_BYTES * 2).pop().unwrap().payload.state.state_buffers;
     let large = source[2].clone();
     let mut comparison = Comparison::new(stored_snapshot(&node, source.clone()).await?, unknown())?;
     let mut start = super::super::whole().start;
@@ -497,7 +497,7 @@ async fn inventories_tile_the_captured_membership_while_current_payloads_are_chu
     let mut chunks = Vec::new();
     while !comparison.complete {
         let body = comparison.reply(&node, &vec![], false, 0).await?;
-        assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
+        assert!(bincode::serialized_size(&body)? <= MAX_FRAME_BYTES as u64);
         let StateFrameBody::Round { items, .. } = body else { panic!("state frame") };
         for item in items {
             match item {
@@ -661,7 +661,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         None,
         false,
         0,
-        stored_snapshot(&node, states(200, PAGE_BYTES / 2)).await?,
+        stored_snapshot(&node, states(200, MAX_PAGE_BYTES / 2)).await?,
         unknown(),
     )
     .await?;
@@ -671,7 +671,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
     {
         let state = session.state.lock().await;
         assert!(state.bytes <= WINDOW_BYTES);
-        assert!(state.retained.len() <= MAX_INFLIGHT_FRAMES - 2);
+        assert!(state.retained.len() <= MAX_FRAMES_IN_FLIGHT - 2);
         assert!(!state.room(false));
         assert!(state.room(true), "ordinary output must leave a control/repair reserve");
         assert!(!state.comparison.as_ref().unwrap().complete);
@@ -696,7 +696,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(sequences.len() > MAX_INFLIGHT_FRAMES);
+    assert!(sequences.len() > MAX_FRAMES_IN_FLIGHT);
     assert!(sequences.iter().copied().eq(1..=sequences.len() as u64));
     Ok(())
 }
@@ -706,7 +706,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
     let (node, peer, _) = node().await?;
     let first = proto::RequestId::new();
     let mut first_id = None;
-    for index in 0..MAX_STATE_STREAMS + 2 {
+    for index in 0..MAX_OPEN_STREAMS + 2 {
         let request = if index == 0 { first.clone() } else { proto::RequestId::new() };
         let initial = start_state_stream(&node, peer, request, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
         first_id.get_or_insert(initial.frame.stream);
@@ -739,7 +739,7 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
     let id = initial.frame.stream;
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
-    let oversized = live_item(PAGE_BYTES * 2);
+    let oversized = live_item(MAX_PAGE_BYTES * 2);
     let entity = oversized.entity_id;
     let member = oversized.member.clone();
     let encoded = bincode::serialize(oversized.delta.as_ref().unwrap())?;
@@ -804,7 +804,7 @@ async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyho
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     // Drive the pump explicitly, including the cut between chunk fragments.
     session.pumping.store(true, Ordering::Release);
-    queue_live(&node, peer, id, 1, vec![live_item(PAGE_BYTES * 2), live_item(1)])?;
+    queue_live(&node, peer, id, 1, vec![live_item(MAX_PAGE_BYTES * 2), live_item(1)])?;
     {
         let mut state = session.state.lock().await;
         let body = state.next_live(&session.live)?.unwrap();
@@ -891,7 +891,7 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
         Some((proto::QueryId::new(), 1)),
         false,
         0,
-        stored_snapshot(&node, states(200, PAGE_BYTES / 2)).await?,
+        stored_snapshot(&node, states(200, MAX_PAGE_BYTES / 2)).await?,
         unknown(),
     )
     .await?;
@@ -1619,7 +1619,7 @@ async fn initial_items(node: &TestNode, comparison: &mut Comparison) -> anyhow::
         }
         let StateFrameBody::Round { items, .. } = comparison.reply(node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
-        assert!(bincode::serialized_size(&items)? <= PAGE_BYTES as u64);
+        assert!(bincode::serialized_size(&items)? <= MAX_PAGE_BYTES as u64);
         assert!(!items.iter().any(|item| matches!(item, StateItem::NeedHeads(_) | StateItem::Digest(_))));
         all.extend(items);
     }
@@ -1872,7 +1872,7 @@ async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::
     // the rest of the single request inventory remains deferred.
     assert!(comparison.work.len() <= 385 + 1);
     assert!(comparison.work.iter().any(|work| matches!(work,
-        Work::InitialHeads(rest) if rest.heads.len() == 2048 - HEAD_PAGE)));
+        Work::InitialHeads(rest) if rest.heads.len() == 2048 - MAX_PAGE_HEADS)));
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 2048);
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), 2048);
@@ -1892,7 +1892,7 @@ async fn prefix_encoded_initial_inventory_keeps_its_cursor_across_work_batches()
         assert_eq!(page.bounds.start, start);
         assert_eq!(page.heads.len(), remaining);
         comparison.expand_initial_heads(page)?;
-        remaining -= HEAD_PAGE;
+        remaining -= MAX_PAGE_HEADS;
         if remaining > 0 {
             let Some(Work::InitialHeads(next)) = comparison.work.front() else { panic!("only the deferred equal batch remains") };
             assert_ne!(next.bounds.start, start);
@@ -1985,7 +1985,7 @@ async fn compressed_initial_spans_share_one_uncompressed_work_budget() -> anyhow
             .into(),
     };
     let known = proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Heads(page); 8] };
-    assert!(bincode::serialized_size(&known)? < INITIAL_INVENTORY_BYTES as u64);
+    assert!(bincode::serialized_size(&known)? < MAX_OFFER_BYTES as u64);
     let error = Comparison::new(snapshot(vec![]).await?, known).err().expect("aggregate work must be rejected before span validation");
     assert!(error.to_string().contains("initial inventory exceeds limit"));
     Ok(())
@@ -2012,14 +2012,14 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let mut requester = super::super::QueryTree::default().refresh(spec.clone(), vec![before]).await?;
     let known = requester.offer().await?;
     let [proto::SpanContent::Heads(page)] = known.spans.as_slice() else { panic!("one valid complete initial inventory") };
-    assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+    assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64);
     let supplied_clock = page.heads.to_vec()[0].entity.head.clone();
     let address = leaf_address(&page.heads.to_vec()[0].key, page.heads.to_vec()[0].entity.entity_id);
     let removal = StateItem::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(address.clone()), std::ops::Bound::Included(address)),
         heads: vec![].into(),
     });
-    assert!(bincode::serialized_size(&removal)? > PAGE_BYTES as u64);
+    assert!(bincode::serialized_size(&removal)? > MAX_PAGE_BYTES as u64);
     let (node, _, _) = node().await?;
     let mut tx = node.storage.transaction();
     tx.set_state(&Default::default(), &former).await?;
@@ -2068,7 +2068,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
     let mut spans = Vec::new();
     loop {
         let page = requester.page(remaining)?;
-        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64);
         let end = page.bounds.end.clone();
         spans.push(proto::SpanContent::Heads(page));
         if end == super::super::whole().end {
@@ -2078,7 +2078,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
         remaining = super::super::whole().after(&last);
     }
     let known = proto::KnownState { spec: spec(), spans };
-    assert!(bincode::serialized_size(&known)? > INITIAL_INVENTORY_BYTES as u64);
+    assert!(bincode::serialized_size(&known)? > MAX_OFFER_BYTES as u64);
     assert!(Comparison::new(snapshot(vec![]).await?, known).is_err());
     Ok(())
 }

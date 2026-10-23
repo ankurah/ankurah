@@ -20,19 +20,4 @@ pub(crate) use server::{
 };
 pub(crate) use tree::{QueryTree, Snapshot};
 
-// Local responder limits, deliberately absent from the wire request.
-const PAGE_BYTES: usize = 64 * 1024;
-// Resident state reads and ready items may fill a reply. Tree reads and
-// repairs that may load storage or walk history have a separate, lower cap.
-const PAGE_STEPS: usize = 128;
-const PAGE_WORK: usize = 32;
-const HEAD_PAGE: usize = 128;
-const INITIAL_INVENTORY_BYTES: usize = 256 * 1024;
-const INITIAL_INVENTORY_HEADS: usize = 2048;
-const MAX_REPAIR_BYTES: usize = 64 * 1024 * 1024;
-const FRAME_BYTES: usize = PAGE_BYTES + 4096;
-const WINDOW_BYTES: usize = 4 * 1024 * 1024;
-const CONTROL_BYTES: usize = 2 * FRAME_BYTES;
-const MAX_INFLIGHT_FRAMES: usize = 128;
-
 fn whole() -> ankurah_proto::TreeSpan { ankurah_proto::TreeSpan::under(&ankurah_digest_tree::NodePrefix::root()) }

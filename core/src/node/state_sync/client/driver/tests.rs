@@ -546,7 +546,7 @@ async fn round_pin_refresh_evicts_large_merged_resident_and_query_still_installs
     assert!(driver.round_pins.contains_key(&entity_id));
 
     let backend = LWWBackend::new();
-    backend.set(proto::PropertyId::EntityId(id(94)), Some(Value::String("x".repeat(super::super::super::WINDOW_BYTES))));
+    backend.set(proto::PropertyId::EntityId(id(94)), Some(Value::String("x".repeat(WINDOW_BYTES))));
     let large = proto::Event::update(
         entity_id,
         entity.head(),
@@ -716,7 +716,7 @@ async fn overlay_coalesces_reentry_and_has_an_aggregate_byte_bound() -> anyhow::
     let one_decision = bincode::serialized_size(&(id(1), Some(member(1))))? as usize;
     assert_eq!(driver.projection.retained_bytes(), one_decision, "coalescing does not retain intermediate revisions");
     driver.check_retained()?;
-    let huge = proto::QueryMember { key: vec![1; super::super::super::WINDOW_BYTES], head: head(1) };
+    let huge = proto::QueryMember { key: vec![1; WINDOW_BYTES], head: head(1) };
     driver.projection.publish(1011, vec![(id(1), Some(huge))])?;
     assert!(driver.check_retained().is_err(), "one wide key cannot escape the aggregate overlay limit");
     Ok(())
@@ -934,12 +934,12 @@ async fn first_chunk_reservation_can_receive_rest_after_later_live_fills_window(
     let later = proto::DeltaContent::StateSnapshot {
         state: proto::StateFragment {
             state: entity.to_state()?,
-            attestations: proto::AttestationSet(vec![proto::Attestation(vec![7; super::super::super::WINDOW_BYTES])]),
+            attestations: proto::AttestationSet(vec![proto::Attestation(vec![7; WINDOW_BYTES])]),
         },
     };
     let later = bincode::serialize(&later)?;
-    for (index, part) in later.chunks(super::super::super::PAGE_BYTES / 2).enumerate() {
-        let offset = index * (super::super::super::PAGE_BYTES / 2);
+    for (index, part) in later.chunks(MAX_PAGE_BYTES / 2).enumerate() {
+        let offset = index * (MAX_PAGE_BYTES / 2);
         driver.chunk(
             &node,
             id(90),
@@ -955,7 +955,7 @@ async fn first_chunk_reservation_can_receive_rest_after_later_live_fills_window(
             },
         )?;
     }
-    assert!(driver.application_bytes >= super::super::super::WINDOW_BYTES);
+    assert!(driver.application_bytes >= WINDOW_BYTES);
     assert_eq!(driver.application_jobs, 2);
     assert_eq!(driver.queued_jobs[&entity.id()].len(), 1);
     assert!(driver.can_receive(), "the earlier reserved job requires more bytes: application pressure cannot stop that reception");

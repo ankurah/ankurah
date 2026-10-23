@@ -2,14 +2,15 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, Weak},
-    time::Duration,
 };
 
-use ankurah_proto::{self as proto, RequestId, StateFrame};
+use ankurah_proto::{
+    self as proto,
+    state_sync::limits::{CONTROL_BYTES, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_BYTES, MAX_OPEN_STREAMS, STREAM_TTL, WINDOW_BYTES},
+    RequestId, StateFrame,
+};
 use anyhow::ensure;
 use futures::FutureExt;
-
-use super::{CONTROL_BYTES, FRAME_BYTES, MAX_INFLIGHT_FRAMES, WINDOW_BYTES};
 
 type AbandonStream = Arc<dyn Fn(proto::StateStreamId) + Send + Sync>;
 
@@ -38,7 +39,7 @@ impl Registry {
                     return Some((handler, stream_id));
                 }
                 self.retired.push_back((request.clone(), handler));
-                if self.retired.len() > 128 {
+                if self.retired.len() > MAX_OPEN_STREAMS {
                     self.retired.pop_front();
                 }
             }
@@ -130,7 +131,7 @@ impl IncomingStates {
         let mut registry = self.0.lock().unwrap();
         ensure!(!registry.streams.contains_key(&request), "state request already registered");
         let cleanup = query.map_or_else(Vec::new, |(query, _)| registry.cancel_query(query));
-        ensure!(registry.streams.len() < 128, "too many incoming state streams");
+        ensure!(registry.streams.len() < MAX_OPEN_STREAMS, "too many incoming state streams");
         let inbox = Arc::new(Inbox::default());
         registry
             .streams
@@ -225,9 +226,9 @@ impl Drop for IncomingStates {
 impl Inbox {
     pub fn insert(&self, frame: StateFrame) -> anyhow::Result<()> {
         let encoded = bincode::serialize(&frame)?;
-        ensure!(encoded.len() <= FRAME_BYTES, "state frame exceeds limit");
+        ensure!(encoded.len() <= MAX_FRAME_BYTES, "state frame exceeds limit");
         ensure!(
-            encoded.len() as u64 + super::budget::frame_expansion(&frame)? <= FRAME_BYTES as u64,
+            encoded.len() as u64 + super::budget::frame_expansion(&frame)? <= MAX_FRAME_BYTES as u64,
             "state frame exceeds decoded-work limit"
         );
         let mut state = self.state.lock().unwrap();
@@ -241,7 +242,7 @@ impl Inbox {
             ensure!(previous == &encoded, "conflicting repeated state frame");
             return Ok(());
         }
-        ensure!(state.frames.len() < MAX_INFLIGHT_FRAMES, "too many out-of-order frames");
+        ensure!(state.frames.len() < MAX_FRAMES_IN_FLIGHT, "too many out-of-order frames");
         ensure!(state.bytes + encoded.len() <= WINDOW_BYTES + CONTROL_BYTES, "incoming state window exceeded");
         state.bytes += encoded.len();
         state.frames.insert(frame.sequence, (frame, encoded));
@@ -279,7 +280,7 @@ impl Inbox {
                 continue;
             }
             let started = stalled_since.get_or_insert_with(web_time::Instant::now);
-            let remaining = Duration::from_secs(120).saturating_sub(started.elapsed());
+            let remaining = STREAM_TTL.saturating_sub(started.elapsed());
             let timeout = futures_timer::Delay::new(remaining).fuse();
             futures::pin_mut!(timeout);
             futures::select! {
@@ -293,6 +294,7 @@ impl Inbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn frame(stream_id: proto::StateStreamId, sequence: u64) -> StateFrame {
         StateFrame {
@@ -350,10 +352,10 @@ mod tests {
                     registry.route(&stream.request, changed)
                 }
                 2 => {
-                    for sequence in 2..=MAX_INFLIGHT_FRAMES {
+                    for sequence in 2..=MAX_FRAMES_IN_FLIGHT {
                         registry.route(&stream.request, frame(id, sequence as u64))?;
                     }
-                    registry.route(&stream.request, frame(id, MAX_INFLIGHT_FRAMES as u64 + 1))
+                    registry.route(&stream.request, frame(id, MAX_FRAMES_IN_FLIGHT as u64 + 1))
                 }
                 _ => registry.route(&stream.request, frame(id, 0)),
             };
@@ -378,10 +380,10 @@ mod tests {
         registry.observe_stream(&request, stream_id);
         registry.observe_stream(&RequestId::new(), proto::StateStreamId::new());
         assert_eq!(*cancelled.lock().unwrap(), vec![stream_id]);
-        for _ in 0..256 {
+        for _ in 0..2 * MAX_OPEN_STREAMS {
             drop(registry.register(RequestId::new(), None, Some(handler.clone()))?);
         }
-        assert_eq!(registry.0.lock().unwrap().retired.len(), 128);
+        assert_eq!(registry.0.lock().unwrap().retired.len(), MAX_OPEN_STREAMS);
         Ok(())
     }
 

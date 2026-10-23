@@ -1,4 +1,4 @@
-use super::codec::{MAX_BYTES, MAX_ROWS, PLAIN, PLAIN_FIXED, PREFIX, PREFIX_FIXED};
+use super::codec::{PLAIN, PLAIN_FIXED, PREFIX, PREFIX_FIXED};
 use super::*;
 use crate::{EventId, SpanContent, StateAnswer, StateItem, TreeSpan, TreeSpanInventory};
 use std::ops::Bound;
@@ -139,13 +139,13 @@ fn rejects_malformed_payloads_before_any_cursor_can_observe_them() {
 #[test]
 fn compression_cannot_bypass_expanded_work_or_head_limits() {
     let expanded: PackedHeads = keyed_heads(&vec![vec![42; 4096]; 128], 1).into();
-    assert!(expanded.bytes.len() < MAX_BYTES);
+    assert!(expanded.bytes.len() < MAX_OFFER_BYTES);
     assert!(PackedHeads::decode(&expanded.bytes).is_err());
     assert!(bincode::serialize(&expanded).is_err());
-    let too_many: PackedHeads = keyed_heads(&vec![vec![]; MAX_ROWS + 1], 0).into();
+    let too_many: PackedHeads = keyed_heads(&vec![vec![]; MAX_OFFER_HEADS + 1], 0).into();
     assert!(PackedHeads::decode(&too_many.bytes).is_err());
     assert!(bincode::serialize(&too_many).is_err());
-    assert!(PackedHeads::decode(&vec![PLAIN; MAX_BYTES + 1]).is_err());
+    assert!(PackedHeads::decode(&vec![PLAIN; MAX_OFFER_BYTES + 1]).is_err());
 }
 
 #[test]

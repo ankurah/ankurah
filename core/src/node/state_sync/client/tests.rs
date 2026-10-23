@@ -1,5 +1,6 @@
 use super::*;
 use ankurah_digest_tree::leaf_address;
+use ankurah_proto::state_sync::limits::{MAX_FRAME_BYTES, MAX_PAGE_BYTES};
 use std::ops::Bound::*;
 
 mod cancellation;
@@ -15,7 +16,7 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
         })
         .collect::<Vec<_>>();
     let page = proto::TreeSpanInventory { bounds: super::super::whole(), heads: rows.into() };
-    assert!(page.expanded_size() < super::super::PAGE_BYTES as u64);
+    assert!(page.expanded_size() < MAX_PAGE_BYTES as u64);
     let frame = proto::StateFrame {
         stream: proto::StateStreamId::new(),
         sequence: 0,
@@ -25,7 +26,7 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
             progress: proto::ComparisonProgress::Continue,
         },
     };
-    assert!(bincode::serialized_size(&frame).unwrap() < super::super::FRAME_BYTES as u64);
+    assert!(bincode::serialized_size(&frame).unwrap() < MAX_FRAME_BYTES as u64);
     let inbox = super::super::Inbox::default();
     assert!(inbox.insert(frame).unwrap_err().to_string().contains("decoded-work limit"));
 }

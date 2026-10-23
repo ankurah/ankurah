@@ -1,6 +1,9 @@
 use super::*;
 use crate::{changes::EntityChange, node::applier::Delivery, reactor::ChangeNotification};
 use ankurah_digest_tree::CanonicalCodec;
+use ankurah_proto::state_sync::limits::{
+    MAX_DELTA_BYTES, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_HEADS, WINDOW_BYTES,
+};
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -11,6 +14,21 @@ use projection::{Projection, Round};
 // admission reserved for ongoing publications and data-only causal repairs.
 const MAX_ACTIVE_ROUND_APPLICATIONS: usize = 128;
 const MAX_ACTIVE_LIVE_APPLICATIONS: usize = 16;
+/// Entities one stream tracks in any one set: causal targets, changed round
+/// entities, or entities pinned for the round.
+const MAX_TRACKED_IDS: usize = 100_000;
+/// Live publications received but not yet installed, as many as a window of frames can open.
+const MAX_PENDING_PUBLICATIONS: usize = MAX_FRAMES_IN_FLIGHT;
+/// Deltas reassembled from chunks at once.
+const MAX_ASSEMBLIES: usize = MAX_FRAMES_IN_FLIGHT;
+/// Entity applications queued or running: a window of frames, each carrying its most items.
+const MAX_APPLICATION_JOBS: usize = MAX_FRAMES_IN_FLIGHT * MAX_FRAME_ITEMS;
+/// Delta bytes awaiting application or assembly: a window of frames plus one delta
+/// still arriving in chunks.
+const MAX_QUEUED_DELTA_BYTES: usize = MAX_DELTA_BYTES + WINDOW_BYTES;
+/// Completed applications observed per wakeup, so their notifications batch
+/// without starving incoming frames.
+const READY_JOB_BATCH: usize = 128;
 
 type TargetKey = Vec<u8>;
 fn target_key(id: proto::EntityId, target: &proto::Clock) -> TargetKey {
@@ -72,7 +90,7 @@ impl Goals {
         if rows.contains_key(&key) {
             return Ok(());
         }
-        ensure!(self.count < 100_000, "too many causal targets");
+        ensure!(self.count < MAX_TRACKED_IDS, "too many causal targets");
         self.bytes += key.len() + proto::EntityId::BYTE_LEN;
         self.count += 1;
         rows.insert(key, Goal { id, head, covered, attempts: 0, requested: false });
@@ -291,7 +309,7 @@ impl Driver {
                 "interleaved source publications"
             );
             ensure!(revision > self.received_revision, "stale source publication");
-            ensure!(self.publications.len() < super::super::MAX_INFLIGHT_FRAMES, "too many pending source publications");
+            ensure!(self.publications.len() < MAX_PENDING_PUBLICATIONS, "too many pending source publications");
             self.publications.push_back(Publication {
                 revision,
                 changes: IndexMap::new(),
@@ -322,10 +340,7 @@ impl Driver {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let bytes = bincode::serialized_size(&delta)? as usize;
-        ensure!(
-            self.application_bytes + self.assembly_bytes + bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
-            "application byte queue exceeded limit"
-        );
+        ensure!(self.application_bytes + self.assembly_bytes + bytes <= MAX_QUEUED_DELTA_BYTES, "application byte queue exceeded limit");
         self.application_bytes += bytes;
         let id = delta.entity_id;
         self.reserve_application(node, peer, credentials, owner, id, repair, Box::pin(async move { Some(delta) }))
@@ -347,7 +362,7 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(self.application_jobs < super::super::MAX_INFLIGHT_FRAMES * 128, "application queue exceeded limit");
+        ensure!(self.application_jobs < MAX_APPLICATION_JOBS, "application queue exceeded limit");
         self.application_jobs += 1;
         match owner {
             Owner::Round(_) => self.round_jobs += 1,
@@ -451,7 +466,10 @@ impl Driver {
                 Owner::Live(_) => false,
             };
             if self.stream.query.is_some() && round_changed {
-                ensure!(self.round_changed.contains(&applied.id) || self.round_changed.len() < 100_000, "too many changed round entities");
+                ensure!(
+                    self.round_changed.contains(&applied.id) || self.round_changed.len() < MAX_TRACKED_IDS,
+                    "too many changed round entities"
+                );
                 self.round_changed.insert(applied.id);
             }
             if self.round_changed.contains(&applied.id) {
@@ -494,7 +512,7 @@ impl Driver {
         self.remove_round_pin(&id);
         let Some((query, _)) = self.stream.query else { return };
         let Some(query) = node.live_queries.get(query) else { return };
-        if query.resultset().contains_key(&id) || self.round_pins.len() >= 100_000 || self.round_pin_bytes >= super::super::WINDOW_BYTES {
+        if query.resultset().contains_key(&id) || self.round_pins.len() >= MAX_TRACKED_IDS || self.round_pin_bytes >= WINDOW_BYTES {
             return;
         }
         let Some(bytes) = entity
@@ -508,7 +526,7 @@ impl Driver {
         };
         // Pinning is an optimization. A large state or exhausted admission
         // budget falls back to the ordinary storage reload at installation.
-        if bytes <= super::super::WINDOW_BYTES - self.round_pin_bytes {
+        if bytes <= WINDOW_BYTES - self.round_pin_bytes {
             self.round_pin_bytes += bytes;
             self.round_pins.insert(id, (entity.clone(), bytes));
         }
@@ -576,10 +594,7 @@ impl Driver {
             return Ok(());
         }
         if !self.assemblies.contains_key(&key) {
-            ensure!(
-                self.assemblies.len() < super::super::MAX_INFLIGHT_FRAMES && chunk.offset == 0,
-                "too many or out-of-order partial deltas"
-            );
+            ensure!(self.assemblies.len() < MAX_ASSEMBLIES && chunk.offset == 0, "too many or out-of-order partial deltas");
             let (sender, receive) = tokio::sync::oneshot::channel();
             self.reserve_application(
                 node,
@@ -604,9 +619,8 @@ impl Driver {
             "invalid delta chunk sequence"
         );
         ensure!(
-            self.assembly_bytes + chunk.bytes.len() <= super::super::MAX_REPAIR_BYTES
-                && self.application_bytes + self.assembly_bytes + chunk.bytes.len()
-                    <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
+            self.assembly_bytes + chunk.bytes.len() <= MAX_DELTA_BYTES
+                && self.application_bytes + self.assembly_bytes + chunk.bytes.len() <= MAX_QUEUED_DELTA_BYTES,
             "delta assembly exceeds limit"
         );
         self.assembly_bytes += chunk.bytes.len();
@@ -620,10 +634,7 @@ impl Driver {
             let delta = proto::EntityDelta { entity_id: chunk.entity_id, content };
             self.assembly_bytes -= assembly.bytes.len();
             self.application_bytes += bincode::serialized_size(&delta)? as usize;
-            ensure!(
-                self.application_bytes + self.assembly_bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
-                "application byte queue exceeded limit"
-            );
+            ensure!(self.application_bytes + self.assembly_bytes <= MAX_QUEUED_DELTA_BYTES, "application byte queue exceeded limit");
             if matches!(owner, Owner::Live(_)) {
                 self.add_live_delta_targets(
                     match owner {
@@ -663,7 +674,7 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(items.len() <= 128, "state item limit exceeded");
+        ensure!(items.len() <= MAX_FRAME_ITEMS, "state item limit exceeded");
         let owner = Owner::Round(round);
         let mut answers = Vec::new();
         for item in items {
@@ -676,8 +687,8 @@ impl Driver {
                     answers.push(StateAnswer::Heads(self.projection.round.as_ref().unwrap().snapshot.page(bounds)?));
                 }
                 StateItem::Heads(page) => {
-                    ensure!(4 + page.expanded_size() <= super::super::PAGE_BYTES as u64, "peer head inventory exceeds decoded-work budget");
-                    ensure!(page.heads.len() <= super::super::HEAD_PAGE, "peer sent too many heads");
+                    ensure!(4 + page.expanded_size() <= MAX_PAGE_BYTES as u64, "peer head inventory exceeds decoded-work budget");
+                    ensure!(page.heads.len() <= MAX_PAGE_HEADS, "peer sent too many heads");
                     page.validate(&self.spec)?;
                     let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
@@ -782,7 +793,7 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(items.len() <= 128, "live item limit exceeded");
+        ensure!(items.len() <= MAX_FRAME_ITEMS, "live item limit exceeded");
         for item in items {
             self.add_live_delta_targets(revision, item.entity_id, &item.member, item.delta.as_ref())?;
             if let Some(content) = item.delta {
@@ -861,7 +872,7 @@ impl Driver {
                 }
             }
             StateFrameBody::LiveRepair { items } => {
-                ensure!(items.len() <= 128, "state item limit exceeded");
+                ensure!(items.len() <= MAX_FRAME_ITEMS, "state item limit exceeded");
                 for repair in items {
                     self.receive_repair(node, peer, credentials, Owner::Repair, repair).await?;
                 }
@@ -890,14 +901,14 @@ impl Driver {
         let targets: usize = self.publications.iter().map(|publication| publication.goals.bytes).sum();
         let ids: usize = self.publications.iter().map(|publication| publication.goals.count).sum();
         let changes: usize = self.publications.iter().map(|publication| publication.change_bytes).sum();
-        ensure!(targets <= super::super::WINDOW_BYTES && ids <= 100_000, "unapplied live target window exhausted");
+        ensure!(targets <= WINDOW_BYTES && ids <= MAX_TRACKED_IDS, "unapplied live target window exhausted");
         ensure!(
-            changes + self.projection.retained_bytes() + self.round_changed.len() * proto::EntityId::BYTE_LEN <= super::super::WINDOW_BYTES,
+            changes + self.projection.retained_bytes() + self.round_changed.len() * proto::EntityId::BYTE_LEN <= WINDOW_BYTES,
             "membership notification window exhausted"
         );
         let retained: usize = self.publications.iter().map(|publication| publication.retained_bytes).sum();
         ensure!(
-            retained + self.application_bytes + self.assembly_bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
+            retained + self.application_bytes + self.assembly_bytes <= MAX_QUEUED_DELTA_BYTES,
             "pending publication data exceeded byte limit"
         );
         Ok(())
@@ -1020,7 +1031,7 @@ impl Driver {
             || self.publications.iter().any(|publication| publication.changes.contains_key(&id) || publication.goals.rows.contains_key(&id))
     }
 
-    fn can_receive(&self) -> bool { self.application_bytes < super::super::WINDOW_BYTES || !self.assemblies.is_empty() }
+    fn can_receive(&self) -> bool { self.application_bytes < WINDOW_BYTES || !self.assemblies.is_empty() }
 
     async fn commit_publications<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<()>
     where
@@ -1345,7 +1356,7 @@ impl Driver {
                     if let Some(change) = self.observe(&node, job).await? {
                         changes.push((change, deferred));
                     }
-                    for _ in 1..128 {
+                    for _ in 1..READY_JOB_BATCH {
                         let Some(Some(job)) = self.jobs.next().now_or_never() else { break };
                         let job = job?;
                         let deferred = self.deferred_notification(job.owner, job.id);

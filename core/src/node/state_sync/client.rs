@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use ankurah_proto::{self as proto, ComparisonProgress, RepairItem, StateAnswer, StateFrameBody, StateItem};
+use ankurah_proto::{
+    self as proto, state_sync::limits::STREAM_TTL, ComparisonProgress, RepairItem, StateAnswer, StateFrameBody, StateItem,
+};
 use anyhow::{bail, ensure};
 use bincode::Options;
 use futures::FutureExt;
@@ -17,6 +19,9 @@ use crate::{
 mod driver;
 mod projection;
 pub(crate) use driver::RefreshHandle;
+
+/// Events the coverage check may walk to decide whether a local head covers a target.
+const COVERAGE_BUDGET: usize = 256;
 
 pub(crate) struct RemoteState {
     pub stream_id: proto::StateStreamId,
@@ -118,13 +123,14 @@ where
     if actual == target || target.entries().iter().all(|entry| actual.entries().contains(entry)) {
         return Ok(true);
     }
-    let relation = match crate::event_dag::compare(LocalEventGetter::new(node.storage.clone(), node.durable), actual, target, 256).await {
-        Ok(relation) => relation,
-        // A later target can be registered before its data/history applies.
-        // Missing local history proves neither coverage nor an invalid stream.
-        Err(RetrievalError::EventNotFound(_)) => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
+    let relation =
+        match crate::event_dag::compare(LocalEventGetter::new(node.storage.clone(), node.durable), actual, target, COVERAGE_BUDGET).await {
+            Ok(relation) => relation,
+            // A later target can be registered before its data/history applies.
+            // Missing local history proves neither coverage nor an invalid stream.
+            Err(RetrievalError::EventNotFound(_)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
     Ok(matches!(
         relation.relation,
         crate::event_dag::AbstractCausalRelation::Equal | crate::event_dag::AbstractCausalRelation::StrictDescends { .. }
@@ -240,7 +246,7 @@ fn send_abandonment<CD: crate::session::ContextData>(
 
 async fn state_deadline<T>(future: impl std::future::Future<Output = T>) -> Result<T, RetrievalError> {
     let future = future.fuse();
-    let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(120)).fuse();
+    let timeout = futures_timer::Delay::new(STREAM_TTL).fuse();
     futures::pin_mut!(future, timeout);
     futures::select! {
         result = future => Ok(result),

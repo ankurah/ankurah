@@ -4,15 +4,15 @@
 //! as four little-endian bytes; other modes use varints. IDs are always 32 bytes.
 
 use super::PackedHeads;
-use crate::{Clock, EntityId, EventId};
+use crate::{
+    state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS},
+    Clock, EntityId, EventId,
+};
 
 pub(super) const PLAIN: u8 = 1;
 pub(super) const PREFIX: u8 = 2;
 pub(super) const PLAIN_FIXED: u8 = 3;
 pub(super) const PREFIX_FIXED: u8 = 4;
-// A smaller message budget and row count still apply to follow-up pages in core.
-pub(super) const MAX_BYTES: usize = 256 * 1024;
-pub(super) const MAX_ROWS: usize = 2048;
 type Result<T> = std::result::Result<T, &'static str>;
 
 pub(super) fn uint_size(value: usize) -> usize {
@@ -197,13 +197,13 @@ pub(super) fn tips(clock: &[u8], count: usize, fixed: bool) -> impl Iterator<Ite
 /// Check all fields before retaining or exposing a payload. Cap the expanded plain
 /// payload as well as its wire bytes so repeated prefixes cannot amplify work.
 pub(super) fn validate(bytes: &[u8]) -> Result<(usize, u64, usize, bool)> {
-    if bytes.len() > MAX_BYTES {
+    if bytes.len() > MAX_OFFER_BYTES {
         return Err("packed inventory exceeds byte limit");
     }
     let mut reader = Reader::new(bytes);
     let (prefix, fixed) = reader.mode()?;
     let count = reader.uint()?;
-    if count > MAX_ROWS {
+    if count > MAX_OFFER_HEADS {
         return Err("packed inventory exceeds head limit");
     }
     let mut plain_size = 1 + uint_size(count);
@@ -213,7 +213,7 @@ pub(super) fn validate(bytes: &[u8]) -> Result<(usize, u64, usize, bool)> {
     for _ in 0..count {
         let head = reader.head(prefix, fixed, &mut key)?;
         plain_size += uint_size(head.key.len()) + head.key.len() + 32 + uint_size(head.tips) + head.clock.len();
-        if plain_size > MAX_BYTES {
+        if plain_size > MAX_OFFER_BYTES {
             return Err("expanded inventory exceeds byte limit");
         }
         expanded_size += 8 + head.key.len() as u64 + 32 + 8 + 36 * head.tips as u64;

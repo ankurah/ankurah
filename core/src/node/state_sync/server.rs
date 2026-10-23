@@ -1,7 +1,4 @@
-use super::{
-    Snapshot, CONTROL_BYTES, FRAME_BYTES, HEAD_PAGE, INITIAL_INVENTORY_BYTES, INITIAL_INVENTORY_HEADS, MAX_INFLIGHT_FRAMES,
-    MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS, PAGE_WORK, WINDOW_BYTES,
-};
+use super::Snapshot;
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
@@ -10,7 +7,12 @@ use crate::{
 };
 use ankurah_digest_tree::{leaf_address, NodePrefix};
 use ankurah_proto::{
-    self as proto, ComparisonProgress, RepairItem, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan,
+    self as proto,
+    state_sync::limits::{
+        CONTROL_BYTES, MAX_DELTA_BYTES, MAX_FEEDBACK_ANSWERS, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_BYTES, MAX_FRAME_ITEMS, MAX_OFFER_BYTES,
+        MAX_OFFER_HEADS, MAX_OFFER_SPANS, MAX_OPEN_STREAMS, MAX_PAGE_BYTES, MAX_PAGE_HEADS, STREAM_TTL, WINDOW_BYTES,
+    },
+    ComparisonProgress, RepairItem, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan,
 };
 use anyhow::{bail, ensure};
 use std::{
@@ -23,8 +25,15 @@ use std::{
 };
 use web_time::Instant;
 
-const STREAM_TTL: Duration = Duration::from_secs(120);
-const MAX_STATE_STREAMS: usize = 128;
+/// Work steps one comparison reply may take. A step adds at most one item, so a
+/// reply stays within MAX_FRAME_ITEMS.
+const MAX_FRAME_STEPS: usize = MAX_FRAME_ITEMS;
+/// Tree reads and history walks one reply may take. They can load storage, so
+/// they get a lower cap than ready items.
+const MAX_FRAME_TREE_WORK: usize = 32;
+/// Deltas larger than this travel as chunks of this size, leaving room in a
+/// frame for other items.
+const DELTA_CHUNK_BYTES: usize = MAX_PAGE_BYTES / 2;
 const MAX_FEEDBACK: usize = 256;
 const MAX_OFFERED_TARGETS: usize = 100_000;
 // Initial request identities live for the connection lifetime; reaching this
@@ -32,7 +41,7 @@ const MAX_OFFERED_TARGETS: usize = 100_000;
 const MAX_ORIGINS: usize = 100_000;
 const MAX_FEEDBACK_IDS: usize = 100_000;
 const MAX_HISTORY: usize = 4096;
-const MAX_LIVE_BYTES: usize = MAX_REPAIR_BYTES + WINDOW_BYTES;
+const MAX_LIVE_BYTES: usize = MAX_DELTA_BYTES + WINDOW_BYTES;
 const MAX_LIVE_ITEMS: usize = 4096;
 #[cfg(test)]
 mod tests;
@@ -160,7 +169,7 @@ impl<CD: ContextData> StateStreams<CD> {
             last_sent: session.sent.load(Ordering::Acquire),
             catalog: session.catalog,
         });
-        if retired.len() > MAX_STATE_STREAMS {
+        if retired.len() > MAX_OPEN_STREAMS {
             retired.pop_front();
         }
         Some(session)
@@ -178,7 +187,7 @@ impl<CD: ContextData> StateStreams<CD> {
         if !closed.contains(&id) {
             closed.push_back(id);
         }
-        if closed.len() > MAX_STATE_STREAMS {
+        if closed.len() > MAX_OPEN_STREAMS {
             closed.pop_front();
         }
     }
@@ -295,14 +304,14 @@ impl Stream {
         Ok(())
     }
     fn room(&self, priority: bool) -> bool {
-        self.retained.len() < MAX_INFLIGHT_FRAMES - if priority { 0 } else { 2 }
-            && self.bytes + FRAME_BYTES <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 }
+        self.retained.len() < MAX_FRAMES_IN_FLIGHT - if priority { 0 } else { 2 }
+            && self.bytes + MAX_FRAME_BYTES <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 }
     }
     fn retain(&mut self, frame: StateFrame, priority: bool) -> anyhow::Result<()> {
         let bytes = bincode::serialized_size(&frame)? as usize;
-        ensure!(bytes <= FRAME_BYTES, "state frame exceeds hard limit");
+        ensure!(bytes <= MAX_FRAME_BYTES, "state frame exceeds hard limit");
         ensure!(
-            self.retained.len() < MAX_INFLIGHT_FRAMES && self.bytes + bytes <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 },
+            self.retained.len() < MAX_FRAMES_IN_FLIGHT && self.bytes + bytes <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 },
             "state replay window exhausted"
         );
         if let StateFrameBody::Live { revision, complete: true, .. } | StateFrameBody::LiveChunk { revision, complete: true, .. } =
@@ -382,7 +391,7 @@ impl Stream {
 
     fn next_live(&mut self, live: &Mutex<LiveQueue>) -> anyhow::Result<Option<StateFrameBody>> {
         if let Some(assembly) = self.live_chunk.as_mut() {
-            let end = (assembly.offset + PAGE_BYTES / 2).min(assembly.bytes.len());
+            let end = (assembly.offset + DELTA_CHUNK_BYTES).min(assembly.bytes.len());
             let last = end == assembly.bytes.len();
             let complete = last && assembly.complete;
             let body = StateFrameBody::LiveChunk {
@@ -420,7 +429,7 @@ impl Stream {
                 break;
             }
             let size = bincode::serialized_size(item)? as usize;
-            if size > PAGE_BYTES / 2 {
+            if size > DELTA_CHUNK_BYTES {
                 if !items.is_empty() {
                     break;
                 }
@@ -430,7 +439,7 @@ impl Stream {
                 self.offer_live_target(revision, &item)?;
                 let content = item.delta.ok_or_else(|| anyhow::anyhow!("oversized live membership metadata"))?;
                 let bytes = bincode::serialize(&content)?;
-                ensure!(bytes.len() <= MAX_REPAIR_BYTES, "live delta exceeds assembly limit");
+                ensure!(bytes.len() <= MAX_DELTA_BYTES, "live delta exceeds assembly limit");
                 let complete = queue.publications.front().unwrap().items.is_empty();
                 if complete {
                     queue.publications.pop_front();
@@ -440,7 +449,7 @@ impl Stream {
                 drop(queue);
                 return self.next_live(live);
             }
-            if bytes + size > PAGE_BYTES || items.len() == PAGE_STEPS {
+            if bytes + size > MAX_PAGE_BYTES || items.len() == MAX_FRAME_ITEMS {
                 break;
             }
             let item = queue.publications.front_mut().unwrap().items.pop_front().unwrap();
@@ -496,7 +505,7 @@ impl Stream {
                 Ok(events) => {
                     let content = proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() };
                     let bytes = bincode::serialize(&content)?;
-                    if bytes.len() > PAGE_BYTES / 2 {
+                    if bytes.len() > DELTA_CHUNK_BYTES {
                         self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
                         return Box::pin(self.next_live_repair(node, credentials, catalog)).await;
                     }
@@ -508,7 +517,7 @@ impl Stream {
                 }
             },
             Work::Chunks { entity_id, target, bytes, offset } => {
-                let end = (offset + PAGE_BYTES / 2).min(bytes.len());
+                let end = (offset + DELTA_CHUNK_BYTES).min(bytes.len());
                 let item = RepairItem::Chunk {
                     target: target.clone(),
                     chunk: proto::EntityDeltaChunk {
@@ -696,7 +705,7 @@ where
     {
         let mut sessions = connection.state_streams.sessions.lock().unwrap();
         let mut origins = connection.state_streams.origins.lock().unwrap();
-        ensure!(sessions.len() < MAX_STATE_STREAMS, "too many open state streams");
+        ensure!(sessions.len() < MAX_OPEN_STREAMS, "too many open state streams");
         ensure!(origins.len() < MAX_ORIGINS, "connection exhausted its bounded origin history");
         ensure!(!origins.contains_key(&session.initial_request), "initial request origin was already used");
         ensure!(!sessions.values().any(|s| s.initial_request == session.initial_request), "initial request already has a stream");
@@ -755,14 +764,14 @@ where
         });
     };
     ensure!(session.permits(&credentials), "state stream credentials changed");
-    ensure!(answers.as_ref().is_none_or(|answers| answers.len() <= 128), "too many comparison answers");
+    ensure!(answers.as_ref().is_none_or(|answers| answers.len() <= MAX_FEEDBACK_ANSWERS), "too many comparison answers");
     let encoded = bincode::serialize(&(processed_through, applied_through, &answers))?;
-    ensure!(encoded.len() <= FRAME_BYTES, "state feedback exceeds limit");
+    ensure!(encoded.len() <= MAX_FRAME_BYTES, "state feedback exceeds limit");
     let expansion = match &answers {
         Some(proto::FeedbackAnswers::Round { answers, .. }) => super::budget::answers_bytes(answers)? - bincode::serialized_size(answers)?,
         _ => 0,
     };
-    ensure!(encoded.len() as u64 + expansion <= FRAME_BYTES as u64, "state feedback exceeds decoded-work limit");
+    ensure!(encoded.len() as u64 + expansion <= MAX_FRAME_BYTES as u64, "state feedback exceeds decoded-work limit");
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(proto::NodeResponseBody::StateStreamUnavailable);
@@ -911,7 +920,7 @@ where
     ensure!(session.query.is_some(), "Fetch cannot refresh a standing query");
     ensure!(snapshot.spec == session.spec && known.spec == session.spec, "refresh changed tree specification");
     let encoded = bincode::serialize(&known)?;
-    ensure!(encoded.len() <= INITIAL_INVENTORY_BYTES + FRAME_BYTES, "refresh offer exceeds limit");
+    ensure!(encoded.len() <= MAX_OFFER_BYTES + MAX_FRAME_BYTES, "refresh offer exceeds limit");
     let comparison = Comparison::new(snapshot, known)?;
     let mut queue = session.live.lock().unwrap();
     ensure!(!queue.stopped, "live stream stopped");
@@ -979,7 +988,7 @@ where
     let bytes = sizes.iter().sum::<usize>();
     let mut queue = session.live.lock().unwrap();
     if queue.stopped
-        || sizes.iter().any(|size| *size > MAX_REPAIR_BYTES)
+        || sizes.iter().any(|size| *size > MAX_DELTA_BYTES)
         || queue.items + items.len() > MAX_LIVE_ITEMS
         || queue.publications.len() >= MAX_LIVE_ITEMS
         || queue.bytes.saturating_add(bytes) > MAX_LIVE_BYTES
@@ -1277,7 +1286,7 @@ where
             }
             bytes =
                 bytes.checked_add(bincode::serialized_size(&event)? as usize).ok_or_else(|| anyhow::anyhow!("history size overflow"))?;
-            ensure!(bytes <= MAX_REPAIR_BYTES, "causal repair exceeds byte limit");
+            ensure!(bytes <= MAX_DELTA_BYTES, "causal repair exceeds byte limit");
             if event.payload.parent.is_empty() {
                 ensure!(
                     proto::EntityId::from(id.clone()) == entity_id && genesis.as_ref().is_none_or(|root| root == &id),
@@ -1348,7 +1357,7 @@ impl Comparison {
         };
         ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
         ensure!(
-            known.spans.len() <= 128 && super::budget::offer_bytes(&known)? as usize <= INITIAL_INVENTORY_BYTES,
+            known.spans.len() <= MAX_OFFER_SPANS && super::budget::offer_bytes(&known)? as usize <= MAX_OFFER_BYTES,
             "initial inventory exceeds limit"
         );
         let mut spans = known.spans;
@@ -1393,7 +1402,7 @@ impl Comparison {
                 proto::SpanContent::Heads(page) => {
                     frontier = None;
                     head_count += page.heads.len();
-                    ensure!(head_count <= INITIAL_INVENTORY_HEADS, "initial inventory exceeds head limit");
+                    ensure!(head_count <= MAX_OFFER_HEADS, "initial inventory exceeds head limit");
                     page.validate(&comparison.snapshot.spec)?;
                     let mut cursor = page.heads.cursor();
                     while let Some((id, clock)) = cursor.next_clock() {
@@ -1416,7 +1425,7 @@ impl Comparison {
     }
 
     fn answer(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
-        ensure!(answers.len() <= 128, "too many comparison answers");
+        ensure!(answers.len() <= MAX_FEEDBACK_ANSWERS, "too many comparison answers");
         for answer in answers {
             match answer {
                 StateAnswer::NeedRepair(proto::RepairRequest { entity_id, target }) => {
@@ -1439,8 +1448,8 @@ impl Comparison {
                     self.work.push_back(Work::Compare { head, prefix });
                 }
                 StateAnswer::Heads(page) => {
-                    ensure!(page.heads.len() <= HEAD_PAGE, "too many heads in one page");
-                    ensure!(4 + page.expanded_size() <= PAGE_BYTES as u64, "head inventory exceeds decoded-work budget");
+                    ensure!(page.heads.len() <= MAX_PAGE_HEADS, "too many heads in one page");
+                    ensure!(4 + page.expanded_size() <= MAX_PAGE_BYTES as u64, "head inventory exceeds decoded-work budget");
                     let index = self
                         .head_requests
                         .iter()
@@ -1489,7 +1498,7 @@ impl Comparison {
                 work.push(Work::Item(StateItem::Heads(proto::TreeSpanInventory { bounds, heads: Default::default() })));
             }
         };
-        let count = page.heads.len().min(HEAD_PAGE);
+        let count = page.heads.len().min(MAX_PAGE_HEADS);
         for _ in 0..count {
             let leaf = page.heads.next().expect("bounded by remaining rows");
             if !self.snapshot.entries.contains_key(&leaf.entity.entity_id) {
@@ -1543,10 +1552,10 @@ impl Comparison {
         let mut fits = true;
         for item in &work {
             fits &= match item {
-                Work::Item(item) => bincode::serialized_size(item)? <= PAGE_BYTES as u64,
+                Work::Item(item) => bincode::serialized_size(item)? <= MAX_PAGE_BYTES as u64,
                 Work::SendHeads(bounds) => {
                     let item = StateItem::Heads(proto::TreeSpanInventory { bounds: bounds.clone(), heads: Default::default() });
-                    bincode::serialized_size(&item)? <= (PAGE_BYTES / 2) as u64
+                    bincode::serialized_size(&item)? <= (MAX_PAGE_BYTES / 2) as u64
                 }
                 _ => true,
             };
@@ -1578,7 +1587,7 @@ impl Comparison {
         loop {
             let remote = self.snapshot.page(remaining.clone())?;
             count += remote.heads.len();
-            ensure!(count <= HEAD_PAGE, "head span was not fully refined");
+            ensure!(count <= MAX_PAGE_HEADS, "head span was not fully refined");
             let mut cursor = remote.heads.cursor();
             while let Some(leaf) = cursor.next() {
                 let id = leaf.entity.entity_id;
@@ -1622,7 +1631,7 @@ impl Comparison {
         let mut bytes = 0;
         let mut tree_or_history_work = 0;
         let repair_frame = !self.pending_repairs.is_empty();
-        for _ in 0..PAGE_STEPS {
+        for _ in 0..MAX_FRAME_STEPS {
             if repair_frame && self.pending_repairs.is_empty() {
                 break;
             }
@@ -1650,7 +1659,7 @@ impl Comparison {
                 _ => false,
             };
             if expensive {
-                if tree_or_history_work == PAGE_WORK {
+                if tree_or_history_work == MAX_FRAME_TREE_WORK {
                     self.work.push_front(work);
                     break;
                 }
@@ -1664,7 +1673,7 @@ impl Comparison {
                             content: proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() },
                         };
                         let bytes = bincode::serialize(&delta.content)?;
-                        if bytes.len() > PAGE_BYTES / 2 {
+                        if bytes.len() > DELTA_CHUNK_BYTES {
                             self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
                             None
                         } else {
@@ -1702,7 +1711,7 @@ impl Comparison {
                         local.prefix = prefix;
                         if local.digest == known.digest {
                             None
-                        } else if local.digest.count() <= HEAD_PAGE as i64 {
+                        } else if local.digest.count() <= MAX_PAGE_HEADS as i64 {
                             self.work.push_front(Work::AskHeads(known.bounds));
                             None
                         } else {
@@ -1800,10 +1809,10 @@ impl Comparison {
                         }
                     }
                     let item = StateItem::Repair(RepairItem::Delta { target: target.clone(), delta });
-                    if bincode::serialized_size(&item)? as usize > PAGE_BYTES / 2 {
+                    if bincode::serialized_size(&item)? as usize > DELTA_CHUNK_BYTES {
                         let StateItem::Repair(RepairItem::Delta { delta, .. }) = item else { unreachable!() };
                         let bytes = bincode::serialize(&delta.content)?;
-                        ensure!(bytes.len() <= super::MAX_REPAIR_BYTES, "entity repair exceeds transfer limit");
+                        ensure!(bytes.len() <= MAX_DELTA_BYTES, "entity repair exceeds transfer limit");
                         self.work.push_front(Work::Chunks { entity_id: id, target, bytes, offset: 0 });
                         None
                     } else {
@@ -1811,7 +1820,7 @@ impl Comparison {
                     }
                 }
                 Work::Chunks { entity_id, target, bytes, offset } => {
-                    let end = (offset + PAGE_BYTES / 2).min(bytes.len());
+                    let end = (offset + DELTA_CHUNK_BYTES).min(bytes.len());
                     let item = StateItem::Repair(RepairItem::Chunk {
                         target: target.clone(),
                         chunk: proto::EntityDeltaChunk {
@@ -1829,7 +1838,7 @@ impl Comparison {
             };
             if let Some(item) = item {
                 let size = super::budget::item_bytes(&item)? as usize;
-                if !items.is_empty() && bytes + size > PAGE_BYTES {
+                if !items.is_empty() && bytes + size > MAX_PAGE_BYTES {
                     self.work.push_front(Work::Item(item));
                     break;
                 }

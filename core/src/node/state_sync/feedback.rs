@@ -4,7 +4,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ankurah_proto as proto;
+use ankurah_proto::{
+    self as proto,
+    state_sync::limits::{MAX_FEEDBACK_ANSWERS, MAX_PAGE_BYTES, STREAM_TTL, WINDOW_BYTES},
+};
 use anyhow::ensure;
 use futures::FutureExt;
 
@@ -69,8 +72,8 @@ impl Pending {
         let mut bytes = 0;
         while let Some(answer) = self.answers.pop_front() {
             let size = answer.bytes()? as usize;
-            ensure!(size <= super::PAGE_BYTES, "state answer exceeds limit");
-            if run.len() == 128 || bytes + size > super::PAGE_BYTES {
+            ensure!(size <= MAX_PAGE_BYTES, "state answer exceeds limit");
+            if run.len() == MAX_FEEDBACK_ANSWERS || bytes + size > MAX_PAGE_BYTES {
                 self.answers.push_front(answer);
                 break;
             }
@@ -122,7 +125,7 @@ impl Feedback {
                 None => Vec::new(),
             };
             let bytes = answers.iter().try_fold(0, |bytes, answer| answer.bytes().map(|size| bytes + size as usize))?;
-            ensure!(pending.bytes + bytes <= super::WINDOW_BYTES, "state answer queue exceeded limit");
+            ensure!(pending.bytes + bytes <= WINDOW_BYTES, "state answer queue exceeded limit");
             pending.bytes += bytes;
             pending.answers.extend(answers);
             pending.applied_through = pending.applied_through.max(applied_through);
@@ -161,7 +164,7 @@ impl Feedback {
                             proto::NodeRequestBody::StateFeedback { stream: stream_id, processed_through, applied_through, answers },
                         )
                         .fuse();
-                    let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(120)).fuse();
+                    let timeout = futures_timer::Delay::new(STREAM_TTL).fuse();
                     futures::pin_mut!(request, timeout);
                     let response = futures::select! {
                         response = request => response?,

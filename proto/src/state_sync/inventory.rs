@@ -5,7 +5,10 @@ use ankurah_digest_tree::{CanonicalCodec, TreeError};
 use bytes::Bytes;
 use serde::{de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{Clock, EntityId, TreeSpan, TreeSpec};
+use crate::{
+    state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS},
+    Clock, EntityId, TreeSpan, TreeSpec,
+};
 
 mod codec;
 mod cursor;
@@ -144,7 +147,7 @@ impl PackedHeads {
 
 impl Serialize for PackedHeads {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.bytes.len() > codec::MAX_BYTES || self.plain_size > codec::MAX_BYTES || self.len > codec::MAX_ROWS {
+        if self.bytes.len() > MAX_OFFER_BYTES || self.plain_size > MAX_OFFER_BYTES || self.len > MAX_OFFER_HEADS {
             return Err(serde::ser::Error::custom("inventory exceeds codec limits"));
         }
         if serializer.is_human_readable() {

@@ -10,7 +10,11 @@ use ankurah_digest_tree::{
     leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafData, NodePrefix, PropertyTypes, TreeRequest,
     TreeTransaction,
 };
-use ankurah_proto::{self as proto, Clock, EntityId, TreeSpanDigest, TreeSpec};
+use ankurah_proto::{
+    self as proto,
+    state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS, MAX_OFFER_SPANS, MAX_PAGE_BYTES, MAX_PAGE_HEADS},
+    Clock, EntityId, TreeSpanDigest, TreeSpec,
+};
 
 use crate::schema::catalog::CatalogManager;
 #[cfg(test)]
@@ -21,8 +25,8 @@ use ankurah_proto::{Attested, EntityState};
 type Entries = BTreeMap<EntityId, TreeEntry>;
 type Members = BTreeMap<Vec<u8>, EntityId>;
 
-const OFFER_BYTES: u64 = 16 * 1024;
-const OFFER_SPANS: usize = 128;
+/// The encoded size an offer of span digests stays within while its frontier is refined.
+const FRONTIER_BYTES: u64 = 16 * 1024;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
 const COMPACT_AFTER_CHANGES: usize = 128;
@@ -422,7 +426,7 @@ impl Snapshot {
             let Some(index) = frontier
                 .iter()
                 .enumerate()
-                .filter(|(_, (head, expandable))| *expandable && head.digest.count() > super::HEAD_PAGE as i64)
+                .filter(|(_, (head, expandable))| *expandable && head.digest.count() > MAX_PAGE_HEADS as i64)
                 .max_by_key(|(_, (head, _))| head.digest.count())
                 .map(|(index, _)| index)
             else {
@@ -435,14 +439,14 @@ impl Snapshot {
             }
             let mut candidate = frontier.clone();
             candidate.splice(index..=index, children.into_iter().map(|head| (head, true)));
-            if candidate.len() > OFFER_SPANS {
+            if candidate.len() > MAX_OFFER_SPANS {
                 continue;
             }
             let inventory = proto::KnownState {
                 spec: self.spec.clone(),
                 spans: candidate.iter().map(|(head, _)| proto::SpanContent::Digest(head.clone())).collect(),
             };
-            if bincode::serialized_size(&inventory)? <= OFFER_BYTES {
+            if bincode::serialized_size(&inventory)? <= FRONTIER_BYTES {
                 frontier = candidate;
             }
         }
@@ -453,14 +457,14 @@ impl Snapshot {
     }
 
     fn initial_inventory(&self) -> Option<proto::KnownState> {
-        if self.members.len() > super::INITIAL_INVENTORY_HEADS {
+        if self.members.len() > MAX_OFFER_HEADS {
             return None;
         }
         let mut minimum_bytes = 0usize;
         for (address, id) in self.members.iter() {
             let head = &self.entries[id].head;
             minimum_bytes = minimum_bytes.saturating_add(address.len()).saturating_add(head.len().saturating_mul(32));
-            if minimum_bytes > super::INITIAL_INVENTORY_BYTES {
+            if minimum_bytes > MAX_OFFER_BYTES {
                 return None;
             }
         }
@@ -471,7 +475,7 @@ impl Snapshot {
             spec: self.spec.clone(),
             spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), heads })],
         };
-        super::budget::offer_bytes(&inventory).ok().filter(|size| *size <= super::INITIAL_INVENTORY_BYTES as u64).map(|_| inventory)
+        super::budget::offer_bytes(&inventory).ok().filter(|size| *size <= MAX_OFFER_BYTES as u64).map(|_| inventory)
     }
 
     pub fn page(&self, bounds: proto::TreeSpan) -> anyhow::Result<proto::TreeSpanInventory> {
@@ -484,17 +488,17 @@ impl Snapshot {
         let rows = if empty {
             Vec::new()
         } else {
-            self.members.range((bounds.start.clone(), bounds.end.clone())).take(super::HEAD_PAGE + 1).collect::<Vec<_>>()
+            self.members.range((bounds.start.clone(), bounds.end.clone())).take(MAX_PAGE_HEADS + 1).collect::<Vec<_>>()
         };
         let mut count = 0;
         let mut bytes = 0;
-        for (index, (address, id)) in rows.iter().take(super::HEAD_PAGE).enumerate() {
+        for (index, (address, id)) in rows.iter().take(MAX_PAGE_HEADS).enumerate() {
             let head = &self.entries[*id].head;
             let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
             // Preserve the decoded-work budget even when repeated keys compress well.
             let overhead = 4 + bincode::serialized_size(&proto::TreeSpan::new(bounds.start.clone(), end))? + 8;
             let size = 8 + address.len() as u64 + 8 + 36 * head.len() as u64;
-            if overhead + bytes + size > super::PAGE_BYTES as u64 {
+            if overhead + bytes + size > MAX_PAGE_BYTES as u64 {
                 anyhow::ensure!(count > 0, "single head inventory exceeds byte limit");
                 break;
             }
@@ -509,7 +513,7 @@ impl Snapshot {
         );
         let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), heads };
         anyhow::ensure!(
-            bincode::serialized_size(&proto::StateAnswer::Heads(page.clone()))? <= super::PAGE_BYTES as u64,
+            bincode::serialized_size(&proto::StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64,
             "head inventory bounds exceed byte limit"
         );
         Ok(page)

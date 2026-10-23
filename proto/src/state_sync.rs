@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 mod inventory;
+pub mod limits;
 mod validation;
 pub use inventory::{
     ClockRef, EntityHead, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
