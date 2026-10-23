@@ -194,12 +194,13 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
             if uncovered {
                 self.insert_branch(&prefix, &children, after.as_ref().expect("the insertion is uncovered")).await?;
             } else if children.is_empty() && added && !removed {
-                let sample = self.leaves(&TreeSpan::under(&prefix), BUCKET_CAPACITY + 1).await?;
+                // Topology depends on row count; reading or rebuilding a leaf validates its contents.
+                let sample = self.transaction.scan(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY + 1).await?;
                 if sample.len() > BUCKET_CAPACITY {
                     self.rebuild_subtree(&prefix).await?;
                 }
             } else if !children.is_empty() && removed && !added {
-                let sample = self.leaves(&TreeSpan::under(&prefix), BUCKET_CAPACITY / 2 + 1).await?;
+                let sample = self.transaction.scan(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY / 2 + 1).await?;
                 if sample.len() <= BUCKET_CAPACITY / 2 {
                     self.rebuild_subtree(&prefix).await?;
                 }
@@ -448,6 +449,94 @@ mod tests {
         fn hash_leaf(bytes: &[u8]) -> Self::Element { Ristretto255::hash_leaf(bytes) }
         fn encode(element: &Self::Element, bytes: &mut [u8]) { Ristretto255::encode(element, bytes); }
         fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> { Ristretto255::decode(bytes) }
+    }
+
+    #[tokio::test]
+    async fn topology_counts_do_not_decode_neighboring_leaves() {
+        static DECODES: AtomicUsize = AtomicUsize::new(0);
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct CountedDecode;
+        impl DigestGroup for CountedDecode {
+            type Element = <Ristretto255 as DigestGroup>::Element;
+            const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
+            const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
+            fn zero() -> Self::Element { Ristretto255::zero() }
+            fn add(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::add(sum, other); }
+            fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
+            fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
+            fn hash_leaf(bytes: &[u8]) -> Self::Element { Ristretto255::hash_leaf(bytes) }
+            fn encode(element: &Self::Element, bytes: &mut [u8]) { Ristretto255::encode(element, bytes); }
+            fn decode(bytes: &[u8]) -> Result<Self::Element, crate::digest::DecodeError> {
+                DECODES.fetch_add(1, Ordering::Relaxed);
+                Ristretto255::decode(bytes)
+            }
+        }
+        let leaf = |n: u8| LeafData { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
+        for removing in [false, true] {
+            let maps = crate::MemoryMaps::new();
+            let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
+            let size = if removing { 96 } else { 32 };
+            let mut setup = TreeTransaction::<CountedDecode, _>::bind(&spec, maps.begin());
+            setup.build((0..size).map(leaf)).await.unwrap();
+            setup.commit().await.unwrap();
+            let change = if removing {
+                LeafChange { before: Some(leaf(size - 1)), after: None }
+            } else {
+                LeafChange { before: None, after: Some(leaf(size)) }
+            };
+            let mut tx = TreeTransaction::<CountedDecode, _>::bind(&spec, maps.begin());
+            DECODES.store(0, Ordering::Relaxed);
+            tx.apply_change(change).await.unwrap();
+            assert_eq!(DECODES.load(Ordering::Relaxed), usize::from(removing), "only the removed leaf needs decoding");
+            tx.commit().await.unwrap();
+            let expected = if removing { size - 1 } else { size + 1 };
+            assert_eq!(TreeTransaction::<Ristretto255, _>::bind(&spec, maps.begin()).audit().await.unwrap().leaves, expected as usize);
+        }
+    }
+
+    #[tokio::test]
+    async fn counting_defers_neighbor_validation_but_leaf_reads_and_rebuilds_reject_corruption() {
+        let leaf = |n: u8| LeafData { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
+        // A plain insertion, an insertion causing a split, and a removal causing a merge.
+        for (initial, removing) in [(32, false), (64, false), (65, true)] {
+            let tree = DigestTree::<Ristretto255>::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True));
+            let mut setup = tree.begin();
+            setup.build((0..initial).map(leaf)).await.unwrap();
+            if removing {
+                for n in 33..initial {
+                    setup.apply_change(LeafChange { before: Some(leaf(n)), after: None }).await.unwrap();
+                }
+            }
+            setup.commit().await.unwrap();
+            tree.begin().audit().await.unwrap();
+            let mut corrupt = tree.begin();
+            let address = leaf(0).row::<Ristretto255>().address();
+            let old = corrupt.transaction.get(MapName::Leaves, &address).await.unwrap().unwrap();
+            let mut invalid = old.clone();
+            let start = invalid.len() - Ristretto255::ELEMENT_LEN;
+            invalid[start..].fill(0xff); // Valid row length/version, invalid compressed element.
+            corrupt.transaction.put_if(MapName::Leaves, &address, Some(&old), &invalid).await.unwrap();
+            corrupt.commit().await.unwrap();
+            assert!(matches!(tree.begin().leaf(&[], leaf(0).entity_id).await, Err(TreeError::Unreadable { what: "leaf value", .. })));
+            assert!(tree.begin().audit().await.is_err());
+            let before = tree.begin().node(&NodePrefix::root()).await.unwrap();
+            let change = if removing {
+                LeafChange { before: Some(leaf(32)), after: None }
+            } else {
+                LeafChange { before: None, after: Some(leaf(initial)) }
+            };
+            let mut tx = tree.begin();
+            if initial == 32 {
+                tx.apply_change(change).await.unwrap();
+                tx.commit().await.unwrap();
+                assert!(matches!(tree.begin().leaf(&[], leaf(0).entity_id).await, Err(TreeError::Unreadable { .. })));
+                assert!(tree.begin().audit().await.is_err());
+            } else {
+                assert!(matches!(tx.apply_change(change).await, Err(TreeError::Unreadable { what: "leaf value", .. })));
+                assert!(matches!(tx.commit().await, Err(TreeError::Conflict)), "failed rebuild cannot publish partial changes");
+                assert_eq!(tree.begin().node(&NodePrefix::root()).await.unwrap(), before);
+            }
+        }
     }
 
     #[tokio::test]

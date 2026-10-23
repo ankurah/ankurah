@@ -117,7 +117,7 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
     for payload in [8, 1024] {
         let (node, _, _) = node().await?;
         let source = states(PAGE_STEPS * 2, payload);
-        let first_id = source[0].payload.entity_id;
+        let ids: Vec<_> = source.iter().map(|state| state.payload.entity_id).collect();
         let snapshot = stored_snapshot(&node, source.clone()).await?;
         let mut residents = Vec::new();
         for state in source {
@@ -149,7 +149,7 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
             );
         }
         drop(residents);
-        assert!(node.entities.get(&first_id).is_none(), "reply construction must not retain resident entity handles");
+        assert!(ids.iter().all(|id| node.entities.get(id).is_none()), "reply construction must not retain resident entity handles");
     }
     Ok(())
 }
