@@ -130,10 +130,6 @@ fn large_prepared_builds_match_serial_bytes_for_both_groups_without_a_runtime() 
         compare_prepared_build_to_serial::<Ristretto255>().await;
         compare_prepared_build_to_serial::<crate::LtHash16>().await;
     });
-    #[cfg(not(target_arch = "wasm32"))]
-    if let Some(pool) = preparation_pool() {
-        assert!(pool.current_num_threads() <= 4);
-    }
 }
 
 #[test]

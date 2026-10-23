@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, ops::Bound, sync::Arc};
 use ankql::ast::{Resolved, Selection};
 use ankurah_core_types::{KeySpec, PropertyPath, ValueType};
 use ankurah_digest_tree::{
-    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafInput, NodePrefix, PropertyTypes, TreeRequest,
+    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafInput, NodePrefix, PropertyTypes, TreeError, TreeRequest,
     TreeTransaction,
 };
 use ankurah_proto::{self as proto, Clock, EntityId, TreeSpanDigest, TreeSpec};
@@ -21,6 +21,11 @@ const OFFER_BYTES: u64 = 16 * 1024;
 const OFFER_SPANS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
+/// Builds of at least this many leaves run on a blocking thread: a build over
+/// memory maps never yields, and at about 5 µs to hash a leaf these hold a
+/// thread for 5 ms or more.
+#[cfg(not(target_arch = "wasm32"))]
+const BLOCKING_BUILD_LEAVES: usize = 1024;
 
 /// The entity metadata retained with a leaf. Payloads remain in entity/storage ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,10 +218,16 @@ fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
 
 impl Index {
     async fn build(spec: TreeSpec, entries: Entries) -> anyhow::Result<Self> {
-        let tree = DigestTree::new(spec.clone());
-        let mut tx = tree.begin();
-        tx.build(entries.values().map(TreeEntry::leaf)).await?;
-        tx.commit().await?;
+        let leaves: Vec<LeafInput> = entries.values().map(TreeEntry::leaf).collect();
+        #[cfg(not(target_arch = "wasm32"))]
+        let tree = if leaves.len() >= BLOCKING_BUILD_LEAVES {
+            let spec = spec.clone();
+            tokio::task::spawn_blocking(move || futures::executor::block_on(build_tree(spec, leaves))).await??
+        } else {
+            build_tree(spec.clone(), leaves).await?
+        };
+        #[cfg(target_arch = "wasm32")]
+        let tree = build_tree(spec.clone(), leaves).await?;
         let mut missing_counts = vec![0; spec.key_spec().keyparts.len()];
         for entry in entries.values() {
             for index in missing_parts(&spec, entry) {
@@ -278,6 +289,15 @@ impl Index {
             missing_counts: self.missing_counts.clone(),
         }
     }
+}
+
+/// A tree defined by `spec` holding `leaves`.
+async fn build_tree(spec: TreeSpec, leaves: Vec<LeafInput>) -> Result<DigestTree, TreeError> {
+    let tree = DigestTree::new(spec);
+    let mut tx = tree.begin();
+    tx.build(leaves).await?;
+    tx.commit().await?;
+    Ok(tree)
 }
 
 #[cfg(test)]

@@ -11,33 +11,26 @@ use crate::digest::{Digest, DigestGroup};
 use crate::error::TreeError;
 use crate::store::{EncodedLeaf, MapAccess, MapName};
 
-#[cfg(not(target_arch = "wasm32"))]
-const PARALLEL_PREPARATION_MIN_LEAVES: usize = 1024;
+/// How many leaves a build hashes and encodes before writing them, so that
+/// the encoded leaves waiting to be written stay few however large the build.
 const PREPARATION_BATCH_LEAVES: usize = 1024;
 
+/// How many leaves a batch holds before it is hashed on rayon's threads.
+/// Smaller batches, a small build or the end of a large one, are hashed on
+/// the build's own thread: at about 5 µs a leaf they take a few milliseconds,
+/// which spreading over threads would shorten by little while taking the
+/// threads from the application.
 #[cfg(not(target_arch = "wasm32"))]
-fn preparation_pool() -> Option<&'static rayon::ThreadPool> {
-    use std::sync::OnceLock;
+const PARALLEL_PREPARATION_MIN_LEAVES: usize = 1024;
 
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(4));
-        if workers == 1 {
-            return None;
-        }
-        rayon::ThreadPoolBuilder::new().num_threads(workers).build().ok()
-    })
-    .as_ref()
-}
-
+/// Hash and encode each leaf filed at its address, a large batch on rayon's
+/// global thread pool, which the application configures.
 fn prepare_leaves<G: DigestGroup>(leaves: Vec<(Vec<u8>, LeafInput)>) -> Vec<EncodedLeaf<G>> {
     #[cfg(not(target_arch = "wasm32"))]
     if leaves.len() >= PARALLEL_PREPARATION_MIN_LEAVES {
         use rayon::prelude::*;
 
-        if let Some(pool) = preparation_pool() {
-            return pool.install(|| leaves.into_par_iter().map(|(address, leaf)| EncodedLeaf::new(address, leaf.into_row())).collect());
-        }
+        return leaves.into_par_iter().map(|(address, leaf)| EncodedLeaf::new(address, leaf.into_row())).collect();
     }
     leaves.into_iter().map(|(address, leaf)| EncodedLeaf::new(address, leaf.into_row())).collect()
 }
@@ -51,9 +44,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// addresses are rejected. The replacement is atomic at commit; failure
     /// or cancellation prevents this transaction from committing.
     ///
-    /// On native targets, large batches prepare leaf hashes and encodings on
-    /// a shared pool of up to four workers; transaction writes stay serial.
-    /// Builds fall back to serial preparation when workers are unavailable.
+    /// On native targets, a large build hashes and encodes its leaves on
+    /// rayon's global thread pool, and writes them in order. Over the memory
+    /// maps a build runs to its end without yielding, so an async caller runs
+    /// a large one where a thread may block, such as Tokio's
+    /// `spawn_blocking`.
     pub async fn build(&mut self, leaves: impl IntoIterator<Item = LeafInput>) -> Result<(), TreeError> {
         self.generation += 1;
         let mut guard = self.mutation_guard();
