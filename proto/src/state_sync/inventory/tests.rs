@@ -1,6 +1,9 @@
 use super::codec::{PLAIN, PREFIX};
 use super::*;
-use crate::{EventId, TreeSpan, TreeSpanInventory};
+use crate::{
+    state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS},
+    EventId, TreeSpan, TreeSpanInventory,
+};
 
 fn keyed_heads(keys: &[Vec<u8>], tips: usize) -> Vec<KeyedEntityHead> {
     keys.iter()
@@ -24,9 +27,12 @@ fn keyed_heads(keys: &[Vec<u8>], tips: usize) -> Vec<KeyedEntityHead> {
         .collect()
 }
 
+/// Heads a test knows are within one inventory's limits.
+fn packed(heads: Vec<KeyedEntityHead>) -> PackedHeads { PackedHeads::try_from(heads).unwrap() }
+
 fn verify(original: Vec<KeyedEntityHead>) {
     let expected = serde_json::to_value(&original).unwrap();
-    let packed: PackedHeads = original.into();
+    let packed = packed(original);
     let bytes = bincode::serialize(&packed).unwrap();
     let decoded: PackedHeads = bincode::deserialize(&bytes).unwrap();
     assert_eq!(serde_json::to_value(&decoded).unwrap(), expected);
@@ -56,10 +62,10 @@ fn full_keys_ids_and_clocks_round_trip_in_both_encodings() {
 #[test]
 fn plain_fallback_and_prefix_choice_use_actual_encoded_size() {
     for keys in [vec![], vec![vec![]; 128], vec![b"one".to_vec()]] {
-        let packed: PackedHeads = keyed_heads(&keys, 1).into();
+        let packed = packed(keyed_heads(&keys, 1));
         assert_eq!(packed.bytes[0], PLAIN);
     }
-    let packed: PackedHeads = keyed_heads(&[b"a long shared prefix/one".to_vec(), b"a long shared prefix/two".to_vec()], 1).into();
+    let packed = packed(keyed_heads(&[b"a long shared prefix/one".to_vec(), b"a long shared prefix/two".to_vec()], 1));
     assert_eq!(packed.bytes[0], PREFIX);
     assert!(packed.bytes.len() < packed.unshared_bytes);
     let clone = packed.clone();
@@ -86,14 +92,13 @@ fn raw_clock(entries: &[(usize, u8)], mode: u8) -> Vec<u8> {
 }
 
 #[test]
-fn noncanonical_clocks_are_normalized_once_and_invalid_annotations_fail() {
+fn clocks_must_list_their_tips_in_ascending_event_order() {
     for mode in [PLAIN, PREFIX] {
-        let packed = PackedHeads::decode(&raw_clock(&[(7, 2), (1, 1), (1, 1)], mode)).unwrap();
+        let packed = PackedHeads::decode(&raw_clock(&[(1, 1), (7, 2)], mode)).unwrap();
         let expected = Clock::new(vec![(1, EventId::from_bytes([1; 32])), (7, EventId::from_bytes([2; 32]))]).unwrap();
         assert!(packed.cursor().next().unwrap().entity.head.equals(&expected));
-        assert!(codec::validate(&packed.bytes).unwrap().canonical);
-        for entries in [vec![(0, 1)], vec![(1, 1), (2, 1)]] {
-            assert!(PackedHeads::decode(&raw_clock(&entries, mode)).is_err());
+        for entries in [vec![(7, 2), (1, 1)], vec![(1, 1), (1, 1)], vec![(1, 1), (2, 1)], vec![(0, 1)]] {
+            assert!(PackedHeads::decode(&raw_clock(&entries, mode)).is_err(), "{entries:?}");
         }
     }
 }
@@ -101,7 +106,7 @@ fn noncanonical_clocks_are_normalized_once_and_invalid_annotations_fail() {
 #[test]
 fn rejects_malformed_payloads_before_any_cursor_can_observe_them() {
     for keys in [vec![vec![]; 2], vec![b"shared-prefix-one".to_vec(), b"shared-prefix-two".to_vec()]] {
-        let page: PackedHeads = keyed_heads(&keys, 1).into();
+        let page = packed(keyed_heads(&keys, 1));
         for n in 0..page.bytes.len() {
             assert!(PackedHeads::decode(&page.bytes[..n]).is_err());
         }
@@ -120,15 +125,32 @@ fn rejects_malformed_payloads_before_any_cursor_can_observe_them() {
     }
 }
 
+/// A payload of `count` heads with clockless IDs whose keys all repeat one key of
+/// `key_len` bytes, each after the first written as a fully shared prefix.
+fn repeated_keys(count: usize, key_len: usize) -> Vec<u8> {
+    let mut out = vec![PREFIX];
+    codec::put_uint(&mut out, count);
+    for n in 0..count {
+        let (shared, suffix) = if n == 0 { (0, key_len) } else { (key_len, 0) };
+        codec::put_uint(&mut out, shared);
+        codec::put_uint(&mut out, suffix);
+        out.extend(std::iter::repeat_n(42, suffix));
+        out.extend_from_slice(&[n as u8; 32]);
+        out.push(0);
+    }
+    out
+}
+
 #[test]
-fn compression_cannot_bypass_the_unshared_size_or_head_limits() {
-    let repeated: PackedHeads = keyed_heads(&vec![vec![42; 4096]; 128], 1).into();
-    assert!(repeated.bytes.len() < MAX_OFFER_BYTES);
-    assert!(PackedHeads::decode(&repeated.bytes).is_err());
-    assert!(bincode::serialize(&repeated).is_err());
-    let too_many: PackedHeads = keyed_heads(&vec![vec![]; MAX_OFFER_HEADS + 1], 0).into();
-    assert!(PackedHeads::decode(&too_many.bytes).is_err());
-    assert!(bincode::serialize(&too_many).is_err());
+fn encoding_and_decoding_refuse_more_than_one_inventory_may_carry() {
+    // Shared prefixes keep these bytes small on the wire; their unshared size is over the limit.
+    let repeated = repeated_keys(128, 4096);
+    assert!(repeated.len() < MAX_OFFER_BYTES);
+    assert!(matches!(PackedHeads::decode(&repeated), Err(InventoryError::ExceedsLimit(_))));
+    assert!(matches!(PackedHeads::try_from(keyed_heads(&vec![vec![42; 4096]; 128], 0)), Err(InventoryError::ExceedsLimit(_))));
+    assert!(matches!(PackedHeads::decode(&repeated_keys(MAX_OFFER_HEADS + 1, 0)), Err(InventoryError::ExceedsLimit(_))));
+    assert!(matches!(PackedHeads::try_from(keyed_heads(&vec![vec![]; MAX_OFFER_HEADS + 1], 0)), Err(InventoryError::ExceedsLimit(_))));
+    assert!(PackedHeads::decode(&repeated_keys(MAX_OFFER_HEADS, 0)).is_ok());
     assert!(PackedHeads::decode(&vec![PLAIN; MAX_OFFER_BYTES + 1]).is_err());
 }
 
@@ -137,7 +159,7 @@ fn prefix_sharing_saves_wire_bytes_but_not_work() -> bincode::Result<()> {
     let text = b"a long key text".as_slice();
     let shared: Vec<_> = (0..64u8).map(|n| [text, &[n]].concat()).collect();
     let unshared: Vec<_> = (0..64u8).map(|n| [&[n], text].concat()).collect();
-    let inventory = |keys: &[Vec<u8>]| TreeSpanInventory { bounds: TreeSpan::all(), heads: keyed_heads(keys, 1).into() };
+    let inventory = |keys: &[Vec<u8>]| TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(keyed_heads(keys, 1)) };
     let (shared, unshared) = (inventory(&shared), inventory(&unshared));
     assert_eq!(shared.heads.bytes[0], PREFIX);
     assert_eq!(unshared.heads.bytes[0], PLAIN);
@@ -145,21 +167,6 @@ fn prefix_sharing_saves_wire_bytes_but_not_work() -> bincode::Result<()> {
     assert_eq!(shared.work_bytes()?, unshared.work_bytes()?, "equal key lengths describe equal work");
     assert_eq!(unshared.work_bytes()?, bincode::serialized_size(&unshared)?, "plain keys share nothing");
     Ok(())
-}
-
-#[test]
-fn retained_clocks_share_the_inventory_and_survive_cursor_drop() {
-    let packed: PackedHeads = keyed_heads(&[b"shared-prefix-a".to_vec(), b"shared-prefix-b".to_vec()], 6).into();
-    let expected = packed.to_vec();
-    let mut cursor = packed.cursor();
-    let (id, clock) = cursor.next_clock().unwrap();
-    let start = packed.bytes.as_ptr() as usize;
-    let clock_start = clock.bytes.as_ptr() as usize;
-    assert!((start..start + packed.bytes.len()).contains(&clock_start));
-    drop(packed);
-    drop(cursor);
-    assert_eq!(id, expected[0].entity.entity_id);
-    assert_eq!(clock.to_owned(), expected[0].entity.head);
 }
 
 #[test]
@@ -185,7 +192,7 @@ fn inventory_validation_checks_bounds_order_duplicates_and_canonical_keys() {
     let heads = keyed_heads(&[vec![], vec![], vec![]], 1);
     let address = |index: usize| leaf_address(&heads[index].key, heads[index].entity.entity_id);
     for bounds in [TreeSpan::all(), TreeSpan::new(Included(address(0)), Included(address(2)))] {
-        let inventory = TreeSpanInventory { bounds, heads: heads.clone().into() };
+        let inventory = TreeSpanInventory { bounds, heads: packed(heads.clone()) };
         inventory.validate(&spec).unwrap();
         let decoded: TreeSpanInventory = bincode::deserialize(&bincode::serialize(&inventory).unwrap()).unwrap();
         decoded.validate(&spec).unwrap();
@@ -194,11 +201,11 @@ fn inventory_validation_checks_bounds_order_duplicates_and_canonical_keys() {
     let invalid = [
         TreeSpanInventory { bounds: TreeSpan::new(Excluded(address(1)), Excluded(address(1))), heads: Default::default() },
         TreeSpanInventory { bounds: TreeSpan::new(Included(address(2)), Included(address(0))), heads: Default::default() },
-        TreeSpanInventory { bounds: TreeSpan::new(Excluded(address(0)), Included(address(2))), heads: heads.clone().into() },
-        TreeSpanInventory { bounds: TreeSpan::new(Included(address(0)), Excluded(address(2))), heads: heads.clone().into() },
-        TreeSpanInventory { bounds: TreeSpan::all(), heads: vec![heads[1].clone(), heads[0].clone()].into() },
-        TreeSpanInventory { bounds: TreeSpan::all(), heads: vec![heads[0].clone(), heads[0].clone()].into() },
-        TreeSpanInventory { bounds: TreeSpan::all(), heads: keyed_heads(&[vec![1]], 1).into() },
+        TreeSpanInventory { bounds: TreeSpan::new(Excluded(address(0)), Included(address(2))), heads: packed(heads.clone()) },
+        TreeSpanInventory { bounds: TreeSpan::new(Included(address(0)), Excluded(address(2))), heads: packed(heads.clone()) },
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(vec![heads[1].clone(), heads[0].clone()]) },
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(vec![heads[0].clone(), heads[0].clone()]) },
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(keyed_heads(&[vec![1]], 1)) },
     ];
     for inventory in invalid {
         assert!(inventory.validate(&spec).is_err(), "{inventory:?}");
@@ -206,6 +213,6 @@ fn inventory_validation_checks_bounds_order_duplicates_and_canonical_keys() {
         assert!(decoded.validate(&spec).is_err());
     }
     let keyed = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(PropertyId::Id, ValueType::EntityId)]), ankql::ast::Predicate::True);
-    let inventory = TreeSpanInventory { bounds: TreeSpan::all(), heads: heads.into() };
+    let inventory = TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(heads) };
     assert!(inventory.validate(&keyed).is_err(), "an inventory valid under another key spec is not sufficient");
 }

@@ -386,7 +386,8 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory {
                 bounds: serde_json::from_value(serde_json::json!({ "start": { "Included": [] }, "end": "Unbounded" }))?,
                 heads: vec![proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id, head: known_head.clone() } }]
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             })],
         };
         let requests = [

@@ -470,7 +470,8 @@ impl Snapshot {
         }
         let heads = proto::PackedHeads::encode(
             self.members.iter().map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), *id, &self.entries[id].head)),
-        );
+        )
+        .ok()?;
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
             spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: super::whole(), heads })],
@@ -511,7 +512,7 @@ impl Snapshot {
             rows.iter()
                 .take(count)
                 .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), **id, &self.entries[*id].head)),
-        );
+        )?;
         let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), heads };
         anyhow::ensure!(page.work_bytes()? <= MAX_PAGE_BYTES as u64, "head inventory bounds exceed byte limit");
         Ok(page)

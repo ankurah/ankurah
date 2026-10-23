@@ -25,7 +25,7 @@ pub mod limits;
 mod validation;
 mod work;
 pub use inventory::{
-    ClockRef, EntityHead, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
+    ClockRef, EntityHead, EntityHeadRef, HeadCursor, InventoryError, KeyedEntityHead, KeyedEntityHeadRef, PackedHeads, TreeSpanInventory,
 };
 
 use crate::{Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId};

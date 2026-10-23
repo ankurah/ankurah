@@ -661,7 +661,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                         round: 0,
                         answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
                             bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-                            heads: vec![].into()
+                            heads: Default::default()
                         })]
                     })
                 }
@@ -693,7 +693,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
                         round: 0,
                         answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
                             bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-                            heads: vec![].into()
+                            heads: Default::default()
                         })]
                     })
                 }

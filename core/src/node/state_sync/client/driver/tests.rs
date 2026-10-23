@@ -25,7 +25,7 @@ async fn malformed_inventories_do_not_change_the_round_projection() -> anyhow::R
     let head = |n| proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id: id(n), head: head(n) } };
     let address = |n| ankurah_digest_tree::leaf_address(&[], id(n));
     let invalid = [
-        StateItem::Heads(proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: vec![head(4), head(2)].into() }),
+        StateItem::Heads(proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: vec![head(4), head(2)].try_into().unwrap() }),
         StateItem::Heads(proto::TreeSpanInventory {
             bounds: proto::TreeSpan::new(std::ops::Bound::Included(address(4)), std::ops::Bound::Included(address(2))),
             heads: Default::default(),

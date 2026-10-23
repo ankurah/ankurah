@@ -3,6 +3,8 @@
 //! The prefix encoding adds the shared-byte count before each key suffix. IDs are
 //! always 32 bytes.
 
+use ankurah_digest_tree::TreeError;
+
 use super::PackedHeads;
 use crate::{
     state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS},
@@ -11,7 +13,30 @@ use crate::{
 
 pub(super) const PLAIN: u8 = 1;
 pub(super) const PREFIX: u8 = 2;
-type Result<T> = std::result::Result<T, &'static str>;
+type Result<T> = std::result::Result<T, InventoryError>;
+
+/// Why a packed inventory, or an inventory's heads within its bounds, is invalid.
+#[derive(Debug, thiserror::Error)]
+pub enum InventoryError {
+    /// The bytes are not a well-formed packed inventory.
+    #[error("malformed packed inventory: {0}")]
+    Malformed(&'static str),
+    /// The heads are more, or larger, than one inventory may carry.
+    #[error("packed inventory exceeds its {0}")]
+    ExceedsLimit(&'static str),
+    /// The inventory's bounds contain no address.
+    #[error("empty inventory bounds")]
+    EmptyBounds,
+    /// A key is not canonical under the tree's key spec.
+    #[error("inventory key is not canonical: {0}")]
+    InvalidKey(#[from] TreeError),
+    /// A head's address lies outside the inventory's bounds.
+    #[error("inventory head outside its bounds")]
+    OutsideBounds,
+    /// A head's address does not follow the preceding head's.
+    #[error("inventory heads out of address order")]
+    Unordered,
+}
 
 /// How the payload writes each key: whole, or as a suffix of the preceding key.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -58,8 +83,9 @@ fn clock_size(head: &Clock) -> usize {
 pub(super) fn plain_head_size(key_len: usize, head: &Clock) -> usize { uint_size(key_len) + key_len + 32 + clock_size(head) }
 
 /// Encode borrowed keyed entity heads directly, without cloning their keys or clocks.
-/// The repeatable iterator is scanned for exact size before one buffer is built.
-pub(super) fn write<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> PackedHeads {
+/// The repeatable iterator is scanned for exact size, and checked against one
+/// inventory's limits, before one buffer is built.
+pub(super) fn write<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> Result<PackedHeads> {
     let mut count = 0;
     let mut plain = 0;
     let mut compressed = 0;
@@ -70,6 +96,13 @@ pub(super) fn write<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clo
         plain += plain_head_size(key.len(), head);
         compressed += uint_size(shared) + uint_size(key.len() - shared) + key.len() - shared + 32 + clock_size(head);
         previous = key;
+    }
+    let unshared_bytes = 1 + uint_size(count) + plain;
+    if count > MAX_OFFER_HEADS {
+        return Err(InventoryError::ExceedsLimit("head limit"));
+    }
+    if unshared_bytes > MAX_OFFER_BYTES {
+        return Err(InventoryError::ExceedsLimit("byte limit"));
     }
     let encoding = if compressed < plain { KeyEncoding::Prefix } else { KeyEncoding::Plain };
     let mut bytes = Vec::with_capacity(1 + uint_size(count) + if encoding == KeyEncoding::Prefix { compressed } else { plain });
@@ -98,7 +131,7 @@ pub(super) fn write<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clo
         }
         previous = key;
     }
-    PackedHeads { bytes: bytes.into(), len: count, unshared_bytes: 1 + uint_size(count) + plain }
+    Ok(PackedHeads { bytes: bytes.into(), len: count, unshared_bytes })
 }
 
 /// One keyed entity head as it lies in the payload: its reconstructed key, its
@@ -117,8 +150,8 @@ pub(super) struct Reader<'a> {
 impl<'a> Reader<'a> {
     pub fn new(bytes: &'a [u8]) -> Self { Self { bytes, offset: 0 } }
     pub fn take(&mut self, len: usize) -> Result<&'a [u8]> {
-        let end = self.offset.checked_add(len).ok_or("length overflow")?;
-        let bytes = self.bytes.get(self.offset..end).ok_or("truncated inventory")?;
+        let end = self.offset.checked_add(len).ok_or(InventoryError::Malformed("length overflow"))?;
+        let bytes = self.bytes.get(self.offset..end).ok_or(InventoryError::Malformed("truncated inventory"))?;
         self.offset = end;
         Ok(bytes)
     }
@@ -128,14 +161,14 @@ impl<'a> Reader<'a> {
             251 => u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as u64,
             252 => u32::from_le_bytes(self.take(4)?.try_into().unwrap()) as u64,
             253 => u64::from_le_bytes(self.take(8)?.try_into().unwrap()),
-            _ => return Err("invalid inventory integer"),
+            _ => return Err(InventoryError::Malformed("invalid inventory integer")),
         };
-        usize::try_from(value).map_err(|_| "inventory integer overflow")
+        usize::try_from(value).map_err(|_| InventoryError::Malformed("inventory integer overflow"))
     }
     pub fn generation(&mut self) -> Result<u32> {
-        let value = u32::try_from(self.uint()?).map_err(|_| "invalid clock generation")?;
+        let value = u32::try_from(self.uint()?).map_err(|_| InventoryError::Malformed("invalid clock generation"))?;
         if value == 0 {
-            return Err("invalid clock generation");
+            return Err(InventoryError::Malformed("invalid clock generation"));
         }
         Ok(value)
     }
@@ -143,7 +176,7 @@ impl<'a> Reader<'a> {
         match self.take(1)?[0] {
             PLAIN => Ok(KeyEncoding::Plain),
             PREFIX => Ok(KeyEncoding::Prefix),
-            _ => Err("unsupported inventory encoding"),
+            _ => Err(InventoryError::Malformed("unsupported inventory encoding")),
         }
     }
     pub fn head<'k>(&mut self, encoding: KeyEncoding, key: &'k mut Vec<u8>) -> Result<EncodedHead<'k, 'a>>
@@ -153,11 +186,11 @@ impl<'a> Reader<'a> {
             KeyEncoding::Prefix => self.uint()?,
         };
         if shared > key.len() {
-            return Err("prefix exceeds preceding key");
+            return Err(InventoryError::Malformed("prefix exceeds preceding key"));
         }
         let length = self.uint()?;
         let suffix = self.take(length)?;
-        shared.checked_add(length).ok_or("expanded key length overflow")?;
+        shared.checked_add(length).ok_or(InventoryError::Malformed("key length overflow"))?;
         let full_key = match encoding {
             KeyEncoding::Plain => suffix,
             KeyEncoding::Prefix => {
@@ -169,7 +202,7 @@ impl<'a> Reader<'a> {
         let entity_id = EntityId::from_bytes(self.take(32)?.try_into().unwrap());
         let tips = self.uint()?;
         if tips > (self.bytes.len() - self.offset) / 33 {
-            return Err("truncated clock");
+            return Err(InventoryError::Malformed("truncated clock"));
         }
         let start = self.offset;
         for _ in 0..tips {
@@ -194,39 +227,35 @@ pub(super) fn tips(clock: &[u8], count: usize) -> impl Iterator<Item = (u32, Eve
 pub(super) struct Validated {
     pub heads: usize,
     pub unshared_bytes: usize,
-    /// Whether every clock already lists its tips in ascending event order.
-    pub canonical: bool,
 }
 
 /// Check all fields before retaining or exposing a payload. Cap the unshared size
-/// as well as the wire bytes, so repeated prefixes cannot amplify work.
+/// as well as the wire bytes, so repeated prefixes cannot amplify work. Each clock
+/// must list its tips in ascending event order, as the writer does.
 pub(super) fn validate(bytes: &[u8]) -> Result<Validated> {
     if bytes.len() > MAX_OFFER_BYTES {
-        return Err("packed inventory exceeds byte limit");
+        return Err(InventoryError::ExceedsLimit("byte limit"));
     }
     let mut reader = Reader::new(bytes);
     let encoding = reader.key_encoding()?;
     let heads = reader.uint()?;
     if heads > MAX_OFFER_HEADS {
-        return Err("packed inventory exceeds head limit");
+        return Err(InventoryError::ExceedsLimit("head limit"));
     }
     let mut unshared_bytes = 1 + uint_size(heads);
-    let mut canonical = true;
     let mut key = Vec::new();
     for _ in 0..heads {
         let head = reader.head(encoding, &mut key)?;
         unshared_bytes += uint_size(head.key.len()) + head.key.len() + 32 + uint_size(head.tips) + head.clock.len();
         if unshared_bytes > MAX_OFFER_BYTES {
-            return Err("unshared inventory exceeds byte limit");
+            return Err(InventoryError::ExceedsLimit("byte limit"));
         }
-        let ordered = tips(head.clock, head.tips).map(|(_, id)| id).is_sorted_by(|a, b| a < b);
-        if !ordered {
-            Clock::new(tips(head.clock, head.tips).collect::<Vec<_>>()).map_err(|_| "invalid clock annotations")?;
-            canonical = false;
+        if !tips(head.clock, head.tips).map(|(_, id)| id).is_sorted_by(|a, b| a < b) {
+            return Err(InventoryError::Malformed("clock tips out of ascending event order"));
         }
     }
     if reader.offset != bytes.len() {
-        return Err("trailing inventory bytes");
+        return Err(InventoryError::Malformed("trailing inventory bytes"));
     }
-    Ok(Validated { heads, unshared_bytes, canonical })
+    Ok(Validated { heads, unshared_bytes })
 }

@@ -1,18 +1,16 @@
 //! Packed, independently decodable inventories. Binary serde retains the validated
 //! byte buffer; JSON keeps the readable list of keyed entity heads.
 
-use ankurah_digest_tree::{CanonicalCodec, TreeError};
+use ankurah_digest_tree::CanonicalCodec;
 use bytes::Bytes;
 use serde::{de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::{
-    state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS},
-    Clock, EntityId, TreeSpan, TreeSpec,
-};
+use crate::{Clock, EntityId, TreeSpan, TreeSpec};
 
 mod codec;
 mod cursor;
-pub use cursor::{ClockRef, EntityHeadRef, HeadCursor, InventoryClock, KeyedEntityHeadRef};
+pub use codec::InventoryError;
+pub use cursor::{ClockRef, EntityHeadRef, HeadCursor, KeyedEntityHeadRef};
 
 /// All keyed entity heads within exactly `bounds`, including empty gaps.
 ///
@@ -30,9 +28,9 @@ impl TreeSpanInventory {
     /// Check canonical keys, nonempty bounds and strictly increasing addresses
     /// within those bounds. Reads borrowed heads without rebuilding their clocks.
     /// Message budgets and correspondence to a requested span belong to the caller.
-    pub fn validate(&self, spec: &TreeSpec) -> Result<(), TreeError> {
+    pub fn validate(&self, spec: &TreeSpec) -> Result<(), InventoryError> {
         if self.bounds.is_empty() {
-            return Err(TreeError::InvalidKey("empty inventory bounds"));
+            return Err(InventoryError::EmptyBounds);
         }
         let mut previous = Vec::new();
         let mut address = Vec::new();
@@ -42,8 +40,11 @@ impl TreeSpanInventory {
             address.clear();
             address.extend_from_slice(head.key);
             address.extend_from_slice(&head.entity.entity_id.to_bytes());
-            if !self.bounds.contains(&address) || address <= previous {
-                return Err(TreeError::InvalidKey("invalid inventory address order or bounds"));
+            if !self.bounds.contains(&address) {
+                return Err(InventoryError::OutsideBounds);
+            }
+            if address <= previous {
+                return Err(InventoryError::Unordered);
             }
             std::mem::swap(&mut previous, &mut address);
         }
@@ -85,19 +86,22 @@ impl std::fmt::Debug for PackedHeads {
 }
 
 impl Default for PackedHeads {
-    fn default() -> Self { Self::encode(std::iter::empty()) }
+    fn default() -> Self { Self::encode(std::iter::empty()).expect("an empty inventory is within every limit") }
 }
 
-impl From<Vec<KeyedEntityHead>> for PackedHeads {
-    fn from(heads: Vec<KeyedEntityHead>) -> Self {
+impl TryFrom<Vec<KeyedEntityHead>> for PackedHeads {
+    type Error = InventoryError;
+    fn try_from(heads: Vec<KeyedEntityHead>) -> Result<Self, InventoryError> {
         Self::encode(heads.iter().map(|head| (head.key.as_slice(), head.entity.entity_id, &head.entity.head)))
     }
 }
 
 impl PackedHeads {
     /// Encode borrowed keyed entity heads directly, without cloning their keys or clocks.
-    /// The repeatable iterator is scanned for exact size before one buffer is built.
-    pub fn encode<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> Self { codec::write(heads) }
+    /// Refuses more, or larger, heads than one inventory may carry.
+    pub fn encode<'a>(heads: impl Iterator<Item = (&'a [u8], EntityId, &'a Clock)> + Clone) -> Result<Self, InventoryError> {
+        codec::write(heads)
+    }
 
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
@@ -112,7 +116,7 @@ impl PackedHeads {
     /// The work one head adds to an inventory, for filling a page head by head.
     pub fn head_work_bytes(key_len: usize, head: &Clock) -> usize { codec::plain_head_size(key_len, head) }
 
-    /// Explicitly materialize owned heads when a caller needs independent values.
+    /// Materialize owned heads, the inverse of encoding them.
     pub fn to_vec(&self) -> Vec<KeyedEntityHead> {
         let mut heads = Vec::with_capacity(self.len);
         let mut cursor = self.cursor();
@@ -126,31 +130,14 @@ impl PackedHeads {
     /// The cursor shares the packed buffer and can be retained across work batches.
     pub fn cursor(&self) -> HeadCursor { HeadCursor::new(self.bytes.clone()) }
 
-    fn decode(bytes: &[u8]) -> Result<Self, &'static str> {
+    fn decode(bytes: &[u8]) -> Result<Self, InventoryError> {
         let validated = codec::validate(bytes)?;
-        if validated.canonical {
-            return Ok(Self { bytes: Bytes::copy_from_slice(bytes), len: validated.heads, unshared_bytes: validated.unshared_bytes });
-        }
-        // Rare noncanonical clocks retain Clock's sorting/deduplication semantics.
-        // Validate the entire bounded payload before normalizing it once, so all
-        // later cursors see canonical clocks and never allocate per-head clocks.
-        let mut reader = codec::Reader::new(bytes);
-        let encoding = reader.key_encoding()?;
-        reader.uint()?;
-        let mut key = Vec::new();
-        let mut heads = Vec::with_capacity(validated.heads);
-        for _ in 0..validated.heads {
-            heads.push(KeyedEntityHeadRef::from_encoded(reader.head(encoding, &mut key)?).to_owned());
-        }
-        Ok(heads.into())
+        Ok(Self { bytes: Bytes::copy_from_slice(bytes), len: validated.heads, unshared_bytes: validated.unshared_bytes })
     }
 }
 
 impl Serialize for PackedHeads {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        if self.bytes.len() > MAX_OFFER_BYTES || self.unshared_bytes > MAX_OFFER_BYTES || self.len > MAX_OFFER_HEADS {
-            return Err(serde::ser::Error::custom("inventory exceeds codec limits"));
-        }
         if serializer.is_human_readable() {
             let mut seq = serializer.serialize_seq(Some(self.len))?;
             let mut cursor = self.cursor();
@@ -168,9 +155,7 @@ impl<'de> Deserialize<'de> for PackedHeads {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if deserializer.is_human_readable() {
             let heads = Vec::<KeyedEntityHead>::deserialize(deserializer)?;
-            let packed = Self::from(heads);
-            codec::validate(&packed.bytes).map_err(serde::de::Error::custom)?;
-            Ok(packed)
+            Self::try_from(heads).map_err(serde::de::Error::custom)
         } else {
             deserializer.deserialize_bytes(HeadsVisitor)
         }

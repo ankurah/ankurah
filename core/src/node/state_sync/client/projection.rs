@@ -153,7 +153,7 @@ mod tests {
         let mut round = Round::new(StateRound { number: 0, revision: 0 }, snapshot);
         let page = proto::TreeSpanInventory {
             bounds: proto::TreeSpan::new(Excluded(address(2)), Included(address(7))),
-            heads: vec![leaf(4), leaf(6)].into(),
+            heads: vec![leaf(4), leaf(6)].try_into().unwrap(),
         };
         page.validate(&spec)?;
         round.replace(page.clone());

@@ -549,8 +549,7 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
     let source = states(1, 10);
     let id = source[0].payload.entity_id;
     let mut comparison = Comparison::new(stored_snapshot(&node, source.clone()).await?, unknown())?;
-    let clock = proto::PackedHeads::encode(std::iter::once((&[][..], id, &source[0].payload.state.head))).cursor().next_clock().unwrap().1;
-    comparison.known_clocks.insert(id, clock);
+    comparison.known_clocks.insert(id, source[0].payload.state.head.clone());
     let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state frame") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items.as_slice(), [StateItem::Heads(page)] if page.heads.to_vec()[0].entity.entity_id == id));
@@ -672,7 +671,7 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             None,
             Some(proto::FeedbackAnswers::Round {
                 round: 0,
-                answers: vec![StateAnswer::Heads(proto::TreeSpanInventory { bounds: super::super::whole(), heads: vec![].into() })]
+                answers: vec![StateAnswer::Heads(proto::TreeSpanInventory { bounds: super::super::whole(), heads: Default::default() })]
             }),
             vec![]
         )
@@ -1981,7 +1980,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let mut rows = second.heads.to_vec();
     rows[0].key = key;
     let addr = leaf_address(&rows[0].key, rows[0].entity.entity_id);
-    second.heads = rows.into();
+    second.heads = rows.try_into().unwrap();
     first.bounds.end = std::ops::Bound::Excluded(addr.clone());
     second.bounds.start = std::ops::Bound::Included(addr);
     duplicate.spans.push(proto::SpanContent::Heads(second));
@@ -1999,7 +1998,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
             key: vec![],
             entity: proto::EntityHead { entity_id: last.payload.entity_id, head: last.payload.state.head },
         }]
-        .into(),
+        .try_into()?,
     }));
     assert!(Comparison::new(stored_snapshot(&node, before).await?, oversized).is_err(), "total leaf cap spans all pages");
     Ok(())
@@ -2015,7 +2014,8 @@ async fn compressed_initial_spans_share_one_uncompressed_work_budget() -> anyhow
                 entity: proto::EntityHead { entity_id: proto::EntityId::from_bytes([n; 32]), head: proto::Clock::default() },
             })
             .collect::<Vec<_>>()
-            .into(),
+            .try_into()
+            .unwrap(),
     };
     let known = proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Heads(page); 8] };
     assert!(bincode::serialized_size(&known)? < MAX_OFFER_BYTES as u64);
@@ -2050,7 +2050,7 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let address = leaf_address(&page.heads.to_vec()[0].key, page.heads.to_vec()[0].entity.entity_id);
     let removal = StateItem::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(address.clone()), std::ops::Bound::Included(address)),
-        heads: vec![].into(),
+        heads: Default::default(),
     });
     assert!(bincode::serialized_size(&removal)? > MAX_PAGE_BYTES as u64);
     let (node, _, _) = node().await?;

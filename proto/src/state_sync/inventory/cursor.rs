@@ -42,25 +42,6 @@ impl HeadCursor {
         self.remaining -= 1;
         Some(KeyedEntityHeadRef::from_encoded(head))
     }
-
-    /// Retain a clock for later repair selection without allocating its entries.
-    /// The returned slice shares this inventory's backing buffer.
-    pub fn next_clock(&mut self) -> Option<(EntityId, InventoryClock)> {
-        let bytes = self.bytes.clone();
-        let head = self.next()?;
-        Some((head.entity.entity_id, InventoryClock { bytes: bytes.slice_ref(head.entity.head.bytes), count: head.entity.head.count }))
-    }
-}
-
-/// A captured inventory clock whose bytes can outlive the traversal cursor.
-#[derive(Debug, Clone)]
-pub struct InventoryClock {
-    pub(super) bytes: Bytes,
-    count: usize,
-}
-
-impl InventoryClock {
-    pub fn to_owned(&self) -> Clock { ClockRef { bytes: &self.bytes, count: self.count }.to_owned() }
 }
 
 #[derive(Debug, Serialize)]
@@ -94,8 +75,6 @@ pub struct ClockRef<'a> {
 }
 
 impl ClockRef<'_> {
-    pub fn len(&self) -> usize { self.count }
-    pub fn is_empty(&self) -> bool { self.count == 0 }
     pub fn entries(&self) -> impl Iterator<Item = (u32, EventId)> + '_ { codec::tips(self.bytes, self.count) }
     pub fn to_owned(&self) -> Clock { Clock::new(self.entries().collect::<Vec<_>>()).expect("validated clock") }
     pub fn equals(&self, clock: &Clock) -> bool {

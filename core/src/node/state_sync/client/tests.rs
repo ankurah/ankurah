@@ -15,7 +15,7 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
             entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() },
         })
         .collect::<Vec<_>>();
-    let page = proto::TreeSpanInventory { bounds: super::super::whole(), heads: rows.into() };
+    let page = proto::TreeSpanInventory { bounds: super::super::whole(), heads: rows.try_into().unwrap() };
     assert!(page.work_bytes().unwrap() < MAX_PAGE_BYTES as u64);
     let frame = proto::StateFrame {
         stream: proto::StateStreamId::new(),

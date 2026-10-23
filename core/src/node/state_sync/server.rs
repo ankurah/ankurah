@@ -279,7 +279,7 @@ struct Comparison {
     summaries: HashMap<Vec<u8>, NodePrefix>,
     head_requests: Vec<TreeSpan>,
     repaired: HashSet<proto::EntityId>,
-    known_clocks: HashMap<proto::EntityId, proto::InventoryClock>,
+    known_clocks: HashMap<proto::EntityId, proto::Clock>,
     offered: HashSet<Vec<u8>>,
     pending_repairs: HashSet<Vec<u8>>,
     repair_attempts: HashMap<Vec<u8>, usize>,
@@ -1399,8 +1399,11 @@ impl Comparison {
                     ensure!(head_count <= MAX_OFFER_HEADS, "initial inventory exceeds head limit");
                     page.validate(&comparison.snapshot.spec)?;
                     let mut cursor = page.heads.cursor();
-                    while let Some((id, clock)) = cursor.next_clock() {
-                        ensure!(comparison.known_clocks.insert(id, clock).is_none(), "duplicate entity in initial inventory");
+                    while let Some(head) = cursor.next() {
+                        ensure!(
+                            comparison.known_clocks.insert(head.entity.entity_id, head.entity.head.to_owned()).is_none(),
+                            "duplicate entity in initial inventory"
+                        );
                     }
                     comparison.work.push_back(Work::InitialHeads(InitialHeads { bounds: page.bounds, heads: page.heads.cursor() }));
                 }
@@ -1514,7 +1517,7 @@ impl Comparison {
                             key: entry.key.clone(),
                             entity: proto::EntityHead { entity_id: entry.entity_id, head: entry.head.clone() },
                         }]
-                        .into(),
+                        .try_into()?,
                     })));
                     work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head.to_owned())));
                 }
@@ -1555,7 +1558,7 @@ impl Comparison {
             };
         }
         if !fits {
-            work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].to_owned()))).collect();
+            work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].clone()))).collect();
             work.push(Work::SendHeads(processed_bounds));
         }
         if !page.heads.is_empty() {
@@ -1762,7 +1765,7 @@ impl Comparison {
                     let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         let id = leaf.entity.entity_id;
-                        self.work.push_front(Work::Repair(id, self.known_clocks.get(&id).map(proto::InventoryClock::to_owned)));
+                        self.work.push_front(Work::Repair(id, self.known_clocks.get(&id).cloned()));
                     }
                     Some(StateItem::Heads(page))
                 }
