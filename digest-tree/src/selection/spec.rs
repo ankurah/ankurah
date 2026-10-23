@@ -72,10 +72,19 @@ use crate::error::TreeError;
 /// keys with the canonical codec. The reuse planner analyzes predicates to
 /// prove coverage and exact bounds, but does not load or evaluate entity state.
 /// Whether a tree is an index tree is a fact about its owner, not its spec.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TreeSpec {
     key_spec: KeySpec<PropertyId>,
     predicate: Predicate<Resolved>,
+    /// The bytes equality and hashing compare, made once by [`TreeSpec::new`].
+    #[serde(skip)]
+    identity: Vec<u8>,
+}
+
+impl std::fmt::Debug for TreeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TreeSpec").field("key_spec", &self.key_spec).field("predicate", &self.predicate).finish_non_exhaustive()
+    }
 }
 
 impl<'de> Deserialize<'de> for TreeSpec {
@@ -100,7 +109,8 @@ impl TreeSpec {
             part.direction = IndexDirection::Asc;
             part.nulls = None;
         }
-        Self { key_spec, predicate }
+        let identity = Self::identity_bytes(&key_spec, &predicate);
+        Self { key_spec, predicate, identity }
     }
 
     /// Choose a new layout: equality-pinned paths first; under a limit, the
@@ -148,9 +158,9 @@ impl TreeSpec {
 
     /// Identity ignores display labels but preserves predicate structure and
     /// literal bits. The stored predicate retains its labels for diagnostics.
-    fn identity_bytes(&self) -> Vec<u8> {
+    fn identity_bytes(key_spec: &KeySpec<PropertyId>, predicate: &Predicate<Resolved>) -> Vec<u8> {
         let predicate = ankql::selection::map_references::<Resolved, Resolved>(
-            &Selection::from(self.predicate.clone()),
+            &Selection::from(predicate.clone()),
             &|path| {
                 let mut reference = PropertyPath::from(path.property_id());
                 reference.subpath = path.subpath.clone();
@@ -159,7 +169,7 @@ impl TreeSpec {
             &|model| *model,
         )
         .predicate;
-        bincode::serialize(&(&self.key_spec, predicate)).expect("a tree spec serializes")
+        bincode::serialize(&(key_spec, predicate)).expect("a tree spec serializes")
     }
 }
 
@@ -170,7 +180,7 @@ impl TreeSpec {
 /// equal Selections share a tree, is the caller's job, done before it builds
 /// the spec. So is the order of a conjunction's terms, which the bytes keep.
 impl PartialEq for TreeSpec {
-    fn eq(&self, other: &Self) -> bool { self.identity_bytes() == other.identity_bytes() }
+    fn eq(&self, other: &Self) -> bool { self.identity == other.identity }
 }
 
 /// Equality compares bytes, which compare totally, float literals included.
@@ -178,7 +188,7 @@ impl Eq for TreeSpec {}
 
 /// Hashes the bytes equality compares, so equal specs hash alike.
 impl Hash for TreeSpec {
-    fn hash<H: Hasher>(&self, state: &mut H) { self.identity_bytes().hash(state) }
+    fn hash<H: Hasher>(&self, state: &mut H) { self.identity.hash(state) }
 }
 
 #[cfg(test)]

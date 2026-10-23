@@ -208,8 +208,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         id_direction: IndexDirection,
         limit: usize,
     ) -> Result<Vec<LeafRow<G>>, TreeError> {
-        let spec = self.spec.key_spec().clone();
-        let mut walk = TierWalk::new(&spec, directions, id_direction, limit, spans);
+        let spec = self.spec.clone();
+        let mut walk = TierWalk::new(spec.key_spec(), directions, id_direction, limit, spans);
         let mut leaves = Vec::new();
         while let Some(scan) = walk.next_scan() {
             let rows = match scan.direction {

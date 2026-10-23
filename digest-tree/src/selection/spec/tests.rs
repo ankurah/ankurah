@@ -114,7 +114,7 @@ fn every_order_over_the_same_parts_is_one_tree() {
 #[test]
 fn the_entity_id_tree_serializes_canonically() {
     let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::True);
-    assert_eq!(hex(&spec.identity_bytes()), "000000000000000005000000");
+    assert_eq!(hex(&spec.identity), "000000000000000005000000");
 }
 
 /// Specs with a key and a float in the predicate, pinned at their identity
@@ -133,7 +133,7 @@ fn specs_with_float_literals_compare_by_their_bits() {
         .into_iter()
         .map(|(key_spec, bound, bytes)| {
             let spec = TreeSpec::new(key_spec, rating_above(Value::F64(bound)));
-            assert_eq!(hex(&spec.identity_bytes()), bytes, "{bound:?}");
+            assert_eq!(hex(&spec.identity), bytes, "{bound:?}");
             spec
         })
         .collect();

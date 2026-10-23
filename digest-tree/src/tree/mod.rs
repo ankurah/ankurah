@@ -13,6 +13,7 @@
 //! base, a bounded batch per transaction.
 
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::digest::{DigestGroup, Ristretto255};
 use crate::error::TreeError;
@@ -40,21 +41,21 @@ pub use scope::{LeafCursor, LeafPage, TreeScope};
 /// Its operations run in transactions: [`DigestTree::begin`] gives one.
 #[derive(Debug)]
 pub struct DigestTree<G: DigestGroup = Ristretto255> {
-    spec: TreeSpec,
+    spec: Arc<TreeSpec>,
     maps: MemoryMaps,
     group: PhantomData<G>,
 }
 
 impl<G: DigestGroup> DigestTree<G> {
     /// An empty tree defined by `spec`.
-    pub fn new(spec: TreeSpec) -> Self { Self { spec, maps: MemoryMaps::new(), group: PhantomData } }
+    pub fn new(spec: TreeSpec) -> Self { Self { spec: Arc::new(spec), maps: MemoryMaps::new(), group: PhantomData } }
 
     /// The spec that defines the tree.
     pub fn spec(&self) -> &TreeSpec { &self.spec }
 
     /// Begin a transaction over the tree's maps as they stand now, with the
     /// tree's operations.
-    pub fn begin(&self) -> TreeTransaction<G> { TreeTransaction::bind(&self.spec, self.maps.begin()) }
+    pub fn begin(&self) -> TreeTransaction<G> { TreeTransaction::over(self.spec.clone(), self.maps.begin()) }
 }
 
 /// One transaction over a tree's maps, with the tree's operations, its leaves
@@ -73,11 +74,11 @@ impl<G: DigestGroup> DigestTree<G> {
 pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction> {
     pub(crate) transaction: T,
     group: PhantomData<G>,
-    pub(crate) spec: TreeSpec,
+    pub(crate) spec: Arc<TreeSpec>,
     pub(crate) failed: bool,
     pub(crate) generation: u64,
     /// Identifies the transaction view a scope belongs to.
-    pub(crate) view: std::sync::Arc<()>,
+    pub(crate) view: Arc<()>,
 }
 
 impl<G: DigestGroup, T: MapTransaction> TreeTransaction<G, T> {
@@ -164,8 +165,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// tree.commit().await.unwrap();
     /// # }
     /// ```
-    pub fn bind(spec: &TreeSpec, maps: T) -> Self {
-        Self { transaction: maps, group: PhantomData, spec: spec.clone(), failed: false, generation: 0, view: std::sync::Arc::new(()) }
+    pub fn bind(spec: &TreeSpec, maps: T) -> Self { Self::over(Arc::new(spec.clone()), maps) }
+
+    /// A transaction over `maps` as the tree `spec` defines, sharing the spec.
+    fn over(spec: Arc<TreeSpec>, maps: T) -> Self {
+        Self { transaction: maps, group: PhantomData, spec, failed: false, generation: 0, view: Arc::new(()) }
     }
 
     pub(crate) fn mutation_guard(&mut self) -> MutationGuard<'_, G, T> { MutationGuard { tree: self, failure: Some(Failure::Poisoned) } }
