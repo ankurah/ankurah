@@ -12,8 +12,9 @@ use crate::digest::{Digest, DigestGroup, Ristretto255};
 use crate::error::TreeError;
 use crate::store::ByteBounds;
 
-/// A span of leaf addresses. Endpoints are complete addresses, not suffixes
-/// relative to a node prefix.
+/// A span of leaf addresses: every address from its start bound to its end
+/// bound, in byte order. Endpoints are complete addresses, not suffixes
+/// relative to a tree node's prefix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeSpan {
     /// The lower bound.
@@ -23,20 +24,11 @@ pub struct TreeSpan {
 }
 
 impl TreeSpan {
-    /// The range between two bounds.
+    /// The span between two bounds.
     pub fn new(start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Self { Self { start, end } }
 
     /// Every address.
     pub fn all() -> Self { Self::new(Bound::Unbounded, Bound::Unbounded) }
-
-    /// Whether this span contains no addresses.
-    pub fn is_empty(&self) -> bool { empty(self) }
-
-    /// Whether every address in this span also belongs to `other`.
-    pub fn is_subset_of(&self, other: &Self) -> bool { subset(self, other) }
-
-    /// Compare lower bounds in address order, including open and unbounded ends.
-    pub fn cmp_start(&self, other: &Self) -> std::cmp::Ordering { lower_cmp(&self.start, &other.start) }
 
     /// Every address beneath `prefix`: the leaves of a bucket, or of any tree
     /// node.
@@ -45,13 +37,18 @@ impl TreeSpan {
         Self::new(Bound::Included(start), end.map_or(Bound::Unbounded, Bound::Excluded))
     }
 
-    /// The rest of this range after `address`, to read the next page.
+    /// Every byte string that begins with `bytes`.
+    pub(crate) fn starting_with(bytes: &[u8]) -> Self {
+        Self::new(Bound::Included(bytes.to_vec()), prefix_end(bytes).map_or(Bound::Unbounded, Bound::Excluded))
+    }
+
+    /// The rest of this span after `address`, to read the next page.
     pub fn after(&self, address: &[u8]) -> Self { Self::new(Bound::Excluded(address.to_vec()), self.end.clone()) }
 
     /// The bounds as a range scan takes them.
     pub fn bounds(&self) -> ByteBounds<'_> { (self.start.as_ref().map(Vec::as_slice), self.end.as_ref().map(Vec::as_slice)) }
 
-    /// Whether `address` lies within the range.
+    /// Whether `address` lies within the span.
     pub fn contains(&self, address: &[u8]) -> bool {
         let above_start = match &self.start {
             Bound::Included(start) => address >= start.as_slice(),
@@ -65,9 +62,118 @@ impl TreeSpan {
         };
         above_start && below_end
     }
+
+    /// Whether the bounds admit no address: the start lies past the end, or
+    /// on it with either bound excluding it. A span between two adjacent byte
+    /// strings, such as from `a` excluded to `a` followed by a zero byte
+    /// excluded, holds no address either but is not reported empty.
+    pub fn is_empty(&self) -> bool {
+        match (&self.start, &self.end) {
+            (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+            (Bound::Included(start), Bound::Included(end)) => start > end,
+            (Bound::Included(start) | Bound::Excluded(start), Bound::Included(end) | Bound::Excluded(end)) => start >= end,
+        }
+    }
+
+    /// Whether every address in this span also belongs to `other`, judged by
+    /// the bounds: an empty span belongs to every span.
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.is_empty() || (cmp_starts(&self.start, &other.start).is_ge() && cmp_ends(&self.end, &other.end).is_le())
+    }
+
+    /// Compare lower bounds in address order, including open and unbounded ends.
+    pub fn cmp_start(&self, other: &Self) -> Ordering { cmp_starts(&self.start, &other.start) }
+
+    /// The addresses in both this span and `other`; `None` when the
+    /// intersection is empty.
+    pub fn intersect(&self, other: &Self) -> Option<TreeSpan> {
+        let start = if cmp_starts(&self.start, &other.start).is_ge() { &self.start } else { &other.start };
+        let end = if cmp_ends(&self.end, &other.end).is_le() { &self.end } else { &other.end };
+        let span = TreeSpan::new(start.clone(), end.clone());
+        (!span.is_empty()).then_some(span)
+    }
+
+    /// The one byte string this span holds, when both its bounds include it.
+    pub(crate) fn single(&self) -> Option<&[u8]> {
+        match (&self.start, &self.end) {
+            (Bound::Included(start), Bound::Included(end)) if start == end => Some(start),
+            _ => None,
+        }
+    }
+
+    /// The parts of this span outside `covered`, whose spans must be sorted
+    /// by start and must not overlap. Keeping these gaps matters when the
+    /// other peer has leaves absent locally.
+    pub(crate) fn gaps(&self, covered: &[TreeSpan]) -> Vec<TreeSpan> {
+        let mut start = self.start.clone();
+        let mut gaps = Vec::new();
+        for covered in covered {
+            let Some(covered) = self.intersect(covered) else { continue };
+            let end = match covered.start {
+                Bound::Included(value) => Bound::Excluded(value),
+                Bound::Excluded(value) => Bound::Included(value),
+                Bound::Unbounded => {
+                    start = match covered.end {
+                        Bound::Included(value) => Bound::Excluded(value),
+                        Bound::Excluded(value) => Bound::Included(value),
+                        Bound::Unbounded => return gaps,
+                    };
+                    continue;
+                }
+            };
+            let gap = TreeSpan::new(start, end);
+            if !gap.is_empty() {
+                gaps.push(gap);
+            }
+            start = match covered.end {
+                Bound::Included(value) => Bound::Excluded(value),
+                Bound::Excluded(value) => Bound::Included(value),
+                Bound::Unbounded => return gaps,
+            };
+        }
+        let tail = TreeSpan::new(start, self.end.clone());
+        if !tail.is_empty() {
+            gaps.push(tail);
+        }
+        gaps
+    }
+
+    /// The addresses of `spans` as spans in address order that neither
+    /// overlap nor touch: empty spans dropped, the rest sorted by start and
+    /// merged where they meet.
+    pub(crate) fn normalize(mut spans: Vec<TreeSpan>) -> Vec<TreeSpan> {
+        spans.retain(|span| !span.is_empty());
+        spans.sort_by(TreeSpan::cmp_start);
+        let mut out: Vec<TreeSpan> = Vec::new();
+        for span in spans {
+            if let Some(previous) = out.last_mut() {
+                let touches = match (&previous.end, &span.start) {
+                    (Bound::Unbounded, _) | (_, Bound::Unbounded) => true,
+                    (Bound::Excluded(end), Bound::Excluded(start)) => end > start,
+                    (Bound::Included(end) | Bound::Excluded(end), Bound::Included(start) | Bound::Excluded(start)) => end >= start,
+                };
+                if touches {
+                    if cmp_ends(&span.end, &previous.end).is_gt() {
+                        previous.end = span.end;
+                    }
+                    continue;
+                }
+            }
+            out.push(span);
+        }
+        out
+    }
+
+    /// The addresses in both a span of `left` and a span of `right`,
+    /// normalized.
+    pub(crate) fn intersect_all(left: &[TreeSpan], right: &[TreeSpan]) -> Vec<TreeSpan> {
+        TreeSpan::normalize(left.iter().flat_map(|left| right.iter().filter_map(move |right| left.intersect(right))).collect())
+    }
 }
 
-pub(crate) fn lower_cmp(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> Ordering {
+/// Two lower bounds in address order: an unbounded start comes first, and an
+/// included start before an excluded one of the same bytes.
+fn cmp_starts(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> Ordering {
     match (a, b) {
         (Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
         (Bound::Unbounded, _) => Ordering::Less,
@@ -77,7 +183,10 @@ pub(crate) fn lower_cmp(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> Ordering {
         (Bound::Excluded(a), Bound::Included(b)) => a.cmp(b).then(Ordering::Greater),
     }
 }
-pub(crate) fn upper_cmp(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> Ordering {
+
+/// Two upper bounds in address order: an unbounded end comes last, and an
+/// included end after an excluded one of the same bytes.
+fn cmp_ends(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> Ordering {
     match (a, b) {
         (Bound::Unbounded, Bound::Unbounded) => Ordering::Equal,
         (Bound::Unbounded, _) => Ordering::Greater,
@@ -87,88 +196,9 @@ pub(crate) fn upper_cmp(a: &Bound<Vec<u8>>, b: &Bound<Vec<u8>>) -> Ordering {
         (Bound::Excluded(a), Bound::Included(b)) => a.cmp(b).then(Ordering::Less),
     }
 }
-pub(crate) fn empty(range: &TreeSpan) -> bool {
-    match (&range.start, &range.end) {
-        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
-        (Bound::Included(a), Bound::Included(b)) => a > b,
-        (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => a >= b,
-    }
-}
-pub(crate) fn intersect(a: &TreeSpan, b: &TreeSpan) -> Option<TreeSpan> {
-    let start = if lower_cmp(&a.start, &b.start).is_ge() { &a.start } else { &b.start };
-    let end = if upper_cmp(&a.end, &b.end).is_le() { &a.end } else { &b.end };
-    let range = TreeSpan::new(start.clone(), end.clone());
-    (!empty(&range)).then_some(range)
-}
 
-/// The portions of `range` outside a sorted, disjoint set of covered ranges.
-/// Keeping these gaps matters when the other peer has leaves absent locally.
-pub(crate) fn gaps(range: &TreeSpan, covered: &[TreeSpan]) -> Vec<TreeSpan> {
-    let mut start = range.start.clone();
-    let mut gaps = Vec::new();
-    for covered in covered {
-        let Some(covered) = intersect(range, covered) else { continue };
-        let end = match covered.start {
-            Bound::Included(value) => Bound::Excluded(value),
-            Bound::Excluded(value) => Bound::Included(value),
-            Bound::Unbounded => {
-                start = match covered.end {
-                    Bound::Included(value) => Bound::Excluded(value),
-                    Bound::Excluded(value) => Bound::Included(value),
-                    Bound::Unbounded => return gaps,
-                };
-                continue;
-            }
-        };
-        let gap = TreeSpan::new(start, end);
-        if !empty(&gap) {
-            gaps.push(gap);
-        }
-        start = match covered.end {
-            Bound::Included(value) => Bound::Excluded(value),
-            Bound::Excluded(value) => Bound::Included(value),
-            Bound::Unbounded => return gaps,
-        };
-    }
-    let tail = TreeSpan::new(start, range.end.clone());
-    if !empty(&tail) {
-        gaps.push(tail);
-    }
-    gaps
-}
-pub(crate) fn subset(a: &TreeSpan, b: &TreeSpan) -> bool {
-    empty(a) || (lower_cmp(&a.start, &b.start).is_ge() && upper_cmp(&a.end, &b.end).is_le())
-}
-pub(crate) fn singleton(range: &TreeSpan) -> Option<&[u8]> {
-    match (&range.start, &range.end) {
-        (Bound::Included(a), Bound::Included(b)) if a == b => Some(a),
-        _ => None,
-    }
-}
-pub(crate) fn normalize(mut ranges: Vec<TreeSpan>) -> Vec<TreeSpan> {
-    ranges.retain(|range| !empty(range));
-    ranges.sort_by(|a, b| lower_cmp(&a.start, &b.start));
-    let mut out: Vec<TreeSpan> = Vec::new();
-    for range in ranges {
-        if let Some(previous) = out.last_mut() {
-            let touches = match (&previous.end, &range.start) {
-                (Bound::Unbounded, _) | (_, Bound::Unbounded) => true,
-                (Bound::Excluded(a), Bound::Excluded(b)) => a > b,
-                (Bound::Included(a) | Bound::Excluded(a), Bound::Included(b) | Bound::Excluded(b)) => a >= b,
-            };
-            if touches {
-                if upper_cmp(&range.end, &previous.end).is_gt() {
-                    previous.end = range.end;
-                }
-                continue;
-            }
-        }
-        out.push(range);
-    }
-    out
-}
-
-/// First byte string after every string starting with `prefix`.
+/// The first byte string after every string that begins with `prefix`; `None`
+/// when no string follows them all, as for a prefix of only 255 bytes.
 pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut end = prefix.to_vec();
     while let Some(byte) = end.pop() {
@@ -178,14 +208,6 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
-}
-
-pub(crate) fn prefix_range(prefix: &[u8]) -> TreeSpan {
-    TreeSpan::new(Bound::Included(prefix.to_vec()), prefix_end(prefix).map_or(Bound::Unbounded, Bound::Excluded))
-}
-
-pub(crate) fn intersections(a: &[TreeSpan], b: &[TreeSpan]) -> Vec<TreeSpan> {
-    normalize(a.iter().flat_map(|a| b.iter().filter_map(move |b| intersect(a, b))).collect())
 }
 
 /// A tree span and the digest of its leaves, cached or computed for clipped bounds.
@@ -305,14 +327,14 @@ mod tests {
         let ranges: Vec<_> = endpoints
             .iter()
             .flat_map(|start| endpoints.iter().map(move |end| TreeSpan::new(start.clone(), end.clone())))
-            .filter(|range| !empty(range))
+            .filter(|range| !range.is_empty())
             .collect();
         let samples = [vec![], vec![0], vec![1], vec![1, 0], vec![1, 0, 0], vec![1, 1], vec![2], vec![2, 0], vec![255]];
         for range in &ranges {
             for a in &ranges {
                 for b in &ranges {
-                    let covered = normalize(vec![a.clone(), b.clone()]);
-                    let missing = gaps(range, &covered);
+                    let covered = TreeSpan::normalize(vec![a.clone(), b.clone()]);
+                    let missing = range.gaps(&covered);
                     for address in &samples {
                         let uncovered = range.contains(address) && !covered.iter().any(|part| part.contains(address));
                         assert_eq!(

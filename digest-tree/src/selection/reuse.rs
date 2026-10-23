@@ -9,7 +9,7 @@ use ankurah_core_types::{IndexDirection, IndexKeyPart, KeySpec, PropertyId, Prop
 
 use super::request::{clauses, path, Clause, TreeRequest};
 use super::TreeSpec;
-use crate::address::span::{intersect, normalize, prefix_end, prefix_range, singleton, subset};
+use crate::address::span::prefix_end;
 use crate::address::{validate_part, TreeSpan};
 
 /// How a tree serves a request before applying its optional limit.
@@ -89,7 +89,7 @@ impl TreeSpec {
         }
         Some(ReusePlan {
             kind: if whole { TreeMatch::Whole } else { TreeMatch::Span },
-            ranges: normalize(ranges),
+            ranges: TreeSpan::normalize(ranges),
             directions,
             id_direction,
         })
@@ -100,7 +100,7 @@ fn implies(left: &[Clause], right: &[Clause]) -> bool {
     left.iter().all(|a| {
         right.iter().any(|b| {
             b.opaque.is_subset(&a.opaque)
-                && b.fields.iter().all(|(path, domain)| a.fields.get(path).is_some_and(|value| subset(value, domain)))
+                && b.fields.iter().all(|(path, domain)| a.fields.get(path).is_some_and(|value| value.is_subset_of(domain)))
         })
     })
 }
@@ -112,7 +112,7 @@ fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Opti
     let mut required: BTreeSet<_> = query
         .fields
         .iter()
-        .filter(|(path, domain)| !admission.iter().all(|c| c.fields.get(*path).is_some_and(|stored| subset(stored, domain))))
+        .filter(|(path, domain)| !admission.iter().all(|c| c.fields.get(*path).is_some_and(|stored| stored.is_subset_of(domain))))
         .map(|(path, _)| path.clone())
         .collect();
     let mut prefix = Vec::new();
@@ -124,10 +124,10 @@ fn span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) -> Opti
         let implicit_id = index == key.keyparts.len();
         let Some(domain) = query.fields.get(&path) else { break };
         required.remove(&path);
-        if let Some(value) = singleton(domain) {
+        if let Some(value) = domain.single() {
             // The implicit entity-id suffix has no nullable part marker.
             prefix.extend(if implicit_id { value.get(1..)? } else { value });
-            range = prefix_range(&prefix);
+            range = TreeSpan::starting_with(&prefix);
         } else {
             range = part_range(&prefix, domain, implicit_id)?;
             break;
@@ -143,7 +143,7 @@ fn part_range(prefix: &[u8], domain: &TreeSpan, implicit_id: bool) -> Option<Tre
         let value = if implicit_id { value.get(1..)? } else { value };
         Some([prefix, value].concat())
     };
-    let whole = prefix_range(prefix);
+    let whole = TreeSpan::starting_with(prefix);
     let empty = || TreeSpan::new(Included(vec![]), Excluded(vec![]));
     let start = match &domain.start {
         Included(value) => Included(address(value)?),
@@ -158,5 +158,5 @@ fn part_range(prefix: &[u8], domain: &TreeSpan, implicit_id: bool) -> Option<Tre
         Excluded(value) => Excluded(address(value)?),
         Unbounded => whole.end.clone(),
     };
-    Some(intersect(&whole, &TreeSpan::new(start, end)).unwrap_or_else(empty))
+    Some(whole.intersect(&TreeSpan::new(start, end)).unwrap_or_else(empty))
 }

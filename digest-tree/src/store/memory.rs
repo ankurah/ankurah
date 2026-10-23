@@ -141,8 +141,7 @@ impl MapAccess for MemoryTransaction {
     }
 
     async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
-        let owned = crate::TreeSpan::new(bounds.0.map(<[u8]>::to_vec), bounds.1.map(<[u8]>::to_vec));
-        if crate::address::span::empty(&owned) {
+        if inverted(bounds) {
             return Ok(Vec::new());
         }
         let began_with = self.began_with.0[map as usize].range::<[u8], _>(bounds).rev();

@@ -9,7 +9,7 @@ use ankurah_core_types::{EntityId, IndexDirection, KeySpec, PropertyId};
 
 use super::reuse::ReusePlan;
 use super::{TreeRequest, TreeSpec};
-use crate::address::span::{intersections, normalize, prefix_end, prefix_range};
+use crate::address::span::prefix_end;
 use crate::address::{CanonicalCodec, TreeSpan};
 use crate::error::TreeError;
 
@@ -52,7 +52,7 @@ impl TreeSpec {
         }
         if walk.seen == limit {
             let cut = order_cut(self.key_spec(), &directions, id_direction, last.expect("a positive limit was filled"), true)?;
-            ranges = intersections(&ranges, &cut);
+            ranges = TreeSpan::intersect_all(&ranges, &cut);
         }
         Ok(ranges)
     }
@@ -129,13 +129,13 @@ impl<'a> TierWalk<'a> {
         };
         let parts = address_parts(self.spec, address)?;
         let prefix = parts[..=tier.depth].concat();
-        let inside = intersections(&tier.ranges, &[prefix_range(&prefix)]);
+        let inside = TreeSpan::intersect_all(&tier.ranges, &[TreeSpan::starting_with(&prefix)]);
         let direction = self.directions[tier.depth];
         let rest = match direction {
             IndexDirection::Asc => prefix_end(&prefix).map(|end| TreeSpan::new(Included(end), Unbounded)),
             IndexDirection::Desc => Some(TreeSpan::new(Unbounded, Excluded(prefix))),
         };
-        tier.ranges = rest.map(|rest| intersections(&tier.ranges, &[rest])).unwrap_or_default();
+        tier.ranges = rest.map(|rest| TreeSpan::intersect_all(&tier.ranges, &[rest])).unwrap_or_default();
         tier.next = 0;
         let depth = tier.depth + 1;
         self.tiers.push(Tier { ranges: inside, depth, next: 0 });
@@ -162,7 +162,7 @@ pub(crate) fn order_cut(
     let mut ranges = Vec::new();
     for (part, direction) in parts.iter().zip(directions) {
         let value = [prefix.as_slice(), part].concat();
-        let tier = prefix_range(&prefix);
+        let tier = TreeSpan::starting_with(&prefix);
         let smaller = before == (*direction == IndexDirection::Asc);
         let range = if smaller {
             Some(TreeSpan::new(tier.start, Excluded(value.clone())))
@@ -174,7 +174,7 @@ pub(crate) fn order_cut(
         }
         prefix = value;
     }
-    let tier = prefix_range(&prefix);
+    let tier = TreeSpan::starting_with(&prefix);
     let address = address.to_vec();
     let smaller = before == (id_direction == IndexDirection::Asc);
     let edge = if smaller {
@@ -183,7 +183,7 @@ pub(crate) fn order_cut(
         TreeSpan::new(if before { Included(address) } else { Excluded(address) }, tier.end)
     };
     ranges.push(edge);
-    Ok(normalize(ranges))
+    Ok(TreeSpan::normalize(ranges))
 }
 
 #[cfg(test)]

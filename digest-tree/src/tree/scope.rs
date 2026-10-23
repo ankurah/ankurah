@@ -6,7 +6,6 @@ use std::sync::Arc;
 use ankurah_core_types::IndexDirection;
 
 use super::TreeTransaction;
-use crate::address::span::{gaps, intersect, intersections, lower_cmp, normalize, subset};
 use crate::address::{NodePrefix, TreeSpan, TreeSpanDigest};
 use crate::digest::{Digest, DigestGroup, Ristretto255};
 use crate::error::TreeError;
@@ -53,7 +52,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// including multiple keys for one entity, and walk in address order.
     pub fn scope_ranges(&self, ranges: impl IntoIterator<Item = TreeSpan>) -> TreeScope {
         TreeScope {
-            ranges: normalize(ranges.into_iter().collect()),
+            ranges: TreeSpan::normalize(ranges.into_iter().collect()),
             directions: vec![IndexDirection::Asc; self.spec.key_spec().keyparts.len()],
             id_direction: IndexDirection::Asc,
             snapshot: self.snapshot.clone(),
@@ -83,7 +82,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 if rows.len() == limit {
                     let last = rows.last().expect("a positive limit was filled");
                     let cut = order_cut(spec.key_spec(), &directions, id_direction, &last.address(), true)?;
-                    ranges = intersections(&ranges, &cut);
+                    ranges = TreeSpan::intersect_all(&ranges, &cut);
                 }
             }
         }
@@ -124,7 +123,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     /// Refine a span digest into the nearest cached descendants, keeping its address
     /// clip. At a terminal bucket, returns its exact clipped span digest again.
     pub async fn refine(&mut self, head: &TreeSpanDigest<G>) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
-        let bounds = intersect(&TreeSpan::under(&head.prefix), &head.bounds).ok_or(TreeError::InvalidKey("empty tree span"))?;
+        let bounds = TreeSpan::under(&head.prefix).intersect(&head.bounds).ok_or(TreeError::InvalidKey("empty tree span"))?;
         let children = self.child_prefixes(&head.prefix).await?;
         if children.is_empty() {
             return self.span_digests_in(&head.prefix, &bounds).await;
@@ -133,7 +132,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         for prefix in children {
             heads.extend(self.span_digests_in(&prefix, &bounds).await?);
         }
-        heads.sort_by(|a, b| lower_cmp(&a.bounds.start, &b.bounds.start));
+        heads.sort_by(|a, b| a.bounds.cmp_start(&b.bounds));
         Ok(heads)
     }
 
@@ -142,10 +141,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let mut heads = Vec::new();
         while let Some(prefix) = pending.pop() {
             let entire = TreeSpan::under(&prefix);
-            let Some(bounds) = intersect(&entire, range) else {
+            let Some(bounds) = entire.intersect(range) else {
                 continue;
             };
-            if subset(&entire, range) {
+            if entire.is_subset_of(range) {
                 if let Some(node) = self.node(&prefix).await? {
                     if node.digest.count() < 0 {
                         return Err(TreeError::Audit("negative node count"));
@@ -163,7 +162,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                 pending.extend(children.into_iter().rev());
             }
         }
-        heads.sort_by(|a, b| lower_cmp(&a.bounds.start, &b.bounds.start));
+        heads.sort_by(|a, b| a.bounds.cmp_start(&b.bounds));
         Ok(heads)
     }
 
@@ -192,7 +191,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let next = if more {
             let spec = &self.spec;
             let cut = order_cut(spec.key_spec(), &scope.directions, scope.id_direction, &rows.last().unwrap().address(), false)?;
-            Some(LeafCursor { remaining: intersections(ranges, &cut), scope: scope.clone() })
+            Some(LeafCursor { remaining: TreeSpan::intersect_all(ranges, &cut), scope: scope.clone() })
         } else {
             None
         };
@@ -230,5 +229,5 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 /// not cover their parent's addresses. Represent the rest explicitly.
 fn empty_gaps<G: DigestGroup>(prefix: &NodePrefix, bounds: &TreeSpan, children: &[NodePrefix]) -> Vec<TreeSpanDigest<G>> {
     let covered: Vec<_> = children.iter().map(TreeSpan::under).collect();
-    gaps(bounds, &covered).into_iter().map(|bounds| TreeSpanDigest { prefix: prefix.clone(), bounds, digest: Digest::empty() }).collect()
+    bounds.gaps(&covered).into_iter().map(|bounds| TreeSpanDigest { prefix: prefix.clone(), bounds, digest: Digest::empty() }).collect()
 }

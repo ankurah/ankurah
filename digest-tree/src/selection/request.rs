@@ -9,7 +9,6 @@ use ankql::ast::{ComparisonOperator as Op, Expr, OrderDirection, Predicate, Reso
 use ankurah_core_types::{IndexDirection, IndexKeyPart, KeySpec, PropertyId, PropertyPath, ValueType};
 
 use crate::address::encode_part;
-use crate::address::span::{empty, intersect, singleton};
 use crate::address::TreeSpan;
 use crate::error::TreeError;
 
@@ -78,8 +77,8 @@ impl TreeRequest {
     }
 
     pub(crate) fn pinned(&self, path: &PropertyPath) -> Option<&[u8]> {
-        let value = singleton(self.clauses.first()?.fields.get(path)?)?;
-        self.clauses.iter().all(|c| c.fields.get(path).and_then(singleton) == Some(value)).then_some(value)
+        let value = self.clauses.first()?.fields.get(path)?.single()?;
+        self.clauses.iter().all(|c| c.fields.get(path).and_then(TreeSpan::single) == Some(value)).then_some(value)
     }
 }
 
@@ -111,7 +110,7 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
                     let mut possible = true;
                     for (path, domain) in &b.fields {
                         let domain = match merged.fields.get(path) {
-                            Some(previous) => intersect(previous, domain),
+                            Some(previous) => previous.intersect(domain),
                             None => Some(domain.clone()),
                         };
                         match domain {
@@ -194,7 +193,7 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
                 }
                 _ => return Ok(opaque(predicate)),
             };
-            if empty(&domain) {
+            if domain.is_empty() {
                 Ok(vec![])
             } else {
                 Ok(vec![field(path, domain.start, domain.end)])
