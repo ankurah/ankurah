@@ -26,7 +26,7 @@ const QUIET: Duration = Duration::from_millis(2);
 
 /// The messages and bytes each node sent during the measured interval, serialized and without
 /// transport framing.
-#[derive(Clone, Default, Serialize)]
+#[derive(Default, Serialize)]
 pub struct Traffic {
     pub requester_messages: usize,
     pub responder_messages: usize,
@@ -140,9 +140,6 @@ impl Link {
         state.measuring = true;
         Ok(())
     }
-
-    /// The traffic counted so far in the measured interval.
-    pub fn traffic(&self) -> Traffic { self.state.lock().unwrap().traffic.clone() }
 
     /// Stops counting traffic and returns what the measured interval sent. Fails if a node
     /// reported an error.

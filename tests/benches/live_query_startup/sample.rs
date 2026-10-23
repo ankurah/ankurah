@@ -22,9 +22,11 @@ struct Landmark {
 }
 
 impl Landmark {
+    /// The landmark at the present moment.
     fn reached(start: Instant) -> anyhow::Result<Self> { Ok(Self { us: start.elapsed().as_micros(), cpu: ProcessCpu::now()? }) }
 }
 
+/// Runs one sample of `case` on a fresh fixture and prints its record.
 pub async fn run(case: &Case<'_>) -> anyhow::Result<()> {
     let selection = case.selection();
     let ordered = case.limit.is_some();
@@ -77,7 +79,6 @@ pub async fn run(case: &Case<'_>) -> anyhow::Result<()> {
     // The activation's subscription response and a quiet link confirm the result already verified.
     let settled_at = fixture.link.settle(subscriptions_before + 1, required_query_subscription).await?;
     let settled = Landmark { us: settled_at.duration_since(start).as_micros(), cpu: ProcessCpu::now()? };
-    let settled_traffic = fixture.link.traffic();
     // Work the nodes do after the link settles still counts; only the verifier's own point reads
     // of each expected entity are left out.
     let verified_entities = fixture.expected.members.len();
@@ -104,28 +105,22 @@ pub async fn run(case: &Case<'_>) -> anyhow::Result<()> {
         ready_us: ready.map(|ready| ready.us),
         local_result_installed_us: installed.map(|installed| installed.us),
         local_result_capture_us: installation.map(|installation| installation.capture_us),
-        initial_drained_us: settled.us,
-        settled_us: settled.us.max(ready.map_or(verified.us, |ready| ready.us)),
-        transport_settled_us: settled.us,
         verified_us: verified.us,
         verification_us,
-        verification_attempts: verified_entities,
+        transport_settled_us: settled.us,
         verified: true,
         traffic,
-        settled_traffic,
         server_reads,
         client_reads,
         phase_process_cpu: PhaseCpu {
-            scope: "process CPU during each interval: server/client combined, all background threads included; phases can overlap; initial/final drain follow verification and include it; local_result_capture is separate reconnect capture work; excludes teardown",
             setup: ProcessCpu::between(setup_cpu, measurement_cpu),
             through_ready: through(ready),
-            through_initial_drain: through(Some(settled)),
             through_local_result_installed: through(installed),
             local_result_capture: installation.and_then(|installation| installation.capture_cpu),
             verification: ProcessCpu::between(verification_cpu, verified.cpu),
             through_verified: through(Some(verified)),
-            after_verification_drain: ProcessCpu::between(verified.cpu, settled.cpu),
-            through_final_drain: through(Some(settled)),
+            through_transport_settled: through(Some(settled)),
+            verified_to_transport_settled: ProcessCpu::between(verified.cpu, settled.cpu),
         },
     }
     .print()?;

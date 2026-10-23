@@ -104,10 +104,6 @@ pub enum Cache {
     Empty,
     /// The first half of the result.
     Half,
-    /// Alternating blocks of 256 result rows.
-    HalfBlocks,
-    /// Every other result row.
-    HalfInterleaved,
     /// The whole result, fetched with the measured selection itself.
     All,
     /// Every row, fetched with the unlimited predicate, so a limited query can be answered from a
@@ -122,8 +118,6 @@ impl FromStr for Cache {
         Ok(match cache {
             "empty" => Cache::Empty,
             "half" => Cache::Half,
-            "half_blocks" => Cache::HalfBlocks,
-            "half_interleaved" => Cache::HalfInterleaved,
             "all" => Cache::All,
             "full" => Cache::Full,
             _ => anyhow::bail!("unknown cache mode: {cache}"),

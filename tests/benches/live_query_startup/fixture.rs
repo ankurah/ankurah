@@ -84,63 +84,15 @@ impl Fixture {
     pub async fn prefetch(&self, case: &Case<'_>, selection: &str) -> anyhow::Result<usize> {
         phase("prefetch");
         let result_count = case.result_count();
-        let limited = case.limit.is_some();
-        let cached = match case.cache {
-            Cache::Empty => 0,
+        let (cached, coverage) = match case.cache {
+            Cache::Empty => (0, 0),
             Cache::Half => {
-                let half = if limited {
+                let half = if case.limit.is_some() {
                     format!("body >= 'row-' AND body < 'row-{:08}'", result_count / 2)
                 } else {
                     format!("position < {}", result_count / 2)
                 };
-                self.reader.fetch::<StartupRowView>(half).await?.len()
-            }
-            Cache::HalfBlocks => {
-                let blocks = (0..result_count)
-                    .step_by(512)
-                    .map(|start| {
-                        let end = (start + 256).min(result_count);
-                        if limited {
-                            format!("(body >= 'row-{start:08}' AND body < 'row-{end:08}')")
-                        } else {
-                            format!("(position >= {start} AND position < {end})")
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                let wanted: BTreeSet<_> = self
-                    .rows
-                    .iter()
-                    .take(result_count)
-                    .enumerate()
-                    .filter(|(position, _)| position / 256 % 2 == 0)
-                    .map(|(_, row)| row.id())
-                    .collect();
-                let mut cached_ids = BTreeSet::new();
-                for batch in blocks.chunks(16) {
-                    cached_ids.extend(self.reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
-                }
-                anyhow::ensure!(cached_ids == wanted, "gapped prefetch membership");
-                cached_ids.len()
-            }
-            Cache::HalfInterleaved => {
-                let positions = (0..result_count)
-                    .step_by(2)
-                    .map(|position| if limited { format!("body = 'row-{position:08}'") } else { format!("position = {position}") })
-                    .collect::<Vec<_>>();
-                let wanted: BTreeSet<_> = self
-                    .rows
-                    .iter()
-                    .take(result_count)
-                    .enumerate()
-                    .filter(|(position, _)| position % 2 == 0)
-                    .map(|(_, row)| row.id())
-                    .collect();
-                let mut cached_ids = BTreeSet::new();
-                for batch in positions.chunks(32) {
-                    cached_ids.extend(self.reader.fetch::<StartupRowView>(batch.join(" OR ")).await?.into_iter().map(|row| row.id()));
-                }
-                anyhow::ensure!(cached_ids == wanted, "gapped prefetch membership");
-                cached_ids.len()
+                (self.reader.fetch::<StartupRowView>(half).await?.len(), result_count / 2)
             }
             Cache::All => {
                 let fetched = self.reader.fetch::<StartupRowView>(selection).await?;
@@ -150,17 +102,9 @@ impl Fixture {
                         "prefetch has incorrect ordered membership"
                     );
                 }
-                fetched.len()
+                (fetched.len(), result_count)
             }
-            Cache::Full => self.reader.fetch::<StartupRowView>(case.predicate()).await?.len(),
-        };
-        let coverage = match case.cache {
-            Cache::Empty => 0,
-            Cache::Half => result_count / 2,
-            Cache::HalfBlocks => (0..result_count).filter(|position| position / 256 % 2 == 0).count(),
-            Cache::HalfInterleaved => result_count.div_ceil(2),
-            Cache::All => result_count,
-            Cache::Full => case.entities,
+            Cache::Full => (self.reader.fetch::<StartupRowView>(case.predicate()).await?.len(), case.entities),
         };
         anyhow::ensure!(cached == coverage, "prefetch coverage: fetched {cached} rows, expected {coverage}");
         self.link.settle(0, None).await?;
