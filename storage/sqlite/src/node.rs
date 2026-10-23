@@ -312,8 +312,10 @@ impl SqliteExecutor for NodeConnection {
         let statement = self.prepare(sql)?;
         let width = width(&statement)?;
         if width == 0 {
-            // A statement without columns yields no rows; it runs for its effect.
-            all(&statement, params, 0)?;
+            // A statement without columns yields no rows; it runs for its
+            // effect, through `run`, since better-sqlite3 refuses `all` on a
+            // statement it reports yields no rows.
+            statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
             return Ok(Vec::new());
         }
         let source = source(&statement)?;

@@ -231,6 +231,22 @@ async fn execute_refuses_a_statement_that_yields_a_row() -> Result<()> {
     Ok(())
 }
 
+/// `query` runs a statement that yields no rows for its effect and returns
+/// none, as rusqlite's does, on every driver.
+#[engine_test]
+async fn query_runs_a_statement_that_yields_no_rows() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (rows, count) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY)", &[])?;
+            let rows = executor.query("INSERT INTO things (k) VALUES (1)", &[])?.len();
+            Ok((rows, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
+        })
+        .await?;
+    assert_eq!((rows, count), (0, 1), "the insert ran and yielded no rows");
+    Ok(())
+}
+
 /// An error SQLite raises carries its extended result code on rusqlite and
 /// on node:sqlite alike, and none on better-sqlite3, which names the code
 /// without its number.
