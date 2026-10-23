@@ -2,7 +2,7 @@
 //!
 //! Converts AnkQL predicates to SQLite-compatible SQL WHERE clauses.
 
-use crate::error::SqliteError;
+use crate::{error::SqliteError, value::SqliteValue};
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core_types::Value;
 use ankurah_storage_common::EngineColumns;
@@ -130,7 +130,7 @@ fn can_pushdown_expr(expr: &Expr<Resolved>) -> bool {
 /// SQL builder for SQLite queries
 pub struct SqlBuilder {
     sql: String,
-    params: Vec<rusqlite::types::Value>,
+    params: Vec<SqliteValue>,
     fields: Vec<String>,
     table_name: Option<String>,
 }
@@ -153,12 +153,12 @@ impl SqlBuilder {
 
     fn push_sql(&mut self, s: &str) { self.sql.push_str(s); }
 
-    fn push_param(&mut self, value: rusqlite::types::Value) {
+    fn push_param(&mut self, value: SqliteValue) {
         self.sql.push('?');
         self.params.push(value);
     }
 
-    pub fn build(self) -> Result<(String, Vec<rusqlite::types::Value>), SqlGenerationError> {
+    pub fn build(self) -> Result<(String, Vec<SqliteValue>), SqlGenerationError> {
         if self.fields.is_empty() || self.table_name.is_none() {
             // Just return WHERE clause
             return Ok((self.sql, self.params));
@@ -172,7 +172,7 @@ impl SqlBuilder {
     }
 
     #[allow(dead_code)]
-    pub fn build_where_clause(self) -> (String, Vec<rusqlite::types::Value>) { (self.sql, self.params) }
+    pub fn build_where_clause(self) -> (String, Vec<SqliteValue>) { (self.sql, self.params) }
 
     pub fn expr(&mut self, expr: &Expr<EngineColumns>) -> Result<(), SqlGenerationError> {
         match expr {
@@ -212,33 +212,33 @@ impl SqlBuilder {
 
     fn literal(&mut self, lit: &Value) {
         match lit {
-            Value::String(s) => self.push_param(rusqlite::types::Value::Text(s.clone())),
-            Value::I64(i) => self.push_param(rusqlite::types::Value::Integer(*i)),
-            Value::F64(f) => self.push_param(rusqlite::types::Value::Real(*f)),
-            Value::Bool(b) => self.push_param(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
-            Value::I16(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
-            Value::I32(i) => self.push_param(rusqlite::types::Value::Integer(*i as i64)),
-            Value::EntityId(id) => self.push_param(rusqlite::types::Value::Text(id.to_base64())),
-            Value::Object(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
-            Value::Binary(bytes) => self.push_param(rusqlite::types::Value::Blob(bytes.clone())),
+            Value::String(s) => self.push_param(SqliteValue::Text(s.clone())),
+            Value::I64(i) => self.push_param(SqliteValue::Integer(*i)),
+            Value::F64(f) => self.push_param(SqliteValue::Real(*f)),
+            Value::Bool(b) => self.push_param(SqliteValue::Integer(if *b { 1 } else { 0 })),
+            Value::I16(i) => self.push_param(SqliteValue::Integer(*i as i64)),
+            Value::I32(i) => self.push_param(SqliteValue::Integer(*i as i64)),
+            Value::EntityId(id) => self.push_param(SqliteValue::Text(id.to_base64())),
+            Value::Object(bytes) => self.push_param(SqliteValue::Blob(bytes.clone())),
+            Value::Binary(bytes) => self.push_param(SqliteValue::Blob(bytes.clone())),
             // For JSON literals, extract the raw SQL value since json_extract() returns SQL types.
             // json.to_string() would produce "US" (with quotes) but we need just US.
             Value::Json(json) => match json {
-                serde_json::Value::String(s) => self.push_param(rusqlite::types::Value::Text(s.clone())),
+                serde_json::Value::String(s) => self.push_param(SqliteValue::Text(s.clone())),
                 serde_json::Value::Number(n) => {
                     if let Some(i) = n.as_i64() {
-                        self.push_param(rusqlite::types::Value::Integer(i));
+                        self.push_param(SqliteValue::Integer(i));
                     } else if let Some(f) = n.as_f64() {
-                        self.push_param(rusqlite::types::Value::Real(f));
+                        self.push_param(SqliteValue::Real(f));
                     } else {
                         // Fallback: serialize as text
-                        self.push_param(rusqlite::types::Value::Text(n.to_string()));
+                        self.push_param(SqliteValue::Text(n.to_string()));
                     }
                 }
-                serde_json::Value::Bool(b) => self.push_param(rusqlite::types::Value::Integer(if *b { 1 } else { 0 })),
-                serde_json::Value::Null => self.push_param(rusqlite::types::Value::Null),
+                serde_json::Value::Bool(b) => self.push_param(SqliteValue::Integer(if *b { 1 } else { 0 })),
+                serde_json::Value::Null => self.push_param(SqliteValue::Null),
                 // For arrays and objects, serialize as JSON text
-                _ => self.push_param(rusqlite::types::Value::Text(json.to_string())),
+                _ => self.push_param(SqliteValue::Text(json.to_string())),
             },
         }
     }
@@ -362,6 +362,8 @@ mod tests {
     use ankql::parser::parse_selection;
     use ankql::selection::map_references;
     use ankurah_storage_common::ColumnPath;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test as test;
 
     fn lowered(query: &str) -> Selection<EngineColumns> {
         map_references(&parse_selection(query).unwrap(), &|path| ColumnPath::new(path.first(), path.steps[1..].to_vec()), &|model| {

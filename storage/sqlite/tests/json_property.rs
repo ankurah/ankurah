@@ -20,6 +20,13 @@ use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::test as engine_test;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as engine_test;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as test;
 
 /// Resolves fixture names to deterministic property ids.
 struct FixtureResolver;
@@ -67,7 +74,7 @@ pub struct Track {
     pub licensing: Json,
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_property_storage_and_simple_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -110,7 +117,7 @@ fn test_json_path_pushdown_verification() {
     assert_fully_pushes_down("licensing.nested.deeply.value = 'test'");
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_path_query_string_equality() -> Result<()> {
     // Verify pushdown before running the actual query
     assert_fully_pushes_down("licensing.territory = 'US'");
@@ -157,7 +164,7 @@ async fn test_json_path_query_string_equality() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_path_query_numeric_comparison() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -188,7 +195,7 @@ async fn test_json_path_query_numeric_comparison() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_path_nested_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -229,7 +236,7 @@ async fn test_json_path_nested_query() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_path_combined_with_regular_field() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -253,7 +260,7 @@ async fn test_json_path_combined_with_regular_field() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_path_query_with_or() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -280,7 +287,7 @@ async fn test_json_path_query_with_or() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_path_query_numeric_ordering() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());

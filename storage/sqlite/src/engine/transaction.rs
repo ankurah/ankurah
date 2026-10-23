@@ -41,14 +41,20 @@ pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<EventRow>,
         .collect()
 }
 
-pub(super) fn insert_events(conn: &Connection, events: &[EventRow]) -> Result<(), SqliteError> {
+pub(super) fn insert_events(conn: &dyn SqliteExecutor, events: &[EventRow]) -> Result<(), SqliteError> {
     for event in events {
         conn.execute(
             &format!(
                 r#"INSERT INTO "{EVENT_TABLE}" ("id", "entity_id", "body", "parent", "attestations")
                 VALUES (?, ?, ?, ?, ?) ON CONFLICT ("id") DO NOTHING"#
             ),
-            rusqlite::params![&event.id, &event.entity_id, &event.body, &event.parent, &event.attestations],
+            &[
+                SqliteValue::Text(event.id.clone()),
+                SqliteValue::Text(event.entity_id.clone()),
+                SqliteValue::Blob(event.body.clone()),
+                SqliteValue::Text(event.parent.clone()),
+                SqliteValue::Blob(event.attestations.clone()),
+            ],
         )?;
     }
     Ok(())
@@ -108,10 +114,10 @@ impl StorageTransaction for SqliteTransaction<'_> {
         let Self { engine, entities, events, .. } = self;
         let conn = engine.pool.get().await.map_err(|error| MutationError::General(Box::new(SqliteError::Pool(error.to_string()))))?;
         engine.ensure_shared_tables(&conn).await?;
-        conn.with_connection_mut(move |c| {
+        conn.with_executor(move |c| {
             // BEGIN IMMEDIATE serializes writers before expectations
             // are read, including concurrent first inserts.
-            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let tx = c.begin(Behavior::Immediate)?;
             let mut ordered: Vec<(usize, &EntityRow)> = entities.iter().enumerate().collect();
             ordered.sort_by_key(|(_, write)| write.entity_id);
 
@@ -120,18 +126,16 @@ impl StorageTransaction for SqliteTransaction<'_> {
             for (_, write) in &ordered {
                 let entity_id = write.entity_id;
                 let entity_key = entity_id.to_base64();
-                let current_row = tx
-                    .query_row(
-                        &format!(
-                            r#"SELECT "id", "state_buffer", "head", "attestations"
+                let current_row = tx.query_row(
+                    &format!(
+                        r#"SELECT "id", "state_buffer", "head", "attestations"
                                FROM "{ENTITY_TABLE}" WHERE "id" = ?"#
-                        ),
-                        [&entity_key],
-                        raw_state_from_sqlite_row,
-                    )
-                    .optional()?;
+                    ),
+                    &[SqliteValue::Text(entity_key.clone())],
+                )?;
                 let current = current_row
                     .map(|row| {
+                        let row = raw_state_from_sqlite_row(&row)?;
                         let memberships = memberships_from_sqlite_connection(&tx, &entity_key)?;
                         decode_state_row(row, memberships)
                     })
@@ -162,7 +166,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
                             r#"INSERT OR IGNORE INTO "{ENTITY_MODEL_TABLE}" ("entity_id", "model_key")
                                VALUES (?, ?)"#
                         ),
-                        rusqlite::params![&entity_key, bincode::serialize(model)?],
+                        &[SqliteValue::Text(entity_key.clone()), SqliteValue::Blob(bincode::serialize(model)?)],
                     )?;
                 }
             }
@@ -180,7 +184,12 @@ impl StorageTransaction for SqliteTransaction<'_> {
                                "head" = excluded."head",
                                "attestations" = excluded."attestations""#
                     ),
-                    rusqlite::params![&write.entity_key, &write.state_buffers, &serde_json::to_string(&write.head)?, &write.attestations,],
+                    &[
+                        SqliteValue::Text(write.entity_key.clone()),
+                        SqliteValue::Blob(write.state_buffers.clone()),
+                        SqliteValue::Text(serde_json::to_string(&write.head)?),
+                        SqliteValue::Blob(write.attestations.clone()),
+                    ],
                 )?;
                 for projection in &write.materializations {
                     projection.write(&tx)?;

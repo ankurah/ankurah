@@ -5,18 +5,18 @@ use ankurah_core::{
 };
 use ankurah_proto::{Attested, EntityState, ModelId, PropertyId};
 use ankurah_storage_common::naming;
-use rusqlite::{params_from_iter, Connection};
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::debug;
 
 use super::{SqliteStorageEngine, COLUMN_MAP_TABLE};
 use crate::{
-    connection::{PooledConnection, SqliteConnectionManager},
+    driver::{Pool, PooledConnection},
     error::SqliteError,
+    exec::SqliteExecutor,
     value::SqliteValue,
 };
 
-fn create_materialization_table(conn: &Connection, table_name: &str) -> Result<(), SqliteError> {
+fn create_materialization_table(conn: &dyn SqliteExecutor, table_name: &str) -> Result<(), SqliteError> {
     let query = format!(
         r#"CREATE TABLE IF NOT EXISTS "{}"(
             "id" TEXT PRIMARY KEY
@@ -24,7 +24,7 @@ fn create_materialization_table(conn: &Connection, table_name: &str) -> Result<(
         table_name
     );
     debug!("Creating materialization table: {}", query);
-    conn.execute(&query, [])?;
+    conn.execute(&query, &[])?;
     Ok(())
 }
 
@@ -46,7 +46,7 @@ fn property_key_text(id: &PropertyId) -> String { serde_json::to_string(id).expe
 ///
 /// `CREATE TABLE IF NOT EXISTS` is idempotent, so this needs no DDL lock,
 /// exactly like the canonical-table creators above.
-fn create_column_map_table(conn: &Connection) -> Result<(), SqliteError> {
+fn create_column_map_table(conn: &dyn SqliteExecutor) -> Result<(), SqliteError> {
     let query = r#"CREATE TABLE IF NOT EXISTS "_ankurah_sqlite_column_map"(
             "model_key" BLOB NOT NULL,
             "property_key" TEXT NOT NULL,
@@ -55,7 +55,7 @@ fn create_column_map_table(conn: &Connection) -> Result<(), SqliteError> {
             UNIQUE ("model_key", "column_name")
         )"#;
     debug!("Creating property column map table: {}", query);
-    conn.execute(query, [])?;
+    conn.execute(query, &[])?;
     Ok(())
 }
 
@@ -69,7 +69,7 @@ pub struct SqliteColumn {
 
 /// Private handle for one model's SQLite query materialization.
 pub(super) struct Materialization {
-    pool: bb8::Pool<SqliteConnectionManager>,
+    pool: Pool,
     model_key: Vec<u8>,
     materialization_table_name: String,
     columns: Arc<std::sync::RwLock<Vec<SqliteColumn>>>,
@@ -90,13 +90,13 @@ pub(super) struct Materialization {
 pub(super) struct PreparedMaterialization {
     entity_id: String,
     table: String,
-    materialized: Vec<(String, rusqlite::types::Value, bool)>,
+    materialized: Vec<(String, SqliteValue, bool)>,
 }
 
 impl PreparedMaterialization {
-    pub(super) fn write(&self, transaction: &rusqlite::Transaction<'_>) -> Result<(), SqliteError> {
+    pub(super) fn write(&self, transaction: &dyn SqliteExecutor) -> Result<(), SqliteError> {
         let mut columns = vec!["id".to_owned()];
-        let mut values = vec![rusqlite::types::Value::Text(self.entity_id.clone())];
+        let mut values = vec![SqliteValue::Text(self.entity_id.clone())];
         let mut placeholder_is_jsonb = vec![false];
         for (name, value, is_jsonb) in &self.materialized {
             columns.push(name.clone());
@@ -109,7 +109,7 @@ impl PreparedMaterialization {
         // Replace the whole projection so properties absent from this state become NULL.
         let query = format!(r#"INSERT OR REPLACE INTO "{}"({}) VALUES({})"#, self.table, columns_str, placeholders);
         debug!("materialize_state query: {}", query);
-        transaction.execute(&query, params_from_iter(values.iter()))?;
+        transaction.execute(&query, &values)?;
         Ok(())
     }
 }
@@ -134,7 +134,7 @@ impl Materialization {
             property_columns: Arc::new(std::sync::RwLock::new(BTreeMap::new())),
         };
         let id_pin_key = property_key_text(&PropertyId::Id);
-        conn.with_connection(move |c| {
+        conn.with_executor(move |c| {
             create_materialization_table(c, &table_name)?;
             create_column_map_table(c)?;
             c.execute(
@@ -142,7 +142,7 @@ impl Materialization {
                     r#"INSERT OR IGNORE INTO "{COLUMN_MAP_TABLE}"
                        ("model_key", "property_key", "column_name") VALUES (?, ?, 'id')"#
                 ),
-                rusqlite::params![model_key, id_pin_key],
+                &[SqliteValue::Blob(model_key), SqliteValue::Text(id_pin_key)],
             )?;
             Ok(())
         })
@@ -176,12 +176,12 @@ impl Materialization {
     async fn load_column_map(&self, conn: &PooledConnection) -> Result<(), SqliteError> {
         let model_key = self.model_key.clone();
         let rows: Vec<(String, String)> = conn
-            .with_connection(move |c| {
-                let mut stmt =
-                    c.prepare(r#"SELECT "property_key", "column_name" FROM "_ankurah_sqlite_column_map" WHERE "model_key" = ?"#)?;
-                let rows =
-                    stmt.query_map([&model_key], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
-                        .collect::<Result<Vec<_>, _>>()?;
+            .with_executor(move |c| {
+                let rows = c.query(
+                    r#"SELECT "property_key", "column_name" FROM "_ankurah_sqlite_column_map" WHERE "model_key" = ?"#,
+                    &[SqliteValue::Blob(model_key)],
+                )?;
+                let rows = rows.iter().map(|row| Ok((row.text(0)?, row.text(1)?))).collect::<Result<Vec<_>, SqliteError>>()?;
                 Ok(rows)
             })
             .await?;
@@ -309,20 +309,17 @@ impl Materialization {
             let candidate = column.clone();
             let conn = self.pool.get().await.map_err(|error| MutationError::General(error.into()))?;
             let winner: Option<String> = conn
-                .with_connection(move |c| {
+                .with_executor(move |c| {
                     c.execute(
                         r#"INSERT OR IGNORE INTO "_ankurah_sqlite_column_map" ("model_key", "property_key", "column_name") VALUES (?, ?, ?)"#,
-                        rusqlite::params![model_key, property_key, candidate],
+                        &[SqliteValue::Blob(model_key.clone()), SqliteValue::Text(property_key.clone()), SqliteValue::Text(candidate)],
                     )?;
-                    match c.query_row(
+                    c.query_row(
                         r#"SELECT "column_name" FROM "_ankurah_sqlite_column_map" WHERE "model_key" = ? AND "property_key" = ?"#,
-                        rusqlite::params![model_key, property_key],
-                        |row| row.get::<_, String>(0),
-                    ) {
-                        Ok(name) => Ok(Some(name)),
-                        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-                        Err(e) => Err(SqliteError::Rusqlite(e)),
-                    }
+                        &[SqliteValue::Blob(model_key), SqliteValue::Text(property_key)],
+                    )?
+                    .map(|row| row.text(0))
+                    .transpose()
                 })
                 .await?;
 
@@ -369,12 +366,10 @@ impl Materialization {
     async fn rebuild_columns_cache(&self, conn: &PooledConnection) -> Result<(), SqliteError> {
         let table_name = self.table().to_owned();
         let new_columns = conn
-            .with_connection(move |c| {
-                let mut stmt = c.prepare(&format!("PRAGMA table_info(\"{}\")", table_name))?;
-                let columns: Vec<SqliteColumn> = stmt
-                    .query_map([], |row| Ok(SqliteColumn { name: row.get(1)?, data_type: row.get(2)? }))?
-                    .filter_map(|r| r.ok())
-                    .collect();
+            .with_executor(move |c| {
+                let rows = c.query(&format!("PRAGMA table_info(\"{}\")", table_name), &[])?;
+                let columns: Vec<SqliteColumn> =
+                    rows.iter().filter_map(|row| Some(SqliteColumn { name: row.text(1).ok()?, data_type: row.text(2).ok()? })).collect();
                 Ok(columns)
             })
             .await?;
@@ -402,8 +397,8 @@ impl Materialization {
                 debug!("Adding column: {}", alter_query);
 
                 let query = alter_query.clone();
-                conn.with_connection(move |c| {
-                    c.execute(&query, [])?;
+                conn.with_executor(move |c| {
+                    c.execute(&query, &[])?;
                     Ok(())
                 })
                 .await?;
@@ -433,7 +428,7 @@ impl Materialization {
                 missing.push((column.clone(), value.sqlite_type()));
             }
             let is_jsonb = value.is_jsonb();
-            materialized.push((column, value.to_sql(), is_jsonb));
+            materialized.push((column, value, is_jsonb));
         }
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
         self.add_missing_columns(&conn, missing).await?;

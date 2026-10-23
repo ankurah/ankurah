@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 
 # Script to run WASM tests for Ankurah project
-# Usage: ./scripts/run-wasm-tests.sh [package_name|--discover]
+# Usage: ./scripts/run-wasm-tests.sh [package_name|storage_sqlite_node|--discover]
 # If no package name is provided, runs tests for all discovered wasm packages
+# (in headless Chrome) and then ankurah-storage-sqlite's suite on node:sqlite (in Node)
 # Use --discover to only show discovered packages without running tests
 
 set -e
@@ -114,6 +115,22 @@ run_wasm_tests() {
     cd - > /dev/null
 }
 
+# ankurah-storage-sqlite runs on wasm32 over Node.js's built-in SQLite (its
+# `node` feature), so that suite runs in Node rather than Chrome; its name
+# carries no "wasm", so the Chrome discovery above leaves it alone.
+run_node_sqlite_tests() {
+    print_status "Running WASM tests in Node for ankurah-storage-sqlite (node feature)..."
+    cd "$PROJECT_ROOT/storage/sqlite"
+    if wasm-pack test --node -- --features node; then
+        print_status "✅ WASM tests passed for storage-sqlite on Node"
+    else
+        print_error "❌ WASM tests failed for storage-sqlite on Node"
+        cd - > /dev/null
+        exit 1
+    fi
+    cd - > /dev/null
+}
+
 # Main execution
 main() {
     local target_package="$1"
@@ -155,6 +172,12 @@ main() {
         exit 0
     fi
     
+    if [ "$target_package" = "storage_sqlite_node" ]; then
+        run_node_sqlite_tests
+        print_status "🎉 All WASM tests completed successfully!"
+        exit 0
+    fi
+
     if [ -n "$target_package" ]; then
         # Run tests for specific package
         found=false
@@ -187,6 +210,7 @@ main() {
             [ -z "$package_name" ] && continue
             run_wasm_tests "$package_dir" "$package_name"
         done <<< "$wasm_packages"
+        run_node_sqlite_tests
     fi
     
     print_status "🎉 All WASM tests completed successfully!"

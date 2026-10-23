@@ -15,10 +15,10 @@ use ankurah_core::storage::{CommittedEntityWrite, StorageCommitOutcome, StorageC
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
 use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
-use rusqlite::{params_from_iter, Connection, OptionalExtension, TransactionBehavior};
 
-use crate::connection::{PooledConnection, SqliteConnectionManager};
+use crate::driver::{self, Pool, PooledConnection};
 use crate::error::SqliteError;
+use crate::exec::{Behavior, Row, SqliteExecutor};
 use crate::value::SqliteValue;
 
 mod materialization;
@@ -26,9 +26,6 @@ mod query;
 mod transaction;
 use materialization::{Materialization, PreparedMaterialization};
 pub use transaction::SqliteTransaction;
-
-/// Default connection pool size
-pub const DEFAULT_POOL_SIZE: u32 = 10;
 
 /// Engine-level key/value metadata for the store itself (currently just the
 /// 'protocol_version' record). Not application data: it survives
@@ -60,15 +57,15 @@ fn reserved_system_table_names() -> Vec<String> {
         .collect()
 }
 
-fn table_exists(conn: &Connection, table: &str) -> Result<bool, SqliteError> {
-    Ok(conn.query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", [table], |_| Ok(())).optional()?.is_some())
+fn table_exists(conn: &dyn SqliteExecutor, table: &str) -> Result<bool, SqliteError> {
+    Ok(conn.query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", &[SqliteValue::Text(table.to_owned())])?.is_some())
 }
 
 /// SQLite storage engine
 pub struct SqliteStorageEngine {
     /// One shared schema and physical-name map per materialization.
     materializations: SafeMap<ModelId, Arc<tokio::sync::OnceCell<Arc<Materialization>>>>,
-    pool: bb8::Pool<SqliteConnectionManager>,
+    pool: Pool,
     /// Optional labels for first-use physical name assignment.
     resolver: Arc<std::sync::RwLock<Option<std::sync::Weak<dyn CatalogResolver>>>>,
 }
@@ -77,17 +74,16 @@ impl SqliteStorageEngine {
     async fn registered_table_name(&self, model: &ModelId) -> Result<Option<String>, RetrievalError> {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         let model_key = bincode::serialize(model).map_err(RetrievalError::storage)?;
-        conn.with_connection(move |c| {
+        conn.with_executor(move |c| {
             if !table_exists(c, MODEL_MAP_TABLE)? {
                 return Ok(None);
             }
             c.query_row(
                 &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}" WHERE "model_key" = ?"#),
-                rusqlite::params![model_key],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(SqliteError::from)
+                &[SqliteValue::Blob(model_key)],
+            )?
+            .map(|row| row.text(0))
+            .transpose()
         })
         .await
         .map_err(|e| RetrievalError::storage(e))
@@ -115,8 +111,8 @@ impl SqliteStorageEngine {
         let model_key = bincode::serialize(model).map_err(RetrievalError::storage)?;
         let model = *model;
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
-        conn.with_connection_mut(move |c| {
-            let tx = c.transaction()?;
+        conn.with_executor(move |c| {
+            let tx = c.begin(Behavior::Deferred)?;
             tx.execute(
                 &format!(
                     r#"CREATE TABLE IF NOT EXISTS "{MODEL_MAP_TABLE}" (
@@ -124,31 +120,24 @@ impl SqliteStorageEngine {
                         "materialization_table_name" TEXT NOT NULL UNIQUE
                     )"#
                 ),
-                [],
+                &[],
             )?;
-            if let Some(name) = tx
-                .query_row(
-                    &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}" WHERE "model_key" = ?"#),
-                    rusqlite::params![&model_key],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            {
+            if let Some(row) = tx.query_row(
+                &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}" WHERE "model_key" = ?"#),
+                &[SqliteValue::Blob(model_key.clone())],
+            )? {
+                let name = row.text(0)?;
                 tx.commit()?;
                 return Ok(name);
             }
 
-            let mut stmt = tx.prepare(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#))?;
             let mut taken = std::collections::HashSet::new();
-            for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
-                taken.insert(row?);
+            for row in tx.query(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#), &[])? {
+                taken.insert(row.text(0)?);
             }
-            drop(stmt);
-            let mut stmt = tx.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'")?;
-            for row in stmt.query_map([], |row| row.get::<_, String>(0))? {
-                taken.insert(row?);
+            for row in tx.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'", &[])? {
+                taken.insert(row.text(0)?);
             }
-            drop(stmt);
             taken.extend(FIXED_STORAGE_TABLES.iter().map(|name| (*name).to_owned()));
             let is_taken =
                 |candidate: &str| taken.contains(candidate) || reserved_system_table_names().iter().any(|reserved| reserved == candidate);
@@ -170,7 +159,7 @@ impl SqliteStorageEngine {
             };
             tx.execute(
                 &format!(r#"INSERT INTO "{MODEL_MAP_TABLE}" ("model_key", "materialization_table_name") VALUES (?, ?)"#),
-                rusqlite::params![&model_key, &materialization_table_name],
+                &[SqliteValue::Blob(model_key), SqliteValue::Text(materialization_table_name.clone())],
             )?;
             tx.commit()?;
             Ok(materialization_table_name)
@@ -184,26 +173,17 @@ impl SqliteStorageEngine {
     /// Records or checks the store's protocol version (see
     /// `check_protocol_version`) so every construction path verifies
     /// the store it is about to serve.
-    pub async fn new(pool: bb8::Pool<SqliteConnectionManager>) -> anyhow::Result<Self> {
+    pub async fn new(pool: Pool) -> anyhow::Result<Self> {
         let engine = Self { pool, materializations: SafeMap::new(), resolver: Arc::new(std::sync::RwLock::new(None)) };
         engine.check_protocol_version().await?;
         Ok(engine)
     }
 
     /// Open a file-based SQLite database
-    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let manager = SqliteConnectionManager::file(path.as_ref());
-        let pool = bb8::Pool::builder().max_size(DEFAULT_POOL_SIZE).build(manager).await?;
-        Self::new(pool).await
-    }
+    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> { Self::new(driver::file_pool(path.as_ref()).await?).await }
 
     /// Open an in-memory SQLite database (for testing)
-    pub async fn open_in_memory() -> anyhow::Result<Self> {
-        let manager = SqliteConnectionManager::memory();
-        // For in-memory, we use a single connection to keep the database alive
-        let pool = bb8::Pool::builder().max_size(1).build(manager).await?;
-        Self::new(pool).await
-    }
+    pub async fn open_in_memory() -> anyhow::Result<Self> { Self::new(driver::memory_pool().await?).await }
 
     /// Check whether a physical SQLite name uses only the supported characters.
     pub fn sane_name(name: &str) -> bool {
@@ -218,10 +198,10 @@ impl SqliteStorageEngine {
     }
 
     /// Get a reference to the connection pool (for testing/diagnostics)
-    pub fn pool(&self) -> &bb8::Pool<SqliteConnectionManager> { &self.pool }
+    pub fn pool(&self) -> &Pool { &self.pool }
 
     pub(crate) async fn ensure_shared_tables(&self, conn: &PooledConnection) -> Result<(), SqliteError> {
-        conn.with_connection(|c| {
+        conn.with_executor(|c| {
             c.execute(
                 &format!(
                     r#"CREATE TABLE IF NOT EXISTS "{ENTITY_TABLE}" (
@@ -231,7 +211,7 @@ impl SqliteStorageEngine {
                         "attestations" BLOB NOT NULL
                     )"#
                 ),
-                [],
+                &[],
             )?;
             c.execute(
                 &format!(
@@ -243,14 +223,14 @@ impl SqliteStorageEngine {
                         "attestations" BLOB NOT NULL
                     )"#
                 ),
-                [],
+                &[],
             )?;
             c.execute(
                 &format!(
                     r#"CREATE INDEX IF NOT EXISTS "{EVENT_TABLE}_entity_id_idx"
                        ON "{EVENT_TABLE}" ("entity_id")"#
                 ),
-                [],
+                &[],
             )?;
             c.execute(
                 &format!(
@@ -260,7 +240,7 @@ impl SqliteStorageEngine {
                         PRIMARY KEY ("entity_id", "model_key")
                     )"#
                 ),
-                [],
+                &[],
             )?;
             Ok(())
         })
@@ -283,18 +263,15 @@ impl SqliteStorageEngine {
     /// - ankurah tables present but no record: refuse as an unversioned store
     async fn check_protocol_version(&self) -> Result<(), SqliteError> {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
-        conn.with_connection(|c| {
-            let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
-            let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
+        conn.with_executor(|c| {
+            let rows = c.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &[])?;
+            let tables: Vec<String> = rows.iter().filter_map(|row| row.text(0).ok()).collect();
             let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(&table.as_str()));
 
             let recorded: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
-                match c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| row.get(0))
-                {
-                    Ok(value) => Some(value),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(e) => return Err(SqliteError::Rusqlite(e)),
-                }
+                c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])?
+                    .map(|row| row.text(0))
+                    .transpose()?
             } else {
                 None
             };
@@ -306,17 +283,17 @@ impl SqliteStorageEngine {
                 None if has_ankurah_tables => Err(SqliteError::UnversionedStore { expected: PROTOCOL_VERSION }),
                 None => {
                     // Fresh store: claim the record.
-                    c.execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), [])?;
+                    c.execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), &[])?;
                     c.execute(
                         &format!(r#"INSERT OR IGNORE INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', ?)"#),
-                        rusqlite::params![expected],
+                        &[SqliteValue::Text(expected.clone())],
                     )?;
                     // Re-read: if another process recorded between our scan and
                     // our insert, the store must still match this binary.
-                    let reread: String =
-                        c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| {
-                            row.get(0)
-                        })?;
+                    let reread = c
+                        .query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])?
+                        .ok_or_else(|| SqliteError::CorruptRecord("the protocol version record vanished after it was written".into()))?
+                        .text(0)?;
                     if reread == expected {
                         Ok(())
                     } else {
@@ -352,17 +329,18 @@ impl StorageEngine for SqliteStorageEngine {
         }
         let conn = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         self.ensure_shared_tables(&conn).await?;
-        let event_ids: Vec<String> = event_ids.into_iter().map(|id| id.to_base64()).collect();
+        let event_ids: Vec<SqliteValue> = event_ids.into_iter().map(|id| SqliteValue::Text(id.to_base64())).collect();
         let events = conn
-            .with_connection(move |c| {
+            .with_executor(move |c| {
                 let placeholders = (0..event_ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-                let mut stmt = c.prepare(&format!(
-                    r#"SELECT "entity_id", "body", "parent", "attestations"
+                let rows = c.query(
+                    &format!(
+                        r#"SELECT "entity_id", "body", "parent", "attestations"
                    FROM "{EVENT_TABLE}" WHERE "id" IN ({placeholders})"#
-                ))?;
-                let params: Vec<&dyn rusqlite::ToSql> = event_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
-                let rows = stmt.query_map(params.as_slice(), event_from_sqlite_row)?;
-                Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                    ),
+                    &event_ids,
+                )?;
+                rows.iter().map(event_from_sqlite_row).collect::<Result<Vec<_>, _>>()
             })
             .await
             .map_err(RetrievalError::storage)?
@@ -376,13 +354,15 @@ impl StorageEngine for SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         self.ensure_shared_tables(&conn).await?;
         let entity_id = entity_id.to_base64();
-        conn.with_connection(move |c| {
-            let mut stmt = c.prepare(&format!(
-                r#"SELECT "entity_id", "body", "parent", "attestations"
+        conn.with_executor(move |c| {
+            let rows = c.query(
+                &format!(
+                    r#"SELECT "entity_id", "body", "parent", "attestations"
                    FROM "{EVENT_TABLE}" WHERE "entity_id" = ?"#
-            ))?;
-            let rows = stmt.query_map([entity_id], event_from_sqlite_row)?;
-            Ok(rows.collect::<Result<Vec<_>, _>>()?)
+                ),
+                &[SqliteValue::Text(entity_id)],
+            )?;
+            rows.iter().map(event_from_sqlite_row).collect::<Result<Vec<_>, _>>()
         })
         .await
         .map_err(RetrievalError::storage)?
@@ -399,13 +379,12 @@ impl StorageEngine for SqliteStorageEngine {
         self.materializations.clear();
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;
 
-        conn.with_connection(|c| {
+        conn.with_executor(|c| {
             // Dynamic materializations are engine-owned only when named by the
             // durable model map. Arbitrary tables may belong to the embedding
             // application and must survive an Ankurah reset.
-            let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
-            let existing: BTreeSet<String> = stmt.query_map([], |row| row.get(0))?.collect::<Result<_, _>>()?;
-            drop(stmt);
+            let rows = c.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &[])?;
+            let existing: BTreeSet<String> = rows.iter().map(|row| row.text(0)).collect::<Result<_, _>>()?;
 
             let mut owned: BTreeSet<String> = FIXED_STORAGE_TABLES
                 .iter()
@@ -414,12 +393,9 @@ impl StorageEngine for SqliteStorageEngine {
                 .map(str::to_owned)
                 .collect();
             if existing.contains(MODEL_MAP_TABLE) {
-                let mut stmt = c.prepare(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#))?;
+                let rows = c.query(&format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}""#), &[])?;
                 owned.extend(
-                    stmt.query_map([], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()?
-                        .into_iter()
-                        .filter(|name| existing.contains(name)),
+                    rows.iter().map(|row| row.text(0)).collect::<Result<Vec<_>, _>>()?.into_iter().filter(|name| existing.contains(name)),
                 );
             }
 
@@ -428,7 +404,7 @@ impl StorageEngine for SqliteStorageEngine {
             }
 
             for table in owned {
-                c.execute(&format!("DROP TABLE IF EXISTS {}", quote_identifier(&table)), [])?;
+                c.execute(&format!("DROP TABLE IF EXISTS {}", quote_identifier(&table)), &[])?;
             }
 
             Ok(true)
@@ -440,14 +416,14 @@ impl StorageEngine for SqliteStorageEngine {
     async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         let models = conn
-            .with_connection(|c| {
+            .with_executor(|c| {
                 if !table_exists(c, MODEL_MAP_TABLE)? {
                     return Ok(Vec::new());
                 }
-                let mut stmt = c.prepare(&format!(r#"SELECT "model_key" FROM "{MODEL_MAP_TABLE}""#))?;
-                let models = stmt
-                    .query_map([], |row| row.get::<_, Vec<u8>>(0))?
-                    .map(|row| row.map_err(SqliteError::from).and_then(|bytes| bincode::deserialize(&bytes).map_err(SqliteError::from)))
+                let rows = c.query(&format!(r#"SELECT "model_key" FROM "{MODEL_MAP_TABLE}""#), &[])?;
+                let models = rows
+                    .iter()
+                    .map(|row| row.blob(0).and_then(|bytes| bincode::deserialize(&bytes).map_err(SqliteError::from)))
                     .collect::<Result<Vec<ModelId>, SqliteError>>()?;
                 Ok(models)
             })
@@ -458,9 +434,7 @@ impl StorageEngine for SqliteStorageEngine {
 
 type RawStateRow = (String, Vec<u8>, String, Vec<u8>);
 
-fn raw_state_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawStateRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-}
+fn raw_state_from_sqlite_row(row: &Row) -> Result<RawStateRow, SqliteError> { Ok((row.text(0)?, row.blob(1)?, row.text(2)?, row.blob(3)?)) }
 
 fn decode_state_row(
     (id, state_buffer, head, attestations): RawStateRow,
@@ -481,7 +455,7 @@ fn decode_state_row(
 }
 
 async fn load_state(conn: &PooledConnection, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
-    conn.with_connection_mut(move |c| load_states(&c.transaction()?, &[id]))
+    conn.with_executor(move |c| load_states(&c.begin(Behavior::Deferred)?, &[id]))
         .await?
         .into_iter()
         .next()
@@ -489,20 +463,22 @@ async fn load_state(conn: &PooledConnection, id: EntityId) -> Result<Attested<En
 }
 
 /// Reconstruct state and memberships within the caller's read snapshot.
-fn load_states(snapshot: &rusqlite::Transaction<'_>, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, SqliteError> {
+fn load_states(snapshot: &dyn SqliteExecutor, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, SqliteError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let id_strings: Vec<String> = ids.iter().map(EntityId::to_base64).collect();
+    let id_strings: Vec<SqliteValue> = ids.iter().map(|id| SqliteValue::Text(id.to_base64())).collect();
     let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let mut stmt = snapshot.prepare(&format!(
-        r#"SELECT "id", "state_buffer", "head", "attestations"
+    let rows = snapshot.query(
+        &format!(
+            r#"SELECT "id", "state_buffer", "head", "attestations"
            FROM "{ENTITY_TABLE}" WHERE "id" IN ({placeholders})"#
-    ))?;
-    let rows = stmt.query_map(params_from_iter(id_strings.iter()), raw_state_from_sqlite_row)?;
+        ),
+        &id_strings,
+    )?;
     let mut by_id = BTreeMap::new();
-    for row in rows {
-        let row = row?;
+    for row in &rows {
+        let row = raw_state_from_sqlite_row(row)?;
         let memberships = memberships_from_sqlite_connection(snapshot, &row.0)?;
         let state = decode_state_row(row, memberships)?;
         by_id.insert(state.payload.entity_id, state);
@@ -510,17 +486,18 @@ fn load_states(snapshot: &rusqlite::Transaction<'_>, ids: &[EntityId]) -> Result
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
-fn memberships_from_sqlite_connection(conn: &rusqlite::Connection, entity_id: &str) -> Result<BTreeSet<ModelId>, SqliteError> {
-    let mut stmt = conn.prepare(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ?"#))?;
-    let model_keys = stmt.query_map([entity_id], |row| row.get::<_, Vec<u8>>(0))?.collect::<Result<Vec<_>, _>>()?;
+fn memberships_from_sqlite_connection(conn: &dyn SqliteExecutor, entity_id: &str) -> Result<BTreeSet<ModelId>, SqliteError> {
+    let rows = conn.query(
+        &format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ?"#),
+        &[SqliteValue::Text(entity_id.to_owned())],
+    )?;
+    let model_keys = rows.iter().map(|row| row.blob(0)).collect::<Result<Vec<_>, _>>()?;
     model_keys.into_iter().map(|key| bincode::deserialize(&key).map_err(SqliteError::from)).collect()
 }
 
 type RawEventRow = (String, Vec<u8>, String, Vec<u8>);
 
-fn event_from_sqlite_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawEventRow> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-}
+fn event_from_sqlite_row(row: &Row) -> Result<RawEventRow, SqliteError> { Ok((row.text(0)?, row.blob(1)?, row.text(2)?, row.blob(3)?)) }
 
 fn decode_event_row((entity_id, body, parent, attestations): RawEventRow) -> Result<Attested<Event>, RetrievalError> {
     let entity_id = EntityId::from_base64(&entity_id).map_err(|error| RetrievalError::storage(std::io::Error::other(error)))?;
@@ -544,7 +521,14 @@ mod tests {
     use ankurah_proto::Clock;
     use ankurah_proto::PropertyId;
     use ankurah_storage_common::ColumnPath;
+    #[cfg(not(target_arch = "wasm32"))]
+    use rusqlite::Connection;
     use std::collections::BTreeMap;
+    // The cases run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+    #[cfg(not(target_arch = "wasm32"))]
+    use tokio::test as engine_test;
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
     #[derive(Default)]
     struct TestResolver {
@@ -607,7 +591,7 @@ mod tests {
         resolver
     }
 
-    #[tokio::test]
+    #[engine_test]
     async fn fallback_names_survive_late_labels_and_engine_reopen() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let model = ModelId::EntityId(entity_id(0xe1));
@@ -660,6 +644,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn selected_entities_keep_their_state_and_memberships_from_one_snapshot() -> anyhow::Result<()> {
         let directory = tempfile::tempdir()?;
@@ -680,12 +665,13 @@ mod tests {
         after.payload.state.head = Clock::new(vec![(2, EventId::from_bytes([2; 32]))]).unwrap();
         commit_canonical_state(&engine, before.payload.state.head.clone(), after.clone()).await;
 
-        assert_eq!(load_states(&snapshot, &[selected])?, vec![before]);
+        assert_eq!(load_states(&*snapshot, &[selected])?, vec![before]);
         drop(snapshot);
         assert_eq!(engine.get_state(id).await?, after);
         Ok(())
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn concurrent_first_writes_share_ddl_coordination() {
         let directory = tempfile::tempdir().unwrap();
@@ -700,14 +686,14 @@ mod tests {
         assert_eq!(engine.fetch_states(&all.clone().and_member_of(model)).await.unwrap().len(), 2);
     }
 
-    #[tokio::test]
+    #[engine_test]
     async fn test_open_in_memory() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let all = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         assert!(engine.fetch_states(&all.clone().and_member_of(ModelId::System(SystemModel::System))).await.unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[engine_test]
     async fn test_list_models_reads_durable_registrations() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         assert!(engine.list_materializations().await.unwrap().is_empty());
@@ -727,12 +713,12 @@ mod tests {
     /// Human labels only seed first-use physical assignments. Equal labels
     /// remain distinct by durable identity, and every generated identifier is
     /// normalized to lowercase.
-    #[tokio::test]
+    #[engine_test]
     async fn colliding_model_and_property_labels_get_distinct_lowercase_names() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let conn = engine.pool.get().await.unwrap();
-        conn.with_connection(|connection| {
-            connection.execute(r#"CREATE TABLE "sales_report" ("application_value" TEXT)"#, [])?;
+        conn.with_executor(|connection| {
+            connection.execute(r#"CREATE TABLE "sales_report" ("application_value" TEXT)"#, &[])?;
             Ok(())
         })
         .await
@@ -764,13 +750,16 @@ mod tests {
         let conn = engine.pool.get().await.unwrap();
         let model_key = bincode::serialize(&model_a).unwrap();
         let columns = conn
-            .with_connection(move |connection| {
-                let mut statement = connection.prepare(&format!(
-                    r#"SELECT "column_name" FROM "{COLUMN_MAP_TABLE}"
+            .with_executor(move |connection| {
+                let rows = connection.query(
+                    &format!(
+                        r#"SELECT "column_name" FROM "{COLUMN_MAP_TABLE}"
                        WHERE "model_key" = ? AND "column_name" != 'id'
                        ORDER BY "column_name""#
-                ))?;
-                let columns = statement.query_map([model_key], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+                    ),
+                    &[SqliteValue::Blob(model_key)],
+                )?;
+                let columns = rows.iter().map(|row| row.text(0)).collect::<Result<Vec<_>, _>>()?;
                 Ok(columns)
             })
             .await
@@ -783,7 +772,7 @@ mod tests {
 
     /// A canonical write refreshes every materialization named by its explicit
     /// canonical membership set.
-    #[tokio::test]
+    #[engine_test]
     async fn write_refreshes_every_canonical_membership_materialization() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let model_a = ModelId::EntityId(entity_id(0x61));
@@ -816,7 +805,7 @@ mod tests {
         assert_eq!(found[0].payload.entity_id, entity);
     }
 
-    #[tokio::test]
+    #[engine_test]
     async fn stale_head_rolls_back_the_complete_batch() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let model_a = ModelId::EntityId(entity_id(0x81));
@@ -859,7 +848,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[engine_test]
     async fn test_sane_name() {
         assert!(SqliteStorageEngine::sane_name("test_collection"));
         assert!(SqliteStorageEngine::sane_name("test.collection"));
@@ -875,7 +864,7 @@ mod tests {
     /// 2. The `->` operator works for JSON path traversal
     /// 3. Type-aware comparisons work (numeric vs string)
     /// 4. JSONB storage and retrieval works correctly
-    #[tokio::test]
+    #[engine_test]
     async fn test_jsonb_function_availability() -> Result<(), SqliteError> {
         let engine = SqliteStorageEngine::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
         let conn = engine.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
@@ -883,8 +872,8 @@ mod tests {
         // Test 1: Verify jsonb() function exists and works
         // jsonb() returns a BLOB (JSONB binary format), so we query it as BLOB
         let result = conn
-            .with_connection(|c| {
-                let value: Vec<u8> = c.query_row("SELECT jsonb('{\"key\": \"value\"}')", [], |row| row.get(0))?;
+            .with_executor(|c| {
+                let value: Vec<u8> = c.query_row("SELECT jsonb('{\"key\": \"value\"}')", &[])?.expect("one row").blob(0)?;
                 Ok(value)
             })
             .await?;
@@ -894,9 +883,11 @@ mod tests {
         // Test 2: Verify -> operator works for path traversal
         // json_extract returns the SQL value (unquoted string for JSON strings)
         let result = conn
-            .with_connection(|c| {
-                let value: String =
-                    c.query_row(r#"SELECT json_extract(jsonb('{"territory": "US", "count": 10}'), '$.territory')"#, [], |row| row.get(0))?;
+            .with_executor(|c| {
+                let value: String = c
+                    .query_row(r#"SELECT json_extract(jsonb('{"territory": "US", "count": 10}'), '$.territory')"#, &[])?
+                    .expect("one row")
+                    .text(0)?;
                 Ok(value)
             })
             .await?;
@@ -906,12 +897,15 @@ mod tests {
         // Test 3: Verify numeric comparison is numeric (not lexicographic)
         // In SQLite, json_extract with numeric comparison should work correctly
         let result = conn
-            .with_connection(|c| {
-                let value: bool = c.query_row(
-                    r#"SELECT json_extract(jsonb('{"count": 9}'), '$.count') > json_extract(jsonb('{"count": 10}'), '$.count')"#,
-                    [],
-                    |row| row.get(0),
-                )?;
+            .with_executor(|c| {
+                let value: bool = c
+                    .query_row(
+                        r#"SELECT json_extract(jsonb('{"count": 9}'), '$.count') > json_extract(jsonb('{"count": 10}'), '$.count')"#,
+                        &[],
+                    )?
+                    .expect("one row")
+                    .integer(0)?
+                    != 0;
                 Ok(value)
             })
             .await?;
@@ -920,7 +914,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[engine_test]
     async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Result<()> {
         let engine = SqliteStorageEngine::open_in_memory().await?;
         let property = PropertyId::System(ankurah_proto::SystemProperty::Name);
@@ -943,11 +937,14 @@ mod tests {
         }
         let conn = engine.pool.get().await?;
         let rejected = initial[1].payload.entity_id.to_base64();
-        conn.with_connection(move |c| {
-            c.execute_batch(&format!(
-                r#"CREATE TRIGGER reject_second BEFORE UPDATE ON "{ENTITY_TABLE}"
+        conn.with_executor(move |c| {
+            c.execute(
+                &format!(
+                    r#"CREATE TRIGGER reject_second BEFORE UPDATE ON "{ENTITY_TABLE}"
                 WHEN NEW.id = '{rejected}' BEGIN SELECT RAISE(ABORT, 'test write failure'); END;"#
-            ))?;
+                ),
+                &[],
+            )?;
             Ok(())
         })
         .await?;
@@ -965,8 +962,8 @@ mod tests {
         }
 
         let conn = engine.pool.get().await?;
-        conn.with_connection(|c| {
-            c.execute_batch("DROP TRIGGER reject_second")?;
+        conn.with_executor(|c| {
+            c.execute("DROP TRIGGER reject_second", &[])?;
             Ok(())
         })
         .await?;
@@ -987,7 +984,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[engine_test]
     async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result<()> {
         let engine = SqliteStorageEngine::open_in_memory().await?;
         let entity = entity_id(0x51);
@@ -1006,7 +1003,7 @@ mod tests {
     /// 1. JSON properties can be queried using path syntax (e.g., `data.status = 'active'`)
     /// 2. The SQL builder generates correct SQLite JSONB syntax
     /// 3. Queries return correct results
-    #[tokio::test]
+    #[engine_test]
     async fn test_json_path_query() -> anyhow::Result<()> {
         use crate::sql_builder::SqlBuilder;
         use ankql::parser::parse_selection;
@@ -1034,43 +1031,48 @@ mod tests {
 
     /// Test the full cycle: store JSONB via parameter, query via json_extract with parameter.
     /// This mimics exactly what the real code does.
-    #[tokio::test]
+    #[engine_test]
     async fn test_jsonb_storage_and_parameterized_query() -> Result<(), SqliteError> {
         let engine = SqliteStorageEngine::open_in_memory().await.map_err(|e| SqliteError::DDL(e.to_string()))?;
         let conn = engine.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
 
-        conn.with_connection(|c| {
+        conn.with_executor(|c| {
             // Create table with BLOB column for JSONB
-            c.execute(r#"CREATE TABLE test_jsonb (id TEXT PRIMARY KEY, data BLOB)"#, [])?;
+            c.execute(r#"CREATE TABLE test_jsonb (id TEXT PRIMARY KEY, data BLOB)"#, &[])?;
 
             // Insert using jsonb(?) - this is what the real code does
             let json_text = r#"{"territory": "US", "count": 10}"#;
-            c.execute(r#"INSERT INTO test_jsonb (id, data) VALUES (?, jsonb(?))"#, rusqlite::params!["1", json_text])?;
+            c.execute(
+                r#"INSERT INTO test_jsonb (id, data) VALUES (?, jsonb(?))"#,
+                &[SqliteValue::Text("1".into()), SqliteValue::Text(json_text.into())],
+            )?;
 
             // Verify data is stored
-            let count: i32 = c.query_row("SELECT COUNT(*) FROM test_jsonb", [], |row| row.get(0))?;
+            let count = c.query_row("SELECT COUNT(*) FROM test_jsonb", &[])?.expect("one row").integer(0)?;
             assert_eq!(count, 1, "Should have 1 row");
 
             // Check what's in the data column
-            let data_type: String = c.query_row("SELECT typeof(data) FROM test_jsonb WHERE id = '1'", [], |row| row.get(0))?;
+            let data_type = c.query_row("SELECT typeof(data) FROM test_jsonb WHERE id = '1'", &[])?.expect("one row").text(0)?;
             eprintln!("Data column type: {}", data_type);
 
             // Check what json_extract returns
-            let extracted: String =
-                c.query_row(r#"SELECT json_extract(data, '$.territory') FROM test_jsonb WHERE id = '1'"#, [], |row| row.get(0))?;
+            let extracted = c
+                .query_row(r#"SELECT json_extract(data, '$.territory') FROM test_jsonb WHERE id = '1'"#, &[])?
+                .expect("one row")
+                .text(0)?;
             eprintln!("Extracted territory: '{}'", extracted);
 
             // Now try the parameterized query - THIS IS WHAT THE REAL CODE DOES
             let query_param = "US";
-            let result: Result<String, _> = c.query_row(
+            let result = c.query_row(
                 r#"SELECT id FROM test_jsonb WHERE json_extract(data, '$.territory') = ?"#,
-                rusqlite::params![query_param],
-                |row| row.get(0),
+                &[SqliteValue::Text(query_param.into())],
             );
             eprintln!("Query result: {:?}", result);
 
             match result {
-                Ok(id) => assert_eq!(id, "1", "Should find the row with territory = US"),
+                Ok(Some(row)) => assert_eq!(row.text(0)?, "1", "Should find the row with territory = US"),
+                Ok(None) => panic!("Query found no row"),
                 Err(e) => panic!("Query failed: {:?}", e),
             }
 

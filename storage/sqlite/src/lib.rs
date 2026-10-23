@@ -19,6 +19,15 @@
 //!
 //! See [SQLite JSON documentation](https://sqlite.org/json1.html) for details.
 //!
+//! # Drivers
+//!
+//! The engine's SQL is written once, against [`exec::SqliteExecutor`].
+//! Natively it runs on rusqlite connections from a bb8 pool. On wasm32, with
+//! the `node` feature, it runs on Node.js's built-in `node:sqlite` (Node.js
+//! 22.16 or later), for a node inside Node.js where IndexedDB does not exist:
+//! a VS Code extension host, an Electron main process, a JavaScript CLI. The
+//! tables are the same, so a database file opens under either driver.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -29,16 +38,38 @@
 //!
 //! // Or use an in-memory database for testing
 //! let storage = SqliteStorageEngine::open_in_memory().await?;
+//!
+//! // On wasm32 with the `node` feature: adopt a database the host constructed
+//! // (DatabaseSync, or a compatible driver with positional rows and BigInt INTEGERs)
+//! let storage = SqliteStorageEngine::from_database(database).await?;
 //! ```
 
+#[cfg(not(target_arch = "wasm32"))]
 mod connection;
 mod dump;
 mod engine;
 mod error;
+pub mod exec;
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
+#[cfg(all(target_arch = "wasm32", feature = "node"))]
+mod node;
 pub mod sql_builder;
 mod value;
 
+// The driver the engine reaches SQLite through on this target: rusqlite
+// natively, and on wasm32 a JavaScript SQLite chosen by feature.
+#[cfg(not(target_arch = "wasm32"))]
+use native as driver;
+#[cfg(all(target_arch = "wasm32", feature = "node"))]
+use node as driver;
+#[cfg(all(target_arch = "wasm32", not(feature = "node")))]
+compile_error!("on wasm32, ankurah-storage-sqlite runs on a JavaScript SQLite: enable the `node` feature for Node.js's node:sqlite");
+
+#[cfg(not(target_arch = "wasm32"))]
 pub use connection::SqliteConnectionManager;
 pub use engine::{SqliteStorageEngine, SqliteTransaction};
 pub use error::SqliteError;
+#[cfg(all(target_arch = "wasm32", feature = "node"))]
+pub use node::{NodeConnection, NodePool};
 pub use value::SqliteValue;

@@ -4,8 +4,13 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SqliteError {
+    #[cfg(not(target_arch = "wasm32"))]
     #[error("SQLite error: {0}")]
     Rusqlite(#[from] rusqlite::Error),
+
+    #[cfg(all(target_arch = "wasm32", feature = "node"))]
+    #[error("node:sqlite error: {0}")]
+    Node(String),
 
     #[error("Connection pool error: {0}")]
     Pool(String),
@@ -24,6 +29,9 @@ pub enum SqliteError {
 
     #[error("corrupt durable record: {0}")]
     CorruptRecord(String),
+
+    #[error("unexpected row shape: {0}")]
+    Row(String),
 
     #[error("SQL generation error: {0}")]
     SqlGeneration(String),

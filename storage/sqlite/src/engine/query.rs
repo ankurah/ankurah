@@ -10,13 +10,15 @@ use ankurah_storage_common::{
 use super::{load_states, SqliteStorageEngine, ENTITY_TABLE};
 use crate::{
     error::SqliteError,
+    exec::{Behavior, SqliteExecutor},
     sql_builder::{split_predicate_for_sqlite, SqlBuilder},
+    value::SqliteValue,
 };
 
 /// A selection over joined materializations, with any unsupported predicate retained for Rust.
 pub(super) struct Query {
     sql: String,
-    params: Vec<rusqlite::types::Value>,
+    params: Vec<SqliteValue>,
     remaining: Selection<Resolved>,
 }
 
@@ -62,18 +64,17 @@ impl Query {
         })
     }
 
-    fn read_ids(&self, snapshot: &rusqlite::Transaction<'_>) -> Result<Vec<EntityId>, SqliteError> {
-        let mut stmt = snapshot.prepare(&self.sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(&self.params), |row| row.get::<_, String>(0))?;
-        rows.map(|row| EntityId::from_base64(&row?).map_err(|error| SqliteError::CorruptRecord(error.to_string()))).collect()
+    fn read_ids(&self, snapshot: &dyn SqliteExecutor) -> Result<Vec<EntityId>, SqliteError> {
+        let rows = snapshot.query(&self.sql, &self.params)?;
+        rows.iter().map(|row| EntityId::from_base64(&row.text(0)?).map_err(|error| SqliteError::CorruptRecord(error.to_string()))).collect()
     }
 
     pub async fn states(self, engine: &SqliteStorageEngine) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
         let conn = engine.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         engine.ensure_shared_tables(&conn).await?;
         let states = conn
-            .with_connection_mut(move |c| {
-                let snapshot = c.transaction()?;
+            .with_executor(move |c| {
+                let snapshot = c.begin(Behavior::Deferred)?;
                 let ids = self.read_ids(&snapshot)?;
                 Ok((load_states(&snapshot, &ids)?, self.remaining))
             })

@@ -14,6 +14,11 @@
 
 use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
+// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::test as engine_test;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
 /// Helper to run a SQL query that returns a boolean (0 or 1 in SQLite)
 async fn query_bool(sql: &str) -> Result<bool> {
@@ -22,8 +27,8 @@ async fn query_bool(sql: &str) -> Result<bool> {
 
     let sql = sql.to_owned();
     let result = conn
-        .with_connection(move |c| {
-            let value: i32 = c.query_row(&sql, [], |row| row.get(0))?;
+        .with_executor(move |c| {
+            let value = c.query_row(&sql, &[])?.expect("one row").integer(0)?;
             Ok(value != 0)
         })
         .await?;
@@ -31,7 +36,7 @@ async fn query_bool(sql: &str) -> Result<bool> {
     Ok(result)
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_extract_numeric_comparison_is_numeric() -> Result<()> {
     // This test verifies that json_extract numeric comparison is numeric, NOT lexicographic.
     // If this were lexicographic, "9" > "10" would be true (because "9" > "1").
@@ -52,7 +57,7 @@ async fn test_json_extract_numeric_comparison_is_numeric() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_extract_string_comparison_is_lexicographic() -> Result<()> {
     // json_extract string comparisons are lexicographic (as expected for strings)
 
@@ -67,7 +72,7 @@ async fn test_json_extract_string_comparison_is_lexicographic() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_extract_cross_type_comparison() -> Result<()> {
     // Cross-type comparisons in SQLite json_extract
     // SQLite's behavior differs from PostgreSQL JSONB here - it does type coercion
@@ -84,7 +89,7 @@ async fn test_json_extract_cross_type_comparison() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_extract_float_int_comparison() -> Result<()> {
     // Float and int comparisons should work correctly within the numeric family
 
@@ -103,7 +108,7 @@ async fn test_json_extract_float_int_comparison() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_extract_null_comparison() -> Result<()> {
     // SQLite JSON null comparisons
     // Note: json_extract returns SQL NULL for JSON null, which has SQL NULL semantics
@@ -119,7 +124,7 @@ async fn test_json_extract_null_comparison() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_json_extract_path_with_comparison() -> Result<()> {
     // Test that our actual query pattern works correctly
     // This simulates: json_extract(data, '$.count') > 10

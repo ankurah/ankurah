@@ -1,5 +1,6 @@
 #[allow(unused)]
 pub use ankurah::signals::{Peek, Subscribe};
+#[cfg(not(target_arch = "wasm32"))]
 use tracing::Level;
 
 #[allow(unused)]
@@ -16,11 +17,13 @@ pub use ankurah::{
     Context, EntityId, LiveQuery, Model, Node, PermissiveAgent,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use std::{
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
 };
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::sync::Notify;
 
 #[derive(Model, Debug, Serialize, Deserialize)]
@@ -30,6 +33,7 @@ pub struct Album {
 }
 
 // Initialize tracing for tests
+#[cfg(not(target_arch = "wasm32"))]
 #[ctor::ctor]
 fn init_tracing() {
     // if LOG_LEVEL env var is set, use it
@@ -40,7 +44,9 @@ fn init_tracing() {
     }
 }
 
-/// Generic watcher that accumulates notifications and provides async waiting methods
+/// Generic watcher that accumulates notifications and provides async waiting methods.
+/// It waits on tokio timers, so it exists only natively.
+#[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone)]
 pub struct TestWatcher<T, U> {
     changes: Arc<Mutex<Vec<T>>>,
@@ -48,10 +54,12 @@ pub struct TestWatcher<T, U> {
     transform: Arc<dyn Fn(T) -> U + Send + Sync>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T> TestWatcher<T, T> {
     pub fn new() -> Self { Self { changes: Arc::new(Mutex::new(Vec::new())), notify: Arc::new(Notify::new()), transform: Arc::new(|x| x) } }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T, U> TestWatcher<T, U> {
     /// Creates a new generic watcher with identity transform (T -> T)
     pub fn transform(transform: impl Fn(T) -> U + Send + Sync + 'static) -> TestWatcher<T, U> {
@@ -59,6 +67,7 @@ impl<T, U> TestWatcher<T, U> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<R: View + Send + Sync + 'static> TestWatcher<ChangeSet<R>, Vec<(proto::EntityId, ChangeKind)>> {
     /// Creates a new changeset watcher that transforms ChangeSet<R> to Vec<(EntityId, ChangeKind)>
     pub fn changeset() -> TestWatcher<ChangeSet<R>, Vec<(proto::EntityId, ChangeKind)>> {
@@ -88,6 +97,7 @@ impl<R: View + Send + Sync + 'static> TestWatcher<ChangeSet<R>, Vec<(proto::Enti
         changes
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl<T, U> TestWatcher<T, U> {
     pub fn notify(&self, item: T) {
         self.changes.lock().unwrap().push(item);
@@ -182,12 +192,14 @@ impl<T, U> TestWatcher<T, U> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T, U> TestWatcher<T, U>
 where T: Clone
 {
     pub fn peek(&self) -> Vec<U> { self.changes.lock().unwrap().iter().map(|item| (self.transform)(item.clone())).collect() }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: Send + 'static, U> IntoBroadcastListener<T> for &TestWatcher<T, U> {
     fn into_broadcast_listener(self) -> BroadcastListener<T> {
         let changes = self.changes.clone();
@@ -199,6 +211,7 @@ impl<T: Send + 'static, U> IntoBroadcastListener<T> for &TestWatcher<T, U> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<T: Send + 'static, U> IntoSubscribeListener<T> for &TestWatcher<T, U> {
     fn into_subscribe_listener(self) -> Box<dyn Fn(T) + Send + Sync> {
         let changes = self.changes.clone();

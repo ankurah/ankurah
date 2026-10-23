@@ -7,7 +7,7 @@ use ankurah_core::value::Value;
 pub enum SqliteValue {
     /// TEXT type for strings
     Text(String),
-    /// INTEGER type for small integers
+    /// INTEGER type for signed 64-bit integers
     Integer(i64),
     /// REAL type for floating point
     Real(f64),
@@ -46,20 +46,6 @@ impl SqliteValue {
             _ => None,
         }
     }
-
-    /// Convert to a rusqlite parameter value
-    /// Note: For JSONB, this returns the JSON text - the caller must wrap with jsonb()
-    pub fn to_sql(&self) -> rusqlite::types::Value {
-        match self {
-            SqliteValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
-            SqliteValue::Integer(i) => rusqlite::types::Value::Integer(*i),
-            SqliteValue::Real(f) => rusqlite::types::Value::Real(*f),
-            SqliteValue::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
-            // Return as text - the SQL query will wrap this with jsonb()
-            SqliteValue::Jsonb(j) => rusqlite::types::Value::Text(j.to_string()),
-            SqliteValue::Null => rusqlite::types::Value::Null,
-        }
-    }
 }
 
 impl From<Value> for SqliteValue {
@@ -89,6 +75,7 @@ impl From<Option<Value>> for SqliteValue {
 }
 
 /// Convert rusqlite Value to our SqliteValue
+#[cfg(not(target_arch = "wasm32"))]
 impl From<rusqlite::types::Value> for SqliteValue {
     fn from(value: rusqlite::types::Value) -> Self {
         match value {

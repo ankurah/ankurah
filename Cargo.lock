@@ -483,7 +483,9 @@ dependencies = [
  "bincode",
  "ctor 0.2.9",
  "futures-util",
+ "js-sys",
  "rusqlite",
+ "send_wrapper 0.6.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -491,6 +493,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "wasm-bindgen",
+ "wasm-bindgen-test",
 ]
 
 [[package]]

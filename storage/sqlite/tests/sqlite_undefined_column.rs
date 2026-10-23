@@ -12,6 +12,11 @@ use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::test as engine_test;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
 /// Model with status and created fields to test missing column handling
 #[derive(Model, Debug, Serialize, Deserialize)]
@@ -22,7 +27,7 @@ pub struct Task {
 }
 
 /// Test that queries handle undefined columns in WHERE clause
-#[tokio::test]
+#[engine_test]
 async fn test_undefined_column_in_where() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -38,7 +43,7 @@ async fn test_undefined_column_in_where() -> Result<()> {
 }
 
 /// Test that queries handle undefined columns in ORDER BY clause
-#[tokio::test]
+#[engine_test]
 async fn test_undefined_column_in_order_by() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -53,7 +58,7 @@ async fn test_undefined_column_in_order_by() -> Result<()> {
 }
 
 /// Test WHERE on one missing column, ORDER BY on another (both handled upfront)
-#[tokio::test]
+#[engine_test]
 async fn test_undefined_columns_where_and_order_by() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -69,7 +74,7 @@ async fn test_undefined_columns_where_and_order_by() -> Result<()> {
 }
 
 /// Test that after writing data, subsequent queries work
-#[tokio::test]
+#[engine_test]
 async fn test_columns_exist_after_write() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -91,7 +96,7 @@ async fn test_columns_exist_after_write() -> Result<()> {
 
 /// Test cache refresh: query before columns exist, write (creates columns), query again
 /// This validates that the schema cache gets refreshed when columns are added.
-#[tokio::test]
+#[engine_test]
 async fn test_cache_refresh_after_column_creation() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());

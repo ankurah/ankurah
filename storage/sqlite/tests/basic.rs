@@ -9,14 +9,22 @@
 
 mod common;
 
+#[cfg(not(target_arch = "wasm32"))]
 use ankurah::signals::Subscribe;
 use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use ankurah_storage_sqlite::SqliteStorageEngine;
 use anyhow::Result;
-use common::{Album, AlbumView, TestWatcher};
+#[cfg(not(target_arch = "wasm32"))]
+use common::TestWatcher;
+use common::{Album, AlbumView};
 use std::sync::Arc;
+// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+#[cfg(not(target_arch = "wasm32"))]
+use tokio::test as engine_test;
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
-#[tokio::test]
+#[engine_test]
 async fn test_sqlite_create_and_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -39,7 +47,7 @@ async fn test_sqlite_create_and_query() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_sqlite_update_entity() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -70,7 +78,7 @@ async fn test_sqlite_update_entity() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_sqlite_state_change_detection() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -99,7 +107,7 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[engine_test]
 async fn test_sqlite_multiple_updates() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
@@ -132,6 +140,7 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 #[tokio::test]
 async fn test_sqlite_query_with_subscription() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
