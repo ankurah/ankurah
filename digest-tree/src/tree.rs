@@ -343,8 +343,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(children)
     }
 
-    /// Read topology without decoding summary values or their deltas.
-    pub(crate) async fn child_prefixes(&mut self, prefix: &NodePrefix) -> Result<Vec<NodePrefix>, TreeError> {
+    /// The nearest stored descendants, in the same prefix order as [`Self::children`],
+    /// without decoding or summing their digests. Includes pending topology changes
+    /// and still rejects descendant delta rows whose base is missing.
+    pub async fn child_prefixes(&mut self, prefix: &NodePrefix) -> Result<Vec<NodePrefix>, TreeError> {
         let (own_deltas_first, own_deltas_past) = layout::delta_key_bounds(prefix);
         let end = prefix.subtree_key_end();
         let mut start = Bound::Excluded(prefix.to_bytes());
@@ -993,6 +995,7 @@ mod tests {
         for text in ["", "0", "0000000", "1", "01"] {
             maps.append_node_delta(&prefix(text), leaf(7)).await.unwrap();
         }
+        assert_eq!(maps.child_prefixes(&prefix("0")).await.unwrap(), [prefix("0000000"), prefix("01")], "pending insertions");
         maps.commit().await.unwrap();
 
         let mut maps = tree.begin();
@@ -1007,6 +1010,9 @@ mod tests {
         let (child, summary) = &maps.children(&prefix("0")).await.unwrap()[1];
         assert_eq!((child, summary), (&prefix("01"), &NodeRow { digest: leaf(7) }), "a child with an explicit empty baseline");
         assert_eq!(maps.node(&prefix("0")).await.unwrap(), Some(NodeRow { digest: node(3).digest + leaf(7) }));
+        maps.delete_node(&prefix("01")).await.unwrap();
+        assert_eq!(maps.child_prefixes(&prefix("0")).await.unwrap(), [prefix("0000000")], "pending removal hides a committed child");
+        assert_eq!(maps.child_prefixes(&prefix("0")).await.unwrap(), prefixes(maps.children(&prefix("0")).await.unwrap()));
     }
 
     /// A tree node whose prefix ends on a whole byte of its encoding, as one of

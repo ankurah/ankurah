@@ -111,6 +111,86 @@ async fn payload_reads_prefer_current_residents_and_fall_back_without_hydrating(
 }
 
 #[tokio::test]
+async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> anyhow::Result<()> {
+    use crate::retrieval::{LocalEventGetter, LocalStateGetter};
+
+    for payload in [8, 1024] {
+        let (node, _, _) = node().await?;
+        let source = states(PAGE_STEPS * 2, payload);
+        let first_id = source[0].payload.entity_id;
+        let snapshot = stored_snapshot(&node, source.clone()).await?;
+        let mut residents = Vec::new();
+        for state in source {
+            residents.push(
+                node.entities
+                    .get_or_retrieve(
+                        &LocalStateGetter::new(node.storage.clone()),
+                        &LocalEventGetter::new(node.storage.clone(), node.durable),
+                        &state.payload.entity_id,
+                    )
+                    .await?
+                    .unwrap(),
+            );
+        }
+        let mut comparison = Comparison::new(snapshot, unknown())?;
+        let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        assert_eq!(progress, ComparisonProgress::Continue);
+        let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count();
+        assert!(repairs > PAGE_WORK, "resident snapshots must not stop at the storage/history work cap");
+        let sizes = items.iter().map(super::super::budget::item_bytes).collect::<Result<Vec<_>, _>>()?;
+        let bytes: u64 = sizes.iter().sum();
+        assert!(bytes <= PAGE_BYTES as u64);
+        if payload == 8 {
+            assert_eq!(repairs, PAGE_STEPS - 1, "one head page plus repairs fills the step budget");
+        } else {
+            assert!(
+                bytes + super::super::budget::item_bytes(items.last().unwrap())? > PAGE_BYTES as u64,
+                "another same-sized repair would exceed the byte budget"
+            );
+        }
+        drop(residents);
+        assert!(node.entities.get(&first_id).is_none(), "reply construction must not retain resident entity handles");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn storage_and_possible_history_repairs_keep_the_work_cap() -> anyhow::Result<()> {
+    use crate::retrieval::{LocalEventGetter, LocalStateGetter};
+
+    for known_head in [None, Some(proto::Clock::genesis(proto::EventId::from_bytes([9; 32])))] {
+        let (node, _, _) = node().await?;
+        let source = states(PAGE_WORK * 2, 8);
+        let snapshot = stored_snapshot(&node, source.clone()).await?;
+        let mut residents = Vec::new();
+        if known_head.is_some() {
+            for state in &source {
+                residents.push(
+                    node.entities
+                        .get_or_retrieve(
+                            &LocalStateGetter::new(node.storage.clone()),
+                            &LocalEventGetter::new(node.storage.clone(), node.durable),
+                            &state.payload.entity_id,
+                        )
+                        .await?
+                        .unwrap(),
+                );
+            }
+        }
+        let mut comparison = Comparison::new(snapshot, unknown())?;
+        comparison.work = source.iter().map(|state| Work::Repair(state.payload.entity_id, known_head.clone())).collect();
+        let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        assert_eq!(progress, ComparisonProgress::Continue);
+        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), PAGE_WORK);
+        assert_eq!(comparison.repaired.len(), PAGE_WORK);
+        let Some(Work::Repair(deferred, _)) = comparison.work.front() else { panic!("deferred repair") };
+        assert!(!comparison.repaired.contains(deferred), "budget deferral must not mark an unsent repair as complete");
+        drop(residents);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
     let mut source = states(4096, 8);

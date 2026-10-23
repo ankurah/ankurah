@@ -312,7 +312,7 @@ async fn compact_paths(tree: &mut TreeTransaction, addresses: &BTreeSet<Vec<u8>>
     let mut pending = vec![NodePrefix::root()];
     while let Some(prefix) = pending.pop() {
         anyhow::ensure!(!tree.compact_node(&prefix).await?, "resident digest compaction exceeded its maintenance batch");
-        for (child, _) in tree.children(&prefix).await? {
+        for child in tree.child_prefixes(&prefix).await? {
             if addresses.iter().any(|address| child.contains_address(address)) {
                 pending.push(child);
             }

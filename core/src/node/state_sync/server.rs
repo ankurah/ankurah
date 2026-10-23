@@ -1633,15 +1633,21 @@ impl Comparison {
                 break;
             }
             let Some(work) = self.work.pop_front() else { break };
-            // Keep this in step with tree/storage/history access in the arms below.
+            // An unknown-head repair reads only current state. Keep an existing
+            // resident alive through that read so it cannot become storage work.
+            let resident = match &work {
+                Work::Repair(id, None) => node.entities.get(id),
+                _ => None,
+            };
+            // Known-head repairs may walk history even when their entity is resident.
             let expensive = match &work {
+                Work::Repair(..) => resident.is_none(),
                 Work::InitialHeads(_)
                 | Work::AnswerHeads { .. }
                 | Work::CompareFrontier(_)
                 | Work::Compare { .. }
                 | Work::Expand { .. }
                 | Work::SendHeads(_)
-                | Work::Repair(..)
                 | Work::History { .. } => true,
                 _ => false,
             };
@@ -1766,6 +1772,7 @@ impl Comparison {
                     }
                     let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
                     let state = node_state(node, id, &policy).await?;
+                    drop(resident);
                     let allowed = state.as_ref().is_some_and(|state| {
                         (!catalog || state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy))
                             && policy.check_read(&id, &state.payload.state).is_ok()
