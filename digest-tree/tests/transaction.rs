@@ -1,7 +1,9 @@
-//! A fake outer transaction with canonical records and two trees. All records
-//! share one MemoryTransaction; committing separate MemoryMaps would not test
-//! atomicity. Its topology fence is deliberately global, as in the memory
-//! reference adapter, rather than a proposed database locking strategy.
+//! Two trees and entity records that commit atomically through one outer
+//! transaction. The records and both trees share one `MemoryTransaction`,
+//! each tree under a key namespace of its own, so the outer commit lands
+//! everything or nothing; separate `MemoryMaps` would not test that. The
+//! topology fence is the memory maps' own, which covers the whole outer
+//! transaction.
 use std::borrow::BorrowMut;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 

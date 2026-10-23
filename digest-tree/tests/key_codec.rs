@@ -1,3 +1,6 @@
+//! The canonical key codec: its encodings sort as their values do, are
+//! prefix-free, split back into their parts, and refuse what has no
+//! canonical order.
 use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
 use ankurah_digest_tree::CanonicalCodec;
 use proptest::prelude::*;
@@ -11,7 +14,8 @@ proptest! {
     fn string_tuples_are_prefix_free_and_order_preserving(a in ".{0,40}", b in ".{0,40}", x in any::<i64>(), y in any::<i64>()) {
         let spec = spec(&[ValueType::String, ValueType::I64]);
         let encode = |s: &str, n| CanonicalCodec::encode_prefix(&spec, &[Value::from(s), Value::I64(n)]).unwrap();
-        let first = encode(&a, x); let second = encode(&b, y);
+        let first = encode(&a, x);
+        let second = encode(&b, y);
         prop_assert_eq!(first.cmp(&second), a.as_bytes().cmp(b.as_bytes()).then(x.cmp(&y)));
         prop_assert_eq!(CanonicalCodec::split(&spec, &first).unwrap().concat(), first.clone());
         if first != second { prop_assert!(!first.starts_with(&second) && !second.starts_with(&first)); }

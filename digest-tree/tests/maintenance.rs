@@ -1,3 +1,6 @@
+//! Tree maintenance checked against a model of the leaves: change after
+//! change, bucket splits, merges and branch insertions keep every summary
+//! right, and changes that race with them retry.
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
 use ankurah_digest_tree::{Digest, DigestGroup, DigestTree, HeadHash, Leaf, LeafChange, LeafInput, NodePrefix, TreeError, TreeSpec};

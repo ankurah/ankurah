@@ -1,3 +1,6 @@
+//! Scoped reads checked against models of the leaves: counts, digests, pages
+//! and refinements of the scope a Selection makes, under mixed directions,
+//! limits, disjunctions, nulls and bucket edges.
 mod common;
 use ankql::ast::{OrderByItem, OrderDirection, Selection};
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyPath, Value, ValueType};

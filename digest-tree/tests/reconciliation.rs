@@ -1,5 +1,8 @@
-//! A source-authoritative reconciliation fixture, using only the standalone
-//! API. This tests comparison and repair regions, not event conflict resolution.
+//! Reconciliation between two peers' trees, using only this crate's public
+//! API: one side takes the other's leaves as authoritative, compares span
+//! digests, refines where they differ, and repairs the leaves in the spans
+//! that still differ. Comparison and repair are tested here, not how events
+//! resolve conflicts.
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included};
 

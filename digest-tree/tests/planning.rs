@@ -1,3 +1,5 @@
+//! Planning: the key a new Selection's tree is given, and whether an existing
+//! tree serves a Selection, with exact bounds for the entity id.
 mod common;
 use ankql::ast::{ComparisonOperator, Expr, OrderByItem, OrderDirection, Predicate, Selection};
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
