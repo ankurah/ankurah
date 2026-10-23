@@ -289,6 +289,7 @@ struct RestrictedDiscovery {
     deny_empty: bool,
     state_free_reads: bool,
     state_free_proofs: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    state_checks: Option<Arc<std::sync::atomic::AtomicUsize>>,
     retrieval_error: bool,
 }
 #[async_trait::async_trait]
@@ -347,6 +348,9 @@ impl PolicyAgent for RestrictedDiscovery {
         data: &C,
         states: &[(&proto::EntityId, &proto::State)],
     ) -> std::collections::HashMap<proto::EntityId, crate::policy::AccessDenied> {
+        if let Some(checks) = &self.state_checks {
+            checks.fetch_add(states.len(), std::sync::atomic::Ordering::Relaxed);
+        }
         if (self.deny_empty && data.iterable().next().is_none())
             || self.read_allowed.as_ref().is_some_and(|allowed| !allowed.load(std::sync::atomic::Ordering::SeqCst))
         {

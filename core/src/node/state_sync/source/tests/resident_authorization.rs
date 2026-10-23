@@ -2,6 +2,50 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 #[tokio::test]
+async fn reactor_publication_evaluates_the_state_free_read_proof_for_each_change() -> anyhow::Result<()> {
+    let allowed = Arc::new(AtomicBool::new(true));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let proofs = Arc::new(AtomicUsize::new(0));
+    let node = Node::new_durable(
+        Arc::new(OrderedStorage::default()),
+        RestrictedDiscovery {
+            read_allowed: Some(allowed.clone()),
+            state_free_reads: true,
+            state_free_proofs: Some(proofs.clone()),
+            state_checks: Some(checks.clone()),
+            ..Default::default()
+        },
+    );
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let mut current = genesis("01")?;
+    apply(&node, &current).await?;
+    let selected = selection(None);
+    let spec = QueryTree::spec(&selected, &node.catalog);
+    let mut captured = capture_query(&node, selected, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    assert!(captured.snapshot.entries.contains_key(&current.entity_id));
+
+    for (readable, value) in [(true, "02"), (false, "03"), (true, "04")] {
+        allowed.store(readable, Ordering::SeqCst);
+        let before = checks.load(Ordering::Relaxed);
+        let before_proofs = proofs.load(Ordering::Relaxed);
+        current = update(&current, value)?;
+        apply(&node, &current).await?;
+        let batch = captured.cursor.next().await?;
+        assert_eq!(checks.load(Ordering::Relaxed) - before, usize::from(!readable), "only an unavailable proof needs a state check");
+        assert_eq!(proofs.load(Ordering::Relaxed) - before_proofs, 1, "each publication evaluates permission afresh");
+        captured.projection.apply(&batch, false).await?;
+        let snapshot = captured.projection.tree.current_snapshot().await?;
+        assert_eq!(snapshot.entries.contains_key(&current.entity_id), readable);
+        if readable {
+            assert_eq!(snapshot.entries[&current.entity_id].head, proto::Clock::singleton(&current));
+        }
+        assert!(captured.projection.candidates.contains(&current.entity_id), "revoked candidates remain watched for reentry");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn unrestricted_reads_reuse_a_complete_tree_for_a_limit_without_reading_states() -> anyhow::Result<()> {
     let node = node().await?;
     let mut events = Vec::new();

@@ -147,7 +147,9 @@ where
             let entity_id = change.entity().id();
             change.entity().with_read(|entity| {
                 let matches = evaluate_predicate(entity, &subscribed_selection.predicate)?;
-                let entry = if matches && policy.check_read(&entity_id, &entity.to_state()?).is_ok() {
+                let entry = if matches
+                    && (policy.allows_unrestricted_state_reads() || policy.check_read(&entity_id, &entity.to_state()?).is_ok())
+                {
                     let values = subscribed_paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
                     Some(TreeEntry {
                         entity_id,
