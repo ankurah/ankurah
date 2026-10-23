@@ -130,6 +130,9 @@ full round trip.
 
 ### Reading notes and caveats
 
+- `lane_perf` runs `bridge_catchup` at gaps of 32, 100 and 200, because the responder bridges at
+  most 256 events and repairs a longer gap with a snapshot. Of the `bridge_catchup` rows above,
+  only gap 100 has a counterpart in a run of `lane_perf`.
 - The commit throughput here (~37 us, ~27k commits/s) is the full local commit
   path on sled, NOT the bare `compare()`/engine microcost in
   `core/benches/BASELINE.md`. They are not comparable; this one includes
