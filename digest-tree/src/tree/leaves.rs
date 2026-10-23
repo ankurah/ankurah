@@ -46,18 +46,19 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     /// Insert the leaf row at its address, where the transaction sees no row,
     /// and list its key under its entity. [`TreeError::Conflict`] when
-    /// another change got there first.
+    /// another change got there first, and [`TreeError::Inconsistent`] when
+    /// the lookup lists the key already, for a row that is not there.
     pub(crate) async fn insert_leaf(&mut self, prepared: &PreparedLeaf<G>) -> Result<(), TreeError> {
         let row = prepared.row();
         self.transaction.insert(MapName::Leaves, &row.address(), prepared.value()).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
-        if keys.insert(row.key.clone()) {
-            if keys.len() == 2 {
-                self.adjust_multiple_keys(true).await?;
-            }
-            self.transaction.put_if(MapName::Lookup, &row.entity_id.to_bytes(), listed.as_deref(), &layout::lookup_value(&keys)).await?;
+        if !keys.insert(row.key.clone()) {
+            return Err(TreeError::Inconsistent("the lookup lists a leaf that is absent"));
         }
-        Ok(())
+        if keys.len() == 2 {
+            self.adjust_multiple_keys(true).await?;
+        }
+        self.transaction.put_if(MapName::Lookup, &row.entity_id.to_bytes(), listed.as_deref(), &layout::lookup_value(&keys)).await
     }
 
     /// Replace the leaf row at `new`'s address, which the transaction read as
@@ -70,22 +71,23 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
 
     /// Remove the leaf row `row`, as the writer read it, and its key from
     /// under its entity. [`TreeError::Conflict`] when the row there now is
-    /// another, or none.
+    /// another, or none, and [`TreeError::Inconsistent`] when the lookup does
+    /// not list the row's key.
     pub(crate) async fn delete_leaf(&mut self, row: &LeafRow<G>) -> Result<(), TreeError> {
         self.transaction.delete_if(MapName::Leaves, &row.address(), &layout::leaf_value(row)).await?;
         let (listed, mut keys) = self.keys_of(row.entity_id).await?;
-        if keys.remove(&row.key) {
-            if keys.len() == 1 {
-                self.adjust_multiple_keys(false).await?;
-            }
-            let listed = listed.as_deref().expect("the key was listed, so its entity has a lookup value");
-            let id = row.entity_id.to_bytes();
-            match keys.is_empty() {
-                true => self.transaction.delete_if(MapName::Lookup, &id, listed).await?,
-                false => self.transaction.put_if(MapName::Lookup, &id, Some(listed), &layout::lookup_value(&keys)).await?,
-            }
+        if !keys.remove(&row.key) {
+            return Err(TreeError::Inconsistent("the lookup does not list a leaf"));
         }
-        Ok(())
+        if keys.len() == 1 {
+            self.adjust_multiple_keys(false).await?;
+        }
+        let listed = listed.as_deref().expect("the key was listed, so its entity has a lookup value");
+        let id = row.entity_id.to_bytes();
+        match keys.is_empty() {
+            true => self.transaction.delete_if(MapName::Lookup, &id, listed).await,
+            false => self.transaction.put_if(MapName::Lookup, &id, Some(listed), &layout::lookup_value(&keys)).await,
+        }
     }
 
     pub(crate) async fn all_leaves(&mut self, span: &TreeSpan) -> Result<Vec<LeafRow<G>>, TreeError> {

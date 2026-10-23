@@ -21,6 +21,7 @@ in_each_group!(
     leaves_are_read_by_span_a_page_at_a_time,
     the_span_under_a_prefix_reads_its_leaves,
     competing_lookup_updates_for_one_entity_leave_no_orphaned_row,
+    writes_refuse_a_lookup_that_disagrees_with_the_leaves,
 );
 
 async fn a_new_tree_is_empty<G: DigestGroup>() {
@@ -186,4 +187,27 @@ async fn competing_lookup_updates_for_one_entity_leave_no_orphaned_row<G: Digest
     retry.insert_leaf(&PreparedLeaf::new(red.clone())).await.unwrap();
     retry.commit().await.unwrap();
     assert_eq!(tree.begin().entity_leaves(filed).await.unwrap(), [blue, red]);
+}
+
+/// A lookup that disagrees with the leaves is damage, which writes refuse:
+/// inserting a row whose key the lookup already lists for its entity, and
+/// removing a row whose key it does not list.
+async fn writes_refuse_a_lookup_that_disagrees_with_the_leaves<G: DigestGroup>() {
+    let tree = empty_tree::<G>();
+    let (filed, unfiled) = (row::<G>(b"blue\0", entity(1)), row::<G>(b"red\0", entity(1)));
+    let mut maps = tree.begin();
+    maps.insert_leaf(&PreparedLeaf::new(filed.clone())).await.unwrap();
+    maps.commit().await.unwrap();
+
+    // The lookup still lists the key of a leaf row that is gone.
+    let mut damage = tree.begin();
+    damage.transaction.delete_if(MapName::Leaves, &filed.address(), &layout::leaf_value(&filed)).await.unwrap();
+    damage.commit().await.unwrap();
+    assert!(matches!(tree.begin().insert_leaf(&PreparedLeaf::new(filed)).await, Err(TreeError::Inconsistent(_))));
+
+    // A leaf row whose key the lookup does not list.
+    let mut damage = tree.begin();
+    damage.transaction.insert(MapName::Leaves, &unfiled.address(), &layout::leaf_value(&unfiled)).await.unwrap();
+    damage.commit().await.unwrap();
+    assert!(matches!(tree.begin().delete_leaf(&unfiled).await, Err(TreeError::Inconsistent(_))));
 }
