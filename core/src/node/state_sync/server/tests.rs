@@ -78,6 +78,39 @@ fn live_item(bytes: usize) -> proto::QueryChange {
 }
 
 #[tokio::test]
+async fn payload_reads_prefer_current_residents_and_fall_back_without_hydrating() -> anyhow::Result<()> {
+    use crate::retrieval::{LocalEventGetter, LocalStateGetter};
+
+    let (node, _, _) = node().await?;
+    let current = positioned_state(1, 20, 3)?;
+    let id = current.payload.entity_id;
+    node.storage.set_state(current.clone());
+    let resident = node
+        .entities
+        .get_or_retrieve(&LocalStateGetter::new(node.storage.clone()), &LocalEventGetter::new(node.storage.clone(), node.durable), &id)
+        .await?
+        .unwrap();
+    let mut stored = positioned_state(1, 10, 2)?;
+    stored.attestations.push(proto::Attestation(vec![42]));
+    node.storage.set_state(stored.clone());
+    *node.storage.reject_state_read.lock().unwrap() = Some(id);
+    let credentials = vec![];
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
+
+    let read = node_state(&node, id, &policy).await?.unwrap();
+    assert_eq!(read.payload, current.payload, "the payload comes from the current resident, without a storage read");
+    assert!(read.attestations.is_empty(), "PermissiveAgent freshly attests with None; stored attestations must not leak onto newer state");
+
+    drop(resident);
+    *node.storage.reject_state_read.lock().unwrap() = None;
+    let read = node_state(&node, id, &policy).await?.unwrap();
+    assert_eq!(read, stored, "storage fallback retains the attestation belonging to that state");
+    assert!(node.entities.get(&id).is_none(), "sending a storage payload does not make an entity resident");
+    assert!(node_state(&node, proto::EntityId::random(), &policy).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
     let mut source = states(4096, 8);
@@ -441,12 +474,24 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items.as_slice(), [StateItem::Heads(page)] if page.heads.to_vec()[0].entity.entity_id == id));
     assert!(comparison.offered.contains(&target_id(id, &source[0].payload.state.head)), "membership still offers its captured target");
+    let _resident = node
+        .entities
+        .get_or_retrieve(
+            &crate::retrieval::LocalStateGetter::new(node.storage.clone()),
+            &crate::retrieval::LocalEventGetter::new(node.storage.clone(), node.durable),
+            &id,
+        )
+        .await?
+        .unwrap();
+    *node.storage.reject_state_read.lock().unwrap() = Some(id);
     let mut comparison = Comparison::new(stored_snapshot(&node, source).await?, unknown())?;
     let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], true, 0).await? else { panic!("state") };
     assert!(
         items.iter().any(|item| matches!(item, StateItem::RepairUnavailable { entity_id, .. } if *entity_id == id)),
         "a captured member cannot authorize an out-of-scope current payload"
     );
+    let error = target_history(&node, id, &proto::Clock::default(), &vec![], true).await.unwrap_err();
+    assert!(error.to_string().contains("outside catalog scope"), "resident history reads must authorize current state too");
     Ok(())
 }
 
@@ -1574,6 +1619,16 @@ async fn captured_membership_and_current_payload_keep_both_targets_across_moves_
         let snapshot = super::super::QueryTree::default().refresh(spec.clone(), vec![captured.clone()]).await?;
         let captured_entry = snapshot.entries[&id].clone();
         node.storage.set_state(current.clone());
+        let _resident = node
+            .entities
+            .get_or_retrieve(
+                &crate::retrieval::LocalStateGetter::new(node.storage.clone()),
+                &crate::retrieval::LocalEventGetter::new(node.storage.clone(), node.durable),
+                &id,
+            )
+            .await?
+            .unwrap();
+        *node.storage.reject_state_read.lock().unwrap() = Some(id);
         let mut comparison = Comparison::new(snapshot, proto::KnownState { spec: spec.clone(), spans: vec![] })?;
         let items = initial_items(&node, &mut comparison).await?;
         let [StateItem::Heads(page), StateItem::Repair { target, delta }] = items.as_slice() else {

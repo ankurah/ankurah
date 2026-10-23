@@ -337,8 +337,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let mut state = states[0].clone();
         let entity_id = state.payload.entity_id;
         let known_head = state.payload.state.head.clone();
-        // Seed the protected catalog fixture before connecting peers or creating
-        // resident trees; direct storage writes do not publish node changes.
+        // Seed protected catalog data before reopening the node below.
         let update = proto::Event::update(
             entity_id,
             known_head.clone(),
@@ -357,6 +356,14 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
 
         cases.push((label, model, entity_id, known_head, events));
     }
+
+    // Direct fixture writes bypass publication. Reopen before serving so the
+    // catalog's retained entities and storage begin from the same committed state.
+    let storage = server.storage.clone();
+    drop(context);
+    drop(server);
+    let server = Node::new_durable(storage, agent.clone());
+    let context = server.context_async(DEFAULT_CONTEXT).await?;
 
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     let frames = Arc::new(Mutex::new(Vec::<proto::StateFrame>::new()));

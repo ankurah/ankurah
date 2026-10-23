@@ -1311,6 +1311,13 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     C: ankurah_signals::Signal + ankurah_signals::Peek<Vec<PA::ContextData>>,
 {
+    // Resident handles contain the node's current committed state. Re-attest
+    // that state instead of reloading it; callers still authorize this payload.
+    if let Some(entity) = node.entities.get(&id) {
+        let state = entity.to_entity_state()?;
+        let attestation = node.policy_agent.attest_state(node, &state);
+        return Ok(Some(proto::Attested::opt(state, attestation)));
+    }
     Ok(node
         .storage
         .get_states(vec![id], &policy.retrieval_predicate())
@@ -1770,6 +1777,9 @@ impl Comparison {
                         continue;
                     }
                     let state = state.expect("authorized state exists");
+                    if known.as_ref() == Some(&state.payload.state.head) {
+                        continue;
+                    }
                     let target = state.payload.state.head.clone();
                     let snapshot = known.as_ref().map(|_| proto::DeltaContent::StateSnapshot { state: state.clone().into() });
                     let known = known.map(|head| HashMap::from([(id, head)])).unwrap_or_default();
