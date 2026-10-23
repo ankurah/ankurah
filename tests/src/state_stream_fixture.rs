@@ -112,7 +112,7 @@ impl ScriptedConnection {
                             }
                             false
                         }
-                        proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
+                        proto::NodeMessage::StateFrame { frame, .. } => {
                             if let Some(stream) = routes.get_mut(&frame.stream) {
                                 if stream.scripted {
                                     true
@@ -171,12 +171,7 @@ impl ScriptedConnection {
                 (frame, stream.request.clone(), revision, stream.comparison)
             };
             self.client
-                .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                    id: proto::UpdateId::new(),
-                    from: self.source.id,
-                    to: self.client.id,
-                    body: proto::NodeUpdateBody::StateFrame { request_id: request, frame },
-                }))
+                .handle_message(proto::NodeMessage::StateFrame { from: self.source.id, to: self.client.id, request_id: request, frame })
                 .await?;
             if failed {
                 continue;

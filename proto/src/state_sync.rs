@@ -1,7 +1,7 @@
 //! Bounded comparison rounds within a standing query's state stream.
 //!
 //! The initial response carries metadata and frame zero. Later frames are pushed
-//! through NodeUpdate, correlated with the originating request and stream.
+//! through NodeMessage::StateFrame, correlated with the originating request and stream.
 //! StateFeedback acknowledges a processed prefix and supplies bounded answers;
 //! it returns Success rather than carrying another frame. Responders choose
 //! byte/work/window limits beneath the protocol's hard resource caps.
@@ -81,7 +81,7 @@ pub struct StateReply {
 }
 
 /// Immutable within one connection generation and state stream.
-/// Frame zero is in StateReply; subsequent frames arrive only as NodeUpdate.
+/// Frame zero is in StateReply; subsequent frames arrive only as NodeMessage::StateFrame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFrame {
     pub stream: StateStreamId,

@@ -277,7 +277,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
             let held = held.clone();
             tokio::spawn(async move {
                 while let Some(message) = client_rx.recv().await {
-                    if matches!(&message, proto::NodeMessage::Update(_)) {
+                    if matches!(&message, proto::NodeMessage::StateFrame { .. }) {
                         if let Some(held) = held.lock().unwrap().as_mut() {
                             held.push(message);
                             continue;
@@ -322,12 +322,10 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                 let updates = held.lock().unwrap();
                 catalog_ids.iter().all(|id| {
                     updates.as_ref().unwrap().iter().any(|message| match message {
-                        proto::NodeMessage::Update(update) => match &update.body {
-                            proto::NodeUpdateBody::StateFrame { frame, .. } => match &frame.body {
-                                proto::StateFrameBody::Live { items, .. } => items.iter().any(|item| item.entity_id == *id),
-                                proto::StateFrameBody::LiveChunk { chunk, .. } => chunk.entity_id == *id,
-                                _ => false,
-                            },
+                        proto::NodeMessage::StateFrame { frame, .. } => match &frame.body {
+                            proto::StateFrameBody::Live { items, .. } => items.iter().any(|item| item.entity_id == *id),
+                            proto::StateFrameBody::LiveChunk { chunk, .. } => chunk.entity_id == *id,
+                            _ => false,
                         },
                         _ => false,
                     })

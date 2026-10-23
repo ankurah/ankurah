@@ -75,8 +75,7 @@ impl StorageEngine for Counted {
 struct Traffic {
     request_bytes: usize,
     response_bytes: usize,
-    update_bytes: usize,
-    ack_bytes: usize,
+    pushed_frame_bytes: usize,
     frames: usize,
     requests: usize,
     leaves: usize,
@@ -94,7 +93,6 @@ struct Meter {
     model: Option<proto::ModelId>,
     requests: HashSet<proto::RequestId>,
     comparisons: HashSet<proto::StateStreamId>,
-    updates: HashSet<proto::UpdateId>,
     traffic: Traffic,
     started: Option<Instant>,
     one_way_ms: u64,
@@ -137,24 +135,14 @@ impl Meter {
                     self.observe_frame(page);
                 }
             }
-            proto::NodeMessage::Update(update) => {
-                if let proto::NodeUpdateBody::StateFrame { request_id, frame } = &update.body {
-                    if self.requests.contains(request_id) {
-                        self.updates.insert(update.id.clone());
-                        let bytes = bincode::serialized_size(message).unwrap() as usize;
-                        self.traffic.update_bytes += bytes;
-                        self.traffic.response_bytes += bytes;
-                        self.observe_frame(frame);
-                    }
-                }
+            proto::NodeMessage::StateFrame { request_id, frame, .. } if self.requests.contains(request_id) => {
+                let bytes = bincode::serialized_size(message).unwrap() as usize;
+                self.traffic.pushed_frame_bytes += bytes;
+                self.traffic.response_bytes += bytes;
+                self.observe_frame(frame);
             }
             proto::NodeMessage::AbandonStateStream { stream, .. } if self.comparisons.contains(stream) => {
                 self.traffic.request_bytes += bincode::serialized_size(message).unwrap() as usize;
-            }
-            proto::NodeMessage::UpdateAck(ack) if self.updates.contains(&ack.id) => {
-                let bytes = bincode::serialized_size(message).unwrap() as usize;
-                self.traffic.ack_bytes += bytes;
-                self.traffic.request_bytes += bytes;
             }
             _ => {}
         }

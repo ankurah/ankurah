@@ -68,7 +68,7 @@ impl Captured {
                     );
                 }
             }
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
+            proto::NodeMessage::StateFrame { frame, .. } => {
                 if let Some(stream) = streams.get_mut(&frame.stream) {
                     if stream.scripted {
                         return;
@@ -141,12 +141,7 @@ impl Captured {
         };
         stream.next_sequence += 1;
         stream.next_revision += 1;
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
-            from: stream.from,
-            to: stream.to,
-            body: proto::NodeUpdateBody::StateFrame { request_id: stream.request.clone(), frame },
-        })
+        proto::NodeMessage::StateFrame { from: stream.from, to: stream.to, request_id: stream.request.clone(), frame }
     }
 }
 
@@ -178,8 +173,8 @@ impl PeerSender for SimSender {
 /// A stable *semantic* digest of a `NodeMessage` for the trace.
 ///
 /// This deliberately does NOT hash the whole message: `NodeMessage` carries
-/// random ULID correlation ids (`RequestId`, `TransactionId`, `UpdateId`,
-/// `QueryId`) minted by `::new()` on every send, including by the Node
+/// random ULID correlation ids (`RequestId`, `TransactionId`, `QueryId`)
+/// minted by `::new()` on every send, including by the Node
 /// internally for messages the harness captures. Those ids never affect
 /// scheduling (the scheduler keys on queue position and the seeded RNG, and a
 /// Node's internal correlation is deterministic within a run), but hashing them
@@ -207,10 +202,7 @@ fn semantic_descriptor(message: &proto::NodeMessage) -> String {
         proto::NodeMessage::Response(response) => {
             format!("RESP {}", response_descriptor(&response.body))
         }
-        proto::NodeMessage::Update(update) => match &update.body {
-            proto::NodeUpdateBody::StateFrame { frame, .. } => format!("FRAME {}", frame_descriptor(frame)),
-        },
-        proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
+        proto::NodeMessage::StateFrame { frame, .. } => format!("FRAME {}", frame_descriptor(frame)),
         proto::NodeMessage::UnsubscribeQuery { .. } => "UNSUB".to_string(),
         proto::NodeMessage::AbandonStateStream { .. } => "ABANDON".to_string(),
     }

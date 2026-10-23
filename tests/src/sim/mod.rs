@@ -28,8 +28,8 @@
 //!   it, so the harness forges events with seed-derived entity ids rather than
 //!   committing through `trx.create`. This is the one entropy source in the
 //!   write path and it is fully neutralized.
-//! - Correlation ids (`RequestId`, `TransactionId`, `UpdateId`, `QueryId`) stay
-//!   random, but they never affect scheduling (the scheduler keys on queue
+//! - Correlation ids (`RequestId`, `TransactionId`, `QueryId`) stay random,
+//!   but they never affect scheduling (the scheduler keys on queue
 //!   position and the seeded RNG) and are excluded from the semantic trace
 //!   digest, so they do not perturb the audit.
 //! - `Node::get_durable_peer_random()` uses `rand::thread_rng()` and is reached

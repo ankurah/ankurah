@@ -59,8 +59,7 @@ impl PeerSender for BrowserSender {
         let message = bincode::deserialize(&bytes).map_err(anyhow::Error::from)?;
         if let proto::NodeMessage::Response(response) = &message {
             self.responses.lock().unwrap().push(StateTraffic::Response(response.body.clone()));
-        } else if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = &message
-        {
+        } else if let proto::NodeMessage::StateFrame { frame, .. } = &message {
             self.responses.lock().unwrap().push(StateTraffic::Frame(frame.clone()));
         }
         if let Some(gate) = &self.gate {

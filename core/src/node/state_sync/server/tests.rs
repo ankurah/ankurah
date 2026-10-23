@@ -694,11 +694,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         .unwrap()
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. })
-                if frame.stream == id =>
-            {
-                Some(frame.sequence)
-            }
+            proto::NodeMessage::StateFrame { frame, .. } if frame.stream == id => Some(frame.sequence),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -756,8 +752,7 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
     let mut assembled = Vec::new();
     let mut live_seen = false;
     for message in messages.lock().unwrap().iter() {
-        let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) = message
-        else {
+        let proto::NodeMessage::StateFrame { request_id, frame, .. } = message else {
             continue;
         };
         assert_eq!(request_id, &origin);
@@ -877,14 +872,10 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
         .unwrap()
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate {
-                body:
-                    proto::NodeUpdateBody::StateFrame {
-                        frame: StateFrame { body: StateFrameBody::Live { revision, complete: true, .. }, .. },
-                        ..
-                    },
+            proto::NodeMessage::StateFrame {
+                frame: StateFrame { body: StateFrameBody::Live { revision, complete: true, .. }, .. },
                 ..
-            }) => Some(*revision),
+            } => Some(*revision),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -919,9 +910,7 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
     let bodies = messages
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                Some(&frame.body)
-            }
+            proto::NodeMessage::StateFrame { frame, .. } => Some(&frame.body),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -1024,9 +1013,7 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
         pump_state_stream(&node, peer, id).await?;
         assert!(
             messages.lock().unwrap().iter().any(|message| matches!(message,
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame {
-                    frame: StateFrame { stream: comparison, body: StateFrameBody::Live { revision: 1, complete: true, .. }, .. }, ..
-                }, .. }) if *comparison == id
+                proto::NodeMessage::StateFrame { frame: StateFrame { stream: comparison, body: StateFrameBody::Live { revision: 1, complete: true, .. }, .. }, .. } if *comparison == id
             )),
             "a cancelled comparison must not stop live delivery"
         );
@@ -1297,10 +1284,7 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
     let repair = frames
         .iter()
         .find_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate {
-                body: proto::NodeUpdateBody::StateFrame { frame: StateFrame { body: StateFrameBody::LiveRepair { items }, .. }, .. },
-                ..
-            }) => Some(items),
+            proto::NodeMessage::StateFrame { frame: StateFrame { body: StateFrameBody::LiveRepair { items }, .. }, .. } => Some(items),
             _ => None,
         })
         .expect("causal repair must use the reserved lane without ordinary frame credit");
@@ -1519,16 +1503,13 @@ async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_outpu
     assert!(queue_live(&node, peer, id, 1, vec![item; MAX_LIVE_ITEMS + 1]).is_err());
     expire_state_stream(&node, peer, id).await?;
     let messages = messages.lock().unwrap();
-    assert!(messages.iter().any(|message| matches!(message, proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame: StateFrame { stream: comparison, body: StateFrameBody::RestartRequired, .. }, .. }, .. }) if *comparison == id)));
+    assert!(messages.iter().any(|message| matches!(message, proto::NodeMessage::StateFrame { frame: StateFrame { stream: comparison, body: StateFrameBody::RestartRequired, .. }, .. } if *comparison == id)));
     assert!(!messages.iter().any(|message| matches!(
         message,
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            body: proto::NodeUpdateBody::StateFrame {
-                frame: StateFrame { body: StateFrameBody::Live { .. } | StateFrameBody::LiveChunk { .. }, .. },
-                ..
-            },
+        proto::NodeMessage::StateFrame {
+            frame: StateFrame { body: StateFrameBody::Live { .. } | StateFrameBody::LiveChunk { .. }, .. },
             ..
-        })
+        }
     )));
     drop(messages);
     abandon_state_stream(&node, peer, id).await;
@@ -2203,13 +2184,10 @@ async fn registered_stream_queues_live_changes_before_initial_frame_is_ready() -
     pump_state_stream(&node, peer, id).await?;
     assert!(messages.lock().unwrap().iter().any(|message| matches!(
         message,
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            body: proto::NodeUpdateBody::StateFrame {
-                frame: StateFrame { sequence: 1, body: StateFrameBody::Live { revision: 11, complete: true, .. }, .. },
-                ..
-            },
+        proto::NodeMessage::StateFrame {
+            frame: StateFrame { sequence: 1, body: StateFrameBody::Live { revision: 11, complete: true, .. }, .. },
             ..
-        })
+        }
     )));
     Ok(())
 }
@@ -2272,9 +2250,7 @@ async fn refresh_cut_is_queued_without_waiting_for_stream_io_and_blocks_later_li
     let bodies: Vec<_> = messages
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                Some(&frame.body)
-            }
+            proto::NodeMessage::StateFrame { frame, .. } => Some(&frame.body),
             _ => None,
         })
         .collect();

@@ -127,7 +127,7 @@ pub enum NodeRequestBody {
         model: RegisterModel,
     },
     /// Return flow credit and answer questions without waiting for another page.
-    /// Responses are Success; further numbered frames arrive as NodeUpdate.
+    /// Responses are Success; further numbered frames arrive as NodeMessage::StateFrame.
     /// Retrying the same request id is idempotent. A processed prefix may contain
     /// explicit pending NeedRepair; it is not the global Applied acknowledgment.
     StateFeedback {

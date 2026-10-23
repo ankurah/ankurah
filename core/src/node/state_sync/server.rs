@@ -1126,12 +1126,12 @@ where
         }
         state.retain(frame.clone(), priority)?;
         session.sent.store(sequence, Ordering::Release);
-        connection.send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
+        connection.send_message(proto::NodeMessage::StateFrame {
             from: node.id,
             to: peer,
-            body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame },
-        }))?;
+            request_id: session.initial_request.clone(),
+            frame,
+        })?;
     }
     Ok(())
 }
@@ -1195,12 +1195,12 @@ where
     }
     if !retained
         || connection
-            .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                id: proto::UpdateId::new(),
+            .send_message(proto::NodeMessage::StateFrame {
                 from: node.id,
                 to: peer,
-                body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame: frame.clone() },
-            }))
+                request_id: session.initial_request.clone(),
+                frame: frame.clone(),
+            })
             .is_err()
     {
         node.deregister_peer(peer);
@@ -1219,12 +1219,12 @@ where
                 return;
             }
             if connection
-                .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                    id: proto::UpdateId::new(),
+                .send_message(proto::NodeMessage::StateFrame {
                     from: node.id,
                     to: peer,
-                    body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame: frame.clone() },
-                }))
+                    request_id: session.initial_request.clone(),
+                    frame: frame.clone(),
+                })
                 .is_err()
             {
                 node.deregister_peer(peer);

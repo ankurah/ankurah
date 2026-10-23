@@ -102,7 +102,7 @@ async fn current_snapshot_repairs_validate_received_state_attestations_before_fe
         move |message| {
             let frame = match message {
                 proto::NodeMessage::Response(proto::NodeResponse { body: proto::NodeResponseBody::Fetch(state), .. }) => Some(&state.frame),
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                proto::NodeMessage::StateFrame { frame, .. } => Some(frame),
                 _ => None,
             };
             if let Some(proto::StateFrame { body: proto::StateFrameBody::Round { items, .. }, .. }) = frame {
@@ -370,7 +370,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     let (_conn, _) = common::GatedConnection::new(&server, &client, {
         let frames = frames.clone();
         move |message| {
-            if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+            if let proto::NodeMessage::StateFrame { frame, .. } = message {
                 frames.lock().unwrap().push(frame.clone());
             }
             false
@@ -508,7 +508,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
                     body: proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. },
                     ..
                 }) => Some(&state.frame),
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                proto::NodeMessage::StateFrame { frame, .. } => Some(frame),
                 _ => None,
             };
             if let Some(frame) = frame {

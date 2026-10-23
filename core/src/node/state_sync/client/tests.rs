@@ -95,9 +95,7 @@ struct StreamSender {
 impl crate::connector::PeerSender for StreamSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), crate::connector::SendError> {
         self.messages.lock().unwrap().push(bincode::deserialize(&bincode::serialize(&message).unwrap()).unwrap());
-        if self.hold_continuations.load(std::sync::atomic::Ordering::SeqCst)
-            && matches!(message, proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { .. }, .. }))
-        {
+        if self.hold_continuations.load(std::sync::atomic::Ordering::SeqCst) && matches!(message, proto::NodeMessage::StateFrame { .. }) {
             return Ok(());
         }
         let pause = if matches!(
@@ -230,19 +228,16 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_its_request
     // Queued traffic on the canceled, already-bound origin must not invoke
     // the orphan-metadata cleanup path either.
     client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
+        .handle_message(proto::NodeMessage::StateFrame {
             from: server.id,
             to: client.id,
-            body: proto::NodeUpdateBody::StateFrame {
-                request_id: origin,
-                frame: proto::StateFrame {
-                    stream: comparison,
-                    sequence: 1,
-                    body: proto::StateFrameBody::Live { revision: 1, items: vec![], complete: true },
-                },
+            request_id: origin,
+            frame: proto::StateFrame {
+                stream: comparison,
+                sequence: 1,
+                body: proto::StateFrameBody::Live { revision: 1, items: vec![], complete: true },
             },
-        }))
+        })
         .await?;
     tokio::task::yield_now().await;
     let (_, retained) =
@@ -302,15 +297,12 @@ async fn a_current_live_stream_failure_still_abandons_its_responder_query() -> a
     // before a replacement can reinstall the same query.
     let (entered_rx, release) = hold_request(&requests);
     client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
+        .handle_message(proto::NodeMessage::StateFrame {
             from: server.id,
             to: client.id,
-            body: proto::NodeUpdateBody::StateFrame {
-                request_id: origin.clone(),
-                frame: proto::StateFrame { stream: comparison, sequence: 1, body: proto::StateFrameBody::RestartRequired },
-            },
-        }))
+            request_id: origin.clone(),
+            frame: proto::StateFrame { stream: comparison, sequence: 1, body: proto::StateFrameBody::RestartRequired },
+        })
         .await?;
     until(|| {
         messages.lock().unwrap().iter().any(|message| {

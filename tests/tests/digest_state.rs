@@ -16,7 +16,7 @@ impl Trace {
     fn record(&self, message: &NodeMessage) {
         if let NodeMessage::Response(response) = message {
             self.0.lock().unwrap().push(response.body.clone());
-        } else if let NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+        } else if let NodeMessage::StateFrame { frame, .. } = message {
             self.1.lock().unwrap().push(frame.clone());
         }
     }
@@ -1096,9 +1096,7 @@ async fn pushed_chunks_can_outrun_metadata_and_arrive_out_of_order_without_early
                     parked.store(true, Ordering::Release);
                     true
                 }
-                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                    Some(frame.stream) == *comparison.lock().unwrap()
-                }
+                NodeMessage::StateFrame { frame, .. } => Some(frame.stream) == *comparison.lock().unwrap(),
                 _ => false,
             }
         }
@@ -1201,7 +1199,7 @@ async fn head_inventory_preserves_captured_keys_while_repair_joins_a_concurrent_
         let record_id = record.id();
         move |message| {
             trace.record(message);
-            if let NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+            if let NodeMessage::StateFrame { frame, .. } = message {
                 if matches!(&frame.body, proto::StateFrameBody::Round { items, .. } if bridge_for(items, record_id)) {
                     repair_parked.store(true, Ordering::Release);
                     return true;
@@ -1376,7 +1374,7 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
                     NodeResponseBody::QuerySubscribed { state, .. } => Some(&state.frame),
                     _ => None,
                 },
-                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                NodeMessage::StateFrame { frame, .. } => Some(frame),
                 _ => None,
             };
             let repair = frame.is_some_and(|frame| match &frame.body {

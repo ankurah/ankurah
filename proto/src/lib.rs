@@ -17,7 +17,6 @@ mod subscription;
 pub mod sys;
 pub mod time;
 pub mod transaction;
-pub mod update;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -42,4 +41,3 @@ pub use request::*;
 pub use state_sync::*;
 pub use subscription::QueryId;
 pub use transaction::*;
-pub use update::*;

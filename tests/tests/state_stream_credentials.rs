@@ -142,9 +142,7 @@ async fn live_connecting_history_uses_the_stream_credential_instead_of_the_peer_
         let frames = frames.clone();
         let arrived = arrived.clone();
         move |message| {
-            if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) =
-                message
-            {
+            if let proto::NodeMessage::StateFrame { request_id, frame, .. } = message {
                 if let proto::StateFrameBody::Live { items, .. } = &frame.body {
                     if items.iter().any(|item| item.entity_id == id) {
                         frames.lock().unwrap().push((request_id.clone(), frame.clone()));
@@ -218,14 +216,7 @@ async fn live_connecting_history_uses_the_stream_credential_instead_of_the_peer_
         }],
         complete: true,
     };
-    client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
-            from: server.id,
-            to: client.id,
-            body: proto::NodeUpdateBody::StateFrame { request_id, frame },
-        }))
-        .await?;
+    client.handle_message(proto::NodeMessage::StateFrame { from: server.id, to: client.id, request_id, frame }).await?;
     tokio::time::timeout(Duration::from_secs(5), watcher.take(1)).await??;
     assert_eq!(target.ids(), vec![id]);
     assert_eq!(target.peek()[0].title()?, "final");
@@ -266,7 +257,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
                         }
                     }
                 }
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) => {
+                proto::NodeMessage::StateFrame { request_id, frame, .. } => {
                     // Keep the existing beta query at the base head while alpha
                     // captures a different branch. These are genuine producer
                     // frames; no response or event is forged for the test.

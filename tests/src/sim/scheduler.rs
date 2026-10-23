@@ -183,9 +183,10 @@ impl Scheduler {
                 protected
             }
             proto::NodeMessage::AbandonStateStream { stream, .. } => self.catalog_comparisons.contains(stream),
-            proto::NodeMessage::Update(update) => matches!(&update.body, proto::NodeUpdateBody::StateFrame { request_id, frame }
-                if matches!(frame.body, proto::StateFrameBody::Round { .. })
-                    && (self.catalog_requests.contains(request_id) || self.catalog_comparisons.contains(&frame.stream))),
+            proto::NodeMessage::StateFrame { request_id, frame, .. } => {
+                matches!(frame.body, proto::StateFrameBody::Round { .. })
+                    && (self.catalog_requests.contains(request_id) || self.catalog_comparisons.contains(&frame.stream))
+            }
             _ => false,
         }
     }
@@ -350,8 +351,7 @@ fn recipient_id(message: &proto::NodeMessage) -> Option<proto::EntityId> {
     match message {
         proto::NodeMessage::Request { request, .. } => Some(request.to),
         proto::NodeMessage::Response(response) => Some(response.to),
-        proto::NodeMessage::Update(update) => Some(update.to),
-        proto::NodeMessage::UpdateAck(ack) => Some(ack.to),
+        proto::NodeMessage::StateFrame { to, .. } => Some(*to),
         proto::NodeMessage::UnsubscribeQuery { .. } => None,
         proto::NodeMessage::AbandonStateStream { to, .. } => Some(*to),
     }
