@@ -38,7 +38,19 @@ impl CanonicalCodec {
     /// Split a complete key into its self-delimiting encoded parts, rejecting
     /// malformed, noncanonical or trailing bytes.
     pub fn split<'a>(spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
-        let mut parts = Vec::new();
+        let mut parts = Vec::with_capacity(spec.keyparts.len());
+        Self::walk(spec, key, |part| parts.push(part))?;
+        Ok(parts)
+    }
+
+    /// Check that `key` is a complete key of `spec`, refusing what
+    /// [`CanonicalCodec::split`] refuses, without allocating: for a caller
+    /// that validates many keys and needs none of their parts.
+    pub fn check(spec: &KeySpec<PropertyId>, key: &[u8]) -> Result<(), TreeError> { Self::walk(spec, key, |_| {}) }
+
+    /// Hand each of `key`'s encoded parts to `each`, in order, checking that
+    /// each is canonical and that no bytes follow the last.
+    fn walk<'a>(spec: &KeySpec<PropertyId>, key: &'a [u8], mut each: impl FnMut(&'a [u8])) -> Result<(), TreeError> {
         let mut rest = key;
         for part in &spec.keyparts {
             validate_part(part)?;
@@ -69,23 +81,31 @@ impl CanonicalCodec {
                     }
                 }
                 if part.value_type == ValueType::String {
-                    let mut raw = Vec::new();
-                    let mut i = 1;
-                    while i < encoded.len() - 2 {
-                        raw.push(encoded[i]);
-                        i += if encoded[i] == 0 { 2 } else { 1 };
-                    }
-                    std::str::from_utf8(&raw).map_err(|_| TreeError::InvalidKey("invalid UTF-8"))?;
+                    check_utf8(&encoded[1..encoded.len() - 2])?;
                 }
             }
-            parts.push(encoded);
+            each(encoded);
             rest = tail;
         }
         if !rest.is_empty() {
             return Err(TreeError::InvalidKey("trailing key bytes"));
         }
-        Ok(parts)
+        Ok(())
     }
+}
+
+/// Check that an escaped string's body, its bytes with each zero byte
+/// followed by 255, unescapes to UTF-8. A zero byte is a whole character of
+/// its own, never inside another's encoding, so the string is UTF-8 when
+/// each run between its zero bytes is.
+fn check_utf8(body: &[u8]) -> Result<(), TreeError> {
+    let mut runs = body.split(|byte| *byte == 0);
+    let first = runs.next().unwrap_or_default();
+    // Every later run begins with the 255 that completes its zero byte's escape.
+    for run in std::iter::once(first).chain(runs.map(|run| &run[1..])) {
+        std::str::from_utf8(run).map_err(|_| TreeError::InvalidKey("invalid UTF-8"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_part(part: &IndexKeyPart<PropertyId>) -> Result<(), TreeError> {

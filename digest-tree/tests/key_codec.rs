@@ -18,6 +18,7 @@ proptest! {
         let second = encode(&b, y);
         prop_assert_eq!(first.cmp(&second), a.as_bytes().cmp(b.as_bytes()).then(x.cmp(&y)));
         prop_assert_eq!(CanonicalCodec::split(&spec, &first).unwrap().concat(), first.clone());
+        prop_assert!(CanonicalCodec::check(&spec, &first).is_ok());
         if first != second { prop_assert!(!first.starts_with(&second) && !second.starts_with(&first)); }
     }
     #[test]
@@ -42,8 +43,16 @@ fn null_zero_escapes_and_bad_encodings_are_explicit() {
         assert!(!pair[1].starts_with(&pair[0]));
     }
     assert!(CanonicalCodec::encode_nullable(&strings, &[None]).unwrap() < encoded[0]);
-    for bytes in [vec![], vec![1], vec![1, 0], vec![1, 0, 1], vec![1, 255, 0, 0], vec![0, 0]] {
+    for encoded in &encoded {
+        assert!(CanonicalCodec::check(&strings, encoded).is_ok(), "{encoded:?}");
+    }
+    // An escaped zero byte next to a two-byte character, "é\0", is UTF-8; the
+    // same bytes with the zero inside the character are not.
+    assert!(CanonicalCodec::check(&strings, &[1, 0xC3, 0xA9, 0, 255, 0, 0]).is_ok());
+    let split_character = vec![1, 0xC3, 0, 255, 0xA9, 0, 0];
+    for bytes in [vec![], vec![1], vec![1, 0], vec![1, 0, 1], vec![1, 255, 0, 0], vec![0, 0], split_character] {
         assert!(CanonicalCodec::split(&strings, &bytes).is_err(), "{bytes:?}");
+        assert!(CanonicalCodec::check(&strings, &bytes).is_err(), "{bytes:?}");
     }
     let floats = spec(&[ValueType::F64]);
     assert_eq!(
