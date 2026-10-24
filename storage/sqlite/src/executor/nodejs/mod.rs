@@ -35,10 +35,11 @@ use crate::{
     value::SqliteValueRef,
     SqliteStorageEngine,
 };
-use kept_readers::Readers;
-use parameters::{refuse_a_named_parameter, CheckedParameters};
+use kept_readers::KeptReaders;
+use parameters::{refuse_a_named_parameter, ParameterCounts};
 use statement::{
-    check_source, integer_from_js, js_error, js_params, method, refuse_a_second_statement, source, statement_method, take, width, Rows,
+    integer_from_js, js_error, js_params, method, read_rows, refuse_a_second_statement, refuse_sql_past_its_statement, source,
+    statement_method, width, RowSelection,
 };
 use typed_reader::{plain_row, typed_reader, typed_row};
 
@@ -84,9 +85,21 @@ impl SqliteStorageEngine {
 pub struct NodeJsConnection {
     // The JavaScript handles are bound to the thread that made them; WASM has one.
     database: SendWrapper<JsValue>,
-    readers: SendWrapper<Rc<RefCell<Readers>>>,
+    readers: SendWrapper<Rc<RefCell<KeptReaders>>>,
+    statements: SendWrapper<Rc<RefCell<OwnStatements>>>,
     /// `None` on a database that refuses a call passing too few values itself.
-    parameters: Option<SendWrapper<CheckedParameters>>,
+    parameters: Option<SendWrapper<ParameterCounts>>,
+}
+
+/// The statements the executor runs on a connection for itself, to read its
+/// schema versions and its count of changes: each is prepared on its first
+/// use and kept.
+#[derive(Default)]
+struct OwnStatements {
+    /// `PRAGMA main.schema_version` and `PRAGMA temp.schema_version`, prepared once.
+    version_statements: Option<[JsValue; 2]>,
+    /// `SELECT changes()`, prepared once.
+    changes_statement: Option<JsValue>,
 }
 
 impl NodeJsConnection {
@@ -130,17 +143,18 @@ impl NodeJsConnection {
     /// UPDATE or DELETE changed, read through one statement prepared once,
     /// whose INTEGER needs no typed reader.
     fn changes(&self) -> Result<usize, SqliteError> {
-        let prepared = self.readers.borrow().changes_statement.clone();
+        let prepared = self.statements.borrow().changes_statement.clone();
         let statement = match prepared {
             Some(statement) => statement,
             None => {
                 let statement = self.prepare("SELECT changes()")?;
-                self.readers.borrow_mut().changes_statement = Some(statement.clone());
+                self.statements.borrow_mut().changes_statement = Some(statement.clone());
                 statement
             }
         };
-        let row =
-            take(&statement, &[], 1, Rows::First)?.pop().ok_or_else(|| SqliteError::Node("`SELECT changes()` returned no row".into()))?;
+        let row = read_rows(&statement, &[], 1, RowSelection::First)?
+            .pop()
+            .ok_or_else(|| SqliteError::Node("`SELECT changes()` returned no row".into()))?;
         let changes = integer_from_js(&row.get(0))?;
         usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
     }
@@ -169,10 +183,10 @@ impl SqliteExecutor for NodeJsConnection {
         refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
-        check_source(sql, &source)?;
+        refuse_sql_past_its_statement(sql, &source)?;
         refuse_a_named_parameter(&source)?;
         let width = width(&statement)?;
-        self.check_parameters(sql, params.len())?;
+        self.refuse_too_few_values(sql, params.len())?;
         if width == 0 {
             // A statement without columns yields no row.
             let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
@@ -190,22 +204,22 @@ impl SqliteExecutor for NodeJsConnection {
         self.changes()
     }
 
-    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> { self.read(sql, params, Rows::All) }
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> { self.read(sql, params, RowSelection::All) }
 
     /// Steps the statement's reader once, through `get()`, where a typed
     /// reader has still computed every row of the statement it nests, which
     /// it materializes; only the first is read and checked.
     fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
-        Ok(self.read(sql, params, Rows::First)?.into_iter().next())
+        Ok(self.read(sql, params, RowSelection::First)?.into_iter().next())
     }
 }
 
 impl NodeJsConnection {
-    /// Run the statement `sql` holds and read the rows `rows` names.
-    fn read(&self, sql: &str, params: &[SqliteValueRef<'_>], rows: Rows) -> Result<Vec<Row>, SqliteError> {
+    /// Run the statement `sql` holds and read the rows `selection` names.
+    fn read(&self, sql: &str, params: &[SqliteValueRef<'_>], selection: RowSelection) -> Result<Vec<Row>, SqliteError> {
         if let Some((reader, width)) = self.kept_reader(sql)? {
-            self.check_parameters(sql, params.len())?;
-            match take(&reader, params, 2 * width, rows) {
+            self.refuse_too_few_values(sql, params.len())?;
+            match read_rows(&reader, params, 2 * width, selection) {
                 Ok(taken) => return taken.into_iter().map(typed_row).collect(),
                 // A kept reader can fail where one prepared afresh would not:
                 // the executor watches the schema versions of main and temp
@@ -221,10 +235,10 @@ impl NodeJsConnection {
         refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
-        check_source(sql, &source)?;
+        refuse_sql_past_its_statement(sql, &source)?;
         refuse_a_named_parameter(&source)?;
         let width = width(&statement)?;
-        self.check_parameters(sql, params.len())?;
+        self.refuse_too_few_values(sql, params.len())?;
         if width == 0 {
             // A statement without columns yields no rows; it runs for its
             // effect, through `run`, since better-sqlite3 refuses `all` on a
@@ -237,7 +251,7 @@ impl NodeJsConnection {
                 // Checked once for each SQL text, since a kept reader skips it.
                 self.refuse_a_compound_select(&source, params)?;
                 self.keep_reader(sql, &reader, width);
-                take(&reader, params, 2 * width, rows)?.into_iter().map(typed_row).collect()
+                read_rows(&reader, params, 2 * width, selection)?.into_iter().map(typed_row).collect()
             }
             // The typed reader reads each column as two, so SQLite refuses to
             // prepare the reader of a query that yields more than half of its
@@ -261,7 +275,7 @@ impl NodeJsConnection {
                          value of its rows were refused, so it is not run: write with `execute` and read with a query"
                     )));
                 }
-                take(&statement, params, width, rows)?.into_iter().map(|row| plain_row(row, &nesting)).collect()
+                read_rows(&statement, params, width, selection)?.into_iter().map(|row| plain_row(row, &nesting)).collect()
             }
         }
     }

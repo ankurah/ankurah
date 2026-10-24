@@ -17,7 +17,7 @@ use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
 
 use crate::error::SqliteError;
-use crate::executor::{self, Behavior, Pool, PooledConnection, Row, SqliteExecutor};
+use crate::executor::{self, Pool, PooledConnection, Row, SqliteExecutor, TransactionBehavior};
 use crate::value::{SqliteValue, SqliteValueRef};
 
 mod materialization;
@@ -111,7 +111,7 @@ impl SqliteStorageEngine {
         let model = *model;
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         conn.with_executor(move |c| {
-            let tx = c.begin(Behavior::Deferred)?;
+            let tx = c.begin(TransactionBehavior::Deferred)?;
             tx.execute(
                 &format!(
                     r#"CREATE TABLE IF NOT EXISTS "{MODEL_MAP_TABLE}" (
@@ -477,7 +477,7 @@ fn decode_state_row(
 }
 
 async fn load_state(conn: &PooledConnection, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
-    conn.with_executor(move |c| load_states(&c.begin(Behavior::Deferred)?, &[id]))
+    conn.with_executor(move |c| load_states(&c.begin(TransactionBehavior::Deferred)?, &[id]))
         .await?
         .into_iter()
         .next()
@@ -503,15 +503,15 @@ fn load_states(snapshot: &dyn SqliteExecutor, ids: &[EntityId]) -> Result<Vec<At
     // states decoded are not all held at once.
     for row in rows {
         let fields = raw_state_from_sqlite_row(&row)?;
-        let memberships = memberships_from_sqlite_connection(snapshot, fields.0)?;
+        let memberships = memberships_of(snapshot, fields.0)?;
         let state = decode_state_row(fields, memberships)?;
         by_id.insert(state.payload.entity_id, state);
     }
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
 
-fn memberships_from_sqlite_connection(conn: &dyn SqliteExecutor, entity_id: &str) -> Result<BTreeSet<ModelId>, SqliteError> {
-    let rows = conn
+fn memberships_of(executor: &dyn SqliteExecutor, entity_id: &str) -> Result<BTreeSet<ModelId>, SqliteError> {
+    let rows = executor
         .query(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ?"#), &[SqliteValueRef::Text(entity_id)])?;
     let model_keys = rows.iter().map(|row| row.blob(0)).collect::<Result<Vec<_>, _>>()?;
     model_keys.into_iter().map(|key| bincode::deserialize(key).map_err(SqliteError::from)).collect()

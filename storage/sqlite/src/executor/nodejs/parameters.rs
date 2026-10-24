@@ -15,12 +15,12 @@ use crate::{error::SqliteError, executor::statement_scan};
 
 /// On a database that binds NULL for a positional parameter a call does not
 /// pass, how many values each SQL text's statement was shown to take at
-/// most, by that text (see `check_parameters`).
-pub(super) type CheckedParameters = Rc<RefCell<HashMap<String, usize>>>;
+/// most, by that text (see `refuse_too_few_values`).
+pub(super) type ParameterCounts = Rc<RefCell<HashMap<String, usize>>>;
 
 /// How many SQL texts' parameter counts a connection keeps; past that it
 /// forgets them all, and checks each statement again when it next runs.
-const CHECKED_PARAMETERS: usize = 256;
+const PARAMETER_COUNTS_MAX: usize = 256;
 
 /// SQLite's result code for a parameter index out of range.
 const SQLITE_RANGE: i32 = 25;
@@ -49,7 +49,7 @@ impl NodeJsConnection {
     /// the statement takes no more parameters than were passed. A call that
     /// passes too many, node:sqlite refuses itself. The count shown is kept by
     /// SQL text, so a statement run again with as many values is only looked up.
-    pub(super) fn check_parameters(&self, sql: &str, passed: usize) -> Result<(), SqliteError> {
+    pub(super) fn refuse_too_few_values(&self, sql: &str, passed: usize) -> Result<(), SqliteError> {
         let Some(checked) = &self.parameters else { return Ok(()) };
         if checked.borrow().get(sql).is_some_and(|&most| most <= passed) {
             return Ok(());
@@ -77,7 +77,7 @@ impl NodeJsConnection {
             }
         }
         let mut checked = checked.borrow_mut();
-        if checked.len() >= CHECKED_PARAMETERS {
+        if checked.len() >= PARAMETER_COUNTS_MAX {
             checked.clear();
         }
         checked.insert(sql.to_owned(), passed);
@@ -108,7 +108,7 @@ mod tests {
     use super::*;
 
     /// A node:sqlite connection keeps the parameter counts of at most
-    /// [`CHECKED_PARAMETERS`] SQL texts, forgetting them all to keep the next,
+    /// [`PARAMETER_COUNTS_MAX`] SQL texts, forgetting them all to keep the next,
     /// and shows the count of a statement it forgot again.
     #[wasm_bindgen_test]
     #[cfg_attr(
@@ -122,10 +122,10 @@ mod tests {
         checked.borrow_mut().clear();
         let seven = SqliteValueRef::Integer(7);
         let read = |sql: &str| connection.query(sql, &[seven]).unwrap();
-        for index in 0..CHECKED_PARAMETERS {
+        for index in 0..PARAMETER_COUNTS_MAX {
             read(&format!("SELECT ?, {index}"));
         }
-        assert_eq!(checked.borrow().len(), CHECKED_PARAMETERS);
+        assert_eq!(checked.borrow().len(), PARAMETER_COUNTS_MAX);
         read("SELECT ?, 'one more'");
         assert_eq!(checked.borrow().len(), 1);
         read("SELECT ?, 0");

@@ -336,7 +336,7 @@ mod tests {
     /// vertical tab as an operator, would read a trigger otherwise than SQLite
     /// does, `statement_end` ends it where SQLite's parser does.
     #[test]
-    fn statements_end_where_sqlite_s_parser_ends_them() {
+    fn statements_end_where_the_parser_ends_them() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(SCHEMA).unwrap();
         for sql in [

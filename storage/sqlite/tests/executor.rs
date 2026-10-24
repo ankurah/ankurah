@@ -5,7 +5,7 @@ mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
 use ankurah_storage_sqlite::{
-    executor::{Behavior, Row, SqliteExecutor},
+    executor::{Row, SqliteExecutor, TransactionBehavior},
     SqliteError, SqliteStorageEngine, SqliteValue, SqliteValueRef,
 };
 use anyhow::Result;
@@ -98,7 +98,7 @@ async fn a_pragma_that_sets_a_value_reports_it() -> Result<()> {
 /// A connection the engine opens sets a busy timeout of five seconds, on
 /// every driver: rusqlite sets it on each connection it opens, and the Node.js
 /// executor before any other statement. That a writer then waits for
-/// another's lock is `a_writer_waits_for_another_connection_s_lock`.
+/// another's lock is `a_writer_waits_for_a_lock_another_connection_holds`.
 #[engine_test]
 #[cfg_attr(
     ankurah_sqlite_better_sqlite3,
@@ -355,7 +355,7 @@ async fn execute_returns_the_count_of_changes_rusqlite_returns() -> Result<()> {
 /// on node:sqlite alike, and none on better-sqlite3, which names the code
 /// without its number.
 #[engine_test]
-async fn errors_carry_sqlite_s_extended_result_code() -> Result<()> {
+async fn errors_carry_the_extended_result_code() -> Result<()> {
     let storage = common::open_in_memory().await?;
     let codes = storage
         .with_executor(|executor| {
@@ -681,12 +681,12 @@ const HOLD_MS: u64 = 400;
 /// A writer waits for another connection's write lock on the same file and
 /// takes it once released, rather than failing at once.
 #[engine_test]
-async fn a_writer_waits_for_another_connection_s_lock() -> Result<()> {
+async fn a_writer_waits_for_a_lock_another_connection_holds() -> Result<()> {
     let db = TempDb::new("writer_waits");
     let storage = common::open(db.path()).await?;
     let holder = LockHolder::take(&db, "BEGIN IMMEDIATE", HOLD_MS).await;
     let waited = Stopwatch::start();
-    storage.with_executor(|executor| executor.begin(Behavior::Immediate)?.commit()).await?;
+    storage.with_executor(|executor| executor.begin(TransactionBehavior::Immediate)?.commit()).await?;
     let waited = waited.elapsed_ms();
     holder.released().await;
     assert!(waited >= HOLD_MS as f64 / 2.0, "the writer took the lock after {waited} ms, before it was released");

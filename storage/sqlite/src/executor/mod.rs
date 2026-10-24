@@ -108,11 +108,11 @@ pub trait SqliteExecutor {
 impl dyn SqliteExecutor + '_ {
     /// Open a transaction on this connection. It rolls back when dropped
     /// without [`Transaction::commit`], so an early `?` leaves nothing behind.
-    pub fn begin(&self, behavior: Behavior) -> Result<Transaction<'_>, SqliteError> {
+    pub fn begin(&self, behavior: TransactionBehavior) -> Result<Transaction<'_>, SqliteError> {
         self.execute(
             match behavior {
-                Behavior::Deferred => "BEGIN DEFERRED",
-                Behavior::Immediate => "BEGIN IMMEDIATE",
+                TransactionBehavior::Deferred => "BEGIN DEFERRED",
+                TransactionBehavior::Immediate => "BEGIN IMMEDIATE",
             },
             &[],
         )?;
@@ -122,7 +122,7 @@ impl dyn SqliteExecutor + '_ {
 
 /// How a transaction takes its lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Behavior {
+pub enum TransactionBehavior {
     /// `BEGIN DEFERRED`: a read snapshot that upgrades to a write lock on the first write.
     Deferred,
     /// `BEGIN IMMEDIATE`: the write lock is taken up front, so writers serialize

@@ -29,7 +29,12 @@ impl NodeJsConnection {
         }
         method(&database, "prepare")?;
         method(&database, "exec")?;
-        let mut connection = Self { database: SendWrapper::new(database), readers: SendWrapper::new(Rc::default()), parameters: None };
+        let mut connection = Self {
+            database: SendWrapper::new(database),
+            readers: SendWrapper::new(Rc::default()),
+            statements: SendWrapper::new(Rc::default()),
+            parameters: None,
+        };
         // A database whose statements do not hand rows over as the executor
         // reads them is refused here rather than at its first query.
         let probe = connection.query("SELECT 1", &[])?;

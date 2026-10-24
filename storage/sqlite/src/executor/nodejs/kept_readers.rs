@@ -13,12 +13,12 @@ use super::{
 use crate::error::SqliteError;
 
 /// How many typed readers a connection keeps prepared.
-const KEPT_READERS: usize = 64;
+const KEPT_READERS_MAX: usize = 64;
 
 /// The typed readers a connection has prepared, by the SQL text of the
 /// statement each reads, so that a query run again skips both prepares,
 /// which cost a point lookup several times what reading its row does. At
-/// most [`KEPT_READERS`] are kept, the least recently used leaving first.
+/// most [`KEPT_READERS_MAX`] are kept, the least recently used leaving first.
 /// SQLite prepares a kept statement again when the schema changes, but a
 /// typed reader names its statement's columns, which a `SELECT *` may have
 /// gained or lost; so every kept reader is dropped when the schema version
@@ -27,11 +27,7 @@ const KEPT_READERS: usize = 64;
 /// `read`). A reader is kept only for a statement that
 /// `refuse_a_compound_select` lets through.
 #[derive(Default)]
-pub(super) struct Readers {
-    /// `PRAGMA main.schema_version` and `PRAGMA temp.schema_version`, prepared once.
-    version_statements: Option<[JsValue; 2]>,
-    /// `SELECT changes()`, prepared once.
-    pub(super) changes_statement: Option<JsValue>,
+pub(super) struct KeptReaders {
     /// The schema versions the kept readers were prepared at.
     versions: Option<[i64; 2]>,
     kept: HashMap<String, KeptReader>,
@@ -68,7 +64,7 @@ impl NodeJsConnection {
     /// the least recently used one.
     pub(super) fn keep_reader(&self, sql: &str, statement: &JsValue, width: usize) {
         let mut readers = self.readers.borrow_mut();
-        if readers.kept.len() >= KEPT_READERS {
+        if readers.kept.len() >= KEPT_READERS_MAX {
             let oldest = readers.kept.iter().min_by_key(|(_, reader)| reader.used).map(|(sql, _)| sql.clone());
             if let Some(oldest) = oldest {
                 readers.kept.remove(&oldest);
@@ -81,12 +77,12 @@ impl NodeJsConnection {
 
     /// The schema versions of main and temp, which change whenever their schemas do.
     fn schema_versions(&self) -> Result<[i64; 2], SqliteError> {
-        let prepared = self.readers.borrow().version_statements.clone();
+        let prepared = self.statements.borrow().version_statements.clone();
         let statements = match prepared {
             Some(statements) => statements,
             None => {
                 let statements = [self.prepare("PRAGMA main.schema_version")?, self.prepare("PRAGMA temp.schema_version")?];
-                self.readers.borrow_mut().version_statements = Some(statements.clone());
+                self.statements.borrow_mut().version_statements = Some(statements.clone());
                 statements
             }
         };
@@ -115,7 +111,7 @@ mod tests {
 
     use super::*;
 
-    /// A connection keeps the typed readers of at most [`KEPT_READERS`]
+    /// A connection keeps the typed readers of at most [`KEPT_READERS_MAX`]
     /// queries, making room by dropping the least recently used, and reads a
     /// query whose reader it dropped as before, keeping it again.
     #[wasm_bindgen_test]
@@ -126,14 +122,14 @@ mod tests {
         let sql = |index: usize| format!("SELECT {index} AS kept");
         let read = |index: usize| connection.query(&sql(index), &[]).unwrap()[0].integer(0).unwrap();
         let kept = |index: usize| connection.readers.borrow().kept.contains_key(&sql(index));
-        for index in 0..KEPT_READERS {
+        for index in 0..KEPT_READERS_MAX {
             read(index);
         }
         // The first query becomes the most recently used, so the second leaves first.
         read(0);
-        read(KEPT_READERS);
-        assert_eq!(connection.readers.borrow().kept.len(), KEPT_READERS);
-        assert!(kept(0) && !kept(1) && kept(KEPT_READERS));
+        read(KEPT_READERS_MAX);
+        assert_eq!(connection.readers.borrow().kept.len(), KEPT_READERS_MAX);
+        assert!(kept(0) && !kept(1) && kept(KEPT_READERS_MAX));
         assert_eq!(read(1), 1);
         assert!(kept(1) && !kept(2));
     }

@@ -10,7 +10,7 @@ use ankurah_storage_common::{
 use super::{load_states, SqliteStorageEngine, ENTITY_TABLE};
 use crate::{
     error::SqliteError,
-    executor::{Behavior, SqliteExecutor},
+    executor::{SqliteExecutor, TransactionBehavior},
     sql_builder::{split_predicate_for_sqlite, SqlBuilder},
     value::{SqliteValue, SqliteValueRef},
 };
@@ -74,7 +74,7 @@ impl Query {
         engine.ensure_shared_tables(&conn).await?;
         let states = conn
             .with_executor(move |c| {
-                let snapshot = c.begin(Behavior::Deferred)?;
+                let snapshot = c.begin(TransactionBehavior::Deferred)?;
                 let ids = self.read_ids(&snapshot)?;
                 Ok((load_states(&snapshot, &ids)?, self.remaining))
             })

@@ -265,7 +265,7 @@ impl TempDb {
     }
 
     /// A second connection on the file, for edits behind the engine's back,
-    /// on the engine's driver (see [`LOCK_HOLDER`] for why).
+    /// on the engine's driver (see [`LOCK_HOLDER_WORKER`] for why).
     #[cfg(target_arch = "wasm32")]
     pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::executor::SqliteExecutor> {
         Box::new(if driver::on_better_sqlite3() {
@@ -331,7 +331,7 @@ pub struct LockHolder {
 /// not see each other's locks: the file locks they take belong to the
 /// process, so neither copy's locks keep out the other's connections.
 #[cfg(target_arch = "wasm32")]
-const LOCK_HOLDER: &str = r#"
+const LOCK_HOLDER_WORKER: &str = r#"
 const { parentPort, workerData } = require('node:worker_threads');
 const Database = workerData.betterSqlite3 ? require(workerData.betterSqlite3) : require('node:sqlite').DatabaseSync;
 const database = new Database(workerData.path);
@@ -376,7 +376,7 @@ impl LockHolder {
         );
         let better_sqlite3 = if driver::on_better_sqlite3() { driver::better_sqlite3_entry().into() } else { wasm_bindgen::JsValue::NULL };
         let arguments =
-            js_sys::Array::of5(&LOCK_HOLDER.into(), &db.path_str().into(), &lock.into(), &(hold_ms as f64).into(), &better_sqlite3);
+            js_sys::Array::of5(&LOCK_HOLDER_WORKER.into(), &db.path_str().into(), &lock.into(), &(hold_ms as f64).into(), &better_sqlite3);
         let started: js_sys::Promise = start.apply(&wasm_bindgen::JsValue::NULL, &arguments).unwrap().dyn_into().unwrap();
         let handle = wasm_bindgen_futures::JsFuture::from(started).await.expect("the other connection takes the lock");
         Self { exit: js_sys::Reflect::get(&handle, &"exit".into()).unwrap().dyn_into().unwrap() }

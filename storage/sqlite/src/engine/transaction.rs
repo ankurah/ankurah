@@ -123,7 +123,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
         conn.with_executor(move |c| {
             // BEGIN IMMEDIATE serializes writers before expectations
             // are read, including concurrent first inserts.
-            let tx = c.begin(Behavior::Immediate)?;
+            let tx = c.begin(TransactionBehavior::Immediate)?;
             let mut ordered: Vec<(usize, &EntityRow)> = entities.iter().enumerate().collect();
             ordered.sort_by_key(|(_, write)| write.entity_id);
 
@@ -141,7 +141,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
                 let current = current_row
                     .map(|row| {
                         let row = raw_state_from_sqlite_row(&row)?;
-                        let memberships = memberships_from_sqlite_connection(&tx, &write.entity_key)?;
+                        let memberships = memberships_of(&tx, &write.entity_key)?;
                         decode_state_row(row, memberships)
                     })
                     .transpose()?;
