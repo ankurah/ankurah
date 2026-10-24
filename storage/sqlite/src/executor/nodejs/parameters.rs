@@ -46,11 +46,11 @@ impl NodeJsConnection {
     /// Node.js 22.20.0 on 22 and 24.7.0 on 24, and on every later line. Before,
     /// it skipped each numbered parameter as it bound a call's values in turn,
     /// so that `?, ?3` given two values left `?3` NULL, and the check of a
-    /// call's values (`refuse_too_few_values`) misjudged it. The binding is
-    /// checked rather than the version, which cannot tell the releases apart:
-    /// given two values, `SELECT ?2` reads the second where the binding is
-    /// right, and where it skips `?2`, its second value lands past the
-    /// statement's last parameter, which SQLite refuses (SQLITE_RANGE).
+    /// call's values (`refuse_too_few_values`) misjudged it. Checking the
+    /// binding itself, rather than the version, holds for every release line
+    /// and build: given two values, `SELECT ?2` reads the second where the
+    /// binding is right, and where it skips `?2`, its second value lands past
+    /// the statement's last parameter, which SQLite refuses (SQLITE_RANGE).
     pub(super) fn binds_a_numbered_parameter_at_its_position(&self) -> Result<bool, SqliteError> {
         let statement = self.prepare("SELECT ?2")?;
         match read_rows(&statement, &[SqliteValueRef::Integer(1), SqliteValueRef::Integer(2)], 1, RowSelection::First) {

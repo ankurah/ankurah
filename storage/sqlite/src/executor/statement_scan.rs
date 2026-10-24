@@ -1,7 +1,7 @@
 //! SQL text read as SQLite's tokenizer reads it, for what the executors need
-//! to know before SQLite prepares a statement: where the first statement of
-//! some SQL ends, what SQLite skips between statements, a statement's first
-//! keyword, and its named parameters.
+//! to know before SQLite prepares a statement: whether some SQL holds no
+//! statement, one, or a second after its first, what SQLite skips between
+//! statements, a statement's first keyword, and its first named parameter.
 //!
 //! The scan follows SQLite's tokenizer (`sqlite3GetToken` in tokenize.c) for
 //! every kind of token that can hold a semicolon, a keyword, or a character a

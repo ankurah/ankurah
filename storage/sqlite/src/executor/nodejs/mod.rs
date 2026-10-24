@@ -10,9 +10,9 @@
 //! binds a numbered parameter at its position, Node.js 22.20.0 or later on 22,
 //! 24.7.0 or later on 24, or a later release line, and checks the binding when
 //! it adopts a database (see `binds_a_numbered_parameter_at_its_position`).
-//! Compatible drivers must also support positional rows and BigInt INTEGER results; the
-//! adapter recognizes better-sqlite3's `raw` and `safeIntegers` methods for
-//! these capabilities, and its `source` for `sourceSQL`.
+//! Compatible drivers must also support positional rows and BigInt INTEGER
+//! results; the adapter recognizes better-sqlite3's `raw` and `safeIntegers`
+//! methods for these capabilities, and its `source` for `sourceSQL`.
 //! Hosts can adopt an existing database with [`SqliteStorageEngine::from_database`];
 //! [`NodeJsConnection::open`] constructs Node.js's directly through
 //! `process.getBuiltinModule`. Every call is synchronous, which suits the
@@ -251,8 +251,9 @@ impl NodeJsConnection {
             statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
             return Ok(Vec::new());
         }
-        // The statement past what SQLite skips before it, semicolons and
-        // comments among it, which the source keeps and SQLite cannot nest.
+        // The statement the typed reader nests and the compound check plans:
+        // the source past what SQLite skips before it, which the source keeps,
+        // and whose semicolons a WITH clause cannot hold.
         let nested = statement_scan::skip_to_statement(&source);
         match self.prepare(&typed_reader(nested, width)) {
             Ok(reader) => {

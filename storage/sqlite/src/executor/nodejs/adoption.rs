@@ -60,7 +60,7 @@ impl NodeJsConnection {
         // read through the PRAGMA itself, since a table named `pragma_encoding`
         // takes the place of the table-valued function of that name.
         let encoding = connection.query("PRAGMA encoding", &[])?;
-        if !matches!(encoding.as_slice(), [row] if matches!(row.values(), [SqliteValue::Text(encoding)] if encoding == "UTF-8")) {
+        if !matches!(encoding.as_slice(), [row] if matches!(row.values(), [SqliteValue::Text(name)] if name == "UTF-8")) {
             return Err(SqliteError::Node(
                 "the database's text encoding is not UTF-8, and the Node.js executor reads TEXT as UTF-8 bytes".into(),
             ));

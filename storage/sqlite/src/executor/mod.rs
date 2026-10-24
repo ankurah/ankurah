@@ -56,7 +56,8 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 /// before SQLite prepares either, since SQLite applies some PRAGMAs while it
 /// prepares them. Whitespace, semicolons and comments after the statement
 /// are no second statement, and a CREATE TRIGGER statement runs on to the
-/// END of its body.
+/// END of its body. SQL that holds no statement, only those, is refused as
+/// SQLite refuses to run it, with SQLITE_MISUSE.
 ///
 /// # Where the Node.js executor differs from the native one
 ///
