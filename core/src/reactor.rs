@@ -1,6 +1,6 @@
 mod candidate_changes;
 mod delivery;
-pub use delivery::{NotificationFailure, ReactorEvent};
+pub use delivery::ReactorEvent;
 mod comparison_index;
 pub mod fetch_gap;
 pub(crate) mod maintenance;
@@ -42,6 +42,16 @@ pub struct QueryOrigin {
     pub query: proto::QueryId,
     pub version: u32,
     pub request: proto::RequestId,
+}
+
+/// A query that `notify_change` could not bring up to date, because its events' history could
+/// not be proven: the query is paused, or for `query: None` the entity subscriptions are dropped,
+/// and the committed write stands.
+#[derive(Debug)]
+pub struct NotificationFailure {
+    pub query: Option<proto::QueryId>,
+    pub version: u32,
+    pub error: RetrievalError,
 }
 
 /// Reconcile the source's captured identities while retaining independent local
@@ -570,7 +580,7 @@ impl Reactor<Entity, proto::Attested<proto::Event>> {
     /// before public event filtering and may retain only the index's metadata.
     pub(crate) async fn subscribe_maintenance<T: Send + Sync + 'static>(
         &self,
-        project: impl Fn(&crate::changes::EntityChange, bool) -> anyhow::Result<maintenance::ProjectedChange<T>> + Send + Sync + 'static,
+        project: impl Fn(&[&crate::changes::EntityChange], bool) -> anyhow::Result<Vec<maintenance::ProjectedChange<T>>> + Send + Sync + 'static,
     ) -> Result<(maintenance::SourceRevision, maintenance::MaintenanceSubscription<T>), maintenance::SourceError> {
         self.0.maintenance.subscribe(project).await
     }

@@ -33,21 +33,21 @@ async fn unknown_and_nested_ordering_cannot_select_a_complete_tree() -> anyhow::
                 with_values(id, &[(property, value)])
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let cache = QueryTree::default();
-        cache.refresh(spec(), rows).await?;
+        let mut cache = QueryTree::new(spec(), Entries::new());
+        cache.refresh_states(rows).await?;
         for (direction, limit) in [(OrderDirection::Asc, 3), (OrderDirection::Desc, 2), (OrderDirection::Desc, 3)] {
             let selection = Selection {
                 predicate: Predicate::True,
                 order_by: Some(vec![OrderByItem { path: path.clone(), direction }]),
                 limit: Some(limit),
             };
-            assert!(QueryTree::request(&selection, &catalog).is_err(), "ordering cannot use the scalar planner");
-            let snapshot = cache.current_snapshot().await?;
+            assert!(request_for(&selection, &catalog).is_err(), "ordering cannot use the scalar planner");
+            let snapshot = cache.snapshot();
             assert!(snapshot.cannot_select(&selection, &catalog));
-            let error = snapshot.select(&selection, &catalog).await.err().unwrap();
+            let error = snapshot.select(&selection, &catalog).err().unwrap();
             assert!(error.downcast_ref::<UnsupportedTreeSelection>().is_some());
         }
-        assert_eq!(cache.current_snapshot().await?.entries.len(), 4);
+        assert_eq!(cache.snapshot().entries.len(), 4);
     }
     Ok(())
 }
@@ -61,16 +61,16 @@ async fn descending_scalar_limit_with_missing_values_requires_storage_ordering()
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Desc }]),
         limit: Some(2),
     };
-    let spec = QueryTree::spec(&selection, &catalog);
+    let spec = spec_for(&selection, &catalog);
     assert!(!spec.key_spec().keyparts.is_empty());
     let rows = [(1, None), (2, Some("20")), (3, Some("20")), (4, Some("10"))]
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, value.map(|value| Value::String(value.into())))]))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let cache = QueryTree::default();
-    let view = cache.refresh(spec, rows).await?;
+    let mut cache = QueryTree::new(spec, Entries::new());
+    let view = cache.refresh_states(rows).await?;
     assert!(view.cannot_select(&selection, &catalog));
-    assert!(view.select(&selection, &catalog).await.err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
+    assert!(view.select(&selection, &catalog).err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
     Ok(())
 }
 
@@ -96,7 +96,7 @@ async fn narrower_descending_null_scope_cannot_select_a_complete_tree() -> anyho
         limit: Some(2),
     };
     let catalog = CatalogManager::default();
-    assert!(spec.serves(&QueryTree::request(&selection, &catalog)?).is_some(), "the scalar planner supports this narrower scope");
+    assert!(spec.serves(&request_for(&selection, &catalog)?).is_some(), "the scalar planner supports this narrower scope");
     let rows = [(1, "a", None), (2, "b", None), (3, "b", Some("09")), (4, "b", Some("08")), (5, "c", None)]
         .into_iter()
         .map(|(id, group_value, rank_value)| {
@@ -106,16 +106,16 @@ async fn narrower_descending_null_scope_cannot_select_a_complete_tree() -> anyho
             )
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let cache = QueryTree::default();
-    let snapshot = cache.refresh(spec.clone(), rows).await?;
+    let mut cache = QueryTree::new(spec.clone(), Entries::new());
+    let snapshot = cache.refresh_states(rows).await?;
     assert!(snapshot.cannot_select(&selection, &catalog));
-    assert!(snapshot.select(&selection, &catalog).await.err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
-    assert_eq!(cache.current_snapshot().await?.entries.len(), 5);
+    assert!(snapshot.select(&selection, &catalog).err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
+    assert_eq!(cache.snapshot().entries.len(), 5);
     Ok(())
 }
 
 #[tokio::test]
-async fn descending_scalar_limit_without_missing_values_uses_tree_keys() -> anyhow::Result<()> {
+async fn descending_scalar_limit_cannot_select_a_complete_tree_even_without_missing_values() -> anyhow::Result<()> {
     let property = proto::PropertyId::System(proto::SystemProperty::Label);
     let catalog = CatalogManager::default();
     let selection = Selection {
@@ -123,16 +123,17 @@ async fn descending_scalar_limit_without_missing_values_uses_tree_keys() -> anyh
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Desc }]),
         limit: Some(2),
     };
-    let spec = QueryTree::spec(&selection, &catalog);
+    let spec = spec_for(&selection, &catalog);
     let rows = [(1, "30"), (2, "20"), (3, "20"), (4, "10")]
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, Some(Value::String(value.into())))]))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let tree = QueryTree::default();
-    let snapshot = tree.refresh(spec, rows).await?;
-    assert!(!snapshot.cannot_select(&selection, &catalog));
-    let view = snapshot.select(&selection, &catalog).await?;
-    assert_eq!(view.entries.keys().copied().collect::<Vec<_>>(), [1, 2].map(|id| state(id, 1).payload.entity_id));
+    let mut tree = QueryTree::new(spec, Entries::new());
+    let snapshot = tree.refresh_states(rows).await?;
+    // The rule reads the selection alone: whether today's rows happen to
+    // carry the value cannot decide how a shared tree ranks them tomorrow.
+    assert!(snapshot.cannot_select(&selection, &catalog));
+    assert!(snapshot.select(&selection, &catalog).is_err());
     Ok(())
 }
 
@@ -145,13 +146,13 @@ async fn indexed_route_order_preserves_directions_nulls_and_entity_ties() -> any
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Asc }]),
         limit: Some(4),
     };
-    let spec = QueryTree::spec(&selection, &catalog);
+    let spec = spec_for(&selection, &catalog);
     let rows = [(1, None), (2, Some("20")), (3, Some("20")), (4, Some("10"))]
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, value.map(|value| Value::String(value.into())))]))
         .collect::<anyhow::Result<_>>()?;
-    let tree = QueryTree::default();
-    let snapshot = tree.refresh(spec, rows).await?;
+    let mut tree = QueryTree::new(spec, Entries::new());
+    let snapshot = tree.refresh_states(rows).await?;
     for (direction, id_desc, expected) in [
         (OrderDirection::Asc, false, [1, 4, 2, 3]),
         (OrderDirection::Desc, false, [1, 2, 3, 4]),
@@ -184,15 +185,15 @@ async fn descending_range_reuses_a_broader_tree_with_nulls_outside_the_range() -
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Desc }]),
         limit: Some(1),
     };
-    let tree = QueryTree::default();
+    let mut tree = QueryTree::new(spec, Entries::new());
     let rows = [(1, None), (2, Some("20")), (3, Some("30"))]
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, value.map(|value| Value::String(value.into())))]))
         .collect::<anyhow::Result<_>>()?;
-    let snapshot = tree.refresh(spec, rows).await?;
+    let snapshot = tree.refresh_states(rows).await?;
     assert!(!snapshot.cannot_select(&selection, &catalog));
-    let selected = snapshot.select(&selection, &catalog).await?;
+    let selected = snapshot.select(&selection, &catalog)?;
     assert_eq!(selected.entries.keys().copied().collect::<Vec<_>>(), [state(3, 1).payload.entity_id]);
-    assert_eq!(tree.current_snapshot().await?.entries.len(), 3);
+    assert_eq!(tree.snapshot().entries.len(), 3);
     Ok(())
 }

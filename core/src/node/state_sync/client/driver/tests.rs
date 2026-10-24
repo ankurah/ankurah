@@ -13,7 +13,7 @@ async fn fixture(
 ) -> anyhow::Result<(TestNode, Driver, Arc<super::super::super::IncomingStates>)> {
     let node = TestNode::new(Arc::new(crate::test_utils::TestStorage::default()), crate::policy::PermissiveAgent::new());
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
-    let snapshot = super::super::super::QueryTree::default().refresh(spec, rows).await?;
+    let snapshot = crate::node::state_sync::tree::fixtures::snapshot_of(spec, rows).await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), None, None)?;
     Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new()), registry))
@@ -332,9 +332,11 @@ async fn bind_query_driver(
 ) -> anyhow::Result<(Driver, Arc<super::super::super::IncomingStates>, crate::livequery::EntityLiveQuery)> {
     use crate::peer_subscription::RemoteQuerySubscriber;
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
-    let snapshot = super::super::super::QueryTree::default()
-        .refresh(spec, vec![proto::Attested::opt(proto::EntityState { entity_id: entity.id(), state: entity.to_state()? }, None)])
-        .await?;
+    let snapshot = crate::node::state_sync::tree::fixtures::snapshot_of(
+        spec,
+        vec![proto::Attested::opt(proto::EntityState { entity_id: entity.id(), state: entity.to_state()? }, None)],
+    )
+    .await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), Some((query.query_id(), 1)), None)?;
     query.weak().stream_bound(1, stream.request.clone(), Arc::new(|| false));
@@ -683,7 +685,7 @@ async fn cancelled_round_jobs_do_not_complete_or_write_the_next_round_membership
     let (node, mut driver, _registry) = fixture(vec![state(1)]).await?;
     driver.projection.publish(11, vec![(id(1), None)])?;
     driver.cancel_round(&node, id(90), &[])?;
-    let snapshot = super::super::super::QueryTree::default().refresh(driver.spec.clone(), vec![state(2)]).await?;
+    let snapshot = crate::node::state_sync::tree::fixtures::snapshot_of(driver.spec.clone(), vec![state(2)]).await?;
     driver.projection.begin(Round::new(proto::StateRound { number: 1, revision: 11 }, snapshot))?;
     driver.round_number = 1;
     driver.round_jobs = 1;

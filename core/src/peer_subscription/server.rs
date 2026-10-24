@@ -1,8 +1,7 @@
-use crate::reactor::maintenance::SourceError;
 use crate::{
     error::SubscriptionError,
     node::{
-        state_sync::{QueryTree, ResidentSubscription},
+        state_sync::{accept_peer_spec, ResidentSubscription},
         Node,
     },
     policy::PolicyAgent,
@@ -64,7 +63,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         if let Some(standing) = queries.get(&query_id) {
             anyhow::ensure!(version >= standing.version, "stale subscription version {version}; current version is {}", standing.version);
         }
-        let spec = QueryTree::offered_spec(&selection, &node.catalog, &known_state)?;
+        let spec = accept_peer_spec(&selection, &node.catalog, &known_state)?;
         let catalog = crate::schema::is_catalog_read(&selection.predicate);
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
         let sessions = cdata.cloned().map(SessionSet::from).unwrap_or_else(SessionSet::new);
@@ -72,27 +71,10 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let peer = node.peer_connections.get(&self.peer_id).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
         queries.remove(&query_id);
         peer.state_streams.invalidate_query(query_id);
-        let (state, subscription) = {
-            let mut attempt = 0;
-            loop {
-                let resident = match node.resident_trees.acquire(node, selection.clone(), Some(spec.clone()), credentials.clone()).await {
-                    Err(error) if attempt == 0 && matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)) => {
-                        attempt += 1;
-                        continue;
-                    }
-                    result => result?,
-                };
-                let result = resident
-                    .subscribe(node, self.peer_id, request.clone(), fingerprint.clone(), query_id, version, catalog, known_state.clone())
-                    .await;
-                match result {
-                    Err(error) if attempt == 0 && crate::node::state_sync::ResidentTrees::<CD>::can_retry(&error) => {
-                        attempt += 1;
-                    }
-                    result => break result?,
-                }
-            }
-        };
+        let (state, subscription) = node
+            .resident_trees
+            .subscribe(node, selection, spec, credentials, self.peer_id, request, fingerprint, query_id, version, catalog, known_state)
+            .await?;
         let stream_id = state.frame.stream;
         queries.insert(query_id, StandingQuery { _sessions: sessions, version, stream_id, subscription: Arc::new(subscription) });
         Ok(proto::NodeResponseBody::QuerySubscribed { query_id, state })
@@ -134,7 +116,10 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
 
 #[cfg(test)]
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<QueryTree>)> {
-        self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.subscription.tree()))
+    pub(crate) async fn query_resident_for_test(
+        &self,
+        query: proto::QueryId,
+    ) -> Option<(u32, std::sync::Weak<dyn std::any::Any + Send + Sync>)> {
+        self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.subscription.identity()))
     }
 }

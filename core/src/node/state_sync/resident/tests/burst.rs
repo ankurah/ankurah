@@ -1,12 +1,17 @@
+//! A large cold transfer and the idle maintenance after it.
 use super::*;
 
-async fn wait_for_original_tree(tree: &QueryTree, expected: &BTreeMap<proto::EntityId, proto::Clock>) -> anyhow::Result<()> {
+async fn wait_for_original_tree(
+    resident: &ResidentLease<&'static crate::policy::DefaultContext>,
+    expected: &BTreeMap<proto::EntityId, proto::Clock>,
+) -> anyhow::Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(60), async {
         loop {
-            // Do not ask the resident cache to capture: its retry can silently
-            // replace a failed resident and conceal a lost maintenance queue.
+            // Read through the original lease, not the resident cache: the
+            // cache's retry can silently replace a failed resident and conceal
+            // a lost maintenance queue.
             let current = {
-                let snapshot = tree.current_snapshot().await?;
+                let snapshot = resident.snapshot().await?.snapshot;
                 snapshot.entries.len() == expected.len()
                     && expected.iter().all(|(id, head)| snapshot.entries.get(id).is_some_and(|entry| &entry.head == head))
             };
@@ -22,7 +27,7 @@ async fn wait_for_original_tree(tree: &QueryTree, expected: &BTreeMap<proto::Ent
 
 #[tokio::test]
 async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update() -> anyhow::Result<()> {
-    let (server, client, _messages) = super::super::capture_retry::pair().await?;
+    let (server, client, _messages) = super::retry::pair().await?;
     let mut events = Vec::with_capacity(4096);
     for row in 0..4096 {
         let event = genesis(&format!("row-{row:08}"))?;
@@ -35,30 +40,28 @@ async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update(
     // current resident payloads fill frames without the storage-read work cap.
     let _server_rows = server.fetch_entities_from_local(&selection).await?;
     let resident = acquire(&client.resident_trees, &client, selection.clone()).await?;
-    let original = resident.tree();
-    assert!(original.current_snapshot().await?.entries.is_empty());
-    drop(resident);
+    let original = resident.identity();
+    assert!(resident.snapshot().await?.snapshot.entries.is_empty());
 
     let fetched =
         tokio::time::timeout(std::time::Duration::from_secs(60), client.fetch_from_peer(selection.clone(), &vec![DEFAULT_CONTEXT]))
             .await??;
     assert_eq!(fetched.iter().map(|entity| (entity.id(), entity.head())).collect::<BTreeMap<_, _>>(), expected);
-    wait_for_original_tree(&original, &expected).await?;
+    wait_for_original_tree(&resident, &expected).await?;
 
-    let scans = client.storage.2.load(Ordering::Relaxed);
+    let scans = client.storage.fetches.load(Ordering::Relaxed);
     let exact = acquire(&client.resident_trees, &client, selection.clone()).await?;
-    assert!(Arc::ptr_eq(&original, &exact.tree()), "successful transfer must not hide a replacement tree");
+    assert!(Weak::ptr_eq(&original, &exact.identity()), "successful transfer must not hide a replacement tree");
     let narrower = acquire(&client.resident_trees, &client, above("row-00002047", Some(10))).await?;
-    assert!(Arc::ptr_eq(&original, &narrower.tree()), "a compatible limited selection shares the maintained tree");
+    assert!(Weak::ptr_eq(&original, &narrower.identity()), "a compatible limited selection shares the maintained tree");
     assert_eq!(
         narrower.snapshot().await?.snapshot.entries.keys().copied().collect::<BTreeSet<_>>(),
         events[2048..2058].iter().map(|event| event.entity_id).collect(),
     );
-    assert_eq!(client.storage.2.load(Ordering::Relaxed), scans, "neither reuse path rebuilds from storage");
+    assert_eq!(client.storage.fetches.load(Ordering::Relaxed), scans, "neither reuse path rebuilds from storage");
     drop((exact, narrower, fetched));
 
-    // Finish every peer owner before checking idle maintenance. The original
-    // Arc<QueryTree> used by this test does not pin a resident cache entry.
+    // Finish every peer owner before checking maintenance without routes.
     let streams = client.peer_connections.get(&server.id).unwrap().outgoing_state_streams.clone();
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
@@ -69,13 +72,13 @@ async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update(
     })
     .await?;
     let moved = update(&events[0], "row-99999999")?;
-    let previous_key = original.current_snapshot().await?.entries[&moved.entity_id].key.clone();
+    let previous_key = resident.snapshot().await?.snapshot.entries[&moved.entity_id].key().to_vec();
     apply(&client, &moved).await?;
     expected.insert(moved.entity_id, proto::Clock::singleton(&moved));
-    wait_for_original_tree(&original, &expected).await?;
-    assert_ne!(original.current_snapshot().await?.entries[&moved.entity_id].key, previous_key);
+    wait_for_original_tree(&resident, &expected).await?;
+    assert_ne!(resident.snapshot().await?.snapshot.entries[&moved.entity_id].key(), previous_key);
     let reused = acquire(&client.resident_trees, &client, selection).await?;
-    assert!(Arc::ptr_eq(&original, &reused.tree()), "idle maintenance keeps the same resident reusable");
-    assert_eq!(client.storage.2.load(Ordering::Relaxed), scans);
+    assert!(Weak::ptr_eq(&original, &reused.identity()), "maintenance keeps the same resident reusable");
+    assert_eq!(client.storage.fetches.load(Ordering::Relaxed), scans);
     Ok(())
 }

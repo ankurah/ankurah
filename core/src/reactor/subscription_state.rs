@@ -479,7 +479,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             let mut staged = Vec::new();
             let mut failure = None;
             for (offset, id, events) in rows {
-                match super::delivery::filter(history, delivered.get(&id).cloned().unwrap_or_default(), &events).await {
+                match super::delivery::undelivered_events(history, delivered.get(&id).cloned().unwrap_or_default(), &events).await {
                     Ok((head, events)) => {
                         if !head.is_empty() {
                             delivered.insert(id, head.clone());
@@ -531,7 +531,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         let mut filtered = Vec::with_capacity(changes.len());
         for change in changes.iter() {
             let id = change.entity.id();
-            let (head, events) = super::delivery::filter(history, delivered.get(&id).cloned().unwrap_or_default(), &change.events).await?;
+            let (head, events) =
+                super::delivery::undelivered_events(history, delivered.get(&id).cloned().unwrap_or_default(), &change.events).await?;
             if !head.is_empty() {
                 delivered.insert(id, head);
             }

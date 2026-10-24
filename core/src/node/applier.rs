@@ -320,13 +320,13 @@ impl NodeApplier {
         let mut storage_trx = node.storage.transaction();
         storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
         storage_trx.add_events(events).await?;
-        let mut publication = node.reactor.begin_commit().await;
-        match publication.storage_result(storage_trx.commit().await)? {
+        let mut source = node.reactor.begin_commit().await;
+        match source.record_storage_outcome(storage_trx.commit().await)? {
             crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
             crate::storage::StorageCommitOutcome::Committed(_) => {}
         }
         let (_, entity) = node.entities.with_state(state_getter, event_getter, state.entity_id, state.state.clone()).await?;
-        publication.publish(&[EntityChange::new(entity.clone(), events.to_vec())], delivery == Delivery::Live);
+        source.publish(&[EntityChange::new(entity.clone(), events.to_vec())], delivery == Delivery::Live);
         Ok(Some(entity))
     }
 
@@ -365,19 +365,19 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
-            let mut publication = node.reactor.begin_commit().await;
-            publication.storage_result(storage_trx.commit().await)?.committed()?;
+            let mut source = node.reactor.begin_commit().await;
+            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             if adopted {
                 let (_, entity) = node
                     .entities
                     .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
                     .await?;
                 let change = EntityChange::new(entity, events);
-                publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
+                source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
                 Ok(Some(change))
             } else {
                 let change = candidate.commit(&node.entities, event_getter).await?;
-                publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
+                source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
                 Ok((!change.events().is_empty()).then_some(change))
             }
         })
@@ -409,10 +409,10 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
             storage_trx.add_events(&events).await?;
-            let mut publication = node.reactor.begin_commit().await;
-            publication.storage_result(storage_trx.commit().await)?.committed()?;
+            let mut source = node.reactor.begin_commit().await;
+            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             let change = candidate.commit(&node.entities, event_getter).await?;
-            publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
+            source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
             Ok((!change.events().is_empty()).then_some(change))
         })
     }

@@ -92,14 +92,14 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         if self.failed {
             return Err(MutationError::TransactionFailed);
         }
-        let mut publication = self.node.reactor.begin_commit().await;
-        publication.storage_result(self.storage.commit().await)?.committed()?;
+        let mut source = self.node.reactor.begin_commit().await;
+        source.record_storage_outcome(self.storage.commit().await)?.committed()?;
         let mut changes = Vec::new();
         for (_, entity) in self.entities.entries.drain(..) {
             let change = entity.fork.commit(&self.node.entities, &self.event_getter).await?;
             changes.push(change);
         }
-        publication.publish(&changes, true);
+        source.publish(&changes, true);
         changes.retain(|change| !change.events().is_empty());
         let failures = self.node.reactor.notify_change(changes).await;
         self.node.live_queries.fail_notifications(&failures);

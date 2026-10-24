@@ -27,6 +27,19 @@ pub(crate) enum SourceError {
     Changed,
     #[error("query catalog changed; reopen the query generation")]
     CatalogChanged,
+    #[error("access policy changed for the index's readers; reopen the query")]
+    PolicyChanged,
+}
+
+impl SourceError {
+    /// Whether `error` is a source error that admitting the index again can
+    /// recover from, unlike a source that is no longer available.
+    pub(crate) fn is_retryable(error: &anyhow::Error) -> bool {
+        matches!(
+            error.downcast_ref::<SourceError>(),
+            Some(SourceError::Changed | SourceError::Lagged | SourceError::CatalogChanged | SourceError::PolicyChanged)
+        )
+    }
 }
 
 /// Compact result of inspecting one committed entity. `member` controls the
@@ -45,9 +58,11 @@ pub(crate) struct SourceBatch<T> {
     pub(crate) bytes: usize,
 }
 
+/// What a fence hands its reader: the source's revision at the fence, and the
+/// reader's unconsumed changes up to it, coalesced into at most one batch.
 pub(crate) struct SourceWindow<T> {
     pub(crate) revision: SourceRevision,
-    pub(crate) batches: Vec<Arc<SourceBatch<T>>>,
+    pub(crate) batch: Option<SourceBatch<T>>,
 }
 
 #[derive(Clone)]
@@ -55,12 +70,12 @@ pub(super) struct Maintenance(Arc<MaintenanceInner>);
 
 struct MaintenanceInner {
     gate: Arc<AsyncMutex<()>>,
-    state: Mutex<Publications>,
+    state: Mutex<SourceState>,
     watchers: Arc<Mutex<WatcherSet>>,
 }
 
 #[derive(Default)]
-struct Publications {
+struct SourceState {
     revision: u64,
     unavailable: bool,
     readers: BTreeMap<ReactorSubscriptionId, Weak<dyn MaintenanceReader>>,
@@ -71,7 +86,9 @@ trait MaintenanceReader: Send + Sync {
     fn fail(&self, error: SourceError);
 }
 
-type Projector<T> = dyn Fn(&EntityChange, bool) -> anyhow::Result<ProjectedChange<T>> + Send + Sync;
+/// A reader's projection of one publication's changes, one result per change
+/// in order, computed while the committed entities are available.
+type Projector<T> = dyn Fn(&[&EntityChange], bool) -> anyhow::Result<Vec<ProjectedChange<T>>> + Send + Sync;
 
 struct Reader<T> {
     id: ReactorSubscriptionId,
@@ -116,7 +133,7 @@ impl Maintenance {
 
     pub(super) async fn subscribe<T: Send + Sync + 'static>(
         &self,
-        project: impl Fn(&EntityChange, bool) -> anyhow::Result<ProjectedChange<T>> + Send + Sync + 'static,
+        project: impl Fn(&[&EntityChange], bool) -> anyhow::Result<Vec<ProjectedChange<T>>> + Send + Sync + 'static,
     ) -> Result<(SourceRevision, MaintenanceSubscription<T>), SourceError> {
         let _gate = self.0.gate.lock().await;
         let mut source = self.0.state.lock().unwrap();
@@ -157,8 +174,9 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
         let mut watchers = Vec::with_capacity(changes.len());
         let mut bytes = 0usize;
         let result = (|| {
-            for change in changes {
-                let projected = (self.project)(change, live_events)?;
+            let projected = if changes.is_empty() { Vec::new() } else { (self.project)(changes, live_events)? };
+            anyhow::ensure!(projected.len() == changes.len(), "a projector returns one projection per change");
+            for (change, projected) in changes.iter().zip(projected) {
                 bytes = bytes.checked_add(projected.bytes).ok_or_else(|| anyhow::anyhow!("index change size overflow"))?;
                 let entity_id = change.entity().id();
                 watchers.push(if projected.member {
@@ -209,7 +227,7 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
 }
 
 impl SourceCommit {
-    pub(crate) fn storage_result(
+    pub(crate) fn record_storage_outcome(
         &mut self,
         result: Result<crate::storage::StorageCommitOutcome, crate::error::MutationError>,
     ) -> Result<crate::storage::StorageCommitOutcome, crate::error::MutationError> {
@@ -225,8 +243,8 @@ impl SourceCommit {
             self.finished = true;
             return;
         }
-        let Some(revision) = source.revision.checked_add(1) else { return };
-        source.revision = revision;
+        source.revision += 1;
+        let revision = source.revision;
         source.readers.retain(|_, reader| reader.strong_count() != 0);
         let catalog_changed = changes.iter().any(|change| change.entity().memberships().iter().any(crate::schema::is_catalog_model));
         let changes = Arc::new(changes.iter().collect::<Vec<_>>());
@@ -267,7 +285,7 @@ impl Drop for SourceCommit {
 impl<T> MaintenanceSubscription<T> {
     pub(crate) async fn fence(&mut self) -> Result<SourceWindow<T>, SourceError> { self.fence_inner(None).await }
 
-    pub(crate) async fn validate_limited_read(&mut self, started: SourceRevision) -> Result<SourceWindow<T>, SourceError> {
+    pub(crate) async fn fence_unchanged_since(&mut self, started: SourceRevision) -> Result<SourceWindow<T>, SourceError> {
         self.fence_inner(Some(started)).await
     }
 
@@ -285,7 +303,7 @@ impl<T> MaintenanceSubscription<T> {
         if started.is_some_and(|started| started != revision) {
             return Err(SourceError::Changed);
         }
-        Ok(SourceWindow { revision, batches: reader.pending.take().map(Arc::new).into_iter().collect() })
+        Ok(SourceWindow { revision, batch: reader.pending.take() })
     }
 
     /// Narrow the bootstrap watch only when the supplied membership includes
@@ -318,7 +336,7 @@ impl<T> MaintenanceSubscription<T> {
         Ok(())
     }
 
-    pub(crate) async fn next(&mut self) -> Result<Arc<SourceBatch<T>>, SourceError> {
+    pub(crate) async fn next(&mut self) -> Result<SourceBatch<T>, SourceError> {
         loop {
             let notified = self.reader.notify.notified();
             {
@@ -327,7 +345,7 @@ impl<T> MaintenanceSubscription<T> {
                     return Err(error.clone());
                 }
                 if let Some(batch) = reader.pending.take() {
-                    return Ok(Arc::new(batch));
+                    return Ok(batch);
                 }
             }
             notified.await;

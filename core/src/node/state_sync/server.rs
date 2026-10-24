@@ -1,4 +1,7 @@
-use super::Snapshot;
+use super::{
+    resident::{LiveChange, LiveRead},
+    Snapshot,
+};
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
@@ -944,6 +947,33 @@ where
     queue_round(node, peer, id, number, revision, snapshot, known)
 }
 
+/// Queue a live publication's `changes` on stream `id`, each with the delta
+/// the stream's principal may read, built from `read`; a delta it may not
+/// build stops the stream.
+pub(crate) fn queue_live_changes<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: StateStreamId,
+    revision: u64,
+    changes: Vec<LiveChange>,
+    read: &LiveRead,
+) -> anyhow::Result<()>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let session = connection.state_streams.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
+    match live_items(node, &session.credentials, changes, read) {
+        Ok(items) => queue_live(node, peer, id, revision, items),
+        Err(error) => {
+            session.live.lock().unwrap().stopped = true;
+            kick_state_stream(node, peer, id);
+            Err(error)
+        }
+    }
+}
+
 pub(crate) fn queue_live<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
@@ -986,6 +1016,42 @@ where
     drop(queue);
     kick_state_stream(node, peer, id);
     Ok(())
+}
+
+/// The items one stream delivers for `changes`: each change's member and,
+/// when the stream's principal may read the entity's current state, that
+/// state attested with the events the publication committed for it.
+pub(crate) fn live_items<SE, PA>(
+    node: &Node<SE, PA>,
+    credentials: &Vec<PA::ContextData>,
+    changes: Vec<LiveChange>,
+    read: &LiveRead,
+) -> anyhow::Result<Vec<proto::QueryChange>>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
+    changes
+        .into_iter()
+        .map(|LiveChange { entity_id, member }| {
+            let delta = match read.state(&entity_id) {
+                Some(state) if policy.check_read(&entity_id, &state.state).is_ok() => {
+                    let events = read.events(&entity_id)?;
+                    for event in &events {
+                        policy.check_read_event(event, &state.state)?;
+                    }
+                    let attestation = node.policy_agent.attest_state(node, state);
+                    Some(proto::DeltaContent::StateAndEvents {
+                        state: proto::Attested::opt(state.clone(), attestation).into(),
+                        events: events.into_iter().cloned().map(Into::into).collect(),
+                    })
+                }
+                _ => None,
+            };
+            Ok(proto::QueryChange { entity_id, member, delta })
+        })
+        .collect()
 }
 
 pub(crate) fn kick_state_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId)
@@ -1128,18 +1194,16 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fail_stream(node, peer, id, StateFrameBody::RestartRequired).await
+    fail_state_stream(node, peer, id, StateFrameBody::RestartRequired).await
 }
 
-pub(crate) async fn source_unavailable<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    fail_stream(node, peer, id, StateFrameBody::SourceUnavailable).await
-}
-
-async fn fail_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId, body: StateFrameBody) -> anyhow::Result<()>
+/// End stream `id` with `body`, the terminal frame that tells its peer why.
+pub(crate) async fn fail_state_stream<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: StateStreamId,
+    body: StateFrameBody,
+) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -1340,7 +1404,7 @@ impl Comparison {
         // A valid offer's spans are disjoint and within the tree; plan them in address order.
         let mut spans = known.spans;
         spans.sort_by(|a, b| a.bounds().cmp_start(b.bounds()));
-        let mut start = super::whole().start;
+        let mut start = proto::TreeSpan::all().start;
         let mut frontier = Some(Vec::new());
         for region in spans {
             let bounds = region.bounds();
@@ -1370,7 +1434,7 @@ impl Comparison {
             }
         }
         if !matches!(start, std::ops::Bound::Unbounded) {
-            let rest = TreeSpan::new(start, super::whole().end);
+            let rest = TreeSpan::new(start, proto::TreeSpan::all().end);
             if !rest.is_empty() {
                 comparison.work.push_back(Work::SendHeads(rest));
             }
@@ -1464,14 +1528,14 @@ impl Comparison {
                 work.push(Work::SendHeads(gap));
             }
             let point = TreeSpan::new(Included(address.clone()), Included(address.clone()));
-            if let Some((_, entry)) = self.snapshot.entries_in(&point, 1).next() {
+            if let Some((entity_id, entry)) = self.snapshot.entries_in(&point, 1).next() {
                 flush_removal(&mut removal, &mut work);
                 if !leaf.entity.head.equals(&entry.head) {
                     work.push(Work::Item(StateItem::Heads(proto::TreeSpanInventory {
                         bounds: point,
                         heads: vec![proto::KeyedEntityHead {
-                            key: entry.key.clone(),
-                            entity: proto::EntityHead { entity_id: entry.entity_id, head: entry.head.clone() },
+                            key: entry.key().to_vec(),
+                            entity: proto::EntityHead { entity_id, head: entry.head.clone() },
                         }]
                         .try_into()?,
                     })));
@@ -1641,7 +1705,7 @@ impl Comparison {
                 },
                 Work::CompareFrontier(frontier) => {
                     let digest = ankurah_digest_tree::Digest::checked_sum(frontier.iter().map(|head| head.digest))?;
-                    if self.snapshot.span_digest(super::whole()).await?.digest == digest {
+                    if self.snapshot.span_digest(proto::TreeSpan::all()).await?.digest == digest {
                         None
                     } else {
                         for head in frontier {
