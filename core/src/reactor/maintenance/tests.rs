@@ -538,3 +538,20 @@ async fn closing_the_reactor_fails_every_maintenance_reader() -> anyhow::Result<
     assert!(matches!(source.subscribe_maintenance(project).await, Err(SourceError::Unavailable)));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_local_transaction_publishes_its_entities_to_maintenance() -> anyhow::Result<()> {
+    let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let (_, mut cursor) = subscribe(&node).await?;
+    let transaction = node.privileged_context().begin();
+    let row = crate::schema::catalog::SysModelRow { label: "fixture".into(), name: "Fixture".into() };
+    let id = transaction.create(&row).await?.id();
+    transaction.commit().await?;
+    let head = node.storage.get_state(id).await?.payload.state.head;
+    let batch = cursor.next().await?;
+    assert!(batch.catalog_changed);
+    assert_eq!(batch.changes.iter().find(|change| change.id == id).map(|change| change.head.clone()), Some(head));
+    Ok(())
+}

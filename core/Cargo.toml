@@ -34,11 +34,12 @@ bench-internals = []
 
 [dependencies]
 # Internal dependencies
-ankurah-derive     = { path = "../derive", version = "=0.10.0" }
-ankql              = { path = "../ankql", version = "=0.10.0" }
-ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
-ankurah-proto      = { path = "../proto", version = "=0.10.0" }
-ankurah-signals    = { path = "../signals", version = "=0.10.0" }
+ankurah-derive      = { path = "../derive", version = "=0.10.0" }
+ankql               = { path = "../ankql", version = "=0.10.0" }
+ankurah-core-types  = { path = "../core-types", version = "=0.10.0" }
+ankurah-digest-tree = { path = "../digest-tree", version = "=0.10.0" }
+ankurah-proto       = { path = "../proto", version = "=0.10.0" }
+ankurah-signals     = { path = "../signals", version = "=0.10.0" }
 
 rand                 = { version = "0.8", features = ["small_rng"] }
 anyhow               = "1.0"
