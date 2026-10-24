@@ -36,29 +36,34 @@ mod view_isolation;
 
 /// The core test engine deliberately rejects ORDER BY/LIMIT. This fixture adds
 /// exactly the ordered bounded read exercised here, leaving its real commit and
-/// pause seams intact.
+/// pause seams intact, and counts the reads it serves.
 #[derive(Default)]
-struct OrderedStorage(
-    TestStorage,
-    std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
-    std::sync::atomic::AtomicUsize,
-    std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
-    std::sync::atomic::AtomicUsize, // Rows returned to callers, after the storage LIMIT.
-    std::sync::atomic::AtomicUsize, // Individual state reads, including default get_states calls.
-);
+struct OrderedStorage {
+    inner: TestStorage,
+    /// Pauses the next `fetch_states` until released.
+    fetch_pause: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    /// `fetch_states` calls.
+    fetches: std::sync::atomic::AtomicUsize,
+    /// Pauses the next `get_events` until released.
+    events_pause: std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    /// Rows `fetch_states` returned to callers, after the storage LIMIT.
+    returned_rows: std::sync::atomic::AtomicUsize,
+    /// Individual state reads, including those each `get_states` call makes.
+    state_reads: std::sync::atomic::AtomicUsize,
+}
 
 #[async_trait::async_trait]
 impl StorageEngine for OrderedStorage {
     type Value = Value;
     type Transaction<'a> = TestStorageTransaction<'a>;
-    fn transaction(&self) -> Self::Transaction<'_> { self.0.transaction() }
+    fn transaction(&self) -> Self::Transaction<'_> { self.inner.transaction() }
     async fn get_state(&self, id: proto::EntityId) -> Result<Attested<proto::EntityState>, RetrievalError> {
-        self.5.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.0.get_state(id).await
+        self.state_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.get_state(id).await
     }
     async fn fetch_states(&self, selection: &Selection<Resolved>) -> Result<Vec<Attested<proto::EntityState>>, RetrievalError> {
-        self.2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let pause = self.1.lock().unwrap().take();
+        self.fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pause = self.fetch_pause.lock().unwrap().take();
         if let Some((entered, resume)) = pause {
             let _ = entered.send(());
             let _ = resume.await;
@@ -66,7 +71,7 @@ impl StorageEngine for OrderedStorage {
         let mut scan = selection.clone();
         scan.order_by = None;
         scan.limit = None;
-        let states = self.0.fetch_states(&scan).await?;
+        let states = self.inner.fetch_states(&scan).await?;
         let mut rows: Vec<_> = states
             .into_iter()
             .map(|state| {
@@ -92,22 +97,22 @@ impl StorageEngine for OrderedStorage {
         if let Some(limit) = selection.limit {
             rows.truncate(limit as usize);
         }
-        self.4.fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
+        self.returned_rows.fetch_add(rows.len(), std::sync::atomic::Ordering::Relaxed);
         Ok(rows.into_iter().map(|(_, _, state)| state).collect())
     }
     async fn get_events(&self, ids: Vec<proto::EventId>) -> Result<Vec<Attested<proto::Event>>, RetrievalError> {
-        let pause = self.3.lock().unwrap().take();
+        let pause = self.events_pause.lock().unwrap().take();
         if let Some((entered, resume)) = pause {
             let _ = entered.send(());
             let _ = resume.await;
         }
-        self.0.get_events(ids).await
+        self.inner.get_events(ids).await
     }
     async fn dump_entity_events(&self, id: proto::EntityId) -> Result<Vec<Attested<proto::Event>>, RetrievalError> {
-        self.0.dump_entity_events(id).await
+        self.inner.dump_entity_events(id).await
     }
-    async fn delete_all(&self) -> Result<bool, MutationError> { self.0.delete_all().await }
-    async fn list_materializations(&self) -> Result<Vec<proto::ModelId>, RetrievalError> { self.0.list_materializations().await }
+    async fn delete_all(&self) -> Result<bool, MutationError> { self.inner.delete_all().await }
+    async fn list_materializations(&self) -> Result<Vec<proto::ModelId>, RetrievalError> { self.inner.list_materializations().await }
 }
 
 type TestNode = Node<OrderedStorage, PermissiveAgent>;
@@ -223,7 +228,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
 fn hold_fetch(node: &TestNode) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     let (entered, observed) = oneshot::channel();
     let (release, resume) = oneshot::channel();
-    node.storage.0.hold_fetch.lock().unwrap().insert(model(), (entered, resume));
+    node.storage.inner.hold_fetch.lock().unwrap().insert(model(), (entered, resume));
     (observed, release)
 }
 
@@ -289,7 +294,7 @@ async fn full_capture_folds_changes_before_resolving_a_limit_with_unchanged_entr
     }
     let selection = selection(Some(2));
     let spec = spec_for(&selection, &node.catalog);
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
     let capture = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
     tokio::pin!(capture);
@@ -301,7 +306,11 @@ async fn full_capture_folds_changes_before_resolving_a_limit_with_unchanged_entr
     assert_eq!(actor.tree.entries().len(), 3, "the unchanged replacement is already resident");
     let captured = view(&actor, &selection, &node.catalog).await?;
     assert_eq!(captured.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans + 1, "a concurrent update does not cause a refill read");
+    assert_eq!(
+        node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed),
+        scans + 1,
+        "a concurrent update does not cause a refill read"
+    );
     Ok(())
 }
 
@@ -326,7 +335,7 @@ async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutati
     let spec = spec_for(&selection, &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let frozen = view(&actor, &selection, &node.catalog).await?;
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let moved_a = update(&events[0], "09")?;
     apply(&node, &moved_a).await?;
     let intermediate = actor.refresh(&node).await?.select(&selection, &node.catalog).await?;
@@ -340,7 +349,11 @@ async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutati
     assert_eq!(frozen.entries[&events[0].entity_id].head, proto::Clock::singleton(&events[0]));
     assert_eq!(intermediate.entries[&events[2].entity_id].head, proto::Clock::singleton(&events[2]));
     assert_eq!(actor.tree.entries().len(), 3);
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans, "supported limited scopes never refill from storage");
+    assert_eq!(
+        node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed),
+        scans,
+        "supported limited scopes never refill from storage"
+    );
     Ok(())
 }
 
@@ -597,7 +610,7 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
         )
         .await?;
     let (_, original) = handler.query_resident_for_test(query).await.unwrap();
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     apply(&node, &update(&initial[0], "09")?).await?;
     handler
         .subscribe_query(
@@ -619,7 +632,7 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
     assert_eq!(snapshot.entries.len(), 3, "the resident keeps the full admission");
     let snapshot = snapshot.select(&selection(Some(1)), &node.catalog).await?;
     assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans);
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans);
     handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
     Ok(())
@@ -634,7 +647,7 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
     let spec = spec_for(&selection, &node.catalog);
     let (entered, observed) = oneshot::channel();
     let (read, resume) = oneshot::channel();
-    *node.storage.1.lock().unwrap() = Some((entered, resume));
+    *node.storage.fetch_pause.lock().unwrap() = Some((entered, resume));
     let capture = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
     tokio::pin!(capture);
     assert!(futures::poll!(&mut capture).is_pending());
@@ -644,7 +657,7 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
     let second = update(&first, "03")?;
     let (committed, stored) = oneshot::channel();
     let (admit, admission) = oneshot::channel();
-    *node.storage.0.hold_after_commit.lock().unwrap() = Some((committed, admission));
+    *node.storage.inner.hold_after_commit.lock().unwrap() = Some((committed, admission));
     let publishing = apply(&node, &second);
     tokio::pin!(publishing);
     assert!(futures::poll!(&mut publishing).is_pending());
@@ -702,7 +715,7 @@ async fn a_complete_resident_applies_a_published_batch_while_another_commit_is_i
     // Hold the next commit after its storage write, while it holds the commit gate.
     let (committed, stored) = oneshot::channel();
     let (admit, admission) = oneshot::channel();
-    *node.storage.0.hold_after_commit.lock().unwrap() = Some((committed, admission));
+    *node.storage.inner.hold_after_commit.lock().unwrap() = Some((committed, admission));
     let second = update(&first, "03")?;
     let publishing = apply(&node, &second);
     tokio::pin!(publishing);

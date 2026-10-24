@@ -24,7 +24,7 @@ async fn idle_resident_updates_then_exact_reuse_avoids_another_scan() -> anyhow:
     let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
     let tree = resident.identity();
     let frozen = resident.snapshot().await?.snapshot;
-    let scans = node.storage.2.load(Ordering::Relaxed);
+    let scans = node.storage.fetches.load(Ordering::Relaxed);
     drop(resident);
     let next = update(&initial, "02")?;
     apply(&node, &next).await?;
@@ -33,7 +33,7 @@ async fn idle_resident_updates_then_exact_reuse_avoids_another_scan() -> anyhow:
     let current = reused.snapshot().await?;
     assert_eq!(current.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&next));
     assert_eq!(frozen.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
-    assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "ordinary updates and exact reuse never rescan storage");
+    assert_eq!(node.storage.fetches.load(Ordering::Relaxed), scans, "ordinary updates and exact reuse never rescan storage");
     Ok(())
 }
 
@@ -97,7 +97,7 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
     let resident = acquire(&node.resident_trees, &node, selection.clone()).await?;
     let original = resident.identity();
     drop(resident);
-    let scans = node.storage.2.load(Ordering::Relaxed);
+    let scans = node.storage.fetches.load(Ordering::Relaxed);
     let mut subscriptions = Vec::new();
     for number in [61, 62] {
         let peer = proto::EntityId::from_bytes([number; 32]);
@@ -126,7 +126,7 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
         subscriptions.push((peer, query));
     }
     assert_eq!(node.resident_trees.len(), 1);
-    assert_eq!(node.storage.2.load(Ordering::Relaxed), scans);
+    assert_eq!(node.storage.fetches.load(Ordering::Relaxed), scans);
     let (peer, query) = subscriptions.remove(0);
     node.peer_connections.get(&peer).unwrap().subscription_handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
@@ -267,7 +267,7 @@ async fn slow_initial_history_does_not_block_the_shared_tree() -> anyhow::Result
     .await?;
     let (entered, waiting) = oneshot::channel();
     let (release, resume) = oneshot::channel();
-    *node.storage.3.lock().unwrap() = Some((entered, resume));
+    *node.storage.events_pause.lock().unwrap() = Some((entered, resume));
     let subscription = resident.subscribe(&node, peer, proto::RequestId::new(), vec![], proto::QueryId::new(), 1, false, known);
     tokio::pin!(subscription);
     tokio::select! {
@@ -370,7 +370,7 @@ async fn invalidation_reaches_another_peer_while_first_initial_reply_waits_for_h
     let healthy_connection = node.peer_connections.get(&healthy_peer).unwrap();
     let (entered, waiting) = oneshot::channel();
     let (release, resume) = oneshot::channel();
-    *node.storage.3.lock().unwrap() = Some((entered, resume));
+    *node.storage.events_pause.lock().unwrap() = Some((entered, resume));
     let mut slow = Box::pin(slow_connection.subscription_handler.subscribe_query(
         &node,
         proto::RequestId::new(),
@@ -450,7 +450,7 @@ async fn compatible_selections_share_full_resident_with_independent_scopes() -> 
     }
     let broad = acquire(&node.resident_trees, &node, above("07", None)).await?;
     let full = broad.identity();
-    let scans = node.storage.2.load(Ordering::Relaxed);
+    let scans = node.storage.fetches.load(Ordering::Relaxed);
     let cases = [
         (above("07", None), vec![1, 2, 3, 4]),
         (Selection { order_by: None, ..above("07", None) }, vec![1, 2, 3, 4]),
@@ -472,7 +472,7 @@ async fn compatible_selections_share_full_resident_with_independent_scopes() -> 
         assert_eq!(snapshot.entries.keys().copied().collect::<BTreeSet<_>>(), expected);
     }
     assert_eq!(node.resident_trees.len(), 1);
-    assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "scopes do not scan storage again");
+    assert_eq!(node.storage.fetches.load(Ordering::Relaxed), scans, "scopes do not scan storage again");
     assert_eq!(broad.snapshot().await?.snapshot.entries.len(), 4, "query limits never truncate the resident");
     let before = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
     let changed = update(&events[1], "15")?;
@@ -556,21 +556,21 @@ async fn cold_limit_bounds_physical_retention_and_zero_limit_reads_nothing() -> 
     for value in 0..128 {
         apply(&node, &genesis(&format!("{value:03}"))?).await?;
     }
-    let rows_read = node.storage.4.load(Ordering::Relaxed);
+    let rows_read = node.storage.returned_rows.load(Ordering::Relaxed);
     let limited = acquire(&node.resident_trees, &node, selection(Some(3))).await?;
     assert_eq!(limited.snapshot().await?.snapshot.entries.len(), 3);
     assert_eq!(
-        node.storage.4.load(Ordering::Relaxed) - rows_read,
+        node.storage.returned_rows.load(Ordering::Relaxed) - rows_read,
         3,
         "a cold limited resident reads, and so holds, only the selected rows"
     );
 
-    let scans = node.storage.2.load(Ordering::Relaxed);
-    let rows_read = node.storage.4.load(Ordering::Relaxed);
+    let scans = node.storage.fetches.load(Ordering::Relaxed);
+    let rows_read = node.storage.returned_rows.load(Ordering::Relaxed);
     let empty = acquire(&node.resident_trees, &node, selection(Some(0))).await?;
     assert!(empty.snapshot().await?.snapshot.entries.is_empty());
-    assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "LIMIT 0 must not start an application scan");
-    assert_eq!(node.storage.4.load(Ordering::Relaxed), rows_read);
+    assert_eq!(node.storage.fetches.load(Ordering::Relaxed), scans, "LIMIT 0 must not start an application scan");
+    assert_eq!(node.storage.returned_rows.load(Ordering::Relaxed), rows_read);
     Ok(())
 }
 

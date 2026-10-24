@@ -48,7 +48,7 @@ async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update(
     assert_eq!(fetched.iter().map(|entity| (entity.id(), entity.head())).collect::<BTreeMap<_, _>>(), expected);
     wait_for_original_tree(&resident, &expected).await?;
 
-    let scans = client.storage.2.load(Ordering::Relaxed);
+    let scans = client.storage.fetches.load(Ordering::Relaxed);
     let exact = acquire(&client.resident_trees, &client, selection.clone()).await?;
     assert!(Weak::ptr_eq(&original, &exact.identity()), "successful transfer must not hide a replacement tree");
     let narrower = acquire(&client.resident_trees, &client, above("row-00002047", Some(10))).await?;
@@ -57,7 +57,7 @@ async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update(
         narrower.snapshot().await?.snapshot.entries.keys().copied().collect::<BTreeSet<_>>(),
         events[2048..2058].iter().map(|event| event.entity_id).collect(),
     );
-    assert_eq!(client.storage.2.load(Ordering::Relaxed), scans, "neither reuse path rebuilds from storage");
+    assert_eq!(client.storage.fetches.load(Ordering::Relaxed), scans, "neither reuse path rebuilds from storage");
     drop((exact, narrower, fetched));
 
     // Finish every peer owner before checking maintenance without routes.
@@ -78,6 +78,6 @@ async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update(
     assert_ne!(resident.snapshot().await?.snapshot.entries[&moved.entity_id].key(), previous_key);
     let reused = acquire(&client.resident_trees, &client, selection).await?;
     assert!(Weak::ptr_eq(&original, &reused.identity()), "maintenance keeps the same resident reusable");
-    assert_eq!(client.storage.2.load(Ordering::Relaxed), scans);
+    assert_eq!(client.storage.fetches.load(Ordering::Relaxed), scans);
     Ok(())
 }

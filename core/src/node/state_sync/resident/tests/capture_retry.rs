@@ -90,7 +90,7 @@ async fn catalog_change_during_fetch_capture_reopens_the_source() -> anyhow::Res
     let node = node().await?;
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
     let capture = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
     tokio::pin!(capture);
@@ -101,7 +101,7 @@ async fn catalog_change_during_fetch_capture_reopens_the_source() -> anyhow::Res
     let captured = capture.await?;
     assert_eq!(captured.snapshot.entries.len(), 1);
     assert_eq!(captured.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed) - scans, 2, "the raced admission must be read again");
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2, "the raced admission must be read again");
     assert_eq!(node.resident_trees.len(), 1, "only the replacement admission may be reusable");
     Ok(())
 }
@@ -133,7 +133,7 @@ async fn catalog_churn_bounds_capture_retries_and_later_capture_recovers() -> an
     let node = node().await?;
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let (mut entered, mut release) = hold_fetch(&node);
     let capture = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
     tokio::pin!(capture);
@@ -152,7 +152,7 @@ async fn catalog_churn_bounds_capture_retries_and_later_capture_recovers() -> an
     let error = capture.await.err().expect("continued catalog churn must exhaust the bounded retry");
     assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
     assert!(SourceError::is_retryable(&error));
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
     assert_eq!(node.resident_trees.len(), 0);
     let current = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(current.snapshot.entries.len(), 1);

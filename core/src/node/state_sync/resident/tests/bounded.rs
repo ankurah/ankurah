@@ -12,7 +12,7 @@ async fn bounded_capture_retries_to_find_an_unchanged_replacement() -> anyhow::R
     let second = genesis("02")?;
     apply(&node, &first).await?;
     apply(&node, &second).await?;
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
     let actor = {
         let capture = limited(&node, selection(Some(1)));
@@ -25,7 +25,7 @@ async fn bounded_capture_retries_to_find_an_unchanged_replacement() -> anyhow::R
     };
     assert_eq!(actor.tree.entries().keys().copied().collect::<Vec<_>>(), vec![second.entity_id]);
     assert_eq!(actor.candidates.len(), 1);
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans + 2, "the raced bounded scan must be repeated");
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans + 2, "the raced bounded scan must be repeated");
     let mut different = selection(Some(2));
     assert!(view(&actor, &different, &node.catalog).await.is_err());
     different.limit = None;
@@ -105,10 +105,10 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
     assert_eq!(actor.tree.snapshot().entries.len(), 2);
     assert_eq!(actor.candidates.len(), 2);
     assert_eq!(actor.routes.len(), 1);
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     actor.refresh(&node).await?;
     assert_eq!(actor.revision, revision, "refresh must not roll back the refill's later fence");
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans, "consumed publications must not be replayed");
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans, "consumed publications must not be replayed");
 
     let items = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
@@ -165,7 +165,7 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
 #[tokio::test]
 async fn zero_limit_ignores_application_publications_without_reads_or_retention() -> anyhow::Result<()> {
     let node = node().await?;
-    let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let mut actor = limited(&node, selection(Some(0))).await?;
     apply(&node, &genesis("01")?).await?;
     let before = actor.revision;
@@ -174,6 +174,6 @@ async fn zero_limit_ignores_application_publications_without_reads_or_retention(
     assert!(current.entries.is_empty());
     assert!(actor.tree.entries().is_empty());
     assert!(actor.candidates.is_empty());
-    assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans);
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans);
     Ok(())
 }

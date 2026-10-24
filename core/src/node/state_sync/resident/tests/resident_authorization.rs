@@ -57,23 +57,27 @@ async fn unrestricted_reads_reuse_a_complete_tree_for_a_limit_without_reading_st
     let full = acquire(&node.resident_trees, &node, above("", None)).await?;
     let original = full.identity();
     assert!(node.entities.get(&events[0].entity_id).is_none(), "the proof must not depend on resident payloads");
-    let reads = node.storage.5.load(Ordering::Relaxed);
-    let scans = node.storage.2.load(Ordering::Relaxed);
+    let reads = node.storage.state_reads.load(Ordering::Relaxed);
+    let scans = node.storage.fetches.load(Ordering::Relaxed);
     let limited = acquire(&node.resident_trees, &node, above("row-00000031", Some(10))).await?;
     assert!(Weak::ptr_eq(&original, &limited.identity()));
     assert_eq!(
         limited.snapshot().await?.snapshot.entries.keys().copied().collect::<BTreeSet<_>>(),
         events[32..42].iter().map(|event| event.entity_id).collect(),
     );
-    assert_eq!(node.storage.5.load(Ordering::Relaxed), reads, "unchanged authorization does not reload the complete tree's states");
-    assert_eq!(node.storage.2.load(Ordering::Relaxed), scans);
+    assert_eq!(
+        node.storage.state_reads.load(Ordering::Relaxed),
+        reads,
+        "unchanged authorization does not reload the complete tree's states"
+    );
+    assert_eq!(node.storage.fetches.load(Ordering::Relaxed), scans);
 
     let moved = update(&events[0], "row-99999999")?;
     apply(&node, &moved).await?;
-    let reads = node.storage.5.load(Ordering::Relaxed);
+    let reads = node.storage.state_reads.load(Ordering::Relaxed);
     let snapshot = full.snapshot().await?.snapshot;
     assert_eq!(snapshot.entries[&moved.entity_id].head, proto::Clock::singleton(&moved), "the proof never bypasses reactor maintenance");
-    assert_eq!(node.storage.5.load(Ordering::Relaxed), reads);
+    assert_eq!(node.storage.state_reads.load(Ordering::Relaxed), reads);
     Ok(())
 }
 
@@ -93,24 +97,24 @@ async fn state_free_read_proofs_are_fresh_and_do_not_hide_new_grants_or_revocati
     }
     let denied = acquire(&node.resident_trees, &node, selection(None)).await?;
     assert!(denied.snapshot().await?.snapshot.entries.is_empty());
-    let reads = node.storage.5.load(Ordering::Relaxed);
+    let reads = node.storage.state_reads.load(Ordering::Relaxed);
     allowed.store(true, Ordering::SeqCst);
     assert!(denied.snapshot().await.is_err(), "the old empty admission cannot become an all-readable answer");
-    assert_eq!(node.storage.5.load(Ordering::Relaxed), reads, "the universal grant detects omitted candidates from metadata");
+    assert_eq!(node.storage.state_reads.load(Ordering::Relaxed), reads, "the universal grant detects omitted candidates from metadata");
     let granted = acquire(&node.resident_trees, &node, selection(None)).await?;
     assert_eq!(
         granted.snapshot().await?.snapshot.entries.keys().copied().collect::<BTreeSet<_>>(),
         BTreeSet::from([first.entity_id, second.entity_id]),
     );
-    assert_eq!(node.storage.5.load(Ordering::Relaxed), reads);
+    assert_eq!(node.storage.state_reads.load(Ordering::Relaxed), reads);
 
     let no_credentials = node.resident_trees.acquire(&node, selection(None), None, vec![]).await?;
     assert!(!Weak::ptr_eq(&granted.identity(), &no_credentials.identity()), "a credential change cannot borrow the earlier grant");
     assert!(no_credentials.snapshot().await?.snapshot.entries.is_empty());
-    let reads = node.storage.5.load(Ordering::Relaxed);
+    let reads = node.storage.state_reads.load(Ordering::Relaxed);
     allowed.store(false, Ordering::SeqCst);
     assert!(granted.snapshot().await.is_err(), "the proof is not retained after revocation");
-    assert!(node.storage.5.load(Ordering::Relaxed) > reads, "a false proof falls back to actual state checks");
+    assert!(node.storage.state_reads.load(Ordering::Relaxed) > reads, "a false proof falls back to actual state checks");
     let revoked = acquire(&node.resident_trees, &node, selection(None)).await?;
     assert!(revoked.snapshot().await?.snapshot.entries.is_empty());
     Ok(())
@@ -141,11 +145,15 @@ async fn restricted_or_failed_retrieval_never_uses_a_state_free_read_proof() -> 
             apply(&node, event).await?;
         }
         let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
-        let reads = node.storage.5.load(Ordering::Relaxed);
+        let reads = node.storage.state_reads.load(Ordering::Relaxed);
         let proof_calls = proofs.load(Ordering::Relaxed);
         let snapshot = resident.snapshot().await?.snapshot;
         assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), if retrieval_error { vec![] } else { vec![readable.entity_id] });
-        assert_eq!(node.storage.5.load(Ordering::Relaxed) - reads, 2, "restricted retrieval rechecks every candidate's actual state");
+        assert_eq!(
+            node.storage.state_reads.load(Ordering::Relaxed) - reads,
+            2,
+            "restricted retrieval rechecks every candidate's actual state"
+        );
         assert_eq!(proofs.load(Ordering::Relaxed), proof_calls, "a non-True retrieval predicate never invokes the proof hook");
     }
     Ok(())
@@ -161,9 +169,9 @@ async fn policies_without_a_state_free_proof_keep_their_state_checks() -> anyhow
     node.wait_ready().await?;
     apply(&node, &genesis("01")?).await?;
     let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
-    let reads = node.storage.5.load(Ordering::Relaxed);
+    let reads = node.storage.state_reads.load(Ordering::Relaxed);
     assert!(resident.snapshot().await?.snapshot.entries.is_empty());
-    assert_eq!(node.storage.5.load(Ordering::Relaxed) - reads, 1);
+    assert_eq!(node.storage.state_reads.load(Ordering::Relaxed) - reads, 1);
     Ok(())
 }
 
