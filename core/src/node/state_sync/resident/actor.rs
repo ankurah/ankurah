@@ -21,7 +21,7 @@ use crate::{
     session::ContextData,
     storage::StorageEngine,
 };
-use ankurah_proto as proto;
+use ankurah_proto::{self as proto, state_sync::StateFrameBody};
 use ankurah_signals::Wait;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -475,11 +475,8 @@ impl<CD: ContextData> ResidentActor<CD> {
                     // delay invalidation of the tree's other subscribers.
                     crate::task::spawn(async move {
                         if let Some(node) = weak.upgrade() {
-                            if unavailable {
-                                let _ = crate::node::state_sync::source_unavailable(&node, route.peer, route.stream).await;
-                            } else {
-                                let _ = crate::node::state_sync::expire_state_stream(&node, route.peer, route.stream).await;
-                            }
+                            let reason = if unavailable { StateFrameBody::SourceUnavailable } else { StateFrameBody::RestartRequired };
+                            let _ = crate::node::state_sync::fail_state_stream(&node, route.peer, route.stream, reason).await;
                         }
                     });
                 }
@@ -521,7 +518,7 @@ where
     // A peer waiting on its own handler must not delay this resident.
     crate::task::spawn(async move {
         if let Some(node) = weak.upgrade() {
-            let _ = crate::node::state_sync::expire_state_stream(&node, peer, stream).await;
+            let _ = crate::node::state_sync::fail_state_stream(&node, peer, stream, StateFrameBody::RestartRequired).await;
         }
     });
 }

@@ -1194,18 +1194,16 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fail_stream(node, peer, id, StateFrameBody::RestartRequired).await
+    fail_state_stream(node, peer, id, StateFrameBody::RestartRequired).await
 }
 
-pub(crate) async fn source_unavailable<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId) -> anyhow::Result<()>
-where
-    SE: StorageEngine + Send + Sync + 'static,
-    PA: PolicyAgent + Send + Sync + 'static,
-{
-    fail_stream(node, peer, id, StateFrameBody::SourceUnavailable).await
-}
-
-async fn fail_stream<SE, PA>(node: &Node<SE, PA>, peer: proto::EntityId, id: StateStreamId, body: StateFrameBody) -> anyhow::Result<()>
+/// End stream `id` with `body`, the terminal frame that tells its peer why.
+pub(crate) async fn fail_state_stream<SE, PA>(
+    node: &Node<SE, PA>,
+    peer: proto::EntityId,
+    id: StateStreamId,
+    body: StateFrameBody,
+) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
