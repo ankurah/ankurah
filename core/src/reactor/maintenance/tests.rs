@@ -22,7 +22,11 @@ struct Head {
     events: Vec<proto::EventId>,
 }
 
-fn project(change: &EntityChange, live_events: bool) -> anyhow::Result<ProjectedChange<Head>> {
+fn project(changes: &[&EntityChange], live_events: bool) -> anyhow::Result<Vec<ProjectedChange<Head>>> {
+    changes.iter().map(|change| project_change(change, live_events)).collect()
+}
+
+fn project_change(change: &EntityChange, live_events: bool) -> anyhow::Result<ProjectedChange<Head>> {
     change.entity().with_read(|read| {
         let key = match read.value(&proto::PropertyId::EntityId(EntityId::from_bytes([31; 32]))) {
             Some(Value::String(value)) => Some(value),
@@ -197,9 +201,11 @@ async fn lagged_reader_fails_without_invalidating_an_independent_reader() -> any
     let node = node().await?;
     let (_, mut slow) = node
         .reactor
-        .subscribe_maintenance(|change, live| {
-            let mut projected = project(change, live)?;
-            projected.bytes = MAX_PENDING_BYTES / 2;
+        .subscribe_maintenance(|changes, live| {
+            let mut projected = project(changes, live)?;
+            for projected in &mut projected {
+                projected.bytes = MAX_PENDING_BYTES / 2;
+            }
             Ok(projected)
         })
         .await?;
@@ -430,11 +436,16 @@ async fn maintenance_routes_model_candidates_and_removes_departed_entity_watches
     let project_predicate = predicate.clone();
     let (revision, mut cursor) = node
         .reactor
-        .subscribe_maintenance(move |change, live| {
-            let mut projected = project(change, live)?;
-            projected.member =
-                change.entity().with_read(|read| crate::selection::filter::evaluate_predicate(read, &project_predicate))??;
-            Ok(projected)
+        .subscribe_maintenance(move |changes, live| {
+            changes
+                .iter()
+                .map(|change| {
+                    let mut projected = project_change(change, live)?;
+                    projected.member =
+                        change.entity().with_read(|read| crate::selection::filter::evaluate_predicate(read, &project_predicate))??;
+                    Ok(projected)
+                })
+                .collect()
         })
         .await?;
     cursor.finish_bootstrap(predicate, [], revision).await?;
@@ -472,9 +483,9 @@ async fn dropping_maintenance_unregisters_its_watchers_and_projector() -> anyhow
     let weak = Arc::downgrade(&owned);
     let (revision, mut cursor) = node
         .reactor
-        .subscribe_maintenance(move |change, live| {
+        .subscribe_maintenance(move |changes, live| {
             let _ = &owned;
-            project(change, live)
+            project(changes, live)
         })
         .await?;
     let maintenance = cursor.maintenance.clone();
@@ -525,8 +536,10 @@ async fn catalog_changes_reach_maintenance_without_any_predicate_candidate() -> 
 #[tokio::test]
 async fn projection_failure_invalidates_only_the_affected_subscription() -> anyhow::Result<()> {
     let node = node().await?;
-    let (_, mut failed) =
-        node.reactor.subscribe_maintenance(|_, _| Err::<ProjectedChange<Head>, _>(anyhow::anyhow!("fixture projection refused"))).await?;
+    let (_, mut failed) = node
+        .reactor
+        .subscribe_maintenance(|_, _| Err::<Vec<ProjectedChange<Head>>, _>(anyhow::anyhow!("fixture projection refused")))
+        .await?;
     let (_, mut healthy) = subscribe(&node).await?;
     let event = genesis(51);
     apply(&node, &event, Delivery::Initial).await?;

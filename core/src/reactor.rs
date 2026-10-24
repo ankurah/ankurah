@@ -580,7 +580,7 @@ impl Reactor<Entity, proto::Attested<proto::Event>> {
     /// before public event filtering and may retain only the index's metadata.
     pub(crate) async fn subscribe_maintenance<T: Send + Sync + 'static>(
         &self,
-        project: impl Fn(&crate::changes::EntityChange, bool) -> anyhow::Result<maintenance::ProjectedChange<T>> + Send + Sync + 'static,
+        project: impl Fn(&[&crate::changes::EntityChange], bool) -> anyhow::Result<Vec<maintenance::ProjectedChange<T>>> + Send + Sync + 'static,
     ) -> Result<(maintenance::SourceRevision, maintenance::MaintenanceSubscription<T>), maintenance::SourceError> {
         self.0.maintenance.subscribe(project).await
     }

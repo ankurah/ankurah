@@ -73,7 +73,9 @@ trait MaintenanceReader: Send + Sync {
     fn fail(&self, error: SourceError);
 }
 
-type Projector<T> = dyn Fn(&EntityChange, bool) -> anyhow::Result<ProjectedChange<T>> + Send + Sync;
+/// A reader's projection of one publication's changes, one result per change
+/// in order, computed while the committed entities are available.
+type Projector<T> = dyn Fn(&[&EntityChange], bool) -> anyhow::Result<Vec<ProjectedChange<T>>> + Send + Sync;
 
 struct Reader<T> {
     id: ReactorSubscriptionId,
@@ -118,7 +120,7 @@ impl Maintenance {
 
     pub(super) async fn subscribe<T: Send + Sync + 'static>(
         &self,
-        project: impl Fn(&EntityChange, bool) -> anyhow::Result<ProjectedChange<T>> + Send + Sync + 'static,
+        project: impl Fn(&[&EntityChange], bool) -> anyhow::Result<Vec<ProjectedChange<T>>> + Send + Sync + 'static,
     ) -> Result<(SourceRevision, MaintenanceSubscription<T>), SourceError> {
         let _gate = self.0.gate.lock().await;
         let mut source = self.0.state.lock().unwrap();
@@ -159,8 +161,9 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
         let mut watchers = Vec::with_capacity(changes.len());
         let mut bytes = 0usize;
         let result = (|| {
-            for change in changes {
-                let projected = (self.project)(change, live_events)?;
+            let projected = if changes.is_empty() { Vec::new() } else { (self.project)(changes, live_events)? };
+            anyhow::ensure!(projected.len() == changes.len(), "a projector returns one projection per change");
+            for (change, projected) in changes.iter().zip(projected) {
                 bytes = bytes.checked_add(projected.bytes).ok_or_else(|| anyhow::anyhow!("index change size overflow"))?;
                 let entity_id = change.entity().id();
                 watchers.push(if projected.member {

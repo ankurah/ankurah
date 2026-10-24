@@ -192,13 +192,15 @@ pub(super) fn fold_candidate(candidates: &mut BTreeSet<proto::EntityId>, change:
     }
 }
 
-/// The projection the reactor runs on each commit for the resident `identity`
-/// admits: whether the committed entity matches its predicate, its tree entry
-/// when `identity`'s credentials may read it, and the committed events' ids.
+/// The projection the reactor runs on each publication for the resident
+/// `identity` admits: for each committed entity, whether it matches the
+/// resident's predicate, its tree entry when `identity`'s credentials may read
+/// it, and the committed events' ids. One policy, and at most one evaluation of
+/// its unrestricted-read proof, serves the whole publication.
 fn projector<SE, PA>(
     node: &Node<SE, PA>,
     identity: &Identity<PA::ContextData>,
-) -> impl Fn(&EntityChange, bool) -> anyhow::Result<ProjectedChange<TreeUpdate>> + Send + Sync + 'static
+) -> impl Fn(&[&EntityChange], bool) -> anyhow::Result<Vec<ProjectedChange<TreeUpdate>>> + Send + Sync + 'static
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -208,23 +210,34 @@ where
     let spec = identity.spec.clone();
     let paths = key_paths(&spec);
     let credentials = identity.credentials.clone();
-    move |change, live_events| {
+    move |changes, live_events| {
         let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-        let entity_id = change.entity().id();
-        change.entity().with_read(|entity| {
-            let matches = evaluate_predicate(entity, &predicate)?;
-            let entry = if matches
-                && (policy.allows_unrestricted_state_reads() || policy.check_read(&entity_id, &entity.to_state()?).is_ok())
-            {
-                let values = paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
-                Some(TreeEntry { entity_id, key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?, head: entity.head().clone() })
-            } else {
-                None
-            };
-            let events = if live_events { change.events().iter().map(|event| event.payload.id()).collect() } else { Vec::new() };
-            let bytes = 128 + entry.as_ref().map_or(0, |entry| entry.key.len() + entry.head.len() * 40) + events.len() * 32;
-            Ok(ProjectedChange { value: TreeUpdate { entity_id, entry, matches, events }, member: matches, bytes })
-        })?
+        let unrestricted = std::cell::OnceCell::new();
+        changes
+            .iter()
+            .map(|change| {
+                let entity_id = change.entity().id();
+                change.entity().with_read(|entity| {
+                    let matches = evaluate_predicate(entity, &predicate)?;
+                    let readable = matches
+                        && (*unrestricted.get_or_init(|| policy.allows_unrestricted_state_reads())
+                            || policy.check_read(&entity_id, &entity.to_state()?).is_ok());
+                    let entry = if readable {
+                        let values = paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+                        Some(TreeEntry {
+                            entity_id,
+                            key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?,
+                            head: entity.head().clone(),
+                        })
+                    } else {
+                        None
+                    };
+                    let events = if live_events { change.events().iter().map(|event| event.payload.id()).collect() } else { Vec::new() };
+                    let bytes = 128 + entry.as_ref().map_or(0, |entry| entry.key.len() + entry.head.len() * 40) + events.len() * 32;
+                    Ok(ProjectedChange { value: TreeUpdate { entity_id, entry, matches, events }, member: matches, bytes })
+                })?
+            })
+            .collect()
     }
 }

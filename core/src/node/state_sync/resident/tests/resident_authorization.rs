@@ -166,3 +166,45 @@ async fn policies_without_a_state_free_proof_keep_their_state_checks() -> anyhow
     assert_eq!(node.storage.5.load(Ordering::Relaxed) - reads, 1);
     Ok(())
 }
+
+#[tokio::test]
+async fn one_publication_evaluates_the_state_free_read_proof_once_for_all_its_changes() -> anyhow::Result<()> {
+    let proofs = Arc::new(AtomicUsize::new(0));
+    let node = Node::new_durable(
+        Arc::new(OrderedStorage::default()),
+        RestrictedDiscovery { state_free_reads: true, state_free_proofs: Some(proofs.clone()), ..Default::default() },
+    );
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let mut actor = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    let mut changes = Vec::new();
+    for value in ["01", "02", "03"] {
+        let event = genesis(value)?;
+        let label = LWWBackend::new();
+        label.set(property(), Some(Value::String(value.into())));
+        crate::test_helpers::commit_backend(&label, 1)?;
+        let state = proto::State {
+            memberships: [model()].into_iter().collect(),
+            head: proto::Clock::singleton(&event),
+            state_buffers: proto::StateBuffers([("lww".into(), label.to_state_buffer()?)].into()),
+        };
+        let (_, entity) = node
+            .entities
+            .with_state(
+                &LocalStateGetter::new(node.storage.clone()),
+                &LocalEventGetter::new(node.storage.clone(), false),
+                event.entity_id,
+                state,
+            )
+            .await?;
+        changes.push(crate::changes::EntityChange::new(entity, vec![Attested::from(event)]));
+    }
+    let before = proofs.load(Ordering::Relaxed);
+    node.reactor.begin_commit().await.publish(&changes, true);
+    let batch = actor.cursor.next().await?;
+    assert_eq!(batch.changes.len(), 3);
+    assert_eq!(proofs.load(Ordering::Relaxed) - before, 1, "a publication's projection evaluates the proof once");
+    actor.apply(batch.changes, false).await?;
+    assert_eq!(actor.tree.entries().len(), 3);
+    Ok(())
+}
