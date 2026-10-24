@@ -31,7 +31,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use crate::{
     error::SqliteError,
     exec::{Row, SqliteExecutor},
-    named_parameters::named_parameters,
+    sql_text,
     value::{SqliteValue, SqliteValueRef},
     SqliteStorageEngine,
 };
@@ -318,9 +318,12 @@ impl NodeConnection {
         }
         // EXPLAIN goes before the statement, past what SQLite skips before it,
         // and an EXPLAIN takes no second one.
-        let statement = &sql[filler(sql)..];
-        let explain =
-            if first_keyword(statement).eq_ignore_ascii_case("EXPLAIN") { statement.into() } else { format!("EXPLAIN {statement}") };
+        let statement = sql_text::past_filler(sql);
+        let explain = if sql_text::first_keyword(statement).eq_ignore_ascii_case("EXPLAIN") {
+            statement.into()
+        } else {
+            format!("EXPLAIN {statement}")
+        };
         let probe = method(&self.database, "prepare")?.call1(&self.database, &explain.into()).map_err(js_error)?;
         let values: Array = (0..=passed).map(|_| JsValue::NULL).collect();
         match statement_method(&probe, "get")?.apply(&probe, &values).map_err(js_error) {
@@ -433,9 +436,10 @@ impl SqliteExecutor for NodeConnection {
     /// rows belongs to `query`. node:sqlite's `run` takes the step and
     /// discards the row.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
+        refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
-        refuse_a_second_statement(sql, &source)?;
+        check_source(sql, &source)?;
         refuse_a_named_parameter(&source)?;
         let width = width(&statement)?;
         self.check_parameters(sql, params.len())?;
@@ -461,9 +465,10 @@ impl SqliteExecutor for NodeConnection {
             self.check_parameters(sql, params.len())?;
             return all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect();
         }
+        refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
-        refuse_a_second_statement(sql, &source)?;
+        check_source(sql, &source)?;
         refuse_a_named_parameter(&source)?;
         let width = width(&statement)?;
         self.check_parameters(sql, params.len())?;
@@ -488,7 +493,7 @@ impl SqliteExecutor for NodeConnection {
             // before a TEXT value in its rows were refused, so it is refused
             // before it runs.
             Err(nesting) => {
-                if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| first_keyword(&source).eq_ignore_ascii_case(keyword)) {
+                if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| sql_text::first_keyword(&source).eq_ignore_ascii_case(keyword)) {
                     return Err(SqliteError::Node(format!(
                         "the node executor reads rows exactly only from a query SQLite can nest in a WITH clause, which this \
                          statement is not ({nesting}); a statement such as one with a RETURNING clause could write before a \
@@ -499,52 +504,6 @@ impl SqliteExecutor for NodeConnection {
             }
         }
     }
-}
-
-/// The first keyword of a statement's SQL, past the whitespace and comments
-/// SQLite skips before it.
-fn first_keyword(sql: &str) -> &str {
-    let mut rest = sql;
-    loop {
-        rest = rest.trim_start_matches(|c: char| c.is_ascii_whitespace());
-        if let Some(comment) = rest.strip_prefix("--") {
-            rest = comment.split_once('\n').map_or("", |(_, after)| after);
-        } else if let Some(comment) = rest.strip_prefix("/*") {
-            rest = comment.split_once("*/").map_or("", |(_, after)| after);
-        } else {
-            break;
-        }
-    }
-    let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
-    &rest[..end]
-}
-
-/// How many bytes at the start of `sql` SQLite skips before a statement:
-/// whitespace, semicolons and comments, read as SQLite's tokenizer reads
-/// them. SQLite reads SQL only up to a NUL, so a NUL ends them as the end of
-/// the text does.
-fn filler(sql: &str) -> usize {
-    let bytes = sql.as_bytes();
-    let mut at = 0;
-    while at < bytes.len() {
-        at += match &bytes[at..] {
-            // A run of whitespace begins with one of five characters and goes
-            // on through any of six: the vertical tab only continues one.
-            [b' ' | b'\t' | b'\n' | b'\x0c' | b'\r', rest @ ..] => {
-                1 + rest.iter().take_while(|c| matches!(c, b'\t'..=b'\r' | b' ')).count()
-            }
-            [b';', ..] => 1,
-            [b'-', b'-', rest @ ..] => 2 + rest.iter().take_while(|&&c| c != b'\n' && c != 0).count(),
-            // `/*` with nothing after it is a slash, not a comment; a comment
-            // with no `*/` runs to the end.
-            [b'/', b'*', rest @ ..] if rest.first().is_some_and(|&c| c != 0) => {
-                let body = &rest[..rest.iter().position(|&c| c == 0).unwrap_or(rest.len())];
-                2 + body.windows(2).position(|pair| pair == b"*/").map_or(body.len(), |end| end + 2)
-            }
-            _ => break,
-        };
-    }
-    at
 }
 
 /// The SQL of a typed reader for `statement`, whose rows have `width`
@@ -584,18 +543,29 @@ fn source(statement: &JsValue) -> Result<String, SqliteError> {
     ))
 }
 
-/// Refuse SQL that holds a second statement after the one prepared from it,
-/// before either runs, as the native executor refuses it: node:sqlite runs
-/// the first and ignores the rest without a word. Its `source` is the SQL up
-/// to the end of the first statement. better-sqlite3 refuses a second
-/// statement itself, and its `source` is the whole SQL. Whitespace,
-/// semicolons and comments after the statement are no statement.
-fn refuse_a_second_statement(sql: &str, source: &str) -> Result<(), SqliteError> {
+/// Refuse SQL that holds a second statement, before SQLite prepares either,
+/// as the native executor refuses it: SQLite applies some PRAGMAs while it
+/// prepares them, and node:sqlite runs the first statement and ignores the
+/// rest without a word. Whitespace, semicolons and comments after the
+/// statement are no statement.
+fn refuse_a_second_statement(sql: &str) -> Result<(), SqliteError> {
+    if sql_text::holds_a_second_statement(sql) {
+        // rusqlite's words for the same refusal.
+        return Err(SqliteError::Node("Multiple statements provided".into()));
+    }
+    Ok(())
+}
+
+/// Check where SQLite ended the statement it prepared from `sql`, which the
+/// scan before preparing found to be followed only by what SQLite skips:
+/// node:sqlite's `source` is the SQL up to the end of its first statement,
+/// and better-sqlite3's is the whole SQL. Should SQLite have found more, the
+/// SQL is refused.
+fn check_source(sql: &str, source: &str) -> Result<(), SqliteError> {
     let rest = sql
         .strip_prefix(source)
         .ok_or_else(|| SqliteError::Node(format!("the database reports {source:?} as the SQL of a statement prepared from {sql:?}")))?;
-    if rest.as_bytes().get(filler(rest)).is_some_and(|&byte| byte != 0) {
-        // rusqlite's words for the same refusal.
+    if !sql_text::is_filler(rest) {
         return Err(SqliteError::Node("Multiple statements provided".into()));
     }
     Ok(())
@@ -606,7 +576,7 @@ fn refuse_a_second_statement(sql: &str, source: &str) -> Result<(), SqliteError>
 /// rusqlite binds a call's values to every parameter in turn. better-sqlite3
 /// binds a named parameter only by name, which a positional call cannot give.
 fn refuse_a_named_parameter(source: &str) -> Result<(), SqliteError> {
-    match named_parameters(source).first() {
+    match sql_text::named_parameters(source).first() {
         None => Ok(()),
         Some(name) => Err(SqliteError::Node(format!(
             "the statement has the named parameter {name}, which the node executor does not bind, since node:sqlite would \
@@ -829,11 +799,11 @@ mod tests {
 
     use super::*;
 
-    /// `filler` skips exactly what SQLite skips between statements: SQL that
-    /// is filler to its end prepares on node:sqlite to no statement, and any
-    /// other SQL to a statement or an error.
+    /// `sql_text::is_filler` holds of exactly what SQLite skips between
+    /// statements on node:sqlite's SQLite too: SQL that is filler prepares
+    /// there to no statement, and any other SQL to a statement or an error.
     #[wasm_bindgen_test]
-    fn filler_skips_what_sqlite_skips_between_statements() {
+    fn filler_is_what_node_sqlite_finds_no_statement_in() {
         let construct = Function::new_no_args("return new (process.getBuiltinModule('node:sqlite').DatabaseSync)(':memory:');");
         let sqlite = construct.call0(&JsValue::NULL).unwrap();
         let prepares_to_no_statement = |sql: &str| match method(&sqlite, "prepare").unwrap().call1(&sqlite, &sql.into()) {
@@ -858,12 +828,13 @@ mod tests {
             "/* unended",
             "/*",
             "/",
+            "\u{FEFF}",
+            " \u{FEFF};\u{FEFF} ",
             "\0 SELECT 1",
             " SELECT 1",
             "x",
         ] {
-            let filler_to_its_end = sql.as_bytes().get(filler(sql)).is_none_or(|&byte| byte == 0);
-            assert_eq!(filler_to_its_end, prepares_to_no_statement(sql), "{sql:?}");
+            assert_eq!(sql_text::is_filler(sql), prepares_to_no_statement(sql), "{sql:?}");
         }
     }
 }

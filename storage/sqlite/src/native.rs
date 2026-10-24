@@ -18,6 +18,7 @@ pub(crate) use crate::connection::PooledConnection;
 use crate::{
     error::SqliteError,
     exec::{Row, SqliteExecutor},
+    sql_text,
     value::{SqliteValue, SqliteValueRef},
     SqliteConnectionManager,
 };
@@ -72,19 +73,23 @@ impl SqliteExecutor for Connection {
 }
 
 /// The statement `sql` holds, prepared. SQL that holds a second statement is
-/// refused before either runs: a defect fix, since rusqlite, prepared as
-/// main's engine prepared it, runs the first and ignores the rest without a
-/// word. SQLite reads what follows the first statement; whitespace,
-/// semicolons and comments are no statement.
+/// refused before SQLite prepares either, since SQLite applies some PRAGMAs
+/// while it prepares them: a defect fix, since rusqlite, prepared as main's
+/// engine prepared it, runs the first and ignores the rest without a word.
+/// Whitespace, semicolons and comments after the statement are no statement.
 fn one_statement<'c>(connection: &'c Connection, sql: &str) -> Result<Statement<'c>, SqliteError> {
+    if sql_text::holds_a_second_statement(sql) {
+        return Err(rusqlite::Error::MultipleStatement.into());
+    }
     let mut statements = Batch::new(connection, sql);
     // SQL that holds no statement at all is prepared as before, and SQLite
     // refuses it when it runs.
     let Some(statement) = statements.next()? else { return Ok(connection.prepare(sql)?) };
+    // SQLite reads what follows the statement too, which the scan above found
+    // to be only what it skips, so that it compiles nothing; should SQLite
+    // find a statement there all the same, the SQL is refused.
     match statements.next() {
         Ok(None) => Ok(statement),
-        // What follows the first statement holds a second one, whether or
-        // not SQLite can prepare it, and it would not run either way.
         Ok(Some(_)) | Err(_) => Err(rusqlite::Error::MultipleStatement.into()),
     }
 }

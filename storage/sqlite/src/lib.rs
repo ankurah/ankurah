@@ -50,13 +50,12 @@ mod dump;
 mod engine;
 mod error;
 pub mod exec;
-#[cfg(any(test, all(target_arch = "wasm32", feature = "node")))]
-mod named_parameters;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(all(target_arch = "wasm32", feature = "node"))]
 mod node;
 pub mod sql_builder;
+mod sql_text;
 mod value;
 
 // The driver the engine reaches SQLite through on this target: rusqlite

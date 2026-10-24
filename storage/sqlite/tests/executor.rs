@@ -437,14 +437,10 @@ async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
             Ok((refused, created, accepted, commented))
         })
         .await?;
-    let refusal = if common::on_better_sqlite3() {
-        "The supplied SQL string contains more than one statement"
-    } else {
-        "Multiple statements provided"
-    };
     for outcome in refused {
         let error = outcome.expect_err("a second statement is refused");
-        assert!(error.ends_with(refusal), "{error}");
+        // rusqlite's words, which the node executor uses too.
+        assert!(error.ends_with("Multiple statements provided"), "{error}");
     }
     assert_eq!(created, 0, "no statement of a refused string ran");
     assert_eq!(accepted, [Ok(1), Ok(1)]);
@@ -452,6 +448,65 @@ async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
         commented.expect_err("the typed reader cannot nest the comment better-sqlite3 keeps after the semicolon");
     } else {
         assert_eq!(commented, Ok(1));
+    }
+    Ok(())
+}
+
+/// SQL that holds a second statement is refused before SQLite prepares
+/// either, on every driver: SQLite applies some PRAGMAs, foreign_keys and
+/// query_only among them, while it prepares them, so a refused string leaves
+/// both as they were, whichever of its statements would have changed them.
+#[engine_test]
+async fn a_refused_string_of_two_statements_changes_no_setting() -> Result<()> {
+    fn settings(executor: &dyn SqliteExecutor) -> Result<(i64, i64), SqliteError> {
+        let row = executor
+            .query_row("SELECT (SELECT foreign_keys FROM pragma_foreign_keys), (SELECT query_only FROM pragma_query_only)", &[])?
+            .expect("one row");
+        Ok((row.integer(0)?, row.integer(1)?))
+    }
+    let storage = common::open_in_memory().await?;
+    let (before, refused, after) = storage
+        .with_executor(|executor| {
+            let before = settings(executor)?;
+            let (foreign_keys, query_only) = (1 - before.0, 1 - before.1);
+            let refused = [
+                executor.execute(&format!("SELECT 1; PRAGMA foreign_keys = {foreign_keys}"), &[]),
+                executor.execute(&format!("PRAGMA foreign_keys = {foreign_keys}; SELECT 1"), &[]),
+                executor.query(&format!("SELECT 1; PRAGMA query_only = {query_only}"), &[]).map(|rows| rows.len()),
+                executor.query(&format!("PRAGMA query_only = {query_only}; SELECT 1"), &[]).map(|rows| rows.len()),
+            ]
+            .map(|outcome| outcome.is_err());
+            Ok((before, refused, settings(executor)?))
+        })
+        .await?;
+    assert_eq!(refused, [true; 4]);
+    assert_eq!(after, before, "a refused string changed foreign_keys or query_only");
+    Ok(())
+}
+
+/// What SQLite skips around a statement includes a UTF-8 byte order mark
+/// and semicolons, before a PRAGMA as before any statement, on every driver;
+/// better-sqlite3 alone refuses a byte order mark after a statement, in its
+/// own words.
+#[engine_test]
+async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (timeouts, trailing) = storage
+        .with_executor(|executor| {
+            let timeouts = ["\u{FEFF}PRAGMA busy_timeout", "; PRAGMA busy_timeout"].map(|sql| {
+                executor.query_row(sql, &[]).and_then(|row| row.expect("one row").integer(0)).map_err(|error| error.to_string())
+            });
+            Ok((timeouts, executor.execute("CREATE TABLE marked (x);\u{FEFF}", &[]).map_err(|error| error.to_string())))
+        })
+        .await?;
+    for timeout in timeouts {
+        assert!(timeout.is_ok(), "{timeout:?}");
+    }
+    if common::on_better_sqlite3() {
+        let refusal = trailing.expect_err("better-sqlite3 reads the byte order mark as a second statement");
+        assert!(refusal.ends_with("The supplied SQL string contains more than one statement"), "{refusal}");
+    } else {
+        assert!(trailing.is_ok(), "{trailing:?}");
     }
     Ok(())
 }

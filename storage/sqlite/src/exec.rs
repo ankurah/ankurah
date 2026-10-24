@@ -21,8 +21,10 @@ use crate::{
 /// SQL that carries one always wraps its placeholder in `jsonb(?)`.
 ///
 /// Each call runs one statement: SQL that holds a second one is refused
-/// before either runs. Whitespace, semicolons and comments after the
-/// statement are no second statement.
+/// before SQLite prepares either, since SQLite applies some PRAGMAs while it
+/// prepares them. Whitespace, semicolons and comments after the statement
+/// are no second statement, and a CREATE TRIGGER statement runs on to the
+/// END of its body.
 ///
 /// # Where the node executor differs from the native one
 ///
@@ -50,6 +52,9 @@ use crate::{
 ///   after the semicolon that ends its statement, as `SELECT 1; -- note`
 ///   does: the typed reader nests the SQL better-sqlite3 prepared, and
 ///   better-sqlite3 keeps what follows the semicolon in it.
+/// - better-sqlite3 refuses SQL in which a UTF-8 byte order mark follows a
+///   statement, which its own check of what follows a statement does not
+///   read as whitespace, as SQLite does.
 pub trait SqliteExecutor {
     /// Run one statement that yields no rows; returns SQLite's changes(), as
     /// rusqlite does: the number of rows the statement changed when it is an
