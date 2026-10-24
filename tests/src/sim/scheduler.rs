@@ -13,8 +13,11 @@
 //! subscription retry with a `futures_timer`) that never settle a paused clock,
 //! and sled's `spawn_blocking` further muddies any all-tasks-idle signal.
 //! Draining is robust to all of that: the system is quiescent when a full
-//! delivery round moves no message and no load-bearing message is still
-//! awaiting acceptance.
+//! delivery round moves no message, no load-bearing message is still
+//! awaiting acceptance, and every scripted state publication has its
+//! receiver's answer. A receiver applies state frames on its own task after
+//! `handle_message` returns, so only its feedback (the publication applied)
+//! or its abandonment of the stream shows that it has finished.
 //!
 //! Load-bearing propagation is delivered under an *acceptance check*: a
 //! `CommitTransaction` for a single event whose parents the receiver has not yet
@@ -60,6 +63,11 @@ struct InFlight {
 /// yield or two of becoming ready; a larger budget only delays detection of
 /// genuine idleness.
 const YIELD_BUDGET: usize = 8;
+
+/// How long a receiver may take to answer a scripted publication before the
+/// scheduler reports it stuck. Generous, so a loaded machine cannot fail a
+/// correct run; it only turns a hang into a failure.
+const SCRIPTED_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// Unordered node-pair key for the partition matrix.
 fn pair(a: usize, b: usize) -> (usize, usize) {
@@ -271,7 +279,16 @@ impl Scheduler {
                     }
                 }
                 if settled {
-                    break;
+                    if !self.captured.scripted_publication_unanswered() {
+                        break;
+                    }
+                    // The receiver is still applying a scripted publication on
+                    // its own task, waiting on storage work that no yield
+                    // reaches. Its answer arrives as a message: wait for one.
+                    tokio::time::timeout(SCRIPTED_ANSWER_DEADLINE, self.captured.next_emission())
+                        .await
+                        .expect("a receiver never answered a scripted publication");
+                    continue;
                 }
             }
 
