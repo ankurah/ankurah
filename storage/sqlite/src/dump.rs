@@ -138,17 +138,11 @@ fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
     // SQLite ends a read only when the connection's last statement finishes.
     // The executor reads the whole page first, so a savepoint keeps it here: it
     // begins a transaction on a connection outside one, and nests in one an
-    // embedder left open, which main's page read within too.
-    conn.execute("SAVEPOINT _ankurah_dump_page", &[])?;
-    let page = states_of_page(conn, &query, &arguments);
-    // Released after a failed read too, since a read leaves nothing to undo.
-    // When both fail, the read's error is reported and RELEASE's dropped: a
-    // savepoint that only read fails to release only once SQLite has rolled
-    // it back, as some errors of the read make it do, and RELEASE then
-    // reports no more than that the savepoint is gone.
-    let released = conn.execute("RELEASE _ankurah_dump_page", &[]);
-    let page = page?;
-    released?;
+    // embedder left open, which main's page read within too. A failed read's
+    // error wins over the savepoint's ROLLBACK TO and RELEASE (see `savepoint`).
+    let snapshot = conn.savepoint("_ankurah_dump_page")?;
+    let page = states_of_page(&snapshot, &query, &arguments)?;
+    snapshot.release()?;
     Ok(page)
 }
 
@@ -270,6 +264,92 @@ mod tests {
         }
         assert_eq!(states, [entity_id]);
         storage.with_executor(|executor| executor.execute("COMMIT", &[]).map(drop)).await?;
+        Ok(())
+    }
+
+    /// A page reads each state's memberships as they stood when it read the
+    /// state, though another connection commits a change to them in between,
+    /// since the page's savepoint holds one read snapshot: here the executor
+    /// the page reads through commits a membership through a second
+    /// connection on the WAL file once the query of the states returns.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn a_page_reads_its_memberships_in_the_snapshot_of_its_states() -> anyhow::Result<()> {
+        use std::cell::Cell;
+
+        use ankurah_proto::SystemModel;
+
+        use crate::executor::Row;
+
+        /// An executor on `reader` that runs `change` once its first query
+        /// has returned.
+        struct ChangesAfterTheFirstQuery<'c> {
+            reader: &'c rusqlite::Connection,
+            change: Cell<Option<Box<dyn FnOnce() + 'c>>>,
+        }
+
+        impl SqliteExecutor for ChangesAfterTheFirstQuery<'_> {
+            fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
+                SqliteExecutor::execute(self.reader, sql, params)
+            }
+
+            fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
+                let rows = SqliteExecutor::query(self.reader, sql, params)?;
+                if let Some(change) = self.change.take() {
+                    change();
+                }
+                Ok(rows)
+            }
+
+            fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+                SqliteExecutor::query_row(self.reader, sql, params)
+            }
+        }
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("dump.sqlite");
+        // The engine's connections put the file in WAL mode, where a writer
+        // commits while a reader holds its snapshot.
+        let storage = SqliteStorageEngine::open(&path).await?;
+        let event = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+        let entity_id = event.entity_id;
+        let model = ModelId::System(SystemModel::Model);
+        let state = Attested::opt(
+            EntityState {
+                entity_id,
+                state: State { state_buffers: StateBuffers::default(), memberships: [model].into(), head: Clock::singleton(&event) },
+            },
+            None,
+        );
+        let mut transaction = storage.transaction();
+        transaction.add_events(&[Attested::opt(event, None)]).await?;
+        transaction.set_state(&Clock::default(), &state).await?;
+        assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+
+        let reader = rusqlite::Connection::open(&path)?;
+        let writer = rusqlite::Connection::open(&path)?;
+        let id = entity_id.to_base64();
+        let joined = bincode::serialize(&ModelId::System(SystemModel::Property))?;
+        let join = || {
+            writer
+                .execute(
+                    &format!(r#"INSERT INTO "{ENTITY_MODEL_TABLE}" ("entity_id", "model_key") VALUES (?1, ?2)"#),
+                    rusqlite::params![id, joined],
+                )
+                .expect("the second connection commits a membership");
+        };
+        let executor = ChangesAfterTheFirstQuery { reader: &reader, change: Cell::new(Some(Box::new(join))) };
+        let (_, page) = state_page(&executor, None)?;
+        let memberships: Vec<_> = page
+            .into_iter()
+            .map(|item| match item {
+                StorageDumpItem::State(state) => state.payload.state.memberships,
+                StorageDumpItem::Event(_) => unreachable!("a state page holds only states"),
+            })
+            .collect();
+        assert_eq!(memberships, [BTreeSet::from([model])], "the page reads the memberships as of its states");
+        let now: i64 = writer.query_row(&format!(r#"SELECT count(*) FROM "{ENTITY_MODEL_TABLE}""#), [], |row| row.get(0))?;
+        assert_eq!(now, 2, "the second connection's membership committed");
         Ok(())
     }
 }

@@ -130,6 +130,18 @@ impl dyn SqliteExecutor + '_ {
         )?;
         Ok(Transaction { executor: self, open: true })
     }
+
+    /// Open the savepoint `name`, an identifier, on this connection: a
+    /// transaction where none is open, and nested in the open one where one
+    /// is. Dropped without [`Savepoint::release`], it rolls back to the
+    /// savepoint and releases it, as rusqlite's `Savepoint` does, so an early
+    /// `?` leaves nothing behind and reports its own error: the errors of
+    /// that ROLLBACK TO and RELEASE are dropped, so the error of a statement
+    /// that failed inside the savepoint wins over theirs.
+    pub(crate) fn savepoint(&self, name: &'static str) -> Result<Savepoint<'_>, SqliteError> {
+        self.execute(&format!("SAVEPOINT {name}"), &[])?;
+        Ok(Savepoint { executor: self, name, open: true })
+    }
 }
 
 /// How a transaction takes its lock.
@@ -181,6 +193,49 @@ impl Drop for Transaction<'_> {
             // failure here has nothing left to report to. rusqlite's own
             // transaction guard drops the same way.
             let _ = self.executor.execute("ROLLBACK", &[]);
+        }
+    }
+}
+
+/// An open savepoint on an executor (see `savepoint`). Statements run
+/// through it execute inside it; dropping it unreleased rolls back to it and
+/// releases it.
+pub(crate) struct Savepoint<'e> {
+    executor: &'e dyn SqliteExecutor,
+    name: &'static str,
+    open: bool,
+}
+
+impl Savepoint<'_> {
+    /// Release the savepoint, keeping what ran inside it.
+    pub(crate) fn release(mut self) -> Result<(), SqliteError> {
+        self.executor.execute(&format!("RELEASE {}", self.name), &[])?;
+        self.open = false;
+        Ok(())
+    }
+}
+
+/// Statements run through the savepoint execute inside it.
+impl SqliteExecutor for Savepoint<'_> {
+    fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> { self.executor.execute(sql, params) }
+
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> { self.executor.query(sql, params) }
+
+    fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+        self.executor.query_row(sql, params)
+    }
+}
+
+impl Drop for Savepoint<'_> {
+    fn drop(&mut self) {
+        if self.open {
+            // The statement that failed, inside the savepoint or the RELEASE
+            // that would have ended it, already reported its error, which is
+            // the one to report: these fail, typically, only because SQLite
+            // rolled the whole transaction back for that error, so that the
+            // savepoint is gone.
+            let _ = self.executor.execute(&format!("ROLLBACK TO {}", self.name), &[]);
+            let _ = self.executor.execute(&format!("RELEASE {}", self.name), &[]);
         }
     }
 }
