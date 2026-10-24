@@ -458,19 +458,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
     }
 }
 
-impl Reactor<Entity, proto::Attested<proto::Event>> {
-    pub(crate) async fn begin_commit(&self) -> maintenance::SourceCommit { self.0.maintenance.begin_commit().await }
-
-    /// Subscribe an index before reading its initial contents. Projection runs
-    /// before public event filtering and may retain only the index's metadata.
-    pub(crate) async fn subscribe_maintenance<T: Send + Sync + 'static>(
-        &self,
-        project: impl Fn(&[&crate::changes::EntityChange], bool) -> anyhow::Result<Vec<maintenance::ProjectedChange<T>>> + Send + Sync + 'static,
-    ) -> Result<(maintenance::SourceRevision, maintenance::MaintenanceSubscription<T>), maintenance::SourceError> {
-        self.0.maintenance.subscribe(project).await
-    }
-}
-
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> std::fmt::Debug for Reactor<E, Ev> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let watcher_set = self.0.watcher_set.lock().unwrap();

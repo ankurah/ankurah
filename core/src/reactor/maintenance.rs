@@ -2,10 +2,10 @@
 //!
 //! Projection happens while the committed entity is available. Only the projected
 //! values enter each subscription's bounded queue; no entity handles are retained.
-use super::{watcherset::WatcherOp, ChangeNotification, ReactorSubscriptionId, WatcherChange, WatcherSet};
-use crate::changes::EntityChange;
+use super::{watcherset::WatcherOp, ChangeNotification, Reactor, ReactorSubscriptionId, WatcherChange, WatcherSet};
+use crate::{changes::EntityChange, entity::Entity};
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{EntityId, QueryId};
+use ankurah_proto::{Attested, EntityId, Event, QueryId};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, Weak},
@@ -161,6 +161,21 @@ impl Maintenance {
         for reader in source.readers.values().filter_map(Weak::upgrade) {
             reader.fail(SourceError::Unavailable);
         }
+    }
+}
+
+impl Reactor<Entity, Attested<Event>> {
+    /// Take the commit gate for one storage commit; the returned [`SourceCommit`] publishes the
+    /// commit's changes to maintenance.
+    pub(crate) async fn begin_commit(&self) -> SourceCommit { self.0.maintenance.begin_commit().await }
+
+    /// Subscribe an index before reading its initial contents. Projection runs
+    /// before public event filtering and may retain only the index's metadata.
+    pub(crate) async fn subscribe_maintenance<T: Send + Sync + 'static>(
+        &self,
+        project: impl Fn(&[&EntityChange], bool) -> anyhow::Result<Vec<ProjectedChange<T>>> + Send + Sync + 'static,
+    ) -> Result<(SourceRevision, MaintenanceSubscription<T>), SourceError> {
+        self.0.maintenance.subscribe(project).await
     }
 }
 
