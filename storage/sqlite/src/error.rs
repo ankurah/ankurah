@@ -8,15 +8,16 @@ pub enum SqliteError {
     #[error("SQLite error: {0}")]
     Rusqlite(#[from] rusqlite::Error),
 
+    /// An error of the node executor, on either Node driver.
     #[cfg(all(target_arch = "wasm32", feature = "node"))]
-    #[error("node:sqlite error: {0}")]
+    #[error("node executor error: {0}")]
     Node(String),
 
     /// SQLite refused a statement run through node:sqlite. `code` is SQLite's
     /// extended result code, which rusqlite's `SqliteFailure` carries
     /// natively; [`SqliteError::sqlite_code`] reads it from either.
     #[cfg(all(target_arch = "wasm32", feature = "node"))]
-    #[error("node:sqlite error: {message}")]
+    #[error("node executor error: {message}")]
     NodeSqlite { code: i32, message: String },
 
     #[error("Connection pool error: {0}")]

@@ -15,12 +15,12 @@
 //! `process.getBuiltinModule`. Every call is synchronous, which suits the
 //! single-threaded WASM host: the engine's closures simply run in place.
 //!
-//! node:sqlite hands TEXT over only as a JavaScript string, made by decoding
-//! the bytes up to the first NUL and replacing each byte that is not UTF-8
-//! with U+FFFD, where rusqlite hands over the bytes themselves. So a query
-//! reads its statement through a typed reader that takes TEXT as the bytes
-//! of a BLOB, and decodes them as strictly as rusqlite does (see
-//! `typed_reader`).
+//! Both Node drivers hand TEXT over only as a JavaScript string, made by
+//! decoding the bytes and replacing each byte that is not UTF-8 with U+FFFD
+//! (node:sqlite decodes them only up to the first NUL), where rusqlite hands
+//! over the bytes themselves. So a query reads its statement through a typed
+//! reader that takes TEXT as the bytes of a BLOB, and decodes them as
+//! strictly as rusqlite does (see `typed_reader`).
 
 use std::{cell::RefCell, collections::HashMap, path::Path, rc::Rc};
 
@@ -157,8 +157,8 @@ impl NodeConnection {
         }
         // The typed reader takes TEXT as the bytes SQLite stores, which are
         // UTF-8 only in a UTF-8 database. rusqlite has SQLite convert the TEXT
-        // of a UTF-16 database to UTF-8; node:sqlite offers no way to, so a
-        // UTF-16 database is refused rather than misread.
+        // of a UTF-16 database to UTF-8; neither Node driver offers a way to,
+        // so a UTF-16 database is refused rather than misread.
         let utf8 = connection.query("SELECT (SELECT encoding FROM pragma_encoding) = 'UTF-8'", &[])?;
         if !matches!(utf8.as_slice(), [row] if matches!(row.values(), [SqliteValue::Integer(1)])) {
             return Err(SqliteError::Node(
@@ -455,7 +455,7 @@ impl SqliteExecutor for NodeConnection {
                 all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect()
             }
             // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
-            // in a WITH clause. A PRAGMA or an EXPLAIN is read as node:sqlite
+            // in a WITH clause. A PRAGMA or an EXPLAIN is read as the database
             // hands it over, with its TEXT refused. Any other statement that
             // yields rows, such as one with a RETURNING clause, could write
             // before a TEXT value in its rows were refused, so it is refused
@@ -603,7 +603,7 @@ fn typed_row(row: Array) -> Result<Row, SqliteError> {
 }
 
 /// A row of a PRAGMA or an EXPLAIN, which SQLite would not nest in a typed
-/// reader, read as node:sqlite hands it over. Its TEXT arrives only as a
+/// reader, read as the database hands it over. Its TEXT arrives only as a
 /// JavaScript string that may have lost bytes, so a TEXT value is refused,
 /// naming why the statement could not be nested.
 fn plain_row(row: Array, nesting: &SqliteError) -> Result<Row, SqliteError> {
@@ -612,10 +612,11 @@ fn plain_row(row: Array, nesting: &SqliteError) -> Result<Row, SqliteError> {
         .map(|(index, value)| {
             if value.is_string() {
                 return Err(SqliteError::Node(format!(
-                    "column {index} is TEXT, which node:sqlite hands over only as a string cut at its first NUL and with every \
-                     byte that is not UTF-8 replaced; the node executor reads TEXT exactly only from a query SQLite can nest in \
-                     a WITH clause, which this statement is not ({nesting}), so select the value through a query instead, such \
-                     as a table-valued pragma function like pragma_table_info"
+                    "column {index} is TEXT, which the database hands over only as a string that may have lost bytes (both \
+                     Node drivers replace every byte that is not UTF-8, and node:sqlite cuts the string at its first NUL); the \
+                     node executor reads TEXT exactly only from a query SQLite can nest in a WITH clause, which this statement \
+                     is not ({nesting}), so select the value through a query instead, such as a table-valued pragma function \
+                     like pragma_table_info"
                 )));
             }
             value_from_js(index, value)
@@ -724,10 +725,10 @@ fn js_param(value: &SqliteValueRef<'_>) -> JsValue {
     }
 }
 
-/// The value in column `index` of a row, as node:sqlite hands each storage
-/// class but TEXT over to a statement reading BigInts: NULL as null, INTEGER
-/// as BigInt, REAL as number (2.0 included), BLOB as Uint8Array. A string,
-/// node:sqlite's lossy form of TEXT, is refused, and so is anything else,
+/// The value in column `index` of a row, as both Node drivers hand each
+/// storage class but TEXT over to a statement reading BigInts: NULL as null,
+/// INTEGER as BigInt, REAL as number (2.0 included), BLOB as Uint8Array. A
+/// string, their lossy form of TEXT, is refused, and so is anything else,
 /// `undefined` among it, rather than read as the nearest storage class.
 fn value_from_js(index: usize, value: JsValue) -> Result<SqliteValue, SqliteError> {
     if value.is_null() {
@@ -741,11 +742,11 @@ fn value_from_js(index: usize, value: JsValue) -> Result<SqliteValue, SqliteErro
     } else if value.is_string() {
         Err(SqliteError::Node(format!("column {index} holds TEXT as a string, which may have lost bytes, where its bytes were expected")))
     } else {
-        Err(SqliteError::Node(format!("column {index} holds {value:?}, which node:sqlite hands over for no SQLite storage class")))
+        Err(SqliteError::Node(format!("column {index} holds {value:?}, which stands for no SQLite storage class")))
     }
 }
 
-/// An INTEGER, which node:sqlite hands over as a BigInt.
+/// An INTEGER, which both Node drivers hand over as a BigInt.
 fn integer_from_js(value: &JsValue) -> Result<i64, SqliteError> {
     if !value.is_bigint() {
         return Err(SqliteError::Node(format!("expected an INTEGER as a BigInt, found {value:?}")));
