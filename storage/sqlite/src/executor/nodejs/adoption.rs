@@ -56,9 +56,11 @@ impl NodeJsConnection {
         // The typed reader takes TEXT as the bytes SQLite stores, which are
         // UTF-8 only in a UTF-8 database. rusqlite has SQLite convert the TEXT
         // of a UTF-16 database to UTF-8; neither Node.js driver offers a way to,
-        // so a UTF-16 database is refused rather than misread.
-        let utf8 = connection.query("SELECT (SELECT encoding FROM pragma_encoding) = 'UTF-8'", &[])?;
-        if !matches!(utf8.as_slice(), [row] if matches!(row.values(), [SqliteValue::Integer(1)])) {
+        // so a UTF-16 database is refused rather than misread. The encoding is
+        // read through the PRAGMA itself, since a table named `pragma_encoding`
+        // takes the place of the table-valued function of that name.
+        let encoding = connection.query("PRAGMA encoding", &[])?;
+        if !matches!(encoding.as_slice(), [row] if matches!(row.values(), [SqliteValue::Text(encoding)] if encoding == "UTF-8")) {
             return Err(SqliteError::Node(
                 "the database's text encoding is not UTF-8, and the Node.js executor reads TEXT as UTF-8 bytes".into(),
             ));

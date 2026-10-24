@@ -828,18 +828,29 @@ mod tests {
     /// starts from, `_ankurah_typed_rows`, is written and read back on every
     /// driver: the reader takes a name its query does not use.
     #[engine_test]
-    async fn a_model_named_like_the_typed_reader_is_written_and_read() {
+    async fn a_model_named_like_the_typed_reader_is_written_and_read() { a_model_labelled_is_written_and_read("_ankurah_typed_rows").await }
+
+    /// A model whose table is named `pragma_table_info` is written and read
+    /// back on every driver: the column scan runs the PRAGMA itself, which no
+    /// table can shadow, as such a table shadows the table-valued function of
+    /// its name.
+    #[engine_test]
+    async fn a_model_named_pragma_table_info_is_written_and_read() { a_model_labelled_is_written_and_read("pragma_table_info").await }
+
+    /// A model labelled `label` takes it as its table's name, and its state is
+    /// written and read back.
+    async fn a_model_labelled_is_written_and_read(label: &str) {
         let engine = test_driver::open_in_memory().await.unwrap();
         let model = ModelId::EntityId(entity_id(0xa1));
         let property = PropertyId::EntityId(entity_id(0xa2));
         let resolver: Arc<dyn CatalogResolver> = Arc::new(TestResolver {
-            model_names: BTreeMap::from([(model, "_ankurah_typed_rows".to_owned())]),
+            model_names: BTreeMap::from([(model, label.to_owned())]),
             property_names: BTreeMap::from([(property, "name".to_owned())]),
         });
         let _resolver = install_resolver(&engine, resolver);
         let entity = entity_id(0xa3);
         commit_state(&engine, Clock::default(), model, state_with_strings(entity, 1, &[(property, "alpha")])).await;
-        assert_eq!(engine.materialization(&model).await.unwrap().table(), "_ankurah_typed_rows");
+        assert_eq!(engine.materialization(&model).await.unwrap().table(), label);
 
         let selection = ankql::ast::Selection {
             predicate: ankql::ast::Predicate::Comparison {

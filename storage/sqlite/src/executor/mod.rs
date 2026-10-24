@@ -88,6 +88,8 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///   EXPLAIN's TEXT is read as the driver's JavaScript string, and a string
 ///   holding U+FFFD is refused, since both Node.js drivers put that character in
 ///   place of each byte that is not UTF-8.
+/// - So on Node.js the engine refuses a model's table with a column whose
+///   name holds U+FFFD, since it reads the names through `PRAGMA table_info`.
 /// - On Node.js a query that yields more than half of SQLite's column limit,
 ///   1000 of the default 2000 columns, is refused before it runs, since the
 ///   typed reader reads each column as two; natively it reads up to the

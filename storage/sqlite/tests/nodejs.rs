@@ -210,6 +210,21 @@ fn refuses_a_utf16_database() {
     assert!(error.to_string().contains("not UTF-8"), "{error}");
 }
 
+/// A UTF-16 database is refused though it holds a table named
+/// `pragma_encoding` whose one row reads 'UTF-8': the check runs the PRAGMA
+/// itself, which no table can shadow, as such a table shadows the
+/// table-valued function of its name.
+#[wasm_bindgen_test]
+fn refuses_a_utf16_database_that_holds_a_table_named_pragma_encoding() {
+    let database = host_database(":memory:");
+    let exec: Function = Reflect::get(&database, &"exec".into()).unwrap().dyn_into().unwrap();
+    let schema =
+        "PRAGMA encoding = 'UTF-16le'; CREATE TABLE pragma_encoding (encoding TEXT); INSERT INTO pragma_encoding VALUES ('UTF-8');";
+    exec.call1(&database, &schema.into()).unwrap();
+    let error = NodeJsConnection::from_database(database).err().expect("a UTF-16 database is refused");
+    assert!(error.to_string().contains("not UTF-8"), "{error}");
+}
+
 /// A host database whose statements pass through `tamper`: the body of a
 /// JavaScript function of `statement` and the `sql` it was prepared from,
 /// returning what the executor gets in its place, where `forward(target,

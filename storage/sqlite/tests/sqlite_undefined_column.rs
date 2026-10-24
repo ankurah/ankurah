@@ -114,12 +114,38 @@ async fn test_cache_refresh_after_column_creation() -> Result<()> {
     Ok(())
 }
 
+/// A store that holds a host's table named `pragma_table_info` opens, and its
+/// models' materializations load, on every driver: the column scan runs the
+/// PRAGMA itself, which no table can shadow, as such a table shadows the
+/// table-valued function of its name.
+#[engine_test]
+async fn a_store_holding_a_table_named_pragma_table_info_loads_its_materializations() -> Result<()> {
+    let db = common::TempDb::new("pragma_table_info_table");
+    {
+        let storage = common::open(db.path()).await?;
+        storage.with_executor(|executor| executor.execute("CREATE TABLE pragma_table_info (host_column TEXT)", &[]).map(drop)).await?;
+        let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+        node.system.create().await?;
+        let ctx = node.context_async(c).await.unwrap();
+        let trx = ctx.begin();
+        trx.create(&Task { name: "Write".to_string(), status: "active".to_string(), created: "2026".to_string() }).await?;
+        trx.commit().await?;
+    }
+
+    let node = Node::new_durable(Arc::new(common::open(db.path()).await?), PermissiveAgent::new());
+    let tasks = node.context_async(c).await?.fetch::<TaskView>("status = 'active'").await?;
+    assert_eq!(tasks.len(), 1);
+    Ok(())
+}
+
 /// A materialized column whose name SQLite cannot hand over as UTF-8 TEXT
 /// fails the query that first uses its model after an open, where main left
 /// the column out of the engine's list of columns without an error, so that
 /// a query on it read as one on a missing column, NULL. SQLite never stores
 /// such a name itself; the test plants one, a lone 0xFF byte, through
-/// `writable_schema`.
+/// `writable_schema`. Natively the scan refuses the name in rusqlite's words;
+/// on Node.js the PRAGMA's TEXT arrives as the driver's string, U+FFFD in
+/// place of the byte, and is refused as such.
 #[engine_test]
 #[cfg_attr(
     ankurah_sqlite_better_sqlite3,
@@ -150,6 +176,7 @@ async fn a_column_name_the_scan_cannot_read_fails_the_query() -> Result<()> {
     let node = Node::new_durable(Arc::new(common::open(db.path()).await?), PermissiveAgent::new());
     let fetched = async { Ok::<_, anyhow::Error>(node.context_async(c).await?.fetch::<TaskView>("status = 'active'").await?) }.await;
     let error = format!("{:#}", fetched.expect_err("the column scan cannot read the planted name"));
-    assert!(error.contains("Conversion error from type Text"), "{error}");
+    let refusal = if cfg!(target_arch = "wasm32") { "TEXT holding U+FFFD" } else { "Conversion error from type Text" };
+    assert!(error.contains(refusal), "{error}");
     Ok(())
 }
