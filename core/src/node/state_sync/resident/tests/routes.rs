@@ -167,7 +167,9 @@ async fn unchanged_replacements_follow_query_order_after_commit_changes() -> any
         *event = update(event, &format!("{:02}", index + 1))?;
         apply(&node, event).await?;
     }
-    let mut limited = selection(Some(2));
+    // Ruling missing labels out lets a complete tree rank a descending limit by its keys.
+    let mut limited = above("");
+    limited.limit = Some(2);
     limited.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
     let spec = spec_for(&limited, &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;

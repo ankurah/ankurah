@@ -115,7 +115,7 @@ async fn narrower_descending_null_scope_cannot_select_a_complete_tree() -> anyho
 }
 
 #[tokio::test]
-async fn descending_scalar_limit_without_missing_values_uses_tree_keys() -> anyhow::Result<()> {
+async fn descending_scalar_limit_cannot_select_a_complete_tree_even_without_missing_values() -> anyhow::Result<()> {
     let property = proto::PropertyId::System(proto::SystemProperty::Label);
     let catalog = CatalogManager::default();
     let selection = Selection {
@@ -130,9 +130,10 @@ async fn descending_scalar_limit_without_missing_values_uses_tree_keys() -> anyh
         .collect::<anyhow::Result<Vec<_>>>()?;
     let mut tree = QueryTree::build(spec, Vec::new()).await?;
     let snapshot = tree.refresh_states(rows).await?;
-    assert!(!snapshot.cannot_select(&selection, &catalog));
-    let view = snapshot.select(&selection, &catalog).await?;
-    assert_eq!(view.entries.keys().copied().collect::<Vec<_>>(), [1, 2].map(|id| state(id, 1).payload.entity_id));
+    // The rule reads the selection alone: whether today's rows happen to
+    // carry the value cannot decide how a shared tree ranks them tomorrow.
+    assert!(snapshot.cannot_select(&selection, &catalog));
+    assert!(snapshot.select(&selection, &catalog).await.is_err());
     Ok(())
 }
 

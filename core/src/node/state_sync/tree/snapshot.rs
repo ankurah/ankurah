@@ -1,6 +1,6 @@
 //! A frozen view of a resident's tree, selected for one query.
 
-use super::{key_paths, request_for, serves, Entries, Members, TreeEntry};
+use super::{key_paths, request_for, serves, tree_keys_rank_like_storage, Entries, Members, TreeEntry};
 use crate::schema::catalog::CatalogManager;
 use ankql::ast::{Resolved, Selection};
 use ankurah_core_types::PropertyPath;
@@ -17,7 +17,6 @@ pub(crate) struct Snapshot {
     pub(super) tree: TreeTransaction,
     pub(super) ranges: Option<Vec<proto::TreeSpan>>,
     pub(super) members: Arc<Members>,
-    pub(super) missing_counts: Vec<usize>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +30,7 @@ impl Snapshot {
         }
         match request_for(selection, catalog) {
             Ok(request) if self.physical_spec.serves(&request).is_some() => {
-                selection.limit.is_some() && self.has_descending_nulls(selection)
+                selection.limit.is_some() && !tree_keys_rank_like_storage(selection)
             }
             _ => true,
         }
@@ -50,16 +49,6 @@ impl Snapshot {
         }
         anyhow::ensure!(!self.cannot_select(selection, catalog), UnsupportedTreeSelection);
         self.select_request(&request_for(selection, catalog)?).await
-    }
-
-    pub(super) fn has_descending_nulls(&self, selection: &Selection<Resolved>) -> bool {
-        let paths = key_paths(&self.physical_spec);
-        selection.order_by.iter().flatten().filter(|item| item.direction == ankql::ast::OrderDirection::Desc).any(|item| {
-            item.path != PropertyPath::id()
-                && !(item.path.subpath.is_empty()
-                    && selection.predicate.assume_null(&[item.path.property_id()]) == ankql::ast::Predicate::False)
-                && paths.iter().position(|path| path == &item.path).is_none_or(|index| self.missing_counts[index] != 0)
-        })
     }
 
     pub(super) async fn select_request(mut self, request: &TreeRequest) -> anyhow::Result<Self> {

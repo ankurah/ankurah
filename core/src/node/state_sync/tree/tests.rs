@@ -572,38 +572,6 @@ async fn catalog_arrival_preserves_an_accepted_entity_id_fallback() -> anyhow::R
 }
 
 #[tokio::test]
-async fn missing_key_counts_track_updates_removals_and_frozen_snapshots() -> anyhow::Result<()> {
-    use ankql::ast::{OrderByItem, OrderDirection, Predicate};
-    let spec = keyed_spec();
-    let selection = Selection {
-        predicate: Predicate::True,
-        order_by: Some(vec![OrderByItem { path: PropertyPath::from(spec.key_spec().keyparts[0].key), direction: OrderDirection::Desc }]),
-        limit: Some(2),
-    };
-    let mut cache = QueryTree::build(spec.clone(), Vec::new()).await?;
-    let initial = cache.replace_values(vec![keyed_state(1, 1, Some(Value::I64(1)))?, keyed_state(2, 1, None)?]).await?;
-    assert_eq!(initial.missing_counts, [1]);
-    assert!(initial.has_descending_nulls(&selection));
-    cache.apply_values(vec![keyed_state(2, 2, Some(Value::I64(2)))?], vec![]).await?;
-    let present = cache.snapshot();
-    assert_eq!(present.missing_counts, [0]);
-    assert!(!present.has_descending_nulls(&selection));
-    cache.apply_values(vec![keyed_state(1, 2, None)?, keyed_state(3, 1, None)?], vec![]).await?;
-    assert_eq!(cache.snapshot().missing_counts, [2]);
-    cache.apply_values(Vec::<(Attested<EntityState>, Vec<Option<Value>>)>::new(), vec![numbered_state(1, 2).payload.entity_id]).await?;
-    assert_eq!(cache.snapshot().missing_counts, [1]);
-    cache.apply_values(Vec::<(Attested<EntityState>, Vec<Option<Value>>)>::new(), vec![numbered_state(3, 1).payload.entity_id]).await?;
-    assert_eq!(cache.snapshot().missing_counts, [0]);
-    let rebuilt = cache.replace_values(vec![keyed_state(4, 1, None)?]).await?;
-    assert_eq!(rebuilt.missing_counts, [1]);
-    assert_eq!(initial.missing_counts, [1], "later changes cannot rewrite captured null metadata");
-    assert_eq!(present.missing_counts, [0]);
-    assert!(initial.has_descending_nulls(&selection));
-    assert!(!present.has_descending_nulls(&selection));
-    Ok(())
-}
-
-#[tokio::test]
 async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyhow::Result<()> {
     let rows = (0..256).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
     let mut cache = QueryTree::build(keyed_spec(), Vec::new()).await?;

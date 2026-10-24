@@ -3,7 +3,7 @@
 use crate::{
     node::{
         state_sync::{
-            tree::{request_for, serves},
+            tree::{request_for, serves, tree_keys_rank_like_storage},
             Snapshot,
         },
         Node,
@@ -153,11 +153,7 @@ pub(super) fn compatible_selection<CD: ContextData>(
     // A shared complete index must answer the rank cut from its own keys.
     // Opaque ordering and descending nullable fields need a separate bounded
     // resident, whose storage refill cannot stall this tree's other owners.
-    if requested.selection.order_by.iter().flatten().any(|item| {
-        item.direction == ankql::ast::OrderDirection::Desc
-            && item.path != ankql::ast::PropertyPath::id()
-            && (!item.path.subpath.is_empty() || requested.selection.predicate.assume_null(&[item.path.property_id()]) != Predicate::False)
-    }) {
+    if !tree_keys_rank_like_storage(&requested.selection) {
         return false;
     }
     request_for(&requested.selection, catalog).ok().is_some_and(|request| spec.serves(&request).is_some())

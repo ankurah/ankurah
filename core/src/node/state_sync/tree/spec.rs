@@ -1,7 +1,7 @@
 //! The TreeSpec a selection's resident uses and the selections a TreeSpec serves.
 
 use crate::schema::catalog::CatalogManager;
-use ankql::ast::{Resolved, Selection};
+use ankql::ast::{OrderDirection, Predicate, Resolved, Selection};
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyPath, ValueType};
 use ankurah_digest_tree::{CanonicalCodec, PropertyTypes, TreeRequest};
 use ankurah_proto::{self as proto, TreeSpec};
@@ -75,6 +75,19 @@ pub(crate) fn serves(spec: &TreeSpec, selection: &Selection<Resolved>, catalog: 
         return true;
     }
     request_for(selection, catalog).ok().is_some_and(|request| spec.serves(&request).is_some())
+}
+
+/// Whether a tree's keys rank `selection`'s members in storage's order.
+/// Storage places a missing value first in either direction, while a key
+/// places it first ascending and so last descending. A descending order can
+/// therefore use the keys only over a top-level property that the selection's
+/// predicate rules missing values out of.
+pub(crate) fn tree_keys_rank_like_storage(selection: &Selection<Resolved>) -> bool {
+    !selection.order_by.iter().flatten().any(|item| {
+        item.direction == OrderDirection::Desc
+            && item.path != PropertyPath::id()
+            && (!item.path.subpath.is_empty() || selection.predicate.assume_null(&[item.path.property_id()]) != Predicate::False)
+    })
 }
 
 /// The property path of each of `spec`'s key parts, in key order.

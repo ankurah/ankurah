@@ -4,7 +4,7 @@ mod spans;
 mod spec;
 
 pub(crate) use snapshot::{Snapshot, UnsupportedTreeSelection};
-pub(crate) use spec::{accept_peer_spec, key_paths, request_for, serves, spec_for};
+pub(crate) use spec::{accept_peer_spec, key_paths, request_for, serves, spec_for, tree_keys_rank_like_storage};
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -44,7 +44,6 @@ pub(crate) struct QueryTree {
     tree: DigestTree,
     entries: Arc<Entries>,
     members: Arc<Members>,
-    missing_counts: Vec<usize>,
 }
 
 impl QueryTree {
@@ -53,14 +52,8 @@ impl QueryTree {
         let entries = checked_entries(&spec, entries)?;
         let leaves: Vec<LeafInput> = entries.values().map(TreeEntry::leaf).collect();
         let tree = run_blocking_if_large(leaves.len(), build_tree(spec.clone(), leaves)).await??;
-        let mut missing_counts = vec![0; spec.key_spec().keyparts.len()];
-        for entry in entries.values() {
-            for index in missing_parts(&spec, entry) {
-                missing_counts[index] += 1;
-            }
-        }
         let members = entries.values().map(|entry| (entry.address(), entry.entity_id)).collect();
-        Ok(Self { tree, entries: Arc::new(entries), members: Arc::new(members), missing_counts })
+        Ok(Self { tree, entries: Arc::new(entries), members: Arc::new(members) })
     }
 
     /// Make the tree hold exactly `entries`, changing only the entries that differ.
@@ -124,7 +117,6 @@ impl QueryTree {
             ranges: None,
             entries: self.entries.clone(),
             members: self.members.clone(),
-            missing_counts: self.missing_counts.clone(),
         }
     }
 
@@ -154,15 +146,9 @@ impl QueryTree {
         for (id, after) in changes {
             if let Some(before) = entries.remove(&id) {
                 members.remove(&before.address());
-                for index in missing_parts(self.tree.spec(), &before) {
-                    self.missing_counts[index] -= 1;
-                }
             }
             if let Some(after) = after {
                 members.insert(after.address(), id);
-                for index in missing_parts(self.tree.spec(), &after) {
-                    self.missing_counts[index] += 1;
-                }
                 entries.insert(id, after);
             }
         }
@@ -177,15 +163,6 @@ fn checked_entries(spec: &TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<E
         anyhow::ensure!(checked.insert(entry.entity_id, entry).is_none(), "duplicate tree entity");
     }
     Ok(checked)
-}
-
-fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
-    CanonicalCodec::split(spec.key_spec(), &entry.key)
-        .expect("tree entries have validated canonical keys")
-        .iter()
-        .enumerate()
-        .filter_map(|(index, part)| (part[0] == 0).then_some(index))
-        .collect()
 }
 
 /// Await `work`, an operation on a tree over memory maps that hashes or decodes
