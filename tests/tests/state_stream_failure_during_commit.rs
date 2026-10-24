@@ -1,13 +1,11 @@
 //! A state stream that fails while one of its updates is committing must leave
 //! the receiver's resident entity agreeing with its storage.
 //!
-//! The receiver applies each pushed update in an application job that first
-//! commits storage and then advances the resident entity. When the stream
-//! fails, the receiver drops its in-flight jobs. Sled finishes a commit on a
-//! blocking thread even after its caller is dropped, so a job dropped while it
-//! awaits its commit leaves storage holding the update and the resident entity
-//! without it. This test holds that window open with a storage wrapper and
-//! fails the stream by disconnecting the peers.
+//! The receiver applies each pushed update in an application job, and a failed
+//! stream drops its in-flight jobs. Sled finishes a commit on a blocking thread
+//! even after its caller is gone, so the resident entity must still follow
+//! every commit the receiver dispatched. This test holds a landed commit's
+//! caller with a storage wrapper and fails the stream by disconnecting the peers.
 mod common;
 
 use ankurah::core::error::{MutationError, RetrievalError};
@@ -17,7 +15,13 @@ use ankurah::{ModelId, Mutable};
 use anyhow::Result;
 use async_trait::async_trait;
 use common::*;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 #[tokio::test]
 async fn a_stream_failure_during_a_commit_leaves_the_resident_entity_matching_storage() -> Result<()> {
@@ -38,32 +42,31 @@ async fn a_stream_failure_during_a_commit_leaves_the_resident_entity_matching_st
     assert_eq!(query.ids(), [pet.id()]);
 
     // The server's edit reaches the client as a pushed update; hold the
-    // client's job once its storage commit has landed.
+    // client's commit once it has landed.
     hold.arm(pet.id());
     let trx = writer.begin();
     pet.edit(&trx)?.age()?.replace("2")?;
     trx.commit().await?;
     tokio::time::timeout(Duration::from_secs(10), hold.held.notified()).await?;
 
-    // Disconnecting fails the stream while the job waits for its commit.
+    // Disconnecting fails the stream while the commit is held. Closing the
+    // stream woke the client task that applies its updates; during one yield
+    // of this current-thread runtime, that task sees the failure and drops its
+    // in-flight application jobs.
     drop(connection);
-    if tokio::time::timeout(Duration::from_secs(10), hold.dropped.notified()).await.is_err() {
-        // The client kept the job: let its commit return and the job finish.
-        hold.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while client.get_resident_entity(pet.id()).map(|entity| entity.head()) != Some(stored_head(&client_storage, &pet).await) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await?;
-    }
+    tokio::task::yield_now().await;
+    assert!(!hold.dropped.load(Ordering::Acquire), "the client dropped an update whose storage commit had landed");
 
-    let resident = client.get_resident_entity(pet.id()).expect("the live query holds the pet").head();
-    assert_eq!(
-        resident,
-        stored_head(&client_storage, &pet).await,
-        "the client's resident pet must hold every update its storage committed"
-    );
+    // Once the held commit returns, the resident pet must catch up with storage.
+    hold.release.notify_one();
+    let stored = stored_head(&client_storage, &pet).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while client.get_resident_entity(pet.id()).expect("the live query holds the pet").head() != stored {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("the client's resident pet must hold every update its storage committed"))?;
     Ok(())
 }
 
@@ -78,8 +81,8 @@ struct CommitHold {
     target: std::sync::Mutex<Option<EntityId>>,
     /// Signaled when the target's commit has landed and its caller is held.
     held: tokio::sync::Notify,
-    /// Signaled when the held caller is dropped instead of resuming.
-    dropped: tokio::sync::Notify,
+    /// Set when the held caller is dropped instead of resuming.
+    dropped: AtomicBool,
     /// Lets a held caller resume.
     release: tokio::sync::Notify,
 }
@@ -98,7 +101,7 @@ impl CommitHold {
     }
 }
 
-/// Signals [`CommitHold::dropped`] unless the held caller resumed.
+/// Sets [`CommitHold::dropped`] unless the held caller resumed.
 struct DropSignal<'a> {
     hold: &'a CommitHold,
     resumed: bool,
@@ -107,7 +110,7 @@ struct DropSignal<'a> {
 impl Drop for DropSignal<'_> {
     fn drop(&mut self) {
         if !self.resumed {
-            self.hold.dropped.notify_one();
+            self.hold.dropped.store(true, Ordering::Release);
         }
     }
 }

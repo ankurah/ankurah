@@ -5,6 +5,7 @@ use crate::{
     policy::PermissiveAgent,
     property::backend::{lww::LWWBackend, PropertyBackend},
     retrieval::LocalEventGetter,
+    storage::StorageTransaction,
     test_utils::TestStorage,
     value::Value,
 };
@@ -14,6 +15,7 @@ use proto::{
 use std::collections::BTreeMap;
 use std::sync::{mpsc, Arc};
 
+mod cancellation;
 mod concurrent_snapshots;
 mod delivery;
 mod initial_batch;

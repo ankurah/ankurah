@@ -3,15 +3,18 @@ use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalStateGetter, SuspenseEvents};
-use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
+use entity_write::{EntityWrite, ResidentAdvance};
 use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
+
+mod entity_write;
 
 /// Applies entity deltas received from a peer, whether they arrive as initial
 /// transfer (Fetch, QuerySubscribed, repair) or as live subscription updates.
 /// One path handles every `DeltaContent`; the delivery decides only what the
-/// reactor change publishes. Each delta is applied atomically.
+/// reactor change publishes. Each delta is applied atomically, and a delta whose
+/// write reached storage reaches the resident entity even if its caller is dropped.
 pub struct NodeApplier;
 
 /// How a delta reached this node.
@@ -237,17 +240,14 @@ impl NodeApplier {
         crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
         Self::check_snapshot_events(node, state, &proto::Clock::default(), events, event_getter).await?;
         let attestation = node.policy_agent.attest_state(node, state);
-        let mut storage_trx = node.storage.transaction();
-        storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
-        storage_trx.add_events(events).await?;
-        let mut source = node.reactor.begin_commit().await;
-        match source.record_storage_outcome(storage_trx.commit().await)? {
-            crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
-            crate::storage::StorageCommitOutcome::Committed(_) => {}
-        }
-        let (_, entity) = node.entities.with_state(state_getter, event_getter, state.entity_id, state.state.clone()).await?;
-        source.publish(&[EntityChange::new(entity.clone(), events.to_vec())], delivery == Delivery::Live);
-        Ok(Some(entity))
+        let write = EntityWrite {
+            expected_head: proto::Clock::default(),
+            state: Attested::opt(state.clone(), attestation),
+            events: events.to_vec(),
+            resident: ResidentAdvance::Create,
+        };
+        // A refused write means another delivery stored the entity first.
+        Ok(write.commit(node, delivery).await?.map(|change| change.into_parts().0))
     }
 
     /// Adopt an extending snapshot, or merge its accompanying events. Persist both before publishing.
@@ -281,25 +281,10 @@ impl NodeApplier {
             }
             let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
-            let state = Attested::opt(state, attestation);
-            let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &state).await?;
-            storage_trx.add_events(&events).await?;
-            let mut source = node.reactor.begin_commit().await;
-            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
-            if adopted {
-                let (_, entity) = node
-                    .entities
-                    .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
-                    .await?;
-                let change = EntityChange::new(entity, events);
-                source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
-                Ok(Some(change))
-            } else {
-                let change = candidate.commit(&node.entities, event_getter).await?;
-                source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
-                Ok((!change.events().is_empty()).then_some(change))
-            }
+            let resident = if adopted { ResidentAdvance::Adopt(candidate) } else { ResidentAdvance::Apply(candidate) };
+            let write = EntityWrite { expected_head, state: Attested::opt(state, attestation), events, resident };
+            let change = write.commit(node, delivery).await?.ok_or(MutationError::WriteConflict)?;
+            Ok((adopted || !change.events().is_empty()).then_some(change))
         })
     }
 
@@ -326,13 +311,13 @@ impl NodeApplier {
             candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
-            let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
-            storage_trx.add_events(&events).await?;
-            let mut source = node.reactor.begin_commit().await;
-            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
-            let change = candidate.commit(&node.entities, event_getter).await?;
-            source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
+            let write = EntityWrite {
+                expected_head,
+                state: Attested::opt(state, attestation),
+                events,
+                resident: ResidentAdvance::Apply(candidate),
+            };
+            let change = write.commit(node, delivery).await?.ok_or(MutationError::WriteConflict)?;
             Ok((!change.events().is_empty()).then_some(change))
         })
     }
@@ -396,6 +381,11 @@ impl NodeApplier {
     /// structure, policy and lineage checks run before anything is written, and the delta's
     /// state and events commit in one storage transaction. An error from that commit or after it
     /// is returned as well, but it does not prove that nothing persisted.
+    ///
+    /// The caller may drop this future at any point. Before the delta's write is handed to
+    /// storage, dropping it applies nothing; after, the commit, the resident entity's advance and
+    /// the publication to resident maintenance finish without the caller. A failed state stream
+    /// can therefore drop its applications: it starts nothing new and finishes what is committing.
     pub(crate) async fn apply_delta<SE, PA, E, S>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
