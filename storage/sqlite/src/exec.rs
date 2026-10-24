@@ -36,9 +36,10 @@ use crate::{
 ///   on every driver. SQLite's query plan decides what is at the top level,
 ///   so a compound in a subquery that SQLite flattens into the query is
 ///   refused too. No statement of the engine's own is a compound SELECT.
-/// - Named parameters (`:a`, `@a`, `$a`) are not supported on Node:
-///   node:sqlite binds no positional value to one, leaving it NULL, and
-///   better-sqlite3 refuses the call. rusqlite binds them by position.
+/// - On Node a statement with a named parameter (`:a`, `@a`, `#a` or `$a`)
+///   is refused before it runs, where rusqlite binds a call's values to
+///   named parameters in turn too: node:sqlite would bind no positional value
+///   to one, leaving it NULL. Write a positional `?` for each parameter.
 /// - better-sqlite3 binds no positional value to a numbered parameter such as
 ///   `?1`, and refuses the call; rusqlite and node:sqlite bind the value at
 ///   that position.

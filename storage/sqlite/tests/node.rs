@@ -5,7 +5,7 @@
 mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{exec::SqliteExecutor, NodeConnection, SqliteStorageEngine};
+use ankurah_storage_sqlite::{exec::SqliteExecutor, NodeConnection, SqliteStorageEngine, SqliteValueRef};
 use anyhow::Result;
 use common::{host_database, on_better_sqlite3, Album, AlbumView};
 use js_sys::{Function, Reflect};
@@ -110,6 +110,33 @@ async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
     for refusal in refusals {
         let refusal = refusal.expect_err("a RETURNING statement is refused on Node");
         assert!(refusal.contains("so it is not run"), "{refusal}");
+    }
+    assert_eq!(count, 0, "neither insert ran");
+    Ok(())
+}
+
+/// A statement with a named parameter is refused before it runs, on both
+/// drivers, where rusqlite binds a call's values to it in turn: node:sqlite
+/// would bind none to it, leaving it NULL.
+#[wasm_bindgen_test]
+async fn a_named_parameter_is_refused_before_it_runs() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (refusals, count) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (a, b)", &[])?;
+            let seven = SqliteValueRef::Integer(7);
+            let refusals = [
+                executor.execute("INSERT INTO things VALUES (:a, ?)", &[seven]),
+                executor.execute("INSERT INTO things VALUES (?, @b)", &[seven, seven]),
+                executor.query("SELECT a FROM things WHERE b = $c OR b = #d", &[seven, seven]).map(|rows| rows.len()),
+            ]
+            .map(|outcome| outcome.map_err(|error| error.to_string()));
+            Ok((refusals, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
+        })
+        .await?;
+    for refusal in refusals {
+        let refusal = refusal.expect_err("a named parameter is refused on Node");
+        assert!(refusal.contains("write a positional `?`"), "{refusal}");
     }
     assert_eq!(count, 0, "neither insert ran");
     Ok(())

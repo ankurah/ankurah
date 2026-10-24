@@ -31,6 +31,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use crate::{
     error::SqliteError,
     exec::{Row, SqliteExecutor},
+    named_parameters::named_parameters,
     value::{SqliteValue, SqliteValueRef},
     SqliteStorageEngine,
 };
@@ -433,7 +434,9 @@ impl SqliteExecutor for NodeConnection {
     /// discards the row.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
         let statement = self.prepare(sql)?;
-        refuse_a_second_statement(sql, &source(&statement)?)?;
+        let source = source(&statement)?;
+        refuse_a_second_statement(sql, &source)?;
+        refuse_a_named_parameter(&source)?;
         let width = width(&statement)?;
         self.check_parameters(sql, params.len())?;
         if width == 0 {
@@ -461,6 +464,7 @@ impl SqliteExecutor for NodeConnection {
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
         refuse_a_second_statement(sql, &source)?;
+        refuse_a_named_parameter(&source)?;
         let width = width(&statement)?;
         self.check_parameters(sql, params.len())?;
         if width == 0 {
@@ -595,6 +599,20 @@ fn refuse_a_second_statement(sql: &str, source: &str) -> Result<(), SqliteError>
         return Err(SqliteError::Node("Multiple statements provided".into()));
     }
     Ok(())
+}
+
+/// Refuse a statement that has a named parameter, before it runs:
+/// node:sqlite binds no positional value to one, leaving it NULL, where
+/// rusqlite binds a call's values to every parameter in turn. better-sqlite3
+/// binds a named parameter only by name, which a positional call cannot give.
+fn refuse_a_named_parameter(source: &str) -> Result<(), SqliteError> {
+    match named_parameters(source).first() {
+        None => Ok(()),
+        Some(name) => Err(SqliteError::Node(format!(
+            "the statement has the named parameter {name}, which the node executor does not bind, since node:sqlite would \
+             leave it NULL where rusqlite binds a value to it: write a positional `?` for each parameter"
+        ))),
+    }
 }
 
 /// A row of a typed reader, a storage class and a value for each column of
