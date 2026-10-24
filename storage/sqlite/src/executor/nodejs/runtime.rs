@@ -5,17 +5,17 @@
 use js_sys::{Array, Function, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
 
-use super::{
-    statement::{js_error, method},
-    NodeJsConnection,
+use super::{exception::js_error, statement::method, NodeJsConnection};
+use crate::{
+    error::{DatabaseRefusal, SqliteError},
+    executor::SESSION_PRAGMAS,
 };
-use crate::{error::SqliteError, executor::SESSION_PRAGMAS};
 
 /// The `process` global, which exists only inside Node.js.
 fn nodejs_process() -> Result<JsValue, SqliteError> {
     let process = Reflect::get(&js_sys::global(), &"process".into()).map_err(js_error)?;
     if process.is_undefined() || process.is_null() {
-        return Err(SqliteError::Node("no `process` global: the Node.js executor runs only inside Node.js".into()));
+        return Err(DatabaseRefusal::NoNodeSqlite { missing: "the `process` global" }.into());
     }
     Ok(process)
 }
@@ -35,21 +35,18 @@ impl NodeJsConnection {
         // Node.js has had `process.getBuiltinModule` since 22.3, before any
         // release whose node:sqlite the executor runs on, so a runtime without
         // it is no Node.js the executor runs on.
-        let get_builtin: Function = Reflect::get(&process, &"getBuiltinModule".into()).map_err(js_error)?.dyn_into().map_err(|_| {
-            SqliteError::Node(
-                "`process` has no `getBuiltinModule` method, which Node.js has from 22.3: the Node.js executor needs \
-                 Node.js 22.20.0 or later on 22, 24.7.0 or later on 24, or a later release line"
-                    .into(),
-            )
-        })?;
+        let get_builtin: Function = Reflect::get(&process, &"getBuiltinModule".into())
+            .map_err(js_error)?
+            .dyn_into()
+            .map_err(|_| DatabaseRefusal::NoNodeSqlite { missing: "`process.getBuiltinModule`" })?;
         let module = get_builtin.call1(&process, &"node:sqlite".into()).map_err(js_error)?;
         if module.is_undefined() || module.is_null() {
-            return Err(SqliteError::Node("`node:sqlite` is unavailable in this build of Node.js".into()));
+            return Err(DatabaseRefusal::NoNodeSqlite { missing: "the `node:sqlite` module" }.into());
         }
         let constructor: Function = Reflect::get(&module, &"DatabaseSync".into())
             .map_err(js_error)?
             .dyn_into()
-            .map_err(|_| SqliteError::Node("`node:sqlite` exports no DatabaseSync constructor".into()))?;
+            .map_err(|_| DatabaseRefusal::NoNodeSqlite { missing: "`node:sqlite`'s `DatabaseSync` constructor" })?;
         let database = Reflect::construct(&constructor, &Array::of1(&path.into())).map_err(js_error)?;
         // The busy timeout comes before any other statement, as rusqlite sets
         // it at open, since from_database's checks already read the file.

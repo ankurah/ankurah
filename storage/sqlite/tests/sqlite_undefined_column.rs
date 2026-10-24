@@ -7,7 +7,8 @@
 
 mod common;
 
-use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
+use ankurah::{core::error::RetrievalError, policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
+use ankurah_storage_sqlite::{Refusal, SqliteError};
 use anyhow::Result;
 use common::engine_test;
 use serde::{Deserialize, Serialize};
@@ -143,9 +144,9 @@ async fn a_store_holding_a_table_named_pragma_table_info_loads_its_materializati
 /// the column out of the engine's list of columns without an error, so that
 /// a query on it read as one on a missing column, NULL. SQLite never stores
 /// such a name itself; the test plants one, a lone 0xFF byte, through
-/// `writable_schema`. Natively the scan refuses the name in rusqlite's words;
-/// on Node.js the PRAGMA's TEXT arrives as the driver's string, U+FFFD in
-/// place of the byte, and is refused as such.
+/// `writable_schema`. Natively the scan refuses the name as TEXT that is not
+/// UTF-8, as rusqlite refuses it; on Node.js the PRAGMA's TEXT arrives as the
+/// driver's string, U+FFFD in place of the byte, and is refused as such.
 #[engine_test]
 #[cfg_attr(
     ankurah_sqlite_better_sqlite3,
@@ -175,8 +176,15 @@ async fn a_column_name_the_scan_cannot_read_fails_the_query() -> Result<()> {
 
     let node = Node::new_durable(Arc::new(common::open(db.path()).await?), PermissiveAgent::new());
     let fetched = async { Ok::<_, anyhow::Error>(node.context_async(c).await?.fetch::<TaskView>("status = 'active'").await?) }.await;
-    let error = format!("{:#}", fetched.expect_err("the column scan cannot read the planted name"));
-    let refusal = if cfg!(target_arch = "wasm32") { "TEXT holding U+FFFD" } else { "Conversion error from type Text" };
-    assert!(error.contains(refusal), "{error}");
+    let error = fetched.expect_err("the column scan cannot read the planted name");
+    let refusal = match error.downcast_ref::<RetrievalError>() {
+        Some(RetrievalError::StorageError(storage)) => storage.downcast_ref::<SqliteError>().and_then(SqliteError::refusal),
+        _ => None,
+    };
+    if cfg!(target_arch = "wasm32") {
+        assert_eq!(refusal, Some(Refusal::ReplacementCharacter { column: 1 }), "{error:#}");
+    } else {
+        assert!(matches!(refusal, Some(Refusal::TextNotUtf8 { column: 1, .. })), "{error:#}");
+    }
     Ok(())
 }

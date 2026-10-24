@@ -6,9 +6,9 @@
 use js_sys::{Array, BigInt, Function, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue};
 
-use super::NodeJsConnection;
+use super::{exception::js_error, NodeJsConnection};
 use crate::{
-    error::SqliteError,
+    error::{DatabaseRefusal, Refusal, SqliteError},
     executor::statement_scan::{self, Statements},
     value::{SqliteValue, SqliteValueRef},
 };
@@ -39,7 +39,7 @@ fn return_arrays(statement: &JsValue) -> Result<(), SqliteError> {
             raw.call1(statement, &JsValue::TRUE).map_err(js_error)?;
         }
     } else {
-        return Err(SqliteError::Node("positional rows require setReturnArrays (node:sqlite's) or raw (better-sqlite3's)".into()));
+        return Err(DatabaseRefusal::NoPositionalRows.into());
     }
     Ok(())
 }
@@ -52,7 +52,7 @@ fn read_big_ints(statement: &JsValue) -> Result<(), SqliteError> {
     } else if let Ok(safe_integers) = method(statement, "safeIntegers") {
         safe_integers.call1(statement, &JsValue::TRUE).map_err(js_error)?;
     } else {
-        return Err(SqliteError::Node("exact INTEGER results require setReadBigInts or safeIntegers".into()));
+        return Err(DatabaseRefusal::NoExactIntegers.into());
     }
     Ok(())
 }
@@ -73,7 +73,7 @@ pub(super) fn width(statement: &JsValue) -> Result<usize, SqliteError> {
         .call0(statement)
         .map_err(js_error)?
         .dyn_into()
-        .map_err(|_| SqliteError::Node("`columns()` did not return an array".into()))?;
+        .map_err(|columns| unreadable(format!("{columns:?} from `columns()`, where an array was expected")))?;
     Ok(columns.length() as usize)
 }
 
@@ -87,14 +87,8 @@ pub(super) fn source(statement: &JsValue) -> Result<String, SqliteError> {
             return Ok(source);
         }
     }
-    Err(SqliteError::Node(
-        "the database's statements report no `sourceSQL` (better-sqlite3's `source`), which the Node.js executor needs".into(),
-    ))
+    Err(DatabaseRefusal::NoStatementSource.into())
 }
-
-/// SQLite's result code for a misuse of its API, which it returns natively
-/// for a step of SQL that holds no statement.
-const SQLITE_MISUSE: i32 = 21;
 
 /// Refuse SQL that holds no statement, or a second one, before SQLite
 /// prepares anything. Returns the statement's first named parameter, which
@@ -106,20 +100,16 @@ const SQLITE_MISUSE: i32 = 21;
 ///   word. Whitespace, semicolons and comments after the statement are no
 ///   statement.
 /// - SQL that holds no statement, only whitespace, semicolons and comments,
-///   is refused as SQLite refuses to run it natively, with SQLITE_MISUSE.
-///   It is refused before it is prepared, since node:sqlite can crash the
-///   process, in a later `sqlite3_step`, once it collects a statement
-///   prepared from such SQL while the database is open, as Node.js 24.13.0
-///   does.
+///   is refused as SQLite refuses to run it natively, with SQLITE_MISUSE,
+///   which the refusal answers as its `sqlite_code`. It is refused before
+///   it is prepared, since node:sqlite can crash the process, in a later
+///   `sqlite3_step`, once it collects a statement prepared from such SQL
+///   while the database is open, as Node.js 24.13.0 does.
 pub(super) fn refuse_all_but_one_statement(sql: &str) -> Result<Option<&str>, SqliteError> {
     match statement_scan::statements(sql) {
         Statements::One { named_parameter } => Ok(named_parameter),
-        // rusqlite's words for the same refusal.
-        Statements::Several => Err(SqliteError::Node("Multiple statements provided".into())),
-        Statements::None => Err(SqliteError::NodeSqlite {
-            code: SQLITE_MISUSE,
-            message: "the SQL holds no statement, which SQLite refuses to run, as a misuse of its API (SQLITE_MISUSE)".into(),
-        }),
+        Statements::Several => Err(Refusal::MultipleStatements.into()),
+        Statements::None => Err(Refusal::NoStatement.into()),
     }
 }
 
@@ -129,11 +119,9 @@ pub(super) fn refuse_all_but_one_statement(sql: &str) -> Result<Option<&str>, Sq
 /// and better-sqlite3's is the whole SQL. Should SQLite have found more, the
 /// SQL is refused.
 pub(super) fn refuse_sql_past_its_statement(sql: &str, source: &str) -> Result<(), SqliteError> {
-    let rest = sql
-        .strip_prefix(source)
-        .ok_or_else(|| SqliteError::Node(format!("the database reports {source:?} as the SQL of a statement prepared from {sql:?}")))?;
+    let rest = sql.strip_prefix(source).ok_or_else(|| unreadable(format!("{source:?} as the SQL of a statement prepared from {sql:?}")))?;
     if !statement_scan::holds_no_statement(rest) {
-        return Err(SqliteError::Node("Multiple statements provided".into()));
+        return Err(Refusal::SqlPastItsStatement.into());
     }
     Ok(())
 }
@@ -173,17 +161,16 @@ pub(super) fn all(statement: &JsValue, params: &[SqliteValueRef<'_>], width: usi
         .apply(statement, &js_params(params))
         .map_err(js_error)?
         .dyn_into()
-        .map_err(|_| SqliteError::Node("`all()` did not return an array".into()))?;
+        .map_err(|rows| unreadable(format!("{rows:?} from `all()`, where an array of rows was expected")))?;
     rows.iter().map(|row| row_of_width(row, width)).collect()
 }
 
 /// A row a statement returned, refused unless it is an array of `width`
 /// values.
 fn row_of_width(row: JsValue, width: usize) -> Result<Array, SqliteError> {
-    let row: Array =
-        row.dyn_into().map_err(|row| SqliteError::Node(format!("a statement returned a row that is not an array: {row:?}")))?;
+    let row: Array = row.dyn_into().map_err(|row| unreadable(format!("{row:?} as a row, which is not an array")))?;
     if row.length() as usize != width {
-        return Err(SqliteError::Node(format!("a statement of {width} columns returned a row of {}", row.length())));
+        return Err(unreadable(format!("a row of {} values from a statement of {width} columns", row.length())));
     }
     Ok(row)
 }
@@ -218,59 +205,43 @@ pub(super) fn value_from_js(index: usize, value: JsValue) -> Result<SqliteValue,
     } else if let Some(bytes) = value.dyn_ref::<Uint8Array>() {
         Ok(SqliteValue::Blob(bytes.to_vec()))
     } else if value.is_string() {
-        Err(SqliteError::Node(format!("column {index} holds TEXT as a string, which may have lost bytes, where its bytes were expected")))
+        Err(unreadable(format!("TEXT as a string, which may have lost bytes, in column {index}, where its bytes were expected")))
     } else {
-        Err(SqliteError::Node(format!("column {index} holds {value:?}, which stands for no SQLite storage class")))
+        Err(unreadable(format!("{value:?} in column {index}, which stands for no SQLite storage class")))
     }
 }
 
-/// An INTEGER, which both Node.js drivers hand over as a BigInt.
+/// An INTEGER, which both Node.js drivers hand over as a BigInt to a
+/// statement reading BigInts. One handed over as a number shows that the
+/// database's statements do not read BigInts, and is refused as such.
 pub(super) fn integer_from_js(value: &JsValue) -> Result<i64, SqliteError> {
     if !value.is_bigint() {
-        return Err(SqliteError::Node(format!("expected an INTEGER as a BigInt, found {value:?}")));
+        if value.as_f64().is_some() {
+            return Err(DatabaseRefusal::NoExactIntegers.into());
+        }
+        return Err(unreadable(format!("{value:?} where an INTEGER was expected, as a BigInt")));
     }
-    i64::try_from(value.clone().unchecked_into::<BigInt>()).map_err(|_| SqliteError::Node(format!("{value:?} does not fit in 64 bits")))
+    i64::try_from(value.clone().unchecked_into::<BigInt>())
+        .map_err(|_| unreadable(format!("the INTEGER {value:?}, which does not fit in 64 bits")))
 }
 
-/// A method of the database object, which the refusal of one it lacks names;
-/// `open` checks `process.getBuiltinModule` with a refusal of its own.
-pub(super) fn method(database: &JsValue, name: &str) -> Result<Function, SqliteError> {
+/// A method of the database object, which the refusal of one it lacks names.
+pub(super) fn method(database: &JsValue, name: &'static str) -> Result<Function, SqliteError> {
     Reflect::get(database, &name.into())
         .map_err(js_error)?
         .dyn_into::<Function>()
-        .map_err(|_| SqliteError::Node(format!("the database object has no `{name}` method")))
+        .map_err(|_| DatabaseRefusal::NoDatabaseMethod { name }.into())
 }
 
 /// A method of a statement the database prepared. node:sqlite's statements
 /// have every method the executor calls, on every Node.js it runs on.
-pub(super) fn statement_method(statement: &JsValue, name: &str) -> Result<Function, SqliteError> {
-    Reflect::get(statement, &name.into()).map_err(js_error)?.dyn_into::<Function>().map_err(|_| {
-        SqliteError::Node(format!(
-            "the database's statements have no `{name}` method, which the Node.js executor needs; node:sqlite's statements have \
-             every method it calls"
-        ))
-    })
+pub(super) fn statement_method(statement: &JsValue, name: &'static str) -> Result<Function, SqliteError> {
+    Reflect::get(statement, &name.into())
+        .map_err(js_error)?
+        .dyn_into::<Function>()
+        .map_err(|_| DatabaseRefusal::NoStatementMethod { name }.into())
 }
 
-/// A JavaScript exception as an error. One that node:sqlite raises for SQLite
-/// carries SQLite's extended result code as `errcode`, which is kept, as
-/// rusqlite keeps it natively. better-sqlite3's errors carry no `errcode`,
-/// only the code's name as `code`, which is deliberately not read, since
-/// turning a name back into its number takes a table of SQLite's codes: on
-/// better-sqlite3 an error SQLite raised has no [`SqliteError::sqlite_code`].
-pub(super) fn js_error(value: JsValue) -> SqliteError {
-    let message = if let Some(error) = value.dyn_ref::<js_sys::Error>() {
-        String::from(error.message())
-    } else if let Some(text) = value.as_string() {
-        text
-    } else {
-        format!("{value:?}")
-    };
-    let code = if value.is_object() { Reflect::get(&value, &"errcode".into()).ok().and_then(|code| code.as_f64()) } else { None };
-    match code {
-        Some(code) if code.fract() == 0.0 && (f64::from(i32::MIN)..=f64::from(i32::MAX)).contains(&code) => {
-            SqliteError::NodeSqlite { code: code as i32, message }
-        }
-        _ => SqliteError::Node(message),
-    }
-}
+/// The refusal of `what`, something the database handed over that the
+/// executor cannot read as SQLite's, such as a row that is not an array.
+pub(super) fn unreadable(what: String) -> SqliteError { DatabaseRefusal::Unreadable(what).into() }

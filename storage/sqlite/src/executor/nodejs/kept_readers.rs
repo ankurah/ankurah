@@ -7,7 +7,8 @@ use js_sys::Array;
 use wasm_bindgen::{JsCast, JsValue};
 
 use super::{
-    statement::{integer_from_js, js_error, statement_method, width},
+    exception::js_error,
+    statement::{integer_from_js, statement_method, unreadable, width},
     NodeJsConnection,
 };
 use crate::error::SqliteError;
@@ -93,7 +94,7 @@ impl NodeJsConnection {
                 .call0(statement)
                 .map_err(js_error)?
                 .dyn_into()
-                .map_err(|row| SqliteError::Node(format!("`PRAGMA schema_version` returned {row:?}, not a row")))?;
+                .map_err(|row| unreadable(format!("{row:?} as a row of `PRAGMA schema_version`")))?;
             *version = integer_from_js(&row.get(0))?;
         }
         Ok(versions)
@@ -157,7 +158,7 @@ mod tests {
         let (connection, calls) = ticking_connection();
         assert_eq!(connection.query(TICKING_QUERY, &[]).unwrap().len(), 3, "the first run calls tick() three times");
         let error = connection.query(TICKING_QUERY, &[]).expect_err("the kept reader's run calls tick() a fourth time");
-        assert!(error.to_string().contains("tick refuses its fourth call"), "{error}");
+        assert!(matches!(&error, SqliteError::JavaScript(message) if message == "tick refuses its fourth call"), "{error}");
         assert_eq!(calls(), 4.0, "the failed run called tick() once, and nothing ran it again");
         assert!(connection.readers.borrow().kept.contains_key(TICKING_QUERY));
         assert_eq!(connection.query(TICKING_QUERY, &[]).unwrap().len(), 3);

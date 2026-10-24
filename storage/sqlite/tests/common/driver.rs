@@ -20,7 +20,7 @@
 //! `common`. Each test binary uses only some of it.
 #![allow(dead_code)]
 
-use ankurah_storage_sqlite::SqliteStorageEngine;
+use ankurah_storage_sqlite::{SqliteError, SqliteStorageEngine};
 #[cfg(target_arch = "wasm32")]
 use js_sys::{Array, Function, Reflect};
 #[cfg(target_arch = "wasm32")]
@@ -58,6 +58,22 @@ pub fn on_better_sqlite3() -> bool {
     );
     built
 }
+
+/// The message of `error` when it is a JavaScript exception, as a Node.js
+/// driver throws for its own refusal of a call, such as better-sqlite3's of a
+/// call that passes too few values: never natively, where rusqlite's
+/// refusals are errors of its own.
+#[cfg(target_arch = "wasm32")]
+pub fn javascript_message(error: &SqliteError) -> Option<&str> {
+    match error {
+        SqliteError::JavaScript(message) => Some(message),
+        _ => None,
+    }
+}
+
+/// The message of `error` when it is a JavaScript exception: never natively.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn javascript_message(_: &SqliteError) -> Option<&str> { None }
 
 /// The engine a test runs on in memory: the one `open_in_memory` opens, or on
 /// the better-sqlite3 run the engine adopting a better-sqlite3 database.

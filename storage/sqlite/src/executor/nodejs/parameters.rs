@@ -8,10 +8,15 @@ use js_sys::Array;
 use wasm_bindgen::JsValue;
 
 use super::{
-    statement::{integer_from_js, js_error, method, read_rows, statement_method, RowSelection},
+    exception::js_error,
+    statement::{integer_from_js, method, read_rows, statement_method, RowSelection},
     NodeJsConnection,
 };
-use crate::{error::SqliteError, executor::statement_scan, value::SqliteValueRef};
+use crate::{
+    error::{Refusal, SqliteError, SqliteFailure},
+    executor::statement_scan,
+    value::SqliteValueRef,
+};
 
 /// On a database that binds NULL for a positional parameter a call does not
 /// pass, how many values each SQL text's statement was shown to take at
@@ -54,8 +59,11 @@ impl NodeJsConnection {
     pub(super) fn binds_a_numbered_parameter_at_its_position(&self) -> Result<bool, SqliteError> {
         let statement = self.prepare("SELECT ?2")?;
         match read_rows(&statement, &[SqliteValueRef::Integer(1), SqliteValueRef::Integer(2)], 1, RowSelection::First) {
-            Ok(rows) => Ok(matches!(rows.as_slice(), [row] if integer_from_js(&row.get(0)).is_ok_and(|value| value == 2))),
-            Err(SqliteError::NodeSqlite { code: SQLITE_RANGE, .. }) => Ok(false),
+            Ok(rows) => match rows.as_slice() {
+                [row] => Ok(integer_from_js(&row.get(0))? == 2),
+                _ => Ok(false),
+            },
+            Err(SqliteError::Sqlite(SqliteFailure { code: Some(SQLITE_RANGE), .. })) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -84,16 +92,9 @@ impl NodeJsConnection {
         let probe = method(&self.database, "prepare")?.call1(&self.database, &explain.into()).map_err(js_error)?;
         let values: Array = (0..=passed).map(|_| JsValue::NULL).collect();
         match statement_method(&probe, "get")?.apply(&probe, &values).map_err(js_error) {
-            Err(SqliteError::NodeSqlite { code: SQLITE_RANGE, .. }) => {}
+            Err(SqliteError::Sqlite(SqliteFailure { code: Some(SQLITE_RANGE), .. })) => {}
             Err(error) => return Err(error),
-            Ok(_) => {
-                // rusqlite's words for the same refusal, which also name the
-                // count needed; the probe shows only that it is more.
-                return Err(SqliteError::Node(format!(
-                    "Wrong number of parameters passed to query. Got {passed}, needed more: this database binds NULL for each \
-                     parameter not passed, where rusqlite refuses the call, so the Node.js executor refuses it before it runs"
-                )));
-            }
+            Ok(_) => return Err(Refusal::TooFewValues { passed }.into()),
         }
         let mut checked = checked.borrow_mut();
         if checked.len() >= PARAMETER_COUNTS_MAX {
@@ -114,10 +115,7 @@ impl NodeJsConnection {
 pub(super) fn refuse_a_named_parameter(named_parameter: Option<&str>) -> Result<(), SqliteError> {
     match named_parameter {
         None => Ok(()),
-        Some(name) => Err(SqliteError::Node(format!(
-            "the statement has the named parameter {name}, which the Node.js executor does not bind, since node:sqlite would \
-             leave it NULL where rusqlite binds a value to it: write a positional `?` for each parameter"
-        ))),
+        Some(name) => Err(Refusal::NamedParameter { name: name.to_owned() }.into()),
     }
 }
 

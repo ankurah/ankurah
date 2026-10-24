@@ -1,7 +1,7 @@
 //! What every executor must agree on where values cross the driver boundary.
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{executor::Row, SqliteValue, SqliteValueRef};
+use ankurah_storage_sqlite::{executor::Row, Refusal, SqliteValue, SqliteValueRef};
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -96,9 +96,9 @@ async fn duplicate_column_names_keep_both_positions() -> Result<()> {
 }
 
 /// A query that yields more than half of SQLite's column limit, 1000 of the
-/// default 2000 columns, is refused on Node.js before it runs, saying so, since
-/// the typed reader reads each column as two; rusqlite reads it. A query of
-/// 1000 columns reads on every driver.
+/// default 2000 columns, is refused on Node.js before it runs, naming its
+/// width, since the typed reader reads each column as two; rusqlite reads it.
+/// A query of 1000 columns reads on every driver.
 #[engine_test]
 async fn a_query_of_more_than_a_thousand_columns_is_refused_on_nodejs() -> Result<()> {
     let columns = |count: usize| format!("SELECT {}", (0..count).map(|index| index.to_string()).collect::<Vec<_>>().join(", "));
@@ -106,15 +106,14 @@ async fn a_query_of_more_than_a_thousand_columns_is_refused_on_nodejs() -> Resul
     let (thousand, more) = storage
         .with_executor(move |executor| {
             let width = |sql: String| {
-                executor.query_row(&sql, &[]).map(|row| row.expect("one row").values().len()).map_err(|error| error.to_string())
+                executor.query_row(&sql, &[]).map(|row| row.expect("one row").values().len()).map_err(|error| error.refusal())
             };
             Ok((width(columns(1000)), width(columns(1001))))
         })
         .await?;
     assert_eq!(thousand, Ok(1000));
     if cfg!(target_arch = "wasm32") {
-        let refusal = more.expect_err("Node.js refuses a query of 1001 columns");
-        assert!(refusal.contains("the statement yields 1001 columns") && refusal.contains("1000 of the default 2000"), "{refusal}");
+        assert_eq!(more, Err(Some(Refusal::TooManyColumns { width: 1001 })));
     } else {
         assert_eq!(more, Ok(1001));
     }
@@ -122,7 +121,7 @@ async fn a_query_of_more_than_a_thousand_columns_is_refused_on_nodejs() -> Resul
 }
 
 /// TEXT crosses the boundary as its bytes: a NUL inside it is kept, and TEXT
-/// whose bytes are not UTF-8 is refused, in rusqlite's words, on every
+/// whose bytes are not UTF-8 is refused, as rusqlite refuses it, on every
 /// driver. (node:sqlite's own strings would cut the first value at its NUL
 /// and turn the second into U+FFFD.)
 #[engine_test]
@@ -153,10 +152,7 @@ async fn text_keeps_an_embedded_nul_and_refuses_bytes_that_are_not_utf8() -> Res
 
     let error =
         storage.with_executor(|executor| executor.query("SELECT 'ok', CAST(x'ff41' AS TEXT)", &[])).await.expect_err("0xff is not UTF-8");
-    assert!(
-        error.to_string().ends_with("Conversion error from type Text at index: 1, invalid utf-8 sequence of 1 bytes from index 0"),
-        "{error}"
-    );
+    assert!(matches!(error.refusal(), Some(Refusal::TextNotUtf8 { column: 1, .. })), "{error}");
     Ok(())
 }
 
@@ -217,7 +213,7 @@ async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
                 ("SELECT (SELECT (SELECT i FROM integers UNION ALL SELECT r FROM reals))", &EXACT[..1]),
                 ("SELECT EXISTS (SELECT i FROM integers UNION ALL SELECT r FROM reals)", &["Integer(1)"][..]),
             ]
-            .map(|(sql, native)| (executor.query(sql, &[]).map(values).map_err(|error| error.to_string()), native));
+            .map(|(sql, native)| (executor.query(sql, &[]).map(values).map_err(|error| error.refusal()), native));
             // Each statement every driver reads, with the values it reads.
             static ROUNDED: [&str; 2] = ["Real(1.5)", "Real(9007199254740992.0)"];
             let same = [
@@ -235,8 +231,7 @@ async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
         .await?;
     for (read, native) in refused {
         if cfg!(target_arch = "wasm32") {
-            let refusal = read.expect_err("Node.js refuses the compound SELECT");
-            assert!(refusal.contains("WITH x AS MATERIALIZED"), "{refusal}");
+            assert_eq!(read, Err(Some(Refusal::CompoundSelect)), "Node.js refuses the compound SELECT");
         } else {
             assert_eq!(read.expect("rusqlite reads a compound SELECT directly"), native);
         }

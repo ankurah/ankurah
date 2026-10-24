@@ -32,7 +32,7 @@ pub mod temp_db;
 #[allow(unused)]
 pub use driver::host_database;
 #[allow(unused)]
-pub use driver::{engine_test, on_better_sqlite3, open, open_in_memory};
+pub use driver::{engine_test, javascript_message, on_better_sqlite3, open, open_in_memory};
 #[allow(unused)]
 pub use temp_db::TempDb;
 

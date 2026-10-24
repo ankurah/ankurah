@@ -55,7 +55,7 @@ pub mod sql_builder;
 mod value;
 
 pub use engine::{SqliteStorageEngine, SqliteTransaction};
-pub use error::SqliteError;
+pub use error::{DatabaseRefusal, Refusal, SqliteError, SqliteFailure};
 #[cfg(not(target_arch = "wasm32"))]
 pub use executor::native::connection::SqliteConnectionManager;
 #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]

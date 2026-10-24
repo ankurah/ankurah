@@ -8,11 +8,11 @@
 use js_sys::Array;
 
 use super::{
-    statement::{all, integer_from_js, value_from_js},
+    statement::{all, integer_from_js, unreadable, value_from_js},
     NodeJsConnection,
 };
 use crate::{
-    error::SqliteError,
+    error::{DatabaseRefusal, Refusal, SqliteError},
     executor::Row,
     value::{SqliteValue, SqliteValueRef},
 };
@@ -55,20 +55,19 @@ pub(super) fn typed_row(row: Array) -> Result<Row, SqliteError> {
         .map(|column| {
             let index = column as usize;
             let class = row.get(2 * column);
-            let class =
-                class.as_string().ok_or_else(|| SqliteError::Node(format!("the storage class of column {index} arrived as {class:?}")))?;
+            let class = class.as_string().ok_or_else(|| unreadable(format!("{class:?} as the storage class of column {index}")))?;
             match (class.as_str(), value_from_js(index, row.get(2 * column + 1))?) {
-                ("text", SqliteValue::Blob(bytes)) => String::from_utf8(bytes).map(SqliteValue::Text).map_err(|error| {
-                    // rusqlite's words for the same refusal.
-                    SqliteError::Node(format!("Conversion error from type Text at index: {index}, {}", error.utf8_error()))
-                }),
+                ("text", SqliteValue::Blob(bytes)) => String::from_utf8(bytes)
+                    .map(SqliteValue::Text)
+                    .map_err(|error| Refusal::TextNotUtf8 { column: index, error: error.utf8_error() }.into()),
                 ("null", value @ SqliteValue::Null)
                 | ("integer", value @ SqliteValue::Integer(_))
                 | ("real", value @ SqliteValue::Real(_))
                 | ("blob", value @ SqliteValue::Blob(_)) => Ok(value),
-                (class, value) => {
-                    Err(SqliteError::Node(format!("column {index} holds a value of storage class {class} that arrived as {value:?}")))
-                }
+                // An INTEGER handed over as a number, as a statement that does
+                // not read BigInts hands it over.
+                ("integer", SqliteValue::Real(_)) => Err(DatabaseRefusal::NoExactIntegers.into()),
+                (class, value) => Err(unreadable(format!("{value:?} as a value of storage class {class} in column {index}"))),
             }
         })
         .collect::<Result<Vec<_>, _>>()
@@ -81,16 +80,11 @@ pub(super) fn typed_row(row: Array) -> Result<Row, SqliteError> {
 /// EXPLAIN's TEXT of C strings, so it holds no NUL for node:sqlite to cut it
 /// at, but a string holding U+FFFD is refused, since both Node.js drivers put
 /// that character in place of each byte that is not UTF-8.
-pub(super) fn plain_row(row: Array, nesting: &SqliteError) -> Result<Row, SqliteError> {
+pub(super) fn plain_row(row: Array) -> Result<Row, SqliteError> {
     row.iter()
         .enumerate()
         .map(|(index, value)| match value.as_string() {
-            Some(text) if text.contains('\u{FFFD}') => Err(SqliteError::Node(format!(
-                "column {index} is TEXT holding U+FFFD, which both Node.js drivers put in place of each byte that is not UTF-8 \
-                 when they hand TEXT over as a string; the Node.js executor reads TEXT as its bytes only from a query SQLite can \
-                 nest in a WITH clause, which this statement is not ({nesting}), so select the value through such a query, \
-                 such as a table-valued pragma function like pragma_table_info"
-            ))),
+            Some(text) if text.contains('\u{FFFD}') => Err(Refusal::ReplacementCharacter { column: index }.into()),
             Some(text) => Ok(SqliteValue::Text(text)),
             None => value_from_js(index, value),
         })
@@ -123,7 +117,7 @@ impl NodeJsConnection {
         let mut steps = Vec::new();
         for step in all(&plan, params, 4)? {
             let detail = step.get(3);
-            let detail = detail.as_string().ok_or_else(|| SqliteError::Node(format!("a step of a query plan reads {detail:?}")))?;
+            let detail = detail.as_string().ok_or_else(|| unreadable(format!("{detail:?} as the detail of a step of a query plan")))?;
             steps.push((integer_from_js(&step.get(0))?, integer_from_js(&step.get(1))?, detail));
         }
         // The query (0), and each scalar subquery that stands in the query or
@@ -144,15 +138,7 @@ impl NodeJsConnection {
         }
         let compound = |detail: &String| detail == "COMPOUND QUERY" || detail.starts_with("MERGE (");
         if steps.iter().any(|(_, parent, detail)| top_level.contains(parent) && compound(detail)) {
-            return Err(SqliteError::Node(
-                "a compound SELECT at the top level of a query, or in a scalar subquery or an EXISTS there, is refused on \
-                 Node.js, before it runs: the Node.js executor reads rows through a typed reader that nests the query, which \
-                 gives each column the affinity of a compound's first SELECT, or of a scalar subquery's last, whichever \
-                 SELECT a value came from, and so can change it, as an INTEGER past 2^53 read through a REAL column \
-                 changes to the nearest REAL; select from the compound as `WITH x AS MATERIALIZED (…) SELECT * FROM x`, \
-                 which reads the same on every driver"
-                    .into(),
-            ));
+            return Err(Refusal::CompoundSelect.into());
         }
         Ok(())
     }

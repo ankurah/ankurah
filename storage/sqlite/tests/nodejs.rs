@@ -5,13 +5,21 @@
 mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{executor::SqliteExecutor, NodeJsConnection, SqliteStorageEngine, SqliteValueRef};
+use ankurah_storage_sqlite::{
+    executor::SqliteExecutor, DatabaseRefusal, NodeJsConnection, Refusal, SqliteError, SqliteStorageEngine, SqliteValueRef,
+};
 use anyhow::Result;
 use common::{host_database, on_better_sqlite3, Album, AlbumView};
 use js_sys::{Function, Reflect};
 use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
+
+/// The refusal an engine's constructor reports, if it reports one.
+fn refusal_of(error: &anyhow::Error) -> Option<Refusal> { error.downcast_ref::<SqliteError>().and_then(SqliteError::refusal) }
+
+/// The refusal of a database, as a [`Refusal::Database`].
+fn refused_database(refusal: DatabaseRefusal) -> Option<Refusal> { Some(Refusal::Database(refusal)) }
 
 #[wasm_bindgen_test]
 async fn adopts_a_host_built_database() -> Result<()> {
@@ -33,7 +41,7 @@ async fn adopts_a_host_built_database() -> Result<()> {
 #[wasm_bindgen_test]
 async fn refuses_an_object_without_the_database_shape() {
     let error = SqliteStorageEngine::from_database(JsValue::from_str("not a database")).await.err().expect("a string is not a database");
-    assert!(error.to_string().contains("prepare"), "the refusal names the shape it wanted: {error}");
+    assert!(matches!(refusal_of(&error), Some(Refusal::Database(DatabaseRefusal::NotAnObject { .. }))), "{error}");
 }
 
 // Hide one capability on an actual statement of the run's driver to exercise
@@ -60,7 +68,7 @@ async fn refuses_a_driver_without_positional_rows() {
     let method = if on_better_sqlite3() { "raw" } else { "setReturnArrays" };
     let database = without_statement_method(host_database(":memory:"), method);
     let error = SqliteStorageEngine::from_database(database).await.err().expect("object rows are not positional");
-    assert!(error.to_string().contains("positional rows"), "{error}");
+    assert_eq!(refusal_of(&error), refused_database(DatabaseRefusal::NoPositionalRows), "{error}");
 }
 
 #[wasm_bindgen_test]
@@ -68,7 +76,7 @@ async fn refuses_a_driver_without_exact_integers() {
     let method = if on_better_sqlite3() { "safeIntegers" } else { "setReadBigInts" };
     let database = without_statement_method(host_database(":memory:"), method);
     let error = SqliteStorageEngine::from_database(database).await.err().expect("Number cannot represent every INTEGER");
-    assert!(error.to_string().contains("exact INTEGER"), "{error}");
+    assert_eq!(refusal_of(&error), refused_database(DatabaseRefusal::NoExactIntegers), "{error}");
 }
 
 // Hand over a copy of each statement of the run's driver that holds all but
@@ -104,14 +112,13 @@ extern "C" {
 async fn refuses_a_driver_whose_statements_report_no_sql() {
     let database = without_statement_source(host_database(":memory:"));
     let error = SqliteStorageEngine::from_database(database).await.err().expect("the executor reads each statement's SQL");
-    assert!(error.to_string().contains("report no `sourceSQL` (better-sqlite3's `source`)"), "{error}");
+    assert_eq!(refusal_of(&error), refused_database(DatabaseRefusal::NoStatementSource), "{error}");
 }
 
 /// TEXT from a statement SQLite cannot nest in the typed reader, such as a
 /// PRAGMA, is read as the driver's string, and the PRAGMA's other storage
 /// classes as ever; a string holding U+FFFD, which a driver may have put in
-/// place of bytes that are not UTF-8, is refused, pointing at the
-/// table-valued function, which reads TEXT as its bytes.
+/// place of bytes that are not UTF-8, is refused, naming its column.
 #[wasm_bindgen_test]
 async fn text_from_a_statement_sqlite_cannot_nest_is_read_as_a_string() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -120,13 +127,12 @@ async fn text_from_a_statement_sqlite_cannot_nest_is_read_as_a_string() -> Resul
             let names = executor.query(r#"PRAGMA table_info("_ankurah_meta")"#, &[])?;
             let names = names.iter().map(|row| row.text(1).map(str::to_owned)).collect::<Result<Vec<_>, _>>()?;
             executor.execute("CREATE TABLE marked (\"\u{FFFD}\" TEXT)", &[])?;
-            let marked = executor.query("PRAGMA table_info(marked)", &[]).map(|rows| rows.len()).map_err(|error| error.to_string());
+            let marked = executor.query("PRAGMA table_info(marked)", &[]).map(|rows| rows.len()).map_err(|error| error.refusal());
             Ok((names, marked, executor.query_row("PRAGMA busy_timeout", &[])?.expect("one row").integer(0)?))
         })
         .await?;
     assert_eq!(names, ["key", "value"]);
-    let refusal = marked.expect_err("a string holding U+FFFD is refused");
-    assert!(refusal.contains("column 1 is TEXT holding U+FFFD") && refusal.contains("pragma_table_info"), "{refusal}");
+    assert_eq!(marked, Err(Some(Refusal::ReplacementCharacter { column: 1 })), "a string holding U+FFFD is refused");
     assert_eq!(timeout, 5000);
     Ok(())
 }
@@ -144,13 +150,12 @@ async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
                 "INSERT INTO things (v) VALUES ('x') RETURNING v",
                 "/* a comment */ WITH value (v) AS (VALUES ('y')) INSERT INTO things (v) SELECT v FROM value RETURNING rowid",
             ]
-            .map(|sql| executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| error.to_string()));
+            .map(|sql| executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| error.refusal()));
             Ok((refusals, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
         })
         .await?;
     for refusal in refusals {
-        let refusal = refusal.expect_err("a RETURNING statement is refused on Node.js");
-        assert!(refusal.contains("so it is not run"), "{refusal}");
+        assert!(matches!(refusal, Err(Some(Refusal::NotNestable(_)))), "a RETURNING statement is refused on Node.js: {refusal:?}");
     }
     assert_eq!(count, 0, "neither insert ran");
     Ok(())
@@ -171,13 +176,13 @@ async fn a_named_parameter_is_refused_before_it_runs() -> Result<()> {
                 executor.execute("INSERT INTO things VALUES (?, @b)", &[seven, seven]),
                 executor.query("SELECT a FROM things WHERE b = $c OR b = #d", &[seven, seven]).map(|rows| rows.len()),
             ]
-            .map(|outcome| outcome.map_err(|error| error.to_string()));
+            .map(|outcome| outcome.map_err(|error| error.refusal()));
             Ok((refusals, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
         })
         .await?;
-    for refusal in refusals {
-        let refusal = refusal.expect_err("a named parameter is refused on Node.js");
-        assert!(refusal.contains("write a positional `?`"), "{refusal}");
+    // Each refusal names the statement's first named parameter.
+    for (refusal, name) in refusals.into_iter().zip([":a", "@b", "$c"]) {
+        assert_eq!(refusal, Err(Some(Refusal::NamedParameter { name: name.to_owned() })));
     }
     assert_eq!(count, 0, "neither insert ran");
     Ok(())
@@ -198,7 +203,7 @@ fn refuses_a_database_that_reads_double_quoted_names_as_strings() {
          return new DatabaseSync(':memory:', { enableDoubleQuotedStringLiterals: true });",
     );
     let error = NodeJsConnection::from_database(construct.call0(&JsValue::NULL).unwrap()).err().expect("the database is refused");
-    assert!(error.to_string().contains("enableDoubleQuotedStringLiterals"), "{error}");
+    assert_eq!(error.refusal(), refused_database(DatabaseRefusal::DoubleQuotedStringLiterals), "{error}");
 }
 
 #[wasm_bindgen_test]
@@ -207,7 +212,7 @@ fn refuses_a_utf16_database() {
     let exec: Function = Reflect::get(&database, &"exec".into()).unwrap().dyn_into().unwrap();
     exec.call1(&database, &"PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (v TEXT);".into()).unwrap();
     let error = NodeJsConnection::from_database(database).err().expect("a UTF-16 database is refused");
-    assert!(error.to_string().contains("not UTF-8"), "{error}");
+    assert_eq!(error.refusal(), refused_database(DatabaseRefusal::NotUtf8), "{error}");
 }
 
 /// A UTF-16 database is refused though it holds a table named
@@ -222,7 +227,7 @@ fn refuses_a_utf16_database_that_holds_a_table_named_pragma_encoding() {
         "PRAGMA encoding = 'UTF-16le'; CREATE TABLE pragma_encoding (encoding TEXT); INSERT INTO pragma_encoding VALUES ('UTF-8');";
     exec.call1(&database, &schema.into()).unwrap();
     let error = NodeJsConnection::from_database(database).err().expect("a UTF-16 database is refused");
-    assert!(error.to_string().contains("not UTF-8"), "{error}");
+    assert_eq!(error.refusal(), refused_database(DatabaseRefusal::NotUtf8), "{error}");
 }
 
 /// A host database whose statements pass through `tamper`: the body of a
@@ -246,8 +251,8 @@ fn tampered_database(tamper: &str) -> JsValue {
 }
 
 /// The refusal `NodeJsConnection::from_database` gives a tampered database.
-fn refusal(tamper: &str) -> String {
-    NodeJsConnection::from_database(tampered_database(tamper)).err().expect("the database is refused").to_string()
+fn refusal(tamper: &str) -> Option<Refusal> {
+    NodeJsConnection::from_database(tampered_database(tamper)).err().expect("the database is refused").refusal()
 }
 
 /// An INTEGER handed over as a number cannot be told from a REAL, so such a
@@ -256,32 +261,48 @@ fn refusal(tamper: &str) -> String {
 #[wasm_bindgen_test]
 fn refuses_a_database_that_hands_an_integer_over_as_a_number() {
     let method = if on_better_sqlite3() { "safeIntegers" } else { "setReadBigInts" };
-    let error = refusal(&format!(
+    let refusal = refusal(&format!(
         "return new Proxy(statement, {{ get: (target, name) => name === '{method}' ? () => {{}} : forward(target, name) }});"
     ));
-    assert!(error.contains("expected an INTEGER as a BigInt, found JsValue(0)"), "{error}");
+    assert_eq!(refusal, refused_database(DatabaseRefusal::NoExactIntegers));
 }
 
 /// A row whose INTEGER arrives as a number is refused, the storage class the
-/// typed reader reports for it standing against the number.
+/// typed reader reports for it showing that the number stands for an
+/// INTEGER.
 #[wasm_bindgen_test]
 fn refuses_a_row_whose_integer_arrives_as_a_number() {
-    let error = refusal(
+    let refusal = refusal(
         "return new Proxy(statement, { get: (target, name) => name === 'all' && sql.startsWith('WITH _ankurah_typed_rows')
              ? (...params) => target.all(...params).map((row) => row.map((value) => typeof value === 'bigint' ? Number(value) : value))
              : forward(target, name) });",
     );
-    assert!(error.contains("storage class integer that arrived as Real(1.0)"), "{error}");
+    assert_eq!(refusal, refused_database(DatabaseRefusal::NoExactIntegers));
 }
 
 #[wasm_bindgen_test]
 fn refuses_a_row_of_the_wrong_width() {
-    let error = refusal(
+    let refusal = refusal(
         "return new Proxy(statement, { get: (target, name) => name === 'all' && sql.startsWith('WITH _ankurah_typed_rows')
              ? (...params) => target.all(...params).map((row) => [...row, 0n])
              : forward(target, name) });",
     );
-    assert!(error.contains("returned a row of 3"), "{error}");
+    let unreadable = "a row of 3 values from a statement of 2 columns".to_owned();
+    assert_eq!(refusal, refused_database(DatabaseRefusal::Unreadable(unreadable)));
+}
+
+/// A typed reader the database fails to prepare for a reason other than
+/// SQLite's, such as an exception the driver throws, fails with that
+/// exception, not as a statement SQLite cannot nest.
+#[wasm_bindgen_test]
+fn a_typed_reader_that_fails_to_prepare_otherwise_than_in_sqlite_reports_the_failure() {
+    let error = NodeJsConnection::from_database(tampered_database(
+        "if (sql.startsWith('WITH _ankurah_typed_rows')) throw new TypeError('the typed reader is not prepared');
+         return statement;",
+    ))
+    .err()
+    .expect("the database is refused");
+    assert_eq!(common::javascript_message(&error), Some("the typed reader is not prepared"), "{error}");
 }
 
 /// A database that skips a numbered parameter as it binds a call's values,
@@ -296,7 +317,7 @@ fn refuses_a_row_of_the_wrong_width() {
               checks no binding of one there"
 )]
 fn refuses_a_database_that_skips_a_numbered_parameter() {
-    let error = refusal(
+    let refusal = refusal(
         "return sql !== 'SELECT ?2' ? statement : new Proxy(statement, { get: (target, name) => name === 'get'
              ? (...params) => {
                    if (params.length < 2) return target.get(...params);
@@ -304,7 +325,7 @@ fn refuses_a_database_that_skips_a_numbered_parameter() {
                }
              : forward(target, name) });",
     );
-    assert!(error.contains("Node.js 22.20.0 or later on 22, 24.7.0 or later on 24, or a later release line"), "{error}");
+    assert_eq!(refusal, refused_database(DatabaseRefusal::SkipsNumberedParameters));
 }
 
 /// `undefined` is no storage class: it is refused, not read as NULL.
@@ -317,5 +338,6 @@ fn refuses_undefined_where_null_was_handed_over() {
     ))
     .expect("SELECT 1 holds no NULL to tamper with");
     let error = connection.query("SELECT NULL", &[]).expect_err("undefined is refused");
-    assert!(error.to_string().contains("holds JsValue(undefined)"), "{error}");
+    let unreadable = "JsValue(undefined) in column 0, which stands for no SQLite storage class".to_owned();
+    assert_eq!(error.refusal(), refused_database(DatabaseRefusal::Unreadable(unreadable)), "{error}");
 }

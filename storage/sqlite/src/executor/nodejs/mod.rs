@@ -19,6 +19,7 @@
 //! single-threaded WASM host: the engine's closures simply run in place.
 
 mod adoption;
+mod exception;
 mod kept_readers;
 mod parameters;
 mod runtime;
@@ -32,16 +33,17 @@ use send_wrapper::SendWrapper;
 use wasm_bindgen::JsValue;
 
 use crate::{
-    error::SqliteError,
+    error::{Refusal, SqliteError},
     executor::{statement_scan, Row, SqliteExecutor},
     value::SqliteValueRef,
     SqliteStorageEngine,
 };
+use exception::js_error;
 use kept_readers::KeptReaders;
 use parameters::{refuse_a_named_parameter, ParameterCounts};
 use statement::{
-    integer_from_js, js_error, js_params, method, read_rows, refuse_all_but_one_statement, refuse_sql_past_its_statement, source,
-    statement_method, width, RowSelection,
+    integer_from_js, js_params, method, read_rows, refuse_all_but_one_statement, refuse_sql_past_its_statement, source, statement_method,
+    unreadable, width, RowSelection,
 };
 use typed_reader::{plain_row, typed_reader, typed_row};
 
@@ -136,9 +138,10 @@ impl NodeJsConnection {
         let count = match changes.as_f64() {
             Some(0.0) => return self.changes(),
             Some(count) if count.fract() == 0.0 => count as i64,
-            _ => integer_from_js(&changes)?,
+            Some(_) => return Err(unreadable(format!("{changes:?} as the count of rows `run()` changed"))),
+            None => integer_from_js(&changes)?,
         };
-        usize::try_from(count).map_err(|_| SqliteError::Node(format!("`run()` reported {count} changed rows")))
+        usize::try_from(count).map_err(|_| unreadable(format!("{count} as the count of rows `run()` changed")))
     }
 
     /// SQLite's changes(): the count of rows the connection's last INSERT,
@@ -154,11 +157,10 @@ impl NodeJsConnection {
                 statement
             }
         };
-        let row = read_rows(&statement, &[], 1, RowSelection::First)?
-            .pop()
-            .ok_or_else(|| SqliteError::Node("`SELECT changes()` returned no row".into()))?;
+        let row =
+            read_rows(&statement, &[], 1, RowSelection::First)?.pop().ok_or_else(|| unreadable("no row from `SELECT changes()`".into()))?;
         let changes = integer_from_js(&row.get(0))?;
-        usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
+        usize::try_from(changes).map_err(|_| unreadable(format!("{changes} as the count of rows SQLite's changes() reports")))
     }
 }
 
@@ -198,8 +200,7 @@ impl SqliteExecutor for NodeJsConnection {
         // the step yielded, or undefined when it finished the statement.
         let row = statement_method(&statement, "get")?.apply(&statement, &js_params(params)).map_err(js_error)?;
         if !row.is_undefined() {
-            // rusqlite's words for the same refusal.
-            return Err(SqliteError::Node("Execute returned results - did you mean to call query?".into()));
+            return Err(Refusal::ExecuteReturnedRows.into());
         }
         // rusqlite then reports the connection's count of changed rows, which
         // a statement that yields rows leaves as the last change set it.
@@ -265,27 +266,22 @@ impl NodeJsConnection {
             // The typed reader reads each column as two, so SQLite refuses to
             // prepare the reader of a query that yields more than half of its
             // column limit, 2000 by default, though it prepared the query.
-            Err(too_wide) if too_wide.to_string().contains("too many columns in result set") => Err(SqliteError::Node(format!(
-                "the statement yields {width} columns, and the Node.js executor's typed reader reads each as two, its \
-                 storage class and its value, so it reads at most half of SQLite's column limit, 1000 of the default \
-                 2000 columns ({too_wide})"
-            ))),
+            Err(SqliteError::Sqlite(failure)) if failure.message == "too many columns in result set" => {
+                Err(Refusal::TooManyColumns { width }.into())
+            }
             // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
             // in a WITH clause. A PRAGMA or an EXPLAIN is read as the database
             // hands it over, its TEXT as a string (see `plain_row`). Any other
             // statement that yields rows, such as one with a RETURNING clause,
-            // could write before a TEXT value in its rows were refused, so it
-            // is refused before it runs.
-            Err(nesting) => {
+            // could write before a TEXT value in its rows was refused, so it
+            // is refused before it runs, with SQLite's error.
+            Err(SqliteError::Sqlite(failure)) => {
                 if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| statement_scan::first_keyword(&source).eq_ignore_ascii_case(keyword)) {
-                    return Err(SqliteError::Node(format!(
-                        "the Node.js executor reads rows exactly only from a query SQLite can nest in a WITH clause, which this \
-                         statement is not ({nesting}); a statement such as one with a RETURNING clause could write before a \
-                         value of its rows were refused, so it is not run: write with `execute` and read with a query"
-                    )));
+                    return Err(Refusal::NotNestable(failure).into());
                 }
-                read_rows(&statement, params, width, selection)?.into_iter().map(|row| plain_row(row, &nesting)).collect()
+                read_rows(&statement, params, width, selection)?.into_iter().map(plain_row).collect()
             }
+            Err(error) => Err(error),
         }
     }
 }

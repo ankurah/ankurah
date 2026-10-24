@@ -1,6 +1,6 @@
 //! What `execute`, `query` and `query_row` run and return, on every executor.
 
-use ankurah_storage_sqlite::{executor::SqliteExecutor, SqliteError, SqliteValueRef};
+use ankurah_storage_sqlite::{executor::SqliteExecutor, Refusal, SqliteError, SqliteValueRef};
 use anyhow::Result;
 
 use crate::common::{self, engine_test, TempDb};
@@ -17,12 +17,11 @@ async fn query_row_reads_no_row_past_the_first() -> Result<()> {
             executor.execute("INSERT INTO texts VALUES (1, 'valid'), (2, CAST(x'ff41' AS TEXT))", &[])?;
             let sql = "SELECT v FROM texts ORDER BY id";
             let first = executor.query_row(sql, &[])?.expect("a first row").text(0)?.to_owned();
-            Ok((first, executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| error.to_string())))
+            Ok((first, executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| error.refusal())))
         })
         .await?;
     assert_eq!(first, "valid");
-    let refusal = every.expect_err("the second row's TEXT is not UTF-8");
-    assert!(refusal.ends_with("Conversion error from type Text at index: 0, invalid utf-8 sequence of 1 bytes from index 0"), "{refusal}");
+    assert!(matches!(every, Err(Some(Refusal::TextNotUtf8 { column: 0, .. }))), "the second row's TEXT is not UTF-8: {every:?}");
     Ok(())
 }
 
@@ -41,12 +40,11 @@ async fn execute_refuses_a_statement_that_yields_a_row() -> Result<()> {
                 "SELECT 1 WHERE 0",
                 "INSERT INTO things (k) VALUES (2), (3)",
             ]
-            .map(|sql| executor.execute(sql, &[]).map_err(|error| error.to_string())))
+            .map(|sql| executor.execute(sql, &[]).map_err(|error| error.refusal())))
         })
         .await?;
     for refused in &outcomes[..3] {
-        let error = refused.as_ref().expect_err("a statement that yields a row is refused");
-        assert!(error.ends_with("Execute returned results - did you mean to call query?"), "{error}");
+        assert_eq!(refused, &Err(Some(Refusal::ExecuteReturnedRows)), "a statement that yields a row is refused");
     }
     assert!(outcomes[3].is_ok(), "a statement whose step yields no row runs: {:?}", outcomes[3]);
     assert_eq!(outcomes[4], Ok(2));
