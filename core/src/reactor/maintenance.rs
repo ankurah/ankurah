@@ -55,12 +55,12 @@ pub(super) struct Maintenance(Arc<MaintenanceInner>);
 
 struct MaintenanceInner {
     gate: Arc<AsyncMutex<()>>,
-    state: Mutex<Publications>,
+    state: Mutex<SourceState>,
     watchers: Arc<Mutex<WatcherSet>>,
 }
 
 #[derive(Default)]
-struct Publications {
+struct SourceState {
     revision: u64,
     unavailable: bool,
     readers: BTreeMap<ReactorSubscriptionId, Weak<dyn MaintenanceReader>>,
@@ -209,7 +209,7 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
 }
 
 impl SourceCommit {
-    pub(crate) fn storage_result(
+    pub(crate) fn record_storage_outcome(
         &mut self,
         result: Result<crate::storage::StorageCommitOutcome, crate::error::MutationError>,
     ) -> Result<crate::storage::StorageCommitOutcome, crate::error::MutationError> {
@@ -267,7 +267,7 @@ impl Drop for SourceCommit {
 impl<T> MaintenanceSubscription<T> {
     pub(crate) async fn fence(&mut self) -> Result<SourceWindow<T>, SourceError> { self.fence_inner(None).await }
 
-    pub(crate) async fn validate_limited_read(&mut self, started: SourceRevision) -> Result<SourceWindow<T>, SourceError> {
+    pub(crate) async fn fence_unchanged_since(&mut self, started: SourceRevision) -> Result<SourceWindow<T>, SourceError> {
         self.fence_inner(Some(started)).await
     }
 

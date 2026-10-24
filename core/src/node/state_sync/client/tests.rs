@@ -15,7 +15,7 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
             entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() },
         })
         .collect::<Vec<_>>();
-    let page = proto::TreeSpanInventory { bounds: super::super::whole(), heads: rows.try_into().unwrap() };
+    let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: rows.try_into().unwrap() };
     assert!(page.work_bytes().unwrap() < MAX_PAGE_BYTES as u64);
     let frame = proto::StateFrame {
         stream: proto::StateStreamId::new(),
@@ -382,10 +382,10 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
     let tree = super::super::QueryTree::default();
-    let mut snapshot = tree.refresh(super::super::QueryTree::spec(&selection, &client.catalog), states).await?;
+    let mut snapshot = tree.refresh(super::super::tree::spec_for(&selection, &client.catalog), states).await?;
     // A mixed leaf/summary inventory requires per-region work. Thirty-three
     // positive spans exceed that budget, leaving a continuation on wire.
-    let mut start = super::super::whole().start;
+    let mut start = proto::TreeSpan::all().start;
     let mut spans = Vec::new();
     for n in 1..=32 {
         let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
@@ -396,7 +396,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
         });
         start = Included(address(n));
     }
-    spans.push(proto::SpanContent::Digest(snapshot.span_digest(proto::TreeSpan::new(start, super::super::whole().end)).await?));
+    spans.push(proto::SpanContent::Digest(snapshot.span_digest(proto::TreeSpan::new(start, proto::TreeSpan::all().end)).await?));
     gate.store(true, std::sync::atomic::Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
@@ -448,7 +448,7 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
     let mut snapshot =
-        super::super::QueryTree::default().refresh(super::super::QueryTree::spec(&selection, &client.catalog), states).await?;
+        super::super::QueryTree::default().refresh(super::super::tree::spec_for(&selection, &client.catalog), states).await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
         &client,
@@ -482,7 +482,7 @@ async fn fetch_and_subscription_share_each_nodes_resident_tree() -> anyhow::Resu
     let (server, client, query, _messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
-    let spec = super::super::QueryTree::spec(&selection, &client.catalog);
+    let spec = super::super::tree::spec_for(&selection, &client.catalog);
     let local = client.resident_trees.acquire(&client, selection.clone(), Some(spec.clone()), credentials.clone()).await?;
     let local_tree = local.tree();
     drop(local);

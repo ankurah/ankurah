@@ -41,7 +41,7 @@ async fn unknown_and_nested_ordering_cannot_select_a_complete_tree() -> anyhow::
                 order_by: Some(vec![OrderByItem { path: path.clone(), direction }]),
                 limit: Some(limit),
             };
-            assert!(QueryTree::request(&selection, &catalog).is_err(), "ordering cannot use the scalar planner");
+            assert!(request_for(&selection, &catalog).is_err(), "ordering cannot use the scalar planner");
             let snapshot = cache.current_snapshot().await?;
             assert!(snapshot.cannot_select(&selection, &catalog));
             let error = snapshot.select(&selection, &catalog).await.err().unwrap();
@@ -61,7 +61,7 @@ async fn descending_scalar_limit_with_missing_values_requires_storage_ordering()
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Desc }]),
         limit: Some(2),
     };
-    let spec = QueryTree::spec(&selection, &catalog);
+    let spec = spec_for(&selection, &catalog);
     assert!(!spec.key_spec().keyparts.is_empty());
     let rows = [(1, None), (2, Some("20")), (3, Some("20")), (4, Some("10"))]
         .into_iter()
@@ -96,7 +96,7 @@ async fn narrower_descending_null_scope_cannot_select_a_complete_tree() -> anyho
         limit: Some(2),
     };
     let catalog = CatalogManager::default();
-    assert!(spec.serves(&QueryTree::request(&selection, &catalog)?).is_some(), "the scalar planner supports this narrower scope");
+    assert!(spec.serves(&request_for(&selection, &catalog)?).is_some(), "the scalar planner supports this narrower scope");
     let rows = [(1, "a", None), (2, "b", None), (3, "b", Some("09")), (4, "b", Some("08")), (5, "c", None)]
         .into_iter()
         .map(|(id, group_value, rank_value)| {
@@ -123,7 +123,7 @@ async fn descending_scalar_limit_without_missing_values_uses_tree_keys() -> anyh
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Desc }]),
         limit: Some(2),
     };
-    let spec = QueryTree::spec(&selection, &catalog);
+    let spec = spec_for(&selection, &catalog);
     let rows = [(1, "30"), (2, "20"), (3, "20"), (4, "10")]
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, Some(Value::String(value.into())))]))
@@ -145,7 +145,7 @@ async fn indexed_route_order_preserves_directions_nulls_and_entity_ties() -> any
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Asc }]),
         limit: Some(4),
     };
-    let spec = QueryTree::spec(&selection, &catalog);
+    let spec = spec_for(&selection, &catalog);
     let rows = [(1, None), (2, Some("20")), (3, Some("20")), (4, Some("10"))]
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, value.map(|value| Value::String(value.into())))]))

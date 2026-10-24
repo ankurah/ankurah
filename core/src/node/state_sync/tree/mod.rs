@@ -4,6 +4,7 @@ mod spans;
 mod spec;
 
 pub(crate) use snapshot::{Snapshot, UnsupportedTreeSelection};
+pub(crate) use spec::{accept_peer_spec, key_paths, request_for, serves, spec_for};
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -228,7 +229,7 @@ async fn build_tree(spec: TreeSpec, leaves: Vec<LeafInput>) -> Result<DigestTree
 #[cfg(test)]
 fn entry_from_state(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<TreeEntry> {
     let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
-    let values = QueryTree::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
+    let values = key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
     Ok(TreeEntry {
         entity_id: state.payload.entity_id,
         key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?,

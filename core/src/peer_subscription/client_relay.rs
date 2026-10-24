@@ -652,7 +652,7 @@ where
         }
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
 
-        let mut snapshot = node.resident_trees.capture(&node, selection.clone(), None, context_data.clone()).await?.snapshot;
+        let mut snapshot = node.resident_trees.snapshot(&node, selection.clone(), None, context_data.clone()).await?.snapshot;
         if let Some(query) = node.live_queries.get(query_id) {
             query.retain_tree(version, snapshot.resident.clone());
         }

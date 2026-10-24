@@ -6,7 +6,10 @@ use crate::node::state_sync::Snapshot;
 use crate::{
     entity::TemporaryEntity,
     node::{
-        state_sync::{tree::TreeEntry, QueryTree},
+        state_sync::{
+            tree::{key_paths, TreeEntry},
+            QueryTree,
+        },
         Node,
     },
     policy::{ContextPolicy, PolicyAgent},
@@ -100,7 +103,7 @@ where
     let weak = node.weak();
     let subscribed_selection = selection.clone();
     let subscribed_spec = spec.clone();
-    let subscribed_paths = QueryTree::key_paths(&spec);
+    let subscribed_paths = key_paths(&spec);
     let subscribed_credentials = credentials.clone();
     let (mut start, mut cursor) = node
         .reactor
@@ -139,7 +142,7 @@ where
             (rows, projection.candidates, _) = projection.read(node, &policy).await?;
         }
         let window = if matches!(projection.coverage, Coverage::Limited(_)) && projection.selection.limit != Some(0) {
-            match cursor.validate_limited_read(start).await {
+            match cursor.fence_unchanged_since(start).await {
                 Err(SourceError::Changed) => {
                     let window = cursor.fence().await?;
                     for batch in &window.batches {
@@ -219,7 +222,7 @@ impl QueryProjection {
         let mut rows = BTreeMap::new();
         let mut candidates = BTreeSet::new();
         let mut ordered = Vec::new();
-        let paths = QueryTree::key_paths(&self.spec);
+        let paths = key_paths(&self.spec);
         if self.selection.limit != Some(0) {
             for state in node.storage.fetch_states(&self.selection).await? {
                 let id = state.payload.entity_id;

@@ -3,9 +3,9 @@
 use super::{
     bootstrap::{CapturedQuery, QueryProjection, TreeUpdate, MAX_READ_ATTEMPTS},
     identity::{Coverage, Identity},
-    lease::{Capture, Command, Resident},
+    lease::{Command, Resident, ResidentSnapshot},
     route::{current_state, Route},
-    Entries,
+    Lru,
 };
 use crate::{
     node::{state_sync::Snapshot, Node, WeakNode},
@@ -24,14 +24,14 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 type RouteMembership = (BTreeMap<proto::EntityId, proto::QueryMember>, Vec<proto::EntityId>);
 
-pub(crate) struct QuerySource<CD: ContextData> {
+pub(crate) struct ResidentActor<CD: ContextData> {
     credentials: Vec<CD>,
     pub(super) projection: QueryProjection,
     pub(super) cursor: MaintenanceSubscription<TreeUpdate>,
     pub(super) revision: u64,
     pub(super) routes: Vec<Route>,
 }
-impl<CD: ContextData> QuerySource<CD> {
+impl<CD: ContextData> ResidentActor<CD> {
     pub(super) fn credentials(&self) -> &[CD] { &self.credentials }
     pub(super) fn from_capture(credentials: Vec<CD>, capture: CapturedQuery) -> Self {
         Self { credentials, projection: capture.projection, cursor: capture.cursor, revision: capture.revision, routes: Vec::new() }
@@ -181,7 +181,7 @@ impl<CD: ContextData> QuerySource<CD> {
                 pending.push(batch);
             }
             let (rows, candidates, ordered) = self.projection.read(node, &policy).await?;
-            match self.cursor.validate_limited_read(window.revision).await {
+            match self.cursor.fence_unchanged_since(window.revision).await {
                 Err(SourceError::Changed) => continue,
                 result => {
                     let revision = result?.revision;
@@ -235,7 +235,7 @@ impl<CD: ContextData> QuerySource<CD> {
     }
 }
 
-impl<CD: ContextData> QuerySource<CD> {
+impl<CD: ContextData> ResidentActor<CD> {
     /// Run this actor until its resident is dropped or the node stops, then
     /// remove its entry and invalidate the routes it still serves.
     #[allow(clippy::too_many_arguments)]
@@ -245,10 +245,10 @@ impl<CD: ContextData> QuerySource<CD> {
         receiver: mpsc::Receiver<Command<CD>>,
         canceled: oneshot::Receiver<()>,
         cleanup: Arc<Notify>,
-        entries: Weak<Mutex<Entries<CD>>>,
+        lru: Weak<Mutex<Lru<CD>>>,
         resident: Weak<Resident<CD>>,
         id: u64,
-        scope: Identity<CD>,
+        identity: Identity<CD>,
     ) where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -261,13 +261,13 @@ impl<CD: ContextData> QuerySource<CD> {
             let result = tokio::select! {
                 _ = canceled => Ok(()),
                 _ = run.wait_value(false) => Ok(()),
-                result = run_resident(&mut actor, weak.clone(), receiver, cleanup, &entries, id, &scope) => result,
+                result = run_resident(&mut actor, weak.clone(), receiver, cleanup, &lru, id, &identity) => result,
             };
             if let Some(resident) = resident.upgrade() {
                 resident.alive.store(false, Ordering::Release);
             }
-            if let Some(entries) = entries.upgrade() {
-                entries.lock().unwrap().entries.retain(|entry| entry.id != id);
+            if let Some(lru) = lru.upgrade() {
+                lru.lock().unwrap().slots.retain(|slot| slot.id != id);
             }
             // Removal is immediate; transport cleanup may wait for its handler.
             if let Err(error) = result {
@@ -293,13 +293,13 @@ impl<CD: ContextData> QuerySource<CD> {
 }
 
 async fn run_resident<SE, PA>(
-    actor: &mut QuerySource<PA::ContextData>,
+    actor: &mut ResidentActor<PA::ContextData>,
     weak: WeakNode<SE, PA>,
     mut commands: mpsc::Receiver<Command<PA::ContextData>>,
     cleanup: Arc<Notify>,
-    entries: &Weak<Mutex<Entries<PA::ContextData>>>,
+    lru: &Weak<Mutex<Lru<PA::ContextData>>>,
     id: u64,
-    scope: &Identity<PA::ContextData>,
+    identity: &Identity<PA::ContextData>,
 ) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -313,11 +313,11 @@ where
                 let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                 let captured = async {
                     node.system.check_not_halted()?;
-                    scope.check(&node)?;
+                    identity.check(&node)?;
                     let snapshot = actor.refresh(&node).await?;
                     actor.check_authorization(&node).await?;
-                    let entries = entries.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
-                    entries.lock().unwrap().update_bytes(id, actor.accounted_bytes())?;
+                    let lru = lru.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
+                    lru.lock().unwrap().update_bytes(id, actor.accounted_bytes())?;
                     Ok::<_, anyhow::Error>(snapshot)
                 }.await;
                 let snapshot = match captured {
@@ -325,8 +325,8 @@ where
                     Err(error) => {
                         // A retry must not reacquire the failed source before
                         // the actor's outer cleanup has removed its entry.
-                        if let Some(entries) = entries.upgrade() {
-                            entries.lock().unwrap().entries.retain(|entry| entry.id != id);
+                        if let Some(lru) = lru.upgrade() {
+                            lru.lock().unwrap().slots.retain(|slot| slot.id != id);
                         }
                         command.reject(&error);
                         return Err(error);
@@ -349,7 +349,7 @@ where
                     }
                 };
                 match command {
-                    Command::Snapshot { response, .. } => { let _ = response.send(Ok(Capture { revision: actor.revision, snapshot })); }
+                    Command::Snapshot { response, .. } => { let _ = response.send(Ok(ResidentSnapshot { revision: actor.revision, snapshot })); }
                     Command::Subscribe { view, peer, request, fingerprint, query, version, catalog, known, owner, response } => {
                         if response.is_closed() || owner.strong_count() == 0 { continue; }
                         let members = snapshot.query_members();
@@ -370,12 +370,12 @@ where
             batch = actor.cursor.next() => {
                 let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                 node.system.check_not_halted()?;
-                scope.check(&node)?;
+                identity.check(&node)?;
                 actor.publish(&node, batch?).await?;
             }
             _ = cleanup.notified() => { actor.routes.retain(|route| route.owner.strong_count() != 0); }
         }
-        let entries = entries.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
-        entries.lock().unwrap().update_bytes(id, actor.accounted_bytes())?;
+        let lru = lru.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
+        lru.lock().unwrap().update_bytes(id, actor.accounted_bytes())?;
     }
 }

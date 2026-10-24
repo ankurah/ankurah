@@ -1,5 +1,6 @@
-//! A query's delivered event frontier is independent of the entity's current state.
-//! Initial snapshots can advance the latter without consuming live notifications.
+//! The events a query still has to deliver for an entity. Each query keeps the
+//! frontier of the events it has delivered apart from the entity's current
+//! state, which an initial snapshot advances without delivering any events.
 use crate::{
     error::RetrievalError,
     event_dag::{compare, AbstractCausalRelation, DEFAULT_BUDGET},
@@ -7,6 +8,8 @@ use crate::{
 };
 use ankurah_proto as proto;
 
+/// An event the reactor delivers. `causal_event` is the protocol event whose parents place it in
+/// its entity's history; an event without one is always delivered.
 pub trait ReactorEvent: Clone + Send + 'static {
     fn causal_event(&self) -> Option<&proto::Event> { None }
 }
@@ -14,14 +17,12 @@ impl ReactorEvent for proto::Attested<proto::Event> {
     fn causal_event(&self) -> Option<&proto::Event> { Some(&self.payload) }
 }
 
-#[derive(Debug)]
-pub struct NotificationFailure {
-    pub query: Option<proto::QueryId>,
-    pub version: u32,
-    pub error: RetrievalError,
-}
-
-pub(super) async fn filter<Ev: ReactorEvent>(
+/// The events among `events` that `delivered` does not yet include, in order,
+/// and the frontier advanced past them. An event whose parent is not the
+/// frontier is traced to it through `history`: an ancestor of the frontier is
+/// dropped, a descendant replaces it, and a concurrent event joins the tips it
+/// does not descend from.
+pub(super) async fn undelivered_events<Ev: ReactorEvent>(
     history: Option<&(dyn GetEvents + Send + Sync)>,
     mut delivered: proto::Clock,
     events: &[Ev],
@@ -69,93 +70,4 @@ pub(super) async fn filter<Ev: ReactorEvent>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        retrieval::LocalEventGetter,
-        storage::{StorageEngine, StorageTransaction},
-        test_utils::TestStorage,
-    };
-    use std::sync::Arc;
-
-    #[tokio::test]
-    async fn descendant_notification_needs_connecting_history_but_not_the_baseline_event() -> anyhow::Result<()> {
-        let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, proto::OperationSet::default());
-        let baseline = proto::Clock::singleton(&genesis);
-        let parent = proto::Event::update(genesis.entity_id, baseline.clone(), proto::AuthorId::Unknown, proto::OperationSet::default());
-        let child = proto::Event::update(
-            genesis.entity_id,
-            proto::Clock::singleton(&parent),
-            proto::AuthorId::Unknown,
-            proto::OperationSet::default(),
-        );
-        let storage = Arc::new(TestStorage::default());
-        let mut transaction = storage.transaction();
-        transaction.add_events(&[parent.clone().into(), child.clone().into()]).await?;
-        transaction.commit().await?.committed()?;
-        // An initial snapshot establishes the baseline clock without supplying
-        // its event payload. The later live child supplies the connecting history.
-        assert!(storage.get_events(vec![genesis.id()]).await?.is_empty());
-        let history = LocalEventGetter::new(storage, false);
-        let (frontier, accepted) = filter(Some(&history), baseline, &[proto::Attested::from(child.clone())]).await?;
-        assert_eq!(frontier, proto::Clock::singleton(&child));
-        assert_eq!(accepted.len(), 1);
-        let (frontier, accepted) =
-            filter(Some(&history), frontier, &[proto::Attested::from(parent), proto::Attested::from(child.clone())]).await?;
-        assert_eq!(frontier, proto::Clock::singleton(&child));
-        assert!(accepted.is_empty(), "connecting history and duplicate live events remain silent");
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn concurrent_notifications_keep_a_minimal_frontier_and_suppress_ancestor_replays() -> anyhow::Result<()> {
-        let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, proto::OperationSet::default());
-        let baseline = proto::Clock::singleton(&genesis);
-        let branch = |model: u8| {
-            proto::Event::update(
-                genesis.entity_id,
-                baseline.clone(),
-                proto::AuthorId::Unknown,
-                proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(proto::ModelId::EntityId(
-                    proto::EntityId::from_bytes([model; 32]),
-                )))]),
-            )
-        };
-        let left = branch(1);
-        let right = branch(2);
-        let merged = proto::Event::update(
-            genesis.entity_id,
-            proto::Clock::from_events([&left, &right]),
-            proto::AuthorId::Unknown,
-            proto::OperationSet::default(),
-        );
-        let storage = Arc::new(TestStorage::default());
-        let mut transaction = storage.transaction();
-        transaction
-            .add_events(
-                &[genesis.clone(), left.clone(), right.clone(), merged.clone()].into_iter().map(proto::Attested::from).collect::<Vec<_>>(),
-            )
-            .await?;
-        transaction.commit().await?.committed()?;
-        let history = LocalEventGetter::new(storage, false);
-        let (frontier, accepted) =
-            filter(Some(&history), baseline, &[proto::Attested::from(left.clone()), proto::Attested::from(right.clone())]).await?;
-        assert_eq!(frontier, proto::Clock::from_events([&left, &right]));
-        assert_eq!(accepted.len(), 2);
-        let (frontier, accepted) = filter(
-            Some(&history),
-            frontier,
-            &[
-                proto::Attested::from(merged.clone()),
-                proto::Attested::from(left),
-                proto::Attested::from(right),
-                proto::Attested::from(genesis),
-            ],
-        )
-        .await?;
-        assert_eq!(frontier, proto::Clock::singleton(&merged));
-        assert_eq!(accepted.len(), 1);
-        assert_eq!(accepted[0].payload.id(), merged.id());
-        Ok(())
-    }
-}
+mod tests;

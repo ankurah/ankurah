@@ -1,7 +1,7 @@
 use super::*;
 
 async fn capture(node: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<CapturedQuery> {
-    let spec = QueryTree::spec(&selection, &node.catalog);
+    let spec = spec_for(&selection, &node.catalog);
     capture_filtered_query(
         node,
         selection.clone(),
@@ -100,7 +100,7 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
     let stream = pending.id();
     pending.initialize(&node).await?;
     let owner = Arc::new(());
-    let mut actor = QuerySource::from_capture(vec![DEFAULT_CONTEXT], captured);
+    let mut actor = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], captured);
     actor.routes.push(Route { peer, stream, owner: Arc::downgrade(&owner), selection: selected.clone(), filtered: selected, members });
 
     let first = update(&initial[0], "09")?;
@@ -186,7 +186,7 @@ async fn zero_limit_ignores_application_publications_without_reads_or_retention(
     let node = node().await?;
     let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
     let captured = capture(&node, selection(Some(0))).await?;
-    let mut actor = QuerySource::from_capture(vec![DEFAULT_CONTEXT], captured);
+    let mut actor = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], captured);
     apply(&node, &genesis("01")?).await?;
     let before = actor.revision;
     let current = actor.refresh(&node).await?;

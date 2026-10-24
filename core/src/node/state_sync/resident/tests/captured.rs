@@ -6,7 +6,7 @@ async fn maintenance_and_captures_retain_only_keys_and_cloned_heads() -> anyhow:
     let original = genesis("01")?;
     apply(&node, &original).await?;
     let selected = selection(None);
-    let spec = QueryTree::spec(&selected, &node.catalog);
+    let spec = spec_for(&selected, &node.catalog);
     let mut captured = capture_query(&node, selected, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     let id = original.entity_id;
     let frozen = captured.snapshot;

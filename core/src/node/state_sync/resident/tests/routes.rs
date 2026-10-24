@@ -39,7 +39,7 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
     for event in &events {
         apply(&node, event).await?;
     }
-    let spec = QueryTree::spec(&selection(Some(2)), &node.catalog);
+    let spec = spec_for(&selection(Some(2)), &node.catalog);
     let tree = Arc::new(QueryTree::default());
     let mut capture = capture_query(&node, selection(None), spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
     let frozen = tree.current_snapshot().await?.select(&selection(Some(1)), &node.catalog).await?;
@@ -83,7 +83,7 @@ async fn shared_tree_routes_apply_different_membership_predicates() -> anyhow::R
     apply(&node, &initial).await?;
     let mut admitted = above("00");
     admitted.order_by = None;
-    let spec = QueryTree::spec(&admitted, &node.catalog);
+    let spec = spec_for(&admitted, &node.catalog);
     let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     let mut all = route(&node, &capture.projection, admitted).await?;
     let mut narrow = route(&node, &capture.projection, above("05")).await?;
@@ -124,7 +124,7 @@ async fn a_denied_event_only_fails_routes_that_would_deliver_it() -> anyhow::Res
     node.wait_ready().await?;
     apply(&node, &initial).await?;
     let admitted = above("00");
-    let spec = QueryTree::spec(&admitted, &node.catalog);
+    let spec = spec_for(&admitted, &node.catalog);
     let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     let mut includes = route(&node, &capture.projection, admitted).await?;
     let mut excludes = route(&node, &capture.projection, above("03")).await?;
@@ -171,7 +171,7 @@ async fn unchanged_replacements_follow_query_order_after_commit_changes() -> any
     }
     let mut limited = selection(Some(2));
     limited.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
-    let spec = QueryTree::spec(&limited, &node.catalog);
+    let spec = spec_for(&limited, &node.catalog);
     let tree = Arc::new(QueryTree::default());
     let mut capture = capture_query(&node, selection(None), spec, vec![DEFAULT_CONTEXT], tree).await?;
     let mut route = route(&node, &capture.projection, limited).await?;
@@ -231,7 +231,7 @@ async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<(
     let stream = pending.id();
     pending.initialize(&node).await?;
     let owner = Arc::new(());
-    let mut actor = QuerySource::from_capture(vec![DEFAULT_CONTEXT], capture);
+    let mut actor = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], capture);
     actor.routes.push(Route { peer, stream, owner: Arc::downgrade(&owner), selection: selected.clone(), filtered: selected, members });
     let first = update(&initial[0], "09")?;
     let second = update(&initial[1], "08")?;

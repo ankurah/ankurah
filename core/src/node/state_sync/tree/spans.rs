@@ -32,7 +32,7 @@ impl Snapshot {
         }
         // A bounded disjoint frontier recognizes both equal inventories and
         // small changed spans without serial refinement exchanges.
-        let root = self.span_digest(crate::node::state_sync::whole()).await?;
+        let root = self.span_digest(proto::TreeSpan::all()).await?;
         let mut frontier = vec![(root, true)];
         for _ in 0..OFFER_REFINEMENTS {
             let Some(index) = frontier
@@ -86,7 +86,7 @@ impl Snapshot {
         .ok()?;
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
-            spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: crate::node::state_sync::whole(), heads })],
+            spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads })],
         };
         inventory.work_bytes().ok().filter(|work| *work <= MAX_OFFER_BYTES as u64).map(|_| inventory)
     }

@@ -6,11 +6,11 @@ mod lease;
 mod route;
 
 use self::{
-    actor::QuerySource,
+    actor::ResidentActor,
     identity::{compatible_access, compatible_selection, Coverage, Identity, QueryView},
     lease::Resident,
 };
-use super::QueryTree;
+use super::tree::{serves, spec_for, QueryTree};
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
@@ -21,7 +21,7 @@ use crate::{
 use ankql::ast::{Resolved, Selection};
 use ankurah_digest_tree::TreeSpec;
 use ankurah_proto as proto;
-pub(crate) use lease::{Capture, ResidentLease, ResidentPin, ResidentSubscription};
+pub(crate) use lease::{ResidentLease, ResidentPin, ResidentSnapshot, ResidentSubscription};
 use std::{
     collections::VecDeque,
     sync::{
@@ -38,17 +38,17 @@ const MAX_BYTES: usize = 128 * 1024 * 1024;
 /// entries under the existing operation/stream bounds; the LRU count and byte
 /// allowances bound additional idle retention. Frozen rounds remain independent.
 pub(crate) struct ResidentTrees<CD: ContextData> {
-    entries: Arc<Mutex<Entries<CD>>>,
+    lru: Arc<Mutex<Lru<CD>>>,
     // Only misses serialize. Hits never wait for an unrelated storage scan.
     builds: tokio::sync::Mutex<()>,
 }
-struct Entries<CD: ContextData> {
-    entries: VecDeque<Entry<CD>>,
+struct Lru<CD: ContextData> {
+    slots: VecDeque<Slot<CD>>,
     next_id: u64,
     max_entries: usize,
     max_bytes: usize,
 }
-struct Entry<CD: ContextData> {
+struct Slot<CD: ContextData> {
     id: u64,
     identity: Identity<CD>,
     resident: Arc<Resident<CD>>,
@@ -62,27 +62,25 @@ impl<CD: ContextData> Default for ResidentTrees<CD> {
 impl<CD: ContextData> ResidentTrees<CD> {
     pub(super) fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self {
-            entries: Arc::new(Mutex::new(Entries { entries: VecDeque::new(), next_id: 0, max_entries, max_bytes })),
+            lru: Arc::new(Mutex::new(Lru { slots: VecDeque::new(), next_id: 0, max_entries, max_bytes })),
             builds: tokio::sync::Mutex::new(()),
         }
     }
     #[cfg(test)]
-    pub(crate) fn evict_idle(&self) {
-        self.entries.lock().unwrap().entries.retain(|entry| entry.resident.pins.load(Ordering::Acquire) != 0);
-    }
+    pub(crate) fn evict_idle(&self) { self.lru.lock().unwrap().slots.retain(|slot| slot.resident.pins.load(Ordering::Acquire) != 0); }
     #[cfg(test)]
-    pub(crate) fn len(&self) -> usize { self.entries.lock().unwrap().entries.len() }
+    pub(crate) fn len(&self) -> usize { self.lru.lock().unwrap().slots.len() }
 
     pub(crate) fn can_retry(error: &anyhow::Error) -> bool {
         matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Changed | SourceError::Lagged | SourceError::CatalogChanged))
     }
-    pub(crate) async fn capture<SE, PA>(
+    pub(crate) async fn snapshot<SE, PA>(
         &self,
         node: &Node<SE, PA>,
         selection: Selection<Resolved>,
         spec: Option<proto::TreeSpec>,
         credentials: Vec<CD>,
-    ) -> anyhow::Result<Capture>
+    ) -> anyhow::Result<ResidentSnapshot>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -117,9 +115,9 @@ impl<CD: ContextData> ResidentTrees<CD> {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
         let mut filtered = selection.clone();
         filtered.predicate = policy.filter_predicate(filtered.predicate)?;
-        let wire_required = spec.is_some();
-        let spec = spec.unwrap_or_else(|| QueryTree::spec(&selection, &node.catalog));
-        anyhow::ensure!(QueryTree::serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
+        let peer_spec = spec.is_some();
+        let spec = spec.unwrap_or_else(|| spec_for(&selection, &node.catalog));
+        anyhow::ensure!(serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
         let requested = Identity {
             coverage: Coverage::for_selection(&selection),
             selection,
@@ -128,11 +126,11 @@ impl<CD: ContextData> ResidentTrees<CD> {
             spec,
             credentials,
         };
-        if let Some(lease) = self.entries.lock().unwrap().get(&requested, &node.catalog, wire_required) {
+        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec) {
             return Ok(lease);
         }
         let _build = self.builds.lock().await;
-        if let Some(lease) = self.entries.lock().unwrap().get(&requested, &node.catalog, wire_required) {
+        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec) {
             return Ok(lease);
         }
         let view = Arc::new(QueryView {
@@ -162,7 +160,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         )
         .await?;
         node.system.check_not_halted()?;
-        let actor = QuerySource::from_capture(identity.credentials.clone(), captured);
+        let actor = ResidentActor::from_capture(identity.credentials.clone(), captured);
         let bytes = actor.accounted_bytes();
         let (commands, receiver) = mpsc::channel(8);
         let (stop, canceled) = oneshot::channel();
@@ -175,73 +173,72 @@ impl<CD: ContextData> ResidentTrees<CD> {
             pins: AtomicUsize::new(0),
             #[cfg(test)]
             tree,
-            cache: Arc::downgrade(&self.entries),
+            lru: Arc::downgrade(&self.lru),
         });
         let lease = ResidentLease::new(resident.clone(), view);
-        let scope = identity.clone();
         let id = {
-            let mut entries = self.entries.lock().unwrap();
-            let id = entries.next_id;
-            entries.next_id = id.checked_add(1).ok_or_else(|| anyhow::anyhow!("resident tree identity exhausted"))?;
-            entries.entries.push_back(Entry { id, identity, resident: resident.clone(), bytes });
+            let mut lru = self.lru.lock().unwrap();
+            let id = lru.next_id;
+            lru.next_id = id.checked_add(1).ok_or_else(|| anyhow::anyhow!("resident tree identity exhausted"))?;
+            lru.slots.push_back(Slot { id, identity: identity.clone(), resident: resident.clone(), bytes });
             id
         };
-        actor.spawn(node, receiver, canceled, cleanup, Arc::downgrade(&self.entries), Arc::downgrade(&resident), id, scope);
+        actor.spawn(node, receiver, canceled, cleanup, Arc::downgrade(&self.lru), Arc::downgrade(&resident), id, identity);
         Ok(lease)
     }
 }
 
-impl<CD: ContextData> Entries<CD> {
+impl<CD: ContextData> Lru<CD> {
     fn get(
         &mut self,
         requested: &Identity<CD>,
         catalog: &crate::schema::catalog::CatalogManager,
-        wire_required: bool,
+        peer_spec: bool,
     ) -> Option<ResidentLease<CD>> {
-        self.entries.retain(|entry| entry.resident.alive.load(Ordering::Acquire));
-        let compatible = |entry: &Entry<CD>| {
-            let existing = &entry.identity;
+        self.slots.retain(|slot| slot.resident.alive.load(Ordering::Acquire));
+        let compatible = |slot: &Slot<CD>| {
+            let existing = &slot.identity;
             existing.coverage.permits(&requested.selection)
                 && existing.credentials == requested.credentials
                 && existing.retrieval == requested.retrieval
-                && (!wire_required || existing.spec.key_spec() == requested.spec.key_spec())
+                && (!peer_spec || existing.spec.key_spec() == requested.spec.key_spec())
                 && compatible_selection(existing, requested, catalog)
                 && compatible_access(existing, requested, catalog)
         };
         let position = self
-            .entries
+            .slots
             .iter()
-            .rposition(|entry| matches!(entry.identity.coverage, Coverage::Complete) && compatible(entry))
-            .or_else(|| self.entries.iter().rposition(|entry| entry.identity.spec == requested.spec && compatible(entry)))
-            .or_else(|| self.entries.iter().rposition(compatible))?;
-        let entry = self.entries.remove(position)?;
+            .rposition(|slot| matches!(slot.identity.coverage, Coverage::Complete) && compatible(slot))
+            .or_else(|| self.slots.iter().rposition(|slot| slot.identity.spec == requested.spec && compatible(slot)))
+            .or_else(|| self.slots.iter().rposition(compatible))?;
+        let slot = self.slots.remove(position)?;
         let view = Arc::new(QueryView {
             selection: requested.selection.clone(),
             filtered: requested.filtered.clone(),
-            spec: if wire_required { requested.spec.clone() } else { entry.identity.spec.clone() },
+            spec: if peer_spec { requested.spec.clone() } else { slot.identity.spec.clone() },
         });
-        let lease = ResidentLease::new(entry.resident.clone(), view);
-        self.entries.push_back(entry);
+        let lease = ResidentLease::new(slot.resident.clone(), view);
+        self.slots.push_back(slot);
         Some(lease)
     }
     fn trim_idle(&mut self) {
         // A result too large for idle retention must not evict useful small trees.
-        self.entries.retain(|entry| entry.resident.pins.load(Ordering::Acquire) != 0 || entry.bytes <= self.max_bytes);
+        self.slots.retain(|slot| slot.resident.pins.load(Ordering::Acquire) != 0 || slot.bytes <= self.max_bytes);
         loop {
-            let idle = self.entries.iter().filter(|entry| entry.resident.pins.load(Ordering::Acquire) == 0);
-            let (count, bytes) = idle.fold((0, 0usize), |(count, bytes), entry| (count + 1, bytes.saturating_add(entry.bytes)));
+            let idle = self.slots.iter().filter(|slot| slot.resident.pins.load(Ordering::Acquire) == 0);
+            let (count, bytes) = idle.fold((0, 0usize), |(count, bytes), slot| (count + 1, bytes.saturating_add(slot.bytes)));
             if count <= self.max_entries && bytes <= self.max_bytes {
                 break;
             }
-            let Some(victim) = self.entries.iter().position(|entry| entry.resident.pins.load(Ordering::Acquire) == 0) else {
+            let Some(victim) = self.slots.iter().position(|slot| slot.resident.pins.load(Ordering::Acquire) == 0) else {
                 break;
             };
-            self.entries.remove(victim);
+            self.slots.remove(victim);
         }
     }
     fn update_bytes(&mut self, id: u64, bytes: usize) -> anyhow::Result<()> {
-        let entry = self.entries.iter_mut().find(|entry| entry.id == id).ok_or_else(|| anyhow::anyhow!("resident tree evicted"))?;
-        entry.bytes = bytes;
+        let slot = self.slots.iter_mut().find(|slot| slot.id == id).ok_or_else(|| anyhow::anyhow!("resident tree evicted"))?;
+        slot.bytes = bytes;
         self.trim_idle();
         Ok(())
     }

@@ -1214,7 +1214,7 @@ impl Driver {
         let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
         let (selection, stored) = query.resolved_selection().ok_or_else(|| anyhow::anyhow!("query selection disappeared"))?;
         ensure!(stored == version, "refresh selection changed");
-        let mut snapshot = node.resident_trees.capture(node, selection, Some(self.spec.clone()), credentials.to_vec()).await?.snapshot;
+        let mut snapshot = node.resident_trees.snapshot(node, selection, Some(self.spec.clone()), credentials.to_vec()).await?.snapshot;
         query.retain_tree(version, snapshot.resident.clone());
         let known_state = snapshot.offer().await?;
         let number = self.round_number.checked_add(1).ok_or_else(|| anyhow::anyhow!("round number exhausted"))?;

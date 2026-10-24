@@ -91,7 +91,7 @@ async fn digest_and_cloned_heads_advance_together_without_retaining_payloads() -
     let mut input = keyed_state(1, 1, Some(Value::I64(5)))?.0;
     let original_head = input.payload.state.head.clone();
     let mut old = tree.refresh(keyed_spec(), vec![input.clone()]).await?;
-    let old_digest = old.span_digest(super::super::whole()).await?;
+    let old_digest = old.span_digest(proto::TreeSpan::all()).await?;
     input.payload.state.head = proto::Clock::genesis(proto::EventId::from_bytes([7; 32]));
     // Mutating the source state does not mutate the metadata that was admitted.
     assert_eq!(old.entries[&input.payload.entity_id].head, original_head);
@@ -103,8 +103,8 @@ async fn digest_and_cloned_heads_advance_together_without_retaining_payloads() -
     tree.apply_entries(vec![changed.clone()], vec![]).await?;
     let mut current = tree.current_snapshot().await?;
     assert_eq!(current.entries[&changed.entity_id], changed);
-    assert_ne!(current.span_digest(super::super::whole()).await?.digest, old_digest.digest);
-    assert_eq!(old.span_digest(super::super::whole()).await?, old_digest);
+    assert_ne!(current.span_digest(proto::TreeSpan::all()).await?.digest, old_digest.digest);
+    assert_eq!(old.span_digest(proto::TreeSpan::all()).await?, old_digest);
     assert_eq!(old.entries[&input.payload.entity_id].head, original_head);
     Ok(())
 }
@@ -113,16 +113,16 @@ async fn digest_and_cloned_heads_advance_together_without_retaining_payloads() -
 async fn different_spec_requires_a_distinct_tree() -> anyhow::Result<()> {
     let tree = QueryTree::default();
     let mut old = tree.refresh(spec(), vec![state(1, 1)]).await?;
-    let original = old.span_digest(super::super::whole()).await?;
+    let original = old.span_digest(proto::TreeSpan::all()).await?;
     assert!(tree.replace_values(keyed_spec(), vec![keyed_state(1, 2, Some(Value::I64(8)))?]).await.is_err());
     assert_eq!(tree.current_snapshot().await?.spec, spec());
-    assert_eq!(tree.current_snapshot().await?.span_digest(super::super::whole()).await?, original);
+    assert_eq!(tree.current_snapshot().await?.span_digest(proto::TreeSpan::all()).await?, original);
     let other = QueryTree::default();
     assert_ne!(
         other
             .replace_values(keyed_spec(), vec![keyed_state(1, 2, Some(Value::I64(8)))?])
             .await?
-            .span_digest(super::super::whole())
+            .span_digest(proto::TreeSpan::all())
             .await?
             .digest,
         original.digest
@@ -134,14 +134,14 @@ async fn different_spec_requires_a_distinct_tree() -> anyhow::Result<()> {
 async fn invalid_entry_update_preserves_heads_membership_and_digest() -> anyhow::Result<()> {
     let tree = QueryTree::default();
     let mut old = tree.replace_values(keyed_spec(), vec![keyed_state(1, 1, Some(Value::I64(8)))?]).await?;
-    let digest = old.span_digest(super::super::whole()).await?;
+    let digest = old.span_digest(proto::TreeSpan::all()).await?;
     let id = numbered_state(1, 1).payload.entity_id;
     let invalid = TreeEntry { entity_id: id, key: vec![0xff], head: state(1, 2).payload.state.head };
     assert!(tree.apply_entries(vec![invalid], vec![id]).await.is_err());
     let mut current = tree.current_snapshot().await?;
     assert_eq!(current.entries, old.entries);
     assert_eq!(current.members(), old.members());
-    assert_eq!(current.span_digest(super::super::whole()).await?, digest);
+    assert_eq!(current.span_digest(proto::TreeSpan::all()).await?, digest);
     Ok(())
 }
 
@@ -160,12 +160,12 @@ async fn wide_clock_changes_offer_policy_without_changing_the_maintained_tree() 
                 .collect::<Vec<_>>(),
         )?;
         let mut snapshot = tree.refresh(spec(), vec![input]).await?;
-        assert!(snapshot.page(super::super::whole()).is_err(), "follow-up pages have the smaller budget");
-        let digest = snapshot.span_digest(super::super::whole()).await?;
+        assert!(snapshot.page(proto::TreeSpan::all()).is_err(), "follow-up pages have the smaller budget");
+        let digest = snapshot.span_digest(proto::TreeSpan::all()).await?;
         let offer = snapshot.offer().await?;
         assert_eq!(matches!(offer.spans.as_slice(), [proto::SpanContent::Heads(_)]), count == 3000);
         assert_eq!(digest.digest.count(), 1);
-        assert_eq!(tree.current_snapshot().await?.span_digest(super::super::whole()).await?, digest);
+        assert_eq!(tree.current_snapshot().await?.span_digest(proto::TreeSpan::all()).await?, digest);
     }
     Ok(())
 }
@@ -176,11 +176,11 @@ async fn projected_keys_match_transient_decoding_across_sparse_movement_and_dens
         (0..256).map(|id| keyed_state(id, 1, (id != 11).then_some(Value::I64(id as i64 - 128)))).collect::<anyhow::Result<Vec<_>>>()?;
     let query = QueryTree::default();
     let mut old = query.replace_values(keyed_spec(), initial.clone()).await?;
-    let original = old.span_digest(super::super::whole()).await?;
+    let original = old.span_digest(proto::TreeSpan::all()).await?;
     let original_members = old.members();
     let oracle = QueryTree::default();
     let mut decoded = oracle.refresh(keyed_spec(), initial.iter().map(|(state, _)| state.clone()).collect()).await?;
-    assert_eq!(original, decoded.span_digest(super::super::whole()).await?);
+    assert_eq!(original, decoded.span_digest(proto::TreeSpan::all()).await?);
     assert_eq!(original_members, decoded.members());
 
     let mut sparse = initial;
@@ -201,9 +201,9 @@ async fn projected_keys_match_transient_decoding_across_sparse_movement_and_dens
         let oracle = QueryTree::default();
         let mut decoded = oracle.refresh(keyed_spec(), rows.into_iter().map(|(state, _)| state).collect()).await?;
         assert_eq!(captured.members(), decoded.members());
-        assert_eq!(captured.span_digest(super::super::whole()).await?, decoded.span_digest(super::super::whole()).await?);
+        assert_eq!(captured.span_digest(proto::TreeSpan::all()).await?, decoded.span_digest(proto::TreeSpan::all()).await?);
         assert_eq!(old.members(), original_members);
-        assert_eq!(old.span_digest(super::super::whole()).await?, original);
+        assert_eq!(old.span_digest(proto::TreeSpan::all()).await?, original);
     }
     Ok(())
 }
@@ -216,7 +216,7 @@ async fn small_and_empty_inventories_offer_exact_heads_from_the_maintained_tree(
         let mut snapshot = query.refresh(spec(), states).await?;
         let inventory = snapshot.offer().await?;
         let [proto::SpanContent::Heads(page)] = inventory.spans.as_slice() else { panic!("expected one exact inventory") };
-        assert_eq!(page.bounds, super::super::whole());
+        assert_eq!(page.bounds, proto::TreeSpan::all());
         assert_eq!(page.heads.len(), count);
         assert_eq!(snapshot.members().len(), count);
         for (id, leaf) in page.heads.to_vec().iter().enumerate() {
@@ -253,7 +253,7 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let query = QueryTree::default();
     let mut old = query.replace_values(wide_spec.clone(), rows).await?;
-    let mut remaining = super::super::whole();
+    let mut remaining = proto::TreeSpan::all();
     let mut pages = Vec::new();
     let mut ids = Vec::new();
     loop {
@@ -261,10 +261,10 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
         assert_eq!(page.bounds.start, remaining.start);
         assert!(page.work_bytes()? <= MAX_PAGE_BYTES as u64);
         ids.extend(page.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id));
-        let complete = page.bounds.end == super::super::whole().end;
+        let complete = page.bounds.end == proto::TreeSpan::all().end;
         if !complete {
             let Bound::Included(last) = &page.bounds.end else { panic!("a byte-bounded page must advance") };
-            remaining = super::super::whole().after(last);
+            remaining = proto::TreeSpan::all().after(last);
         }
         pages.push(page);
         if complete {
@@ -282,7 +282,7 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
 
     let changed = (0..32).map(|id| keyed_state(id as u32, 2, Some(Value::String("changed".into())))).collect::<anyhow::Result<Vec<_>>>()?;
     query.replace_values(wide_spec, changed).await?;
-    assert_eq!(bincode::serialize(&old.page(super::super::whole())?)?, bincode::serialize(&pages[0])?);
+    assert_eq!(bincode::serialize(&old.page(proto::TreeSpan::all())?)?, bincode::serialize(&pages[0])?);
     Ok(())
 }
 
@@ -301,7 +301,7 @@ async fn a_page_fills_to_the_work_of_its_whole_keys() -> anyhow::Result<()> {
         .map(|id| keyed_state(id, 1, Some(Value::String("k".repeat(433)))))
         .collect::<anyhow::Result<Vec<_>>>()?;
     let snapshot = QueryTree::default().replace_values(spec, rows).await?;
-    let page = snapshot.page(super::super::whole())?;
+    let page = snapshot.page(proto::TreeSpan::all())?;
     assert_eq!(page.heads.len(), MAX_PAGE_HEADS);
     assert!(page.work_bytes()? <= MAX_PAGE_BYTES as u64);
     Ok(())
@@ -349,11 +349,11 @@ async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() 
     let inventory = old.offer().await?;
     assert!(inventory.spans.iter().all(|region| matches!(region, proto::SpanContent::Heads(_))));
 
-    let original = old.span_digest(super::super::whole()).await?;
+    let original = old.span_digest(proto::TreeSpan::all()).await?;
 
     let mut unchanged = query.refresh(spec(), initial).await?;
 
-    assert_eq!(unchanged.span_digest(super::super::whole()).await?, original);
+    assert_eq!(unchanged.span_digest(proto::TreeSpan::all()).await?, original);
     for states in [
         (10..80).map(|id| state(id, if id == 30 { 2 } else { 1 })).collect::<Vec<_>>(),
         (20..40).map(|id| state(id, 3)).collect(),
@@ -364,8 +364,8 @@ async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() 
         let recomputed_query = QueryTree::default();
         let mut recomputed = recomputed_query.refresh(spec(), states).await?;
         assert_eq!(incremental.members(), recomputed.members());
-        assert_eq!(incremental.span_digest(super::super::whole()).await?, recomputed.span_digest(super::super::whole()).await?);
-        assert_eq!(old.span_digest(super::super::whole()).await?, original);
+        assert_eq!(incremental.span_digest(proto::TreeSpan::all()).await?, recomputed.span_digest(proto::TreeSpan::all()).await?);
+        assert_eq!(old.span_digest(proto::TreeSpan::all()).await?, original);
     }
     Ok(())
 }
@@ -387,7 +387,7 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
     assert!(inventory.spans.len() > 1, "a new large tree must offer its bounded cached descendants");
     assert!(inventory.spans.len() <= MAX_OFFER_SPANS);
     assert!(bincode::serialized_size(&inventory)? <= FRONTIER_BYTES);
-    let mut next = super::super::whole().start;
+    let mut next = proto::TreeSpan::all().start;
     let mut digests = Vec::new();
     let mut empty = false;
     for region in inventory.spans {
@@ -402,9 +402,9 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
             Bound::Unbounded => Bound::Unbounded,
         };
     }
-    assert_eq!(next, super::super::whole().end);
+    assert_eq!(next, proto::TreeSpan::all().end);
     assert!(empty, "gaps before and after the populated addresses must remain explicit");
-    let root = snapshot.span_digest(super::super::whole()).await?;
+    let root = snapshot.span_digest(proto::TreeSpan::all()).await?;
     assert_eq!(ankurah_digest_tree::Digest::checked_sum(digests.iter().copied())?, root.digest);
 
     let mut warm = query.refresh(spec(), states).await?;
@@ -428,7 +428,7 @@ async fn complete_initial_inventories_are_bounded_and_immutable() -> anyhow::Res
         let offer = old.offer().await?;
         assert!(bincode::serialized_size(&offer)? <= MAX_OFFER_BYTES as u64);
         let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("one complete initial inventory") };
-        assert_eq!(inventory.bounds, super::super::whole());
+        assert_eq!(inventory.bounds, proto::TreeSpan::all());
         assert_eq!(inventory.heads.len(), count);
         let received = inventory.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id).collect::<Vec<_>>();
         let wire = bincode::serialize(&offer)?;
@@ -475,16 +475,16 @@ async fn incomplete_initial_inventory_falls_back_for_count_or_total_bytes() -> a
         )
         .await?;
     let mut pages = Vec::new();
-    let mut remaining = super::super::whole();
+    let mut remaining = proto::TreeSpan::all();
     loop {
         let page = wide.page(remaining)?;
         let end = page.bounds.end.clone();
         pages.push(proto::SpanContent::Heads(page));
-        if end == super::super::whole().end {
+        if end == proto::TreeSpan::all().end {
             break;
         }
         let Bound::Included(last) = end else { panic!("progress") };
-        remaining = super::super::whole().after(&last);
+        remaining = proto::TreeSpan::all().after(&last);
     }
     let oversized = proto::KnownState { spec: spec(), spans: pages };
     assert!(bincode::serialized_size(&oversized)? > MAX_OFFER_BYTES as u64);
@@ -502,7 +502,7 @@ async fn source_row_deltas_preserve_frozen_snapshots_across_sparse_and_dense_cha
     let initial = (0..192).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
     let tree = QueryTree::default();
     let mut old = tree.replace_values(keyed_spec(), initial.clone()).await?;
-    let old_head = old.span_digest(super::super::whole()).await?;
+    let old_head = old.span_digest(proto::TreeSpan::all()).await?;
     let old_members = old.members();
     let removed = initial[11].0.payload.entity_id;
     let sparse = keyed_state(10, 2, Some(Value::I64(-100)))?;
@@ -531,9 +531,9 @@ async fn source_row_deltas_preserve_frozen_snapshots_across_sparse_and_dense_cha
         let oracle = QueryTree::default();
         let mut rebuilt = oracle.refresh(keyed_spec(), expected.iter().map(|(state, _)| state.clone()).collect()).await?;
         assert_eq!(current.members(), rebuilt.members());
-        assert_eq!(current.span_digest(super::super::whole()).await?, rebuilt.span_digest(super::super::whole()).await?);
+        assert_eq!(current.span_digest(proto::TreeSpan::all()).await?, rebuilt.span_digest(proto::TreeSpan::all()).await?);
         assert_eq!(old.members(), old_members);
-        assert_eq!(old.span_digest(super::super::whole()).await?, old_head);
+        assert_eq!(old.span_digest(proto::TreeSpan::all()).await?, old_head);
     }
     let before = tree.current_snapshot().await?.members();
     let invalid = keyed_state(10, 4, Some(Value::String("wrong type".into())))?;
@@ -573,12 +573,12 @@ async fn catalog_arrival_preserves_an_accepted_entity_id_fallback() -> anyhow::R
         order_by: Some(vec![OrderByItem { path, direction: OrderDirection::Asc }]),
         limit: None,
     };
-    let fallback = QueryTree::spec(&selection, &CatalogManager::default());
+    let fallback = spec_for(&selection, &CatalogManager::default());
     assert!(fallback.key_spec().keyparts.is_empty(), "missing catalog types require entity-ID keys");
-    assert_eq!(QueryTree::spec(&selection, &node.catalog).key_spec().keyparts.len(), 1, "catalog types now permit a keyed layout");
+    assert_eq!(spec_for(&selection, &node.catalog).key_spec().keyparts.len(), 1, "catalog types now permit a keyed layout");
     let offer = proto::KnownState { spec: fallback.clone(), spans: vec![] };
     assert_eq!(
-        QueryTree::offered_spec(&selection, &node.catalog, &offer)?,
+        accept_peer_spec(&selection, &node.catalog, &offer)?,
         fallback,
         "the accepted fallback remains a distinct tree specification"
     );
@@ -629,13 +629,13 @@ async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyho
     );
     let offer = view.offer().await?;
     let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("small scoped inventory") };
-    assert_eq!(inventory.bounds, super::super::whole(), "scope gaps remain known-empty query addresses");
+    assert_eq!(inventory.bounds, proto::TreeSpan::all(), "scope gaps remain known-empty query addresses");
     assert_eq!(inventory.heads.len(), 55);
 
     let oracle = QueryTree::default();
     let mut selected = oracle.replace_values(keyed_spec(), rows[201..].to_vec()).await?;
-    let expected = selected.span_digest(super::super::whole()).await?;
-    let digest = view.span_digest(super::super::whole()).await?;
+    let expected = selected.span_digest(proto::TreeSpan::all()).await?;
+    let digest = view.span_digest(proto::TreeSpan::all()).await?;
     assert_eq!(digest, expected);
     let children = view.refine(&digest).await?;
     assert_eq!(Digest::checked_sum(children.iter().map(|child| child.digest))?, digest.digest);
@@ -647,7 +647,7 @@ async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyho
         );
     }
     let mut full = cache.current_snapshot().await?;
-    assert_eq!(full.span_digest(super::super::whole()).await?.digest.count(), 256, "selecting a view must not cache a partial tree");
+    assert_eq!(full.span_digest(proto::TreeSpan::all()).await?.digest.count(), 256, "selecting a view must not cache a partial tree");
     assert_eq!(full.entries.len(), 256);
     Ok(())
 }
@@ -667,8 +667,8 @@ async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Re
         high.entries.keys().copied().collect::<Vec<_>>(),
         (5..8).map(|id| numbered_state(id, 1).payload.entity_id).collect::<Vec<_>>()
     );
-    let low_before = low.span_digest(super::super::whole()).await?;
-    let high_before = high.span_digest(super::super::whole()).await?;
+    let low_before = low.span_digest(proto::TreeSpan::all()).await?;
+    let high_before = high.span_digest(proto::TreeSpan::all()).await?;
     assert_eq!(low_before.digest.count(), 2);
     assert_eq!(high_before.digest.count(), 3);
     let high_point = high.members.keys().next().unwrap().clone();
@@ -680,8 +680,8 @@ async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Re
     cache.apply_values(vec![keyed_state(99, 2, Some(Value::I64(-10)))?], vec![]).await?;
     let after = cache.current_snapshot().await?.select_request(&range_request(-1000, Some(2), false)).await?;
     assert_eq!(after.entries.keys().copied().collect::<Vec<_>>(), [0, 99].map(|id| numbered_state(id, 1).payload.entity_id));
-    assert_eq!(low.span_digest(super::super::whole()).await?, low_before);
-    assert_eq!(high.span_digest(super::super::whole()).await?, high_before);
+    assert_eq!(low.span_digest(proto::TreeSpan::all()).await?, low_before);
+    assert_eq!(high.span_digest(proto::TreeSpan::all()).await?, high_before);
     assert_eq!(cache.current_snapshot().await?.entries.len(), 9);
     Ok(())
 }
@@ -697,7 +697,7 @@ async fn limited_peers_answer_bounds_using_their_own_cut() -> anyhow::Result<()>
     for view in [&mut left, &mut right] {
         let offer = view.offer().await?;
         let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("limited inventory") };
-        assert_eq!(inventory.bounds, super::super::whole());
+        assert_eq!(inventory.bounds, proto::TreeSpan::all());
         assert_eq!(inventory.heads.len(), 2);
     }
     let left_last = left.members.keys().last().unwrap().clone();
@@ -708,8 +708,8 @@ async fn limited_peers_answer_bounds_using_their_own_cut() -> anyhow::Result<()>
     let point = proto::TreeSpan::new(Bound::Included(right_last.clone()), Bound::Included(right_last));
     assert_eq!(left.span_digest(point.clone()).await?.digest.count(), 0);
     assert_eq!(right.span_digest(point).await?.digest.count(), 1);
-    assert_eq!(left.span_digest(super::super::whole()).await?.digest.count(), 2);
-    assert_eq!(right.span_digest(super::super::whole()).await?.digest.count(), 2);
+    assert_eq!(left.span_digest(proto::TreeSpan::all()).await?.digest.count(), 2);
+    assert_eq!(right.span_digest(proto::TreeSpan::all()).await?.digest.count(), 2);
     Ok(())
 }
 
@@ -729,7 +729,7 @@ async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> 
 
     let mut view = full.with_spec(wire_spec.clone(), &selection, &catalog)?.select(&selection, &catalog).await?;
     assert_eq!(view.spec, wire_spec);
-    assert_eq!(view.span_digest(super::super::whole()).await?.digest.count(), 2);
+    assert_eq!(view.span_digest(proto::TreeSpan::all()).await?.digest.count(), 2);
     {
         let resident = cache.0.lock().await;
         let resident = resident.as_ref().unwrap();
@@ -737,7 +737,7 @@ async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> 
 
         assert_eq!(resident.entries.len(), 3);
     }
-    assert_eq!(cache.current_snapshot().await?.span_digest(super::super::whole()).await?.digest.count(), 3);
+    assert_eq!(cache.current_snapshot().await?.span_digest(proto::TreeSpan::all()).await?.digest.count(), 3);
     assert_eq!(cache.0.lock().await.as_ref().unwrap().tree.spec(), &spec());
     Ok(())
 }
@@ -750,9 +750,9 @@ async fn zero_limit_view_does_not_empty_the_resident_tree() -> anyhow::Result<()
     selection.limit = Some(0);
     let mut view = full.select(&selection, &CatalogManager::default()).await?;
     assert!(view.entries.is_empty());
-    assert_eq!(view.span_digest(super::super::whole()).await?.digest, Digest::empty());
+    assert_eq!(view.span_digest(proto::TreeSpan::all()).await?.digest, Digest::empty());
 
-    assert_eq!(cache.current_snapshot().await?.span_digest(super::super::whole()).await?.digest.count(), 8);
+    assert_eq!(cache.current_snapshot().await?.span_digest(proto::TreeSpan::all()).await?.digest.count(), 8);
     Ok(())
 }
 
@@ -791,18 +791,18 @@ fn compatible_offered_spec_accepts_broader_admission_but_rejects_invalid_keys() 
         right: Box::new(Expr::Literal(Value::EntityId(state(1, 1).payload.entity_id))),
     });
     let offer = proto::KnownState { spec: spec(), spans: vec![] };
-    assert_eq!(QueryTree::offered_spec(&selection, &catalog, &offer)?, spec());
+    assert_eq!(accept_peer_spec(&selection, &catalog, &offer)?, spec());
     let mut differently_ordered = selection.clone();
     differently_ordered.order_by = Some(vec![OrderByItem {
         path: PropertyPath::from(proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN]))),
         direction: OrderDirection::Desc,
     }]);
-    assert!(QueryTree::serves(&spec(), &differently_ordered, &catalog), "an unlimited order does not change the selected span");
+    assert!(serves(&spec(), &differently_ordered, &catalog), "an unlimited order does not change the selected span");
     let invalid =
         TreeSpec::new(KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(proto::PropertyId::Id, ValueType::I64)]), Predicate::True);
-    assert!(!QueryTree::serves(&invalid, &Selection::from(Predicate::True), &catalog));
+    assert!(!serves(&invalid, &Selection::from(Predicate::True), &catalog));
     let mut invalid = ankurah_core_types::IndexKeyPart::asc(proto::PropertyId::Id, ValueType::EntityId);
     invalid.collation = Some("unsupported".into());
-    assert!(!QueryTree::serves(&TreeSpec::new(KeySpec::new(vec![invalid]), Predicate::True), &selection, &catalog));
+    assert!(!serves(&TreeSpec::new(KeySpec::new(vec![invalid]), Predicate::True), &selection, &catalog));
     Ok(())
 }

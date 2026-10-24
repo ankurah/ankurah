@@ -1,6 +1,6 @@
 //! A frozen view of a resident's tree, selected for one query.
 
-use super::{Entries, Members, QueryTree, TreeEntry};
+use super::{key_paths, request_for, serves, Entries, Members, TreeEntry};
 use crate::schema::catalog::CatalogManager;
 use ankql::ast::{Resolved, Selection};
 use ankurah_core_types::PropertyPath;
@@ -29,7 +29,7 @@ impl Snapshot {
         if selection.limit == Some(0) || (self.physical_spec.predicate() == &selection.predicate && selection.limit.is_none()) {
             return false;
         }
-        match QueryTree::request(selection, catalog) {
+        match request_for(selection, catalog) {
             Ok(request) if self.physical_spec.serves(&request).is_some() => {
                 selection.limit.is_some() && self.has_descending_nulls(selection)
             }
@@ -49,11 +49,11 @@ impl Snapshot {
             return Ok(self);
         }
         anyhow::ensure!(!self.cannot_select(selection, catalog), UnsupportedTreeSelection);
-        self.select_request(&QueryTree::request(selection, catalog)?).await
+        self.select_request(&request_for(selection, catalog)?).await
     }
 
     pub(super) fn has_descending_nulls(&self, selection: &Selection<Resolved>) -> bool {
-        let paths = QueryTree::key_paths(&self.physical_spec);
+        let paths = key_paths(&self.physical_spec);
         selection.order_by.iter().flatten().filter(|item| item.direction == ankql::ast::OrderDirection::Desc).any(|item| {
             item.path != PropertyPath::id()
                 && !(item.path.subpath.is_empty()
@@ -71,8 +71,8 @@ impl Snapshot {
     pub fn with_spec(mut self, spec: TreeSpec, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Self> {
         anyhow::ensure!(
             self.physical_spec.key_spec() == spec.key_spec()
-                && QueryTree::serves(&self.physical_spec, selection, catalog)
-                && QueryTree::serves(&spec, selection, catalog),
+                && serves(&self.physical_spec, selection, catalog)
+                && serves(&spec, selection, catalog),
             "incompatible comparison tree spec"
         );
         self.spec = spec;
@@ -112,11 +112,11 @@ impl Snapshot {
         membership.order_by = None;
         membership.limit = None;
         let ranges = if self.physical_spec.predicate() == &membership.predicate {
-            vec![crate::node::state_sync::whole()]
+            vec![proto::TreeSpan::all()]
         } else {
-            self.physical_spec.selected_spans(&QueryTree::request(&membership, catalog)?, &self.members)?
+            self.physical_spec.selected_spans(&request_for(&membership, catalog)?, &self.members)?
         };
-        let paths = QueryTree::key_paths(&self.physical_spec);
+        let paths = key_paths(&self.physical_spec);
         let order = selection
             .order_by
             .iter()

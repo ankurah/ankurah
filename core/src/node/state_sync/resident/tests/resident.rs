@@ -78,18 +78,16 @@ async fn oversized_miss_does_not_evict_a_useful_small_entry() -> anyhow::Result<
     }
     let small = above("03", None);
     let capture =
-        capture_query(&node, small.clone(), QueryTree::spec(&small, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()))
-            .await?;
+        capture_query(&node, small.clone(), spec_for(&small, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     assert_eq!(capture.projection.tree.current_snapshot().await?.entries.len(), 1);
-    let small_bytes = QuerySource::from_capture(vec![DEFAULT_CONTEXT], capture).accounted_bytes();
+    let small_bytes = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], capture).accounted_bytes();
     let budget = small_bytes + 1;
     assert!(small_bytes <= budget);
     let all = selection(None);
     let full_capture =
-        capture_query(&node, all.clone(), QueryTree::spec(&all, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()))
-            .await?;
+        capture_query(&node, all.clone(), spec_for(&all, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     assert_eq!(full_capture.projection.tree.current_snapshot().await?.entries.len(), 4);
-    assert!(QuerySource::from_capture(vec![DEFAULT_CONTEXT], full_capture).accounted_bytes() > budget);
+    assert!(ResidentActor::from_capture(vec![DEFAULT_CONTEXT], full_capture).accounted_bytes() > budget);
     let cache = ResidentTrees::with_limits(2, budget);
     let resident = acquire(&cache, &node, above("03", None)).await?;
     let tree = resident.tree();
@@ -132,7 +130,7 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
                 selection.clone(),
                 Some(&DEFAULT_CONTEXT),
                 1,
-                proto::KnownState { spec: QueryTree::spec(&selection, &node.catalog), spans: vec![] },
+                proto::KnownState { spec: spec_for(&selection, &node.catalog), spans: vec![] },
             )
             .await?;
         let (_, tree) = handler.subscription_handler.query_tree_for_test(query).await.unwrap();
@@ -192,19 +190,19 @@ async fn permissions_are_rechecked_and_new_grants_are_not_lost() -> anyhow::Resu
         apply(&node, &genesis(value)?).await?;
     }
     let selection = selection(None);
-    let spec = QueryTree::spec(&selection, &node.catalog);
-    let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
+    let spec = spec_for(&selection, &node.catalog);
+    let capture = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert!(capture.snapshot.entries.is_empty());
     allowed.store(true, Ordering::SeqCst);
-    let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
+    let capture = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(capture.snapshot.entries.len(), 1, "a newly granted cached candidate is discovered");
     discovery.store(true, Ordering::SeqCst);
-    let capture = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
+    let capture = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(capture.snapshot.entries.len(), 2, "a broader discovery scope requires a fresh capture");
-    let denied = node.resident_trees.capture(&node, selection.clone(), Some(spec.clone()), vec![]).await?;
+    let denied = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![]).await?;
     assert!(denied.snapshot.entries.is_empty(), "empty credentials are not privileged and never borrow an authorized view");
     allowed.store(false, Ordering::SeqCst);
-    let denied = node.resident_trees.capture(&node, selection, Some(spec), vec![DEFAULT_CONTEXT]).await?;
+    let denied = node.resident_trees.snapshot(&node, selection, Some(spec), vec![DEFAULT_CONTEXT]).await?;
     assert!(denied.snapshot.entries.is_empty(), "revoked rows cannot be disclosed by a cache hit");
     assert_eq!(capture.snapshot.entries.len(), 2, "the old comparison snapshot is frozen independently");
     Ok(())

@@ -2,7 +2,10 @@
 
 use crate::{
     node::{
-        state_sync::{QueryTree, Snapshot},
+        state_sync::{
+            tree::{request_for, serves},
+            Snapshot,
+        },
         Node,
     },
     policy::{ContextPolicy, PolicyAgent},
@@ -91,7 +94,7 @@ pub(super) fn compatible_selection<CD: ContextData>(
     catalog: &crate::schema::catalog::CatalogManager,
 ) -> bool {
     let spec = &existing.spec;
-    if !QueryTree::serves(spec, &requested.selection, catalog) {
+    if !serves(spec, &requested.selection, catalog) {
         return false;
     }
     if matches!(existing.coverage, Coverage::Limited(_)) || requested.selection.limit.is_none() {
@@ -107,7 +110,7 @@ pub(super) fn compatible_selection<CD: ContextData>(
     }) {
         return false;
     }
-    QueryTree::request(&requested.selection, catalog).ok().is_some_and(|request| spec.serves(&request).is_some())
+    request_for(&requested.selection, catalog).ok().is_some_and(|request| spec.serves(&request).is_some())
 }
 
 /// A policy may depend on the requested predicate. A shared resident is safe
@@ -127,5 +130,5 @@ pub(super) fn compatible_access<CD: ContextData>(
     let mut filtered = requested.filtered.clone();
     filtered.limit = None;
     filtered.order_by = None;
-    QueryTree::request(&filtered, catalog).ok().and_then(|request| intersection.serves(&request)) == Some(TreeMatch::Whole)
+    request_for(&filtered, catalog).ok().and_then(|request| intersection.serves(&request)) == Some(TreeMatch::Whole)
 }

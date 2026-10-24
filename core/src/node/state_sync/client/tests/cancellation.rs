@@ -142,11 +142,10 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     let (server, client, query, messages) = stream_fixture_with_gate(gate.clone()).await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTree::default()
-        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
-        .await?;
+    let mut snapshot =
+        super::super::super::QueryTree::default().refresh(super::super::super::tree::spec_for(&selection, &client.catalog), states).await?;
     // Force real refinement work beyond frame zero while holding its continuations.
-    let mut start = super::super::super::whole().start;
+    let mut start = proto::TreeSpan::all().start;
     let mut spans = Vec::new();
     for n in 1..=32 {
         let bounds = proto::TreeSpan::new(start, Excluded(address(n)));
@@ -157,7 +156,7 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
         });
         start = Included(address(n));
     }
-    spans.push(proto::SpanContent::Digest(snapshot.span_digest(proto::TreeSpan::new(start, super::super::super::whole().end)).await?));
+    spans.push(proto::SpanContent::Digest(snapshot.span_digest(proto::TreeSpan::new(start, proto::TreeSpan::all().end)).await?));
     gate.store(true, Ordering::SeqCst);
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
@@ -247,9 +246,8 @@ async fn fetch_validation_error_abandons_once() -> anyhow::Result<()> {
     let (server, client, query, messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTree::default()
-        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
-        .await?;
+    let mut snapshot =
+        super::super::super::QueryTree::default().refresh(super::super::super::tree::spec_for(&selection, &client.catalog), states).await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) =
         request_state(&client, server.id, &credentials, proto::NodeRequestBody::Fetch { selection, known_state: snapshot.offer().await? })
@@ -270,9 +268,8 @@ async fn queued_fetch_cleanup_cannot_send_on_a_replacement_connection() -> anyho
     let (server, client, query, messages) = stream_fixture().await?;
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let mut snapshot = super::super::super::QueryTree::default()
-        .refresh(super::super::super::QueryTree::spec(&selection, &client.catalog), states)
-        .await?;
+    let mut snapshot =
+        super::super::super::QueryTree::default().refresh(super::super::super::tree::spec_for(&selection, &client.catalog), states).await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (mut stream, response) =
         request_state(&client, server.id, &credentials, proto::NodeRequestBody::Fetch { selection, known_state: snapshot.offer().await? })

@@ -1340,7 +1340,7 @@ impl Comparison {
         // A valid offer's spans are disjoint and within the tree; plan them in address order.
         let mut spans = known.spans;
         spans.sort_by(|a, b| a.bounds().cmp_start(b.bounds()));
-        let mut start = super::whole().start;
+        let mut start = proto::TreeSpan::all().start;
         let mut frontier = Some(Vec::new());
         for region in spans {
             let bounds = region.bounds();
@@ -1370,7 +1370,7 @@ impl Comparison {
             }
         }
         if !matches!(start, std::ops::Bound::Unbounded) {
-            let rest = TreeSpan::new(start, super::whole().end);
+            let rest = TreeSpan::new(start, proto::TreeSpan::all().end);
             if !rest.is_empty() {
                 comparison.work.push_back(Work::SendHeads(rest));
             }
@@ -1641,7 +1641,7 @@ impl Comparison {
                 },
                 Work::CompareFrontier(frontier) => {
                     let digest = ankurah_digest_tree::Digest::checked_sum(frontier.iter().map(|head| head.digest))?;
-                    if self.snapshot.span_digest(super::whole()).await?.digest == digest {
+                    if self.snapshot.span_digest(proto::TreeSpan::all()).await?.digest == digest {
                         None
                     } else {
                         for head in frontier {

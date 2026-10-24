@@ -230,7 +230,7 @@ impl Transaction {
                 relayed = true;
             }
             let mut publication = node.reactor.begin_commit().await;
-            publication.storage_result(storage_trx.commit().await)?.committed()?;
+            publication.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             let mut changes = Vec::new();
             for (entity, fork) in forks {
                 let change = fork.commit(&node.entities, &event_getter).await?;

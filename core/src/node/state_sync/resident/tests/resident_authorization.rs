@@ -21,7 +21,7 @@ async fn reactor_publication_evaluates_the_state_free_read_proof_for_each_change
     let mut current = genesis("01")?;
     apply(&node, &current).await?;
     let selected = selection(None);
-    let spec = QueryTree::spec(&selected, &node.catalog);
+    let spec = spec_for(&selected, &node.catalog);
     let mut captured = capture_query(&node, selected, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
     assert!(captured.snapshot.entries.contains_key(&current.entity_id));
 

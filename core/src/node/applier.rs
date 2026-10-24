@@ -321,7 +321,7 @@ impl NodeApplier {
         storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
         storage_trx.add_events(events).await?;
         let mut publication = node.reactor.begin_commit().await;
-        match publication.storage_result(storage_trx.commit().await)? {
+        match publication.record_storage_outcome(storage_trx.commit().await)? {
             crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
             crate::storage::StorageCommitOutcome::Committed(_) => {}
         }
@@ -366,7 +366,7 @@ impl NodeApplier {
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
             let mut publication = node.reactor.begin_commit().await;
-            publication.storage_result(storage_trx.commit().await)?.committed()?;
+            publication.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             if adopted {
                 let (_, entity) = node
                     .entities
@@ -410,7 +410,7 @@ impl NodeApplier {
             storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
             storage_trx.add_events(&events).await?;
             let mut publication = node.reactor.begin_commit().await;
-            publication.storage_result(storage_trx.commit().await)?.committed()?;
+            publication.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             let change = candidate.commit(&node.entities, event_getter).await?;
             publication.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
             Ok((!change.events().is_empty()).then_some(change))

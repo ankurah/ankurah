@@ -183,7 +183,7 @@ async fn definite_storage_rejection_does_not_poison_source() -> anyhow::Result<(
     let (start, mut cursor) = source.subscribe_maintenance(project).await?;
     let mut commit = source.begin_commit().await;
     assert!(matches!(
-        commit.storage_result(Ok(crate::storage::StorageCommitOutcome::Conflict { observed: Default::default() }))?,
+        commit.record_storage_outcome(Ok(crate::storage::StorageCommitOutcome::Conflict { observed: Default::default() }))?,
         crate::storage::StorageCommitOutcome::Conflict { .. }
     ));
     drop(commit);
@@ -386,10 +386,10 @@ async fn limited_read_validation_preserves_crossing_publications_for_retry() -> 
     let node = node().await?;
     let (start, mut cursor) = subscribe(&node).await?;
     apply(&node, &genesis(17), Delivery::Live).await?;
-    assert!(matches!(cursor.validate_limited_read(start).await, Err(SourceError::Changed)));
+    assert!(matches!(cursor.fence_unchanged_since(start).await, Err(SourceError::Changed)));
     let window = cursor.fence().await?;
     assert_eq!(window.batches.len(), 1);
-    let unchanged = cursor.validate_limited_read(window.revision).await?;
+    let unchanged = cursor.fence_unchanged_since(window.revision).await?;
     assert_eq!(unchanged.revision, window.revision);
     assert!(unchanged.batches.is_empty());
     Ok(())
