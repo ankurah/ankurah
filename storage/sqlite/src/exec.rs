@@ -64,14 +64,14 @@ pub trait SqliteExecutor {
 
     /// Run one statement and collect every row it yields, in order.
     fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError>;
+
+    /// Run one statement and return its first row, if it yields one, reading
+    /// no row past it, as rusqlite's `query_row` does: a row after the first
+    /// that cannot be read does not fail the call.
+    fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError>;
 }
 
 impl dyn SqliteExecutor + '_ {
-    /// Run a statement and return its first row, if it yields one.
-    pub fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
-        Ok(self.query(sql, params)?.into_iter().next())
-    }
-
     /// Open a transaction on this connection. It rolls back when dropped
     /// without [`Transaction::commit`], so an early `?` leaves nothing behind.
     pub fn begin(&self, behavior: Behavior) -> Result<Transaction<'_>, SqliteError> {
@@ -122,6 +122,10 @@ impl SqliteExecutor for Transaction<'_> {
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> { self.executor.execute(sql, params) }
 
     fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> { self.executor.query(sql, params) }
+
+    fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+        self.executor.query_row(sql, params)
+    }
 }
 
 impl<'e> std::ops::Deref for Transaction<'e> {

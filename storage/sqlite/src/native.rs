@@ -66,10 +66,23 @@ impl SqliteExecutor for Connection {
         let mut rows = statement.query(params_from_iter(params))?;
         let mut collected = Vec::new();
         while let Some(row) = rows.next()? {
-            collected.push(Row::new((0..width).map(|index| value_from_ref(index, row.get_ref(index)?)).collect::<Result<_, _>>()?));
+            collected.push(row_of(row, width)?);
         }
         Ok(collected)
     }
+
+    fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+        let mut statement = one_statement(self, sql)?;
+        let width = statement.column_count();
+        let mut rows = statement.query(params_from_iter(params))?;
+        rows.next()?.map(|row| row_of(row, width)).transpose()
+    }
+}
+
+/// A row read out of SQLite, each of its `width` columns as its storage class
+/// says it is.
+fn row_of(row: &rusqlite::Row<'_>, width: usize) -> Result<Row, SqliteError> {
+    Ok(Row::new((0..width).map(|index| value_from_ref(index, row.get_ref(index)?)).collect::<Result<_, _>>()?))
 }
 
 /// The statement `sql` holds, prepared. SQL that holds a second statement is

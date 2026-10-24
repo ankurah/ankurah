@@ -496,10 +496,22 @@ impl SqliteExecutor for NodeConnection {
         self.changes()
     }
 
-    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> { self.read(sql, params, Rows::All) }
+
+    /// Steps the statement's reader once, through `get()`, where a typed
+    /// reader has still computed every row of the statement it nests, which
+    /// it materializes; only the first is read and checked.
+    fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+        Ok(self.read(sql, params, Rows::First)?.into_iter().next())
+    }
+}
+
+impl NodeConnection {
+    /// Run the statement `sql` holds and read the rows `rows` names.
+    fn read(&self, sql: &str, params: &[SqliteValueRef<'_>], rows: Rows) -> Result<Vec<Row>, SqliteError> {
         if let Some((reader, width)) = self.kept_reader(sql)? {
             self.check_parameters(sql, params.len())?;
-            return all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect();
+            return take(&reader, params, 2 * width, rows)?.into_iter().map(typed_row).collect();
         }
         refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
@@ -520,7 +532,7 @@ impl SqliteExecutor for NodeConnection {
                 // Checked once for each SQL text, since a kept reader skips it.
                 self.refuse_a_compound_select(&source, params)?;
                 self.keep_reader(sql, &reader, width);
-                all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect()
+                take(&reader, params, 2 * width, rows)?.into_iter().map(typed_row).collect()
             }
             // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
             // in a WITH clause. A PRAGMA or an EXPLAIN is read as the database
@@ -536,10 +548,19 @@ impl SqliteExecutor for NodeConnection {
                          value of its rows were refused, so it is not run: write with `execute` and read with a query"
                     )));
                 }
-                all(&statement, params, width)?.into_iter().map(|row| plain_row(row, &nesting)).collect()
+                take(&statement, params, width, rows)?.into_iter().map(|row| plain_row(row, &nesting)).collect()
             }
         }
     }
+}
+
+/// Which rows of a statement a read takes.
+#[derive(Clone, Copy)]
+enum Rows {
+    /// Every row, through `all()`.
+    All,
+    /// The first row alone, through `get()`, which steps the statement once.
+    First,
 }
 
 /// The SQL of a typed reader for `statement`, whose rows have `width`
@@ -732,6 +753,20 @@ fn width(statement: &JsValue) -> Result<usize, SqliteError> {
     Ok(columns.length() as usize)
 }
 
+/// Run a statement and take the rows `rows` names.
+fn take(statement: &JsValue, params: &[SqliteValueRef<'_>], width: usize, rows: Rows) -> Result<Vec<Array>, SqliteError> {
+    match rows {
+        Rows::All => all(statement, params, width),
+        Rows::First => {
+            let row = statement_method(statement, "get")?.apply(statement, &js_params(params)).map_err(js_error)?;
+            if row.is_undefined() {
+                return Ok(Vec::new());
+            }
+            Ok(vec![shaped(row, width)?])
+        }
+    }
+}
+
 /// Run a statement and take every row it yields, refusing any row that is
 /// not an array of `width` values before a value of it is read.
 fn all(statement: &JsValue, params: &[SqliteValueRef<'_>], width: usize) -> Result<Vec<Array>, SqliteError> {
@@ -740,16 +775,18 @@ fn all(statement: &JsValue, params: &[SqliteValueRef<'_>], width: usize) -> Resu
         .map_err(js_error)?
         .dyn_into()
         .map_err(|_| SqliteError::Node("`all()` did not return an array".into()))?;
-    rows.iter()
-        .map(|row| {
-            let row: Array =
-                row.dyn_into().map_err(|row| SqliteError::Node(format!("a statement returned a row that is not an array: {row:?}")))?;
-            if row.length() as usize != width {
-                return Err(SqliteError::Node(format!("a statement of {width} columns returned a row of {}", row.length())));
-            }
-            Ok(row)
-        })
-        .collect()
+    rows.iter().map(|row| shaped(row, width)).collect()
+}
+
+/// A row a statement returned, refused unless it is an array of `width`
+/// values.
+fn shaped(row: JsValue, width: usize) -> Result<Array, SqliteError> {
+    let row: Array =
+        row.dyn_into().map_err(|row| SqliteError::Node(format!("a statement returned a row that is not an array: {row:?}")))?;
+    if row.length() as usize != width {
+        return Err(SqliteError::Node(format!("a statement of {width} columns returned a row of {}", row.length())));
+    }
+    Ok(row)
 }
 
 fn js_params(params: &[SqliteValueRef<'_>]) -> Array { params.iter().map(js_param).collect() }

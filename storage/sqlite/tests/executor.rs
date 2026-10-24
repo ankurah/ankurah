@@ -178,6 +178,27 @@ async fn rows_lend_their_text_and_blob_values() -> Result<()> {
     Ok(())
 }
 
+/// `query_row` reads a statement's first row and no row past it, on every
+/// driver, as rusqlite's does: a later row that cannot be read fails `query`,
+/// and not `query_row`.
+#[engine_test]
+async fn query_row_reads_no_row_past_the_first() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (first, every) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE texts (id INTEGER PRIMARY KEY, v TEXT)", &[])?;
+            executor.execute("INSERT INTO texts VALUES (1, 'valid'), (2, CAST(x'ff41' AS TEXT))", &[])?;
+            let sql = "SELECT v FROM texts ORDER BY id";
+            let first = executor.query_row(sql, &[])?.expect("a first row").text(0)?.to_owned();
+            Ok((first, executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| error.to_string())))
+        })
+        .await?;
+    assert_eq!(first, "valid");
+    let refusal = every.expect_err("the second row's TEXT is not UTF-8");
+    assert!(refusal.ends_with("Conversion error from type Text at index: 0, invalid utf-8 sequence of 1 bytes from index 0"), "{refusal}");
+    Ok(())
+}
+
 /// A statement read again after the schema changes reads as the schema now
 /// stands, though the node executor keeps the reader it prepared for the
 /// statement: `SELECT *` gains the column its table gained, and a TEMP table
