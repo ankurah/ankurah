@@ -9,7 +9,7 @@ use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
 
 /// Consolidates all logic for applying remote updates to a node
-/// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (initial Fetch/QuerySubscribed)
+/// Handles both SubscriptionUpdateItem (streaming updates) and EntityDelta (Get responses)
 pub struct NodeApplier;
 
 impl NodeApplier {
@@ -28,15 +28,20 @@ impl NodeApplier {
 
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
         // but this feels brittle, because failure to apply this event would affect the other contexts on this node.
-        let Some(relay) = &node.subscription_relay else {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates without a subscription relay").into());
-        };
         // A peer may push only what we asked it for, so a push is admissible
-        // only against a standing query of ours with that peer.
-        if !relay.has_subscription_with_peer(from_peer_id) {
-            return Err(MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription with").into());
+        // only against a standing query of ours with that peer or a Fetch we
+        // have in flight with it.
+        let fetching = node.peer_connections.get(from_peer_id).and_then(|peer| peer.fetches.credentials());
+        let subscribed = node.subscription_relay.as_ref().filter(|relay| relay.has_subscription_with_peer(from_peer_id));
+        if fetching.is_none() && subscribed.is_none() {
+            return Err(
+                MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription or Fetch with").into()
+            );
         }
-        let cdata = relay.get_contexts_for_peer(from_peer_id);
+        let mut cdata = fetching.unwrap_or_default();
+        if let Some(relay) = subscribed {
+            cdata.extend(relay.get_contexts_for_peer(from_peer_id));
+        }
 
         // Apply all updates. One bad item must not poison the batch: failures
         // are collected per item, the remaining items still apply, and the
@@ -365,7 +370,7 @@ impl NodeApplier {
         Ok(())
     }
 
-    /// Apply EntityDelta from Fetch or QuerySubscribed responses
+    /// Apply EntityDelta from Get responses
     /// Returns Some(EntityChange) if the delta resulted in a change, None otherwise
     async fn apply_delta<SE, PA, E, S>(
         node: &Node<SE, PA>,
