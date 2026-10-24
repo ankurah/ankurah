@@ -658,10 +658,14 @@ where
         use crate::retrieval::LocalEventGetter;
         use std::collections::HashSet;
 
+        // The most events a bridge carries. A longer gap is repaired with a state snapshot, and the
+        // causal comparison starts from the same budget, so a long gap costs a bounded history read.
+        const MAX_BRIDGE_EVENTS: usize = 256;
+
         let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);
 
         // First check the causal relationship
-        let comparison_result = compare(&event_getter, current_head, known_head, 256).await?;
+        let comparison_result = compare(&event_getter, current_head, known_head, MAX_BRIDGE_EVENTS).await?;
 
         match comparison_result.relation {
             AbstractCausalRelation::Equal => {
@@ -678,7 +682,7 @@ where
 
                 while !frontier.is_empty() {
                     let batch = std::mem::take(&mut frontier);
-                    if visited.len() + batch.len() > 256 {
+                    if visited.len() + batch.len() > MAX_BRIDGE_EVENTS {
                         return Ok(vec![]);
                     }
                     let fetched = self.storage.get_events(batch).await?;
