@@ -9,14 +9,14 @@ pub enum SqliteError {
     Rusqlite(#[from] rusqlite::Error),
 
     /// An error of the node executor, on either Node driver.
-    #[cfg(all(target_arch = "wasm32", feature = "node"))]
+    #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
     #[error("node executor error: {0}")]
     Node(String),
 
     /// SQLite refused a statement run through node:sqlite. `code` is SQLite's
     /// extended result code, which rusqlite's `SqliteFailure` carries
     /// natively; [`SqliteError::sqlite_code`] reads it from either.
-    #[cfg(all(target_arch = "wasm32", feature = "node"))]
+    #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
     #[error("node executor error: {message}")]
     NodeSqlite { code: i32, message: String },
 
@@ -66,7 +66,7 @@ impl SqliteError {
     /// themselves, before SQLite binds anything, so their code is `None`,
     /// where node:sqlite's refusal is SQLite's SQLITE_RANGE, `Some(25)`. A
     /// call that passes too few has `None` on every driver, refused before
-    /// SQLite runs by rusqlite, by the node executor on node:sqlite, and by
+    /// SQLite runs by rusqlite, by the Node.js executor on node:sqlite, and by
     /// better-sqlite3.
     pub fn sqlite_code(&self) -> Option<i32> {
         match self {
@@ -76,7 +76,7 @@ impl SqliteError {
             SqliteError::Rusqlite(rusqlite::Error::SqliteFailure(error, _) | rusqlite::Error::SqlInputError { error, .. }) => {
                 Some(error.extended_code)
             }
-            #[cfg(all(target_arch = "wasm32", feature = "node"))]
+            #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
             SqliteError::NodeSqlite { code, .. } => Some(*code),
             _ => None,
         }

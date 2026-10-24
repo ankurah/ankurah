@@ -371,7 +371,7 @@ impl Materialization {
         let new_columns = conn
             .with_executor(move |c| {
                 // PRAGMA table_info's rows, through its table-valued function:
-                // the node executor reads TEXT exactly only from a query.
+                // the Node.js executor reads TEXT exactly only from a query.
                 let rows = c.query("SELECT * FROM pragma_table_info(?)", &[SqliteValueRef::Text(&table_name)])?;
                 // Changed from main, which skipped a column it could not read,
                 // and on a failed step ended the list there without an error,

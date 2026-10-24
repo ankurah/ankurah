@@ -5,7 +5,7 @@
 //! the suite is built with `--cfg ankurah_sqlite_better_sqlite3` and run
 //! with `ANKURAH_SQLITE_TEST_DRIVER` set to `better-sqlite3`, as
 //! scripts/run-wasm-tests.sh builds and runs it for the suite's second run in
-//! Node. On that run a test's engine adopts a better-sqlite3 database through
+//! Node.js. On that run a test's engine adopts a better-sqlite3 database through
 //! `SqliteStorageEngine::from_database`, because `open` and `open_in_memory`
 //! always build node:sqlite's. The driver is chosen when the suite is built,
 //! so that a test that cannot run on better-sqlite3 reports as ignored on

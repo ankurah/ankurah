@@ -89,7 +89,7 @@ runs that SQL.
   File-backed databases enable WAL and the engine's standard performance
   pragmas; the in-memory engine uses a one-connection pool so all operations
   observe the same database.
-- On wasm32, behind the `node` feature, the engine runs on one database
+- On wasm32, behind the `nodejs` feature, the engine runs on one database
   object of Node.js 22.20.0 or later, synchronously on the calling thread.
   `open` and `open_in_memory` construct a node:sqlite `DatabaseSync` and give
   it the native connections' session settings. A host that built a database

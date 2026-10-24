@@ -12,7 +12,7 @@ use anyhow::Result;
 use common::{session_settings, LockHolder, Stopwatch, TempDb};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::test as engine_test;
 #[cfg(target_arch = "wasm32")]
@@ -27,7 +27,7 @@ pub struct Stamp {
 }
 
 /// INTEGER parameters bind exactly, so an i64 past 2^53 is stored, compared
-/// and ordered exactly in SQL (on Node they cross the boundary as BigInt).
+/// and ordered exactly in SQL (on Node.js they cross the boundary as BigInt).
 #[engine_test]
 async fn integers_past_the_double_range_are_exact() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -82,7 +82,7 @@ async fn integral_reals_read_as_reals() -> Result<()> {
 }
 
 /// A PRAGMA that sets a value and reports it as TEXT returns the TEXT on
-/// every driver: on Node, which cannot nest a PRAGMA in its typed reader, as
+/// every driver: on Node.js, which cannot nest a PRAGMA in its typed reader, as
 /// the driver's string.
 #[engine_test]
 async fn a_pragma_that_sets_a_value_reports_it() -> Result<()> {
@@ -96,7 +96,7 @@ async fn a_pragma_that_sets_a_value_reports_it() -> Result<()> {
 }
 
 /// A connection the engine opens sets a busy timeout of five seconds, on
-/// every driver: rusqlite sets it on each connection it opens, and the node
+/// every driver: rusqlite sets it on each connection it opens, and the Node.js
 /// executor before any other statement. That a writer then waits for
 /// another's lock is `a_writer_waits_for_another_connection_s_lock`.
 #[engine_test]
@@ -142,11 +142,11 @@ async fn duplicate_column_names_keep_both_positions() -> Result<()> {
 }
 
 /// A query that yields more than half of SQLite's column limit, 1000 of the
-/// default 2000 columns, is refused on Node before it runs, saying so, since
+/// default 2000 columns, is refused on Node.js before it runs, saying so, since
 /// the typed reader reads each column as two; rusqlite reads it. A query of
 /// 1000 columns reads on every driver.
 #[engine_test]
-async fn a_query_of_more_than_a_thousand_columns_is_refused_on_node() -> Result<()> {
+async fn a_query_of_more_than_a_thousand_columns_is_refused_on_nodejs() -> Result<()> {
     let columns = |count: usize| format!("SELECT {}", (0..count).map(|index| index.to_string()).collect::<Vec<_>>().join(", "));
     let storage = common::open_in_memory().await?;
     let (thousand, more) = storage
@@ -159,7 +159,7 @@ async fn a_query_of_more_than_a_thousand_columns_is_refused_on_node() -> Result<
         .await?;
     assert_eq!(thousand, Ok(1000));
     if cfg!(target_arch = "wasm32") {
-        let refusal = more.expect_err("Node refuses a query of 1001 columns");
+        let refusal = more.expect_err("Node.js refuses a query of 1001 columns");
         assert!(refusal.contains("the statement yields 1001 columns") && refusal.contains("1000 of the default 2000"), "{refusal}");
     } else {
         assert_eq!(more, Ok(1001));
@@ -207,7 +207,7 @@ async fn text_keeps_an_embedded_nul_and_refuses_bytes_that_are_not_utf8() -> Res
 }
 
 /// Empty TEXT and an empty BLOB, bound or written as literals, read back as
-/// they were stored on every driver: the node executor's typed reader reads
+/// they were stored on every driver: the Node.js executor's typed reader reads
 /// TEXT as the BLOB of its bytes, and SQLite hands a zero-length BLOB over
 /// with a null pointer, which a driver could read as NULL.
 #[engine_test]
@@ -249,7 +249,7 @@ async fn query_row_reads_no_row_past_the_first() -> Result<()> {
 }
 
 /// A statement read again after the schema changes reads as the schema now
-/// stands, though the node executor keeps the reader it prepared for the
+/// stands, though the Node.js executor keeps the reader it prepared for the
 /// statement: `SELECT *` gains the column its table gained, in main or in an
 /// attached database, and a TEMP table of the same name takes the table's
 /// place.
@@ -269,7 +269,7 @@ async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
             executor.execute("CREATE TEMP TABLE things (a, b, c)", &[])?;
             executor.execute("INSERT INTO temp.things VALUES (1, 2, 3)", &[])?;
             let shadowed = width_of_every_column(executor, "things")?;
-            // The node executor watches the schema versions of main and temp
+            // The Node.js executor watches the schema versions of main and temp
             // only, so its reader of the attached table fails, and is
             // prepared afresh.
             executor.execute("ATTACH DATABASE ':memory:' AS aux", &[])?;
@@ -412,11 +412,11 @@ async fn a_double_quoted_name_that_matches_no_column_is_refused() -> Result<()> 
 }
 
 /// A compound SELECT at the top level of a query, or in a scalar subquery
-/// there, is refused on Node before it runs, where rusqlite reads its values
-/// directly: Node's typed reader would read a later SELECT's INTEGER past
+/// there, is refused on Node.js before it runs, where rusqlite reads its values
+/// directly: Node.js's typed reader would read a later SELECT's INTEGER past
 /// 2^53 with the affinity of the first SELECT's REAL column, or of a scalar
 /// subquery's last SELECT's, as the nearest REAL. A compound in an EXISTS is
-/// refused on Node too, though it reads the same everywhere. Selected from a
+/// refused on Node.js too, though it reads the same everywhere. Selected from a
 /// materialized CTE, or from a subquery or CTE that SQLite does not flatten,
 /// where SQLite applies the first SELECT's affinity on every driver, or in
 /// an IN, the compound reads the same everywhere.
@@ -434,7 +434,7 @@ async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
             executor.execute("INSERT INTO reals VALUES (1.5)", &[])?;
             executor.execute("CREATE TABLE integers (i INTEGER)", &[])?;
             executor.execute("INSERT INTO integers VALUES (9007199254740993)", &[])?;
-            // Each statement Node refuses, with the values rusqlite reads.
+            // Each statement Node.js refuses, with the values rusqlite reads.
             static EXACT: [&str; 2] = ["Integer(9007199254740993)", "Real(1.5)"];
             let refused = [
                 ("SELECT r FROM reals UNION ALL SELECT i FROM integers", &EXACT[..]),
@@ -465,7 +465,7 @@ async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
         .await?;
     for (read, native) in refused {
         if cfg!(target_arch = "wasm32") {
-            let refusal = read.expect_err("Node refuses the compound SELECT");
+            let refusal = read.expect_err("Node.js refuses the compound SELECT");
             assert!(refusal.contains("WITH x AS MATERIALIZED"), "{refusal}");
         } else {
             assert_eq!(read.expect("rusqlite reads a compound SELECT directly"), native);
@@ -512,7 +512,7 @@ async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
         .await?;
     assert_eq!(passed, [Ok(1), Ok(1)]);
     let refused = refused.map(|outcome| outcome.expect_err("the call is refused"));
-    // rusqlite's words for too few values, which the node executor uses too
+    // rusqlite's words for too few values, which the Node.js executor uses too
     // on node:sqlite; better-sqlite3 refuses the call in its own.
     let too_few = if common::on_better_sqlite3() {
         "Too few parameter values were provided"
@@ -588,7 +588,7 @@ async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
         .await?;
     for outcome in refused {
         let error = outcome.expect_err("a second statement is refused");
-        // rusqlite's words, which the node executor uses too.
+        // rusqlite's words, which the Node.js executor uses too.
         assert!(error.ends_with("Multiple statements provided"), "{error}");
     }
     assert_eq!(created, 0, "no statement of a refused string ran");

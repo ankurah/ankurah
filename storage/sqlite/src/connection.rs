@@ -52,7 +52,7 @@ impl SqliteConnectionManager {
         // double-quoted name that matched no column read as a string, in a
         // query and in DDL alike, and a stale name read as data instead of
         // failing. Off, such a name fails with "no such column", as it does
-        // on both Node drivers (see node.rs).
+        // on both Node.js drivers (see nodejs.rs).
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
 

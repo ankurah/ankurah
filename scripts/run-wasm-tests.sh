@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 
 # Script to run WASM tests for Ankurah project
-# Usage: ./scripts/run-wasm-tests.sh [package_name|browser|storage_sqlite_node|storage_sqlite_better_sqlite3|--discover]
+# Usage: ./scripts/run-wasm-tests.sh [package_name|browser|storage_sqlite_node_sqlite|storage_sqlite_better_sqlite3|--discover]
 # If no package name is provided, runs tests for all discovered wasm packages
-# (in headless Chrome) and then ankurah-storage-sqlite's suite on node:sqlite (in Node)
+# (in headless Chrome) and then ankurah-storage-sqlite's suite on node:sqlite (in Node.js)
 # browser runs only the discovered packages, in headless Chrome
 # storage_sqlite_better_sqlite3 runs that suite again on better-sqlite3, which
 # `npm ci` in storage/sqlite/tests installs
@@ -119,15 +119,15 @@ run_wasm_tests() {
 }
 
 # ankurah-storage-sqlite runs on wasm32 over Node.js's built-in SQLite (its
-# `node` feature), so that suite runs in Node rather than Chrome; its name
+# `nodejs` feature), so that suite runs in Node.js rather than Chrome; its name
 # carries no "wasm", so the Chrome discovery above leaves it alone.
 run_node_sqlite_tests() {
-    print_status "Running WASM tests in Node for ankurah-storage-sqlite (node feature)..."
+    print_status "Running WASM tests in Node.js for ankurah-storage-sqlite (nodejs feature)..."
     cd "$PROJECT_ROOT/storage/sqlite"
-    if wasm-pack test --node -- --features node; then
-        print_status "✅ WASM tests passed for storage-sqlite on Node"
+    if wasm-pack test --node -- --features nodejs; then
+        print_status "✅ WASM tests passed for storage-sqlite on Node.js"
     else
-        print_error "❌ WASM tests failed for storage-sqlite on Node"
+        print_error "❌ WASM tests failed for storage-sqlite on Node.js"
         cd - > /dev/null
         exit 1
     fi
@@ -149,11 +149,11 @@ run_better_sqlite3_tests() {
         print_error "  (cd storage/sqlite/tests && npm ci)"
         exit 1
     fi
-    print_status "Running WASM tests in Node for ankurah-storage-sqlite (node feature) on better-sqlite3..."
+    print_status "Running WASM tests in Node.js for ankurah-storage-sqlite (nodejs feature) on better-sqlite3..."
     cd "$PROJECT_ROOT/storage/sqlite"
     if ANKURAH_SQLITE_TEST_DRIVER=better-sqlite3 \
         CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="--cfg ankurah_sqlite_better_sqlite3" \
-        wasm-pack test --node -- --features node; then
+        wasm-pack test --node -- --features nodejs; then
         print_status "✅ WASM tests passed for storage-sqlite on better-sqlite3"
     else
         print_error "❌ WASM tests failed for storage-sqlite on better-sqlite3"
@@ -214,7 +214,7 @@ main() {
         exit 0
     fi
 
-    if [ "$target_package" = "storage_sqlite_node" ]; then
+    if [ "$target_package" = "storage_sqlite_node_sqlite" ]; then
         run_node_sqlite_tests
         print_status "🎉 All WASM tests completed successfully!"
         exit 0

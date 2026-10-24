@@ -87,20 +87,20 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
-      # ankurah-storage-sqlite's suites on Node run in the sqlite-node job.
+      # ankurah-storage-sqlite's suites on Node.js run in the sqlite-nodejs job.
       - name: Run WASM tests
         run: ./scripts/run-wasm-tests.sh browser
         env:
           RUST_BACKTRACE: 1
 
-  sqlite-node:
+  sqlite-nodejs:
     name: SQLite on Node.js ${{ matrix.node }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # ankurah-storage-sqlite's node feature runs on Node.js 22.20.0 and
-        # later (NODE_FLOOR in storage/sqlite/src/node.rs): the floor, and the
+        # ankurah-storage-sqlite's nodejs feature runs on Node.js 22.20.0 and
+        # later (NODE_FLOOR in storage/sqlite/src/nodejs.rs): the floor, and the
         # current release.
         node: ["22.20.0", "24"]
 
@@ -127,7 +127,7 @@ jobs:
           node-version: ${{ matrix.node }}
 
       - name: Run WASM tests on node:sqlite
-        run: ./scripts/run-wasm-tests.sh storage_sqlite_node
+        run: ./scripts/run-wasm-tests.sh storage_sqlite_node_sqlite
         env:
           RUST_BACKTRACE: 1
 

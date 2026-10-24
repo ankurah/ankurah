@@ -1,11 +1,11 @@
-//! What only the node executor offers: adopting a database the host built,
+//! What only the Node.js executor offers: adopting a database the host built,
 //! and refusing an object of the wrong shape.
 #![cfg(target_arch = "wasm32")]
 
 mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{exec::SqliteExecutor, NodeConnection, SqliteStorageEngine, SqliteValueRef};
+use ankurah_storage_sqlite::{exec::SqliteExecutor, NodeJsConnection, SqliteStorageEngine, SqliteValueRef};
 use anyhow::Result;
 use common::{host_database, on_better_sqlite3, Album, AlbumView};
 use js_sys::{Function, Reflect};
@@ -149,7 +149,7 @@ async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
         })
         .await?;
     for refusal in refusals {
-        let refusal = refusal.expect_err("a RETURNING statement is refused on Node");
+        let refusal = refusal.expect_err("a RETURNING statement is refused on Node.js");
         assert!(refusal.contains("so it is not run"), "{refusal}");
     }
     assert_eq!(count, 0, "neither insert ran");
@@ -176,7 +176,7 @@ async fn a_named_parameter_is_refused_before_it_runs() -> Result<()> {
         })
         .await?;
     for refusal in refusals {
-        let refusal = refusal.expect_err("a named parameter is refused on Node");
+        let refusal = refusal.expect_err("a named parameter is refused on Node.js");
         assert!(refusal.contains("write a positional `?`"), "{refusal}");
     }
     assert_eq!(count, 0, "neither insert ran");
@@ -197,7 +197,7 @@ fn refuses_a_database_that_reads_double_quoted_names_as_strings() {
         "const { DatabaseSync } = process.getBuiltinModule('node:sqlite');
          return new DatabaseSync(':memory:', { enableDoubleQuotedStringLiterals: true });",
     );
-    let error = NodeConnection::from_database(construct.call0(&JsValue::NULL).unwrap()).err().expect("the database is refused");
+    let error = NodeJsConnection::from_database(construct.call0(&JsValue::NULL).unwrap()).err().expect("the database is refused");
     assert!(error.to_string().contains("enableDoubleQuotedStringLiterals"), "{error}");
 }
 
@@ -206,7 +206,7 @@ fn refuses_a_utf16_database() {
     let database = host_database(":memory:");
     let exec: Function = Reflect::get(&database, &"exec".into()).unwrap().dyn_into().unwrap();
     exec.call1(&database, &"PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (v TEXT);".into()).unwrap();
-    let error = NodeConnection::from_database(database).err().expect("a UTF-16 database is refused");
+    let error = NodeJsConnection::from_database(database).err().expect("a UTF-16 database is refused");
     assert!(error.to_string().contains("not UTF-8"), "{error}");
 }
 
@@ -230,9 +230,9 @@ fn tampered_database(tamper: &str) -> JsValue {
     wrap.call1(&JsValue::NULL, &host_database(":memory:")).unwrap()
 }
 
-/// The refusal `NodeConnection::from_database` gives a tampered database.
+/// The refusal `NodeJsConnection::from_database` gives a tampered database.
 fn refusal(tamper: &str) -> String {
-    NodeConnection::from_database(tampered_database(tamper)).err().expect("the database is refused").to_string()
+    NodeJsConnection::from_database(tampered_database(tamper)).err().expect("the database is refused").to_string()
 }
 
 /// An INTEGER handed over as a number cannot be told from a REAL, so such a
@@ -272,7 +272,7 @@ fn refuses_a_row_of_the_wrong_width() {
 /// `undefined` is no storage class: it is refused, not read as NULL.
 #[wasm_bindgen_test]
 fn refuses_undefined_where_null_was_handed_over() {
-    let connection = NodeConnection::from_database(tampered_database(
+    let connection = NodeJsConnection::from_database(tampered_database(
         "return new Proxy(statement, { get: (target, name) => name === 'all'
              ? (...params) => target.all(...params).map((row) => row.map((value) => value === null ? undefined : value))
              : forward(target, name) });",

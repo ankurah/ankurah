@@ -267,9 +267,9 @@ impl TempDb {
     #[cfg(target_arch = "wasm32")]
     pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::exec::SqliteExecutor> {
         Box::new(if driver::on_better_sqlite3() {
-            ankurah_storage_sqlite::NodeConnection::from_database(driver::host_database(self.path_str())).unwrap()
+            ankurah_storage_sqlite::NodeJsConnection::from_database(driver::host_database(self.path_str())).unwrap()
         } else {
-            ankurah_storage_sqlite::NodeConnection::open(self.path_str()).unwrap()
+            ankurah_storage_sqlite::NodeJsConnection::open(self.path_str()).unwrap()
         })
     }
 }
@@ -293,7 +293,7 @@ impl Drop for TempDb {
     }
 }
 
-/// Node's built-in modules.
+/// Node.js's built-in modules.
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)]
 pub mod node {
@@ -312,7 +312,7 @@ pub mod node {
 }
 
 /// Another connection to a database file, on a thread of its own, holding a
-/// real lock on it: a std thread natively, a worker thread on Node. It runs
+/// real lock on it: a std thread natively, a worker thread on Node.js. It runs
 /// `lock` (a BEGIN), and commits once `hold_ms` have passed, while this
 /// thread's connection waits for the lock.
 #[allow(dead_code)]
@@ -324,7 +324,7 @@ pub struct LockHolder {
     exit: js_sys::Promise,
 }
 
-/// The worker's side of a [`LockHolder`] on Node. Its connection is on the
+/// The worker's side of a [`LockHolder`] on Node.js. Its connection is on the
 /// driver the engine's is on, because two copies of SQLite in one process do
 /// not see each other's locks: the file locks they take belong to the
 /// process, so neither copy's locks keep out the other's connections.

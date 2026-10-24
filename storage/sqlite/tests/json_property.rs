@@ -21,7 +21,7 @@ use ankurah_storage_sqlite::sql_builder::{split_predicate_for_sqlite, SplitPredi
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
 #[cfg(not(target_arch = "wasm32"))]
 use tokio::test as engine_test;
 #[cfg(target_arch = "wasm32")]

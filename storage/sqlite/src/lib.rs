@@ -23,7 +23,7 @@
 //!
 //! The engine's SQL is written once, against [`exec::SqliteExecutor`].
 //! Natively it runs on rusqlite connections from a bb8 pool. On wasm32, with
-//! the `node` feature, it runs on Node.js's built-in `node:sqlite`, or on a
+//! the `nodejs` feature, it runs on Node.js's built-in `node:sqlite`, or on a
 //! better-sqlite3 database the host adopts (Node.js 22.20.0 or later), for a
 //! node inside Node.js where IndexedDB does not exist: a VS Code extension
 //! host, an Electron main process, a JavaScript CLI. The tables are the same,
@@ -40,7 +40,7 @@
 //! // Or use an in-memory database for testing
 //! let storage = SqliteStorageEngine::open_in_memory().await?;
 //!
-//! // On wasm32 with the `node` feature: adopt a database the host constructed
+//! // On wasm32 with the `nodejs` feature: adopt a database the host constructed
 //! // (DatabaseSync, or a compatible driver with positional rows and BigInt INTEGERs)
 //! let storage = SqliteStorageEngine::from_database(database).await?;
 //! ```
@@ -53,8 +53,8 @@ mod error;
 pub mod exec;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
-#[cfg(all(target_arch = "wasm32", feature = "node"))]
-mod node;
+#[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
+mod nodejs;
 pub mod sql_builder;
 mod sql_text;
 mod value;
@@ -63,17 +63,17 @@ mod value;
 // natively, and on wasm32 a JavaScript SQLite chosen by feature.
 #[cfg(not(target_arch = "wasm32"))]
 use native as driver;
-#[cfg(all(target_arch = "wasm32", feature = "node"))]
-use node as driver;
-#[cfg(all(target_arch = "wasm32", not(feature = "node")))]
-compile_error!("on wasm32, ankurah-storage-sqlite runs on a JavaScript SQLite: enable the `node` feature for Node.js's node:sqlite");
+#[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
+use nodejs as driver;
+#[cfg(all(target_arch = "wasm32", not(feature = "nodejs")))]
+compile_error!("on wasm32, ankurah-storage-sqlite runs on a JavaScript SQLite: enable the `nodejs` feature for Node.js's node:sqlite");
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use connection::SqliteConnectionManager;
 pub use engine::{SqliteStorageEngine, SqliteTransaction};
 pub use error::SqliteError;
-#[cfg(all(target_arch = "wasm32", feature = "node"))]
-pub use node::{NodeConnection, NodePool};
+#[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
+pub use nodejs::{NodeJsConnection, NodeJsPool};
 pub use value::{SqliteValue, SqliteValueRef};
 
 // The unit tests build their engines on the SQLite driver the run names,

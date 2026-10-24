@@ -4,7 +4,7 @@
 //! SQLite driver. Everything above it decides *which* SQL to run: the shared
 //! tables, the per-model materializations and their column maps, the pushdown
 //! predicate, the exact-head commit. Everything below it runs that SQL on one
-//! SQLite connection: `native.rs` over rusqlite, and on wasm32 `node.rs` over
+//! SQLite connection: `native.rs` over rusqlite, and on wasm32 `nodejs.rs` over
 //! Node.js's built-in `node:sqlite` module, or over a better-sqlite3 database
 //! that a host hands the engine through `SqliteStorageEngine::from_database`.
 
@@ -27,11 +27,11 @@ use crate::{
 /// are no second statement, and a CREATE TRIGGER statement runs on to the
 /// END of its body.
 ///
-/// # Where the node executor differs from the native one
+/// # Where the Node.js executor differs from the native one
 ///
-/// - On Node a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
+/// - On Node.js a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
 ///   top level of a query, or in a scalar subquery there, is refused before
-///   it runs. Node reads a query's rows through a typed reader that nests the
+///   it runs. Node.js reads a query's rows through a typed reader that nests the
 ///   query in a WITH clause, which gives each column an affinity: a
 ///   compound's first SELECT's, or a scalar subquery's last SELECT's,
 ///   whichever SELECT the value came from. That can change a value: an
@@ -45,19 +45,19 @@ use crate::{
 ///   so a compound in an EXISTS or in a WHERE clause's scalar subquery is
 ///   refused as well, though it reads the same everywhere. No statement of
 ///   the engine's own holds a compound SELECT.
-/// - On Node a statement with a named parameter (`:a`, `@a`, `#a` or `$a`)
+/// - On Node.js a statement with a named parameter (`:a`, `@a`, `#a` or `$a`)
 ///   is refused before it runs, where rusqlite binds a call's values to
 ///   named parameters in turn too: node:sqlite would bind no positional value
 ///   to one, leaving it NULL. Write a positional `?` for each parameter.
 /// - better-sqlite3 binds no positional value to a numbered parameter such as
 ///   `?1`, and refuses the call; rusqlite and node:sqlite bind the value at
 ///   that position.
-/// - On Node a query that SQLite cannot nest in a WITH clause is refused,
+/// - On Node.js a query that SQLite cannot nest in a WITH clause is refused,
 ///   before it runs, unless it is a PRAGMA or an EXPLAIN. A PRAGMA's or an
 ///   EXPLAIN's TEXT is read as the driver's JavaScript string, and a string
-///   holding U+FFFD is refused, since both Node drivers put that character in
+///   holding U+FFFD is refused, since both Node.js drivers put that character in
 ///   place of each byte that is not UTF-8.
-/// - On Node a query that yields more than half of SQLite's column limit,
+/// - On Node.js a query that yields more than half of SQLite's column limit,
 ///   1000 of the default 2000 columns, is refused before it runs, since the
 ///   typed reader reads each column as two; natively it reads up to the
 ///   limit.

@@ -1,22 +1,22 @@
-//! The node executor: Node.js's built-in `node:sqlite` module, driven from WASM.
+//! The Node.js executor: Node.js's built-in `node:sqlite` module, driven from WASM.
 //!
 //! The WASM build of an Ankurah node has no IndexedDB inside Node.js (a VS
 //! Code extension host, an Electron main process, a JavaScript CLI) and no
 //! native library either, but Node.js ships SQLite as `node:sqlite`. The
 //! engine reaches it through a `DatabaseSync`-shaped JavaScript object:
 //! `prepare(sql)` giving statements with `run(...params)`, `get(...params)`,
-//! `all(...params)`, `columns()` and `sourceSQL`, plus `exec(sql)`. Node's
+//! `all(...params)`, `columns()` and `sourceSQL`, plus `exec(sql)`. Node.js's
 //! own `DatabaseSync` has that shape; the executor runs on Node.js 22.20.0 or
 //! later (see `NODE_FLOOR`). Compatible
 //! drivers must also support positional rows and BigInt INTEGER results; the
 //! adapter recognizes better-sqlite3's `raw` and `safeIntegers` methods for
 //! these capabilities, and its `source` for `sourceSQL`.
 //! Hosts can adopt an existing database with [`SqliteStorageEngine::from_database`];
-//! [`NodeConnection::open`] constructs Node's directly through
+//! [`NodeJsConnection::open`] constructs Node.js's directly through
 //! `process.getBuiltinModule`. Every call is synchronous, which suits the
 //! single-threaded WASM host: the engine's closures simply run in place.
 //!
-//! Both Node drivers hand TEXT over only as a JavaScript string, made by
+//! Both Node.js drivers hand TEXT over only as a JavaScript string, made by
 //! decoding the bytes and replacing each byte that is not UTF-8 with U+FFFD
 //! (node:sqlite decodes them only up to the first NUL), where rusqlite hands
 //! over the bytes themselves. So a query reads its statement through a typed
@@ -39,21 +39,21 @@ use crate::{
 
 /// The engine names the connection its pool hands out `PooledConnection`;
 /// here the pool holds a single database.
-pub(crate) use NodeConnection as PooledConnection;
-/// The engine's pool on Node.
-pub(crate) type Pool = NodePool;
+pub(crate) use NodeJsConnection as PooledConnection;
+/// The engine's pool on Node.js.
+pub(crate) type Pool = NodeJsPool;
 
-/// The oldest Node.js the node executor runs on, on either driver: from
+/// The oldest Node.js the Node.js executor runs on, on either driver: from
 /// 22.20.0, node:sqlite binds a positional value to a numbered parameter such
 /// as `?2` as rusqlite does, where before it bound none, leaving the
 /// parameter NULL.
 const NODE_FLOOR: [u32; 3] = [22, 20, 0];
 
 /// The `process` global, which exists only inside Node.js.
-fn node_process() -> Result<JsValue, SqliteError> {
+fn nodejs_process() -> Result<JsValue, SqliteError> {
     let process = Reflect::get(&js_sys::global(), &"process".into()).map_err(js_error)?;
     if process.is_undefined() || process.is_null() {
-        return Err(SqliteError::Node("no `process` global: the node executor runs only inside Node.js".into()));
+        return Err(SqliteError::Node("no `process` global: the Node.js executor runs only inside Node.js".into()));
     }
     Ok(process)
 }
@@ -73,10 +73,10 @@ fn meets_node_floor(version: &str) -> Result<(), SqliteError> {
     match parts {
         Some(parts) if parts.len() == 3 && parts.as_slice() >= NODE_FLOOR.as_slice() => Ok(()),
         Some(parts) if parts.len() == 3 => Err(SqliteError::Node(format!(
-            "the node executor needs Node.js 22.20.0 or later, whose node:sqlite binds a positional value to a numbered \
+            "the Node.js executor needs Node.js 22.20.0 or later, whose node:sqlite binds a positional value to a numbered \
              parameter such as `?2` as rusqlite does; this is Node.js {version}"
         ))),
-        _ => Err(SqliteError::Node(format!("Node.js reports its version as {version:?}, which the node executor cannot read"))),
+        _ => Err(SqliteError::Node(format!("Node.js reports its version as {version:?}, which the Node.js executor cannot read"))),
     }
 }
 
@@ -87,7 +87,7 @@ fn meets_node_floor(version: &str) -> Result<(), SqliteError> {
 /// takes a lock.
 const BUSY_TIMEOUT: &str = "PRAGMA busy_timeout=5000;";
 
-/// connection.rs's session pragmas, which make a Node connection behave like
+/// connection.rs's session pragmas, which make a Node.js connection behave like
 /// a native one.
 const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
      PRAGMA synchronous=NORMAL;
@@ -99,14 +99,14 @@ const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 /// The pool behind `SqliteStorageEngine::open`.
 pub(crate) async fn file_pool(path: &Path) -> anyhow::Result<Pool> {
     let path = path.to_str().ok_or_else(|| anyhow::anyhow!("the database path is not valid UTF-8"))?;
-    Ok(NodePool::new(NodeConnection::open(path)?))
+    Ok(NodeJsPool::new(NodeJsConnection::open(path)?))
 }
 
 /// The pool behind `SqliteStorageEngine::open_in_memory`.
-pub(crate) async fn memory_pool() -> anyhow::Result<Pool> { Ok(NodePool::new(NodeConnection::open(":memory:")?)) }
+pub(crate) async fn memory_pool() -> anyhow::Result<Pool> { Ok(NodeJsPool::new(NodeJsConnection::open(":memory:")?)) }
 
 impl SqliteStorageEngine {
-    /// Adopt a database object the host constructed: Node's `DatabaseSync`, or
+    /// Adopt a database object the host constructed: Node.js's `DatabaseSync`, or
     /// a compatible driver whose statements support positional arrays and BigInt
     /// INTEGER results. The host owns session settings, including busy timeout.
     ///
@@ -118,7 +118,7 @@ impl SqliteStorageEngine {
     /// not open the same file with another copy in the same process, as
     /// [`SqliteStorageEngine::open`] would with node:sqlite's.
     pub async fn from_database(database: JsValue) -> anyhow::Result<Self> {
-        Self::new(NodePool::new(NodeConnection::from_database(database)?)).await
+        Self::new(NodeJsPool::new(NodeJsConnection::from_database(database)?)).await
     }
 
     /// The JavaScript database object this engine runs on, for a host that
@@ -129,7 +129,7 @@ impl SqliteStorageEngine {
 /// One `DatabaseSync`-shaped database. Clones share the same JavaScript
 /// object, the same kept typed readers and the same checked parameter counts.
 #[derive(Clone)]
-pub struct NodeConnection {
+pub struct NodeJsConnection {
     // The JavaScript handles are bound to the thread that made them; WASM has one.
     database: SendWrapper<JsValue>,
     readers: SendWrapper<Rc<RefCell<Readers>>>,
@@ -182,15 +182,15 @@ struct KeptReader {
     used: u64,
 }
 
-impl NodeConnection {
-    /// Adopt a database object the host constructed: Node's `DatabaseSync` or
+impl NodeJsConnection {
+    /// Adopt a database object the host constructed: Node.js's `DatabaseSync` or
     /// a compatible driver whose statements support positional arrays and BigInt
     /// INTEGER results. The host owns session settings, including busy timeout.
     /// A driver with a copy of SQLite of its own must not share a file with
     /// another copy in the same process (see
     /// [`SqliteStorageEngine::from_database`]).
     pub fn from_database(database: JsValue) -> Result<Self, SqliteError> {
-        require_node_floor(&node_process()?)?;
+        require_node_floor(&nodejs_process()?)?;
         if !database.is_object() {
             return Err(SqliteError::Node(format!(
                 "a database must be an object with prepare and exec methods, such as node:sqlite's DatabaseSync; got {database:?}"
@@ -212,12 +212,12 @@ impl NodeConnection {
         }
         // The typed reader takes TEXT as the bytes SQLite stores, which are
         // UTF-8 only in a UTF-8 database. rusqlite has SQLite convert the TEXT
-        // of a UTF-16 database to UTF-8; neither Node driver offers a way to,
+        // of a UTF-16 database to UTF-8; neither Node.js driver offers a way to,
         // so a UTF-16 database is refused rather than misread.
         let utf8 = connection.query("SELECT (SELECT encoding FROM pragma_encoding) = 'UTF-8'", &[])?;
         if !matches!(utf8.as_slice(), [row] if matches!(row.values(), [SqliteValue::Integer(1)])) {
             return Err(SqliteError::Node(
-                "the database's text encoding is not UTF-8, and the node executor reads TEXT as UTF-8 bytes".into(),
+                "the database's text encoding is not UTF-8, and the Node.js executor reads TEXT as UTF-8 bytes".into(),
             ));
         }
         // A double-quoted name that matches no column fails with "no such
@@ -240,17 +240,17 @@ impl NodeConnection {
         Ok(connection)
     }
 
-    /// Open a database through Node's built-in module; `":memory:"` for an
+    /// Open a database through Node.js's built-in module; `":memory:"` for an
     /// in-memory one. Applies the session settings a native connection has.
     pub fn open(path: &str) -> Result<Self, SqliteError> {
-        let process = node_process()?;
+        let process = nodejs_process()?;
         require_node_floor(&process)?;
         // Node.js has had `process.getBuiltinModule` since 22.3, before the
         // floor, so a runtime that reports a version past the floor without
         // it is no Node.js the executor runs on.
         let get_builtin: Function = Reflect::get(&process, &"getBuiltinModule".into()).map_err(js_error)?.dyn_into().map_err(|_| {
             SqliteError::Node(
-                "`process` has no `getBuiltinModule` method, which Node.js has from 22.3: the node executor needs \
+                "`process` has no `getBuiltinModule` method, which Node.js has from 22.3: the Node.js executor needs \
                  Node.js 22.20.0 or later"
                     .into(),
             )
@@ -394,7 +394,7 @@ impl NodeConnection {
                 // count needed; the probe shows only that it is more.
                 return Err(SqliteError::Node(format!(
                     "Wrong number of parameters passed to query. Got {passed}, needed more: this database binds NULL for each \
-                     parameter not passed, where rusqlite refuses the call, so the node executor refuses it before it runs"
+                     parameter not passed, where rusqlite refuses the call, so the Node.js executor refuses it before it runs"
                 )));
             }
         }
@@ -453,7 +453,7 @@ impl NodeConnection {
         if steps.iter().any(|(_, parent, detail)| top_level.contains(parent) && compound(detail)) {
             return Err(SqliteError::Node(
                 "a compound SELECT at the top level of a query, or in a scalar subquery or an EXISTS there, is refused on \
-                 Node, before it runs: the node executor reads rows through a typed reader that nests the query, which \
+                 Node.js, before it runs: the Node.js executor reads rows through a typed reader that nests the query, which \
                  gives each column the affinity of a compound's first SELECT, or of a scalar subquery's last, whichever \
                  SELECT a value came from, and so can change it, as an INTEGER past 2^53 read through a REAL column \
                  changes to the nearest REAL; select from the compound as `WITH x AS MATERIALIZED (…) SELECT * FROM x`, \
@@ -511,21 +511,21 @@ impl NodeConnection {
     }
 }
 
-/// The node executor's stand-in for a pool: one database, handed out by clone.
+/// The Node.js executor's stand-in for a pool: one database, handed out by clone.
 #[derive(Clone)]
-pub struct NodePool {
-    connection: NodeConnection,
+pub struct NodeJsPool {
+    connection: NodeJsConnection,
 }
 
-impl NodePool {
-    pub fn new(connection: NodeConnection) -> Self { Self { connection } }
+impl NodeJsPool {
+    pub fn new(connection: NodeJsConnection) -> Self { Self { connection } }
 
-    pub async fn get(&self) -> Result<NodeConnection, SqliteError> { Ok(self.connection.clone()) }
+    pub async fn get(&self) -> Result<NodeJsConnection, SqliteError> { Ok(self.connection.clone()) }
 
-    pub fn connection(&self) -> &NodeConnection { &self.connection }
+    pub fn connection(&self) -> &NodeJsConnection { &self.connection }
 }
 
-impl SqliteExecutor for NodeConnection {
+impl SqliteExecutor for NodeJsConnection {
     /// Runs a statement as rusqlite's `execute` does: one step, refusing the
     /// statement when that step yields a row, since a statement that returns
     /// rows belongs to `query`. node:sqlite's `run` takes the step and
@@ -565,7 +565,7 @@ impl SqliteExecutor for NodeConnection {
     }
 }
 
-impl NodeConnection {
+impl NodeJsConnection {
     /// Run the statement `sql` holds and read the rows `rows` names.
     fn read(&self, sql: &str, params: &[SqliteValueRef<'_>], rows: Rows) -> Result<Vec<Row>, SqliteError> {
         if let Some((reader, width)) = self.kept_reader(sql)? {
@@ -610,7 +610,7 @@ impl NodeConnection {
             // prepare the reader of a query that yields more than half of its
             // column limit, 2000 by default, though it prepared the query.
             Err(too_wide) if too_wide.to_string().contains("too many columns in result set") => Err(SqliteError::Node(format!(
-                "the statement yields {width} columns, and the node executor's typed reader reads each as two, its \
+                "the statement yields {width} columns, and the Node.js executor's typed reader reads each as two, its \
                  storage class and its value, so it reads at most half of SQLite's column limit, 1000 of the default \
                  2000 columns ({too_wide})"
             ))),
@@ -623,7 +623,7 @@ impl NodeConnection {
             Err(nesting) => {
                 if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| sql_text::first_keyword(&source).eq_ignore_ascii_case(keyword)) {
                     return Err(SqliteError::Node(format!(
-                        "the node executor reads rows exactly only from a query SQLite can nest in a WITH clause, which this \
+                        "the Node.js executor reads rows exactly only from a query SQLite can nest in a WITH clause, which this \
                          statement is not ({nesting}); a statement such as one with a RETURNING clause could write before a \
                          value of its rows were refused, so it is not run: write with `execute` and read with a query"
                     )));
@@ -684,7 +684,7 @@ fn source(statement: &JsValue) -> Result<String, SqliteError> {
         }
     }
     Err(SqliteError::Node(
-        "the database's statements report no `sourceSQL` (better-sqlite3's `source`), which the node executor needs".into(),
+        "the database's statements report no `sourceSQL` (better-sqlite3's `source`), which the Node.js executor needs".into(),
     ))
 }
 
@@ -724,7 +724,7 @@ fn refuse_a_named_parameter(source: &str) -> Result<(), SqliteError> {
     match sql_text::named_parameters(source).first() {
         None => Ok(()),
         Some(name) => Err(SqliteError::Node(format!(
-            "the statement has the named parameter {name}, which the node executor does not bind, since node:sqlite would \
+            "the statement has the named parameter {name}, which the Node.js executor does not bind, since node:sqlite would \
              leave it NULL where rusqlite binds a value to it: write a positional `?` for each parameter"
         ))),
     }
@@ -762,15 +762,15 @@ fn typed_row(row: Array) -> Result<Row, SqliteError> {
 /// reader, read as the database hands it over. Its TEXT arrives as a
 /// JavaScript string, read as the TEXT: SQLite makes a PRAGMA's or an
 /// EXPLAIN's TEXT of C strings, so it holds no NUL for node:sqlite to cut it
-/// at, but a string holding U+FFFD is refused, since both Node drivers put
+/// at, but a string holding U+FFFD is refused, since both Node.js drivers put
 /// that character in place of each byte that is not UTF-8.
 fn plain_row(row: Array, nesting: &SqliteError) -> Result<Row, SqliteError> {
     row.iter()
         .enumerate()
         .map(|(index, value)| match value.as_string() {
             Some(text) if text.contains('\u{FFFD}') => Err(SqliteError::Node(format!(
-                "column {index} is TEXT holding U+FFFD, which both Node drivers put in place of each byte that is not UTF-8 \
-                 when they hand TEXT over as a string; the node executor reads TEXT as its bytes only from a query SQLite can \
+                "column {index} is TEXT holding U+FFFD, which both Node.js drivers put in place of each byte that is not UTF-8 \
+                 when they hand TEXT over as a string; the Node.js executor reads TEXT as its bytes only from a query SQLite can \
                  nest in a WITH clause, which this statement is not ({nesting}), so select the value through such a query, \
                  such as a table-valued pragma function like pragma_table_info"
             ))),
@@ -884,7 +884,7 @@ fn js_param(value: &SqliteValueRef<'_>) -> JsValue {
     }
 }
 
-/// The value in column `index` of a row, as both Node drivers hand each
+/// The value in column `index` of a row, as both Node.js drivers hand each
 /// storage class but TEXT over to a statement reading BigInts: NULL as null,
 /// INTEGER as BigInt, REAL as number (2.0 included), BLOB as Uint8Array. A
 /// string, their lossy form of TEXT, is refused, and so is anything else,
@@ -905,7 +905,7 @@ fn value_from_js(index: usize, value: JsValue) -> Result<SqliteValue, SqliteErro
     }
 }
 
-/// An INTEGER, which both Node drivers hand over as a BigInt.
+/// An INTEGER, which both Node.js drivers hand over as a BigInt.
 fn integer_from_js(value: &JsValue) -> Result<i64, SqliteError> {
     if !value.is_bigint() {
         return Err(SqliteError::Node(format!("expected an INTEGER as a BigInt, found {value:?}")));
@@ -927,7 +927,7 @@ fn method(database: &JsValue, name: &str) -> Result<Function, SqliteError> {
 fn statement_method(statement: &JsValue, name: &str) -> Result<Function, SqliteError> {
     Reflect::get(statement, &name.into()).map_err(js_error)?.dyn_into::<Function>().map_err(|_| {
         SqliteError::Node(format!(
-            "the database's statements have no `{name}` method, which the node executor needs; node:sqlite's statements have \
+            "the database's statements have no `{name}` method, which the Node.js executor needs; node:sqlite's statements have \
              every method it calls"
         ))
     })
@@ -975,7 +975,7 @@ mod tests {
             assert!(refusal.contains("Node.js 22.20.0 or later") && refusal.contains(version), "{refusal}");
         }
         assert!(meets_node_floor("22.20").is_err());
-        require_node_floor(&node_process().unwrap()).expect("the Node.js running the tests meets the floor");
+        require_node_floor(&nodejs_process().unwrap()).expect("the Node.js running the tests meets the floor");
     }
 
     /// `sql_text::is_filler` holds of exactly what SQLite skips between
@@ -1022,7 +1022,7 @@ mod tests {
     /// query whose reader it dropped as before, keeping it again.
     #[wasm_bindgen_test]
     fn keeps_the_typed_readers_of_the_most_recently_used_queries() {
-        let connection = NodeConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();
+        let connection = NodeJsConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();
         // SQL texts of the test's own, so that the readers of the queries
         // `from_database` ran leave first.
         let sql = |index: usize| format!("SELECT {index} AS kept");
@@ -1049,7 +1049,7 @@ mod tests {
         ignore = "better-sqlite3 refuses a call that passes too few values itself, so its connections keep no counts"
     )]
     fn forgets_the_parameter_counts_past_its_limit() {
-        let connection = NodeConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();
+        let connection = NodeJsConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();
         let checked = connection.parameters.as_ref().expect("node:sqlite binds NULL for a value a call does not pass");
         // Without the counts of the queries `from_database` ran.
         checked.borrow_mut().clear();

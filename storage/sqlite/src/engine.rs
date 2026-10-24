@@ -537,7 +537,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     use rusqlite::Connection;
     use std::collections::BTreeMap;
-    // The cases run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
+    // The cases run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
     #[cfg(not(target_arch = "wasm32"))]
     use tokio::test as engine_test;
     #[cfg(target_arch = "wasm32")]
@@ -818,7 +818,7 @@ mod tests {
         assert_eq!(found[0].payload.entity_id, entity);
     }
 
-    /// A model whose table takes the name the node executor's typed reader
+    /// A model whose table takes the name the Node.js executor's typed reader
     /// starts from, `_ankurah_typed_rows`, is written and read back on every
     /// driver: the reader takes a name its query does not use.
     #[engine_test]

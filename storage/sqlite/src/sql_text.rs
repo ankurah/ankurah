@@ -152,7 +152,7 @@ pub(crate) fn statement_end(sql: &str) -> usize {
 pub(crate) fn holds_a_second_statement(sql: &str) -> bool { !is_filler(&sql[statement_end(sql)..]) }
 
 /// `sql` past what SQLite skips before its first statement.
-#[cfg(any(test, all(target_arch = "wasm32", feature = "node")))]
+#[cfg(any(test, all(target_arch = "wasm32", feature = "nodejs")))]
 pub(crate) fn past_filler(sql: &str) -> &str {
     let start =
         tokens(sql).find(|(kind, _)| !matches!(kind, Kind::Space | Kind::Semicolon)).map_or(sql.len(), |(_, token)| offset(sql, token));
@@ -161,7 +161,7 @@ pub(crate) fn past_filler(sql: &str) -> &str {
 
 /// The keyword a statement begins with, past what SQLite skips before it, or
 /// an empty string when it begins with no word.
-#[cfg(any(test, all(target_arch = "wasm32", feature = "node")))]
+#[cfg(any(test, all(target_arch = "wasm32", feature = "nodejs")))]
 pub(crate) fn first_keyword(sql: &str) -> &str {
     match tokens(past_filler(sql)).next() {
         Some((Kind::Word, word)) => word,
@@ -173,7 +173,7 @@ pub(crate) fn first_keyword(sql: &str) -> &str {
 /// them: `:name`, `@name`, `#name` or `$name`, with the `::` and `(…)`
 /// suffixes of SQLite's Tcl form. better-sqlite3's SQLite is built without
 /// that form, and fails to prepare SQL that uses it.
-#[cfg(any(test, all(target_arch = "wasm32", feature = "node")))]
+#[cfg(any(test, all(target_arch = "wasm32", feature = "nodejs")))]
 pub(crate) fn named_parameters(sql: &str) -> Vec<&str> {
     tokens(sql).filter(|(kind, _)| *kind == Kind::Parameter).map(|(_, parameter)| parameter).collect()
 }
