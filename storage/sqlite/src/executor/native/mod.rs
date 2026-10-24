@@ -11,7 +11,7 @@ pub(crate) mod connection;
 use rusqlite::{
     params_from_iter,
     types::{ToSqlOutput, Type, ValueRef},
-    Batch, Connection, Statement, ToSql,
+    Connection, Statement, ToSql,
 };
 
 use crate::{
@@ -71,22 +71,17 @@ fn row_of(row: &rusqlite::Row<'_>, width: usize) -> Result<Row, SqliteError> {
 /// refused before SQLite prepares either, since SQLite applies some PRAGMAs
 /// while it prepares them: a defect fix, since rusqlite, prepared as main's
 /// engine prepared it, runs the first and ignores the rest without a word.
-/// Whitespace, semicolons and comments after the statement are no statement.
+/// Whitespace, semicolons and comments after the statement are no statement;
+/// anything else after it is, a byte SQLite cannot read among it. The scan
+/// alone finds a second statement, so SQLite prepares the first statement,
+/// past what it skips before it, and nothing after. SQL that holds no
+/// statement is prepared too, and SQLite refuses it when it runs, with
+/// SQLITE_MISUSE.
 fn one_statement<'c>(connection: &'c Connection, sql: &str) -> Result<Statement<'c>, SqliteError> {
     if statement_scan::statements(sql) == Statements::Several {
         return Err(rusqlite::Error::MultipleStatement.into());
     }
-    let mut statements = Batch::new(connection, sql);
-    // SQL that holds no statement at all is prepared as before, and SQLite
-    // refuses it when it runs.
-    let Some(statement) = statements.next()? else { return Ok(connection.prepare(sql)?) };
-    // SQLite reads what follows the statement too, which the scan above found
-    // to be only what it skips, so that it compiles nothing; should SQLite
-    // find a statement there all the same, the SQL is refused.
-    match statements.next() {
-        Ok(None) => Ok(statement),
-        Ok(Some(_)) | Err(_) => Err(rusqlite::Error::MultipleStatement.into()),
-    }
+    Ok(connection.prepare(sql)?)
 }
 
 /// A column as its storage class says it is, copied once out of SQLite's

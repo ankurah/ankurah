@@ -10,7 +10,8 @@ use crate::common::{self, engine_test};
 /// every driver, where rusqlite and node:sqlite ran the first and ignored the
 /// rest. Whitespace, semicolons and comments after a statement are no second
 /// statement, except that better-sqlite3 refuses a query with a comment after
-/// its semicolon (see `SqliteExecutor`).
+/// its semicolon (see `SqliteExecutor`); a byte SQLite cannot read after it
+/// is.
 #[engine_test]
 async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -21,10 +22,12 @@ async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
                 // The second statement cannot even be prepared until the first has run.
                 executor.execute("CREATE TABLE c (x); INSERT INTO c VALUES (1)", &[]),
                 executor.query("SELECT 1; SELECT 2", &[]).map(|rows| rows.len()),
+                // A vertical tab begins no whitespace for SQLite's tokenizer.
+                executor.execute("CREATE TABLE e (x);\x0b", &[]),
             ]
             .map(|outcome| outcome.map_err(|error| error.to_string()));
             let created = executor
-                .query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('a', 'b', 'c')", &[])?
+                .query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('a', 'b', 'c', 'e')", &[])?
                 .expect("one row")
                 .integer(0)?;
             executor.execute("CREATE TABLE d (x)", &[])?;
