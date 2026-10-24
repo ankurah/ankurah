@@ -499,9 +499,9 @@ mod map_costs {
     #[tokio::test]
     async fn bounded_reads_do_not_load_delta_history_from_an_excluded_branch() {
         let (maps, counts) = populated(128).await;
-        let range = TreeSpan::new(Included(leaf(0, 0).key), Excluded(leaf(2, 0).key));
+        let span = TreeSpan::new(Included(leaf(0, 0).key), Excluded(leaf(2, 0).key));
         let mut tx = begin(&maps, &counts);
-        let scope = tx.scope_spans([range.clone()]);
+        let scope = tx.scope_spans([span.clone()]);
         assert_eq!(tx.count(&scope).await.unwrap(), 2);
         let baseline = counts.lock().unwrap().clone();
         drop(tx);
@@ -511,7 +511,7 @@ mod map_costs {
         }
         tx.commit().await.unwrap();
         let mut tx = begin(&maps, &counts);
-        let scope = tx.scope_spans([range]);
+        let scope = tx.scope_spans([span]);
         reset(&counts);
         assert_eq!(tx.count(&scope).await.unwrap(), 2);
         let measured = counts.lock().unwrap().clone();

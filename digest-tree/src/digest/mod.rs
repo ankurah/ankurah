@@ -103,8 +103,8 @@ pub struct LeafElement<G: DigestGroup = Ristretto255>(pub(crate) G::Element);
 /// number of leaves summed.
 ///
 /// A tree node's digest is the digest of the leaves beneath it, and the digest
-/// of a range is the sum of the digests that tile it. Two digests are equal
-/// when both their elements and their counts are.
+/// of a span of leaves is the sum of the digests that tile it. Two digests are
+/// equal when both their elements and their counts are.
 ///
 /// The count is signed so that the difference of two digests, such as the
 /// change one leaf change makes to every tree node on its path, is a digest

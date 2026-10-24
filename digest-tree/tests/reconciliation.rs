@@ -184,7 +184,7 @@ fn limited_request(direction: OrderDirection, limit: u64) -> TreeRequest {
 }
 
 #[tokio::test]
-async fn underfilled_limits_keep_the_range_needed_to_acquire_members() {
+async fn underfilled_limits_keep_the_spans_needed_to_acquire_members() {
     for direction in [OrderDirection::Asc, OrderDirection::Desc] {
         for initial in [0, 3] {
             let opener = build::<Ristretto255>((0..initial).map(|n| leaf(n, 0))).await;
