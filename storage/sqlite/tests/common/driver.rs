@@ -26,6 +26,13 @@ use js_sys::{Array, Function, Reflect};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue};
 
+/// The attribute of a test that runs on every target: natively under tokio,
+/// and on wasm32 under wasm-bindgen-test in Node.js.
+#[cfg(not(target_arch = "wasm32"))]
+pub use tokio::test as engine_test;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_bindgen_test::wasm_bindgen_test as engine_test;
+
 /// Whether this run builds its databases with better-sqlite3: never
 /// natively, where rusqlite builds them.
 #[cfg(not(target_arch = "wasm32"))]

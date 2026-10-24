@@ -19,13 +19,9 @@ use ankurah::property::Json;
 use ankurah::{policy::DEFAULT_CONTEXT as c, EntityId, Model, ModelId, Node, PermissiveAgent, PropertyId, ValueType};
 use ankurah_storage_sqlite::sql_builder::{split_predicate_for_sqlite, SplitPredicate};
 use anyhow::Result;
+use common::engine_test;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::test as engine_test;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test as test;
 

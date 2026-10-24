@@ -489,7 +489,7 @@ fn load_states(snapshot: &dyn SqliteExecutor, ids: &[EntityId]) -> Result<Vec<At
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let id_strings: Vec<String> = ids.iter().map(|id| id.to_base64()).collect();
+    let id_strings: Vec<String> = ids.iter().map(EntityId::to_base64).collect();
     let placeholders = (0..ids.len()).map(|_| "?").collect::<Vec<_>>().join(", ");
     let rows = snapshot.query(
         &format!(
@@ -537,7 +537,7 @@ fn decode_event_row((entity_id, body, parent, attestations): RawEventRow<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_driver;
+    use crate::test_driver::{self, engine_test};
     use ankurah_core::{
         property::backend::{lww::LWWBackend, PropertyBackend},
         value::Value,
@@ -548,11 +548,6 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     use rusqlite::Connection;
     use std::collections::BTreeMap;
-    // The cases run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
-    #[cfg(not(target_arch = "wasm32"))]
-    use tokio::test as engine_test;
-    #[cfg(target_arch = "wasm32")]
-    use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
     #[derive(Default)]
     struct TestResolver {

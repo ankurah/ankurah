@@ -31,7 +31,7 @@ pub mod driver;
 #[allow(unused)]
 pub use driver::host_database;
 #[allow(unused)]
-pub use driver::{on_better_sqlite3, open, open_in_memory};
+pub use driver::{engine_test, on_better_sqlite3, open, open_in_memory};
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Album {

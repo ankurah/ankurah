@@ -120,20 +120,10 @@ run_wasm_tests() {
 
 # ankurah-storage-sqlite runs on wasm32 over Node.js's built-in SQLite (its
 # `nodejs` feature), so that suite runs in Node.js rather than Chrome; its name
-# carries no "wasm", so the Chrome discovery above leaves it alone.
-run_node_sqlite_tests() {
-    print_status "Running WASM tests in Node.js for ankurah-storage-sqlite (nodejs feature)..."
-    cd "$PROJECT_ROOT/storage/sqlite"
-    if wasm-pack test --node -- --features nodejs; then
-        print_status "✅ WASM tests passed for storage-sqlite on Node.js"
-    else
-        print_error "❌ WASM tests failed for storage-sqlite on Node.js"
-        cd - > /dev/null
-        exit 1
-    fi
-    cd - > /dev/null
-}
-
+# carries no "wasm", so the Chrome discovery above leaves it alone. The
+# argument names the driver the suite builds its databases with: node:sqlite
+# or better-sqlite3.
+#
 # The engine also adopts a better-sqlite3 database a host built, though it
 # never builds one itself, so the same suite runs again with better-sqlite3
 # building each database the tests build (see
@@ -143,20 +133,23 @@ run_node_sqlite_tests() {
 # reports as ignored; the cfg goes in the wasm32 target's rustflags, which
 # cargo joins with those .cargo/config.toml gives every wasm32 build, where
 # RUSTFLAGS would replace them.
-run_better_sqlite3_tests() {
-    if [ ! -d "$PROJECT_ROOT/storage/sqlite/tests/node_modules/better-sqlite3" ]; then
-        print_error "better-sqlite3 is not installed. Please install it first:"
-        print_error "  (cd storage/sqlite/tests && npm ci)"
-        exit 1
+run_storage_sqlite_tests() {
+    local driver="$1"
+    local -a environment=("ANKURAH_SQLITE_TEST_DRIVER=$driver")
+    if [ "$driver" = "better-sqlite3" ]; then
+        if [ ! -d "$PROJECT_ROOT/storage/sqlite/tests/node_modules/better-sqlite3" ]; then
+            print_error "better-sqlite3 is not installed. Please install it first:"
+            print_error "  (cd storage/sqlite/tests && npm ci)"
+            exit 1
+        fi
+        environment+=("CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS=--cfg ankurah_sqlite_better_sqlite3")
     fi
-    print_status "Running WASM tests in Node.js for ankurah-storage-sqlite (nodejs feature) on better-sqlite3..."
+    print_status "Running WASM tests in Node.js for ankurah-storage-sqlite (nodejs feature) on $driver..."
     cd "$PROJECT_ROOT/storage/sqlite"
-    if ANKURAH_SQLITE_TEST_DRIVER=better-sqlite3 \
-        CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="--cfg ankurah_sqlite_better_sqlite3" \
-        wasm-pack test --node -- --features nodejs; then
-        print_status "✅ WASM tests passed for storage-sqlite on better-sqlite3"
+    if env "${environment[@]}" wasm-pack test --node -- --features nodejs; then
+        print_status "✅ WASM tests passed for storage-sqlite on $driver"
     else
-        print_error "❌ WASM tests failed for storage-sqlite on better-sqlite3"
+        print_error "❌ WASM tests failed for storage-sqlite on $driver"
         cd - > /dev/null
         exit 1
     fi
@@ -215,13 +208,13 @@ main() {
     fi
 
     if [ "$target_package" = "storage_sqlite_node_sqlite" ]; then
-        run_node_sqlite_tests
+        run_storage_sqlite_tests node:sqlite
         print_status "🎉 All WASM tests completed successfully!"
         exit 0
     fi
 
     if [ "$target_package" = "storage_sqlite_better_sqlite3" ]; then
-        run_better_sqlite3_tests
+        run_storage_sqlite_tests better-sqlite3
         print_status "🎉 All WASM tests completed successfully!"
         exit 0
     fi
@@ -258,7 +251,7 @@ main() {
             [ -z "$package_name" ] && continue
             run_wasm_tests "$package_dir" "$package_name"
         done <<< "$wasm_packages"
-        run_node_sqlite_tests
+        run_storage_sqlite_tests node:sqlite
     fi
     
     print_status "🎉 All WASM tests completed successfully!"

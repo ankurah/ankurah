@@ -15,11 +15,7 @@
 mod common;
 
 use anyhow::Result;
-// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::test as engine_test;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_test::wasm_bindgen_test as engine_test;
+use common::engine_test;
 
 /// Helper to run a SQL query that returns a boolean (0 or 1 in SQLite)
 async fn query_bool(sql: &str) -> Result<bool> {

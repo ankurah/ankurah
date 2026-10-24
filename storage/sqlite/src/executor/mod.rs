@@ -35,6 +35,16 @@ use crate::{
     value::{SqliteValue, SqliteValueRef},
 };
 
+/// The session pragmas every connection the engine opens runs, natively and
+/// on Node.js alike, so that a Node.js connection behaves like a native one.
+/// Each executor sets the busy timeout apart, before them.
+pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
+     PRAGMA synchronous=NORMAL;
+     PRAGMA foreign_keys=ON;
+     PRAGMA cache_size=-64000;
+     PRAGMA mmap_size=268435456;
+     PRAGMA temp_store=MEMORY;";
+
 /// One SQLite connection, driven synchronously and in order.
 ///
 /// Parameters are positional `?` placeholders, bound by reference, without
@@ -162,11 +172,6 @@ impl SqliteExecutor for Transaction<'_> {
     }
 }
 
-impl<'e> std::ops::Deref for Transaction<'e> {
-    type Target = dyn SqliteExecutor + 'e;
-    fn deref(&self) -> &Self::Target { self.executor }
-}
-
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
         if self.open {
@@ -194,8 +199,6 @@ impl Row {
 
     pub fn values(&self) -> &[SqliteValue] { &self.0 }
 
-    pub fn into_values(self) -> Vec<SqliteValue> { self.0 }
-
     pub fn get(&self, index: usize) -> Result<&SqliteValue, SqliteError> {
         self.0.get(index).ok_or_else(|| SqliteError::Row(format!("column {index} is missing from a row of {} columns", self.0.len())))
     }
@@ -205,14 +208,6 @@ impl Row {
         match self.get(index)? {
             SqliteValue::Text(text) => Ok(text),
             other => Err(mismatch(index, other, "TEXT")),
-        }
-    }
-
-    /// A TEXT column that may be NULL.
-    pub fn opt_text(&self, index: usize) -> Result<Option<&str>, SqliteError> {
-        match self.get(index)? {
-            SqliteValue::Null => Ok(None),
-            _ => self.text(index).map(Some),
         }
     }
 

@@ -2,10 +2,7 @@
 mod cases;
 mod common;
 
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::test as engine_test;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_test::wasm_bindgen_test as engine_test;
+use common::engine_test;
 
 #[engine_test]
 async fn integer_comparisons_follow_numeric_order() -> anyhow::Result<()> {

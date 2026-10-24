@@ -8,12 +8,7 @@ mod common;
 use ankurah_core::storage::StorageEngine;
 use ankurah_proto::{ModelId, SystemModel, PROTOCOL_VERSION};
 use ankurah_storage_sqlite::{SqliteError, SqliteStorageEngine};
-use common::TempDb;
-// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::test as engine_test;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_test::wasm_bindgen_test as engine_test;
+use common::{engine_test, TempDb};
 
 async fn touch_system_materialization(engine: &SqliteStorageEngine) -> anyhow::Result<()> {
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };

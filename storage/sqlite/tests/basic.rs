@@ -15,13 +15,8 @@ use ankurah::{policy::DEFAULT_CONTEXT as c, Mutable, Node, PermissiveAgent};
 use anyhow::Result;
 #[cfg(not(target_arch = "wasm32"))]
 use common::TestWatcher;
-use common::{Album, AlbumView};
+use common::{engine_test, Album, AlbumView};
 use std::sync::Arc;
-// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::test as engine_test;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
 #[engine_test]
 async fn test_sqlite_create_and_query() -> Result<()> {

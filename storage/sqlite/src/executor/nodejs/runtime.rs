@@ -9,7 +9,7 @@ use super::{
     statement::{js_error, method},
     NodeJsConnection,
 };
-use crate::error::SqliteError;
+use crate::{error::SqliteError, executor::SESSION_PRAGMAS};
 
 /// The oldest Node.js the Node.js executor runs on, on either driver: from
 /// 22.20.0, node:sqlite binds a positional value to a numbered parameter such
@@ -54,15 +54,6 @@ fn meets_node_floor(version: &str) -> Result<(), SqliteError> {
 /// once, and on a file in a rollback journal even preparing `SELECT 1`
 /// takes a lock.
 const BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout=5000;";
-
-/// connection.rs's session pragmas, which make a Node.js connection behave like
-/// a native one.
-const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
-     PRAGMA synchronous=NORMAL;
-     PRAGMA foreign_keys=ON;
-     PRAGMA cache_size=-64000;
-     PRAGMA mmap_size=268435456;
-     PRAGMA temp_store=MEMORY;";
 
 impl NodeJsConnection {
     /// Open a database through Node.js's built-in module; `":memory:"` for an

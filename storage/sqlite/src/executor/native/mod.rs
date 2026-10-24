@@ -1,10 +1,10 @@
 //! The native executor: the engine's SQL run on rusqlite connections.
 //!
-//! The bb8 pool, the `spawn_blocking` hop and the session pragmas stay in
-//! `connection.rs`; this file only lets the engine reach a pooled rusqlite
-//! connection through [`SqliteExecutor`], binding [`SqliteValueRef`]
-//! parameters and reading each column by its SQLite storage class, with no
-//! conversion.
+//! The bb8 pool and the `spawn_blocking` hop stay in `connection.rs`, which
+//! also runs the session pragmas; this file only lets the engine reach a
+//! pooled rusqlite connection through [`SqliteExecutor`], binding
+//! [`SqliteValueRef`] parameters and reading each column by its SQLite
+//! storage class, with no conversion.
 
 pub(crate) mod connection;
 

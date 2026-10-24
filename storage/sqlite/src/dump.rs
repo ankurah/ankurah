@@ -191,13 +191,9 @@ mod tests {
     use ankurah_core::storage::{StorageCommitOutcome, StorageEngine, StorageTransaction};
     use ankurah_proto::{AuthorId, OperationSet};
     use futures_util::{pin_mut, StreamExt};
-    #[cfg(not(target_arch = "wasm32"))]
-    use tokio::test as engine_test;
-    #[cfg(target_arch = "wasm32")]
-    use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
     use super::*;
-    use crate::test_driver;
+    use crate::test_driver::{self, engine_test};
 
     #[engine_test]
     async fn dump_crosses_cursor_pages_without_skipping_records() -> anyhow::Result<()> {

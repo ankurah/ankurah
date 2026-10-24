@@ -9,14 +9,9 @@ use ankurah_storage_sqlite::{
     SqliteError, SqliteStorageEngine, SqliteValue, SqliteValueRef,
 };
 use anyhow::Result;
-use common::{session_settings, LockHolder, Stopwatch, TempDb};
+use common::{engine_test, session_settings, LockHolder, Stopwatch, TempDb};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-// The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.js.
-#[cfg(not(target_arch = "wasm32"))]
-use tokio::test as engine_test;
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
 #[derive(Model, Debug, Serialize, Deserialize)]
 pub struct Stamp {

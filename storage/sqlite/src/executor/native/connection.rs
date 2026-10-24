@@ -6,7 +6,7 @@ use std::sync::Arc;
 use rusqlite::{config::DbConfig, Connection};
 use tokio::sync::Mutex;
 
-use crate::error::SqliteError;
+use crate::{error::SqliteError, executor::SESSION_PRAGMAS};
 
 /// Configuration for SQLite connections
 #[derive(Clone, Debug)]
@@ -39,14 +39,7 @@ impl SqliteConnectionManager {
         };
 
         // Performance optimizations
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA synchronous=NORMAL;
-             PRAGMA foreign_keys=ON;
-             PRAGMA cache_size=-64000;
-             PRAGMA mmap_size=268435456;
-             PRAGMA temp_store=MEMORY;",
-        )?;
+        conn.execute_batch(SESSION_PRAGMAS)?;
 
         // A defect fix: main left double-quoted string literals on, so a
         // double-quoted name that matched no column read as a string, in a
