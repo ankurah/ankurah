@@ -17,15 +17,22 @@ use crate::{
     value::{SqliteValue, SqliteValueRef},
 };
 
-/// The SQL of a typed reader for `statement`, whose rows have `width`
-/// columns: the statement nested in a WITH clause, and each of its columns
-/// read as two, the value's storage class from `typeof()` and the value
-/// itself, TEXT cast to the BLOB of its bytes. MATERIALIZED has SQLite
-/// compute each value once, so that the class and the value read are of the
-/// same one; SQLite keeps a nested ORDER BY when the query around it has
-/// none, and a materialized statement's rows are read in the order it
-/// yielded them.
-pub(super) fn typed_reader(statement: &str, width: usize) -> String {
+/// A typed reader's SQL, and the name of the CTE it nests its statement in,
+/// which SQLite names in its error when the statement no longer yields as
+/// many columns as the reader names.
+pub(super) struct TypedReader {
+    pub(super) sql: String,
+    pub(super) name: String,
+}
+
+/// A typed reader for `statement`, whose rows have `width` columns: the
+/// statement nested in a WITH clause, and each of its columns read as two,
+/// the value's storage class from `typeof()` and the value itself, TEXT cast
+/// to the BLOB of its bytes. MATERIALIZED has SQLite compute each value once,
+/// so that the class and the value read are of the same one; SQLite keeps a
+/// nested ORDER BY when the query around it has none, and a materialized
+/// statement's rows are read in the order it yielded them.
+pub(super) fn typed_reader(statement: &str, width: usize) -> TypedReader {
     // A statement's source keeps the semicolon that ended it, which a nested
     // statement cannot have.
     let statement = statement.trim_end().strip_suffix(';').unwrap_or(statement);
@@ -38,13 +45,14 @@ pub(super) fn typed_reader(statement: &str, width: usize) -> String {
     // cannot stand in for a table the statement names, such as a model's
     // table of the same name; SQLite reads names without regard to ASCII case.
     let text = statement.to_ascii_lowercase();
-    let reader = std::iter::once("_ankurah_typed_rows".to_owned())
+    let name = std::iter::once("_ankurah_typed_rows".to_owned())
         .chain((1..).map(|suffix| format!("_ankurah_typed_rows_{suffix}")))
         .find(|name| !text.contains(name.as_str()))
         .expect("a finite statement leaves some suffix unused");
     // The statement stands on lines of its own, so that a comment ending it
     // cannot swallow the parenthesis that closes it.
-    format!("WITH {reader}({names}) AS MATERIALIZED (\n{statement}\n) SELECT {columns} FROM {reader}")
+    let sql = format!("WITH {name}({names}) AS MATERIALIZED (\n{statement}\n) SELECT {columns} FROM {name}");
+    TypedReader { sql, name }
 }
 
 /// A row of a typed reader, a storage class and a value for each column of

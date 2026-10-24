@@ -228,14 +228,15 @@ impl NodeJsConnection {
                 // only, so a reader of an attached database's table can name
                 // fewer or more columns than its statement now yields. SQLite
                 // then fails to prepare the reader again, before it runs
-                // anything, and so only such a reader is dropped and its
-                // statement read afresh, as on its first run. Any other failure
-                // is reported as it came, and the reader kept: the statement may
-                // have run in part, calling a host function, and SQLite may
-                // have rolled back the transaction it ran in, so running it
-                // again could repeat that part, or run outside the transaction.
-                Err(error) if !self.yields_another_width(sql, width) => return Err(error),
-                Err(_) => self.drop_reader(sql),
+                // anything, with an error that names the reader, and only on
+                // that error is the reader dropped and its statement read
+                // afresh, as on its first run. Any other failure is reported
+                // as it came, and the reader kept: the statement may have run
+                // in part, calling a host function, and SQLite may have rolled
+                // back the transaction it ran in, so running it again could
+                // repeat that part, or run outside the transaction.
+                Err(error) if self.reader_went_stale(sql, &error) => self.drop_reader(sql),
+                Err(error) => return Err(error),
             }
         }
         let named_parameter = refuse_all_but_one_statement(sql)?;
@@ -256,11 +257,12 @@ impl NodeJsConnection {
         // the source past what SQLite skips before it, which the source keeps,
         // and whose semicolons a WITH clause cannot hold.
         let nested = statement_scan::skip_to_statement(&source);
-        match self.prepare(&typed_reader(nested, width)) {
+        let typed = typed_reader(nested, width);
+        match self.prepare(&typed.sql) {
             Ok(reader) => {
                 // Checked once for each SQL text, since a kept reader skips it.
                 self.refuse_a_compound_select(nested, params)?;
-                self.keep_reader(sql, &reader, width);
+                self.keep_reader(sql, &reader, width, typed.name);
                 read_rows(&reader, params, 2 * width, selection)?.into_iter().map(typed_row).collect()
             }
             // The typed reader reads each column as two, so SQLite refuses to

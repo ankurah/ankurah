@@ -8,13 +8,17 @@ use wasm_bindgen::{JsCast, JsValue};
 
 use super::{
     exception::js_error,
-    statement::{integer_from_js, statement_method, unreadable, width},
+    statement::{integer_from_js, statement_method, unreadable},
     NodeJsConnection,
 };
-use crate::error::SqliteError;
+use crate::error::{SqliteError, SqliteFailure};
 
 /// How many typed readers a connection keeps prepared.
 const KEPT_READERS_MAX: usize = 64;
+
+/// SQLite's result code for an error of its own, such as one it meets as it
+/// prepares a statement.
+const SQLITE_ERROR: i32 = 1;
 
 /// The typed readers a connection has prepared, by the SQL text of the
 /// statement each reads, so that a query run again skips both prepares,
@@ -25,9 +29,9 @@ const KEPT_READERS_MAX: usize = 64;
 /// gained or lost; so every kept reader is dropped when the schema version
 /// of main or temp changes, and one that fails because its statement now
 /// yields another number of columns, as a reader of an attached database's
-/// table can, is dropped and its statement read afresh (see `read`). A
-/// reader is kept only for a statement that `refuse_a_compound_select` lets
-/// through.
+/// table can, is dropped and its statement read afresh (see
+/// `reader_went_stale`). A reader is kept only for a statement that
+/// `refuse_a_compound_select` lets through.
 #[derive(Default)]
 pub(super) struct KeptReaders {
     /// The schema versions the kept readers were prepared at.
@@ -40,6 +44,8 @@ pub(super) struct KeptReaders {
 struct KeptReader {
     statement: JsValue,
     width: usize,
+    /// The name of the CTE the reader nests its statement in.
+    name: String,
     used: u64,
 }
 
@@ -62,9 +68,9 @@ impl NodeJsConnection {
         }))
     }
 
-    /// Keep a typed reader just prepared for `sql`, making room by dropping
-    /// the least recently used one.
-    pub(super) fn keep_reader(&self, sql: &str, statement: &JsValue, width: usize) {
+    /// Keep a typed reader just prepared for `sql`, which nests its statement
+    /// in the CTE `name`, making room by dropping the least recently used one.
+    pub(super) fn keep_reader(&self, sql: &str, statement: &JsValue, width: usize, name: String) {
         let mut readers = self.readers.borrow_mut();
         if readers.kept.len() >= KEPT_READERS_MAX {
             let oldest = readers.kept.iter().min_by_key(|(_, reader)| reader.used).map(|(sql, _)| sql.clone());
@@ -74,7 +80,7 @@ impl NodeJsConnection {
         }
         readers.clock += 1;
         let used = readers.clock;
-        readers.kept.insert(sql.to_owned(), KeptReader { statement: statement.clone(), width, used });
+        readers.kept.insert(sql.to_owned(), KeptReader { statement: statement.clone(), width, name, used });
     }
 
     /// The schema versions of main and temp, which change whenever their schemas do.
@@ -104,13 +110,24 @@ impl NodeJsConnection {
     /// afresh, as on its first run.
     pub(super) fn drop_reader(&self, sql: &str) { self.readers.borrow_mut().kept.remove(sql); }
 
-    /// Whether the statement `sql`, prepared afresh, yields another number of
-    /// columns than the `kept_width` its kept reader names, which is why
-    /// SQLite fails to prepare that reader again. A statement that no longer
-    /// prepares yields no other width, so that the reader's own failure is
-    /// reported.
-    pub(super) fn yields_another_width(&self, sql: &str, kept_width: usize) -> bool {
-        self.prepare(sql).and_then(|statement| width(&statement)).is_ok_and(|width| width != kept_width)
+    /// Whether `error` is SQLite's failure to prepare the typed reader kept
+    /// for `sql` again because its statement no longer yields as many columns
+    /// as the reader names: SQLite reports that as an SQLITE_ERROR, "table
+    /// <reader> has <N> values for <M> columns", naming the reader's CTE and
+    /// the width it was kept at. A failure SQLite words otherwise is not
+    /// such a failure, so that it is reported as it came.
+    pub(super) fn reader_went_stale(&self, sql: &str, error: &SqliteError) -> bool {
+        let SqliteError::Sqlite(SqliteFailure { code: Some(SQLITE_ERROR), message }) = error else {
+            return false;
+        };
+        let readers = self.readers.borrow();
+        let Some(reader) = readers.kept.get(sql) else {
+            return false;
+        };
+        message
+            .strip_prefix(&format!("table {} has ", reader.name))
+            .and_then(|rest| rest.strip_suffix(&format!(" values for {} columns", reader.width)))
+            .is_some_and(|values| values.parse::<usize>().is_ok())
     }
 }
 
@@ -181,6 +198,33 @@ mod tests {
         assert_eq!(Reflect::get(connection.database(), &open.into()).unwrap().as_bool(), Some(true), "the transaction is open");
         connection.execute("ROLLBACK", &[]).unwrap();
         assert_eq!(connection.query_row("SELECT count(*) FROM f", &[]).unwrap().unwrap().integer(0).unwrap(), 3);
+    }
+
+    /// A kept reader whose statement fails with an error SQLite raises as it
+    /// runs, an SQLITE_ERROR as the one naming the reader is, reports the
+    /// error and does not run the statement again: json() refuses the
+    /// malformed JSON of a row inserted after the reader was kept, and
+    /// `tally()` counts the rows the statement reached.
+    #[wasm_bindgen_test]
+    fn a_kept_reader_that_fails_with_another_sqlite_error_reports_it() {
+        let database = test_driver::host_database(":memory:");
+        let register = Function::new_with_args(
+            "database",
+            "let calls = 0;
+             database.function('tally', () => { calls += 1; return null; });
+             return () => calls;",
+        );
+        let calls: Function = register.call1(&JsValue::NULL, &database).unwrap().dyn_into().unwrap();
+        let connection = NodeJsConnection::from_database(database).unwrap();
+        connection.execute("CREATE TABLE j (a)", &[]).unwrap();
+        connection.execute("INSERT INTO j VALUES ('{}'), ('[]')", &[]).unwrap();
+        let sql = "SELECT tally(), json(a) FROM j ORDER BY rowid";
+        assert_eq!(connection.query(sql, &[]).unwrap().len(), 2, "the first run calls tally() twice and keeps the reader");
+        connection.execute("INSERT INTO j VALUES ('{')", &[]).unwrap();
+        let error = connection.query(sql, &[]).expect_err("json() refuses malformed JSON");
+        assert_eq!(error.sqlite_code(), Some(1), "{error}");
+        let calls = calls.call0(&JsValue::NULL).unwrap().as_f64().unwrap();
+        assert_eq!(calls, 5.0, "the failed run reached the table's three rows, and nothing ran the statement again");
     }
 
     /// A connection keeps the typed readers of at most [`KEPT_READERS_MAX`]
