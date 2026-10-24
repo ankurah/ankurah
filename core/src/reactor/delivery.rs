@@ -89,8 +89,9 @@ impl<Ev> PreparedEvents<Ev> {
     }
 }
 
-/// Resolve every plan's undelivered events through `history`. A plan whose history cannot be
-/// proven prepares nothing and returns its failure instead.
+/// Resolve every plan's undelivered events through `history`, and return a failure for each
+/// entity whose history cannot be proven. A query's plan then prepares nothing, so the query
+/// publishes none of the batch; an entity subscription's plan loses only the failing entity.
 pub(super) async fn prepare<Ev: ReactorEvent>(
     history: Option<&(dyn GetEvents + Send + Sync)>,
     plans: Vec<DeliveryPlan<'_, Ev>>,
@@ -99,21 +100,19 @@ pub(super) async fn prepare<Ev: ReactorEvent>(
     let mut failures = Vec::new();
     for DeliveryPlan { query, version, mut delivered, rows } in plans {
         let mut staged = Vec::new();
-        let mut failure = None;
-        for (offset, id, events) in rows {
-            match delivered.take_undelivered(history, id, events).await {
+        for (offset, entity, events) in rows {
+            match delivered.take_undelivered(history, entity, events).await {
                 Ok(row) => staged.push(((query, offset), row)),
                 Err(error) => {
-                    failure = Some(error);
-                    break;
+                    failures.push(NotificationFailure { query, version, entity, error });
+                    if query.is_some() {
+                        staged.clear();
+                        break;
+                    }
                 }
             }
         }
-        if let Some(error) = failure {
-            failures.push(NotificationFailure { query, version, error });
-        } else {
-            prepared.rows.extend(staged);
-        }
+        prepared.rows.extend(staged);
     }
     (prepared, failures)
 }

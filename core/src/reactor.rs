@@ -39,13 +39,15 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-/// A query that `notify_change` could not bring up to date, because its events' history could
-/// not be proven: the query is paused, or for `query: None` the entity subscriptions are dropped,
-/// and the committed write stands.
+/// A notification `notify_change` could not deliver, because an entity's event history could not
+/// be proven. A failing query is paused; for `query: None`, the subscription's explicit
+/// subscription to that entity is dropped. The committed write stands either way.
 #[derive(Debug)]
 pub struct NotificationFailure {
     pub query: Option<proto::QueryId>,
     pub version: u32,
+    /// The entity whose event history could not be proven.
+    pub entity: proto::EntityId,
     pub error: RetrievalError,
 }
 

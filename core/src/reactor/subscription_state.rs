@@ -381,12 +381,17 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         if !failures.is_empty() {
             let mut state = self.state.lock().unwrap();
             for failure in &failures {
-                if let Some(query) = failure.query.and_then(|id| state.queries.get_mut(&id)) {
-                    query.paused = true;
-                    query.resultset.set_loaded(false);
-                } else if failure.query.is_none() {
-                    state.entity_subscriptions.clear();
-                    state.entity_delivered.clear();
+                match failure.query {
+                    Some(id) => {
+                        if let Some(query) = state.queries.get_mut(&id) {
+                            query.paused = true;
+                            query.resultset.set_loaded(false);
+                        }
+                    }
+                    None => {
+                        state.entity_subscriptions.remove(&failure.entity);
+                        state.entity_delivered.forget(&failure.entity);
+                    }
                 }
             }
         }

@@ -24,7 +24,7 @@ impl LiveQueryRegistry {
             if let Some(query) = failure.query.and_then(|id| self.get(id)) {
                 query.fail_resolution(failure.version, failure.error.clone());
             } else {
-                tracing::warn!(error = %failure.error, "reactor notification could not establish event coverage");
+                tracing::warn!(error = %failure.error, entity = %failure.entity, "reactor notification could not establish event coverage");
             }
         }
     }
