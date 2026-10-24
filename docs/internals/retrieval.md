@@ -88,8 +88,8 @@ entity state snapshots, translating "not found" into `Ok(None)`.
 
 ## The Event Lifecycle: Stage, Apply, Commit
 
-A typical flow in [`NodeApplier::apply_update`](node-architecture.md#streaming-updates-updatecontent)
-for `EventOnly` content:
+A typical flow in [`NodeApplier::apply_delta`](node-architecture.md#live-publications)
+for an event bridge:
 
 ```text
 for each event:

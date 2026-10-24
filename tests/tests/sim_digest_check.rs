@@ -13,26 +13,23 @@ use ankurah_tests::sim::transport::message_digest;
 
 fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> proto::NodeMessage {
     let frag: proto::EventFragment = ev.into();
-    proto::NodeMessage::Update(proto::NodeUpdate {
-        id: proto::UpdateId::new(),
+    proto::NodeMessage::StateFrame {
         from: entity,
         to: entity,
-        body: proto::NodeUpdateBody::StateFrame {
-            request_id: proto::RequestId::new(),
-            frame: proto::StateFrame {
-                stream: proto::StateStreamId::new(),
-                sequence: 1,
-                body: proto::StateFrameBody::Live {
-                    revision: 1,
-                    items: vec![ankurah_tests::state_stream_fixture::change(proto::EntityDelta {
-                        entity_id: entity,
-                        content: proto::DeltaContent::EventBridge { events: vec![frag] },
-                    })],
-                    complete: true,
-                },
+        request_id: proto::RequestId::new(),
+        frame: proto::StateFrame {
+            stream: proto::StateStreamId::new(),
+            sequence: 1,
+            body: proto::StateFrameBody::Live {
+                revision: 1,
+                items: vec![ankurah_tests::state_stream_fixture::change(proto::EntityDelta {
+                    entity_id: entity,
+                    content: proto::DeltaContent::EventBridge { events: vec![frag] },
+                })],
+                complete: true,
             },
         },
-    })
+    }
 }
 
 #[test]
@@ -57,30 +54,25 @@ fn digest_is_stable_for_identical_content() {
 
 #[test]
 fn comparison_digest_tracks_repair_content_but_not_session_ids() {
-    let reply = |event: proto::Event| {
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
-            from: event.entity_id,
-            to: event.entity_id,
-            body: proto::NodeUpdateBody::StateFrame {
-                request_id: proto::RequestId::new(),
-                frame: proto::StateFrame {
-                    stream: proto::StateStreamId::new(),
-                    sequence: 1,
-                    body: proto::StateFrameBody::State {
-                        round: 0,
-                        items: vec![proto::StateItem::Repair {
-                            target: proto::Clock::singleton(&event),
-                            delta: proto::EntityDelta {
-                                entity_id: event.entity_id,
-                                content: proto::DeltaContent::EventBridge { events: vec![model::attest(event).into()] },
-                            },
-                        }],
-                        progress: proto::ComparisonProgress::Complete,
+    let reply = |event: proto::Event| proto::NodeMessage::StateFrame {
+        from: event.entity_id,
+        to: event.entity_id,
+        request_id: proto::RequestId::new(),
+        frame: proto::StateFrame {
+            stream: proto::StateStreamId::new(),
+            sequence: 1,
+            body: proto::StateFrameBody::Round {
+                round: 0,
+                items: vec![proto::StateItem::Repair(proto::RepairItem::Delta {
+                    target: proto::Clock::singleton(&event),
+                    delta: proto::EntityDelta {
+                        entity_id: event.entity_id,
+                        content: proto::DeltaContent::EventBridge { events: vec![model::attest(event).into()] },
                     },
-                },
+                })],
+                progress: proto::ComparisonProgress::Complete,
             },
-        })
+        },
     };
     let one = model::genesis_event(1, model::Field::Title, "one");
     let two = model::genesis_event(1, model::Field::Title, "two");
@@ -90,15 +82,12 @@ fn comparison_digest_tracks_repair_content_but_not_session_ids() {
 }
 
 fn frame_message(sequence: u64, body: proto::StateFrameBody) -> proto::NodeMessage {
-    proto::NodeMessage::Update(proto::NodeUpdate {
-        id: proto::UpdateId::new(),
+    proto::NodeMessage::StateFrame {
         from: proto::EntityId::from_bytes([1; 32]),
         to: proto::EntityId::from_bytes([2; 32]),
-        body: proto::NodeUpdateBody::StateFrame {
-            request_id: proto::RequestId::new(),
-            frame: proto::StateFrame { stream: proto::StateStreamId::new(), sequence, body },
-        },
-    })
+        request_id: proto::RequestId::new(),
+        frame: proto::StateFrame { stream: proto::StateStreamId::new(), sequence, body },
+    }
 }
 
 #[test]

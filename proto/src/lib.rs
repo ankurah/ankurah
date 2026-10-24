@@ -12,12 +12,11 @@ pub mod id;
 pub mod message;
 pub mod peering;
 pub mod request;
-pub mod state;
+pub mod state_sync;
 mod subscription;
 pub mod sys;
 pub mod time;
 pub mod transaction;
-pub mod update;
 
 #[cfg(feature = "postgres")]
 pub mod postgres;
@@ -39,7 +38,6 @@ pub use message::*;
 pub use peering::*;
 pub use registration::*;
 pub use request::*;
-pub use state::*;
+pub use state_sync::*;
 pub use subscription::QueryId;
 pub use transaction::*;
-pub use update::*;

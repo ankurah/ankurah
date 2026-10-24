@@ -572,7 +572,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 RequestError::PeerNotConnected => true,
                 RequestError::ConnectionLost => true,
                 RequestError::SystemNotReady => true,
-                RequestError::StateCaptureBusy => true,
+                RequestError::StateSnapshotBusy => true,
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
                 RequestError::ServerError(_) => false,
@@ -669,8 +669,8 @@ where
         .await?;
         let state = match response {
             proto::NodeResponseBody::QuerySubscribed { query_id: response_query, state } if response_query == query_id => state,
-            proto::NodeResponseBody::StateStreamUnavailable { .. } => return Err(RequestError::ConnectionLost.into()),
-            proto::NodeResponseBody::StateCaptureBusy => return Err(RequestError::StateCaptureBusy.into()),
+            proto::NodeResponseBody::StateStreamUnavailable => return Err(RequestError::ConnectionLost.into()),
+            proto::NodeResponseBody::StateSnapshotBusy => return Err(RequestError::StateSnapshotBusy.into()),
             proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
             other => return Err(RequestError::UnexpectedResponse(other).into()),
         };
@@ -1223,7 +1223,7 @@ mod tests {
     #[tokio::test]
     async fn capture_busy_is_retryable_but_policy_and_generic_server_errors_are_terminal() {
         for (error, retryable) in [
-            (RequestError::StateCaptureBusy, true),
+            (RequestError::StateSnapshotBusy, true),
             (RequestError::AccessDenied(crate::policy::AccessDenied::ByPolicy("fixture denies query")), false),
             (RequestError::ServerError("invalid tree specification".into()), false),
         ] {
@@ -1245,7 +1245,7 @@ mod tests {
     /// whether the late reply is a success or a permanent failure.
     #[tokio::test]
     async fn stale_reply_does_not_overwrite_newer_version() {
-        for stale_reply in [Ok(()), Err(RequestError::ServerError("rejected".into())), Err(RequestError::StateCaptureBusy)] {
+        for stale_reply in [Ok(()), Err(RequestError::ServerError("rejected".into())), Err(RequestError::StateSnapshotBusy)] {
             let (relay, mock_sender, peer_id) = connected_relay();
             let query_id = proto::QueryId::new();
             let stale = mock_sender.hold_next_reply();

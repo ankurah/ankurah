@@ -899,7 +899,7 @@ async fn catalog_lookup_waits_for_subscription_delivery() -> anyhow::Result<()> 
         ) {
             observed_reads.fetch_add(1, Ordering::Relaxed);
         }
-        gated.load(Ordering::Relaxed) && matches!(message, proto::NodeMessage::Update { .. })
+        gated.load(Ordering::Relaxed) && matches!(message, proto::NodeMessage::StateFrame { .. })
     })
     .await;
     let server_ctx = server.context_async(DEFAULT_CONTEXT).await?;

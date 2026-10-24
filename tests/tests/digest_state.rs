@@ -3,7 +3,7 @@ mod common;
 use ankurah::Mutable;
 use anyhow::Result;
 use common::*;
-use proto::{NodeMessage, NodeResponseBody, StateItem};
+use proto::{NodeMessage, NodeResponseBody, RepairItem, StateItem};
 use std::{
     collections::HashSet,
     sync::{Arc, Mutex},
@@ -16,7 +16,7 @@ impl Trace {
     fn record(&self, message: &NodeMessage) {
         if let NodeMessage::Response(response) = message {
             self.0.lock().unwrap().push(response.body.clone());
-        } else if let NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+        } else if let NodeMessage::StateFrame { frame, .. } = message {
             self.1.lock().unwrap().push(frame.clone());
         }
     }
@@ -44,7 +44,7 @@ impl Trace {
             .chain(pushed.iter())
             .filter(|frame| comparisons.contains(&frame.stream))
             .flat_map(|frame| match &frame.body {
-                proto::StateFrameBody::State { items, .. } => items.clone(),
+                proto::StateFrameBody::Round { items, .. } => items.clone(),
                 _ => vec![],
             })
             .collect()
@@ -71,13 +71,13 @@ async fn wait_for_named(description: &str, mut condition: impl FnMut() -> bool) 
 }
 fn bridge_for(items: &[StateItem], id: EntityId) -> bool {
     items.iter().any(|item| {
-        matches!(item, StateItem::Repair { delta, .. }
+        matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. })
         if delta.entity_id == id && matches!(delta.content, proto::DeltaContent::EventBridge { .. }))
     })
 }
 fn offers_target(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool {
     items.iter().any(|item| match item {
-        StateItem::Repair { target, delta } => delta.entity_id == id && target == head,
+        StateItem::Repair(RepairItem::Delta { target, delta }) => delta.entity_id == id && target == head,
         _ => false,
     })
 }
@@ -146,7 +146,7 @@ async fn fetch_initial_inventory_omits_equal_heads_and_sends_only_the_changed_ta
     assert_eq!(cold.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum::<usize>(), 256);
     assert_eq!(
         cold.iter()
-            .filter(|item| matches!(item, StateItem::Repair { delta, .. }
+            .filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. })
         if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })))
             .count(),
         256
@@ -158,7 +158,7 @@ async fn fetch_initial_inventory_omits_equal_heads_and_sends_only_the_changed_ta
     assert!(
         trace.0.lock().unwrap().iter().any(|body| matches!(body,
         NodeResponseBody::Fetch(state) if matches!(state.frame.body,
-            proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))),
+            proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Complete, .. }))),
         "empty comparison output must still finish with Complete"
     );
 
@@ -183,9 +183,9 @@ async fn fetch_initial_inventory_omits_equal_heads_and_sends_only_the_changed_ta
     assert_eq!(heads.len(), 1);
     assert_eq!(heads[0].entity.entity_id, pets[117].id());
     assert_eq!(heads[0].entity.head, pets[117].entity().head());
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 1);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), 1);
     assert!(
-        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
+        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair(RepairItem::Delta { .. }))),
         "only the changed target needs output: {items:?}"
     );
     Ok(())
@@ -268,7 +268,7 @@ async fn empty_query_inventory_sends_snapshots_without_asserting_global_entity_a
         items
             .iter()
             .filter(
-                |item| matches!(item, StateItem::Repair { delta, .. } if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))
+                |item| matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. }) if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))
             )
             .count(),
         192
@@ -305,7 +305,7 @@ async fn fetch_falls_back_to_snapshot_when_event_bridge_exceeds_work_budget() ->
     assert_eq!(fetched[0].entity().head(), pet.entity().head());
     assert!(trace.items(None).iter().any(|item| matches!(
         item,
-        StateItem::Repair { delta, .. }
+        StateItem::Repair(RepairItem::Delta { delta, .. })
             if delta.entity_id == pet.id() && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
     )));
     Ok(())
@@ -334,8 +334,10 @@ async fn large_snapshot_is_chunked_and_applied_before_fetch_returns() -> Result<
     assert_eq!(fetched[0].id(), id);
     assert_eq!(fetched[0].title()?, payload);
     let items = trace.items(None);
-    let chunks: Vec<_> =
-        items.iter().filter_map(|item| if let StateItem::RepairChunk { chunk, .. } = item { Some(chunk) } else { None }).collect();
+    let chunks: Vec<_> = items
+        .iter()
+        .filter_map(|item| if let StateItem::Repair(RepairItem::Chunk { chunk, .. }) = item { Some(chunk) } else { None })
+        .collect();
     assert!(chunks.len() >= 5);
     assert_eq!(chunks[0].offset, 0);
     for pair in chunks.windows(2) {
@@ -371,7 +373,13 @@ async fn live_edits_cross_unfinished_comparison_then_reconnect_from_retained_sta
             if let NodeMessage::Request {
                 request:
                     proto::NodeRequest {
-                        body: proto::NodeRequestBody::ContinueState { stream: comparison, round: Some(0), answers, .. }, ..
+                        body:
+                            proto::NodeRequestBody::StateFeedback {
+                                stream: comparison,
+                                answers: Some(proto::FeedbackAnswers::Round { round: 0, answers }),
+                                ..
+                            },
+                        ..
                     },
                 ..
             } = message
@@ -635,13 +643,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &no_credentials,
-                proto::NodeRequestBody::ContinueState {
-                    stream: comparison,
-                    round: None,
-                    processed_through: 0,
-                    applied_through: None,
-                    answers: vec![]
-                }
+                proto::NodeRequestBody::StateFeedback { stream: comparison, processed_through: 0, applied_through: None, answers: None }
             )
             .await?,
         NodeResponseBody::Error(_)
@@ -651,15 +653,17 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::ContinueState {
+                proto::NodeRequestBody::StateFeedback {
                     stream: comparison,
-                    round: Some(0),
                     applied_through: None,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
-                        bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-                        heads: vec![].into()
-                    })],
+                    answers: Some(proto::FeedbackAnswers::Round {
+                        round: 0,
+                        answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
+                            bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                            heads: Default::default()
+                        })]
+                    })
                 }
             )
             .await?,
@@ -671,13 +675,7 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::ContinueState {
-                    stream: comparison,
-                    round: None,
-                    processed_through: 0,
-                    applied_through: None,
-                    answers: vec![]
-                }
+                proto::NodeRequestBody::StateFeedback { stream: comparison, processed_through: 0, applied_through: None, answers: None }
             )
             .await?,
         NodeResponseBody::Success
@@ -687,19 +685,21 @@ async fn comparisons_reject_wrong_credentials_unsolicited_answers_and_early_appl
             .request(
                 server.id,
                 &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::ContinueState {
+                proto::NodeRequestBody::StateFeedback {
                     stream: comparison,
-                    round: Some(0),
                     applied_through: None,
                     processed_through: 0,
-                    answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
-                        bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
-                        heads: vec![].into()
-                    })],
+                    answers: Some(proto::FeedbackAnswers::Round {
+                        round: 0,
+                        answers: vec![proto::StateAnswer::Heads(proto::TreeSpanInventory {
+                            bounds: proto::TreeSpan::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+                            heads: Default::default()
+                        })]
+                    })
                 }
             )
             .await?,
-        NodeResponseBody::StateStreamUnavailable { .. }
+        NodeResponseBody::StateStreamUnavailable
     ));
     Ok(())
 }
@@ -798,13 +798,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
     let initial = replies().remove(0);
     assert_eq!(bincode::serialize(&initial)?, bincode::serialize(&replies()[1])?);
     let comparison = initial.frame.stream;
-    let feedback = proto::NodeRequestBody::ContinueState {
-        stream: comparison,
-        round: None,
-        processed_through: 0,
-        applied_through: None,
-        answers: vec![],
-    };
+    let feedback = proto::NodeRequestBody::StateFeedback { stream: comparison, processed_through: 0, applied_through: None, answers: None };
     let request = proto::RequestId::new();
     for _ in 0..2 {
         server
@@ -826,15 +820,7 @@ async fn retry_replays_frame_zero_and_feedback_without_advancing_twice() -> Resu
             request: proto::NodeRequest { id: origin, from: client.id, to: server.id, body },
         })
         .await?;
-    wait_for(|| {
-        trace
-            .0
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|body| matches!(body, NodeResponseBody::StateStreamUnavailable { stream: id } if *id == comparison))
-    })
-    .await;
+    wait_for(|| trace.0.lock().unwrap().iter().any(|body| matches!(body, NodeResponseBody::StateStreamUnavailable))).await;
     server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     Ok(())
 }
@@ -1058,7 +1044,7 @@ async fn expiring_unfinished_generation_signals_restart_while_established_querie
                 }
             )
             .await?,
-        NodeResponseBody::StateStreamUnavailable { .. }
+        NodeResponseBody::StateStreamUnavailable
     ));
     server.handle_message(proto::NodeMessage::AbandonStateStream { from: client.id, to: server.id, stream: comparison }).await?;
     let trx = writer.begin();
@@ -1096,9 +1082,7 @@ async fn pushed_chunks_can_outrun_metadata_and_arrive_out_of_order_without_early
                     parked.store(true, Ordering::Release);
                     true
                 }
-                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                    Some(frame.stream) == *comparison.lock().unwrap()
-                }
+                NodeMessage::StateFrame { frame, .. } => Some(frame.stream) == *comparison.lock().unwrap(),
                 _ => false,
             }
         }
@@ -1110,7 +1094,8 @@ async fn pushed_chunks_can_outrun_metadata_and_arrive_out_of_order_without_early
     *target.lock().unwrap() = Some(query.query_id());
     wait_for(|| {
         parked.load(Ordering::Acquire)
-            && trace.items(Some(query.query_id())).iter().filter(|item| matches!(item, StateItem::RepairChunk { .. })).count() >= 5
+            && trace.items(Some(query.query_id())).iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Chunk { .. }))).count()
+                >= 5
     })
     .await;
     gate.release_last(&client, 1).await;
@@ -1156,7 +1141,7 @@ async fn byte_smaller_snapshot_advances_a_retained_older_entity_truthfully() -> 
     assert_eq!(retained.title()?, value);
     assert_eq!(retained.artist()?, "retained");
     assert_eq!(retained.entity().head(), record.entity().head());
-    assert!(trace.items(None).iter().any(|item| matches!(item, StateItem::Repair { delta, .. }
+    assert!(trace.items(None).iter().any(|item| matches!(item, StateItem::Repair(RepairItem::Delta { delta, .. })
         if delta.entity_id == record.id() && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))));
     Ok(())
 }
@@ -1201,8 +1186,8 @@ async fn head_inventory_preserves_captured_keys_while_repair_joins_a_concurrent_
         let record_id = record.id();
         move |message| {
             trace.record(message);
-            if let NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
-                if matches!(&frame.body, proto::StateFrameBody::State { items, .. } if bridge_for(items, record_id)) {
+            if let NodeMessage::StateFrame { frame, .. } = message {
+                if matches!(&frame.body, proto::StateFrameBody::Round { items, .. } if bridge_for(items, record_id)) {
                     repair_parked.store(true, Ordering::Release);
                     return true;
                 }
@@ -1273,7 +1258,7 @@ async fn retained_frontier_snapshot_first_joins_preserve_globally_cached_branche
 
 fn snapshot_offer(items: &[StateItem], id: EntityId, head: &proto::Clock) -> bool {
     items.iter().any(|item| match item {
-        StateItem::Repair { target, delta } => {
+        StateItem::Repair(RepairItem::Delta { target, delta }) => {
             delta.entity_id == id && target == head && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. })
         }
         _ => false,
@@ -1376,11 +1361,11 @@ async fn snapshot_first_joins_preserve_cached_branches(count: usize, initial_inv
                     NodeResponseBody::QuerySubscribed { state, .. } => Some(&state.frame),
                     _ => None,
                 },
-                NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                NodeMessage::StateFrame { frame, .. } => Some(frame),
                 _ => None,
             };
             let repair = frame.is_some_and(|frame| match &frame.body {
-                proto::StateFrameBody::State { items, .. } => bridge_for(items, concurrent_id),
+                proto::StateFrameBody::Round { items, .. } => bridge_for(items, concurrent_id),
                 _ => false,
             });
             if repair {

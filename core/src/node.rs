@@ -366,37 +366,6 @@ where
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
 
-    // TODO LATER: rework this to be retried in the background some number of times
-    pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
-        if self.system.check_not_halted().is_err() {
-            return;
-        }
-        // same as request, minus cdata and the sign_request step
-        debug!("{self}.send_update({node_id:#}, {notification})");
-        let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
-        let id = proto::UpdateId::new();
-
-        // Get the peer connection
-        let Some(connection) = self.peer_connections.get(&node_id) else {
-            warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
-            return;
-        };
-
-        // Store the response channel
-        connection.pending_updates.insert(id.clone(), response_tx);
-
-        let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body: notification });
-
-        match connection.send_message(notification) {
-            Ok(_) => {}
-            Err(e) => {
-                warn!("Failed to send update to peer {}: {}", node_id, e);
-            }
-        };
-
-        // response_rx.await.map_err(|_| RequestError::InternalChannelClosed)??;
-    }
-
     // TODO add a node id argument to this function rather than getting it from the message
     // (does this actually make it more secure? or just move the place they could lie to us to the handshake?)
     // Not if its signed by a node key.
@@ -404,38 +373,6 @@ where
     pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
         self.system.check_not_halted()?;
         match message {
-            proto::NodeMessage::Update(update) => {
-                debug!("Node({}) received update {}", self.id, update);
-
-                if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
-                    let _from = update.from;
-                    let _id = update.id.clone();
-                    if update.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
-                        return Ok(());
-                    }
-
-                    // take down the return address
-                    let id = update.id.clone();
-                    let to = update.from;
-                    let from = self.id;
-
-                    // TODO - validate the from node id is the one we're connected to
-                    let body = match self.handle_update(update).await {
-                        Ok(_) => proto::NodeUpdateAckBody::Success,
-                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
-                    };
-
-                    sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
-                }
-            }
-            proto::NodeMessage::UpdateAck(ack) => {
-                debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
-                // let connection = self.peer_connections.get(&ack.from).ok_or(RequestError::PeerNotConnected)?;
-                // if let Some(tx) = connection.pending_updates.remove(&ack.id) {
-                //     tx.send(Ok(proto::NodeResponseBody::Success)).unwrap();
-                // }
-            }
             proto::NodeMessage::Request { auth, request } => {
                 debug!("Node({}) received request {}", self.id, request);
                 // TODO: Should we spawn a task here and make handle_message synchronous?
@@ -475,7 +412,7 @@ where
                                         )
                                     ) =>
                             {
-                                proto::NodeResponseBody::StateCaptureBusy
+                                proto::NodeResponseBody::StateSnapshotBusy
                             }
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                         },
@@ -516,6 +453,15 @@ where
                 }
                 if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
                     let _ = tx.send(Ok(response.body));
+                }
+            }
+            proto::NodeMessage::StateFrame { from, to, request_id, frame } => {
+                if to != self.id {
+                    warn!("{} received message from {} but is not the intended recipient", self.id, from);
+                    return Ok(());
+                }
+                if let Some(connection) = self.peer_connections.get(&from) {
+                    connection.incoming_states.route(&request_id, frame)?;
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
@@ -606,13 +552,12 @@ where
                     .subscribe_query(self, request.id, fingerprint, query_id, selection, cdata, version, known_state)
                     .await
             }
-            proto::NodeRequestBody::ContinueState { stream: stream_id, round, processed_through, applied_through, answers } => {
-                state_sync::continue_state(
+            proto::NodeRequestBody::StateFeedback { stream: stream_id, processed_through, applied_through, answers } => {
+                state_sync::apply_state_feedback(
                     self,
                     request.from,
                     request.id,
                     stream_id,
-                    round,
                     processed_through,
                     applied_through,
                     answers,
@@ -627,16 +572,6 @@ where
             proto::NodeRequestBody::FinishStateRound { stream, round, outcome } => {
                 state_sync::finish_state_round(self, request.from, stream, round, outcome, credentials).await
             }
-        }
-    }
-
-    async fn handle_update(&self, notification: proto::NodeUpdate) -> anyhow::Result<()> {
-        let Some(_connection) = self.peer_connections.get(&notification.from) else {
-            return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
-        };
-
-        match notification.body {
-            proto::NodeUpdateBody::StateFrame { request_id, frame } => _connection.incoming_states.route(&request_id, frame),
         }
     }
 
@@ -855,8 +790,8 @@ where
     }
 
     /// Compare a temporary result tree with a durable peer and apply its repairs before returning.
-    /// Retry once if the stream is lost or capture is busy; sustained capture
-    /// churn returns StateCaptureBusy so this finite call cannot retry forever.
+    /// Retry once if the stream is lost or the responder could not take a stable snapshot;
+    /// sustained source churn returns StateSnapshotBusy so this finite call cannot retry forever.
     pub(crate) async fn fetch_from_peer(
         &self,
         selection: ankql::ast::Selection<Resolved>,
@@ -877,12 +812,12 @@ where
             .await?;
             let state = match response {
                 proto::NodeResponseBody::Fetch(state) => state,
-                proto::NodeResponseBody::StateCaptureBusy if attempt == 0 => {
+                proto::NodeResponseBody::StateSnapshotBusy if attempt == 0 => {
                     drop(stream);
                     futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
                     continue;
                 }
-                proto::NodeResponseBody::StateCaptureBusy => return Err(RequestError::StateCaptureBusy.into()),
+                proto::NodeResponseBody::StateSnapshotBusy => return Err(RequestError::StateSnapshotBusy.into()),
                 proto::NodeResponseBody::Error(error) => return Err(RequestError::ServerError(error).into()),
                 other => return Err(RequestError::UnexpectedResponse(other).into()),
             };

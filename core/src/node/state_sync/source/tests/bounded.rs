@@ -134,10 +134,9 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
             let mut items = Vec::new();
             let mut complete = false;
             for message in messages.lock().unwrap().iter() {
-                let proto::NodeMessage::Update(update) = message else {
+                let proto::NodeMessage::StateFrame { frame, .. } = message else {
                     continue;
                 };
-                let proto::NodeUpdateBody::StateFrame { frame, .. } = &update.body;
                 let proto::StateFrameBody::Live { revision: sent, items: sent_items, complete: last } = &frame.body else {
                     continue;
                 };

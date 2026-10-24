@@ -1,7 +1,4 @@
-use super::{
-    Snapshot, CONTROL_BYTES, FRAME_BYTES, HEAD_PAGE, INITIAL_INVENTORY_BYTES, INITIAL_INVENTORY_HEADS, MAX_INFLIGHT_FRAMES,
-    MAX_REPAIR_BYTES, PAGE_BYTES, PAGE_STEPS, PAGE_WORK, WINDOW_BYTES,
-};
+use super::Snapshot;
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
@@ -9,7 +6,14 @@ use crate::{
     storage::StorageEngine,
 };
 use ankurah_digest_tree::{leaf_address, NodePrefix};
-use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan};
+use ankurah_proto::{
+    self as proto,
+    state_sync::limits::{
+        CONTROL_BYTES, MAX_DELTA_BYTES, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_BYTES, MAX_FRAME_ITEMS, MAX_OFFER_BYTES, MAX_OPEN_STREAMS,
+        MAX_PAGE_BYTES, MAX_PAGE_HEADS, STREAM_TTL, WINDOW_BYTES,
+    },
+    ComparisonProgress, RepairItem, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan,
+};
 use anyhow::{bail, ensure};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -21,8 +25,15 @@ use std::{
 };
 use web_time::Instant;
 
-const STREAM_TTL: Duration = Duration::from_secs(120);
-const MAX_STATE_STREAMS: usize = 128;
+/// Work steps one comparison reply may take. A step adds at most one item, so a
+/// reply stays within MAX_FRAME_ITEMS.
+const MAX_FRAME_STEPS: usize = MAX_FRAME_ITEMS;
+/// Tree reads and history walks one reply may take. They can load storage, so
+/// they get a lower cap than ready items.
+const MAX_FRAME_TREE_WORK: usize = 32;
+/// Deltas larger than this travel as chunks of this size, leaving room in a
+/// frame for other items.
+const DELTA_CHUNK_BYTES: usize = MAX_PAGE_BYTES / 2;
 const MAX_FEEDBACK: usize = 256;
 const MAX_OFFERED_TARGETS: usize = 100_000;
 // Initial request identities live for the connection lifetime; reaching this
@@ -30,7 +41,7 @@ const MAX_OFFERED_TARGETS: usize = 100_000;
 const MAX_ORIGINS: usize = 100_000;
 const MAX_FEEDBACK_IDS: usize = 100_000;
 const MAX_HISTORY: usize = 4096;
-const MAX_LIVE_BYTES: usize = MAX_REPAIR_BYTES + WINDOW_BYTES;
+const MAX_LIVE_BYTES: usize = MAX_DELTA_BYTES + WINDOW_BYTES;
 const MAX_LIVE_ITEMS: usize = 4096;
 #[cfg(test)]
 mod tests;
@@ -96,11 +107,10 @@ struct Retained {
     frame: Arc<StateFrame>,
     bytes: usize,
 }
-struct LiveAssembly {
+/// A live delta too large for one frame, sent as chunks across frames.
+struct LiveChunks {
     revision: u64,
-    entity_id: proto::EntityId,
-    bytes: Vec<u8>,
-    offset: usize,
+    chunks: proto::DeltaChunks,
     member: Option<proto::QueryMember>,
     complete: bool,
 }
@@ -132,7 +142,7 @@ struct Stream {
     feedback: VecDeque<(proto::RequestId, Vec<u8>)>,
     feedback_bytes: usize,
     retired_feedback: HashSet<proto::RequestId>,
-    live_chunk: Option<LiveAssembly>,
+    live_chunk: Option<LiveChunks>,
     live_targets: VecDeque<LiveTargetRef>,
     live_target_index: HashMap<Arc<[u8]>, LiveTarget>,
     target_bytes: usize,
@@ -158,7 +168,7 @@ impl<CD: ContextData> StateStreams<CD> {
             last_sent: session.sent.load(Ordering::Acquire),
             catalog: session.catalog,
         });
-        if retired.len() > MAX_STATE_STREAMS {
+        if retired.len() > MAX_OPEN_STREAMS {
             retired.pop_front();
         }
         Some(session)
@@ -176,7 +186,7 @@ impl<CD: ContextData> StateStreams<CD> {
         if !closed.contains(&id) {
             closed.push_back(id);
         }
-        if closed.len() > MAX_STATE_STREAMS {
+        if closed.len() > MAX_OPEN_STREAMS {
             closed.pop_front();
         }
     }
@@ -198,19 +208,14 @@ impl<CD: ContextData> StateStreams<CD> {
         fingerprint: &[u8],
         credentials: &[CD],
     ) -> anyhow::Result<Option<proto::NodeResponseBody>> {
-        let session = self
-            .sessions
-            .lock()
-            .unwrap()
-            .iter()
-            .find_map(|(id, session)| (&session.initial_request == request).then_some((*id, session.clone())));
-        if let Some((id, session)) = session {
+        let session = self.sessions.lock().unwrap().values().find(|session| &session.initial_request == request).cloned();
+        if let Some(session) = session {
             ensure!(session.fingerprint == fingerprint && session.permits(credentials), "initial retry changed its request");
             let initial = session.initial.lock().unwrap();
             let Some(initial) = initial.as_ref() else {
-                return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: id }));
+                return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable));
             };
-            let reply = proto::StateReply { spec: session.spec.clone(), round: session.initial_round, frame: (**initial).clone() };
+            let reply = proto::StateReply { round: session.initial_round, frame: (**initial).clone() };
             return Ok(Some(match session.query {
                 Some((query_id, _)) => proto::NodeResponseBody::QuerySubscribed { query_id, state: reply },
                 None => proto::NodeResponseBody::Fetch(reply),
@@ -221,10 +226,10 @@ impl<CD: ContextData> StateStreams<CD> {
                 origin.fingerprint == fingerprint && same_credentials(&origin.credentials, credentials),
                 "retired initial retry changed its request"
             );
-            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: origin.id }));
+            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable));
         }
-        if let Some(id) = self.origins.lock().unwrap().get(request) {
-            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable { stream: *id }));
+        if self.origins.lock().unwrap().contains_key(request) {
+            return Ok(Some(proto::NodeResponseBody::StateStreamUnavailable));
         }
         Ok(None)
     }
@@ -260,7 +265,7 @@ enum Work {
     Item(StateItem),
     Repair(proto::EntityId, Option<proto::Clock>),
     History { entity_id: proto::EntityId, target: proto::Clock },
-    Chunks { entity_id: proto::EntityId, target: proto::Clock, bytes: Vec<u8>, offset: usize },
+    Chunks { target: proto::Clock, chunks: proto::DeltaChunks },
 }
 
 struct InitialHeads {
@@ -273,12 +278,18 @@ struct Comparison {
     summaries: HashMap<Vec<u8>, NodePrefix>,
     head_requests: Vec<TreeSpan>,
     repaired: HashSet<proto::EntityId>,
-    known_clocks: HashMap<proto::EntityId, proto::InventoryClock>,
+    known_clocks: HashMap<proto::EntityId, proto::Clock>,
     offered: HashSet<Vec<u8>>,
     pending_repairs: HashSet<Vec<u8>>,
     repair_attempts: HashMap<Vec<u8>, usize>,
     complete: bool,
     unavailable: bool,
+}
+/// The next chunk of a split delta, and the work that sends the rest.
+fn next_repair_chunk(target: proto::Clock, mut chunks: proto::DeltaChunks) -> (RepairItem, Option<Work>) {
+    let chunk = chunks.next().expect("split work keeps its unsent chunks");
+    let rest = (!chunk.last).then(|| Work::Chunks { target: target.clone(), chunks });
+    (RepairItem::Chunk { target, chunk }, rest)
 }
 fn target_id(entity: proto::EntityId, head: &proto::Clock) -> Vec<u8> {
     bincode::serialize(&(entity, head)).expect("causal target serializes")
@@ -298,14 +309,14 @@ impl Stream {
         Ok(())
     }
     fn room(&self, priority: bool) -> bool {
-        self.retained.len() < MAX_INFLIGHT_FRAMES - if priority { 0 } else { 2 }
-            && self.bytes + FRAME_BYTES <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 }
+        self.retained.len() < MAX_FRAMES_IN_FLIGHT - if priority { 0 } else { 2 }
+            && self.bytes + MAX_FRAME_BYTES <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 }
     }
     fn retain(&mut self, frame: StateFrame, priority: bool) -> anyhow::Result<()> {
         let bytes = bincode::serialized_size(&frame)? as usize;
-        ensure!(bytes <= FRAME_BYTES, "state frame exceeds hard limit");
+        ensure!(bytes <= MAX_FRAME_BYTES, "state frame exceeds hard limit");
         ensure!(
-            self.retained.len() < MAX_INFLIGHT_FRAMES && self.bytes + bytes <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 },
+            self.retained.len() < MAX_FRAMES_IN_FLIGHT && self.bytes + bytes <= WINDOW_BYTES + if priority { CONTROL_BYTES } else { 0 },
             "state replay window exhausted"
         );
         if let StateFrameBody::Live { revision, complete: true, .. } | StateFrameBody::LiveChunk { revision, complete: true, .. } =
@@ -328,9 +339,9 @@ impl Stream {
         }
         // Absent can still carry readable state and events. Its data may need
         // connecting history even though it no longer belongs to the query.
-        if let Some(proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. }) = &item.delta {
-            if !heads.contains(&&state.state.head) {
-                heads.push(&state.state.head);
+        if let Some(head) = item.delta.as_ref().and_then(proto::DeltaContent::state_head) {
+            if !heads.contains(&head) {
+                heads.push(head);
             }
         }
         for head in heads {
@@ -384,22 +395,11 @@ impl Stream {
     }
 
     fn next_live(&mut self, live: &Mutex<LiveQueue>) -> anyhow::Result<Option<StateFrameBody>> {
-        if let Some(assembly) = self.live_chunk.as_mut() {
-            let end = (assembly.offset + PAGE_BYTES / 2).min(assembly.bytes.len());
-            let last = end == assembly.bytes.len();
-            let complete = last && assembly.complete;
-            let body = StateFrameBody::LiveChunk {
-                revision: assembly.revision,
-                member: assembly.member.clone(),
-                chunk: proto::EntityDeltaChunk {
-                    entity_id: assembly.entity_id,
-                    offset: assembly.offset as u64,
-                    bytes: assembly.bytes[assembly.offset..end].to_vec().into(),
-                    last,
-                },
-                complete,
-            };
-            assembly.offset = end;
+        if let Some(live) = self.live_chunk.as_mut() {
+            let chunk = live.chunks.next().expect("a live delta keeps its unsent chunks");
+            let last = chunk.last;
+            let body =
+                StateFrameBody::LiveChunk { revision: live.revision, member: live.member.clone(), chunk, complete: last && live.complete };
             if last {
                 self.live_chunk = None;
             }
@@ -423,7 +423,7 @@ impl Stream {
                 break;
             }
             let size = bincode::serialized_size(item)? as usize;
-            if size > PAGE_BYTES / 2 {
+            if size > DELTA_CHUNK_BYTES {
                 if !items.is_empty() {
                     break;
                 }
@@ -432,18 +432,18 @@ impl Stream {
                 queue.bytes -= size;
                 self.offer_live_target(revision, &item)?;
                 let content = item.delta.ok_or_else(|| anyhow::anyhow!("oversized live membership metadata"))?;
-                let bytes = bincode::serialize(&content)?;
-                ensure!(bytes.len() <= MAX_REPAIR_BYTES, "live delta exceeds assembly limit");
+                let payload = content.encode_payload()?;
+                ensure!(payload.len() <= MAX_DELTA_BYTES, "live delta exceeds assembly limit");
                 let complete = queue.publications.front().unwrap().items.is_empty();
                 if complete {
                     queue.publications.pop_front();
                 }
-                self.live_chunk =
-                    Some(LiveAssembly { revision, entity_id: item.entity_id, bytes, offset: 0, member: item.member, complete });
+                let chunks = proto::EntityDeltaChunk::split(item.entity_id, payload, DELTA_CHUNK_BYTES);
+                self.live_chunk = Some(LiveChunks { revision, chunks, member: item.member, complete });
                 drop(queue);
                 return self.next_live(live);
             }
-            if bytes + size > PAGE_BYTES || items.len() == PAGE_STEPS {
+            if bytes + size > MAX_PAGE_BYTES || items.len() == MAX_FRAME_ITEMS {
                 break;
             }
             let item = queue.publications.front_mut().unwrap().items.pop_front().unwrap();
@@ -466,9 +466,8 @@ impl Stream {
             || live.lock().unwrap().publications.front().is_some_and(|publication| publication.revision <= revision)
     }
 
-    fn request_live_repairs(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
-        for answer in answers {
-            let StateAnswer::NeedRepair { entity_id, target } = answer else { bail!("live feedback cannot answer round questions") };
+    fn request_live_repairs(&mut self, requests: Vec<proto::RepairRequest>) -> anyhow::Result<()> {
+        for proto::RepairRequest { entity_id, target } in requests {
             let key = bincode::serialize(&(entity_id, &target))?;
             let offered =
                 self.live_target_index.get_mut(key.as_slice()).ok_or_else(|| anyhow::anyhow!("unsolicited live repair target"))?;
@@ -499,40 +498,32 @@ impl Stream {
             Work::History { entity_id, target } => match target_history(node, entity_id, &target, credentials, catalog).await {
                 Ok(events) => {
                     let content = proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() };
-                    let bytes = bincode::serialize(&content)?;
-                    if bytes.len() > PAGE_BYTES / 2 {
-                        self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
+                    let payload = content.encode_payload()?;
+                    if payload.len() > DELTA_CHUNK_BYTES {
+                        let chunks = proto::EntityDeltaChunk::split(entity_id, payload, DELTA_CHUNK_BYTES);
+                        self.live_repairs.push_front(Work::Chunks { target, chunks });
                         return Box::pin(self.next_live_repair(node, credentials, catalog)).await;
                     }
-                    StateItem::Repair { target, delta: proto::EntityDelta { entity_id, content } }
+                    RepairItem::Delta { target, delta: proto::EntityDelta { entity_id, content } }
                 }
                 Err(error) => {
                     tracing::debug!(%entity_id, %error, "live causal repair unavailable");
-                    StateItem::RepairUnavailable { entity_id, target }
+                    RepairItem::Unavailable { entity_id, target }
                 }
             },
-            Work::Chunks { entity_id, target, bytes, offset } => {
-                let end = (offset + PAGE_BYTES / 2).min(bytes.len());
-                let item = StateItem::RepairChunk {
-                    target: target.clone(),
-                    chunk: proto::EntityDeltaChunk {
-                        entity_id,
-                        offset: offset as u64,
-                        bytes: bytes[offset..end].to_vec().into(),
-                        last: end == bytes.len(),
-                    },
-                };
-                if end < bytes.len() {
-                    self.live_repairs.push_front(Work::Chunks { entity_id, target, bytes, offset: end });
+            Work::Chunks { target, chunks } => {
+                let (item, rest) = next_repair_chunk(target, chunks);
+                if let Some(rest) = rest {
+                    self.live_repairs.push_front(rest);
                 }
                 item
             }
             _ => unreachable!("only causal repair work enters the live repair queue"),
         };
         let finished = match &item {
-            StateItem::Repair { target, delta } => Some((delta.entity_id, target)),
-            StateItem::RepairChunk { target, chunk } if chunk.last => Some((chunk.entity_id, target)),
-            StateItem::RepairUnavailable { entity_id, target } => Some((*entity_id, target)),
+            RepairItem::Delta { target, delta } => Some((delta.entity_id, target)),
+            RepairItem::Chunk { target, chunk } if chunk.last => Some((chunk.entity_id, target)),
+            RepairItem::Unavailable { entity_id, target } => Some((*entity_id, target)),
             _ => None,
         };
         if let Some((id, target)) = finished {
@@ -553,7 +544,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let id = match body {
-        proto::NodeRequestBody::ContinueState { stream, .. }
+        proto::NodeRequestBody::StateFeedback { stream, .. }
         | proto::NodeRequestBody::FinishStateRound { stream, .. }
         | proto::NodeRequestBody::RefreshState { stream, .. } => stream,
         _ => return crate::schema::request_bypasses_policy(body),
@@ -600,7 +591,7 @@ impl<CD: ContextData> PendingStateStream<CD> {
         *self.session.initial.lock().unwrap() = Some(Arc::new(frame.clone()));
         self.session.initialized.store(true, Ordering::Release);
         self.armed = false;
-        Ok(proto::StateReply { spec: self.session.spec.clone(), round, frame })
+        Ok(proto::StateReply { round, frame })
     }
 }
 impl<CD: ContextData> Drop for PendingStateStream<CD> {
@@ -700,7 +691,7 @@ where
     {
         let mut sessions = connection.state_streams.sessions.lock().unwrap();
         let mut origins = connection.state_streams.origins.lock().unwrap();
-        ensure!(sessions.len() < MAX_STATE_STREAMS, "too many open state streams");
+        ensure!(sessions.len() < MAX_OPEN_STREAMS, "too many open state streams");
         ensure!(origins.len() < MAX_ORIGINS, "connection exhausted its bounded origin history");
         ensure!(!origins.contains_key(&session.initial_request), "initial request origin was already used");
         ensure!(!sessions.values().any(|s| s.initial_request == session.initial_request), "initial request already has a stream");
@@ -735,15 +726,14 @@ where
     Ok(pending)
 }
 
-pub(crate) async fn continue_state<SE, PA>(
+pub(crate) async fn apply_state_feedback<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     request: proto::RequestId,
     id: StateStreamId,
-    round: Option<u64>,
     processed_through: u64,
     applied_through: Option<u64>,
-    answers: Vec<StateAnswer>,
+    answers: Option<proto::FeedbackAnswers>,
     credentials: Vec<PA::ContextData>,
 ) -> anyhow::Result<proto::NodeResponseBody>
 where
@@ -751,28 +741,27 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let connection = node.peer_connections.get(&peer).ok_or_else(|| anyhow::anyhow!("peer disconnected"))?;
+    let has_answers = answers.as_ref().is_some_and(|answers| !answers.is_empty());
     let Some(session) = connection.state_streams.get(&id) else {
-        return Ok(if answers.is_empty() && connection.state_streams.permits_retired_receipt(id, processed_through, &credentials) {
+        return Ok(if !has_answers && connection.state_streams.permits_retired_receipt(id, processed_through, &credentials) {
             proto::NodeResponseBody::Success
         } else {
-            proto::NodeResponseBody::StateStreamUnavailable { stream: id }
+            proto::NodeResponseBody::StateStreamUnavailable
         });
     };
     ensure!(session.permits(&credentials), "state stream credentials changed");
-    ensure!(answers.len() <= 128, "too many comparison answers");
-    let encoded = bincode::serialize(&(round, processed_through, applied_through, &answers))?;
-    ensure!(encoded.len() <= FRAME_BYTES, "state feedback exceeds limit");
-    ensure!(
-        encoded.len() as u64 + super::budget::answers_bytes(&answers)? - bincode::serialized_size(&answers)? <= FRAME_BYTES as u64,
-        "state feedback exceeds decoded-work limit"
-    );
+    if let Some(answers) = &answers {
+        answers.validate(&session.spec)?;
+    }
+    let encoded = bincode::serialize(&(processed_through, applied_through, &answers))?;
+    ensure!(encoded.len() <= MAX_FRAME_BYTES, "state feedback exceeds limit");
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
-        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable);
     }
     if state.failed {
-        if !answers.is_empty() {
-            return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+        if has_answers {
+            return Ok(proto::NodeResponseBody::StateStreamUnavailable);
         }
         state.acknowledge(processed_through)?;
         if processed_through == state.last_sent {
@@ -785,25 +774,26 @@ where
         return Ok(proto::NodeResponseBody::Success);
     }
     if state.retired_feedback.contains(&request) {
-        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable);
     }
     ensure!(state.retired_feedback.len() < MAX_FEEDBACK_IDS, "stream exhausted control replay history");
     state.acknowledge(processed_through)?;
     session.initial.lock().unwrap().take();
-    match round {
-        Some(number) => {
-            ensure!(number <= state.round.number, "feedback names a future round");
+    match answers {
+        Some(proto::FeedbackAnswers::Round { round, answers }) => {
+            ensure!(round <= state.round.number, "feedback names a future round");
             // A delayed repair question may arrive after live application covered
             // its target and Applied retired the round. It cannot author current
             // membership, and retaining the old snapshot merely to reject it
             // would make round retirement race normal application progress.
-            if number == state.round.number {
+            if round == state.round.number {
                 if let Some(comparison) = state.comparison.as_mut() {
                     comparison.answer(answers)?;
                 }
             }
         }
-        None => state.request_live_repairs(answers)?,
+        Some(proto::FeedbackAnswers::LiveRepair { requests }) => state.request_live_repairs(requests)?,
+        None => {}
     }
     if let Some(revision) = applied_through {
         state.acknowledge_live(revision)?;
@@ -837,13 +827,13 @@ where
         return Ok(if connection.state_streams.was_closed(&id) {
             proto::NodeResponseBody::Success
         } else {
-            proto::NodeResponseBody::StateStreamUnavailable { stream: id }
+            proto::NodeResponseBody::StateStreamUnavailable
         });
     };
     ensure!(session.permits(&credentials), "state stream credentials changed");
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) || state.failed {
-        return Ok(proto::NodeResponseBody::StateStreamUnavailable { stream: id });
+        return Ok(proto::NodeResponseBody::StateStreamUnavailable);
     }
     if state.retired_round == Some((round, outcome)) {
         return Ok(proto::NodeResponseBody::Success);
@@ -913,7 +903,7 @@ where
     ensure!(session.query.is_some(), "Fetch cannot refresh a standing query");
     ensure!(snapshot.spec == session.spec && known.spec == session.spec, "refresh changed tree specification");
     let encoded = bincode::serialize(&known)?;
-    ensure!(encoded.len() <= INITIAL_INVENTORY_BYTES + FRAME_BYTES, "refresh offer exceeds limit");
+    ensure!(encoded.len() <= MAX_OFFER_BYTES + MAX_FRAME_BYTES, "refresh offer exceeds limit");
     let comparison = Comparison::new(snapshot, known)?;
     let mut queue = session.live.lock().unwrap();
     ensure!(!queue.stopped, "live stream stopped");
@@ -969,19 +959,16 @@ where
     let session = connection.state_streams.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
     ensure!(session.query.is_some(), "Fetch has no live route");
     ensure!(revision > session.initial_round.revision, "live publication does not follow the initial cut");
-    ensure!(
-        items.iter().all(|item| !matches!(item.delta, Some(proto::DeltaContent::StateAndRelation { .. }))),
-        "StateAndRelation is not supported"
-    );
-    ensure!(
-        items.iter().all(|item| item.member.is_some() || !matches!(item.delta, Some(proto::DeltaContent::EventBridge { .. }))),
-        "absent live bridge has no explicit causal target"
-    );
+    for item in &items {
+        if let Some(delta) = &item.delta {
+            delta.live_target(item.member.as_ref())?;
+        }
+    }
     let sizes = items.iter().map(|item| bincode::serialized_size(item).map(|size| size as usize)).collect::<Result<Vec<_>, _>>()?;
     let bytes = sizes.iter().sum::<usize>();
     let mut queue = session.live.lock().unwrap();
     if queue.stopped
-        || sizes.iter().any(|size| *size > MAX_REPAIR_BYTES)
+        || sizes.iter().any(|size| *size > MAX_DELTA_BYTES)
         || queue.items + items.len() > MAX_LIVE_ITEMS
         || queue.publications.len() >= MAX_LIVE_ITEMS
         || queue.bytes.saturating_add(bytes) > MAX_LIVE_BYTES
@@ -1118,7 +1105,7 @@ where
         if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
             break;
         }
-        if matches!(frame.body, StateFrameBody::BeginRound(_) | StateFrameBody::State { progress: ComparisonProgress::Complete, .. }) {
+        if matches!(frame.body, StateFrameBody::BeginRound(_) | StateFrameBody::Round { progress: ComparisonProgress::Complete, .. }) {
             // Applied covers the finite enumeration. Later requested history may
             // become unnecessary because another live update covers the target;
             // those frames still need wire credit, not another readiness fence.
@@ -1126,12 +1113,12 @@ where
         }
         state.retain(frame.clone(), priority)?;
         session.sent.store(sequence, Ordering::Release);
-        connection.send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
+        connection.send_message(proto::NodeMessage::StateFrame {
             from: node.id,
             to: peer,
-            body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame },
-        }))?;
+            request_id: session.initial_request.clone(),
+            frame,
+        })?;
     }
     Ok(())
 }
@@ -1195,12 +1182,12 @@ where
     }
     if !retained
         || connection
-            .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                id: proto::UpdateId::new(),
+            .send_message(proto::NodeMessage::StateFrame {
                 from: node.id,
                 to: peer,
-                body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame: frame.clone() },
-            }))
+                request_id: session.initial_request.clone(),
+                frame: frame.clone(),
+            })
             .is_err()
     {
         node.deregister_peer(peer);
@@ -1219,12 +1206,12 @@ where
                 return;
             }
             if connection
-                .send_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                    id: proto::UpdateId::new(),
+                .send_message(proto::NodeMessage::StateFrame {
                     from: node.id,
                     to: peer,
-                    body: proto::NodeUpdateBody::StateFrame { request_id: session.initial_request.clone(), frame: frame.clone() },
-                }))
+                    request_id: session.initial_request.clone(),
+                    frame: frame.clone(),
+                })
                 .is_err()
             {
                 node.deregister_peer(peer);
@@ -1279,7 +1266,7 @@ where
             }
             bytes =
                 bytes.checked_add(bincode::serialized_size(&event)? as usize).ok_or_else(|| anyhow::anyhow!("history size overflow"))?;
-            ensure!(bytes <= MAX_REPAIR_BYTES, "causal repair exceeds byte limit");
+            ensure!(bytes <= MAX_DELTA_BYTES, "causal repair exceeds byte limit");
             if event.payload.parent.is_empty() {
                 ensure!(
                     proto::EntityId::from(id.clone()) == entity_id && genesis.as_ref().is_none_or(|root| root == &id),
@@ -1349,33 +1336,14 @@ impl Comparison {
             unavailable: false,
         };
         ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
-        ensure!(
-            known.spans.len() <= 128 && super::budget::offer_bytes(&known)? as usize <= INITIAL_INVENTORY_BYTES,
-            "initial inventory exceeds limit"
-        );
+        known.validate()?;
+        // A valid offer's spans are disjoint and within the tree; plan them in address order.
         let mut spans = known.spans;
-        spans.sort_by(|a, b| {
-            fn bounds(span: &proto::SpanContent) -> &TreeSpan {
-                match span {
-                    proto::SpanContent::Digest(head) => &head.bounds,
-                    proto::SpanContent::Heads(page) => &page.bounds,
-                }
-            }
-            bounds(a).cmp_start(bounds(b))
-        });
+        spans.sort_by(|a, b| a.bounds().cmp_start(b.bounds()));
         let mut start = super::whole().start;
         let mut frontier = Some(Vec::new());
-        let mut head_count = 0;
         for region in spans {
-            ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
-            let bounds = match &region {
-                proto::SpanContent::Digest(head) => &head.bounds,
-                proto::SpanContent::Heads(page) => &page.bounds,
-            };
-            ensure!(
-                !bounds.is_empty() && bounds.is_subset_of(&TreeSpan::new(start.clone(), super::whole().end)),
-                "initial spans overlap or exceed scope"
-            );
+            let bounds = region.bounds();
             if start != bounds.start {
                 frontier = None;
                 let gap = TreeSpan::new(start.clone(), opposite(&bounds.start));
@@ -1386,7 +1354,6 @@ impl Comparison {
             start = opposite(&bounds.end);
             match region {
                 proto::SpanContent::Digest(head) => {
-                    head.validate()?;
                     if let Some(frontier) = &mut frontier {
                         frontier.push(head.clone());
                     }
@@ -1394,12 +1361,9 @@ impl Comparison {
                 }
                 proto::SpanContent::Heads(page) => {
                     frontier = None;
-                    head_count += page.heads.len();
-                    ensure!(head_count <= INITIAL_INVENTORY_HEADS, "initial inventory exceeds head limit");
-                    page.validate(&comparison.snapshot.spec)?;
                     let mut cursor = page.heads.cursor();
-                    while let Some((id, clock)) = cursor.next_clock() {
-                        ensure!(comparison.known_clocks.insert(id, clock).is_none(), "duplicate entity in initial inventory");
+                    while let Some(head) = cursor.next() {
+                        comparison.known_clocks.insert(head.entity.entity_id, head.entity.head.to_owned());
                     }
                     comparison.work.push_back(Work::InitialHeads(InitialHeads { bounds: page.bounds, heads: page.heads.cursor() }));
                 }
@@ -1417,11 +1381,11 @@ impl Comparison {
         Ok(comparison)
     }
 
+    /// Takes this round's answers, which `FeedbackAnswers::validate` already checked.
     fn answer(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
-        ensure!(answers.len() <= 128, "too many comparison answers");
         for answer in answers {
             match answer {
-                StateAnswer::NeedRepair { entity_id, target } => {
+                StateAnswer::NeedRepair(proto::RepairRequest { entity_id, target }) => {
                     let key = target_id(entity_id, &target);
                     ensure!(self.offered.contains(&key), "unsolicited causal repair target");
                     if self.pending_repairs.contains(&key) {
@@ -1435,14 +1399,11 @@ impl Comparison {
                     self.work.push_front(Work::History { entity_id, target });
                 }
                 StateAnswer::Digest(head) => {
-                    head.validate()?;
                     let prefix =
                         self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
                     self.work.push_back(Work::Compare { head, prefix });
                 }
                 StateAnswer::Heads(page) => {
-                    ensure!(page.heads.len() <= HEAD_PAGE, "too many heads in one page");
-                    ensure!(4 + page.expanded_size() <= PAGE_BYTES as u64, "head inventory exceeds decoded-work budget");
                     let index = self
                         .head_requests
                         .iter()
@@ -1450,13 +1411,12 @@ impl Comparison {
                         .ok_or_else(|| anyhow::anyhow!("unsolicited head inventory"))?;
                     let requested = self.head_requests[index].clone();
                     ensure!(page.bounds.is_subset_of(&requested), "head inventory exceeds requested bounds");
-                    page.validate(&self.snapshot.spec)?;
                     let mut last_address = None;
-                    let mut ids = HashSet::new();
                     let mut cursor = page.heads.cursor();
+                    let mut seen = 0;
                     while let Some(leaf) = cursor.next() {
-                        ensure!(ids.insert(leaf.entity.entity_id), "duplicate entity in head inventory");
-                        if ids.len() == page.heads.len() {
+                        seen += 1;
+                        if seen == page.heads.len() {
                             last_address = Some(leaf_address(leaf.key, leaf.entity.entity_id));
                         }
                     }
@@ -1491,7 +1451,7 @@ impl Comparison {
                 work.push(Work::Item(StateItem::Heads(proto::TreeSpanInventory { bounds, heads: Default::default() })));
             }
         };
-        let count = page.heads.len().min(HEAD_PAGE);
+        let count = page.heads.len().min(MAX_PAGE_HEADS);
         for _ in 0..count {
             let leaf = page.heads.next().expect("bounded by remaining rows");
             if !self.snapshot.entries.contains_key(&leaf.entity.entity_id) {
@@ -1513,7 +1473,7 @@ impl Comparison {
                             key: entry.key.clone(),
                             entity: proto::EntityHead { entity_id: entry.entity_id, head: entry.head.clone() },
                         }]
-                        .into(),
+                        .try_into()?,
                     })));
                     work.push(Work::Repair(leaf.entity.entity_id, Some(leaf.entity.head.to_owned())));
                 }
@@ -1545,16 +1505,16 @@ impl Comparison {
         let mut fits = true;
         for item in &work {
             fits &= match item {
-                Work::Item(item) => bincode::serialized_size(item)? <= PAGE_BYTES as u64,
+                Work::Item(item) => bincode::serialized_size(item)? <= MAX_PAGE_BYTES as u64,
                 Work::SendHeads(bounds) => {
                     let item = StateItem::Heads(proto::TreeSpanInventory { bounds: bounds.clone(), heads: Default::default() });
-                    bincode::serialized_size(&item)? <= (PAGE_BYTES / 2) as u64
+                    bincode::serialized_size(&item)? <= (MAX_PAGE_BYTES / 2) as u64
                 }
                 _ => true,
             };
         }
         if !fits {
-            work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].to_owned()))).collect();
+            work = former.into_iter().map(|id| Work::Repair(id, Some(self.known_clocks[&id].clone()))).collect();
             work.push(Work::SendHeads(processed_bounds));
         }
         if !page.heads.is_empty() {
@@ -1580,7 +1540,7 @@ impl Comparison {
         loop {
             let remote = self.snapshot.page(remaining.clone())?;
             count += remote.heads.len();
-            ensure!(count <= HEAD_PAGE, "head span was not fully refined");
+            ensure!(count <= MAX_PAGE_HEADS, "head span was not fully refined");
             let mut cursor = remote.heads.cursor();
             while let Some(leaf) = cursor.next() {
                 let id = leaf.entity.entity_id;
@@ -1624,7 +1584,7 @@ impl Comparison {
         let mut bytes = 0;
         let mut tree_or_history_work = 0;
         let repair_frame = !self.pending_repairs.is_empty();
-        for _ in 0..PAGE_STEPS {
+        for _ in 0..MAX_FRAME_STEPS {
             if repair_frame && self.pending_repairs.is_empty() {
                 break;
             }
@@ -1652,7 +1612,7 @@ impl Comparison {
                 _ => false,
             };
             if expensive {
-                if tree_or_history_work == PAGE_WORK {
+                if tree_or_history_work == MAX_FRAME_TREE_WORK {
                     self.work.push_front(work);
                     break;
                 }
@@ -1665,17 +1625,18 @@ impl Comparison {
                             entity_id,
                             content: proto::DeltaContent::EventBridge { events: events.into_iter().map(Into::into).collect() },
                         };
-                        let bytes = bincode::serialize(&delta.content)?;
-                        if bytes.len() > PAGE_BYTES / 2 {
-                            self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: 0 });
+                        let payload = delta.content.encode_payload()?;
+                        if payload.len() > DELTA_CHUNK_BYTES {
+                            let chunks = proto::EntityDeltaChunk::split(entity_id, payload, DELTA_CHUNK_BYTES);
+                            self.work.push_front(Work::Chunks { target, chunks });
                             None
                         } else {
-                            Some(StateItem::Repair { target, delta })
+                            Some(StateItem::Repair(RepairItem::Delta { target, delta }))
                         }
                     }
                     Err(error) => {
                         tracing::debug!(%entity_id, %error, "required causal repair unavailable");
-                        Some(StateItem::RepairUnavailable { entity_id, target })
+                        Some(StateItem::Repair(RepairItem::Unavailable { entity_id, target }))
                     }
                 },
                 Work::CompareFrontier(frontier) => {
@@ -1704,7 +1665,7 @@ impl Comparison {
                         local.prefix = prefix;
                         if local.digest == known.digest {
                             None
-                        } else if local.digest.count() <= HEAD_PAGE as i64 {
+                        } else if local.digest.count() <= MAX_PAGE_HEADS as i64 {
                             self.work.push_front(Work::AskHeads(known.bounds));
                             None
                         } else {
@@ -1761,7 +1722,7 @@ impl Comparison {
                     let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         let id = leaf.entity.entity_id;
-                        self.work.push_front(Work::Repair(id, self.known_clocks.get(&id).map(proto::InventoryClock::to_owned)));
+                        self.work.push_front(Work::Repair(id, self.known_clocks.get(&id).cloned()));
                     }
                     Some(StateItem::Heads(page))
                 }
@@ -1779,7 +1740,10 @@ impl Comparison {
                     });
                     if !allowed {
                         if let Some(entry) = self.snapshot.entries.get(&id) {
-                            self.work.push_front(Work::Item(StateItem::RepairUnavailable { entity_id: id, target: entry.head.clone() }));
+                            self.work.push_front(Work::Item(StateItem::Repair(RepairItem::Unavailable {
+                                entity_id: id,
+                                target: entry.head.clone(),
+                            })));
                         }
                         continue;
                     }
@@ -1798,37 +1762,29 @@ impl Comparison {
                             }
                         }
                     }
-                    let item = StateItem::Repair { target: target.clone(), delta };
-                    if bincode::serialized_size(&item)? as usize > PAGE_BYTES / 2 {
-                        let StateItem::Repair { delta, .. } = item else { unreachable!() };
-                        let bytes = bincode::serialize(&delta.content)?;
-                        ensure!(bytes.len() <= super::MAX_REPAIR_BYTES, "entity repair exceeds transfer limit");
-                        self.work.push_front(Work::Chunks { entity_id: id, target, bytes, offset: 0 });
+                    let item = StateItem::Repair(RepairItem::Delta { target: target.clone(), delta });
+                    if bincode::serialized_size(&item)? as usize > DELTA_CHUNK_BYTES {
+                        let StateItem::Repair(RepairItem::Delta { delta, .. }) = item else { unreachable!() };
+                        let payload = delta.content.encode_payload()?;
+                        ensure!(payload.len() <= MAX_DELTA_BYTES, "entity repair exceeds transfer limit");
+                        let chunks = proto::EntityDeltaChunk::split(id, payload, DELTA_CHUNK_BYTES);
+                        self.work.push_front(Work::Chunks { target, chunks });
                         None
                     } else {
                         Some(item)
                     }
                 }
-                Work::Chunks { entity_id, target, bytes, offset } => {
-                    let end = (offset + PAGE_BYTES / 2).min(bytes.len());
-                    let item = StateItem::RepairChunk {
-                        target: target.clone(),
-                        chunk: proto::EntityDeltaChunk {
-                            entity_id,
-                            offset: offset as u64,
-                            bytes: bytes[offset..end].to_vec().into(),
-                            last: end == bytes.len(),
-                        },
-                    };
-                    if end < bytes.len() {
-                        self.work.push_front(Work::Chunks { entity_id, target, bytes, offset: end });
+                Work::Chunks { target, chunks } => {
+                    let (item, rest) = next_repair_chunk(target, chunks);
+                    if let Some(rest) = rest {
+                        self.work.push_front(rest);
                     }
-                    Some(item)
+                    Some(StateItem::Repair(item))
                 }
             };
             if let Some(item) = item {
-                let size = super::budget::item_bytes(&item)? as usize;
-                if !items.is_empty() && bytes + size > PAGE_BYTES {
+                let size = item.work_bytes()? as usize;
+                if !items.is_empty() && bytes + size > MAX_PAGE_BYTES {
                     self.work.push_front(Work::Item(item));
                     break;
                 }
@@ -1840,19 +1796,19 @@ impl Comparison {
                             self.offered.insert(target_id(leaf.entity.entity_id, &leaf.entity.head.to_owned()));
                         }
                     }
-                    StateItem::Repair { target, delta } => {
+                    StateItem::Repair(RepairItem::Delta { target, delta }) => {
                         let key = target_id(delta.entity_id, target);
                         self.offered.insert(key.clone());
                         self.pending_repairs.remove(&key);
                     }
-                    StateItem::RepairChunk { target, chunk } => {
+                    StateItem::Repair(RepairItem::Chunk { target, chunk }) => {
                         let key = target_id(chunk.entity_id, target);
                         self.offered.insert(key.clone());
                         if chunk.last {
                             self.pending_repairs.remove(&key);
                         }
                     }
-                    StateItem::RepairUnavailable { entity_id, target } => {
+                    StateItem::Repair(RepairItem::Unavailable { entity_id, target }) => {
                         self.unavailable = true;
                         self.pending_repairs.remove(&target_id(*entity_id, target));
                     }
@@ -1865,7 +1821,7 @@ impl Comparison {
         let finished = self.work.is_empty() && self.summaries.is_empty() && self.head_requests.is_empty();
         let first_complete = finished && !self.complete;
         self.complete |= finished;
-        Ok(StateFrameBody::State {
+        Ok(StateFrameBody::Round {
             round,
             items,
             progress: if first_complete { ComparisonProgress::Complete } else { ComparisonProgress::Continue },

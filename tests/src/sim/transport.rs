@@ -68,7 +68,7 @@ impl Captured {
                     );
                 }
             }
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
+            proto::NodeMessage::StateFrame { frame, .. } => {
                 if let Some(stream) = streams.get_mut(&frame.stream) {
                     if stream.scripted {
                         return;
@@ -87,7 +87,7 @@ impl Captured {
             }
             proto::NodeMessage::Request { request, .. } => {
                 let comparison = match request.body {
-                    proto::NodeRequestBody::ContinueState { stream: comparison, .. }
+                    proto::NodeRequestBody::StateFeedback { stream: comparison, .. }
                     | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => Some(comparison),
                     _ => None,
                 };
@@ -141,12 +141,7 @@ impl Captured {
         };
         stream.next_sequence += 1;
         stream.next_revision += 1;
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
-            from: stream.from,
-            to: stream.to,
-            body: proto::NodeUpdateBody::StateFrame { request_id: stream.request.clone(), frame },
-        })
+        proto::NodeMessage::StateFrame { from: stream.from, to: stream.to, request_id: stream.request.clone(), frame }
     }
 }
 
@@ -178,8 +173,8 @@ impl PeerSender for SimSender {
 /// A stable *semantic* digest of a `NodeMessage` for the trace.
 ///
 /// This deliberately does NOT hash the whole message: `NodeMessage` carries
-/// random ULID correlation ids (`RequestId`, `TransactionId`, `UpdateId`,
-/// `QueryId`) minted by `::new()` on every send, including by the Node
+/// random ULID correlation ids (`RequestId`, `TransactionId`, `QueryId`)
+/// minted by `::new()` on every send, including by the Node
 /// internally for messages the harness captures. Those ids never affect
 /// scheduling (the scheduler keys on queue position and the seeded RNG, and a
 /// Node's internal correlation is deterministic within a run), but hashing them
@@ -207,10 +202,7 @@ fn semantic_descriptor(message: &proto::NodeMessage) -> String {
         proto::NodeMessage::Response(response) => {
             format!("RESP {}", response_descriptor(&response.body))
         }
-        proto::NodeMessage::Update(update) => match &update.body {
-            proto::NodeUpdateBody::StateFrame { frame, .. } => format!("FRAME {}", frame_descriptor(frame)),
-        },
-        proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
+        proto::NodeMessage::StateFrame { frame, .. } => format!("FRAME {}", frame_descriptor(frame)),
         proto::NodeMessage::UnsubscribeQuery { .. } => "UNSUB".to_string(),
         proto::NodeMessage::AbandonStateStream { .. } => "ABANDON".to_string(),
     }
@@ -237,8 +229,8 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
         proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
-        proto::NodeRequestBody::ContinueState { round, processed_through, applied_through, answers, .. } => {
-            format!("continue {}", payload_digest(&(round, processed_through, applied_through, answers)))
+        proto::NodeRequestBody::StateFeedback { processed_through, applied_through, answers, .. } => {
+            format!("feedback {}", payload_digest(&(processed_through, applied_through, answers)))
         }
         proto::NodeRequestBody::RefreshState { round, known_state, .. } => format!("refresh {}", payload_digest(&(round, known_state))),
         proto::NodeRequestBody::FinishStateRound { round, outcome, .. } => format!("finish round {round} {outcome:?}"),
@@ -269,8 +261,8 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
         proto::NodeResponseBody::QuerySubscribed { state, .. } => format!("subscribed {}", state_descriptor(state)),
-        proto::NodeResponseBody::StateStreamUnavailable { .. } => "state stream unavailable".into(),
-        proto::NodeResponseBody::StateCaptureBusy => "state capture busy".into(),
+        proto::NodeResponseBody::StateStreamUnavailable => "state stream unavailable".into(),
+        proto::NodeResponseBody::StateSnapshotBusy => "state snapshot busy".into(),
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).
@@ -278,14 +270,12 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
     }
 }
 
-fn state_descriptor(state: &proto::StateReply) -> String {
-    format!("{} {}", payload_digest(&(&state.spec, state.round)), frame_descriptor(&state.frame))
-}
+fn state_descriptor(state: &proto::StateReply) -> String { format!("{} {}", payload_digest(&state.round), frame_descriptor(&state.frame)) }
 
 fn frame_descriptor(frame: &proto::StateFrame) -> String {
     let body = match &frame.body {
         proto::StateFrameBody::BeginRound(round) => format!("begin {}", payload_digest(round)),
-        proto::StateFrameBody::State { round, items, progress } => format!("state {}", payload_digest(&(round, items, progress))),
+        proto::StateFrameBody::Round { round, items, progress } => format!("state {}", payload_digest(&(round, items, progress))),
         proto::StateFrameBody::Live { revision, items, complete } => format!("live {}", payload_digest(&(revision, items, complete))),
         proto::StateFrameBody::LiveChunk { revision, chunk, member, complete } => {
             format!("livechunk {}", payload_digest(&(revision, chunk, member, complete)))

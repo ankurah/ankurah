@@ -1,8 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use ankurah_proto::{self as proto, ComparisonProgress, StateAnswer, StateFrameBody, StateItem};
+use ankurah_proto::{
+    self as proto, state_sync::limits::STREAM_TTL, ComparisonProgress, RepairItem, StateAnswer, StateFrameBody, StateItem,
+};
 use anyhow::{bail, ensure};
-use bincode::Options;
 use futures::FutureExt;
 
 use super::{feedback::Feedback, IncomingStream, Snapshot};
@@ -17,6 +18,9 @@ use crate::{
 mod driver;
 mod projection;
 pub(crate) use driver::RefreshHandle;
+
+/// Events the coverage check may walk to decide whether a local head covers a target.
+const COVERAGE_BUDGET: usize = 256;
 
 pub(crate) struct RemoteState {
     pub stream_id: proto::StateStreamId,
@@ -79,15 +83,15 @@ where
     let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
     stream.bind(stream_id, catalog, connection.outgoing_state_streams.clone());
     drop(connection);
-    if initial.spec != snapshot.spec || initial.frame.sequence != 0 || initial.round.number != 0 {
+    if let Err(error) = initial.validate() {
         let _ = abandon_current_state(node, peer, stream_id, &stream);
-        return Err(RetrievalError::Other("invalid initial state stream metadata".into()));
+        return Err(RetrievalError::Other(error.to_string()));
     }
     if let Err(error) = stream.inbox.insert(initial.frame) {
         let _ = abandon_current_state(node, peer, stream_id, &stream);
         return Err(error.into());
     }
-    let mut driver = driver::Driver::new(snapshot, initial.round, stream, stream_id)?;
+    let mut driver = driver::Driver::new(snapshot, initial.round, stream, stream_id);
     let result = async {
         driver.prepare(node, query).await?;
         driver.drive(node.weak(), peer, credentials, query, true).await
@@ -118,13 +122,14 @@ where
     if actual == target || target.entries().iter().all(|entry| actual.entries().contains(entry)) {
         return Ok(true);
     }
-    let relation = match crate::event_dag::compare(LocalEventGetter::new(node.storage.clone(), node.durable), actual, target, 256).await {
-        Ok(relation) => relation,
-        // A later target can be registered before its data/history applies.
-        // Missing local history proves neither coverage nor an invalid stream.
-        Err(RetrievalError::EventNotFound(_)) => return Ok(false),
-        Err(error) => return Err(error.into()),
-    };
+    let relation =
+        match crate::event_dag::compare(LocalEventGetter::new(node.storage.clone(), node.durable), actual, target, COVERAGE_BUDGET).await {
+            Ok(relation) => relation,
+            // A later target can be registered before its data/history applies.
+            // Missing local history proves neither coverage nor an invalid stream.
+            Err(RetrievalError::EventNotFound(_)) => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
     Ok(matches!(
         relation.relation,
         crate::event_dag::AbstractCausalRelation::Equal | crate::event_dag::AbstractCausalRelation::StrictDescends { .. }
@@ -221,7 +226,7 @@ where
     // Live feedback still needs the catalog bypass after snapshot release.
     match state_deadline(node.request(peer, credentials, proto::NodeRequestBody::FinishStateRound { stream, round, outcome })).await?? {
         proto::NodeResponseBody::Success => Ok(()),
-        proto::NodeResponseBody::StateStreamUnavailable { .. } => Err(RequestError::ConnectionLost.into()),
+        proto::NodeResponseBody::StateStreamUnavailable => Err(RequestError::ConnectionLost.into()),
         proto::NodeResponseBody::Error(error) => Err(RequestError::ServerError(error).into()),
         other => Err(RequestError::UnexpectedResponse(other).into()),
     }
@@ -240,27 +245,12 @@ fn send_abandonment<CD: crate::session::ContextData>(
 
 async fn state_deadline<T>(future: impl std::future::Future<Output = T>) -> Result<T, RetrievalError> {
     let future = future.fuse();
-    let timeout = futures_timer::Delay::new(std::time::Duration::from_secs(120)).fuse();
+    let timeout = futures_timer::Delay::new(STREAM_TTL).fuse();
     futures::pin_mut!(future, timeout);
     futures::select! {
         result = future => Ok(result),
         _ = timeout => Err(RequestError::ConnectionLost.into()),
     }
-}
-
-fn decode_delta(bytes: &[u8]) -> anyhow::Result<proto::DeltaContent> {
-    Ok(bincode::DefaultOptions::new().with_fixint_encoding().with_limit(bytes.len() as u64).reject_trailing_bytes().deserialize(bytes)?)
-}
-
-fn check_target(target: &proto::Clock, content: &proto::DeltaContent) -> anyhow::Result<()> {
-    match content {
-        proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. } => {
-            ensure!(state.state.head == *target, "snapshot does not match repair target")
-        }
-        proto::DeltaContent::EventBridge { events } => ensure!(!events.is_empty(), "empty event bridge"),
-        proto::DeltaContent::StateAndRelation { .. } => bail!("StateAndRelation is not supported"),
-    }
-    Ok(())
 }
 
 #[cfg(test)]

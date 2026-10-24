@@ -53,6 +53,13 @@ impl ScriptedConnection {
         let (server, receiver, routes) = (source.clone(), client.clone(), streams.clone());
         let source_task = tokio::spawn(async move {
             while let Some(message) = source_rx.recv().await {
+                if let proto::NodeMessage::Request {
+                    request: proto::NodeRequest { body: proto::NodeRequestBody::SubscribeQuery { known_state, .. }, .. },
+                    ..
+                } = &message
+                {
+                    assert!(known_state.spec.key_spec().keyparts.is_empty(), "script fixture requires the entity-ID query key");
+                }
                 if let proto::NodeMessage::AbandonStateStream { stream, .. } = &message {
                     let mut routes = routes.lock().unwrap();
                     if let Some(route) = routes.get_mut(stream).filter(|route| route.scripted) {
@@ -62,13 +69,13 @@ impl ScriptedConnection {
                 }
                 let response = if let proto::NodeMessage::Request { request, .. } = &message {
                     let comparison = match &request.body {
-                        proto::NodeRequestBody::ContinueState { stream: comparison, .. }
+                        proto::NodeRequestBody::StateFeedback { stream: comparison, .. }
                         | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => Some(*comparison),
                         _ => None,
                     };
                     let mut routes = routes.lock().unwrap();
                     comparison.and_then(|id| routes.get_mut(&id)).filter(|stream| stream.scripted).map(|stream| {
-                        if let proto::NodeRequestBody::ContinueState { applied_through: Some(revision), .. } = request.body {
+                        if let proto::NodeRequestBody::StateFeedback { applied_through: Some(revision), .. } = request.body {
                             stream.applied = Some(revision);
                         }
                         proto::NodeMessage::Response(proto::NodeResponse {
@@ -95,7 +102,6 @@ impl ScriptedConnection {
                     match &message {
                         proto::NodeMessage::Response(response) => {
                             if let proto::NodeResponseBody::QuerySubscribed { query_id, state } = &response.body {
-                                assert!(state.spec.key_spec().keyparts.is_empty(), "script fixture requires the entity-ID query key");
                                 routes.insert(
                                     state.frame.stream,
                                     Stream {
@@ -112,7 +118,7 @@ impl ScriptedConnection {
                             }
                             false
                         }
-                        proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
+                        proto::NodeMessage::StateFrame { frame, .. } => {
                             if let Some(stream) = routes.get_mut(&frame.stream) {
                                 if stream.scripted {
                                     true
@@ -171,12 +177,7 @@ impl ScriptedConnection {
                 (frame, stream.request.clone(), revision, stream.comparison)
             };
             self.client
-                .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-                    id: proto::UpdateId::new(),
-                    from: self.source.id,
-                    to: self.client.id,
-                    body: proto::NodeUpdateBody::StateFrame { request_id: request, frame },
-                }))
+                .handle_message(proto::NodeMessage::StateFrame { from: self.source.id, to: self.client.id, request_id: request, frame })
                 .await?;
             if failed {
                 continue;
@@ -241,9 +242,7 @@ pub fn change(delta: proto::EntityDelta) -> proto::QueryChange {
             }
             head
         }
-        proto::DeltaContent::StateSnapshot { state }
-        | proto::DeltaContent::StateAndEvents { state, .. }
-        | proto::DeltaContent::StateAndRelation { state, .. } => state.state.head.clone(),
+        content => content.state_head().expect("every delta but an event bridge carries state").clone(),
     };
     proto::QueryChange { entity_id: delta.entity_id, member: Some(proto::QueryMember { key: vec![], head }), delta: Some(delta.content) }
 }

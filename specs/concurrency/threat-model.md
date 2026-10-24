@@ -403,14 +403,14 @@ contention, a clean error, not corruption.
 ### 3.4 Ingress and DoS claims (the honest gaps)
 
 **C4-14. Every application arm validates events before staging.**
-Invariant: on the `EventOnly`, `StateAndEvent`, and `EventBridge` arms, each event
-fragment passes `validate_received_event` before it is staged or applied; transport
-does not decide trust.
+Invariant: on the `StateAndEvents` and `EventBridge` arms of `DeltaContent`, each
+event fragment passes `validate_received_event` before it is staged or applied;
+transport does not decide trust.
 Trust tier: attestation-dependent (nil under PermissiveAgent).
-Enforcing seam: `node_applier.rs` `validate_and_stage` calls
+Enforcing seam: `node/applier.rs` `validate_and_stage` calls
 `node.policy_agent.validate_received_event(node, from_peer_id, &attested_event)`
-before `stage_event`, in all three arms; `from_peer_id` is threaded from `node.rs`
-`handle_update` through `apply_updates`.
+before `stage_event`, in both arms; `from_peer_id` is the state stream's peer, which
+the requester's stream driver passes to `NodeApplier::apply_delta`.
 Falsifying attack (T2): craft an event a real agent rejects and send it on one of
 these arms; defeated only if the agent's validation is correct.
 Planned test arm: policy-rejection arm on each arm with a rejecting agent (mirrors

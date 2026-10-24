@@ -67,7 +67,7 @@ impl PolicyAgent for CredentialAgent {
             proto::NodeRequestBody::GetEvents { event_ids } => {
                 self.event_requests.lock().unwrap().push((event_ids.clone(), credentials.clone()));
             }
-            proto::NodeRequestBody::ContinueState { .. } | proto::NodeRequestBody::FinishStateRound { .. } => {
+            proto::NodeRequestBody::StateFeedback { .. } | proto::NodeRequestBody::FinishStateRound { .. } => {
                 let request = bincode::deserialize(&bincode::serialize(request).unwrap()).unwrap();
                 self.feedback.lock().unwrap().push((credentials.clone(), request));
                 self.feedback_arrived.notify_one();
@@ -142,9 +142,7 @@ async fn live_connecting_history_uses_the_stream_credential_instead_of_the_peer_
         let frames = frames.clone();
         let arrived = arrived.clone();
         move |message| {
-            if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) =
-                message
-            {
+            if let proto::NodeMessage::StateFrame { request_id, frame, .. } = message {
                 if let proto::StateFrameBody::Live { items, .. } = &frame.body {
                     if items.iter().any(|item| item.entity_id == id) {
                         frames.lock().unwrap().push((request_id.clone(), frame.clone()));
@@ -218,14 +216,7 @@ async fn live_connecting_history_uses_the_stream_credential_instead_of_the_peer_
         }],
         complete: true,
     };
-    client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
-            from: server.id,
-            to: client.id,
-            body: proto::NodeUpdateBody::StateFrame { request_id, frame },
-        }))
-        .await?;
+    client.handle_message(proto::NodeMessage::StateFrame { from: server.id, to: client.id, request_id, frame }).await?;
     tokio::time::timeout(Duration::from_secs(5), watcher.take(1)).await??;
     assert_eq!(target.ids(), vec![id]);
     assert_eq!(target.peek()[0].title()?, "final");
@@ -266,7 +257,7 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
                         }
                     }
                 }
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) => {
+                proto::NodeMessage::StateFrame { request_id, frame, .. } => {
                     // Keep the existing beta query at the base head while alpha
                     // captures a different branch. These are genuine producer
                     // frames; no response or event is forged for the test.
@@ -324,9 +315,9 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     .await?;
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = &response.body else { unreachable!() };
     let comparison = state.frame.stream;
-    let proto::StateFrameBody::State { items, .. } = &state.frame.body else { unreachable!() };
+    let proto::StateFrameBody::Round { items, .. } = &state.frame.body else { unreachable!() };
     assert!(
-        items.iter().any(|item| matches!(item, proto::StateItem::Repair { target, delta }
+        items.iter().any(|item| matches!(item, proto::StateItem::Repair(proto::RepairItem::Delta { target, delta })
         if delta.entity_id == id && *target == captured_target && matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }))),
         "the stock initial producer must offer the exact captured snapshot"
     );
@@ -363,13 +354,13 @@ async fn initial_snapshot_repair_and_application_use_the_stream_credential() -> 
     let feedback = agent.feedback.lock().unwrap();
     assert!(
         feedback.iter().any(|(_, request)| matches!(&request.body,
-        proto::NodeRequestBody::ContinueState { stream: found, answers, .. } if *found == comparison && answers.iter().any(|answer|
-            matches!(answer, proto::StateAnswer::NeedRepair { entity_id, target } if *entity_id == id && *target == captured_target)))),
+        proto::NodeRequestBody::StateFeedback { stream: found, answers: Some(proto::FeedbackAnswers::Round { answers, .. }), .. } if *found == comparison && answers.iter().any(|answer|
+            matches!(answer, proto::StateAnswer::NeedRepair(proto::RepairRequest { entity_id, target }) if *entity_id == id && *target == captured_target)))),
         "the uncovered initial snapshot must actually request connecting history"
     );
     for (credentials, request) in feedback.iter().filter(|(_, request)| {
         matches!(request.body,
-        proto::NodeRequestBody::ContinueState { stream: found, .. } | proto::NodeRequestBody::FinishStateRound { stream: found, .. } if found == comparison)
+        proto::NodeRequestBody::StateFeedback { stream: found, .. } | proto::NodeRequestBody::FinishStateRound { stream: found, .. } if found == comparison)
     }) {
         assert_eq!(
             *credentials,
@@ -450,16 +441,15 @@ async fn cancelled_fetch_abandons_after_its_context_is_gone_and_preserves_anothe
                 .request(
                     server.id,
                     &vec![Credential(1)],
-                    proto::NodeRequestBody::ContinueState {
+                    proto::NodeRequestBody::StateFeedback {
                         stream: comparison,
-                        round: Some(0),
                         processed_through: u64::MAX,
                         applied_through: None,
-                        answers: vec![],
+                        answers: None,
                     },
                 )
                 .await?;
-            if matches!(result, proto::NodeResponseBody::StateStreamUnavailable { stream: found } if found == comparison) {
+            if matches!(result, proto::NodeResponseBody::StateStreamUnavailable) {
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;
@@ -561,16 +551,15 @@ async fn cancelled_catalog_fetch_keeps_credentialless_cleanup() -> Result<()> {
                 .request(
                     server.id,
                     &vec![Credential(1)],
-                    proto::NodeRequestBody::ContinueState {
+                    proto::NodeRequestBody::StateFeedback {
                         stream: comparison,
-                        round: Some(0),
                         processed_through: u64::MAX,
                         applied_through: None,
-                        answers: vec![],
+                        answers: None,
                     },
                 )
                 .await?;
-            if matches!(response, proto::NodeResponseBody::StateStreamUnavailable { stream: found } if found == comparison) {
+            if matches!(response, proto::NodeResponseBody::StateStreamUnavailable) {
                 break Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;

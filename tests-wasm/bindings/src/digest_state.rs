@@ -37,7 +37,7 @@ impl FeedbackGate {
         self.armed.load(Ordering::Acquire)
             && matches!(message,
             proto::NodeMessage::Request { request: proto::NodeRequest {
-                body: proto::NodeRequestBody::ContinueState { round: Some(0), answers, .. }, ..
+                body: proto::NodeRequestBody::StateFeedback { answers: Some(proto::FeedbackAnswers::Round { round: 0, answers }), .. }, ..
             }, .. } if !answers.is_empty())
     }
 
@@ -59,8 +59,7 @@ impl PeerSender for BrowserSender {
         let message = bincode::deserialize(&bytes).map_err(anyhow::Error::from)?;
         if let proto::NodeMessage::Response(response) = &message {
             self.responses.lock().unwrap().push(StateTraffic::Response(response.body.clone()));
-        } else if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = &message
-        {
+        } else if let proto::NodeMessage::StateFrame { frame, .. } = &message {
             self.responses.lock().unwrap().push(StateTraffic::Frame(frame.clone()));
         }
         if let Some(gate) = &self.gate {
@@ -128,14 +127,14 @@ fn frames(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::St
 fn completed(responses: &Responses, query: Option<proto::QueryId>) -> bool {
     frames(responses, query)
         .iter()
-        .any(|frame| matches!(&frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Complete, .. }))
+        .any(|frame| matches!(&frame.body, proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Complete, .. }))
 }
 
 fn items(responses: &Responses, query: Option<proto::QueryId>) -> Vec<proto::StateItem> {
     frames(responses, query)
         .into_iter()
         .flat_map(|frame| match frame.body {
-            proto::StateFrameBody::State { items, .. } => items,
+            proto::StateFrameBody::Round { items, .. } => items,
             _ => vec![],
         })
         .collect()
@@ -174,7 +173,7 @@ async fn run(db_prefix: &str) -> anyhow::Result<()> {
     let fetched = reader.fetch::<TestUserView>("true").await?;
     anyhow::ensure!(fetched.iter().any(|user| user.name().as_deref() == Ok("changed")), "sparse Fetch repair");
     anyhow::ensure!(items(&responses, None).iter().any(|item| matches!(item,
-        proto::StateItem::Repair { delta, .. } if delta.entity_id == users[17].id() && matches!(delta.content, proto::DeltaContent::EventBridge { .. })
+        proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) if delta.entity_id == users[17].id() && matches!(delta.content, proto::DeltaContent::EventBridge { .. })
     )), "sparse Fetch should bridge the known clock");
 
     let query = reader.query_wait::<TestUserView>("true").await?;

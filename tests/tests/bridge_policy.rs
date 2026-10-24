@@ -102,12 +102,12 @@ async fn current_snapshot_repairs_validate_received_state_attestations_before_fe
         move |message| {
             let frame = match message {
                 proto::NodeMessage::Response(proto::NodeResponse { body: proto::NodeResponseBody::Fetch(state), .. }) => Some(&state.frame),
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                proto::NodeMessage::StateFrame { frame, .. } => Some(frame),
                 _ => None,
             };
-            if let Some(proto::StateFrame { body: proto::StateFrameBody::State { items, .. }, .. }) = frame {
+            if let Some(proto::StateFrame { body: proto::StateFrameBody::Round { items, .. }, .. }) = frame {
                 for item in items {
-                    if let proto::StateItem::Repair { delta, .. } = item {
+                    if let proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) = item {
                         if let proto::DeltaContent::StateSnapshot { state } = &delta.content {
                             pages.lock().unwrap().push((delta.entity_id, state.clone()));
                         }
@@ -370,7 +370,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     let (_conn, _) = common::GatedConnection::new(&server, &client, {
         let frames = frames.clone();
         move |message| {
-            if let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) = message {
+            if let proto::NodeMessage::StateFrame { frame, .. } = message {
                 frames.lock().unwrap().push(frame.clone());
             }
             false
@@ -386,7 +386,8 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             spans: vec![proto::SpanContent::Heads(proto::TreeSpanInventory {
                 bounds: serde_json::from_value(serde_json::json!({ "start": { "Included": [] }, "end": "Unbounded" }))?,
                 heads: vec![proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id, head: known_head.clone() } }]
-                    .into(),
+                    .try_into()
+                    .unwrap(),
             })],
         };
         let requests = [
@@ -410,9 +411,9 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                     let mut found = false;
                     loop {
                         let sequence = frame.sequence;
-                        let proto::StateFrameBody::State { items, progress, .. } = frame.body else { panic!("expected catalog state") };
+                        let proto::StateFrameBody::Round { items, progress, .. } = frame.body else { panic!("expected catalog state") };
                         for item in items {
-                            if let proto::StateItem::Repair { delta, .. } = item {
+                            if let proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) = item {
                                 if delta.entity_id == entity_id {
                                     assert!(
                                         matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1),
@@ -430,12 +431,11 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                                 .request(
                                     server.id,
                                     &credentials,
-                                    proto::NodeRequestBody::ContinueState {
+                                    proto::NodeRequestBody::StateFeedback {
                                         stream: comparison,
-                                        round: None,
                                         processed_through: sequence,
                                         applied_through: None,
-                                        answers: vec![]
+                                        answers: None
                                     }
                                 )
                                 .await?,
@@ -508,7 +508,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
                     body: proto::NodeResponseBody::Fetch(state) | proto::NodeResponseBody::QuerySubscribed { state, .. },
                     ..
                 }) => Some(&state.frame),
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => Some(frame),
+                proto::NodeMessage::StateFrame { frame, .. } => Some(frame),
                 _ => None,
             };
             if let Some(frame) = frame {
@@ -549,7 +549,8 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 
     assert!(
         frames.lock().unwrap().iter().any(|frame| match &frame.body {
-            proto::StateFrameBody::State { items, .. } => items.iter().any(|item| matches!(item, proto::StateItem::Repair { delta, .. }
+            proto::StateFrameBody::Round { items, .. } =>
+                items.iter().any(|item| matches!(item, proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. })
             if delta.entity_id == pet_id && matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 2))),
             _ => false,
         }),

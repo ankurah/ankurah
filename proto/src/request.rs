@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventId,
-    KnownState, RegisterModel, RegisteredModel, StateAnswer, StateReply, StateRoundOutcome, StateStreamId,
+    FeedbackAnswers, KnownState, RegisterModel, RegisteredModel, StateReply, StateRoundOutcome, StateStreamId,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -126,33 +126,34 @@ pub enum NodeRequestBody {
     RegisterSchema {
         model: RegisterModel,
     },
-    /// Return flow credit and answer questions without waiting for another page.
-    /// Responses are Success; further numbered frames arrive as NodeUpdate.
-    /// Retrying the same request id is idempotent. A processed prefix may contain
-    /// explicit pending NeedRepair; it is not the global Applied acknowledgment.
-    ContinueState {
+    /// Returns frame credit and the requester's answers on a state stream. The
+    /// responder replies Success; the frames it sends next arrive as
+    /// NodeMessage::StateFrame. A retry with the same request ID and contents is
+    /// harmless. Credit counts frames processed, not applied: only FinishStateRound
+    /// reports a round applied.
+    StateFeedback {
         stream: StateStreamId,
-        /// Answers belong to this round; None addresses live-target repair.
-        /// Credit-only feedback needs no active round.
-        round: Option<u64>,
+        /// The last frame the requester has processed; frames through it stop counting
+        /// against the responder's window.
         processed_through: u64,
-        /// Actual causal coverage and local publication through a complete live
-        /// revision, distinct from frame receipt credit. Releases retained live
-        /// repair targets.
+        /// The last live publication the requester has applied and published, whose
+        /// targets the responder may then forget.
         applied_through: Option<u64>,
-        answers: Vec<StateAnswer>,
+        /// Answers, if any, named by what they respond to.
+        answers: Option<FeedbackAnswers>,
     },
-    /// Compare another frozen offer on the standing stream. One round at a time;
-    /// the number must be the previous round plus one. The responder sends an
-    /// ordered BeginRound marker and returns Success, without an extra page poll.
+    /// Asks for another comparison round on a SubscribeQuery stream, comparing
+    /// `known_state`. The round's number follows the previous round's, and only one
+    /// round runs at a time. The responder replies Success and begins the round with a
+    /// BeginRound frame.
     RefreshState {
         stream: StateStreamId,
         round: u64,
         known_state: KnownState,
     },
-    /// Release only the named round, preserving a subscription's live delivery.
-    /// Fetch retires its stream when its sole round finishes. Repeats are safe.
-    /// The response is Success; readiness does not wait for the Applied reply.
+    /// Ends the named round with its outcome. A subscription's stream continues with
+    /// live delivery; a Fetch's stream ends with its only round. The responder replies
+    /// Success, and a repeat is harmless.
     FinishStateRound {
         stream: StateStreamId,
         round: u64,
@@ -181,8 +182,9 @@ pub enum NodeResponseBody {
     GetEvents(Vec<Attested<Event>>),
     QuerySubscribed {
         query_id: QueryId,
-        /// Subscription establishment and initial transfer completion are distinct.
-        /// Live delivery must preserve the handoff from this captured snapshot.
+        /// The stream's opening reply. The subscription exists once it arrives; its
+        /// first round completes later, and live publications follow the revision that
+        /// round's snapshot reflects.
         state: StateReply,
     },
     /// The resolved schema, with build ids echoed for descriptor binding.
@@ -191,14 +193,13 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
-    /// The initial Fetch or SubscribeQuery capture could not keep up with
-    /// concurrent source changes. No stream was created; retry after backoff.
-    StateCaptureBusy,
-    /// The state stream expired or was invalidated. Restart the original Fetch or
-    /// SubscribeQuery; previously received pages cannot complete a new comparison.
-    StateStreamUnavailable {
-        stream: StateStreamId,
-    },
+    /// The responder could not take a stable snapshot of the query result for an
+    /// initial Fetch or SubscribeQuery while its source kept changing. No stream was
+    /// created; retry after backoff.
+    StateSnapshotBusy,
+    /// The state stream expired or ended. The requester sends its Fetch or
+    /// SubscribeQuery again; frames it received cannot complete a new round.
+    StateStreamUnavailable,
 }
 
 /// A known-ID read reports denial separately from absence, without returning denied state.
@@ -273,8 +274,8 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
             }
-            NodeRequestBody::ContinueState { stream, processed_through, answers, .. } => {
-                write!(f, "ContinueState {stream} through:{processed_through} answers:{}", answers.len())
+            NodeRequestBody::StateFeedback { stream, processed_through, answers, .. } => {
+                write!(f, "StateFeedback {stream} through:{processed_through} answers:{}", answers.as_ref().map_or(0, FeedbackAnswers::len))
             }
             NodeRequestBody::RefreshState { stream, round, known_state } => {
                 write!(f, "RefreshState {stream} round:{round} spans:{}", known_state.spans.len())
@@ -304,8 +305,8 @@ impl std::fmt::Display for NodeResponseBody {
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
-            NodeResponseBody::StateCaptureBusy => write!(f, "StateCaptureBusy"),
-            NodeResponseBody::StateStreamUnavailable { stream } => write!(f, "StateStreamUnavailable {stream}"),
+            NodeResponseBody::StateSnapshotBusy => write!(f, "StateSnapshotBusy"),
+            NodeResponseBody::StateStreamUnavailable => write!(f, "StateStreamUnavailable"),
         }
     }
 }

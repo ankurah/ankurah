@@ -4,10 +4,9 @@ use crate::{
     auth::AuthData,
     id::EntityId,
     peering::{Presence, PresenceRejection},
-    request::{NodeRequest, NodeResponse},
+    request::{NodeRequest, NodeResponse, RequestId},
     subscription::QueryId,
-    update::{NodeUpdate, NodeUpdateAck},
-    StateStreamId,
+    StateFrame, StateStreamId,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -27,8 +26,17 @@ pub enum NodeMessage {
         request: NodeRequest,
     },
     Response(NodeResponse),
-    Update(NodeUpdate),
-    UpdateAck(NodeUpdateAck),
+    /// A state-stream frame after frame zero, pushed by the stream's responder `from`
+    /// to its requester `to`. `request_id` names the Fetch or SubscribeQuery that opened
+    /// the stream, so the requester can route a frame that arrives before that
+    /// request's response. No response is sent; the requester returns frame credit
+    /// in StateFeedback.
+    StateFrame {
+        from: EntityId,
+        to: EntityId,
+        request_id: RequestId,
+        frame: StateFrame,
+    },
     UnsubscribeQuery {
         from: EntityId,
         query_id: QueryId,
@@ -57,8 +65,9 @@ impl std::fmt::Display for NodeMessage {
         match self {
             NodeMessage::Request { request, .. } => write!(f, "Request: {}", request),
             NodeMessage::Response(response) => write!(f, "Response: {}", response),
-            NodeMessage::Update(update) => write!(f, "Update: {}", update),
-            NodeMessage::UpdateAck(update_ack) => write!(f, "UpdateAck: {}", update_ack),
+            NodeMessage::StateFrame { from, to, request_id, frame } => {
+                write!(f, "StateFrame {from}->{to} {request_id} {} sequence:{}", frame.stream, frame.sequence)
+            }
             NodeMessage::UnsubscribeQuery { from, query_id } => write!(f, "Unsubscribe: {} {}", from, query_id),
             NodeMessage::AbandonStateStream { from, to, stream } => write!(f, "AbandonStateStream {from}->{to}: {stream}"),
         }

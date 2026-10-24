@@ -1,5 +1,6 @@
 use super::*;
 use ankurah_digest_tree::leaf_address;
+use ankurah_proto::state_sync::limits::{MAX_FRAME_BYTES, MAX_PAGE_BYTES};
 use std::ops::Bound::*;
 
 mod cancellation;
@@ -14,20 +15,20 @@ fn small_compressed_frame_cannot_bypass_the_aggregate_work_budget() {
             entity: proto::EntityHead { entity_id: id(n), head: proto::Clock::default() },
         })
         .collect::<Vec<_>>();
-    let page = proto::TreeSpanInventory { bounds: super::super::whole(), heads: rows.into() };
-    assert!(page.expanded_size() < super::super::PAGE_BYTES as u64);
+    let page = proto::TreeSpanInventory { bounds: super::super::whole(), heads: rows.try_into().unwrap() };
+    assert!(page.work_bytes().unwrap() < MAX_PAGE_BYTES as u64);
     let frame = proto::StateFrame {
         stream: proto::StateStreamId::new(),
         sequence: 0,
-        body: proto::StateFrameBody::State {
+        body: proto::StateFrameBody::Round {
             round: 0,
             items: vec![proto::StateItem::Heads(page.clone()), proto::StateItem::Heads(page)],
             progress: proto::ComparisonProgress::Continue,
         },
     };
-    assert!(bincode::serialized_size(&frame).unwrap() < super::super::FRAME_BYTES as u64);
+    assert!(bincode::serialized_size(&frame).unwrap() < MAX_FRAME_BYTES as u64);
     let inbox = super::super::Inbox::default();
-    assert!(inbox.insert(frame).unwrap_err().to_string().contains("decoded-work limit"));
+    assert!(inbox.insert(frame).unwrap_err().to_string().contains("work limit"));
 }
 
 // An empty compiled model keeps this lifecycle fixture independent of derives
@@ -95,9 +96,7 @@ struct StreamSender {
 impl crate::connector::PeerSender for StreamSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), crate::connector::SendError> {
         self.messages.lock().unwrap().push(bincode::deserialize(&bincode::serialize(&message).unwrap()).unwrap());
-        if self.hold_continuations.load(std::sync::atomic::Ordering::SeqCst)
-            && matches!(message, proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { .. }, .. }))
-        {
+        if self.hold_continuations.load(std::sync::atomic::Ordering::SeqCst) && matches!(message, proto::NodeMessage::StateFrame { .. }) {
             return Ok(());
         }
         let pause = if matches!(
@@ -230,19 +229,16 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_its_request
     // Queued traffic on the canceled, already-bound origin must not invoke
     // the orphan-metadata cleanup path either.
     client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
+        .handle_message(proto::NodeMessage::StateFrame {
             from: server.id,
             to: client.id,
-            body: proto::NodeUpdateBody::StateFrame {
-                request_id: origin,
-                frame: proto::StateFrame {
-                    stream: comparison,
-                    sequence: 1,
-                    body: proto::StateFrameBody::Live { revision: 1, items: vec![], complete: true },
-                },
+            request_id: origin,
+            frame: proto::StateFrame {
+                stream: comparison,
+                sequence: 1,
+                body: proto::StateFrameBody::Live { revision: 1, items: vec![], complete: true },
             },
-        }))
+        })
         .await?;
     tokio::task::yield_now().await;
     let (_, retained) =
@@ -302,15 +298,12 @@ async fn a_current_live_stream_failure_still_abandons_its_responder_query() -> a
     // before a replacement can reinstall the same query.
     let (entered_rx, release) = hold_request(&requests);
     client
-        .handle_message(proto::NodeMessage::Update(proto::NodeUpdate {
-            id: proto::UpdateId::new(),
+        .handle_message(proto::NodeMessage::StateFrame {
             from: server.id,
             to: client.id,
-            body: proto::NodeUpdateBody::StateFrame {
-                request_id: origin.clone(),
-                frame: proto::StateFrame { stream: comparison, sequence: 1, body: proto::StateFrameBody::RestartRequired },
-            },
-        }))
+            request_id: origin.clone(),
+            frame: proto::StateFrame { stream: comparison, sequence: 1, body: proto::StateFrameBody::RestartRequired },
+        })
         .await?;
     until(|| {
         messages.lock().unwrap().iter().any(|message| {
@@ -419,7 +412,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     )
     .await?;
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = response else { panic!("expected query metadata") };
-    assert!(matches!(state.frame.body, proto::StateFrameBody::State { progress: proto::ComparisonProgress::Continue, .. }));
+    assert!(matches!(state.frame.body, proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Continue, .. }));
     let comparison = state.frame.stream;
     let peer = server.peer_connections.get(&client.id).unwrap();
     let (_, original_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();

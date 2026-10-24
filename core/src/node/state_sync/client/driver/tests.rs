@@ -1,4 +1,5 @@
 use super::*;
+use ankurah_proto::state_sync::limits::MAX_PAGE_BYTES;
 
 fn id(n: u8) -> proto::EntityId { proto::EntityId::from_bytes([n; 32]) }
 fn head(n: u8) -> proto::Clock { proto::Clock::genesis(proto::EventId::from_bytes([n; 32])) }
@@ -15,7 +16,7 @@ async fn fixture(
     let snapshot = super::super::super::QueryTree::default().refresh(spec, rows).await?;
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), None, None)?;
-    Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new())?, registry))
+    Ok((node, Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new()), registry))
 }
 
 #[tokio::test]
@@ -25,14 +26,16 @@ async fn malformed_inventories_do_not_change_the_round_projection() -> anyhow::R
     let head = |n| proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id: id(n), head: head(n) } };
     let address = |n| ankurah_digest_tree::leaf_address(&[], id(n));
     let invalid = [
-        StateItem::Heads(proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: vec![head(4), head(2)].into() }),
+        StateItem::Heads(proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: vec![head(4), head(2)].try_into().unwrap() }),
         StateItem::Heads(proto::TreeSpanInventory {
             bounds: proto::TreeSpan::new(std::ops::Bound::Included(address(4)), std::ops::Bound::Included(address(2))),
             heads: Default::default(),
         }),
     ];
     for item in invalid {
-        assert!(driver.items(&node, id(90), &[], Owner::Round(0), vec![item]).await.is_err());
+        let body = StateFrameBody::Round { round: 0, items: vec![item], progress: ComparisonProgress::Continue };
+        let frame = proto::StateFrame { stream: driver.stream_id, sequence: 1, body };
+        assert!(driver.frame(&node, id(90), &[], frame).await.is_err());
         assert_eq!(driver.projection.round.as_ref().unwrap().members, original);
         assert!(driver.goals.rows.is_empty());
         assert!(driver.jobs.is_empty());
@@ -335,7 +338,7 @@ async fn bind_query_driver(
     let registry = Arc::new(super::super::super::IncomingStates::default());
     let stream = registry.register(proto::RequestId::new(), Some((query.query_id(), 1)), None)?;
     query.weak().stream_bound(1, stream.request.clone(), Arc::new(|| false));
-    let mut driver = Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new())?;
+    let mut driver = Driver::new(snapshot, proto::StateRound { number: 0, revision: 10 }, stream, proto::StateStreamId::new());
     driver.prepare(node, Some((query.query_id(), 1))).await?;
     Ok((driver, registry, query))
 }
@@ -546,7 +549,7 @@ async fn round_pin_refresh_evicts_large_merged_resident_and_query_still_installs
     assert!(driver.round_pins.contains_key(&entity_id));
 
     let backend = LWWBackend::new();
-    backend.set(proto::PropertyId::EntityId(id(94)), Some(Value::String("x".repeat(super::super::super::WINDOW_BYTES))));
+    backend.set(proto::PropertyId::EntityId(id(94)), Some(Value::String("x".repeat(WINDOW_BYTES))));
     let large = proto::Event::update(
         entity_id,
         entity.head(),
@@ -716,7 +719,7 @@ async fn overlay_coalesces_reentry_and_has_an_aggregate_byte_bound() -> anyhow::
     let one_decision = bincode::serialized_size(&(id(1), Some(member(1))))? as usize;
     assert_eq!(driver.projection.retained_bytes(), one_decision, "coalescing does not retain intermediate revisions");
     driver.check_retained()?;
-    let huge = proto::QueryMember { key: vec![1; super::super::super::WINDOW_BYTES], head: head(1) };
+    let huge = proto::QueryMember { key: vec![1; WINDOW_BYTES], head: head(1) };
     driver.projection.publish(1011, vec![(id(1), Some(huge))])?;
     assert!(driver.check_retained().is_err(), "one wide key cannot escape the aggregate overlay limit");
     Ok(())
@@ -732,7 +735,7 @@ async fn live_coverage_can_finish_round_with_queued_repair_and_ignore_late_unava
     // answer is still outstanding. The actual head, not its revision, covers R.
     driver.observe(&node, Applied { owner: Owner::Live(11), id: id(1), head: Some(head(1)), change: None, bytes: 0, repair: None }).await?;
     assert!(driver.complete_round(&node, None).await?);
-    driver.items(&node, id(90), &[], Owner::Repair, vec![StateItem::RepairUnavailable { entity_id: id(1), target: head(1) }]).await?;
+    driver.receive_repair(&node, id(90), &[], Owner::Repair, RepairItem::Unavailable { entity_id: id(1), target: head(1) }).await?;
     assert!(driver.projection.members.contains_key(&id(1)));
     let mut required = Goals::default();
     required.add(id(2), head(2), false)?;
@@ -748,7 +751,7 @@ async fn live_coverage_can_finish_round_with_queued_repair_and_ignore_late_unava
     });
     assert!(
         driver
-            .items(&node, id(90), &[], Owner::Repair, vec![StateItem::RepairUnavailable { entity_id: id(2), target: head(2) }])
+            .receive_repair(&node, id(90), &[], Owner::Repair, RepairItem::Unavailable { entity_id: id(2), target: head(2) })
             .await
             .is_err(),
         "an actually uncovered target still fails"
@@ -934,12 +937,12 @@ async fn first_chunk_reservation_can_receive_rest_after_later_live_fills_window(
     let later = proto::DeltaContent::StateSnapshot {
         state: proto::StateFragment {
             state: entity.to_state()?,
-            attestations: proto::AttestationSet(vec![proto::Attestation(vec![7; super::super::super::WINDOW_BYTES])]),
+            attestations: proto::AttestationSet(vec![proto::Attestation(vec![7; WINDOW_BYTES])]),
         },
     };
     let later = bincode::serialize(&later)?;
-    for (index, part) in later.chunks(super::super::super::PAGE_BYTES / 2).enumerate() {
-        let offset = index * (super::super::super::PAGE_BYTES / 2);
+    for (index, part) in later.chunks(MAX_PAGE_BYTES / 2).enumerate() {
+        let offset = index * (MAX_PAGE_BYTES / 2);
         driver.chunk(
             &node,
             id(90),
@@ -955,7 +958,7 @@ async fn first_chunk_reservation_can_receive_rest_after_later_live_fills_window(
             },
         )?;
     }
-    assert!(driver.application_bytes >= super::super::super::WINDOW_BYTES);
+    assert!(driver.application_bytes >= WINDOW_BYTES);
     assert_eq!(driver.application_jobs, 2);
     assert_eq!(driver.queued_jobs[&entity.id()].len(), 1);
     assert!(driver.can_receive(), "the earlier reserved job requires more bytes: application pressure cannot stop that reception");

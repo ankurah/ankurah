@@ -75,8 +75,7 @@ impl StorageEngine for Counted {
 struct Traffic {
     request_bytes: usize,
     response_bytes: usize,
-    update_bytes: usize,
-    ack_bytes: usize,
+    pushed_frame_bytes: usize,
     frames: usize,
     requests: usize,
     leaves: usize,
@@ -94,7 +93,6 @@ struct Meter {
     model: Option<proto::ModelId>,
     requests: HashSet<proto::RequestId>,
     comparisons: HashSet<proto::StateStreamId>,
-    updates: HashSet<proto::UpdateId>,
     traffic: Traffic,
     started: Option<Instant>,
     one_way_ms: u64,
@@ -109,7 +107,7 @@ impl Meter {
                     proto::NodeRequestBody::Fetch { selection, .. } | proto::NodeRequestBody::SubscribeQuery { selection, .. } => {
                         self.model.is_some_and(|model| selection.predicate.referenced_models().contains(&model))
                     }
-                    proto::NodeRequestBody::ContinueState { stream: comparison, .. }
+                    proto::NodeRequestBody::StateFeedback { stream: comparison, .. }
                     | proto::NodeRequestBody::FinishStateRound { stream: comparison, .. } => self.comparisons.contains(comparison),
                     _ => false,
                 };
@@ -137,38 +135,28 @@ impl Meter {
                     self.observe_frame(page);
                 }
             }
-            proto::NodeMessage::Update(update) => {
-                if let proto::NodeUpdateBody::StateFrame { request_id, frame } = &update.body {
-                    if self.requests.contains(request_id) {
-                        self.updates.insert(update.id.clone());
-                        let bytes = bincode::serialized_size(message).unwrap() as usize;
-                        self.traffic.update_bytes += bytes;
-                        self.traffic.response_bytes += bytes;
-                        self.observe_frame(frame);
-                    }
-                }
+            proto::NodeMessage::StateFrame { request_id, frame, .. } if self.requests.contains(request_id) => {
+                let bytes = bincode::serialized_size(message).unwrap() as usize;
+                self.traffic.pushed_frame_bytes += bytes;
+                self.traffic.response_bytes += bytes;
+                self.observe_frame(frame);
             }
             proto::NodeMessage::AbandonStateStream { stream, .. } if self.comparisons.contains(stream) => {
                 self.traffic.request_bytes += bincode::serialized_size(message).unwrap() as usize;
-            }
-            proto::NodeMessage::UpdateAck(ack) if self.updates.contains(&ack.id) => {
-                let bytes = bincode::serialized_size(message).unwrap() as usize;
-                self.traffic.ack_bytes += bytes;
-                self.traffic.request_bytes += bytes;
             }
             _ => {}
         }
     }
     fn observe_frame(&mut self, frame: &proto::StateFrame) {
         self.traffic.frames += 1;
-        if let proto::StateFrameBody::State { items, .. } = &frame.body {
+        if let proto::StateFrameBody::Round { items, .. } = &frame.body {
             self.traffic.max_reply_items = self.traffic.max_reply_items.max(items.len());
             let bytes = items.iter().map(|item| bincode::serialized_size(item).unwrap() as usize).sum();
             self.traffic.max_reply_item_bytes = self.traffic.max_reply_item_bytes.max(bytes);
             for item in items {
                 match item {
                     proto::StateItem::Heads(page) => self.traffic.leaves += page.heads.len(),
-                    proto::StateItem::Repair { delta, .. } => {
+                    proto::StateItem::Repair(proto::RepairItem::Delta { delta, .. }) => {
                         self.traffic.repairs += 1;
                         if matches!(delta.content, proto::DeltaContent::StateSnapshot { .. }) {
                             self.traffic.snapshots += 1;
@@ -264,8 +252,8 @@ fn record(label: &str, n: usize, server: &TestNode, client: &TestNode, meter: &A
         assert!(meter.errors.is_empty(), "peer errors: {:?}", meter.errors);
         meter.take()
     };
-    assert!(traffic.max_reply_items <= 128);
-    assert!(traffic.max_reply_item_bytes <= 64 * 1024);
+    assert!(traffic.max_reply_items <= proto::state_sync::limits::MAX_FRAME_ITEMS);
+    assert!(traffic.max_reply_item_bytes <= proto::state_sync::limits::MAX_PAGE_BYTES);
     println!(
         "DIGEST_COST {}",
         serde_json::json!({"case":label,"entities":n,"one_way_ms":meter.lock().unwrap().one_way_ms,"wire":traffic,"server_materialization":server.storage.take(),"client_materialization":client.storage.take()})

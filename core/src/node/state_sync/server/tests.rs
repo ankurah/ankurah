@@ -6,6 +6,7 @@ use crate::{
     test_utils::TestStorage,
 };
 use ankurah_digest_tree::CanonicalCodec;
+use ankurah_proto::state_sync::limits::MAX_FEEDBACK_ANSWERS;
 
 type TestNode = Node<TestStorage, PermissiveAgent>;
 #[derive(Clone)]
@@ -65,7 +66,7 @@ fn states(count: usize, payload: usize) -> Vec<proto::Attested<proto::EntityStat
         .collect()
 }
 fn state_items(frame: &StateFrame) -> (&[StateItem], ComparisonProgress) {
-    let StateFrameBody::State { items, progress, .. } = &frame.body else { panic!("state frame") };
+    let StateFrameBody::Round { items, progress, .. } = &frame.body else { panic!("state frame") };
     (items, *progress)
 }
 fn live_item(bytes: usize) -> proto::QueryChange {
@@ -116,7 +117,7 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
 
     for payload in [8, 1024] {
         let (node, _, _) = node().await?;
-        let source = states(PAGE_STEPS * 2, payload);
+        let source = states(MAX_FRAME_STEPS * 2, payload);
         let ids: Vec<_> = source.iter().map(|state| state.payload.entity_id).collect();
         let snapshot = stored_snapshot(&node, source.clone()).await?;
         let mut residents = Vec::new();
@@ -133,18 +134,18 @@ async fn resident_snapshot_repairs_fill_reply_within_byte_and_step_limits() -> a
             );
         }
         let mut comparison = Comparison::new(snapshot, unknown())?;
-        let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
-        let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count();
-        assert!(repairs > PAGE_WORK, "resident snapshots must not stop at the storage/history work cap");
-        let sizes = items.iter().map(super::super::budget::item_bytes).collect::<Result<Vec<_>, _>>()?;
+        let repairs = items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count();
+        assert!(repairs > MAX_FRAME_TREE_WORK, "resident snapshots must not stop at the storage/history work cap");
+        let sizes = items.iter().map(StateItem::work_bytes).collect::<Result<Vec<_>, _>>()?;
         let bytes: u64 = sizes.iter().sum();
-        assert!(bytes <= PAGE_BYTES as u64);
+        assert!(bytes <= MAX_PAGE_BYTES as u64);
         if payload == 8 {
-            assert_eq!(repairs, PAGE_STEPS - 1, "one head page plus repairs fills the step budget");
+            assert_eq!(repairs, MAX_FRAME_STEPS - 1, "one head page plus repairs fills the step budget");
         } else {
             assert!(
-                bytes + super::super::budget::item_bytes(items.last().unwrap())? > PAGE_BYTES as u64,
+                bytes + items.last().unwrap().work_bytes()? > MAX_PAGE_BYTES as u64,
                 "another same-sized repair would exceed the byte budget"
             );
         }
@@ -160,7 +161,7 @@ async fn storage_and_possible_history_repairs_keep_the_work_cap() -> anyhow::Res
 
     for known_head in [None, Some(proto::Clock::genesis(proto::EventId::from_bytes([9; 32])))] {
         let (node, _, _) = node().await?;
-        let source = states(PAGE_WORK * 2, 8);
+        let source = states(MAX_FRAME_TREE_WORK * 2, 8);
         let snapshot = stored_snapshot(&node, source.clone()).await?;
         let mut residents = Vec::new();
         if known_head.is_some() {
@@ -179,10 +180,10 @@ async fn storage_and_possible_history_repairs_keep_the_work_cap() -> anyhow::Res
         }
         let mut comparison = Comparison::new(snapshot, unknown())?;
         comparison.work = source.iter().map(|state| Work::Repair(state.payload.entity_id, known_head.clone())).collect();
-        let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert_eq!(progress, ComparisonProgress::Continue);
-        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), PAGE_WORK);
-        assert_eq!(comparison.repaired.len(), PAGE_WORK);
+        assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), MAX_FRAME_TREE_WORK);
+        assert_eq!(comparison.repaired.len(), MAX_FRAME_TREE_WORK);
         let Some(Work::Repair(deferred, _)) = comparison.work.front() else { panic!("deferred repair") };
         assert!(!comparison.repaired.contains(deferred), "budget deferral must not mark an unsent repair as complete");
         drop(residents);
@@ -205,7 +206,7 @@ async fn summary_aggregate_equality_requires_an_exact_summary_only_cover() -> an
     assert!(known.spans.len() > 1);
     let mut equal = Comparison::new(stored_snapshot(&node, source.clone()).await?, known.clone())?;
     assert!(matches!(equal.work.front(), Some(Work::CompareFrontier(_))));
-    let StateFrameBody::State { items, progress, .. } = equal.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+    let StateFrameBody::Round { items, progress, .. } = equal.reply(&node, &vec![], false, 0).await? else { panic!("state") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(items.is_empty(), "equal captured results need no response items");
 
@@ -243,7 +244,7 @@ async fn a_128_leaf_mismatch_repairs_unknown_and_former_members() -> anyhow::Res
     let new_id = added.payload.entity_id;
     current.push(added);
     let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, known)?;
-    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+    let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
     assert!(matches!(items.as_slice(), [StateItem::NeedHeads(bounds)] if *bounds == super::super::whole()));
     comparison.answer(vec![StateAnswer::Heads(requester.page(super::super::whole())?)])?;
     let Some(Work::AnswerHeads { page, rest }) = comparison.work.pop_front() else { panic!("deferred leaf answer") };
@@ -296,7 +297,7 @@ async fn wider_responder_clocks_split_outbound_inventory_without_repairing_share
     let mut ids = Vec::new();
     for page in pages {
         assert_eq!(page.bounds.start, start);
-        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64);
         ids.extend(page.heads.to_vec().iter().map(|leaf| leaf.entity.entity_id));
         start = opposite(&page.bounds.end);
     }
@@ -334,8 +335,8 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     let mut requester = snapshot(before).await?;
     let mut spans = Vec::new();
     let mut start = super::super::whole().start;
-    for (index, chunk) in current.chunks(HEAD_PAGE).enumerate() {
-        let end = if (index + 1) * HEAD_PAGE == current.len() {
+    for (index, chunk) in current.chunks(MAX_PAGE_HEADS).enumerate() {
+        let end = if (index + 1) * MAX_PAGE_HEADS == current.len() {
             super::super::whole().end
         } else {
             std::ops::Bound::Included(chunk.last().unwrap().payload.entity_id.to_bytes().to_vec())
@@ -347,7 +348,7 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     let mut comparison = Comparison::new(stored_snapshot(&node, current).await?, proto::KnownState { spec: spec(), spans })?;
     let mut answers = Vec::new();
     while !comparison.work.is_empty() {
-        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         for item in items {
             let StateItem::NeedHeads(bounds) = item else { panic!("each changed supplied region must ask for leaves directly") };
             answers.push(StateAnswer::Heads(requester.page(bounds)?));
@@ -356,16 +357,16 @@ async fn valid_batched_leaf_answers_cannot_expand_the_work_queue_past_its_limit(
     assert_eq!(answers.len(), 32, "all questions are legitimate bounded mismatch spans");
     // Several valid feedback requests can be accepted before the producer is polled.
     for batch in answers.chunks(4) {
-        assert!(bincode::serialized_size(&(0u64, batch))? <= FRAME_BYTES as u64);
+        assert!(bincode::serialized_size(&(0u64, batch))? <= MAX_FRAME_BYTES as u64);
         comparison.answer(batch.to_vec())?;
     }
     assert_eq!(comparison.work.len(), 32, "one bounded work item must represent each accepted answer");
     let mut repaired = HashSet::new();
     while !comparison.complete {
-        let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
         for item in items {
-            if let StateItem::Repair { delta, .. } = item {
+            if let StateItem::Repair(RepairItem::Delta { delta, .. }) = item {
                 assert!(repaired.insert(delta.entity_id));
             }
         }
@@ -389,7 +390,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let root = responder.span_digest(super::super::whole()).await?;
     let frontier = responder.refine(&root).await?;
     let original =
-        frontier.iter().find(|head| head.digest.count() > HEAD_PAGE as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
+        frontier.iter().find(|head| head.digest.count() > MAX_PAGE_HEADS as i64 && head.bounds.contains(&missing.to_bytes())).unwrap();
     let bounds = original.bounds.clone();
     let clipped = responder.span_digest(bounds.clone()).await?;
     let refined = responder.refine(&clipped).await?;
@@ -411,8 +412,8 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
     let mut finished = false;
     for _ in 0..64 {
         let body = comparison.reply(&node, &vec![], false, 0).await?;
-        assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
-        let StateFrameBody::State { items, progress, .. } = body else { panic!("state frame") };
+        assert!(bincode::serialized_size(&body)? <= MAX_FRAME_BYTES as u64);
+        let StateFrameBody::Round { items, progress, .. } = body else { panic!("state frame") };
         let mut answers = Vec::new();
         for item in items {
             match item {
@@ -425,7 +426,7 @@ async fn mismatched_frontier_reuses_exact_bounds_then_refines_and_pages_terminal
                     leaf_pages += 1;
                     answers.push(StateAnswer::Heads(requester.page(bounds)?));
                 }
-                StateItem::Repair { delta, .. } => repairs.push(delta.entity_id),
+                StateItem::Repair(RepairItem::Delta { delta, .. }) => repairs.push(delta.entity_id),
                 StateItem::Heads(_) => {}
                 other => panic!("unexpected frontier comparison item: {other:?}"),
             }
@@ -471,7 +472,7 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
         let transferred = items
             .iter()
             .map(|item| match item {
-                StateItem::Repair { .. } => 1,
+                StateItem::Repair(RepairItem::Delta { .. }) => 1,
                 _ => 0,
             })
             .sum::<usize>();
@@ -484,11 +485,11 @@ async fn small_unknown_empty_and_partial_inventories_complete_in_frame_zero() ->
 #[tokio::test]
 async fn inventories_tile_the_captured_membership_while_current_payloads_are_chunked() -> anyhow::Result<()> {
     let (node, _, _) = node().await?;
-    let mut source = states(5, PAGE_BYTES / 4);
+    let mut source = states(5, MAX_PAGE_BYTES / 4);
     for (index, state) in source.iter_mut().enumerate() {
         state.payload.entity_id = proto::EntityId::from_bytes([index as u8 + 1; 32]);
     }
-    source[2].payload.state.state_buffers = states(1, PAGE_BYTES * 2).pop().unwrap().payload.state.state_buffers;
+    source[2].payload.state.state_buffers = states(1, MAX_PAGE_BYTES * 2).pop().unwrap().payload.state.state_buffers;
     let large = source[2].clone();
     let mut comparison = Comparison::new(stored_snapshot(&node, source.clone()).await?, unknown())?;
     let mut start = super::super::whole().start;
@@ -497,8 +498,8 @@ async fn inventories_tile_the_captured_membership_while_current_payloads_are_chu
     let mut chunks = Vec::new();
     while !comparison.complete {
         let body = comparison.reply(&node, &vec![], false, 0).await?;
-        assert!(bincode::serialized_size(&body)? <= FRAME_BYTES as u64);
-        let StateFrameBody::State { items, .. } = body else { panic!("state frame") };
+        assert!(bincode::serialized_size(&body)? <= MAX_FRAME_BYTES as u64);
+        let StateFrameBody::Round { items, .. } = body else { panic!("state frame") };
         for item in items {
             match item {
                 StateItem::Heads(page) => {
@@ -506,14 +507,14 @@ async fn inventories_tile_the_captured_membership_while_current_payloads_are_chu
                     start = opposite(&page.bounds.end);
                     members.extend(page.heads.to_vec().iter().map(|head| head.entity.entity_id));
                 }
-                StateItem::Repair { target, delta } => {
+                StateItem::Repair(RepairItem::Delta { target, delta }) => {
                     let expected = source.iter().find(|state| state.payload.entity_id == delta.entity_id).unwrap();
                     assert_eq!(target, expected.payload.state.head);
                     let proto::DeltaContent::StateSnapshot { state } = delta.content else { panic!("current snapshot") };
                     assert_eq!(state.state, expected.payload.state);
                     assert!(received.insert(delta.entity_id));
                 }
-                StateItem::RepairChunk { target, chunk } => {
+                StateItem::Repair(RepairItem::Chunk { target, chunk }) => {
                     assert_eq!(chunk.entity_id, large.payload.entity_id);
                     assert_eq!(target, large.payload.state.head);
                     assert_eq!(chunk.offset as usize, chunks.len());
@@ -535,8 +536,10 @@ async fn inventories_tile_the_captured_membership_while_current_payloads_are_chu
     for state in &source {
         assert!(comparison.offered.contains(&target_id(state.payload.entity_id, &state.payload.state.head)));
     }
-    comparison
-        .answer(vec![StateAnswer::NeedRepair { entity_id: source[0].payload.entity_id, target: source[0].payload.state.head.clone() }])?;
+    comparison.answer(vec![StateAnswer::NeedRepair(proto::RepairRequest {
+        entity_id: source[0].payload.entity_id,
+        target: source[0].payload.state.head.clone(),
+    })])?;
     assert!(comparison.pending_repairs.contains(&target_id(source[0].payload.entity_id, &source[0].payload.state.head)));
     Ok(())
 }
@@ -547,10 +550,8 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
     let source = states(1, 10);
     let id = source[0].payload.entity_id;
     let mut comparison = Comparison::new(stored_snapshot(&node, source.clone()).await?, unknown())?;
-    let clock =
-        proto::PackedHeads::from_rows(std::iter::once((&[][..], id, &source[0].payload.state.head))).cursor().next_clock().unwrap().1;
-    comparison.known_clocks.insert(id, clock);
-    let StateFrameBody::State { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state frame") };
+    comparison.known_clocks.insert(id, source[0].payload.state.head.clone());
+    let StateFrameBody::Round { items, progress, .. } = comparison.reply(&node, &vec![], false, 0).await? else { panic!("state frame") };
     assert_eq!(progress, ComparisonProgress::Complete);
     assert!(matches!(items.as_slice(), [StateItem::Heads(page)] if page.heads.to_vec()[0].entity.entity_id == id));
     assert!(comparison.offered.contains(&target_id(id, &source[0].payload.state.head)), "membership still offers its captured target");
@@ -565,9 +566,9 @@ async fn inventory_keeps_a_supplied_clock_for_a_member_that_moved_from_another_r
         .unwrap();
     *node.storage.reject_state_read.lock().unwrap() = Some(id);
     let mut comparison = Comparison::new(stored_snapshot(&node, source).await?, unknown())?;
-    let StateFrameBody::State { items, .. } = comparison.reply(&node, &vec![], true, 0).await? else { panic!("state") };
+    let StateFrameBody::Round { items, .. } = comparison.reply(&node, &vec![], true, 0).await? else { panic!("state") };
     assert!(
-        items.iter().any(|item| matches!(item, StateItem::RepairUnavailable { entity_id, .. } if *entity_id == id)),
+        items.iter().any(|item| matches!(item, StateItem::Repair(RepairItem::Unavailable { entity_id, .. }) if *entity_id == id)),
         "a captured member cannot authorize an out-of-scope current payload"
     );
     let error = target_history(&node, id, &proto::Clock::default(), &vec![], true).await.unwrap_err();
@@ -604,16 +605,43 @@ async fn initial_replay_is_identical_even_while_producer_is_locked_and_retires_a
     assert_eq!(bincode::serialize(&state)?, bincode::serialize(&initial)?);
     assert!(connection.state_streams.replay_initial(&origin, &[12], &[]).is_err());
     drop(guard);
-    continue_state(&node, peer, proto::RequestId::new(), initial.frame.stream, None, 0, None, vec![], vec![]).await?;
-    assert!(matches!(
-        connection.state_streams.replay_initial(&origin, &[11], &[])?,
-        Some(proto::NodeResponseBody::StateStreamUnavailable { .. })
-    ));
+    apply_state_feedback(&node, peer, proto::RequestId::new(), initial.frame.stream, 0, None, None, vec![]).await?;
+    assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
     abandon_state_stream(&node, peer, initial.frame.stream).await;
-    assert!(matches!(
-        connection.state_streams.replay_initial(&origin, &[11], &[])?,
-        Some(proto::NodeResponseBody::StateStreamUnavailable { .. })
-    ));
+    assert!(matches!(connection.state_streams.replay_initial(&origin, &[11], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn feedback_answers_beyond_one_page_of_work_are_refused() -> anyhow::Result<()> {
+    let (node, peer, _) = node().await?;
+    let initial =
+        start_state_stream(&node, peer, proto::RequestId::new(), vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown())
+            .await?;
+    let target = |tips: u32| {
+        proto::Clock::new(
+            (0..tips)
+                .map(|n| {
+                    let mut id = [0; 32];
+                    id[..4].copy_from_slice(&n.to_be_bytes());
+                    (1, proto::EventId::from_bytes(id))
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    // 128 requests for 13-tip targets fill one page of work exactly; one larger target exceeds it.
+    let mut answers = Vec::new();
+    for n in 0..MAX_FEEDBACK_ANSWERS {
+        let target = target(if n == 0 { 14 } else { 13 })?;
+        answers.push(StateAnswer::NeedRepair(proto::RepairRequest { entity_id: proto::EntityId::from_bytes([n as u8; 32]), target }));
+    }
+    let answers = proto::FeedbackAnswers::Round { round: 0, answers };
+    assert!(answers.work_bytes()? > MAX_PAGE_BYTES as u64);
+    assert!(bincode::serialized_size(&answers)? + 64 < MAX_FRAME_BYTES as u64, "the whole feedback fits one frame");
+    let error = apply_state_feedback(&node, peer, proto::RequestId::new(), initial.frame.stream, 0, None, Some(answers), vec![])
+        .await
+        .expect_err("answers beyond one page of work");
+    assert!(error.to_string().contains("work limit"), "{error}");
     Ok(())
 }
 
@@ -625,29 +653,31 @@ async fn cumulative_receipts_are_idempotent_and_cannot_grant_unsent_credit() -> 
             .await?;
     let id = initial.frame.stream;
     let request = proto::RequestId::new();
-    continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
-    continue_state(&node, peer, request.clone(), id, None, 0, None, vec![], vec![]).await?;
-    assert!(continue_state(&node, peer, request, id, None, 1, None, vec![], vec![]).await.is_err());
-    assert!(continue_state(&node, peer, proto::RequestId::new(), id, None, 1, None, vec![], vec![]).await.is_err());
+    apply_state_feedback(&node, peer, request.clone(), id, 0, None, None, vec![]).await?;
+    apply_state_feedback(&node, peer, request.clone(), id, 0, None, None, vec![]).await?;
+    assert!(apply_state_feedback(&node, peer, request, id, 1, None, None, vec![]).await.is_err());
+    assert!(apply_state_feedback(&node, peer, proto::RequestId::new(), id, 1, None, None, vec![]).await.is_err());
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: 0 }, vec![]).await?;
     assert!(matches!(
-        continue_state(&node, peer, proto::RequestId::new(), id, None, 0, None, vec![], vec![]).await?,
+        apply_state_feedback(&node, peer, proto::RequestId::new(), id, 0, None, None, vec![]).await?,
         proto::NodeResponseBody::Success
     ));
     assert!(matches!(
-        continue_state(
+        apply_state_feedback(
             &node,
             peer,
             proto::RequestId::new(),
             id,
-            Some(0),
             0,
             None,
-            vec![StateAnswer::Heads(proto::TreeSpanInventory { bounds: super::super::whole(), heads: vec![].into() })],
+            Some(proto::FeedbackAnswers::Round {
+                round: 0,
+                answers: vec![StateAnswer::Heads(proto::TreeSpanInventory { bounds: super::super::whole(), heads: Default::default() })]
+            }),
             vec![]
         )
         .await?,
-        proto::NodeResponseBody::StateStreamUnavailable { .. }
+        proto::NodeResponseBody::StateStreamUnavailable
     ));
     Ok(())
 }
@@ -664,7 +694,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         None,
         false,
         0,
-        stored_snapshot(&node, states(200, PAGE_BYTES / 2)).await?,
+        stored_snapshot(&node, states(200, MAX_PAGE_BYTES / 2)).await?,
         unknown(),
     )
     .await?;
@@ -674,7 +704,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
     {
         let state = session.state.lock().await;
         assert!(state.bytes <= WINDOW_BYTES);
-        assert!(state.retained.len() <= MAX_INFLIGHT_FRAMES - 2);
+        assert!(state.retained.len() <= MAX_FRAMES_IN_FLIGHT - 2);
         assert!(!state.room(false));
         assert!(state.room(true), "ordinary output must leave a control/repair reserve");
         assert!(!state.comparison.as_ref().unwrap().complete);
@@ -687,7 +717,7 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         if done {
             break;
         }
-        continue_state(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
+        apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, None, None, vec![]).await?;
         pump_state_stream(&node, peer, id).await?;
     }
     let sequences = messages
@@ -695,15 +725,11 @@ async fn cold_producer_stops_at_window_and_resumes_with_contiguous_frames() -> a
         .unwrap()
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. })
-                if frame.stream == id =>
-            {
-                Some(frame.sequence)
-            }
+            proto::NodeMessage::StateFrame { frame, .. } if frame.stream == id => Some(frame.sequence),
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert!(sequences.len() > MAX_INFLIGHT_FRAMES);
+    assert!(sequences.len() > MAX_FRAMES_IN_FLIGHT);
     assert!(sequences.iter().copied().eq(1..=sequences.len() as u64));
     Ok(())
 }
@@ -713,7 +739,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
     let (node, peer, _) = node().await?;
     let first = proto::RequestId::new();
     let mut first_id = None;
-    for index in 0..MAX_STATE_STREAMS + 2 {
+    for index in 0..MAX_OPEN_STREAMS + 2 {
         let request = if index == 0 { first.clone() } else { proto::RequestId::new() };
         let initial = start_state_stream(&node, peer, request, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await?;
         first_id.get_or_insert(initial.frame.stream);
@@ -721,9 +747,7 @@ async fn evicted_initial_replay_details_never_allow_the_origin_to_create_a_secon
             .await?;
     }
     let connection = node.peer_connections.get(&peer).unwrap();
-    assert!(
-        matches!(connection.state_streams.replay_initial(&first, &[], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable { stream: comparison }) if Some(comparison) == first_id)
-    );
+    assert!(matches!(connection.state_streams.replay_initial(&first, &[], &[])?, Some(proto::NodeResponseBody::StateStreamUnavailable)));
     assert!(start_state_stream(&node, peer, first, vec![], vec![], None, false, 0, snapshot(vec![]).await?, unknown()).await.is_err());
     Ok(())
 }
@@ -748,7 +772,7 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
     let id = initial.frame.stream;
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
-    let oversized = live_item(PAGE_BYTES * 2);
+    let oversized = live_item(MAX_PAGE_BYTES * 2);
     let entity = oversized.entity_id;
     let member = oversized.member.clone();
     let encoded = bincode::serialize(oversized.delta.as_ref().unwrap())?;
@@ -757,8 +781,7 @@ async fn live_before_applied_uses_the_same_sequence_and_typed_chunks() -> anyhow
     let mut assembled = Vec::new();
     let mut live_seen = false;
     for message in messages.lock().unwrap().iter() {
-        let proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { request_id, frame }, .. }) = message
-        else {
+        let proto::NodeMessage::StateFrame { request_id, frame, .. } = message else {
             continue;
         };
         assert_eq!(request_id, &origin);
@@ -814,7 +837,7 @@ async fn pending_round_marker_waits_for_the_whole_chunked_publication() -> anyho
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     // Drive the pump explicitly, including the cut between chunk fragments.
     session.pumping.store(true, Ordering::Release);
-    queue_live(&node, peer, id, 1, vec![live_item(PAGE_BYTES * 2), live_item(1)])?;
+    queue_live(&node, peer, id, 1, vec![live_item(MAX_PAGE_BYTES * 2), live_item(1)])?;
     {
         let mut state = session.state.lock().await;
         let body = state.next_live(&session.live)?.unwrap();
@@ -878,14 +901,10 @@ async fn waiting_baseline_questions_do_not_starve_live_publications() -> anyhow:
         .unwrap()
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate {
-                body:
-                    proto::NodeUpdateBody::StateFrame {
-                        frame: StateFrame { body: StateFrameBody::Live { revision, complete: true, .. }, .. },
-                        ..
-                    },
+            proto::NodeMessage::StateFrame {
+                frame: StateFrame { body: StateFrameBody::Live { revision, complete: true, .. }, .. },
                 ..
-            }) => Some(*revision),
+            } => Some(*revision),
             _ => None,
         })
         .collect::<Vec<_>>();
@@ -905,7 +924,7 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
         Some((proto::QueryId::new(), 1)),
         false,
         0,
-        stored_snapshot(&node, states(200, PAGE_BYTES / 2)).await?,
+        stored_snapshot(&node, states(200, MAX_PAGE_BYTES / 2)).await?,
         unknown(),
     )
     .await?;
@@ -920,17 +939,15 @@ async fn runnable_baseline_and_live_backlog_both_advance_before_the_window_fills
     let bodies = messages
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                Some(&frame.body)
-            }
+            proto::NodeMessage::StateFrame { frame, .. } => Some(&frame.body),
             _ => None,
         })
         .collect::<Vec<_>>();
     let first_live = bodies.iter().position(|body| matches!(body, StateFrameBody::Live { .. })).unwrap();
     let last_live = bodies.iter().rposition(|body| matches!(body, StateFrameBody::Live { .. })).unwrap();
-    assert!(bodies[..first_live].iter().any(|body| matches!(body, StateFrameBody::State { .. })));
+    assert!(bodies[..first_live].iter().any(|body| matches!(body, StateFrameBody::Round { .. })));
     assert!(
-        bodies[first_live + 1..last_live].iter().any(|body| matches!(body, StateFrameBody::State { .. })),
+        bodies[first_live + 1..last_live].iter().any(|body| matches!(body, StateFrameBody::Round { .. })),
         "a live backlog cannot starve baseline work"
     );
     let live_count = bodies.iter().filter(|body| matches!(body, StateFrameBody::Live { .. })).count();
@@ -1025,9 +1042,7 @@ async fn cancelled_round_retires_fetch_but_keeps_live_stream_until_abandoned() -
         pump_state_stream(&node, peer, id).await?;
         assert!(
             messages.lock().unwrap().iter().any(|message| matches!(message,
-                proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame {
-                    frame: StateFrame { stream: comparison, body: StateFrameBody::Live { revision: 1, complete: true, .. }, .. }, ..
-                }, .. }) if *comparison == id
+                proto::NodeMessage::StateFrame { frame: StateFrame { stream: comparison, body: StateFrameBody::Live { revision: 1, complete: true, .. }, .. }, .. } if *comparison == id
             )),
             "a cancelled comparison must not stop live delivery"
         );
@@ -1088,10 +1103,20 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert!(comparison.pending_repairs.is_empty());
         (comparison.snapshot.members(), comparison.offered.clone())
     };
-    for answers in [vec![], vec![StateAnswer::NeedRepair { entity_id: old.entity_id, target: old.head.clone() }]] {
+    for answers in [vec![], vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: old.entity_id, target: old.head.clone() })]] {
         assert!(
             matches!(
-                continue_state(&node, peer, proto::RequestId::new(), id, Some(0), 0, None, answers, vec![]).await?,
+                apply_state_feedback(
+                    &node,
+                    peer,
+                    proto::RequestId::new(),
+                    id,
+                    0,
+                    None,
+                    Some(proto::FeedbackAnswers::Round { round: 0, answers }),
+                    vec![]
+                )
+                .await?,
                 proto::NodeResponseBody::Success
             ),
             "late round-zero feedback must be harmless after a newer live decision covered its target"
@@ -1103,8 +1128,27 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert_eq!(comparison.offered, targets);
         assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
     }
+    // A retired round's answers are dropped, but only after their structure is checked.
+    let unordered = [2, 1].map(|n| proto::KeyedEntityHead {
+        key: vec![],
+        entity: proto::EntityHead { entity_id: proto::EntityId::from_bytes([n; 32]), head: old.head.clone() },
+    });
+    let page = proto::TreeSpanInventory { bounds: TreeSpan::all(), heads: unordered.to_vec().try_into()? };
+    let malformed = Some(proto::FeedbackAnswers::Round { round: 0, answers: vec![StateAnswer::Heads(page)] });
+    assert!(apply_state_feedback(&node, peer, proto::RequestId::new(), id, 0, None, malformed, vec![]).await.is_err());
     assert!(
-        continue_state(&node, peer, proto::RequestId::new(), id, Some(2), 0, None, vec![], vec![]).await.is_err(),
+        apply_state_feedback(
+            &node,
+            peer,
+            proto::RequestId::new(),
+            id,
+            0,
+            None,
+            Some(proto::FeedbackAnswers::Round { round: 2, answers: vec![] }),
+            vec![]
+        )
+        .await
+        .is_err(),
         "future-round feedback is invalid"
     );
     let last = session.state.lock().await.required_through;
@@ -1165,21 +1209,21 @@ async fn frame_receipts_and_round_applied_do_not_release_live_repair_targets() -
         assert_eq!(state.live_targets.len(), 2);
     }
     let last = session.state.lock().await.last_sent;
-    continue_state(&node, peer, proto::RequestId::new(), id, None, last, None, vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, None, None, vec![]).await?;
     finish_state_round(&node, peer, id, 0, proto::StateRoundOutcome::Applied { processed_through: last }, vec![]).await?;
     {
         let mut state = session.state.lock().await;
         assert_eq!(state.live_targets.len(), 2);
-        state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: first.entity_id, target: first.member.unwrap().head }])?;
+        state.request_live_repairs(vec![proto::RepairRequest { entity_id: first.entity_id, target: first.member.unwrap().head }])?;
         assert_eq!(state.live_repairs.len(), 1, "receipt alone must leave repair admissible");
     }
-    continue_state(&node, peer, proto::RequestId::new(), id, None, last, Some(1), vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, Some(1), None, vec![]).await?;
     {
         let state = session.state.lock().await;
         assert_eq!(state.live_targets.len(), 1);
         assert_eq!(state.live_targets.front().unwrap().revision, 3);
     }
-    continue_state(&node, peer, proto::RequestId::new(), id, None, last, Some(3), vec![], vec![]).await?;
+    apply_state_feedback(&node, peer, proto::RequestId::new(), id, last, Some(3), None, vec![]).await?;
     let state = session.state.lock().await;
     assert!(state.live_targets.is_empty());
     assert_eq!(state.target_bytes, 0);
@@ -1285,27 +1329,24 @@ async fn live_bridge_repair_uses_reserved_credit_when_ordinary_output_is_full() 
                 StateFrame {
                     stream: id,
                     sequence,
-                    body: StateFrameBody::State { round: 0, items: vec![], progress: ComparisonProgress::Continue },
+                    body: StateFrameBody::Round { round: 0, items: vec![], progress: ComparisonProgress::Continue },
                 },
                 false,
             )?;
         }
         assert!(state.room(true));
-        state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: genesis.entity_id, target: target.clone() }])?;
+        state.request_live_repairs(vec![proto::RepairRequest { entity_id: genesis.entity_id, target: target.clone() }])?;
     }
     pump_state_stream(&node, peer, id).await?;
     let frames = messages.lock().unwrap();
     let repair = frames
         .iter()
         .find_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate {
-                body: proto::NodeUpdateBody::StateFrame { frame: StateFrame { body: StateFrameBody::LiveRepair { items }, .. }, .. },
-                ..
-            }) => Some(items),
+            proto::NodeMessage::StateFrame { frame: StateFrame { body: StateFrameBody::LiveRepair { items }, .. }, .. } => Some(items),
             _ => None,
         })
         .expect("causal repair must use the reserved lane without ordinary frame credit");
-    let [StateItem::Repair { target: received, delta }] = repair.as_slice() else { panic!("connecting event repair") };
+    let [RepairItem::Delta { target: received, delta }] = repair.as_slice() else { panic!("connecting event repair") };
     assert_eq!(received, &target);
     assert_eq!(delta.entity_id, genesis.entity_id);
     let proto::DeltaContent::EventBridge { events } = &delta.content else { panic!("event bridge") };
@@ -1371,15 +1412,17 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
     session.pumping.store(true, Ordering::Release);
     let entity = &source[0].payload;
-    continue_state(
+    apply_state_feedback(
         &node,
         peer,
         proto::RequestId::new(),
         id,
-        Some(0),
         0,
         None,
-        vec![StateAnswer::NeedRepair { entity_id: entity.entity_id, target: entity.state.head.clone() }],
+        Some(proto::FeedbackAnswers::Round {
+            round: 0,
+            answers: vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: entity.entity_id, target: entity.state.head.clone() })],
+        }),
         vec![],
     )
     .await?;
@@ -1387,7 +1430,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let last = {
         let state = session.state.lock().await;
         let frame = &state.retained.back().unwrap().frame;
-        assert!(state_items(frame).0.iter().any(|item| matches!(item, StateItem::RepairUnavailable { .. })));
+        assert!(state_items(frame).0.iter().any(|item| matches!(item, StateItem::Repair(RepairItem::Unavailable { .. }))));
         assert_eq!(state.required_through, 0, "late repair must not move the finite enumeration boundary");
         assert!(state.last_sent > 0);
         state.last_sent
@@ -1407,15 +1450,17 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let offer = empty.offer().await?;
     schedule_round(&node, peer, id, 1, 1, empty, offer).await?;
     pump_state_stream(&node, peer, id).await?;
-    continue_state(
+    apply_state_feedback(
         &node,
         peer,
         proto::RequestId::new(),
         id,
-        Some(0),
         last,
         None,
-        vec![StateAnswer::NeedRepair { entity_id: entity.entity_id, target: entity.state.head.clone() }],
+        Some(proto::FeedbackAnswers::Round {
+            round: 0,
+            answers: vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: entity.entity_id, target: entity.state.head.clone() })],
+        }),
         vec![],
     )
     .await?;
@@ -1470,15 +1515,17 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
         unknown(),
     )
     .await?;
-    continue_state(
+    apply_state_feedback(
         &node,
         peer,
         proto::RequestId::new(),
         initial.frame.stream,
-        Some(0),
         0,
         None,
-        vec![StateAnswer::NeedRepair { entity_id: genesis.entity_id, target }],
+        Some(proto::FeedbackAnswers::Round {
+            round: 0,
+            answers: vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: genesis.entity_id, target })],
+        }),
         vec![],
     )
     .await?;
@@ -1486,7 +1533,7 @@ async fn target_history_supplies_both_concurrent_branches_parent_first() -> anyh
     let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&initial.frame.stream).unwrap();
     let state = session.state.lock().await;
     let items = state_items(&state.retained.back().unwrap().frame).0;
-    let StateItem::Repair { delta, .. } = &items[0] else { panic!("history repair") };
+    let StateItem::Repair(RepairItem::Delta { delta, .. }) = &items[0] else { panic!("history repair") };
     let proto::DeltaContent::EventBridge { events } = &delta.content else { panic!("must not resend snapshot") };
     assert_eq!(events.len(), 3);
     assert!(events[0].parent.is_empty());
@@ -1520,16 +1567,13 @@ async fn live_queue_exhaustion_sends_restart_without_emitting_partial_live_outpu
     assert!(queue_live(&node, peer, id, 1, vec![item; MAX_LIVE_ITEMS + 1]).is_err());
     expire_state_stream(&node, peer, id).await?;
     let messages = messages.lock().unwrap();
-    assert!(messages.iter().any(|message| matches!(message, proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame: StateFrame { stream: comparison, body: StateFrameBody::RestartRequired, .. }, .. }, .. }) if *comparison == id)));
+    assert!(messages.iter().any(|message| matches!(message, proto::NodeMessage::StateFrame { frame: StateFrame { stream: comparison, body: StateFrameBody::RestartRequired, .. }, .. } if *comparison == id)));
     assert!(!messages.iter().any(|message| matches!(
         message,
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            body: proto::NodeUpdateBody::StateFrame {
-                frame: StateFrame { body: StateFrameBody::Live { .. } | StateFrameBody::LiveChunk { .. }, .. },
-                ..
-            },
+        proto::NodeMessage::StateFrame {
+            frame: StateFrame { body: StateFrameBody::Live { .. } | StateFrameBody::LiveChunk { .. }, .. },
             ..
-        })
+        }
     )));
     drop(messages);
     abandon_state_stream(&node, peer, id).await;
@@ -1556,13 +1600,7 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
         )
         .await?;
         let id = initial.frame.stream;
-        let receipt = || proto::NodeRequestBody::ContinueState {
-            stream: id,
-            round: None,
-            applied_through: None,
-            processed_through: 0,
-            answers: vec![],
-        };
+        let receipt = || proto::NodeRequestBody::StateFeedback { stream: id, applied_through: None, processed_through: 0, answers: None };
         assert_eq!(state_stream_bypasses_policy(&node, peer, &receipt(), false), catalog);
         let session = node.peer_connections.get(&peer).unwrap().state_streams.get(&id).unwrap();
         assert!(session.permits(&credentials));
@@ -1591,16 +1629,15 @@ async fn retired_controls_preserve_credential_checks_and_catalog_bypass() -> any
                 .unwrap();
             assert_eq!(matches!(response, proto::NodeResponseBody::Success), succeeds);
             if !succeeds {
-                assert!(matches!(response, proto::NodeResponseBody::StateStreamUnavailable { stream: comparison } if *comparison == id));
+                assert!(matches!(response, proto::NodeResponseBody::StateStreamUnavailable));
             }
         }
     }
-    let unknown = proto::NodeRequestBody::ContinueState {
+    let unknown = proto::NodeRequestBody::StateFeedback {
         stream: proto::StateStreamId::new(),
-        round: None,
         applied_through: None,
         processed_through: 0,
-        answers: vec![],
+        answers: None,
     };
     assert!(!state_stream_bypasses_policy(&node, peer, &unknown, false), "unknown controls must pass through policy");
     Ok(())
@@ -1621,9 +1658,9 @@ async fn initial_items(node: &TestNode, comparison: &mut Comparison) -> anyhow::
         if comparison.complete {
             return Ok(all);
         }
-        let StateFrameBody::State { items, .. } = comparison.reply(node, &vec![], false, 0).await? else { panic!("state") };
+        let StateFrameBody::Round { items, .. } = comparison.reply(node, &vec![], false, 0).await? else { panic!("state") };
         assert!(comparison.work.len() <= 4096);
-        assert!(bincode::serialized_size(&items)? <= PAGE_BYTES as u64);
+        assert!(bincode::serialized_size(&items)? <= MAX_PAGE_BYTES as u64);
         assert!(!items.iter().any(|item| matches!(item, StateItem::NeedHeads(_) | StateItem::Digest(_))));
         all.extend(items);
     }
@@ -1651,7 +1688,7 @@ async fn complete_initial_inventory_retains_equal_points_and_repairs_only_change
     let mut comparison = Comparison::new(stored_snapshot(&node, after.clone()).await?, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
     assert!(
-        matches!(items.as_slice(), [StateItem::Heads(page), StateItem::Repair { target, delta }] if page.heads.to_vec()[0].entity.head == after[17].payload.state.head && delta.entity_id == after[17].payload.entity_id && *target == after[17].payload.state.head)
+        matches!(items.as_slice(), [StateItem::Heads(page), StateItem::Repair(RepairItem::Delta { target, delta })] if page.heads.to_vec()[0].entity.head == after[17].payload.state.head && delta.entity_id == after[17].payload.entity_id && *target == after[17].payload.state.head)
     );
     Ok(())
 }
@@ -1711,7 +1748,7 @@ async fn captured_membership_and_current_payload_keep_both_targets_across_moves_
         *node.storage.reject_state_read.lock().unwrap() = Some(id);
         let mut comparison = Comparison::new(snapshot, proto::KnownState { spec: spec.clone(), spans: vec![] })?;
         let items = initial_items(&node, &mut comparison).await?;
-        let [StateItem::Heads(page), StateItem::Repair { target, delta }] = items.as_slice() else {
+        let [StateItem::Heads(page), StateItem::Repair(RepairItem::Delta { target, delta })] = items.as_slice() else {
             panic!("metadata plus current data: {items:?}")
         };
         let head = &page.heads.to_vec()[0];
@@ -1724,13 +1761,14 @@ async fn captured_membership_and_current_payload_keep_both_targets_across_moves_
         let new_key = target_id(id, &current.payload.state.head);
         assert!(comparison.offered.contains(&old_key) && comparison.offered.contains(&new_key));
         comparison.answer(vec![
-            StateAnswer::NeedRepair { entity_id: id, target: captured.payload.state.head.clone() },
-            StateAnswer::NeedRepair { entity_id: id, target: current.payload.state.head.clone() },
+            StateAnswer::NeedRepair(proto::RepairRequest { entity_id: id, target: captured.payload.state.head.clone() }),
+            StateAnswer::NeedRepair(proto::RepairRequest { entity_id: id, target: current.payload.state.head.clone() }),
         ])?;
         assert_eq!(comparison.pending_repairs.len(), 2, "the current payload does not retire the captured head's proof obligation");
         assert_eq!(comparison.repair_attempts[&old_key], 1);
         assert_eq!(comparison.repair_attempts[&new_key], 1);
-        comparison.answer(vec![StateAnswer::NeedRepair { entity_id: id, target: captured.payload.state.head.clone() }])?;
+        comparison
+            .answer(vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: id, target: captured.payload.state.head.clone() })])?;
         assert_eq!(comparison.repair_attempts[&old_key], 1, "pending retries are idempotent for this exact target");
     }
     Ok(())
@@ -1748,7 +1786,9 @@ async fn changed_head_at_the_same_key_sends_captured_metadata_before_newer_paylo
     node.storage.set_state(current.clone());
     let mut comparison = Comparison::new(snapshot, requester.offer().await?)?;
     let items = initial_items(&node, &mut comparison).await?;
-    let [StateItem::Heads(page), StateItem::Repair { target, .. }] = items.as_slice() else { panic!("metadata and repair") };
+    let [StateItem::Heads(page), StateItem::Repair(RepairItem::Delta { target, .. })] = items.as_slice() else {
+        panic!("metadata and repair")
+    };
     assert_eq!(page.heads.to_vec()[0].entity.head, captured.payload.state.head);
     assert_eq!(target, &current.payload.state.head);
     assert_ne!(page.heads.to_vec()[0].entity.head, *target);
@@ -1801,7 +1841,7 @@ async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs
                     members.insert(leaf_address(&leaf.key, leaf.entity.entity_id), leaf.entity.entity_id);
                 }
             }
-            StateItem::Repair { target, delta } => {
+            StateItem::Repair(RepairItem::Delta { target, delta }) => {
                 assert!(repairs.insert(delta.entity_id, target).is_none());
             }
             other => panic!("unexpected diff item: {other:?}"),
@@ -1829,7 +1869,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     let items = initial_items(&node, &mut comparison).await?;
     let mut incoming = HashSet::new();
     for item in items {
-        if let StateItem::Repair { delta, .. } = item {
+        if let StateItem::Repair(RepairItem::Delta { delta, .. }) = item {
             incoming.insert(delta.entity_id);
         }
     }
@@ -1846,7 +1886,7 @@ async fn initial_diff_pages_many_entrants_and_coalesces_dense_removals() -> anyh
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 16);
     assert_eq!(
-        items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(),
+        items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(),
         2048,
         "coalescing must preserve every actual former clock repair"
     );
@@ -1873,10 +1913,10 @@ async fn one_initial_inventory_expands_one_bounded_batch_at_a_time() -> anyhow::
     // the rest of the single request inventory remains deferred.
     assert!(comparison.work.len() <= 385 + 1);
     assert!(comparison.work.iter().any(|work| matches!(work,
-        Work::InitialHeads(rest) if rest.heads.len() == 2048 - HEAD_PAGE)));
+        Work::InitialHeads(rest) if rest.heads.len() == 2048 - MAX_PAGE_HEADS)));
     let items = initial_items(&node, &mut comparison).await?;
     assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Heads(page) if page.heads.is_empty())).count(), 2048);
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 2048);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), 2048);
     Ok(())
 }
 
@@ -1893,7 +1933,7 @@ async fn prefix_encoded_initial_inventory_keeps_its_cursor_across_work_batches()
         assert_eq!(page.bounds.start, start);
         assert_eq!(page.heads.len(), remaining);
         comparison.expand_initial_heads(page)?;
-        remaining -= HEAD_PAGE;
+        remaining -= MAX_PAGE_HEADS;
         if remaining > 0 {
             let Some(Work::InitialHeads(next)) = comparison.work.front() else { panic!("only the deferred equal batch remains") };
             assert_ne!(next.bounds.start, start);
@@ -1930,11 +1970,11 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let items = initial_items(&node, &mut exact).await?;
     assert!(exact.complete);
     assert!(
-        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair { .. })),
+        items.iter().all(|item| matches!(item, StateItem::Heads(_) | StateItem::Repair(RepairItem::Delta { .. }))),
         "unknown gaps require both membership and current state"
     );
     assert_eq!(items.iter().map(|item| if let StateItem::Heads(page) = item { page.heads.len() } else { 0 }).sum::<usize>(), 2047);
-    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair { .. })).count(), 2047);
+    assert_eq!(items.iter().filter(|item| matches!(item, StateItem::Repair(RepairItem::Delta { .. }))).count(), 2047);
     known.spans.push(known.spans[0].clone());
     assert!(
         Comparison::new(stored_snapshot(&node, before.clone()).await?, known).is_err(),
@@ -1949,7 +1989,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
     let mut rows = second.heads.to_vec();
     rows[0].key = key;
     let addr = leaf_address(&rows[0].key, rows[0].entity.entity_id);
-    second.heads = rows.into();
+    second.heads = rows.try_into().unwrap();
     first.bounds.end = std::ops::Bound::Excluded(addr.clone());
     second.bounds.start = std::ops::Bound::Included(addr);
     duplicate.spans.push(proto::SpanContent::Heads(second));
@@ -1967,7 +2007,7 @@ async fn initial_inventory_limits_and_exact_point_bounds_are_validated() -> anyh
             key: vec![],
             entity: proto::EntityHead { entity_id: last.payload.entity_id, head: last.payload.state.head },
         }]
-        .into(),
+        .try_into()?,
     }));
     assert!(Comparison::new(stored_snapshot(&node, before).await?, oversized).is_err(), "total leaf cap spans all pages");
     Ok(())
@@ -1983,12 +2023,13 @@ async fn compressed_initial_spans_share_one_uncompressed_work_budget() -> anyhow
                 entity: proto::EntityHead { entity_id: proto::EntityId::from_bytes([n; 32]), head: proto::Clock::default() },
             })
             .collect::<Vec<_>>()
-            .into(),
+            .try_into()
+            .unwrap(),
     };
     let known = proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Heads(page); 8] };
-    assert!(bincode::serialized_size(&known)? < INITIAL_INVENTORY_BYTES as u64);
+    assert!(bincode::serialized_size(&known)? < MAX_OFFER_BYTES as u64);
     let error = Comparison::new(snapshot(vec![]).await?, known).err().expect("aggregate work must be rejected before span validation");
-    assert!(error.to_string().contains("initial inventory exceeds limit"));
+    assert!(error.to_string().contains("work limit"), "{error}");
     Ok(())
 }
 
@@ -2013,14 +2054,14 @@ async fn valid_long_key_inventory_falls_back_before_split_bounds_exceed_a_frame(
     let mut requester = super::super::QueryTree::default().refresh(spec.clone(), vec![before]).await?;
     let known = requester.offer().await?;
     let [proto::SpanContent::Heads(page)] = known.spans.as_slice() else { panic!("one valid complete initial inventory") };
-    assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+    assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64);
     let supplied_clock = page.heads.to_vec()[0].entity.head.clone();
     let address = leaf_address(&page.heads.to_vec()[0].key, page.heads.to_vec()[0].entity.entity_id);
     let removal = StateItem::Heads(proto::TreeSpanInventory {
         bounds: TreeSpan::new(std::ops::Bound::Included(address.clone()), std::ops::Bound::Included(address)),
-        heads: vec![].into(),
+        heads: Default::default(),
     });
-    assert!(bincode::serialized_size(&removal)? > PAGE_BYTES as u64);
+    assert!(bincode::serialized_size(&removal)? > MAX_PAGE_BYTES as u64);
     let (node, _, _) = node().await?;
     let mut tx = node.storage.transaction();
     tx.set_state(&Default::default(), &former).await?;
@@ -2069,7 +2110,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
     let mut spans = Vec::new();
     loop {
         let page = requester.page(remaining)?;
-        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= PAGE_BYTES as u64);
+        assert!(bincode::serialized_size(&StateAnswer::Heads(page.clone()))? <= MAX_PAGE_BYTES as u64);
         let end = page.bounds.end.clone();
         spans.push(proto::SpanContent::Heads(page));
         if end == super::super::whole().end {
@@ -2079,7 +2120,7 @@ async fn total_initial_bytes_are_checked_before_any_page_is_processed() -> anyho
         remaining = super::super::whole().after(&last);
     }
     let known = proto::KnownState { spec: spec(), spans };
-    assert!(bincode::serialized_size(&known)? > INITIAL_INVENTORY_BYTES as u64);
+    assert!(bincode::serialized_size(&known)? > MAX_OFFER_BYTES as u64);
     assert!(Comparison::new(snapshot(vec![]).await?, known).is_err());
     Ok(())
 }
@@ -2136,11 +2177,11 @@ async fn shared_live_target_survives_until_every_offering_publication_is_applied
     state.acknowledge(2)?;
     state.acknowledge_live(1)?;
     assert_eq!(state.live_target_index.get(key.as_slice()).unwrap().publications, 1);
-    state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: item.entity_id, target: head.clone() }])?;
+    state.request_live_repairs(vec![proto::RepairRequest { entity_id: item.entity_id, target: head.clone() }])?;
     state.acknowledge_live(2)?;
     assert!(state.live_target_index.is_empty() && state.live_targets.is_empty());
     assert_eq!(state.target_bytes, 0);
-    assert!(state.request_live_repairs(vec![StateAnswer::NeedRepair { entity_id: item.entity_id, target: head }]).is_err());
+    assert!(state.request_live_repairs(vec![proto::RepairRequest { entity_id: item.entity_id, target: head }]).is_err());
     Ok(())
 }
 
@@ -2199,18 +2240,15 @@ async fn registered_stream_queues_live_changes_before_initial_frame_is_ready() -
     let initial = pending.initialize(&node).await?;
     assert_eq!(initial.frame.sequence, 0);
     assert_eq!(initial.round.revision, 10);
-    assert!(matches!(initial.frame.body, StateFrameBody::State { progress: ComparisonProgress::Complete, .. }));
+    assert!(matches!(initial.frame.body, StateFrameBody::Round { progress: ComparisonProgress::Complete, .. }));
     session.pumping.store(true, Ordering::Release);
     pump_state_stream(&node, peer, id).await?;
     assert!(messages.lock().unwrap().iter().any(|message| matches!(
         message,
-        proto::NodeMessage::Update(proto::NodeUpdate {
-            body: proto::NodeUpdateBody::StateFrame {
-                frame: StateFrame { sequence: 1, body: StateFrameBody::Live { revision: 11, complete: true, .. }, .. },
-                ..
-            },
+        proto::NodeMessage::StateFrame {
+            frame: StateFrame { sequence: 1, body: StateFrameBody::Live { revision: 11, complete: true, .. }, .. },
             ..
-        })
+        }
     )));
     Ok(())
 }
@@ -2273,9 +2311,7 @@ async fn refresh_cut_is_queued_without_waiting_for_stream_io_and_blocks_later_li
     let bodies: Vec<_> = messages
         .iter()
         .filter_map(|message| match message {
-            proto::NodeMessage::Update(proto::NodeUpdate { body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. }) => {
-                Some(&frame.body)
-            }
+            proto::NodeMessage::StateFrame { frame, .. } => Some(&frame.body),
             _ => None,
         })
         .collect();

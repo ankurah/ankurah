@@ -420,7 +420,7 @@ async fn invalidation_reaches_another_peer_while_first_initial_reply_waits_for_h
     tokio::time::timeout(std::time::Duration::from_secs(3), async {
         loop {
             if messages.lock().unwrap().iter().any(|message| matches!(message,
-                proto::NodeMessage::Update(proto::NodeUpdate { to, body: proto::NodeUpdateBody::StateFrame { frame, .. }, .. })
+                proto::NodeMessage::StateFrame { to, frame, .. }
                     if *to == healthy_peer && frame.stream == state.frame.stream && matches!(frame.body, proto::StateFrameBody::RestartRequired)
             )) { break; }
             tokio::task::yield_now().await;

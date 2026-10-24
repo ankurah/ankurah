@@ -38,46 +38,44 @@ the [Event Retrieval and Staging](retrieval.md) document.
 
 ## The Replication Protocol
 
-Data moves between nodes through two mechanisms: **streaming updates** (pushed)
-and **request/response deltas** (pulled). Both carry entity state and/or events,
-but they serve different moments in the lifecycle.
+Query results move between nodes over **state streams**, which the
+`ankurah_proto::state_sync` module documents in full. Commits travel
+separately, as described under [Commit Paths](#commit-paths).
 
-### Streaming updates (`UpdateContent`)
+### Comparison rounds
 
-Once an ephemeral node has an active subscription with a durable peer, the
-durable node pushes changes as they happen. An update item carries either the
-events alone (`EventOnly`, when the sender expects the receiver to already
-have the state) or the new entity state plus the events that produced it
-(`StateAndEvent`). `EventOnly` is a valid wire format handled by the
-receiver, though current senders always include state. On the receiving side
-the node validates the state, integrates the events via
-[`apply_events`](entity-lifecycle.md#how-events-are-applied), and persists the
-result. If the incoming state diverges from what the receiver already has,
-the receiver falls back to batch `apply_events` with
-[BFS comparison](event-dag.md#comparing-two-clocks).
+A Fetch or SubscribeQuery carries a `KnownState`: the requester's account of the
+query result it already holds, as digests of key ranges or as the head of every
+entity in a range. The durable peer compares it with a snapshot of its own result
+and sends what differs: questions that narrow the ranges whose digests disagree,
+inventories of its heads, and a delta for each entity the requester lacks or holds
+at an older head. Once the requester's copy covers every head the round offered, it
+reports the round applied, and the peer releases its snapshot.
 
-### Request/response deltas (`DeltaContent`)
+Each delta (`DeltaContent`) is one of:
 
-When a subscription is first established -- or when an ephemeral node runs a
-fetch -- the durable node assembles a delta for each entity. The choice of
-delta depends on what the requester already knows:
-
-- **State snapshot** -- the requester has never seen the entity, or the gap is
-  too complex to bridge. The full state is sent.
-- **Event bridge** -- the requester has a known (older) head and the durable
-  node can trace a clean forward path through the DAG. Only the missing events
-  are sent, avoiding a full state transfer.
+- **State snapshot** -- the requester lacks the entity, or no event path connects
+  its head to the target. The full state is sent.
+- **Event bridge** -- the requester holds an older head, and the peer sends only the
+  events that connect it to the target.
 
 The event bridge is especially valuable after brief disconnections: a handful
 of events is far cheaper than retransmitting the full state. The bridge is
-built by walking backward from the current head through parent pointers until
-every frontier member is in the requester's known head, then reversing the
-collected events into causal (oldest-first) order.
+built by walking backward from the target through parent pointers until every
+frontier member is in the requester's head, then reversing the collected events
+into causal (oldest-first) order. The walk is bounded, and a delta too large for
+one frame travels in chunks.
 
-> **Known limitation:** The backward walk currently has no traversal budget. A
-> stale or malicious `known_head` could trigger unbounded event collection.
-> Chunked bridge framing, size limits, and resource governance are tracked in
-> the phase-2 spec (`specs/concurrency/phase-2.md`).
+### Live publications
+
+A SubscribeQuery stream stays open after its first round. The durable peer
+publishes each change to the query's membership, in revision order, with the
+entity data it concerns. The ephemeral node applies the data via
+[`apply_events`](entity-lifecycle.md#how-events-are-applied) and installs the
+membership once its copy covers the published heads. If incoming state diverges
+from what the receiver already has, the receiver falls back to batch
+`apply_events` with [BFS comparison](event-dag.md#comparing-two-clocks). A later
+round can compare the whole result again on the same stream.
 
 
 ## Subscription Propagation
@@ -87,14 +85,12 @@ The flow has three phases: establishment, streaming, and recovery.
 
 **Establishment.** When application code creates a live query on an ephemeral
 node, the node registers it as a pending subscription. When a durable peer is
-(or becomes) available, the node sends a subscribe request that includes a map
-of entities it already knows and their head clocks. The durable peer responds
-with deltas -- state snapshots for unknown entities, event bridges for known
-ones -- and begins monitoring its local reactor for future changes.
+(or becomes) available, the node sends a SubscribeQuery carrying its
+`KnownState`, and the durable peer answers with the stream's first
+[comparison round](#comparison-rounds).
 
-**Streaming.** After establishment, the durable node pushes updates whenever
-entities matching the subscribed query change. The ephemeral node applies these
-incrementally, as described [above](#streaming-updates-updatecontent).
+**Streaming.** After the first round, the durable peer sends the query's
+[live publications](#live-publications) on the same stream.
 
 **Recovery.** If the durable peer disconnects, all subscriptions associated with
 it revert to pending and are automatically re-established when a new durable

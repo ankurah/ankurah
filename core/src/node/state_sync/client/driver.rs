@@ -1,6 +1,6 @@
 use super::*;
 use crate::{changes::EntityChange, node::applier::Delivery, reactor::ChangeNotification};
-use ankurah_digest_tree::CanonicalCodec;
+use ankurah_proto::state_sync::limits::{MAX_DELTA_BYTES, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_ITEMS, WINDOW_BYTES};
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -11,6 +11,21 @@ use projection::{Projection, Round};
 // admission reserved for ongoing publications and data-only causal repairs.
 const MAX_ACTIVE_ROUND_APPLICATIONS: usize = 128;
 const MAX_ACTIVE_LIVE_APPLICATIONS: usize = 16;
+/// Entities one stream tracks in any one set: causal targets, changed round
+/// entities, or entities pinned for the round.
+const MAX_TRACKED_IDS: usize = 100_000;
+/// Live publications received but not yet installed, as many as a window of frames can open.
+const MAX_PENDING_PUBLICATIONS: usize = MAX_FRAMES_IN_FLIGHT;
+/// Deltas reassembled from chunks at once.
+const MAX_ASSEMBLIES: usize = MAX_FRAMES_IN_FLIGHT;
+/// Entity applications queued or running: a window of frames, each carrying its most items.
+const MAX_APPLICATION_JOBS: usize = MAX_FRAMES_IN_FLIGHT * MAX_FRAME_ITEMS;
+/// Delta bytes awaiting application or assembly: a window of frames plus one delta
+/// still arriving in chunks.
+const MAX_QUEUED_DELTA_BYTES: usize = MAX_DELTA_BYTES + WINDOW_BYTES;
+/// Completed applications observed per wakeup, so their notifications batch
+/// without starving incoming frames.
+const READY_JOB_BATCH: usize = 128;
 
 type TargetKey = Vec<u8>;
 fn target_key(id: proto::EntityId, target: &proto::Clock) -> TargetKey {
@@ -72,7 +87,7 @@ impl Goals {
         if rows.contains_key(&key) {
             return Ok(());
         }
-        ensure!(self.count < 100_000, "too many causal targets");
+        ensure!(self.count < MAX_TRACKED_IDS, "too many causal targets");
         self.bytes += key.len() + proto::EntityId::BYTE_LEN;
         self.count += 1;
         rows.insert(key, Goal { id, head, covered, attempts: 0, requested: false });
@@ -114,7 +129,7 @@ struct Assembly {
     owner: Owner,
     id: proto::EntityId,
     target: proto::Clock,
-    bytes: Vec<u8>,
+    delta: proto::DeltaAssembler,
     member: Option<proto::QueryMember>,
     sender: tokio::sync::oneshot::Sender<proto::EntityDelta>,
 }
@@ -173,17 +188,11 @@ pub(super) struct Driver {
 }
 
 impl Driver {
-    pub fn new(
-        snapshot: Snapshot,
-        round: proto::StateRound,
-        stream: IncomingStream,
-        stream_id: proto::StateStreamId,
-    ) -> anyhow::Result<Self> {
-        ensure!(round.number == 0, "initial round number is not zero");
+    pub fn new(snapshot: Snapshot, round: proto::StateRound, stream: IncomingStream, stream_id: proto::StateStreamId) -> Self {
         let spec = snapshot.spec.clone();
         let observed = snapshot.entries.iter().map(|(id, entry)| (*id, entry.head.clone())).collect();
         let (tx, refresh_rx) = tokio::sync::mpsc::channel(2);
-        Ok(Self {
+        Self {
             resident: snapshot.resident.clone(),
             projection: Projection::new(Round::new(round, snapshot)),
             spec,
@@ -224,7 +233,7 @@ impl Driver {
             membership_dirty: false,
             partial_removals: HashSet::new(),
             baseline_installed: false,
-        })
+        }
     }
 
     pub async fn prepare<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<()>
@@ -297,7 +306,7 @@ impl Driver {
                 "interleaved source publications"
             );
             ensure!(revision > self.received_revision, "stale source publication");
-            ensure!(self.publications.len() < super::super::MAX_INFLIGHT_FRAMES, "too many pending source publications");
+            ensure!(self.publications.len() < MAX_PENDING_PUBLICATIONS, "too many pending source publications");
             self.publications.push_back(Publication {
                 revision,
                 changes: IndexMap::new(),
@@ -328,10 +337,7 @@ impl Driver {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         let bytes = bincode::serialized_size(&delta)? as usize;
-        ensure!(
-            self.application_bytes + self.assembly_bytes + bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
-            "application byte queue exceeded limit"
-        );
+        ensure!(self.application_bytes + self.assembly_bytes + bytes <= MAX_QUEUED_DELTA_BYTES, "application byte queue exceeded limit");
         self.application_bytes += bytes;
         let id = delta.entity_id;
         self.reserve_application(node, peer, credentials, owner, id, repair, Box::pin(async move { Some(delta) }))
@@ -353,7 +359,7 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(self.application_jobs < super::super::MAX_INFLIGHT_FRAMES * 128, "application queue exceeded limit");
+        ensure!(self.application_jobs < MAX_APPLICATION_JOBS, "application queue exceeded limit");
         self.application_jobs += 1;
         match owner {
             Owner::Round(_) => self.round_jobs += 1,
@@ -457,7 +463,10 @@ impl Driver {
                 Owner::Live(_) => false,
             };
             if self.stream.query.is_some() && round_changed {
-                ensure!(self.round_changed.contains(&applied.id) || self.round_changed.len() < 100_000, "too many changed round entities");
+                ensure!(
+                    self.round_changed.contains(&applied.id) || self.round_changed.len() < MAX_TRACKED_IDS,
+                    "too many changed round entities"
+                );
                 self.round_changed.insert(applied.id);
             }
             if self.round_changed.contains(&applied.id) {
@@ -500,7 +509,7 @@ impl Driver {
         self.remove_round_pin(&id);
         let Some((query, _)) = self.stream.query else { return };
         let Some(query) = node.live_queries.get(query) else { return };
-        if query.resultset().contains_key(&id) || self.round_pins.len() >= 100_000 || self.round_pin_bytes >= super::super::WINDOW_BYTES {
+        if query.resultset().contains_key(&id) || self.round_pins.len() >= MAX_TRACKED_IDS || self.round_pin_bytes >= WINDOW_BYTES {
             return;
         }
         let Some(bytes) = entity
@@ -514,7 +523,7 @@ impl Driver {
         };
         // Pinning is an optimization. A large state or exhausted admission
         // budget falls back to the ordinary storage reload at installation.
-        if bytes <= super::super::WINDOW_BYTES - self.round_pin_bytes {
+        if bytes <= WINDOW_BYTES - self.round_pin_bytes {
             self.round_pin_bytes += bytes;
             self.round_pins.insert(id, (entity.clone(), bytes));
         }
@@ -568,7 +577,6 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(!chunk.bytes.is_empty(), "empty delta chunk");
         let key = bincode::serialize(&(
             match owner {
                 Owner::Round(n) => (0, n),
@@ -581,11 +589,10 @@ impl Driver {
         if self.discarded_chunks.contains(&key) {
             return Ok(());
         }
-        if !self.assemblies.contains_key(&key) {
-            ensure!(
-                self.assemblies.len() < super::super::MAX_INFLIGHT_FRAMES && chunk.offset == 0,
-                "too many or out-of-order partial deltas"
-            );
+        if let Some(assembly) = self.assemblies.get(&key) {
+            ensure!(assembly.owner == owner && assembly.target == target && assembly.member == member, "invalid delta chunk sequence");
+        } else {
+            ensure!(self.assemblies.len() < MAX_ASSEMBLIES, "too many partial deltas");
             let (sender, receive) = tokio::sync::oneshot::channel();
             self.reserve_application(
                 node,
@@ -596,40 +603,29 @@ impl Driver {
                 (!matches!(owner, Owner::Live(_))).then(|| target.clone()),
                 Box::pin(async move { receive.await.ok() }),
             )?;
+            let delta = proto::DeltaAssembler::new(chunk.entity_id);
             self.assemblies.insert(
                 key.clone(),
-                Assembly { owner, id: chunk.entity_id, target: target.clone(), bytes: Vec::new(), member: member.clone(), sender },
+                Assembly { owner, id: chunk.entity_id, target: target.clone(), delta, member: member.clone(), sender },
             );
         }
-        let assembly = self.assemblies.get_mut(&key).unwrap();
         ensure!(
-            assembly.owner == owner
-                && assembly.target == target
-                && assembly.member == member
-                && chunk.offset == assembly.bytes.len() as u64,
-            "invalid delta chunk sequence"
-        );
-        ensure!(
-            self.assembly_bytes + chunk.bytes.len() <= super::super::MAX_REPAIR_BYTES
-                && self.application_bytes + self.assembly_bytes + chunk.bytes.len()
-                    <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
+            self.assembly_bytes + chunk.bytes.len() <= MAX_DELTA_BYTES
+                && self.application_bytes + self.assembly_bytes + chunk.bytes.len() <= MAX_QUEUED_DELTA_BYTES,
             "delta assembly exceeds limit"
         );
+        let entity_id = chunk.entity_id;
+        let assembled = self.assemblies[&key].delta.len() + chunk.bytes.len();
         self.assembly_bytes += chunk.bytes.len();
-        assembly.bytes.extend_from_slice(&chunk.bytes);
-        if chunk.last {
+        if let Some(content) = self.assemblies.get_mut(&key).unwrap().delta.push(chunk)? {
             let assembly = self.assemblies.remove(&key).unwrap();
-            let content = decode_delta(&assembly.bytes)?;
             if !matches!(owner, Owner::Live(_)) {
-                check_target(&assembly.target, &content)?;
+                content.check_target(&assembly.target)?;
             }
-            let delta = proto::EntityDelta { entity_id: chunk.entity_id, content };
-            self.assembly_bytes -= assembly.bytes.len();
+            let delta = proto::EntityDelta { entity_id, content };
+            self.assembly_bytes -= assembled;
             self.application_bytes += bincode::serialized_size(&delta)? as usize;
-            ensure!(
-                self.application_bytes + self.assembly_bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
-                "application byte queue exceeded limit"
-            );
+            ensure!(self.application_bytes + self.assembly_bytes <= MAX_QUEUED_DELTA_BYTES, "application byte queue exceeded limit");
             if matches!(owner, Owner::Live(_)) {
                 self.add_live_delta_targets(
                     match owner {
@@ -656,72 +652,84 @@ impl Driver {
         Ok(())
     }
 
-    async fn items<SE, PA>(
+    /// Answers a round's questions, stages its membership pages and receives its repairs.
+    async fn round_items<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
         peer: proto::EntityId,
         credentials: &[PA::ContextData],
-        owner: Owner,
+        round: u64,
         items: Vec<StateItem>,
     ) -> anyhow::Result<Vec<StateAnswer>>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(items.len() <= 128, "state item limit exceeded");
+        let owner = Owner::Round(round);
         let mut answers = Vec::new();
         for item in items {
             match item {
                 StateItem::Digest(head) => {
-                    ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
-                    head.validate()?;
                     answers.push(StateAnswer::Digest(self.projection.round.as_mut().unwrap().snapshot.span_digest(head.bounds).await?));
                 }
                 StateItem::NeedHeads(bounds) => {
-                    ensure!(matches!(owner, Owner::Round(_)), "live repair contains comparison question");
                     answers.push(StateAnswer::Heads(self.projection.round.as_ref().unwrap().snapshot.page(bounds)?));
                 }
                 StateItem::Heads(page) => {
-                    ensure!(matches!(owner, Owner::Round(_)), "live repair contains membership");
-                    ensure!(4 + page.expanded_size() <= super::super::PAGE_BYTES as u64, "peer head inventory exceeds decoded-work budget");
-                    ensure!(page.heads.len() <= super::super::HEAD_PAGE, "peer sent too many heads");
-                    page.validate(&self.spec)?;
                     let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         self.add_goal(owner, leaf.entity.entity_id, leaf.entity.head.to_owned())?;
                     }
                     self.projection.round.as_mut().unwrap().replace(page);
                 }
-                StateItem::Repair { target, delta } => {
-                    check_target(&target, &delta.content)?;
-                    self.repair_arrived(delta.entity_id, &target);
-                    self.add_goal(owner, delta.entity_id, target.clone())?;
-                    self.enqueue(node, peer, credentials, owner, delta, Some(target))?;
-                }
-                StateItem::RepairChunk { target, chunk } => {
-                    self.add_goal(owner, chunk.entity_id, target.clone())?;
-                    self.chunk(node, peer, credentials, owner, target, None, chunk)?;
-                }
-                StateItem::RepairUnavailable { entity_id, target } => {
-                    let required = |goals: &Goals| {
-                        goals.rows.get(&entity_id).is_some_and(|rows| rows.values().any(|goal| goal.head == target && !goal.covered))
-                    };
-                    if !required(&self.goals) && !self.publications.iter().any(|publication| required(&publication.goals)) {
-                        continue;
-                    }
-                    let actual =
-                        self.observed.get(&entity_id).cloned().or_else(|| node.entities.get(&entity_id).map(|entity| entity.head()));
-                    if let Some(head) = actual {
-                        if covers_target(node, &head, &target).await? {
-                            self.observe_head(node, entity_id, head).await?;
-                            continue;
-                        }
-                    }
-                    bail!("peer cannot repair required state for {entity_id}");
-                }
+                StateItem::Repair(repair) => self.receive_repair(node, peer, credentials, owner, repair).await?,
             }
         }
         Ok(answers)
+    }
+
+    /// Receives data toward one causal target of a round or of a live publication.
+    /// The frame that carried it was validated on receipt.
+    async fn receive_repair<SE, PA>(
+        &mut self,
+        node: &Node<SE, PA>,
+        peer: proto::EntityId,
+        credentials: &[PA::ContextData],
+        owner: Owner,
+        repair: RepairItem,
+    ) -> anyhow::Result<()>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        match repair {
+            RepairItem::Delta { target, delta } => {
+                self.repair_arrived(delta.entity_id, &target);
+                self.add_goal(owner, delta.entity_id, target.clone())?;
+                self.enqueue(node, peer, credentials, owner, delta, Some(target))?;
+            }
+            RepairItem::Chunk { target, chunk } => {
+                self.add_goal(owner, chunk.entity_id, target.clone())?;
+                self.chunk(node, peer, credentials, owner, target, None, chunk)?;
+            }
+            RepairItem::Unavailable { entity_id, target } => {
+                let required = |goals: &Goals| {
+                    goals.rows.get(&entity_id).is_some_and(|rows| rows.values().any(|goal| goal.head == target && !goal.covered))
+                };
+                if !required(&self.goals) && !self.publications.iter().any(|publication| required(&publication.goals)) {
+                    return Ok(());
+                }
+                let actual = self.observed.get(&entity_id).cloned().or_else(|| node.entities.get(&entity_id).map(|entity| entity.head()));
+                if let Some(head) = actual {
+                    if covers_target(node, &head, &target).await? {
+                        self.observe_head(node, entity_id, head).await?;
+                        return Ok(());
+                    }
+                }
+                bail!("peer cannot repair required state for {entity_id}");
+            }
+        }
+        Ok(())
     }
 
     fn add_live_delta_targets(
@@ -732,19 +740,11 @@ impl Driver {
         content: Option<&proto::DeltaContent>,
     ) -> anyhow::Result<()> {
         if let Some(member) = member {
-            CanonicalCodec.split(self.spec.key_spec(), &member.key)?;
             self.add_goal(Owner::Live(revision), id, member.head.clone())?;
         }
         if let Some(content) = content {
-            let target = match content {
-                proto::DeltaContent::StateSnapshot { state } | proto::DeltaContent::StateAndEvents { state, .. } => {
-                    state.state.head.clone()
-                }
-                proto::DeltaContent::EventBridge { .. } => {
-                    member.as_ref().ok_or_else(|| anyhow::anyhow!("absent event bridge has no target"))?.head.clone()
-                }
-                _ => bail!("unsupported live delta"),
-            };
+            // A reassembled chunk reaches this check only now; whole live items passed it on receipt.
+            let target = content.live_target(member.as_ref())?.clone();
             self.add_goal(Owner::Live(revision), id, target)?;
         }
         Ok(())
@@ -771,7 +771,6 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(items.len() <= 128, "live item limit exceeded");
         for item in items {
             self.add_live_delta_targets(revision, item.entity_id, &item.member, item.delta.as_ref())?;
             if let Some(content) = item.delta {
@@ -809,9 +808,9 @@ impl Driver {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         ensure!(frame.stream == self.stream_id, "state stream identity changed");
+        frame.body.validate(&self.spec)?;
         self.through = frame.sequence;
-        let mut answers = Vec::new();
-        let mut answer_round = None;
+        let mut answers = None;
         match frame.body {
             StateFrameBody::BeginRound(descriptor) => {
                 ensure!(!self.publications.back().is_some_and(|publication| !publication.complete), "round split a publication");
@@ -826,10 +825,10 @@ impl Driver {
                 self.goals = Goals::default();
                 self.round_jobs = 0;
             }
-            StateFrameBody::State { round, items, progress } => {
+            StateFrameBody::Round { round, items, progress } => {
                 if round == self.round_number && self.projection.round.is_some() {
-                    answers = self.items(node, peer, credentials, Owner::Round(round), items).await?;
-                    answer_round = Some(round);
+                    let round_answers = self.round_items(node, peer, credentials, round, items).await?;
+                    answers = Some(proto::FeedbackAnswers::Round { round, answers: round_answers });
                     if progress == ComparisonProgress::Complete {
                         self.projection.round.as_mut().unwrap().complete = true;
                     }
@@ -843,15 +842,15 @@ impl Driver {
                 let target = None::<proto::Clock>;
                 // Absent chunk data must be snapshot-bearing: decode before learning its data target.
                 let target = target.unwrap_or_default();
-                let last = chunk.last;
                 self.chunk(node, peer, credentials, Owner::Live(revision), target, member, chunk)?;
-                ensure!(last || !complete, "publication completed inside a chunk");
                 if complete {
                     self.live(node, peer, credentials, revision, vec![], true).await?;
                 }
             }
             StateFrameBody::LiveRepair { items } => {
-                self.items(node, peer, credentials, Owner::Repair, items).await?;
+                for repair in items {
+                    self.receive_repair(node, peer, credentials, Owner::Repair, repair).await?;
+                }
             }
             StateFrameBody::RestartRequired => return Err(RequestError::ConnectionLost.into()),
             StateFrameBody::SourceUnavailable => {
@@ -860,17 +859,7 @@ impl Driver {
             }
         }
         self.check_retained()?;
-        self.feedback.queue(
-            node,
-            peer,
-            credentials,
-            self.stream_id,
-            self.through,
-            answer_round,
-            self.applied_through,
-            answers,
-            &self.stream.inbox,
-        )?;
+        self.feedback.queue(node, peer, credentials, self.stream_id, self.through, self.applied_through, answers, &self.stream.inbox)?;
         Ok(())
     }
 
@@ -887,14 +876,14 @@ impl Driver {
         let targets: usize = self.publications.iter().map(|publication| publication.goals.bytes).sum();
         let ids: usize = self.publications.iter().map(|publication| publication.goals.count).sum();
         let changes: usize = self.publications.iter().map(|publication| publication.change_bytes).sum();
-        ensure!(targets <= super::super::WINDOW_BYTES && ids <= 100_000, "unapplied live target window exhausted");
+        ensure!(targets <= WINDOW_BYTES && ids <= MAX_TRACKED_IDS, "unapplied live target window exhausted");
         ensure!(
-            changes + self.projection.retained_bytes() + self.round_changed.len() * proto::EntityId::BYTE_LEN <= super::super::WINDOW_BYTES,
+            changes + self.projection.retained_bytes() + self.round_changed.len() * proto::EntityId::BYTE_LEN <= WINDOW_BYTES,
             "membership notification window exhausted"
         );
         let retained: usize = self.publications.iter().map(|publication| publication.retained_bytes).sum();
         ensure!(
-            retained + self.application_bytes + self.assembly_bytes <= super::super::MAX_REPAIR_BYTES + super::super::WINDOW_BYTES,
+            retained + self.application_bytes + self.assembly_bytes <= MAX_QUEUED_DELTA_BYTES,
             "pending publication data exceeded byte limit"
         );
         Ok(())
@@ -928,7 +917,7 @@ impl Driver {
             }
         }
         for (round, goals) in groups {
-            let mut answers = Vec::new();
+            let mut requests = Vec::new();
             for goal in goals.values_mut().filter(|goal| !goal.covered) {
                 if !self.observed.contains_key(&goal.id) {
                     let actual = match node.entities.get(&goal.id) {
@@ -961,18 +950,23 @@ impl Driver {
                 ensure!(goal.attempts < 2, "connecting history failed to cover target");
                 goal.attempts += 1;
                 goal.requested = true;
-                answers.push(StateAnswer::NeedRepair { entity_id: goal.id, target: goal.head.clone() });
+                requests.push(proto::RepairRequest { entity_id: goal.id, target: goal.head.clone() });
             }
-            if !answers.is_empty() {
+            if !requests.is_empty() {
+                let answers = match round {
+                    Some(round) => {
+                        proto::FeedbackAnswers::Round { round, answers: requests.into_iter().map(StateAnswer::NeedRepair).collect() }
+                    }
+                    None => proto::FeedbackAnswers::LiveRepair { requests },
+                };
                 self.feedback.queue(
                     node,
                     peer,
                     credentials,
                     self.stream_id,
                     self.through,
-                    round,
                     self.applied_through,
-                    answers,
+                    Some(answers),
                     &self.stream.inbox,
                 )?;
             }
@@ -999,7 +993,7 @@ impl Driver {
             .collect::<Vec<_>>();
         for key in covered {
             let assembly = self.assemblies.remove(&key).unwrap();
-            self.assembly_bytes -= assembly.bytes.len();
+            self.assembly_bytes -= assembly.delta.len();
             // Dropping sender resolves the reserved job. Ignore the remaining
             // bytes until this round retires; they no longer prove anything needed.
             self.discarded_chunks.insert(key);
@@ -1012,7 +1006,7 @@ impl Driver {
             || self.publications.iter().any(|publication| publication.changes.contains_key(&id) || publication.goals.rows.contains_key(&id))
     }
 
-    fn can_receive(&self) -> bool { self.application_bytes < super::super::WINDOW_BYTES || !self.assemblies.is_empty() }
+    fn can_receive(&self) -> bool { self.application_bytes < WINDOW_BYTES || !self.assemblies.is_empty() }
 
     async fn commit_publications<SE, PA>(&mut self, node: &Node<SE, PA>, query: Option<(proto::QueryId, u32)>) -> anyhow::Result<()>
     where
@@ -1155,7 +1149,7 @@ impl Driver {
         self.clear_round_pins();
         self.assemblies.retain(|_, assembly| {
             if assembly.owner == Owner::Round(number) {
-                self.assembly_bytes -= assembly.bytes.len();
+                self.assembly_bytes -= assembly.delta.len();
                 false
             } else {
                 true
@@ -1271,9 +1265,8 @@ impl Driver {
                     credentials,
                     self.stream_id,
                     self.through,
-                    None,
                     self.applied_through,
-                    vec![],
+                    None,
                     &self.stream.inbox,
                 )?;
             }
@@ -1338,7 +1331,7 @@ impl Driver {
                     if let Some(change) = self.observe(&node, job).await? {
                         changes.push((change, deferred));
                     }
-                    for _ in 1..128 {
+                    for _ in 1..READY_JOB_BATCH {
                         let Some(Some(job)) = self.jobs.next().now_or_never() else { break };
                         let job = job?;
                         let deferred = self.deferred_notification(job.owner, job.id);
