@@ -6,7 +6,6 @@ mod feedback;
 mod incoming;
 mod resident;
 mod server;
-pub(crate) mod source;
 mod tree;
 
 pub(crate) use client::{abandon_current_state, finish_state, receive_state, request_state, RefreshHandle};
