@@ -44,6 +44,7 @@ impl HeadCursor {
     }
 }
 
+/// A keyed entity head borrowed from a packed inventory, valid until the cursor advances.
 #[derive(Debug, Serialize)]
 pub struct KeyedEntityHeadRef<'a> {
     pub key: &'a [u8],
@@ -58,6 +59,7 @@ impl<'a> KeyedEntityHeadRef<'a> {
     pub fn to_owned(&self) -> KeyedEntityHead { KeyedEntityHead { key: self.key.to_vec(), entity: self.entity.to_owned() } }
 }
 
+/// An entity head borrowed from a packed inventory.
 #[derive(Debug, Serialize)]
 pub struct EntityHeadRef<'a> {
     pub entity_id: EntityId,
@@ -68,6 +70,7 @@ impl EntityHeadRef<'_> {
     pub fn to_owned(&self) -> EntityHead { EntityHead { entity_id: self.entity_id, head: self.head.to_owned() } }
 }
 
+/// A clock borrowed from a packed inventory, read tip by tip without allocating.
 #[derive(Debug, Clone, Copy)]
 pub struct ClockRef<'a> {
     bytes: &'a [u8],

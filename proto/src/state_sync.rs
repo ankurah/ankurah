@@ -1,20 +1,22 @@
-//! Bounded comparison rounds within a standing query's state stream.
+//! Query state synchronization: lets a node bring its copy of a query result up to
+//! date with a peer's without resending the entities it already holds.
 //!
-//! The initial response carries metadata and frame zero. Later frames are pushed
-//! through NodeMessage::StateFrame, correlated with the originating request and stream.
-//! StateFeedback acknowledges a processed prefix and supplies bounded answers;
-//! it returns Success rather than carrying another frame. Responders choose
-//! byte/work/window limits beneath the protocol's hard resource caps.
+//! 1. The requester sends Fetch or SubscribeQuery with a `KnownState`: digests of the
+//!    key ranges it holds, or the head of every entity in a range.
+//! 2. The responder answers with a `StateReply`, whose frame zero begins round zero.
+//!    Later frames arrive as `NodeMessage::StateFrame`, numbered by `sequence`.
+//! 3. Within a round the responder sends `StateItem`s: digests to compare, head
+//!    inventories, requests for the requester's heads, and entity repairs. The
+//!    requester replies with `StateFeedback`, returning frame credit and its `StateAnswer`s.
+//! 4. Once it has sent everything, the responder marks the round `Complete`. When the
+//!    requester's local result covers every repair, it sends `FinishStateRound` with
+//!    `Applied`, and the responder releases the round's snapshot.
+//! 5. A SubscribeQuery stream stays open: `Live` frames carry each change to the
+//!    query's membership in revision order, `RefreshState` begins another round, and
+//!    `AbandonStateStream` closes the stream.
 //!
-//! Live publications may interleave with comparison pages. Each round describes
-//! one frozen source revision; later membership decisions must survive its
-//! installation. Complete ends enumeration, while Applied confirms actual
-//! coverage of that finite round and releases its snapshot. Neither gates live
-//! delivery. A standing stream may compare another frozen offer in a later round.
-//!
-//! Frame acknowledgments are flow control, not global application claims.
-//! Peers, connection generations, credentials, snapshots, spec and query version
-//! stay bound throughout. Unknown or superseded streams cannot be adopted.
+//! Both peers enforce the limits in [`limits`]. Byte limits on a message count its
+//! work: its encoded bytes plus the bytes its inventories saved by sharing key prefixes.
 
 pub use ankurah_digest_tree::{TreeSpan, TreeSpanDigest, TreeSpec};
 use serde::{Deserialize, Serialize};
@@ -30,7 +32,8 @@ pub use inventory::{
 
 use crate::{Clock, DeltaContent, EntityDelta, EntityDeltaChunk, EntityId};
 
-/// A responder-issued state stream handle, scoped to one peer connection/query generation.
+/// Names one state stream. Its responder issues it, and it means nothing outside the
+/// connection that opened the stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct StateStreamId(Ulid);
 
@@ -46,23 +49,24 @@ impl std::fmt::Display for StateStreamId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "S-{}", self.0) }
 }
 
-/// Bounded knowledge of the requester's materialized query result.
-/// Spans are disjoint and exact. Omitted spans are unknown, not empty;
-/// an empty span list supplies no result knowledge but still specifies the tree.
-/// No span asserts absence of entity state held outside this query.
+/// The requester's account of its query result, for the responder to compare with
+/// its own. Spans are disjoint; a range no span covers is unknown, not empty, and an
+/// offer with no spans still names the tree its keys belong to. A span describes only
+/// entities in the query's result, never entities outside it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownState {
     pub spec: TreeSpec,
     pub spans: Vec<SpanContent>,
 }
 
+/// What a requester knows about one span of its result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SpanContent {
+    /// A digest of the span's heads, for the responder to compare with its own.
     Digest(TreeSpanDigest),
-    /// All entity heads within these bounds; empty means the range is empty.
-    /// An initial inventory uses the request budget, independently of follow-up
-    /// page limits. Replies need only describe changes; Complete confirms
-    /// unchanged members too.
+    /// Every entity head within the span; an empty inventory says the span is empty.
+    /// It may be as large as the offer's limits allow, larger than an inventory page.
+    /// The responder sends the heads that differ, and its Complete confirms the rest.
     Heads(TreeSpanInventory),
 }
 
@@ -76,24 +80,26 @@ impl SpanContent {
     }
 }
 
-/// One captured query version. Revisions order publications in this stream,
-/// not entity histories or other peers. Round numbers start at zero.
+/// A comparison round's number, counting from zero, and the source revision its
+/// snapshot reflects. Revisions order this stream's publications; they say nothing
+/// about entity histories or other peers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StateRound {
     pub number: u64,
     pub revision: u64,
 }
 
-/// Initial response for the full exact materialized selection. Its round begins
-/// before frame zero and every subsequent live publication in this stream.
+/// The responder's reply to Fetch or SubscribeQuery: round zero and its first frame.
+/// Every live publication of the stream follows the round's revision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateReply {
     pub round: StateRound,
     pub frame: StateFrame,
 }
 
-/// Immutable within one connection generation and state stream.
-/// Frame zero is in StateReply; subsequent frames arrive only as NodeMessage::StateFrame.
+/// One numbered frame of a state stream. A stream and sequence number name exactly one
+/// frame, so a resend carries the same bytes. Frame zero travels in the StateReply and
+/// every later frame as NodeMessage::StateFrame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateFrame {
     pub stream: StateStreamId,
@@ -101,58 +107,52 @@ pub struct StateFrame {
     pub body: StateFrameBody,
 }
 
+/// What one frame carries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateFrameBody {
-    /// Accept the requester's already-frozen offer for the next round. This marker
-    /// precedes its questions/pages and every live publication after its revision.
+    /// Begins the round a RefreshState asked for, comparing the offer it carried. It
+    /// follows every live publication at or before the round's revision and precedes
+    /// the round's items and every later publication.
     BeginRound(StateRound),
-    Round {
-        round: u64,
-        items: Vec<StateItem>,
-        progress: ComparisonProgress,
-    },
-    /// Absolute source membership plus optional causal data. A publication may
-    /// span frames. After `complete` and actual target coverage, the receiver
-    /// publishes its membership and accepted events together, in revision order.
-    Live {
-        revision: u64,
-        items: Vec<QueryChange>,
-        complete: bool,
-    },
-    /// Same entity encoding as RepairItem::Chunk. The membership decision stays fixed
-    /// across fragments. `complete` requires the final fragment and finishes this
-    /// whole publication, not merely this entity. Comparison frames may interleave.
-    LiveChunk {
-        revision: u64,
-        member: Option<QueryMember>,
-        chunk: EntityDeltaChunk,
-        complete: bool,
-    },
-    /// Connecting data for previously offered live targets; none authors membership.
-    LiveRepair {
-        items: Vec<RepairItem>,
-    },
-    /// Mark this generation unavailable and restart; never claim completion.
+    /// Items of the round, and whether the responder has now sent them all.
+    Round { round: u64, items: Vec<StateItem>, progress: ComparisonProgress },
+    /// Part of one live publication: the membership changes the responder's source
+    /// made at `revision`, with data for the entities they concern. A publication may
+    /// span frames, and `complete` marks its last. The requester installs a complete
+    /// publication once its local entities cover every target, in revision order.
+    Live { revision: u64, items: Vec<QueryChange>, complete: bool },
+    /// One chunk of a live change whose delta is too large for a frame, split as a
+    /// repair's delta is. Every chunk repeats the change's membership decision.
+    /// `complete` may accompany only the last chunk, and then completes the whole
+    /// publication, not only this entity. Round frames may arrive between chunks.
+    LiveChunk { revision: u64, member: Option<QueryMember>, chunk: EntityDeltaChunk, complete: bool },
+    /// Data toward targets of live publications that the requester asked to repair.
+    /// It changes no membership.
+    LiveRepair { items: Vec<RepairItem> },
+    /// The responder ended the stream. The requester starts over with a new request
+    /// and treats nothing it received on this stream as complete.
     RestartRequired,
     /// The source cannot prove a gap-free publication history after an uncertain
-    /// commit outcome. Recreating this stream cannot repair it; the source node
-    /// must be reconstructed before it can serve query state again.
+    /// commit outcome. A new stream cannot repair that: the source node must be
+    /// rebuilt before it can serve query state again.
     SourceUnavailable,
 }
 
-/// The sender's captured key and target. Keep these separate from the key/head
-/// of a newer or concurrently merged local entity.
+/// An entity's membership as the source decided it at a revision: its key in the
+/// query's tree, and the head the source held. The requester installs the membership
+/// once its own copy of the entity covers that head, and keeps it apart from the key
+/// and head of its own copy, which may be newer or concurrent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryMember {
     pub key: Vec<u8>,
     pub head: Clock,
 }
 
-/// One absolute membership decision. None means absent, including removals
-/// for which the source may not disclose entity data. A Present with no data
-/// still requires proof that the local entity covers its target head. An Absent
-/// with data must carry a state target; an EventBridge alone has no explicit
-/// target and is permitted only with Present.
+/// One membership decision of a live publication. `member` is None when the entity is
+/// not in the query, which covers a removal whose data the source may not disclose.
+/// `delta` optionally carries the entity's data. A member without one still needs a
+/// local copy that covers its head. Data for an absent entity must carry state, since
+/// an event bridge alone has no target.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryChange {
     pub entity_id: EntityId,
@@ -160,57 +160,64 @@ pub struct QueryChange {
     pub delta: Option<DeltaContent>,
 }
 
+/// Whether the responder has sent every item of a round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ComparisonProgress {
-    /// Further work or questions remain; the responder pushes while credit permits.
-    /// On late repair frames this does not revoke a prior Complete handoff.
+    /// More items follow, sent as credit allows. Repairs sent after Complete carry
+    /// Continue without withdrawing it.
     Continue,
-    /// All offers for this finite round have been sent.
-    /// This does not claim application: late NeedRepair is allowed. Readiness
-    /// requires actual target coverage and local activation. Independently covered
-    /// targets no longer need their outstanding repair requests.
+    /// The responder has sent every item of the round. The requester may still ask for
+    /// repairs, though a target its copy already covers needs none; the round ends when
+    /// the requester's local result covers every target and it reports Applied.
     Complete,
 }
 
-/// A reply may mix refinement, inventory questions and entity repairs.
+/// One item of a round: a question for the requester, heads to adopt, or entity data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateItem {
-    /// Compare this span locally and answer with a digest for the same span.
-    /// The responder may offer several depths; overlap must not be counted twice.
+    /// Asks for the requester's digest of exactly this span. A round may ask about
+    /// nested spans at several depths; the requester answers each on its own.
     Digest(TreeSpanDigest),
-    /// The responder's complete head inventory within this page's bounds.
+    /// Every head the responder holds within the inventory's bounds; the requester
+    /// adopts them as the round's membership there.
     Heads(TreeSpanInventory),
-    /// Enumerate the requester's heads within these bounds, in bounded pages.
+    /// Asks for the requester's heads within these bounds, answered in pages.
     NeedHeads(TreeSpan),
+    /// Data toward one of the round's targets.
     Repair(RepairItem),
 }
 
-/// Entity data toward one causal target, in a round or a LiveRepair frame.
+/// Entity data toward one causal target, sent in a round or a LiveRepair frame.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RepairItem {
-    /// Apply through the normal attestation and causal validation path.
-    /// `target` is the captured sender head covered by this delta. Application
-    /// may retain newer or concurrent local state; sending is not acknowledgment.
+    /// Data that brings the entity to `target`, the head the source published. The
+    /// requester applies it through the usual attestation and causal checks and may
+    /// keep newer or concurrent local state; sending it acknowledges nothing.
     Delta { target: Clock, delta: EntityDelta },
-    /// A fragment of a repair too large for one reply. Target stays fixed for its
-    /// assembly. Complete cannot leave a partial repair; late requested repairs
-    /// may span Continue frames, but every required assembly must finish before Applied.
+    /// One chunk of a delta too large for a frame; the target stays the same across
+    /// its chunks. A responder finishes a round's chunked repairs before marking it
+    /// Complete. A repair the requester asks for later may still span frames, and each
+    /// one it needs must finish before it reports the round Applied.
     Chunk { target: Clock, chunk: EntityDeltaChunk },
-    /// Causal repair cannot be supplied within policy/history/work limits.
-    /// Fail while this target remains required and uncovered. A retired round or
-    /// independently covered target does not become unavailable retroactively.
+    /// The responder cannot send data toward this target within its policy, history
+    /// or work limits. The requester fails if it still needs the target; one its copy
+    /// already covers, or one of a retired round, fails nothing.
     Unavailable { entity_id: EntityId, target: Clock },
 }
 
-/// Answers for any subset of the outstanding spans/entities in a comparison.
+/// One answer to a round, sent in StateFeedback. A feedback may answer any of the
+/// round's outstanding questions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StateAnswer {
-    /// The requester's digest over the exact span offered by the responder.
+    /// The requester's digest over exactly the span the responder asked about.
     Digest(TreeSpanDigest),
+    /// One page of the requester's heads within bounds the responder asked about. A
+    /// page that stops short ends at its last head, and the responder asks for the rest.
     Heads(TreeSpanInventory),
-    /// An already offered snapshot did not incorporate target into local state.
-    /// Only the exact offered entity/target is admissible, including after Complete.
-    /// Answer with bounded connecting events or RepairItem::Unavailable, never the same snapshot.
+    /// The requester's copy did not reach a target the round offered, even after the
+    /// data the responder sent. The responder answers with connecting events or
+    /// RepairItem::Unavailable, never the same snapshot. Only an offered entity and
+    /// target qualify, after Complete too.
     NeedRepair(RepairRequest),
 }
 
@@ -244,19 +251,19 @@ impl FeedbackAnswers {
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 }
 
+/// How a requester ends a round, in FinishStateRound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateRoundOutcome {
-    /// After Complete, the round's offered targets are covered and local result
-    /// installation succeeded, including live publications through its captured
-    /// revision. Later live publications do not hold completion open.
-    /// Release only that round's snapshot.
-    /// processed_through covers enumeration through Complete and returns frame
-    /// credit (including frame 0). Independent live application may already cover
-    /// a target whose requested history is still in flight; that work can retire.
-    /// Later frames still receive credit but cannot change a retired round.
-    /// The requester need not await the reply before reporting readiness.
+    /// After Complete, the requester's local result covers every target the round
+    /// offered and includes every live publication through the round's revision; the
+    /// responder releases the round's snapshot, and later publications never hold the
+    /// round open. `processed_through` must reach the frame that completed the round,
+    /// and returns credit as StateFeedback does. A repair still in flight for a target
+    /// the requester covered by other means may then stop; later frames still receive
+    /// credit but cannot change the round. The requester need not wait for the reply
+    /// before reporting its query ready.
     Applied { processed_through: u64 },
-    /// Discard only this round, preserving the standing stream and its live
-    /// publications. It may be followed by a new frozen offer and round.
+    /// Discards only this round. The stream and its live publications continue, and
+    /// another round may follow.
     Cancelled,
 }

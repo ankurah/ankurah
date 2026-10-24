@@ -1,5 +1,6 @@
-//! Packed, independently decodable inventories. Binary serde retains the validated
-//! byte buffer; JSON keeps the readable list of keyed entity heads.
+//! Inventories of the entity heads within a span, packed into one byte buffer that a
+//! peer validates once and then reads without copying. Binary encodings carry the
+//! buffer itself; human-readable ones list the keyed entity heads.
 
 use std::collections::HashSet;
 
@@ -14,11 +15,13 @@ mod cursor;
 pub use codec::InventoryError;
 pub use cursor::{ClockRef, EntityHeadRef, HeadCursor, KeyedEntityHeadRef};
 
-/// All keyed entity heads within exactly `bounds`, including empty gaps.
+/// Every keyed entity head within exactly `bounds`, so a gap between heads is known
+/// to be empty.
 ///
-/// A large requested span can be split into disjoint inventories in address order.
-/// Each inventory completely describes its bounds; the remaining bounds stay pending.
-/// This is a wire inventory, separate from the tree crate's local scan page and cursor.
+/// A responder splits a large span into inventories in address order; each describes
+/// its own bounds completely, and the rest of the span stays outstanding. Unlike
+/// digest-tree's `LeafPage` and `LeafCursor`, which page through a local tree, an
+/// inventory travels between peers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeSpanInventory {
     pub bounds: TreeSpan,
@@ -72,6 +75,8 @@ pub struct EntityHead {
     pub head: Clock,
 }
 
+/// One entity head at its address in a tree: its key under the tree's key spec, and
+/// the entity's identity and head.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyedEntityHead {
     /// Canonical property values selected by the TreeSpec's KeySpec. The full

@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-/// The encoded size of one frame or one StateFeedback, and the work either describes.
+/// The encoded size and work of one frame, and the encoded size of one StateFeedback.
 pub const MAX_FRAME_BYTES: usize = MAX_PAGE_BYTES + 4096;
 /// The work of one frame's items, of one inventory page, or of one StateFeedback's answers.
 pub const MAX_PAGE_BYTES: usize = 64 * 1024;
