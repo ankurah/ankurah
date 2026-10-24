@@ -457,7 +457,7 @@ where
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
                 // Remove predicate from the peer's subscription
                 if let Some(peer_state) = self.peer_connections.get(&from) {
-                    peer_state.subscription_handler.remove_predicate(self, query_id).await?;
+                    peer_state.subscription_handler.remove_query(self, query_id).await;
                 }
             }
             proto::NodeMessage::AbandonStateStream { from, to, stream } => {
@@ -592,8 +592,9 @@ where
         Ok(())
     }
 
-    /// Build a repair from a selectively requested clock, or a snapshot if no bridge is available.
-    /// Equal clocks need no repair.
+    /// Build the delta that brings a requester from the clock it reported for this entity in `known_map`
+    /// to `entity_state`: none when the clocks are equal, an event bridge when local history connects
+    /// them, and otherwise a state snapshot.
     pub(crate) async fn generate_entity_delta<C>(
         &self,
         known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
@@ -657,10 +658,14 @@ where
         use crate::retrieval::LocalEventGetter;
         use std::collections::HashSet;
 
+        // The most events a bridge carries. A longer gap is repaired with a state snapshot, and the
+        // causal comparison starts from the same budget, so a long gap costs a bounded history read.
+        const MAX_BRIDGE_EVENTS: usize = 256;
+
         let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);
 
         // First check the causal relationship
-        let comparison_result = compare(&event_getter, current_head, known_head, 256).await?;
+        let comparison_result = compare(&event_getter, current_head, known_head, MAX_BRIDGE_EVENTS).await?;
 
         match comparison_result.relation {
             AbstractCausalRelation::Equal => {
@@ -677,7 +682,7 @@ where
 
                 while !frontier.is_empty() {
                     let batch = std::mem::take(&mut frontier);
-                    if visited.len() + batch.len() > 256 {
+                    if visited.len() + batch.len() > MAX_BRIDGE_EVENTS {
                         return Ok(vec![]);
                     }
                     let fetched = self.storage.get_events(batch).await?;
@@ -826,16 +831,35 @@ where
                 Err(RetrievalError::RequestError(RequestError::ConnectionLost)) if attempt == 0 => continue,
                 result => result?,
             };
-            let ids: std::collections::HashSet<_> = remote.ids.iter().copied().collect();
-            // Filter before applying LIMIT: an unreadable or former result in the
-            // local cache must not displace an authoritative peer result.
-            let mut local_selection = selection.clone();
-            local_selection.limit = None;
-            let mut entities = self.fetch_entities_from_local(&local_selection).await?;
-            entities.retain(|entity| ids.contains(&entity.id()));
-            if let Some(limit) = selection.limit {
-                entities.truncate(limit as usize);
-            }
+            // Only the peer's answer counts: a local match it did not name, such as a former or
+            // unreadable result, must not displace one.
+            let entities = match selection.limit {
+                // An empty answer names nothing to read, and an empty IN list is not valid SQL.
+                Some(_) if remote.ids.is_empty() => Vec::new(),
+                // A limited answer names at most `limit` entities, so storage reads only those, in order.
+                Some(_) => {
+                    use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyPath};
+                    let answered = Predicate::Comparison {
+                        left: Box::new(Expr::Path(PropertyPath::id())),
+                        operator: ComparisonOperator::In,
+                        right: Box::new(Expr::ExprList(
+                            remote.ids.iter().map(|id| Expr::Literal(crate::value::Value::EntityId(*id))).collect(),
+                        )),
+                    };
+                    let mut local_selection = selection.clone();
+                    local_selection.predicate = Predicate::And(Box::new(selection.predicate.clone()), Box::new(answered));
+                    self.fetch_entities_from_local(&local_selection).await?
+                }
+                // An unlimited answer can name more ids than one IN list should carry: SQL engines bind
+                // each one, and in-memory filtering scans the list for every row. Read every local
+                // match instead and keep the answered ones.
+                None => {
+                    let ids: std::collections::HashSet<_> = remote.ids.iter().copied().collect();
+                    let mut entities = self.fetch_entities_from_local(&selection).await?;
+                    entities.retain(|entity| ids.contains(&entity.id()));
+                    entities
+                }
+            };
             state_sync::finish_state(self, peer_id, cdata.clone(), remote, None);
             return Ok(entities);
         }

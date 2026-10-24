@@ -187,14 +187,10 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
 
     /// Require entity visibility and any additional event-specific permission.
     pub fn check_read_event(&self, event: &Attested<Event>, state: &State) -> Result<(), AccessDenied> {
-        self.check_read(&event.payload.entity_id, state)?;
-        self.check_event_permission(event, state)
-    }
-
-    fn check_event_permission(&self, event: &Attested<Event>, state: &State) -> Result<(), AccessDenied> {
         if state.memberships.iter().any(crate::schema::reads_bypass_policy) {
             return Ok(());
         }
+        self.check_read(&event.payload.entity_id, state)?;
         match &self.auth {
             ContextAuth::Sessions(_) => self.agent.check_read_event(&self.credentials(), event),
             ContextAuth::Privileged => Ok(()),

@@ -57,7 +57,7 @@ async fn an_unindexed_limit_builds_independently_without_blocking_the_shared_tre
     assert_eq!(node.resident_trees.len(), 2);
     let (_, serving) = connection.subscription_handler.query_resident_for_test(query).await.expect("the other subscription remains active");
     assert!(Weak::ptr_eq(&tree, &serving));
-    connection.subscription_handler.remove_predicate(&node, query).await?;
+    connection.subscription_handler.remove_query(&node, query).await;
     node.deregister_peer(peer);
     Ok(())
 }

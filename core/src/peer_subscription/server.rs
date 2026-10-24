@@ -1,5 +1,4 @@
 use crate::{
-    error::SubscriptionError,
     node::{
         state_sync::{accept_peer_spec, ResidentSubscription},
         Node,
@@ -28,9 +27,10 @@ struct StandingQuery<CD: ContextData> {
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub fn new(peer_id: proto::EntityId) -> Self { Self { peer_id, queries: Mutex::new(HashMap::new()) } }
+    pub(crate) fn new(peer_id: proto::EntityId) -> Self { Self { peer_id, queries: Mutex::new(HashMap::new()) } }
 
-    pub async fn remove_predicate<SE, PA>(&self, node: &Node<SE, PA>, query: proto::QueryId) -> Result<(), SubscriptionError>
+    /// End a standing query, if the peer holds one: close its state stream and release its resident subscription.
+    pub(crate) async fn remove_query<SE, PA>(&self, node: &Node<SE, PA>, query: proto::QueryId)
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -40,10 +40,9 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             peer.state_streams.invalidate_query(query);
         }
         queries.remove(&query);
-        Ok(())
     }
 
-    pub async fn subscribe_query<SE, PA>(
+    pub(crate) async fn subscribe_query<SE, PA>(
         &self,
         node: &Node<SE, PA>,
         request: proto::RequestId,

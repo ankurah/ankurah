@@ -3,24 +3,27 @@ use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalStateGetter, SuspenseEvents};
-use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
+use entity_write::{EntityWrite, ResidentAdvance};
 use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
+
+mod entity_write;
 
 /// Applies entity deltas received from a peer, whether they arrive as initial
 /// transfer (Fetch, QuerySubscribed, repair) or as live subscription updates.
 /// One path handles every `DeltaContent`; the delivery decides only what the
-/// reactor change publishes. Each delta is applied atomically.
+/// reactor change publishes. Each delta is applied atomically, and a delta whose
+/// write reached storage reaches the resident entity even if its caller is dropped.
 pub struct NodeApplier;
 
 /// How a delta reached this node.
 ///
 /// Initial transfer publishes no events on its reactor changes: a repair for
 /// one subscribing query must not surface on another established query holding
-/// the same entity as an event update. Live delivery also returns validated events
-/// independently of state advancement; the reactor tracks each subscriber's
-/// event delivery so a prior initial snapshot cannot swallow a live update.
+/// the same entity as an event update. Live delivery publishes every event it
+/// validated, whether or not the entity advanced; the reactor tracks each
+/// subscriber's event delivery so a prior initial snapshot cannot swallow a live update.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Delivery {
     Initial,
@@ -28,100 +31,15 @@ pub(crate) enum Delivery {
 }
 
 /// What applying one delta did.
-///
-/// `change` is set only when the entity advanced and carries what this
-/// delivery publishes. A failed delta returns an error without persisting a prefix.
 #[derive(Debug)]
 pub(crate) struct DeltaOutcome {
+    /// The entity the delta applied to; an empty bridge reports it only if it is resident.
     pub entity: Option<Entity>,
+    /// The reactor change this delivery publishes, if any.
     pub change: Option<EntityChange>,
-    /// Validated live events remain delivery obligations even when an earlier
-    /// initial snapshot already advanced the entity through them.
-    pub live_events: Vec<Attested<proto::Event>>,
-}
-
-impl DeltaOutcome {
-    fn unchanged(entity: Option<Entity>) -> Self { Self { entity, change: None, live_events: Vec::new() } }
 }
 
 impl NodeApplier {
-    /// Apply initial-transfer deltas concurrently, notifying the reactor for each
-    /// batch that completes together. A concurrent bare snapshot may leave the
-    /// local entity unchanged; callers needing causal coverage use apply_delta
-    /// and check coverage against the resulting entity head.
-    pub(crate) async fn apply_deltas<SE, PA, E, S>(
-        node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
-        deltas: Vec<proto::EntityDelta>,
-        event_getter: &E,
-        state_getter: &S,
-    ) -> Result<(), ApplyError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-        E: SuspenseEvents + Send + Sync,
-        S: crate::retrieval::GetState + Send + Sync,
-    {
-        // Stragglers do not hold back the rest: every batch of futures that is
-        // ready together is notified together.
-        let mut ready_chunks = ReadyChunks::new(deltas.into_iter().map(|delta| async move {
-            let entity_id = delta.entity_id;
-            (entity_id, Self::apply_delta(node, from_peer_id, delta, Delivery::Initial, event_getter, state_getter).await)
-        }));
-
-        let mut errors = Vec::new();
-        while let Some(results) = ready_chunks.next().await {
-            let mut batch = Vec::new();
-            for (entity_id, result) in results {
-                match result {
-                    Ok(outcome) => {
-                        batch.extend(outcome.change);
-                    }
-                    Err(cause) => errors.push(ApplyErrorItem { entity_id, cause }),
-                }
-            }
-            if !batch.is_empty() {
-                node.notify_reactor(batch).await;
-            }
-        }
-
-        if !errors.is_empty() {
-            return Err(ApplyError::Items(errors));
-        }
-        Ok(())
-    }
-
-    /// Apply one delta of any content. Errors before anything is persisted are
-    /// returned as `Err`; everything that applied is described by the outcome.
-    pub(crate) async fn apply_delta<SE, PA, E, S>(
-        node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
-        delta: proto::EntityDelta,
-        delivery: Delivery,
-        event_getter: &E,
-        state_getter: &S,
-    ) -> Result<DeltaOutcome, MutationError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-        E: SuspenseEvents + Send + Sync,
-        S: crate::retrieval::GetState + Send + Sync,
-    {
-        let entity_id = delta.entity_id;
-        match delta.content {
-            proto::DeltaContent::StateSnapshot { state } => {
-                Self::apply_snapshot(node, from_peer_id, entity_id, state, Vec::new(), delivery, event_getter, state_getter).await
-            }
-            proto::DeltaContent::StateAndEvents { state, events } => {
-                Self::apply_snapshot(node, from_peer_id, entity_id, state, events, delivery, event_getter, state_getter).await
-            }
-            proto::DeltaContent::EventBridge { events } => {
-                Self::apply_bridge(node, from_peer_id, entity_id, events, delivery, event_getter, state_getter).await
-            }
-            proto::DeltaContent::StateAndRelation { .. } => Err(MutationError::InvalidUpdate("StateAndRelation is not supported")),
-        }
-    }
-
     /// Validate each event fragment structurally and against policy, then
     /// stage it for causal comparison. Every delta that carries events admits them
     /// here and nowhere else.
@@ -156,11 +74,19 @@ impl NodeApplier {
         crate::event_dag::ordering::topo_sort_events(attested_events)
     }
 
-    /// What a delivery publishes for an advanced entity.
-    fn publish(entity: Entity, events: Vec<Attested<proto::Event>>, delivery: Delivery) -> EntityChange {
+    /// The reactor change a delivery publishes for one applied delta. Initial transfer publishes
+    /// an advanced entity without its events. Live delivery publishes every validated event, even
+    /// when an earlier initial snapshot already advanced the entity through them, and publishes an
+    /// advanced entity even when no events came with it.
+    fn change_for_delivery(
+        entity: &Entity,
+        advanced: bool,
+        events: Vec<Attested<proto::Event>>,
+        delivery: Delivery,
+    ) -> Option<EntityChange> {
         match delivery {
-            Delivery::Initial => EntityChange::new(entity, Vec::new()),
-            Delivery::Live => EntityChange::new(entity, events),
+            Delivery::Initial => advanced.then(|| EntityChange::new(entity.clone(), Vec::new())),
+            Delivery::Live => (advanced || !events.is_empty()).then(|| EntityChange::new(entity.clone(), events)),
         }
     }
 
@@ -188,13 +114,12 @@ impl NodeApplier {
         S: crate::retrieval::GetState + Send + Sync,
     {
         let events = Self::validate_and_stage(node, from_peer_id, entity_id, carried, event_getter)?;
-        let live_events = if delivery == Delivery::Live { events.clone() } else { Vec::new() };
         let state: Attested<proto::EntityState> = (entity_id, fragment).into();
         node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
         if let Some(entity) = Self::save_new_entity(node, &state.payload, &events, delivery, event_getter, state_getter).await? {
-            let change = Self::publish(entity.clone(), events, delivery);
-            return Ok(DeltaOutcome { entity: Some(entity), change: Some(change), live_events });
+            let change = Self::change_for_delivery(&entity, true, events, delivery);
+            return Ok(DeltaOutcome { entity: Some(entity), change });
         }
         let entity = node
             .entities
@@ -202,12 +127,9 @@ impl NodeApplier {
             .await?
             .ok_or(RetrievalError::EntityNotFound(entity_id))?;
 
-        let change = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?;
-        let change = change.map(|change| {
-            let (entity, events) = change.into_parts();
-            Self::publish(entity, events, delivery)
-        });
-        Ok(DeltaOutcome { entity: Some(entity), change, live_events })
+        let advanced = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?.is_some();
+        let change = Self::change_for_delivery(&entity, advanced, events, delivery);
+        Ok(DeltaOutcome { entity: Some(entity), change })
     }
 
     /// Apply a bridge as one atomic batch for both initial and live delivery.
@@ -228,18 +150,20 @@ impl NodeApplier {
     {
         let events = Self::validate_and_stage(node, from_peer_id, entity_id, fragments, event_getter)?;
         if events.is_empty() {
-            return Ok(DeltaOutcome::unchanged(node.entities.get(&entity_id)));
+            return Ok(DeltaOutcome { entity: node.entities.get(&entity_id), change: None });
         }
-        let live_events = if delivery == Delivery::Live { events.clone() } else { Vec::new() };
-        let change = Self::apply_and_commit_events(node, &events, delivery, event_getter).await?.map(|change| {
-            let (entity, events) = change.into_parts();
-            Self::publish(entity, events, delivery)
-        });
-        let entity = match &change {
-            Some(change) => Some(change.entity().clone()),
-            None => node.entities.get_or_retrieve(state_getter, event_getter, &entity_id).await?,
+        let advanced = Self::apply_and_commit_events(node, &events, delivery, event_getter).await?;
+        let entity = match &advanced {
+            Some(change) => change.entity().clone(),
+            // The bridge committed, so storage holds the entity even if no event was new.
+            None => node
+                .entities
+                .get_or_retrieve(state_getter, event_getter, &entity_id)
+                .await?
+                .ok_or(RetrievalError::EntityNotFound(entity_id))?,
         };
-        Ok(DeltaOutcome { entity, change, live_events })
+        let change = Self::change_for_delivery(&entity, advanced.is_some(), events, delivery);
+        Ok(DeltaOutcome { entity: Some(entity), change })
     }
 
     /// Before adopting a snapshot, check that its events lead to its head through the ordered batch,
@@ -316,17 +240,14 @@ impl NodeApplier {
         crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
         Self::check_snapshot_events(node, state, &proto::Clock::default(), events, event_getter).await?;
         let attestation = node.policy_agent.attest_state(node, state);
-        let mut storage_trx = node.storage.transaction();
-        storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
-        storage_trx.add_events(events).await?;
-        let mut source = node.reactor.begin_commit().await;
-        match source.record_storage_outcome(storage_trx.commit().await)? {
-            crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
-            crate::storage::StorageCommitOutcome::Committed(_) => {}
-        }
-        let (_, entity) = node.entities.with_state(state_getter, event_getter, state.entity_id, state.state.clone()).await?;
-        source.publish(&[EntityChange::new(entity.clone(), events.to_vec())], delivery == Delivery::Live);
-        Ok(Some(entity))
+        let write = EntityWrite {
+            expected_head: proto::Clock::default(),
+            state: Attested::opt(state.clone(), attestation),
+            events: events.to_vec(),
+            resident: ResidentAdvance::Create,
+        };
+        // A refused write means another delivery stored the entity first.
+        Ok(write.commit(node, delivery).await?.map(|change| change.into_parts().0))
     }
 
     /// Adopt an extending snapshot, or merge its accompanying events. Persist both before publishing.
@@ -349,36 +270,21 @@ impl NodeApplier {
             let candidate = RemoteTrxEntity::edit(entity)?;
             let expected_head = candidate.head();
             let adopted = candidate.apply_state(event_getter, &snapshot.state).await?;
+            if !adopted && events.is_empty() {
+                return Ok(None);
+            }
             let mut events = events.to_vec();
             if adopted {
                 Self::check_snapshot_events(node, snapshot, &expected_head, &events, event_getter).await?;
             } else {
                 candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
             }
-            if !adopted && events.is_empty() {
-                return Ok(None);
-            }
             let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
-            let state = Attested::opt(state, attestation);
-            let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &state).await?;
-            storage_trx.add_events(&events).await?;
-            let mut source = node.reactor.begin_commit().await;
-            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
-            if adopted {
-                let (_, entity) = node
-                    .entities
-                    .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
-                    .await?;
-                let change = EntityChange::new(entity, events);
-                source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
-                Ok(Some(change))
-            } else {
-                let change = candidate.commit(&node.entities, event_getter).await?;
-                source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
-                Ok((!change.events().is_empty()).then_some(change))
-            }
+            let resident = if adopted { ResidentAdvance::Adopt(candidate) } else { ResidentAdvance::Apply(candidate) };
+            let write = EntityWrite { expected_head, state: Attested::opt(state, attestation), events, resident };
+            let change = write.commit(node, delivery).await?.ok_or(MutationError::WriteConflict)?;
+            Ok((adopted || !change.events().is_empty()).then_some(change))
         })
     }
 
@@ -405,15 +311,109 @@ impl NodeApplier {
             candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
-            let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
-            storage_trx.add_events(&events).await?;
-            let mut source = node.reactor.begin_commit().await;
-            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
-            let change = candidate.commit(&node.entities, event_getter).await?;
-            source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
+            let write = EntityWrite {
+                expected_head,
+                state: Attested::opt(state, attestation),
+                events,
+                resident: ResidentAdvance::Apply(candidate),
+            };
+            let change = write.commit(node, delivery).await?.ok_or(MutationError::WriteConflict)?;
             Ok((!change.events().is_empty()).then_some(change))
         })
+    }
+
+    /// Apply multiple EntityDeltas in parallel with batched reactor notification
+    /// Drains all ready futures per wake and calls reactor.notify_change for each batch
+    /// Collects all errors and returns them at the end - caller decides whether to fail or log
+    pub(crate) async fn apply_deltas<SE, PA, E, S>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        deltas: Vec<proto::EntityDelta>,
+        event_getter: &E,
+        state_getter: &S,
+    ) -> Result<(), ApplyError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        E: SuspenseEvents + Send + Sync,
+        S: crate::retrieval::GetState + Send + Sync,
+    {
+        // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
+        // if there are stragglers, they will be picked up on the next wake
+        // this should in theory be deterministic for eventbridge cases where all events are immediately available
+        let mut ready_chunks = ReadyChunks::new(deltas.into_iter().map(|delta| {
+            let entity_id = delta.entity_id;
+            async move {
+                Self::apply_delta(node, from_peer_id, delta, Delivery::Initial, event_getter, state_getter)
+                    .await
+                    .map_err(|cause| ApplyErrorItem { entity_id, cause })
+            }
+        }));
+
+        let mut all_errors = Vec::new();
+
+        while let Some(results) = ready_chunks.next().await {
+            let mut batch = Vec::new();
+
+            for result in results {
+                match result {
+                    Ok(outcome) => batch.extend(outcome.change),
+                    Err(error_item) => {
+                        all_errors.push(error_item);
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                node.notify_reactor(batch).await;
+            }
+        }
+
+        if !all_errors.is_empty() {
+            return Err(ApplyError::Items(all_errors));
+        }
+
+        Ok(())
+    }
+
+    /// Apply one delta of any content and describe what it did. A refused delta changes nothing:
+    /// structure, policy and lineage checks run before anything is written, and the delta's
+    /// state and events commit in one storage transaction. An error from that commit or after it
+    /// is returned as well, but it does not prove that nothing persisted.
+    ///
+    /// The caller may drop this future at any point. Before the delta's write is handed to
+    /// storage, dropping it applies nothing; after, the commit, the resident entity's advance and
+    /// the publication to resident maintenance finish without the caller. A failed state stream
+    /// can therefore drop its applications: it starts nothing new and finishes what is committing.
+    pub(crate) async fn apply_delta<SE, PA, E, S>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        delta: proto::EntityDelta,
+        delivery: Delivery,
+        event_getter: &E,
+        state_getter: &S,
+    ) -> Result<DeltaOutcome, MutationError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        E: SuspenseEvents + Send + Sync,
+        S: crate::retrieval::GetState + Send + Sync,
+    {
+        let entity_id = delta.entity_id;
+        match delta.content {
+            proto::DeltaContent::StateSnapshot { state } => {
+                Self::apply_snapshot(node, from_peer_id, entity_id, state, Vec::new(), delivery, event_getter, state_getter).await
+            }
+            proto::DeltaContent::StateAndEvents { state, events } => {
+                Self::apply_snapshot(node, from_peer_id, entity_id, state, events, delivery, event_getter, state_getter).await
+            }
+
+            proto::DeltaContent::EventBridge { events } => {
+                Self::apply_bridge(node, from_peer_id, entity_id, events, delivery, event_getter, state_getter).await
+            }
+
+            proto::DeltaContent::StateAndRelation { .. } => Err(MutationError::InvalidUpdate("StateAndRelation not yet implemented")),
+        }
     }
 }
 

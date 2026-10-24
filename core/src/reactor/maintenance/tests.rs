@@ -164,17 +164,11 @@ async fn cancellation_after_storage_commit_invalidates_existing_and_new_subscrip
     let node = node().await?;
     let (_, mut cursor) = subscribe(&node).await?;
     apply(&node, &genesis(13), Delivery::Live).await?;
-    let event = genesis(4);
-    let (entered, wait) = tokio::sync::oneshot::channel();
-    let (_release, resume) = tokio::sync::oneshot::channel();
-    *node.storage.hold_after_commit.lock().unwrap() = Some((entered, resume));
-    {
-        let applying = apply(&node, &event, Delivery::Live);
-        tokio::pin!(applying);
-        assert!(futures::poll!(&mut applying).is_pending());
-        wait.await?;
-        assert_eq!(node.storage.get_state(event.entity_id).await?.payload.state.head, proto::Clock::singleton(&event));
-    }
+    // The applier finishes every commit it dispatches; a commit dropped after storage committed it
+    // and before its publication must still leave no successful read barrier.
+    let mut commit = node.reactor.begin_commit().await;
+    commit.record_storage_outcome(Ok(crate::storage::StorageCommitOutcome::Committed(Default::default())))?;
+    drop(commit);
     assert!(matches!(cursor.next().await, Err(SourceError::Unavailable)));
     assert!(matches!(cursor.fence().await, Err(SourceError::Unavailable)));
     assert!(matches!(subscribe(&node).await, Err(SourceError::Unavailable)));

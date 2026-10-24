@@ -398,13 +398,7 @@ impl Driver {
             )
             .await?;
             let head = outcome.entity.as_ref().map(|entity| entity.head());
-            let change = if matches!(owner, Owner::Live(_)) && !outcome.live_events.is_empty() {
-                let entity = outcome.entity.ok_or_else(|| anyhow::anyhow!("accepted live events have no entity"))?;
-                Some(EntityChange::new(entity, outcome.live_events))
-            } else {
-                outcome.change
-            };
-            Ok(Applied { owner, id, head, change, bytes, repair })
+            Ok(Applied { owner, id, head, change: outcome.change, bytes, repair })
         });
         self.push_application(id, job);
         Ok(())

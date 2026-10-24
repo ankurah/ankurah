@@ -340,3 +340,32 @@ async fn measure_cold_equal_sparse_fetch_and_live_reconnect() -> anyhow::Result<
     }
     Ok(())
 }
+
+/// A Fetch with LIMIT reads no more of the client's cached matches than the server's answer names:
+/// the client caches every match, but its local read keeps to the answered rows.
+#[tokio::test]
+async fn a_limited_fetch_reads_only_the_answered_rows() -> anyhow::Result<()> {
+    let server = Node::new_durable(Arc::new(Counted::new()?), PermissiveAgent::new());
+    server.system.create().await?;
+    let writer = server.context_async(DEFAULT_CONTEXT).await?;
+    let trx = writer.begin();
+    for i in 0..64 {
+        trx.create(&CostRow { value: format!("value-{i:04}") }).await?;
+    }
+    trx.commit().await?;
+    let model = writer.resolve_model_id::<CostRow>().await?;
+    let client = Node::new(Arc::new(Counted::new()?), PermissiveAgent::new());
+    *client.storage.model.lock().unwrap() = Some(model);
+    let meter = Arc::new(Mutex::new(Meter { model: Some(model), ..Default::default() }));
+    connect(&server, &client, &meter).await?;
+    let reader = client.context_async(DEFAULT_CONTEXT).await?;
+    assert_eq!(reader.fetch::<CostRowView>("value >= 'value-'").await?.len(), 64, "the client caches every match");
+    client.storage.take();
+
+    let limited = reader.fetch::<CostRowView>("value >= 'value-' ORDER BY value LIMIT 4").await?;
+    let values = limited.iter().map(|row| row.value()).collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(values, ["value-0000", "value-0001", "value-0002", "value-0003"]);
+    let reads = client.storage.take();
+    assert!(reads.rows <= 4, "the client read cached rows the answer did not name: {reads:?}");
+    Ok(())
+}
