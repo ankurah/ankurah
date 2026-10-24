@@ -109,6 +109,14 @@ impl SqliteStorageEngine {
     /// Adopt a database object the host constructed: Node's `DatabaseSync`, or
     /// a compatible driver whose statements support positional arrays and BigInt
     /// INTEGER results. The host owns session settings, including busy timeout.
+    ///
+    /// A driver such as better-sqlite3 brings a copy of SQLite of its own, and
+    /// two copies in one process cannot coordinate the file locks SQLite
+    /// takes, which belong to the process: one copy closing the file can drop
+    /// the locks the other holds, which SQLite's notes on corruption list as a
+    /// way to corrupt it. So a host that adopts such a database on a file must
+    /// not open the same file with another copy in the same process, as
+    /// [`SqliteStorageEngine::open`] would with node:sqlite's.
     pub async fn from_database(database: JsValue) -> anyhow::Result<Self> {
         Self::new(NodePool::new(NodeConnection::from_database(database)?)).await
     }
@@ -151,7 +159,9 @@ const SQLITE_RANGE: i32 = 25;
 /// SQLite prepares a kept statement again when the schema changes, but a
 /// typed reader names its statement's columns, which a `SELECT *` may have
 /// gained or lost; so every kept reader is dropped when the schema version
-/// of main or temp changes. A reader is kept only for a statement that
+/// of main or temp changes, and one that fails, as a reader of an attached
+/// database's table can, is dropped and its statement read afresh (see
+/// `read`). A reader is kept only for a statement that
 /// `refuse_a_compound_select` lets through.
 #[derive(Default)]
 struct Readers {
@@ -176,6 +186,9 @@ impl NodeConnection {
     /// Adopt a database object the host constructed: Node's `DatabaseSync` or
     /// a compatible driver whose statements support positional arrays and BigInt
     /// INTEGER results. The host owns session settings, including busy timeout.
+    /// A driver with a copy of SQLite of its own must not share a file with
+    /// another copy in the same process (see
+    /// [`SqliteStorageEngine::from_database`]).
     pub fn from_database(database: JsValue) -> Result<Self, SqliteError> {
         require_node_floor(&node_process()?)?;
         if !database.is_object() {
@@ -232,7 +245,16 @@ impl NodeConnection {
     pub fn open(path: &str) -> Result<Self, SqliteError> {
         let process = node_process()?;
         require_node_floor(&process)?;
-        let get_builtin = method(&process, "getBuiltinModule")?;
+        // Node.js has had `process.getBuiltinModule` since 22.3, before the
+        // floor, so a runtime that reports a version past the floor without
+        // it is no Node.js the executor runs on.
+        let get_builtin: Function = Reflect::get(&process, &"getBuiltinModule".into()).map_err(js_error)?.dyn_into().map_err(|_| {
+            SqliteError::Node(
+                "`process` has no `getBuiltinModule` method, which Node.js has from 22.3: the node executor needs \
+                 Node.js 22.20.0 or later"
+                    .into(),
+            )
+        })?;
         let module = get_builtin.call1(&process, &"node:sqlite".into()).map_err(js_error)?;
         if module.is_undefined() || module.is_null() {
             return Err(SqliteError::Node("`node:sqlite` is unavailable in this build of Node.js".into()));
@@ -368,10 +390,12 @@ impl NodeConnection {
             Err(SqliteError::NodeSqlite { code: SQLITE_RANGE, .. }) => {}
             Err(error) => return Err(error),
             Ok(_) => {
+                // rusqlite's words for the same refusal, which also name the
+                // count needed; the probe shows only that it is more.
                 return Err(SqliteError::Node(format!(
-                    "the statement takes more parameters than the {passed} passed, and this database binds NULL for each one \
-                     not passed, where rusqlite refuses the call: pass a value for every parameter"
-                )))
+                    "Wrong number of parameters passed to query. Got {passed}, needed more: this database binds NULL for each \
+                     parameter not passed, where rusqlite refuses the call, so the node executor refuses it before it runs"
+                )));
             }
         }
         let mut checked = checked.borrow_mut();
@@ -546,7 +570,20 @@ impl NodeConnection {
     fn read(&self, sql: &str, params: &[SqliteValueRef<'_>], rows: Rows) -> Result<Vec<Row>, SqliteError> {
         if let Some((reader, width)) = self.kept_reader(sql)? {
             self.check_parameters(sql, params.len())?;
-            return take(&reader, params, 2 * width, rows)?.into_iter().map(typed_row).collect();
+            match take(&reader, params, 2 * width, rows) {
+                Ok(taken) => return taken.into_iter().map(typed_row).collect(),
+                // A kept reader can fail where one prepared afresh would not:
+                // the executor watches the schema versions of main and temp
+                // only, so a reader of an attached database's table can name
+                // fewer columns than SQLite now finds there. Its error is
+                // dropped, with the reader, and the statement read once more
+                // as on its first run, which returns its own error if it fails
+                // too; the query the reader nests only reads, so running it
+                // again changes nothing.
+                Err(_) => {
+                    self.readers.borrow_mut().kept.remove(sql);
+                }
+            }
         }
         refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
@@ -569,6 +606,14 @@ impl NodeConnection {
                 self.keep_reader(sql, &reader, width);
                 take(&reader, params, 2 * width, rows)?.into_iter().map(typed_row).collect()
             }
+            // The typed reader reads each column as two, so SQLite refuses to
+            // prepare the reader of a query that yields more than half of its
+            // column limit, 2000 by default, though it prepared the query.
+            Err(too_wide) if too_wide.to_string().contains("too many columns in result set") => Err(SqliteError::Node(format!(
+                "the statement yields {width} columns, and the node executor's typed reader reads each as two, its \
+                 storage class and its value, so it reads at most half of SQLite's column limit, 1000 of the default \
+                 2000 columns ({too_wide})"
+            ))),
             // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
             // in a WITH clause. A PRAGMA or an EXPLAIN is read as the database
             // hands it over, its TEXT as a string (see `plain_row`). Any other
@@ -868,8 +913,10 @@ fn integer_from_js(value: &JsValue) -> Result<i64, SqliteError> {
     i64::try_from(value.clone().unchecked_into::<BigInt>()).map_err(|_| SqliteError::Node(format!("{value:?} does not fit in 64 bits")))
 }
 
-fn method(target: &JsValue, name: &str) -> Result<Function, SqliteError> {
-    Reflect::get(target, &name.into())
+/// A method of the database object, which the refusal of one it lacks names;
+/// `open` checks `process.getBuiltinModule` with a refusal of its own.
+fn method(database: &JsValue, name: &str) -> Result<Function, SqliteError> {
+    Reflect::get(database, &name.into())
         .map_err(js_error)?
         .dyn_into::<Function>()
         .map_err(|_| SqliteError::Node(format!("the database object has no `{name}` method")))

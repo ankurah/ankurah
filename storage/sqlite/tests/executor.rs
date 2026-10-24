@@ -95,16 +95,16 @@ async fn a_pragma_that_sets_a_value_reports_it() -> Result<()> {
     Ok(())
 }
 
-/// A connection the engine opens waits up to five seconds for another
-/// writer's lock before failing, on every driver: rusqlite sets that timeout
-/// on each connection it opens, and the node executor sets it with its
-/// session pragmas.
+/// A connection the engine opens sets a busy timeout of five seconds, on
+/// every driver: rusqlite sets it on each connection it opens, and the node
+/// executor before any other statement. That a writer then waits for
+/// another's lock is `a_writer_waits_for_another_connection_s_lock`.
 #[engine_test]
 #[cfg_attr(
     ankurah_sqlite_better_sqlite3,
     ignore = "the engine opens no better-sqlite3 database, and one it adopts keeps the busy timeout its host set"
 )]
-async fn connections_wait_five_seconds_for_a_lock() -> Result<()> {
+async fn connections_set_a_busy_timeout_of_five_seconds() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let timeout = storage.with_executor(|executor| executor.query_row("PRAGMA busy_timeout", &[])?.expect("one row").integer(0)).await?;
     assert_eq!(timeout, 5000);
@@ -138,6 +138,32 @@ async fn duplicate_column_names_keep_both_positions() -> Result<()> {
     assert_eq!(row.values().len(), 2);
     assert_eq!(row.integer(0)?, 1);
     assert_eq!(row.integer(1)?, 2);
+    Ok(())
+}
+
+/// A query that yields more than half of SQLite's column limit, 1000 of the
+/// default 2000 columns, is refused on Node before it runs, saying so, since
+/// the typed reader reads each column as two; rusqlite reads it. A query of
+/// 1000 columns reads on every driver.
+#[engine_test]
+async fn a_query_of_more_than_a_thousand_columns_is_refused_on_node() -> Result<()> {
+    let columns = |count: usize| format!("SELECT {}", (0..count).map(|index| index.to_string()).collect::<Vec<_>>().join(", "));
+    let storage = common::open_in_memory().await?;
+    let (thousand, more) = storage
+        .with_executor(move |executor| {
+            let width = |sql: String| {
+                executor.query_row(&sql, &[]).map(|row| row.expect("one row").values().len()).map_err(|error| error.to_string())
+            };
+            Ok((width(columns(1000)), width(columns(1001))))
+        })
+        .await?;
+    assert_eq!(thousand, Ok(1000));
+    if cfg!(target_arch = "wasm32") {
+        let refusal = more.expect_err("Node refuses a query of 1001 columns");
+        assert!(refusal.contains("the statement yields 1001 columns") && refusal.contains("1000 of the default 2000"), "{refusal}");
+    } else {
+        assert_eq!(more, Ok(1001));
+    }
     Ok(())
 }
 
@@ -224,27 +250,37 @@ async fn query_row_reads_no_row_past_the_first() -> Result<()> {
 
 /// A statement read again after the schema changes reads as the schema now
 /// stands, though the node executor keeps the reader it prepared for the
-/// statement: `SELECT *` gains the column its table gained, and a TEMP table
-/// of the same name takes the table's place.
+/// statement: `SELECT *` gains the column its table gained, in main or in an
+/// attached database, and a TEMP table of the same name takes the table's
+/// place.
 #[engine_test]
 async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
-    fn width_of_every_column(executor: &dyn SqliteExecutor) -> Result<usize, SqliteError> {
-        Ok(executor.query_row("SELECT * FROM things", &[])?.expect("one row").values().len())
+    fn width_of_every_column(executor: &dyn SqliteExecutor, table: &str) -> Result<usize, SqliteError> {
+        Ok(executor.query_row(&format!("SELECT * FROM {table}"), &[])?.expect("one row").values().len())
     }
     let storage = common::open_in_memory().await?;
     let widths = storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE things (a)", &[])?;
             executor.execute("INSERT INTO things (a) VALUES (1)", &[])?;
-            let before = width_of_every_column(executor)?;
+            let before = width_of_every_column(executor, "things")?;
             executor.execute("ALTER TABLE things ADD COLUMN b", &[])?;
-            let gained = width_of_every_column(executor)?;
+            let gained = width_of_every_column(executor, "things")?;
             executor.execute("CREATE TEMP TABLE things (a, b, c)", &[])?;
             executor.execute("INSERT INTO temp.things VALUES (1, 2, 3)", &[])?;
-            Ok([before, gained, width_of_every_column(executor)?])
+            let shadowed = width_of_every_column(executor, "things")?;
+            // The node executor watches the schema versions of main and temp
+            // only, so its reader of the attached table fails, and is
+            // prepared afresh.
+            executor.execute("ATTACH DATABASE ':memory:' AS aux", &[])?;
+            executor.execute("CREATE TABLE aux.more (a)", &[])?;
+            executor.execute("INSERT INTO aux.more (a) VALUES (1)", &[])?;
+            let attached = width_of_every_column(executor, "aux.more")?;
+            executor.execute("ALTER TABLE aux.more ADD COLUMN b", &[])?;
+            Ok([before, gained, shadowed, attached, width_of_every_column(executor, "aux.more")?])
         })
         .await?;
-    assert_eq!(widths, [1, 2, 3]);
+    assert_eq!(widths, [1, 2, 3, 1, 2]);
     Ok(())
 }
 
@@ -329,12 +365,22 @@ async fn errors_carry_sqlite_s_extended_result_code() -> Result<()> {
             let unique = executor.execute("INSERT INTO things (k, v) VALUES (2, 'a')", &[]).expect_err("a duplicate value is refused");
             let syntax = executor.query("SELEC 1", &[]).expect_err("a misspelt statement is refused");
             let row = executor.query_row("SELECT 'text'", &[])?.expect("one row").integer(0).expect_err("TEXT is not an INTEGER");
-            Ok([key, unique, syntax, row].map(|error| error.sqlite_code()))
+            let seven = SqliteValueRef::Integer(7);
+            let too_many = executor.query("SELECT ?", &[seven, seven]).expect_err("a value no parameter takes is refused");
+            let too_few = executor.query("SELECT ?, ?", &[seven]).expect_err("a parameter without a value is refused");
+            Ok([key, unique, syntax, row, too_many, too_few].map(|error| error.sqlite_code()))
         })
         .await?;
-    // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR, and
-    // no code for an error SQLite did not raise.
-    let expected = if common::on_better_sqlite3() { [None; 4] } else { [Some(1555), Some(2067), Some(1), None] };
+    // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR, no
+    // code for an error SQLite did not raise, and for a call passing too many
+    // values SQLITE_RANGE on node:sqlite alone, which lets SQLite refuse it.
+    let expected = if common::on_better_sqlite3() {
+        [None; 6]
+    } else if cfg!(target_arch = "wasm32") {
+        [Some(1555), Some(2067), Some(1), None, Some(25), None]
+    } else {
+        [Some(1555), Some(2067), Some(1), None, None, None]
+    };
     assert_eq!(codes, expected);
     Ok(())
 }
@@ -459,13 +505,21 @@ async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
             let stored = executor.query_row("SELECT count(*), count(b) FROM pairs", &[])?.expect("one row");
             Ok((
                 passed.map(|outcome| outcome.map_err(|error| error.to_string())),
-                refused.map(|outcome| outcome.is_err()),
+                refused.map(|outcome| outcome.map_err(|error| error.to_string())),
                 (stored.integer(0)?, stored.integer(1)?),
             ))
         })
         .await?;
     assert_eq!(passed, [Ok(1), Ok(1)]);
-    assert_eq!(refused, [true; 6]);
+    let refused = refused.map(|outcome| outcome.expect_err("the call is refused"));
+    // rusqlite's words for too few values, which the node executor uses too
+    // on node:sqlite; better-sqlite3 refuses the call in its own.
+    let too_few = if common::on_better_sqlite3() {
+        "Too few parameter values were provided"
+    } else {
+        "Wrong number of parameters passed to query. Got 1"
+    };
+    assert!(refused[0].contains(too_few), "{}", refused[0]);
     assert_eq!(stored, (1, 1), "only the insert given both values wrote a row");
     Ok(())
 }

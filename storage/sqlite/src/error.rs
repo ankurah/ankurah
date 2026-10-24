@@ -60,6 +60,14 @@ impl SqliteError {
     /// busy timeout, read the same way whether rusqlite or node:sqlite ran the
     /// statement; `None` for every other error. better-sqlite3 hands the code
     /// over only by name, which is not read, so its refusals have `None` too.
+    ///
+    /// A call that passes more values than its statement takes parameters
+    /// differs between drivers: rusqlite and better-sqlite3 refuse it
+    /// themselves, before SQLite binds anything, so their code is `None`,
+    /// where node:sqlite's refusal is SQLite's SQLITE_RANGE, `Some(25)`. A
+    /// call that passes too few has `None` on every driver, refused before
+    /// SQLite runs by rusqlite, by the node executor on node:sqlite, and by
+    /// better-sqlite3.
     pub fn sqlite_code(&self) -> Option<i32> {
         match self {
             // rusqlite reports a statement SQLite could not parse as an

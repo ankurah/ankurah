@@ -5,7 +5,8 @@
 //! tables, the per-model materializations and their column maps, the pushdown
 //! predicate, the exact-head commit. Everything below it runs that SQL on one
 //! SQLite connection: `native.rs` over rusqlite, and on wasm32 `node.rs` over
-//! Node.js's built-in `node:sqlite` module.
+//! Node.js's built-in `node:sqlite` module, or over a better-sqlite3 database
+//! that a host hands the engine through `SqliteStorageEngine::from_database`.
 
 use crate::{
     error::SqliteError,
@@ -15,8 +16,8 @@ use crate::{
 
 /// One SQLite connection, driven synchronously and in order.
 ///
-/// Parameters are positional `?` placeholders, bound by reference so that a
-/// caller's TEXT and BLOB are not copied to be bound. A
+/// Parameters are positional `?` placeholders, bound by reference, without
+/// first copying a caller's TEXT and BLOB into an owned value. A
 /// [`SqliteValueRef::Jsonb`] parameter is bound as its JSON text, because the
 /// SQL that carries one always wraps its placeholder in `jsonb(?)`.
 ///
@@ -56,6 +57,10 @@ use crate::{
 ///   EXPLAIN's TEXT is read as the driver's JavaScript string, and a string
 ///   holding U+FFFD is refused, since both Node drivers put that character in
 ///   place of each byte that is not UTF-8.
+/// - On Node a query that yields more than half of SQLite's column limit,
+///   1000 of the default 2000 columns, is refused before it runs, since the
+///   typed reader reads each column as two; natively it reads up to the
+///   limit.
 /// - better-sqlite3 refuses a query whose SQL holds more than whitespace
 ///   after the semicolon that ends its statement, as `SELECT 1; -- note`
 ///   does: the typed reader nests the SQL better-sqlite3 prepared, and
@@ -217,7 +222,8 @@ fn mismatch(index: usize, found: &SqliteValue, expected: &str) -> SqliteError {
 
 impl SqliteStorageEngine {
     /// Run a closure on one of the engine's connections through the executor
-    /// boundary: raw SQL access for embedders and tests, the same on every driver.
+    /// boundary: raw SQL access for embedders and tests, on every driver, with
+    /// the differences listed on [`SqliteExecutor`].
     pub async fn with_executor<F, T>(&self, f: F) -> Result<T, SqliteError>
     where
         F: FnOnce(&dyn SqliteExecutor) -> Result<T, SqliteError> + Send + 'static,

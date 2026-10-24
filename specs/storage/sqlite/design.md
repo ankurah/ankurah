@@ -78,7 +78,35 @@ into AnkQL.
 
 ## Connections
 
-The engine uses a `bb8` pool around `rusqlite`. Synchronous connection work is
-run through the connection wrapper's blocking boundary. File-backed databases
-enable WAL and the engine's standard performance pragmas; the in-memory engine
-uses a one-connection pool so all operations observe the same database.
+The engine writes its SQL once, for every driver, against the executor
+boundary (`exec.rs`): a `SqliteExecutor` runs one statement on one SQLite
+connection, and each `Row` it returns holds the values as SQLite stored them.
+Everything above the boundary decides which SQL to run; a driver below it
+runs that SQL.
+
+- Natively, the engine uses a `bb8` pool around `rusqlite`. Synchronous
+  connection work is run through the connection wrapper's blocking boundary.
+  File-backed databases enable WAL and the engine's standard performance
+  pragmas; the in-memory engine uses a one-connection pool so all operations
+  observe the same database.
+- On wasm32, behind the `node` feature, the engine runs on one database
+  object of Node.js 22.20.0 or later, synchronously on the calling thread.
+  `open` and `open_in_memory` construct a node:sqlite `DatabaseSync` and give
+  it the native connections' session settings. A host that built a database
+  itself, a node:sqlite `DatabaseSync` or a better-sqlite3 `Database`, hands
+  it to `SqliteStorageEngine::from_database`, which keeps the host's session
+  settings and refuses a database the executor cannot read exactly. The
+  executor reads each query's rows through a typed reader, a WITH clause
+  that nests the query and reads each value with its storage class; where
+  that cannot read as rusqlite does, the query is refused before it runs.
+  `SqliteExecutor`'s documentation lists each way the drivers differ.
+
+Every connection the engine opens has double-quoted string literals off, for
+DML and DDL, so that a double-quoted name that matches no column fails with
+"no such column" instead of reading as the string of its name: a native
+connection switches them off, and node:sqlite's `DatabaseSync` has them off
+unless constructed with them on. `from_database` refuses a database that reads
+such a name as a string. A schema stored with the literals on still opens, but
+a view or trigger whose body relies on one fails when used, and SQLite then
+refuses to rename any table on that file, or to rename or drop any column,
+since each of those reads every view and trigger again; it still adds one.

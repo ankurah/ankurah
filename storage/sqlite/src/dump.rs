@@ -142,8 +142,11 @@ fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
     // embedder left open, which main's page read within too.
     conn.execute("SAVEPOINT _ankurah_dump_page", &[])?;
     let page = states_of_page(conn, &query, &arguments);
-    // Released after a failed read too, since a read leaves nothing to undo;
-    // the read's own error is the one reported.
+    // Released after a failed read too, since a read leaves nothing to undo.
+    // When both fail, the read's error is reported and RELEASE's dropped: a
+    // savepoint that only read fails to release only once SQLite has rolled
+    // it back, as some errors of the read make it do, and RELEASE then
+    // reports no more than that the savepoint is gone.
     let released = conn.execute("RELEASE _ankurah_dump_page", &[]);
     let page = page?;
     released?;
