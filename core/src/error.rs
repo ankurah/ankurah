@@ -197,8 +197,6 @@ impl From<SendError> for RequestError {
 
 #[derive(Error, Debug)]
 pub enum SubscriptionError {
-    #[error("predicate not found")]
-    PredicateNotFound,
     #[error("already subscribed to predicate")]
     PredicateAlreadySubscribed,
     #[error("subscription not found")]

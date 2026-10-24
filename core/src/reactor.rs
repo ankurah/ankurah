@@ -238,25 +238,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         self.0.subscriptions.lock().unwrap().get(&id).cloned()
     }
 
-    /// Remove a predicate from a subscription
-    pub fn remove_query(&self, subscription_id: ReactorSubscriptionId, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
-        let subscription = {
-            let subscriptions = self.0.subscriptions.lock().unwrap();
-            subscriptions.get(&subscription_id).cloned().ok_or(SubscriptionError::SubscriptionNotFound)?
-        };
-
-        // Remove the query from the subscription
-        let query_state = subscription.remove_query(query_id).ok_or(SubscriptionError::PredicateNotFound)?;
-
-        // Remove from watchers (only if selection was set)
-        if let Some(selection) = &query_state.selection {
-            let mut watcher_set = self.0.watcher_set.lock().unwrap();
-            let watcher_id = (subscription_id, query_id);
-            watcher_set.recurse_predicate_watchers(&selection.predicate, watcher_id, WatcherOp::Remove);
-        }
-        Ok(())
-    }
-
     /// Add entity subscriptions to a subscription
     pub fn add_entity_subscriptions(&self, subscription_id: ReactorSubscriptionId, entity_ids: impl IntoIterator<Item = proto::EntityId>) {
         let subscription = {
@@ -538,8 +519,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         preserve: HashSet<proto::EntityId>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
         let _notify = self.0.notify_lock.lock().await;
-        let subscription = self.0.subscriptions.lock().unwrap().get(&subscription_id).cloned();
-        let Some(subscription) = subscription else { return Ok(HashSet::new()) };
+        let Some(subscription) = self.subscription(subscription_id) else { return Ok(HashSet::new()) };
         let changes = Arc::new(changes);
         let mut candidates = CandidateChanges::new(changes.clone());
         for offset in 0..changes.len() {

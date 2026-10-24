@@ -1,9 +1,7 @@
 use crate::{
-    error::SubscriptionError,
     reactor::{AbstractEntity, Reactor, ReactorUpdate},
     selection::filter::Filterable,
 };
-use ankql::ast::Resolved;
 
 use ankurah_proto::{self as proto};
 use ankurah_signals::{
@@ -58,12 +56,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
     /// Get the subscription ID
     pub fn id(&self) -> ReactorSubscriptionId { self.0.subscription_id }
 
-    /// Remove a predicate from this subscription
-    pub fn remove_predicate(&self, query_id: proto::QueryId) -> Result<(), SubscriptionError> {
-        self.0.reactor.remove_query(self.0.subscription_id, query_id)?;
-        Ok(())
-    }
-
     /// Add entity subscriptions
     pub fn add_entity_subscriptions(&self, entity_ids: impl IntoIterator<Item = proto::EntityId>) {
         let entity_ids: Vec<_> = entity_ids.into_iter().collect();
@@ -74,42 +66,6 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
     pub fn remove_entity_subscriptions(&self, entity_ids: impl IntoIterator<Item = proto::EntityId>) {
         let entity_ids: Vec<_> = entity_ids.into_iter().collect();
         self.0.reactor.remove_entity_subscriptions(self.0.subscription_id, entity_ids);
-    }
-}
-
-// Entity-specific methods for remote subscriptions
-impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Install or replace a remote subscriber's versioned query.
-    pub async fn upsert_query(
-        &self,
-        query_id: proto::QueryId,
-        selection: ankql::ast::Selection<Resolved>,
-        gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
-        source: Arc<dyn crate::reactor::LocalEntitySource>,
-        version: u32,
-    ) -> anyhow::Result<Vec<crate::entity::Entity>> {
-        let subscription = self
-            .0
-            .reactor
-            .subscription(self.0.subscription_id)
-            .ok_or_else(|| anyhow::anyhow!("Subscription {:?} not found", self.0.subscription_id))?;
-
-        // Register watchers before allowing a writer's notification to pass the
-        // initial fetch/install boundary.
-        let notify = self.0.reactor.0.notify_lock.lock().await;
-        let included_entities = source.fetch_entities_from_local(&selection).await?;
-        let resultset = subscription.register_or_get_query(query_id, gap_fetcher, source);
-
-        let mut all_entities =
-            subscription.update_query(query_id, selection.clone(), included_entities, version, &mut (), true, None, true)?;
-
-        drop(notify);
-        subscription.fill_gaps_for_query_entities(query_id, &mut all_entities).await;
-
-        resultset.set_loaded(true);
-
-        let entities = resultset.read().iter_entities().map(|(_, entity)| entity.clone()).collect();
-        Ok(entities)
     }
 }
 

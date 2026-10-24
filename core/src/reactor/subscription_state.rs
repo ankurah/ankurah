@@ -13,40 +13,9 @@ use std::{
 };
 use tracing::debug;
 
-/// Collects query updates into a `Vec`, or discards them through `()`.
-pub(super) trait UpdateItemAccumulator<E> {
-    fn push_initial(&mut self, entity: &E, query_id: proto::QueryId);
-    fn push_add(&mut self, entity: &E, query_id: proto::QueryId);
-    fn push_remove(&mut self, entity: &E, query_id: proto::QueryId);
-}
-
-impl<E: Clone, Ev> UpdateItemAccumulator<E> for Vec<ReactorUpdateItem<E, Ev>> {
-    fn push_initial(&mut self, entity: &E, query_id: proto::QueryId) {
-        Vec::push(
-            self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Initial)] },
-        );
-    }
-
-    fn push_add(&mut self, entity: &E, query_id: proto::QueryId) {
-        Vec::push(
-            self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Add)] },
-        );
-    }
-
-    fn push_remove(&mut self, entity: &E, query_id: proto::QueryId) {
-        Vec::push(
-            self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Remove)] },
-        );
-    }
-}
-
-impl<E> UpdateItemAccumulator<E> for () {
-    fn push_initial(&mut self, _entity: &E, _query_id: proto::QueryId) {}
-    fn push_add(&mut self, _entity: &E, _query_id: proto::QueryId) {}
-    fn push_remove(&mut self, _entity: &E, _query_id: proto::QueryId) {}
+/// A notification that `entity` entered or left `query_id`'s results, carrying no events.
+fn membership_item<E: Clone, Ev>(entity: &E, query_id: proto::QueryId, change: MembershipChange) -> ReactorUpdateItem<E, Ev> {
+    ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, change)] }
 }
 
 type GapFillData<E> = (
@@ -236,18 +205,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         let mut watcher_set = self.watcher_set.lock().unwrap();
         watcher_set.add_predicate_entity_watchers(self.id, query_id, entity_ids);
     }
-    /// Update a query, returning entities newly added to its result set.
-    pub fn update_query<A: UpdateItemAccumulator<E>>(
+    /// Update a query's selection and results, pushing the membership changes to `reactor_updates`.
+    pub fn update_query(
         &self,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<E>,
         version: u32,
-        reactor_updates: &mut A,
+        reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>,
         authoritative: bool,
         membership: Option<&crate::reactor::PeerQueryMembership>,
         complete: bool,
-    ) -> anyhow::Result<Vec<E>> {
+    ) -> anyhow::Result<()> {
         let mut state_guard = self.state.lock().unwrap();
         let state = &mut *state_guard;
 
@@ -310,11 +279,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             for (id, entity) in rw_resultset.iter_entities() {
                 if !before.contains_key(&id) {
                     state.entities.insert(id, entity.clone());
-                    if membership.is_some() && !initial_baseline {
-                        reactor_updates.push_add(entity, query_id);
-                    } else {
-                        reactor_updates.push_initial(entity, query_id);
-                    }
+                    let change = if membership.is_some() && !initial_baseline { MembershipChange::Add } else { MembershipChange::Initial };
+                    reactor_updates.push(membership_item(entity, query_id, change));
                     newly_added.push(entity.clone());
                 }
             }
@@ -322,7 +288,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 if !rw_resultset.contains(&id) {
                     removed_entities.push(id);
                     if query_state.source.can_read(&entity) {
-                        reactor_updates.push_remove(&entity, query_id);
+                        reactor_updates.push(membership_item(&entity, query_id, MembershipChange::Remove));
                     }
                 }
             }
@@ -339,7 +305,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                     if !rw_resultset.contains(&entity_id) {
                         rw_resultset.add(entity.clone());
                         state.entities.insert(entity_id, entity.clone());
-                        reactor_updates.push_initial(&entity, query_id);
+                        reactor_updates.push(membership_item(&entity, query_id, MembershipChange::Initial));
                         newly_added.push(entity);
                     }
                 }
@@ -358,7 +324,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
                 removed_entities.push(entity_id);
                 if can_read {
-                    reactor_updates.push_remove(entity, query_id);
+                    reactor_updates.push(membership_item(entity, query_id, MembershipChange::Remove));
                 }
                 false
             });
@@ -397,19 +363,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             watcher_set.cleanup_removed_predicate_watchers(self.id, query_id, &removed_entities);
         }
 
-        Ok(newly_added)
+        Ok(())
     }
 
     /// Send ReactorUpdate with the given items
     pub fn send_update(&self, items: Vec<ReactorUpdateItem<E, Ev>>) {
         let broadcast = self.state.lock().unwrap().broadcast.clone();
         broadcast.send(ReactorUpdate { items });
-    }
-
-    /// Remove a query and return its state for cleanup
-    pub fn remove_query(&self, query_id: proto::QueryId) -> Option<QueryState<E>> {
-        let mut state = self.state.lock().unwrap();
-        state.queries.remove(&query_id)
     }
 
     /// Get all queries for cleanup (used by unsubscribe)
@@ -748,34 +708,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         state.queries.iter().filter_map(|(query_id, query_state)| self.extract_gap_data(*query_id, query_state)).collect()
     }
 
-    /// Fill gaps for a specific query and append entities to the provided vector
+    /// Fill gaps for a specific query and push ReactorUpdateItems to `reactor_updates`
     /// Also registers entity watchers for gap-filled entities
-    pub async fn fill_gaps_for_query_entities(&self, query_id: proto::QueryId, entities: &mut Vec<E>) {
-        let gap_data = {
-            let state = self.state.lock().unwrap();
-            state.queries.get(&query_id).and_then(|query_state| self.extract_gap_data(query_id, query_state))
-        };
-
-        let Some((query_id, gap_fetcher, selection, resultset, last_entity, gap_size)) = gap_data else {
-            return;
-        };
-
-        // Clear gap_dirty flag immediately
-        resultset.clear_gap_dirty();
-
-        // Process gap fill
-        let gap_filled_entities = self.process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
-
-        // Register entity watchers and append entities
-        if !gap_filled_entities.is_empty() {
-            self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| AbstractEntity::id(e)));
-            entities.extend(gap_filled_entities);
-        }
-    }
-
-    /// Fill gaps for a specific query and push ReactorUpdateItems to the accumulator
-    /// Also registers entity watchers for gap-filled entities
-    pub async fn fill_gaps_for_query<A: UpdateItemAccumulator<E>>(&self, query_id: proto::QueryId, reactor_updates: &mut A) {
+    pub async fn fill_gaps_for_query(&self, query_id: proto::QueryId, reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>) {
         let gap_data = {
             let state = self.state.lock().unwrap();
             state.queries.get(&query_id).and_then(|query_state| self.extract_gap_data(query_id, query_state))
@@ -796,7 +731,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| AbstractEntity::id(e)));
 
             for entity in gap_filled_entities {
-                reactor_updates.push_initial(&entity, query_id);
+                reactor_updates.push(membership_item(&entity, query_id, MembershipChange::Initial));
             }
         }
     }
@@ -951,40 +886,5 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         };
 
         (query_id, gap_items)
-    }
-}
-
-// Entity-specific methods for remote subscriptions
-impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Register a query if absent, installing the caller's gap fetcher,
-    /// or return the already-registered query's resultset. Idempotent
-    /// per query id: for an existing query every argument except the id
-    /// is ignored and the provided fetcher is dropped.
-    pub fn register_or_get_query(
-        &self,
-        query_id: proto::QueryId,
-        gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
-        source: Arc<dyn LocalEntitySource>,
-    ) -> EntityResultSet<crate::entity::Entity> {
-        let mut state = self.state.lock().unwrap();
-
-        use std::collections::hash_map::Entry;
-        match state.queries.entry(query_id) {
-            Entry::Vacant(v) => {
-                let resultset = EntityResultSet::empty();
-                v.insert(QueryState {
-                    selection: None,
-                    gap_fetcher,
-                    source,
-                    paused: false,
-                    resultset: resultset.clone(),
-                    version: 0,
-                    initializing: true,
-                    delivered: HashMap::new(),
-                });
-                resultset
-            }
-            Entry::Occupied(o) => o.get().resultset.clone(),
-        }
     }
 }
