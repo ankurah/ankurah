@@ -1,23 +1,36 @@
-use crate::value::ValueType;
+//! Key specs: the ordered parts an index sorts entities by, each with a
+//! direction and a place for nulls.
+
+use crate::{PropertyId, PropertyPath, ValueType};
 use serde::{Deserialize, Serialize};
 
+/// The composite key an index orders entities by: its parts in order, each
+/// with its direction and where its nulls go.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeySpec<K> {
+    /// The parts, most significant first.
     pub keyparts: Vec<IndexKeyPart<K>>,
 }
 
+/// Which way a key part sorts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IndexDirection {
+    /// Smallest value first.
     Asc,
+    /// Largest value first.
     Desc,
 }
 
+/// Where a key part files entities whose value is null.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NullsOrder {
+    /// Before every non-null value, PostgreSQL's NULLS FIRST.
     First,
+    /// After every non-null value, PostgreSQL's NULLS LAST.
     Last,
 }
 
+/// One part of a [`KeySpec`]: the property it sorts on and how.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct IndexKeyPart<K> {
     /// The property this key part sorts on. Core parameterizes `K` with
@@ -29,18 +42,41 @@ pub struct IndexKeyPart<K> {
     pub key: K,
     /// Optional path within property value (for JSON, future Ref, etc.)
     pub sub_path: Option<Vec<String>>,
-    pub direction: IndexDirection, // ASC/DESC
-    pub value_type: ValueType,     // Expected type for this key component
-    pub nulls: Option<NullsOrder>, // PG-style NULLS FIRST/LAST (optional)
-    pub collation: Option<String>, // collation name/id if relevant (optional)
+    /// Which way this part sorts.
+    pub direction: IndexDirection,
+    /// The type the value is encoded as, which fixes how this part's bytes sort.
+    pub value_type: ValueType,
+    /// Where nulls file, when the index says; PostgreSQL's NULLS FIRST or NULLS LAST.
+    pub nulls: Option<NullsOrder>,
+    /// The collation that orders a string part, when it is not plain byte order.
+    pub collation: Option<String>,
 }
 
 impl<K> IndexKeyPart<K> {
+    /// An ascending part on `key` with no sub-path, nulls order or collation.
     pub fn asc(key: impl Into<K>, value_type: ValueType) -> Self {
         Self { key: key.into(), sub_path: None, direction: IndexDirection::Asc, value_type, nulls: None, collation: None }
     }
+    /// A descending part on `key` with no sub-path, nulls order or collation.
     pub fn desc(key: impl Into<K>, value_type: ValueType) -> Self {
         Self { key: key.into(), sub_path: None, direction: IndexDirection::Desc, value_type, nulls: None, collation: None }
+    }
+}
+
+impl IndexKeyPart<PropertyId> {
+    /// The property path this part sorts on: its property and sub-path.
+    pub fn path(&self) -> PropertyPath {
+        let mut path = PropertyPath::from(self.key);
+        path.subpath = self.sub_path.clone().unwrap_or_default();
+        path
+    }
+
+    /// An ascending part on the property and sub-path of `path`, with no
+    /// nulls order or collation.
+    pub fn asc_on(path: &PropertyPath, value_type: ValueType) -> Self {
+        let mut part = Self::asc(path.property_id(), value_type);
+        part.sub_path = (!path.subpath.is_empty()).then(|| path.subpath.clone());
+        part
     }
 }
 
@@ -50,18 +86,6 @@ impl<K> IndexKeyPart<K> {
 /// back together. A resolved `IndexKeyPart<PropertyId>` has no string form
 /// to parse or reconstruct.
 impl IndexKeyPart<String> {
-    /// Create from a PathExpr (handles multi-step paths)
-    pub fn from_path(path: &ankql::ast::PathExpr, direction: IndexDirection, value_type: ValueType) -> Self {
-        let (key, sub_path) = if path.steps.len() == 1 {
-            (path.steps[0].clone(), None)
-        } else {
-            let key = path.steps[0].clone();
-            let sub_path = path.steps[1..].to_vec();
-            (key, Some(sub_path))
-        };
-        Self { key, sub_path, direction, value_type, nulls: None, collation: None }
-    }
-
     /// Full path as a flat string (e.g., "context.session_id")
     pub fn full_path(&self) -> String {
         match &self.sub_path {
@@ -95,10 +119,12 @@ impl IndexKeyPart<String> {
 }
 
 impl IndexDirection {
+    /// Whether this sorts largest value first.
     pub fn is_desc(&self) -> bool { matches!(self, IndexDirection::Desc) }
 }
 
 impl<K> KeySpec<K> {
+    /// A key spec of these parts, most significant first.
     pub fn new(keyparts: Vec<IndexKeyPart<K>>) -> Self { Self { keyparts } }
 }
 
@@ -177,6 +203,8 @@ impl<K: PartialEq> KeySpec<K> {
     }
 }
 
+/// The answer of [`KeySpec::matches`]: whether an index built on one key spec
+/// can serve a query ordered by another, as it is or scanned backwards.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum IndexSpecMatch {
     /// The index specs match

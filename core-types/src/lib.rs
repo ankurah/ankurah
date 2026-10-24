@@ -8,6 +8,7 @@ uniffi::setup_scaffolding!();
 
 mod entity_id;
 mod error;
+pub mod key_spec;
 mod model_id;
 mod path;
 mod property_id;
@@ -17,6 +18,7 @@ mod value_type;
 
 pub use entity_id::EntityId;
 pub use error::{DecodeError, IdParseError};
+pub use key_spec::{IndexDirection, IndexKeyPart, IndexSpecMatch, KeySpec, NullsOrder};
 pub use model_id::{ModelId, SystemModel};
 pub use path::Path;
 pub use property_id::{PropertyId, SystemProperty};
