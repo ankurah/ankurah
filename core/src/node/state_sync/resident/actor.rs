@@ -14,7 +14,7 @@ use crate::{
         Node, WeakNode,
     },
     policy::{ContextPolicy, PolicyAgent},
-    reactor::maintenance::{MaintenanceSubscription, SourceBatch, SourceError, SourceRevision, MAX_PENDING_BYTES},
+    reactor::maintenance::{MaintenanceSubscription, SourceBatch, SourceError, MAX_PENDING_BYTES},
     session::ContextData,
     storage::StorageEngine,
 };
@@ -67,14 +67,14 @@ impl<CD: ContextData> ResidentActor<CD> {
     /// The bytes this resident is charged against the LRU's idle allowance.
     pub(super) fn accounted_bytes(&self) -> usize { self.tree.accounted_bytes().saturating_add(self.candidates.len() * 64) }
 
-    /// Fold `batch` into the candidates and the tree. With `delivery`, return
+    /// Fold `changes` into the candidates and the tree. With `delivery`, return
     /// the changes to entities that were or now are members, for live routes.
-    pub(super) async fn apply(&mut self, batch: &SourceBatch<TreeUpdate>, delivery: bool) -> anyhow::Result<Vec<TreeUpdate>> {
+    pub(super) async fn apply(&mut self, changes: Vec<TreeUpdate>, delivery: bool) -> anyhow::Result<Vec<TreeUpdate>> {
         let mut affected = BTreeSet::new();
         let mut latest = BTreeMap::new();
-        for change in &batch.changes {
+        for change in &changes {
             fold_candidate(&mut self.candidates, change);
-            latest.insert(change.entity_id, change.entry.clone());
+            latest.insert(change.entity_id, change.entry.as_ref());
             if delivery && (self.tree.entries().contains_key(&change.entity_id) || change.entry.is_some()) {
                 affected.insert(change.entity_id);
             }
@@ -82,14 +82,13 @@ impl<CD: ContextData> ResidentActor<CD> {
         let mut entries = Vec::new();
         let mut removed = Vec::new();
         for (id, entry) in latest {
-            if let Some(entry) = entry {
-                entries.push(entry);
-            } else {
-                removed.push(id);
+            match entry {
+                Some(entry) => entries.push(entry.clone()),
+                None => removed.push(id),
             }
         }
         self.tree.apply(entries, removed).await?;
-        Ok(batch.changes.iter().filter(|change| affected.contains(&change.entity_id)).cloned().collect())
+        Ok(changes.into_iter().filter(|change| affected.contains(&change.entity_id)).collect())
     }
 
     async fn deliver<SE, PA>(
@@ -146,7 +145,7 @@ impl<CD: ContextData> ResidentActor<CD> {
 
     /// Bring the resident up to `batch`, the next committed changes, and
     /// deliver them to its live routes.
-    pub(super) async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Arc<SourceBatch<TreeUpdate>>) -> anyhow::Result<()>
+    pub(super) async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: SourceBatch<TreeUpdate>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -159,7 +158,7 @@ impl<CD: ContextData> ResidentActor<CD> {
             }
         } else {
             let window = self.cursor.fence().await?;
-            let pending = std::iter::once(batch).chain(window.batches).collect();
+            let pending = std::iter::once(batch).chain(window.batch).collect();
             return self.advance_complete(node, pending, window.revision.0).await;
         }
         self.revision = batch.revision.0;
@@ -171,7 +170,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     async fn advance_complete<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
-        pending: Vec<Arc<SourceBatch<TreeUpdate>>>,
+        pending: Vec<SourceBatch<TreeUpdate>>,
         revision: u64,
     ) -> anyhow::Result<()>
     where
@@ -184,12 +183,11 @@ impl<CD: ContextData> ResidentActor<CD> {
             ensure_catalog_unchanged(&self.identity, &batch)?;
             anyhow::ensure!(batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes), SourceError::Lagged);
             bytes += batch.bytes;
-            changes.extend(batch.changes.iter().cloned());
+            changes.extend(batch.changes);
         }
         self.routes.retain(|route| route.owner.strong_count() != 0);
         if !changes.is_empty() {
-            let batch = SourceBatch { revision: SourceRevision(revision), changes, catalog_changed: false, bytes };
-            let sources = self.apply(&batch, !self.routes.is_empty()).await?;
+            let sources = self.apply(changes, !self.routes.is_empty()).await?;
             if !sources.is_empty() {
                 self.deliver(node, revision, sources, None).await;
             }
@@ -204,7 +202,7 @@ impl<CD: ContextData> ResidentActor<CD> {
 
     /// Read a limited resident's cut again after `pending` touched it, fence
     /// the read, replace the tree's entries and deliver the new cut.
-    async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<Arc<SourceBatch<TreeUpdate>>>) -> anyhow::Result<()>
+    async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<SourceBatch<TreeUpdate>>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -216,7 +214,7 @@ impl<CD: ContextData> ResidentActor<CD> {
             attempts += 1;
             anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
             let window = self.cursor.fence().await?;
-            for batch in window.batches {
+            if let Some(batch) = window.batch {
                 ensure_catalog_unchanged(&self.identity, &batch)?;
                 anyhow::ensure!(batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes), SourceError::Lagged);
                 bytes += batch.bytes;
@@ -245,7 +243,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         };
         self.candidates = read.candidates;
         self.tree.replace(read.rows.into_values().collect()).await?;
-        let sources = pending.into_iter().flat_map(|batch| batch.changes.clone()).collect();
+        let sources = pending.into_iter().flat_map(|batch| batch.changes).collect();
         let members = self.tree.snapshot().query_members();
         let prepared = self.routes.iter().map(|_| Ok((members.clone(), read.ordered.clone()))).collect();
         self.deliver(node, revision, sources, Some(prepared)).await;
@@ -262,17 +260,17 @@ impl<CD: ContextData> ResidentActor<CD> {
         let window = self.cursor.fence().await?;
         if matches!(self.identity.coverage, Coverage::Limited(_)) {
             let mut relevant = false;
-            for batch in &window.batches {
+            if let Some(batch) = &window.batch {
                 ensure_catalog_unchanged(&self.identity, batch)?;
-                relevant |= self.identity.filtered.limit != Some(0) && self.relevant(batch);
+                relevant = self.identity.filtered.limit != Some(0) && self.relevant(batch);
             }
             if relevant {
-                self.refill(node, window.batches).await?;
+                self.refill(node, window.batch.into_iter().collect()).await?;
             } else {
                 self.revision = window.revision.0;
             }
         } else {
-            self.advance_complete(node, window.batches, window.revision.0).await?;
+            self.advance_complete(node, window.batch.into_iter().collect(), window.revision.0).await?;
         }
         Ok(self.tree.snapshot())
     }

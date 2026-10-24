@@ -508,7 +508,7 @@ async fn maintenance_respects_retrieval_permission_when_query_membership_is_unch
         let change = batch.changes.iter().find(|change| change.entity_id == current.entity_id).unwrap();
         assert!(change.matches, "all values still satisfy the query/discovery predicate");
         assert_eq!(change.entry.is_some(), readable, "maintenance must enforce the separate retrieval predicate");
-        actor.apply(&batch, false).await?;
+        actor.apply(batch.changes, false).await?;
         let snapshot = actor.tree.snapshot();
         assert_eq!(snapshot.entries.contains_key(&current.entity_id), readable);
         if readable {
@@ -519,7 +519,7 @@ async fn maintenance_respects_retrieval_permission_when_query_membership_is_unch
     let newly_readable = update(&initially_denied, "02")?;
     apply(&node, &newly_readable).await?;
     let batch = actor.cursor.next().await?;
-    actor.apply(&batch, false).await?;
+    actor.apply(batch.changes, false).await?;
     assert_eq!(
         actor.tree.entries()[&newly_readable.entity_id].head,
         proto::Clock::singleton(&newly_readable),
@@ -544,13 +544,13 @@ async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_
     assert!(actor.tree.entries().contains_key(&inside.entity_id));
     let mut route = routes::route(&node, &actor, selection).await?;
     apply(&node, &update(&outside, "08")?).await?;
-    for batch in actor.cursor.fence().await?.batches {
-        assert!(actor.apply(&batch, true).await?.is_empty());
+    if let Some(batch) = actor.cursor.fence().await?.batch {
+        assert!(actor.apply(batch.changes, true).await?.is_empty());
     }
     assert!(!actor.tree.entries().contains_key(&outside.entity_id));
     apply(&node, &update(&inside, "09")?).await?;
     let batch = actor.cursor.next().await?;
-    let changes = actor.apply(&batch, true).await?;
+    let changes = actor.apply(batch.changes, true).await?;
     assert_eq!(changes.len(), 1);
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     let changes = route.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &changes).await?;
@@ -679,7 +679,7 @@ async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<(
     let read_policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     read_policy.check_read(&initial.entity_id, &current_state(&node, initial.entity_id).await?.unwrap().state)?;
     assert_eq!(batch.changes[0].events[0], denied.id());
-    let changes = actor.apply(&batch, true).await?;
+    let changes = actor.apply(batch.changes, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     let error = route
         .changes(&node, &actor.identity.coverage, &actor.tree, &policy, &changes)

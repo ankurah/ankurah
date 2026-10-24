@@ -140,7 +140,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 match cursor.fence_unchanged_since(start).await {
                     Err(SourceError::Changed) => {
                         let window = cursor.fence().await?;
-                        for batch in &window.batches {
+                        if let Some(batch) = &window.batch {
                             ensure_catalog_unchanged(&identity, batch)?;
                         }
                         start = window.revision;
@@ -151,7 +151,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 }
             } else {
                 let window = cursor.fence().await?;
-                for batch in &window.batches {
+                if let Some(batch) = &window.batch {
                     ensure_catalog_unchanged(&identity, batch)?;
                     if selection.limit != Some(0) {
                         for change in &batch.changes {

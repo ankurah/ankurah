@@ -47,7 +47,7 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
     let moved = update(&events[0], "09")?;
     apply(&node, &moved).await?;
     let batch = actor.cursor.next().await?;
-    let sources = actor.apply(&batch, true).await?;
+    let sources = actor.apply(batch.changes, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     let changes_one = one.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
     let changes_two = two.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
@@ -93,7 +93,7 @@ async fn shared_tree_routes_apply_different_membership_predicates() -> anyhow::R
         let next = update(&current, value)?;
         apply(&node, &next).await?;
         let batch = actor.cursor.next().await?;
-        let sources = actor.apply(&batch, true).await?;
+        let sources = actor.apply(batch.changes, true).await?;
         let all_changes = all.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
         let narrow_changes = narrow.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
         assert_eq!(all_changes.len(), 1);
@@ -130,7 +130,7 @@ async fn a_denied_event_only_fails_routes_that_would_deliver_it() -> anyhow::Res
     let old = includes.members.clone();
     apply(&node, &denied).await?;
     let batch = actor.cursor.next().await?;
-    let sources = actor.apply(&batch, true).await?;
+    let sources = actor.apply(batch.changes, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     assert!(includes.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await.is_err());
     assert_eq!(includes.members, old, "a failed publication never partially advances route membership");
@@ -179,7 +179,7 @@ async fn unchanged_replacements_follow_query_order_after_commit_changes() -> any
     }
     let batch = actor.cursor.next().await?;
     assert_eq!(batch.changes.iter().map(|change| change.entity_id).collect::<Vec<_>>(), vec![events[2].entity_id, events[3].entity_id]);
-    let sources = actor.apply(&batch, true).await?;
+    let sources = actor.apply(batch.changes, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     let changes = route.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
     assert_eq!(

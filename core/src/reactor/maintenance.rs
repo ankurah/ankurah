@@ -45,9 +45,11 @@ pub(crate) struct SourceBatch<T> {
     pub(crate) bytes: usize,
 }
 
+/// What a fence hands its reader: the source's revision at the fence, and the
+/// reader's unconsumed changes up to it, coalesced into at most one batch.
 pub(crate) struct SourceWindow<T> {
     pub(crate) revision: SourceRevision,
-    pub(crate) batches: Vec<Arc<SourceBatch<T>>>,
+    pub(crate) batch: Option<SourceBatch<T>>,
 }
 
 #[derive(Clone)]
@@ -285,7 +287,7 @@ impl<T> MaintenanceSubscription<T> {
         if started.is_some_and(|started| started != revision) {
             return Err(SourceError::Changed);
         }
-        Ok(SourceWindow { revision, batches: reader.pending.take().map(Arc::new).into_iter().collect() })
+        Ok(SourceWindow { revision, batch: reader.pending.take() })
     }
 
     /// Narrow the bootstrap watch only when the supplied membership includes
@@ -318,7 +320,7 @@ impl<T> MaintenanceSubscription<T> {
         Ok(())
     }
 
-    pub(crate) async fn next(&mut self) -> Result<Arc<SourceBatch<T>>, SourceError> {
+    pub(crate) async fn next(&mut self) -> Result<SourceBatch<T>, SourceError> {
         loop {
             let notified = self.reader.notify.notified();
             {
@@ -327,7 +329,7 @@ impl<T> MaintenanceSubscription<T> {
                     return Err(error.clone());
                 }
                 if let Some(batch) = reader.pending.take() {
-                    return Ok(Arc::new(batch));
+                    return Ok(batch);
                 }
             }
             notified.await;

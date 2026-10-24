@@ -19,7 +19,7 @@ async fn maintenance_and_captures_retain_only_keys_and_cloned_heads() -> anyhow:
     let published = batch.changes.iter().find(|change| change.entity_id == id).unwrap();
     assert_eq!(published.entry.as_ref().unwrap().head, proto::Clock::singleton(&moved));
     assert_eq!(published.events, vec![moved.id()], "maintenance queues event IDs, not event bodies");
-    actor.apply(&batch, true).await?;
+    actor.apply(batch.changes, true).await?;
     let current = actor.tree.snapshot();
     assert_eq!(current.entries[&id].head, proto::Clock::singleton(&moved));
     assert_eq!(frozen.entries[&id].head, proto::Clock::singleton(&original));

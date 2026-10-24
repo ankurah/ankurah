@@ -92,11 +92,11 @@ async fn maintenance_projects_committed_metadata_before_public_notifications_wit
     apply(&node, &a, Delivery::Live).await?;
     let captured = first.fence().await?;
     assert!(captured.revision > start);
-    assert_eq!(captured.batches.len(), 1);
-    let row = captured.batches[0].changes[0].clone();
+    assert!(captured.batch.is_some());
+    let row = captured.batch.as_ref().unwrap().changes[0].clone();
     assert!(node.entities.get(&a.entity_id).is_none(), "queued metadata must not pin the resident entity");
     assert_eq!(row.head, proto::Clock::singleton(&a));
-    assert_eq!(captured.batches[0].changes[0].events[0], a.id());
+    assert_eq!(captured.batch.as_ref().unwrap().changes[0].events[0], a.id());
 
     let b = Event::update(a.entity_id, proto::Clock::singleton(&a), AuthorId::Unknown, OperationSet(vec![set("after")?]));
     apply(&node, &b, Delivery::Initial).await?;
@@ -109,10 +109,10 @@ async fn maintenance_projects_committed_metadata_before_public_notifications_wit
     assert_eq!(subsequent.changes[0].head, proto::Clock::singleton(&b));
     assert!(subsequent.changes[0].events.is_empty(), "initial application must not become a live event update");
     let second_window = second.fence().await?;
-    assert_eq!(second_window.batches.len(), 1);
-    assert_eq!(second_window.batches[0].changes.len(), 2, "one reader cannot consume another reader's bootstrap window");
-    assert_eq!(second_window.batches[0].changes[0].events, vec![a.id()]);
-    assert!(second_window.batches[0].changes[1].events.is_empty());
+    assert!(second_window.batch.is_some());
+    assert_eq!(second_window.batch.as_ref().unwrap().changes.len(), 2, "one reader cannot consume another reader's bootstrap window");
+    assert_eq!(second_window.batch.as_ref().unwrap().changes[0].events, vec![a.id()]);
+    assert!(second_window.batch.as_ref().unwrap().changes[1].events.is_empty());
     Ok(())
 }
 
@@ -123,16 +123,16 @@ async fn a_fence_drains_its_finite_window_and_leaves_later_commits_for_the_next_
     apply(&node, &genesis(2), Delivery::Live).await?;
     let first = cursor.fence().await?;
     assert!(first.revision > start);
-    assert_eq!(first.batches.len(), 1);
+    assert!(first.batch.is_some());
     let empty = cursor.fence().await?;
     assert_eq!(empty.revision, first.revision);
-    assert!(empty.batches.is_empty());
+    assert!(empty.batch.is_none());
     let later = genesis(3);
     apply(&node, &later, Delivery::Live).await?;
     let next = cursor.fence().await?;
     assert!(next.revision > first.revision);
-    assert_eq!(next.batches.len(), 1);
-    assert_eq!(next.batches[0].changes[0].id, later.entity_id);
+    assert!(next.batch.is_some());
+    assert_eq!(next.batch.as_ref().unwrap().changes[0].id, later.entity_id);
     Ok(())
 }
 
@@ -150,7 +150,7 @@ async fn cancellation_before_commit_does_not_invalidate_source() -> anyhow::Resu
         assert!(futures::poll!(&mut applying).is_pending());
         wait.await?;
     }
-    assert!(cursor.fence().await?.batches.is_empty());
+    assert!(cursor.fence().await?.batch.is_none());
     subscribe(&node).await?;
     Ok(())
 }
@@ -214,13 +214,13 @@ async fn lagged_reader_fails_without_invalidating_an_independent_reader() -> any
         }
         if count == 2 {
             let window = slow.fence().await?;
-            assert_eq!(window.batches.iter().map(|batch| batch.bytes).sum::<usize>(), MAX_PENDING_BYTES);
-            assert_eq!(window.batches.iter().map(|batch| batch.changes.len()).sum::<usize>(), 2);
+            assert_eq!(window.batch.iter().map(|batch| batch.bytes).sum::<usize>(), MAX_PENDING_BYTES);
+            assert_eq!(window.batch.iter().map(|batch| batch.changes.len()).sum::<usize>(), 2);
         }
     }
     assert!(matches!(slow.fence().await, Err(SourceError::Lagged)));
     assert!(matches!(slow.next().await, Err(SourceError::Lagged)));
-    assert!(current.fence().await?.batches.is_empty());
+    assert!(current.fence().await?.batch.is_none());
     subscribe(&node).await?;
     Ok(())
 }
@@ -259,10 +259,10 @@ async fn one_commit_and_4096_separate_commits_preserve_the_same_bounded_metadata
     let many_window = many_cursor.fence().await?;
     assert_eq!(one_window.revision.0, one_start.0 + 1);
     assert_eq!(many_window.revision.0, many_start.0 + 4096);
-    assert_eq!(one_window.batches.len(), 1);
-    assert_eq!(many_window.batches.len(), 1);
-    let one_batch = &one_window.batches[0];
-    let many_batch = &many_window.batches[0];
+    assert!(one_window.batch.is_some());
+    assert!(many_window.batch.is_some());
+    let one_batch = one_window.batch.as_ref().unwrap();
+    let many_batch = many_window.batch.as_ref().unwrap();
     assert_eq!(many_batch.revision, many_window.revision, "the coalesced window ends at its newest publication");
     assert_eq!(many_batch.changes.len(), 4096);
     assert_eq!(one_batch.changes, many_batch.changes, "entity heads and event IDs retain publication order");
@@ -290,9 +290,9 @@ async fn next_detaches_a_window_before_later_publications() -> anyhow::Result<()
     apply(&node, &later, Delivery::Live).await?;
     let next = cursor.fence().await?;
     assert_eq!(detached.changes.iter().flat_map(|head| head.events.clone()).collect::<Vec<_>>(), vec![first.id(), second.id()]);
-    assert_eq!(next.batches.len(), 1);
-    assert_eq!(next.batches[0].changes.len(), 1);
-    assert_eq!(next.batches[0].changes[0].events, vec![later.id()]);
+    assert!(next.batch.is_some());
+    assert_eq!(next.batch.as_ref().unwrap().changes.len(), 1);
+    assert_eq!(next.batch.as_ref().unwrap().changes[0].events, vec![later.id()]);
     assert!(next.revision > detached.revision);
     Ok(())
 }
@@ -310,8 +310,8 @@ async fn coalescing_preserves_catalog_invalidation_before_later_ordinary_changes
     let later = genesis(63);
     apply(&node, &later, Delivery::Live).await?;
     let window = cursor.fence().await?;
-    assert_eq!(window.batches.len(), 1);
-    let batch = &window.batches[0];
+    assert!(window.batch.is_some());
+    let batch = window.batch.as_ref().unwrap();
     assert!(batch.catalog_changed);
     assert_eq!(batch.revision, window.revision);
     assert_eq!(batch.changes.iter().map(|head| head.id).collect::<Vec<_>>(), vec![first.entity_id, catalog.entity_id, later.entity_id]);
@@ -359,9 +359,9 @@ async fn a_commit_batch_and_its_fence_cannot_be_half_published() -> anyhow::Resu
     let (transaction, window) = tokio::join!(transaction, fence);
     transaction?;
     let window = window?;
-    assert_eq!(window.batches.len(), 1);
-    assert_eq!(window.batches[0].changes.len(), 2);
-    for (change, event) in window.batches[0].changes.iter().zip(&events) {
+    assert!(window.batch.is_some());
+    assert_eq!(window.batch.as_ref().unwrap().changes.len(), 2);
+    for (change, event) in window.batch.as_ref().unwrap().changes.iter().zip(&events) {
         assert_eq!(change.head, proto::Clock::singleton(event));
         assert_eq!(change.events[0], event.id());
     }
@@ -388,10 +388,10 @@ async fn limited_read_validation_preserves_crossing_publications_for_retry() -> 
     apply(&node, &genesis(17), Delivery::Live).await?;
     assert!(matches!(cursor.fence_unchanged_since(start).await, Err(SourceError::Changed)));
     let window = cursor.fence().await?;
-    assert_eq!(window.batches.len(), 1);
+    assert!(window.batch.is_some());
     let unchanged = cursor.fence_unchanged_since(window.revision).await?;
     assert_eq!(unchanged.revision, window.revision);
-    assert!(unchanged.batches.is_empty());
+    assert!(unchanged.batch.is_none());
     Ok(())
 }
 
@@ -403,7 +403,7 @@ async fn finishing_bootstrap_cannot_drop_a_commit_crossing_the_scan() -> anyhow:
     apply(&node, &event, Delivery::Initial).await?;
     assert!(matches!(cursor.finish_bootstrap(Predicate::False, [], start).await, Err(SourceError::Changed)));
     let window = cursor.fence().await?;
-    assert_eq!(window.batches[0].changes[0].head, proto::Clock::singleton(&event));
+    assert_eq!(window.batch.as_ref().unwrap().changes[0].head, proto::Clock::singleton(&event));
     cursor.finish_bootstrap(Predicate::False, [event.entity_id], window.revision).await?;
 
     // Even a predicate with no entry candidates must retain the explicitly
@@ -445,7 +445,7 @@ async fn maintenance_routes_model_candidates_and_removes_departed_entity_watches
         OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([8; 32]))))]),
     );
     apply(&node, &unrelated, Delivery::Initial).await?;
-    assert!(cursor.fence().await?.batches.is_empty(), "other models are not projected");
+    assert!(cursor.fence().await?.batch.is_none(), "other models are not projected");
 
     let set = |value: &str| -> anyhow::Result<Operation> {
         let backend = LWWBackend::new();
@@ -516,9 +516,9 @@ async fn catalog_changes_reach_maintenance_without_any_predicate_candidate() -> 
         .await?;
     node.reactor.begin_commit().await.publish(&[EntityChange::new(entity, Vec::new())], false);
     let window = cursor.fence().await?;
-    assert_eq!(window.batches.len(), 1);
-    assert!(window.batches[0].catalog_changed);
-    assert!(window.batches[0].changes.is_empty());
+    assert!(window.batch.is_some());
+    assert!(window.batch.as_ref().unwrap().catalog_changed);
+    assert!(window.batch.as_ref().unwrap().changes.is_empty());
     Ok(())
 }
 

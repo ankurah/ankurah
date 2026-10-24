@@ -34,7 +34,7 @@ async fn reactor_publication_evaluates_the_state_free_read_proof_for_each_change
         let batch = actor.cursor.next().await?;
         assert_eq!(checks.load(Ordering::Relaxed) - before, usize::from(!readable), "only an unavailable proof needs a state check");
         assert_eq!(proofs.load(Ordering::Relaxed) - before_proofs, 1, "each publication evaluates permission afresh");
-        actor.apply(&batch, false).await?;
+        actor.apply(batch.changes, false).await?;
         let snapshot = actor.tree.snapshot();
         assert_eq!(snapshot.entries.contains_key(&current.entity_id), readable);
         if readable {
