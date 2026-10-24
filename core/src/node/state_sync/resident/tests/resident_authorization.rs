@@ -25,7 +25,7 @@ async fn a_restricted_residents_publications_evaluate_its_admitting_proof_afresh
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    assert!(!view(&actor, &selected, &node.catalog).await?.entries.contains_key(&current.entity_id));
+    assert!(!view(&actor, &selected, &node.catalog)?.entries.contains_key(&current.entity_id));
 
     for (readable, value) in [(true, "02"), (false, "03"), (true, "04")] {
         allowed.store(readable, Ordering::SeqCst);

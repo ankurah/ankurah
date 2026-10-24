@@ -175,14 +175,14 @@ impl Coverage {
             Self::Limited(original) => original == selection,
         }
     }
-    pub(super) async fn select(
+    pub(super) fn select(
         &self,
         snapshot: Snapshot,
         selection: &Selection<Resolved>,
         catalog: &crate::schema::catalog::CatalogManager,
     ) -> anyhow::Result<Snapshot> {
         match self {
-            Self::Complete => snapshot.select(selection, catalog).await,
+            Self::Complete => snapshot.select(selection, catalog),
             Self::Limited(original) => {
                 anyhow::ensure!(original == selection, "limited resident does not cover this selection");
                 Ok(snapshot)

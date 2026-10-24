@@ -107,14 +107,13 @@ impl<CD: ContextData> ResidentActor<CD> {
             if route.owner.strong_count() == 0 {
                 continue;
             }
-            let changes = async {
+            let changes = (|| {
                 // Each route reads for its own principal, checked afresh.
                 let policy = ContextPolicy::from_credentials(&node.policy_agent, &route.credentials);
                 ensure_filter_unchanged(&policy, &route.selection, &route.filtered)?;
                 self.identity.ensure_holder_admitted(&policy)?;
-                route.changes(&self.identity.coverage, &self.tree, &node.catalog, &affected, refill.as_ref()).await
-            }
-            .await;
+                route.changes(&self.identity.coverage, &self.tree, &node.catalog, &affected, refill.as_ref())
+            })();
             match changes {
                 Ok(changes) => publications.push((route, changes)),
                 Err(error) => fail_route(node, &route, &error),
@@ -362,18 +361,17 @@ impl<CD: ContextData> ResidentActor<CD> {
                 return Err(error);
             }
         };
-        let selected = async {
+        let selected = (|| {
             let view = command.view();
             let policy = ContextPolicy::from_credentials(&node.policy_agent, &view.credentials);
             ensure_filter_unchanged(&policy, &view.selection, &view.filtered)?;
             self.identity.ensure_holder_admitted(&policy)?;
-            self.identity.coverage.select(snapshot, &view.selection, &node.catalog).await?.with_spec(
+            self.identity.coverage.select(snapshot, &view.selection, &node.catalog)?.with_spec(
                 view.spec.clone(),
                 &view.selection,
                 &node.catalog,
             )
-        }
-        .await;
+        })();
         let snapshot = match selected {
             Ok(snapshot) => snapshot,
             Err(error) => {

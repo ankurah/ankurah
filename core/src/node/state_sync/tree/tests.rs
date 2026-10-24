@@ -557,7 +557,7 @@ async fn catalog_arrival_preserves_an_accepted_entity_id_fallback() -> anyhow::R
 async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyhow::Result<()> {
     let rows = (0..256).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
     let mut cache = QueryTree::new(keyed_spec(), Entries::new());
-    let mut view = cache.replace_values(rows.clone()).await?.select_request(&range_request(200, None, false)).await?;
+    let mut view = cache.replace_values(rows.clone()).await?.select_request(&range_request(200, None, false))?;
     assert_eq!(view.entries.len(), 55);
     assert_eq!(
         view.members.values().copied().collect::<Vec<_>>(),
@@ -593,8 +593,8 @@ async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Re
     let rows = (0..8).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
     let mut cache = QueryTree::new(keyed_spec(), Entries::new());
     cache.replace_values(rows).await?;
-    let mut low = cache.snapshot().select_request(&range_request(-1000, Some(2), false)).await?;
-    let mut high = cache.snapshot().select_request(&range_request(-1000, Some(3), true)).await?;
+    let mut low = cache.snapshot().select_request(&range_request(-1000, Some(2), false))?;
+    let mut high = cache.snapshot().select_request(&range_request(-1000, Some(3), true))?;
     assert_eq!(
         low.entries.keys().copied().collect::<Vec<_>>(),
         (0..2).map(|id| numbered_state(id, 1).payload.entity_id).collect::<Vec<_>>()
@@ -614,7 +614,7 @@ async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Re
     );
 
     cache.apply_values(vec![keyed_state(99, 2, Some(Value::I64(-10)))?], vec![]).await?;
-    let after = cache.snapshot().select_request(&range_request(-1000, Some(2), false)).await?;
+    let after = cache.snapshot().select_request(&range_request(-1000, Some(2), false))?;
     assert_eq!(after.entries.keys().copied().collect::<Vec<_>>(), [0, 99].map(|id| numbered_state(id, 1).payload.entity_id));
     assert_eq!(low.span_digest(proto::TreeSpan::all()).await?, low_before);
     assert_eq!(high.span_digest(proto::TreeSpan::all()).await?, high_before);
@@ -628,8 +628,8 @@ async fn limited_peers_answer_bounds_using_their_own_cut() -> anyhow::Result<()>
     let mut responder = QueryTree::new(keyed_spec(), Entries::new());
     let request = range_request(-1, Some(2), false);
     let rows = |ids: &[u32]| ids.iter().map(|id| keyed_state(*id, 1, Some(Value::I64(*id as i64)))).collect::<anyhow::Result<Vec<_>>>();
-    let mut left = requester.replace_values(rows(&[0, 3, 4])?).await?.select_request(&request).await?;
-    let mut right = responder.replace_values(rows(&[1, 2, 4])?).await?.select_request(&request).await?;
+    let mut left = requester.replace_values(rows(&[0, 3, 4])?).await?.select_request(&request)?;
+    let mut right = responder.replace_values(rows(&[1, 2, 4])?).await?.select_request(&request)?;
     for view in [&mut left, &mut right] {
         let offer = view.offer().await?;
         let [proto::SpanContent::Heads(inventory)] = offer.spans.as_slice() else { panic!("limited inventory") };
@@ -663,7 +663,7 @@ async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> 
     let mut cache = QueryTree::new(spec(), Entries::new());
     let full = cache.refresh_states((0..3).map(|id| state(id, 1)).collect()).await?;
 
-    let mut view = full.with_spec(wire_spec.clone(), &selection, &catalog)?.select(&selection, &catalog).await?;
+    let mut view = full.with_spec(wire_spec.clone(), &selection, &catalog)?.select(&selection, &catalog)?;
     assert_eq!(view.spec, wire_spec);
     assert_eq!(view.span_digest(proto::TreeSpan::all()).await?.digest.count(), 2);
     assert_eq!(&*cache.spec, &spec());
@@ -678,7 +678,7 @@ async fn zero_limit_view_does_not_empty_the_resident_tree() -> anyhow::Result<()
     let full = cache.refresh_states((0..8).map(|id| state(id, 1)).collect()).await?;
     let mut selection = Selection::from(ankql::ast::Predicate::True);
     selection.limit = Some(0);
-    let mut view = full.select(&selection, &CatalogManager::default()).await?;
+    let mut view = full.select(&selection, &CatalogManager::default())?;
     assert!(view.entries.is_empty());
     assert_eq!(view.span_digest(proto::TreeSpan::all()).await?.digest, Digest::empty());
 

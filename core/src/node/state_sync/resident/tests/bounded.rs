@@ -27,9 +27,9 @@ async fn bounded_capture_retries_to_find_an_unchanged_replacement() -> anyhow::R
     assert_eq!(actor.candidates.len(), 1);
     assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans + 2, "the raced bounded scan must be repeated");
     let mut different = selection(Some(2));
-    assert!(view(&actor, &different, &node.catalog).await.is_err());
+    assert!(view(&actor, &different, &node.catalog).is_err());
     different.limit = None;
-    assert!(view(&actor, &different, &node.catalog).await.is_err());
+    assert!(view(&actor, &different, &node.catalog).is_err());
     Ok(())
 }
 

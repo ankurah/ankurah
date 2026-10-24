@@ -44,7 +44,7 @@ async fn unknown_and_nested_ordering_cannot_select_a_complete_tree() -> anyhow::
             assert!(request_for(&selection, &catalog).is_err(), "ordering cannot use the scalar planner");
             let snapshot = cache.snapshot();
             assert!(snapshot.cannot_select(&selection, &catalog));
-            let error = snapshot.select(&selection, &catalog).await.err().unwrap();
+            let error = snapshot.select(&selection, &catalog).err().unwrap();
             assert!(error.downcast_ref::<UnsupportedTreeSelection>().is_some());
         }
         assert_eq!(cache.snapshot().entries.len(), 4);
@@ -70,7 +70,7 @@ async fn descending_scalar_limit_with_missing_values_requires_storage_ordering()
     let mut cache = QueryTree::new(spec, Entries::new());
     let view = cache.refresh_states(rows).await?;
     assert!(view.cannot_select(&selection, &catalog));
-    assert!(view.select(&selection, &catalog).await.err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
+    assert!(view.select(&selection, &catalog).err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
     Ok(())
 }
 
@@ -109,7 +109,7 @@ async fn narrower_descending_null_scope_cannot_select_a_complete_tree() -> anyho
     let mut cache = QueryTree::new(spec.clone(), Entries::new());
     let snapshot = cache.refresh_states(rows).await?;
     assert!(snapshot.cannot_select(&selection, &catalog));
-    assert!(snapshot.select(&selection, &catalog).await.err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
+    assert!(snapshot.select(&selection, &catalog).err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
     assert_eq!(cache.snapshot().entries.len(), 5);
     Ok(())
 }
@@ -133,7 +133,7 @@ async fn descending_scalar_limit_cannot_select_a_complete_tree_even_without_miss
     // The rule reads the selection alone: whether today's rows happen to
     // carry the value cannot decide how a shared tree ranks them tomorrow.
     assert!(snapshot.cannot_select(&selection, &catalog));
-    assert!(snapshot.select(&selection, &catalog).await.is_err());
+    assert!(snapshot.select(&selection, &catalog).is_err());
     Ok(())
 }
 
@@ -192,7 +192,7 @@ async fn descending_range_reuses_a_broader_tree_with_nulls_outside_the_range() -
         .collect::<anyhow::Result<_>>()?;
     let snapshot = tree.refresh_states(rows).await?;
     assert!(!snapshot.cannot_select(&selection, &catalog));
-    let selected = snapshot.select(&selection, &catalog).await?;
+    let selected = snapshot.select(&selection, &catalog)?;
     assert_eq!(selected.entries.keys().copied().collect::<Vec<_>>(), [state(3, 1).payload.entity_id]);
     assert_eq!(tree.snapshot().entries.len(), 3);
     Ok(())

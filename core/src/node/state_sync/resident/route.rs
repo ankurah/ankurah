@@ -79,7 +79,7 @@ impl<CD> Route<CD> {
     /// The membership changes `affected` makes to this route, in the order
     /// the publication committed them, then the entities a moved cut admits
     /// or drops. `refill` is a limited resident's new cut, when it has one.
-    pub(super) async fn changes(
+    pub(super) fn changes(
         &mut self,
         coverage: &Coverage,
         tree: &QueryTree,
@@ -91,7 +91,7 @@ impl<CD> Route<CD> {
             (RouteMembers::Spans(spans), _) => return Ok(spanned_changes(spans, affected)),
             (RouteMembers::Listed(_), Some(refill)) => (refill.members.clone(), refill.ordered.clone()),
             (RouteMembers::Listed(_), None) => {
-                let selected = coverage.select(tree.snapshot(), &self.selection, catalog).await?;
+                let selected = coverage.select(tree.snapshot(), &self.selection, catalog)?;
                 (Arc::new(selected.query_members()), selected.ordered_ids(&self.selection, catalog)?)
             }
         };

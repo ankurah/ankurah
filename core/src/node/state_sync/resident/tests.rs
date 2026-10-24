@@ -222,7 +222,7 @@ async fn delivered<PA: PolicyAgent<ContextData = &'static crate::policy::Default
     route: &mut Route<PA::ContextData>,
     affected: &[Affected],
 ) -> anyhow::Result<Vec<proto::QueryChange>> {
-    let changes = route.changes(&actor.identity.coverage, &actor.tree, &node.catalog, affected, None).await?;
+    let changes = route.changes(&actor.identity.coverage, &actor.tree, &node.catalog, affected, None)?;
     let read = LiveRead::of(node, changes.iter().map(|change| change.entity_id).collect(), affected).await?;
     crate::node::state_sync::server::live_items(node, &route.credentials, changes, &read)
 }
@@ -242,12 +242,8 @@ fn members_of<CD: ContextData>(route: &Route<CD>, actor: &ResidentActor<CD>) -> 
 }
 
 /// The view `selection` selects from `actor`'s tree as it stands.
-async fn view<CD: ContextData>(
-    actor: &ResidentActor<CD>,
-    selection: &Selection<Resolved>,
-    catalog: &CatalogManager,
-) -> anyhow::Result<Snapshot> {
-    actor.identity.coverage.select(actor.tree.snapshot(), selection, catalog).await
+fn view<CD: ContextData>(actor: &ResidentActor<CD>, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Snapshot> {
+    actor.identity.coverage.select(actor.tree.snapshot(), selection, catalog)
 }
 
 impl<CD: ContextData> ResidentLease<CD> {
@@ -301,7 +297,7 @@ async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read(
     apply(&node, &b).await?;
     release.send(()).unwrap();
     let actor = capture.await?;
-    let captured = view(&actor, &selection, &node.catalog).await?;
+    let captured = view(&actor, &selection, &node.catalog)?;
     assert_eq!(actor.tree.entries().len(), 2);
     assert_eq!(captured.entries[&a.entity_id].head, proto::Clock::singleton(&moved));
     assert!(captured.entries.contains_key(&b.entity_id));
@@ -323,7 +319,7 @@ async fn a_complete_id_keyed_tree_cannot_select_an_unindexed_ordered_limit() -> 
     let selection = selection(Some(1));
     let by_id = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
     let actor = complete_resident(&node, by_id, vec![DEFAULT_CONTEXT]).await?;
-    assert!(view(&actor, &selection, &node.catalog).await.is_err(), "a complete tree cannot rank properties absent from its keys");
+    assert!(view(&actor, &selection, &node.catalog).is_err(), "a complete tree cannot rank properties absent from its keys");
     assert_eq!(actor.tree.entries().len(), 2, "a failed scope never truncates the resident admission");
     assert_eq!(
         actor.tree.snapshot().member_map().values().copied().collect::<Vec<_>>(),
@@ -352,7 +348,7 @@ async fn full_capture_folds_changes_before_resolving_a_limit_with_unchanged_entr
     release.send(()).unwrap();
     let actor = capture.await?;
     assert_eq!(actor.tree.entries().len(), 3, "the unchanged replacement is already resident");
-    let captured = view(&actor, &selection, &node.catalog).await?;
+    let captured = view(&actor, &selection, &node.catalog)?;
     assert_eq!(captured.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
     assert_eq!(
         node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed),
@@ -382,16 +378,16 @@ async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutati
     let selection = selection(Some(2));
     let spec = spec_for(&selection, &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    let frozen = view(&actor, &selection, &node.catalog).await?;
+    let frozen = view(&actor, &selection, &node.catalog)?;
     let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let moved_a = update(&events[0], "09")?;
     apply(&node, &moved_a).await?;
-    let intermediate = actor.refresh(&node).await?.select(&selection, &node.catalog).await?;
+    let intermediate = actor.refresh(&node).await?.select(&selection, &node.catalog)?;
     assert_eq!(intermediate.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
     // C now moves past A. The next scope must re-admit unchanged A from the
     // same resident tree, while both previous comparisons stay frozen.
     apply(&node, &update(&events[2], "10")?).await?;
-    let current = actor.refresh(&node).await?.select(&selection, &node.catalog).await?;
+    let current = actor.refresh(&node).await?.select(&selection, &node.catalog)?;
     assert_eq!(current.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[0].entity_id, events[1].entity_id]));
     assert_eq!(current.entries[&events[0].entity_id].head, proto::Clock::singleton(&moved_a));
     assert_eq!(frozen.entries[&events[0].entity_id].head, proto::Clock::singleton(&events[0]));
@@ -561,7 +557,7 @@ async fn maintenance_respects_retrieval_permission_when_query_membership_is_unch
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    let captured = view(&actor, &selected, &node.catalog).await?;
+    let captured = view(&actor, &selected, &node.catalog)?;
     assert!(captured.entries.contains_key(&initial.entity_id));
     assert!(!captured.entries.contains_key(&initially_denied.entity_id));
 
@@ -680,7 +676,7 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
     assert!(Weak::ptr_eq(&full.identity(), &reused), "both limits reuse the complete resident");
     let snapshot = full.snapshot().await?.snapshot;
     assert_eq!(snapshot.entries.len(), 3, "the resident keeps the full admission");
-    let snapshot = snapshot.select(&selection(Some(1)), &node.catalog).await?;
+    let snapshot = snapshot.select(&selection(Some(1)), &node.catalog)?;
     assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
     assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans);
     handler.remove_predicate(&node, query).await?;

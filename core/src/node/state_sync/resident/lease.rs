@@ -15,16 +15,17 @@ use std::sync::{
 };
 use tokio::sync::{mpsc, oneshot, Notify};
 
+/// The handle every lease of one resident shares: the channel to its actor,
+/// the stop signal its drop sends, the wake for its routes' cleanup, whether
+/// its actor still runs, and how many leases pin it.
 pub(super) struct Resident<CD: ContextData> {
     pub(super) commands: mpsc::Sender<Command<CD>>,
-    pub(super) stop: Mutex<Option<oneshot::Sender<()>>>,
+    /// Dropped with the last handle, which stops the actor.
+    pub(super) _stop: oneshot::Sender<()>,
     pub(super) cleanup: Arc<Notify>,
     pub(super) alive: AtomicBool,
     pub(super) pins: AtomicUsize,
     pub(super) lru: Weak<Mutex<Lru<CD>>>,
-}
-impl<CD: ContextData> Drop for Resident<CD> {
-    fn drop(&mut self) { self.stop.lock().unwrap().take(); }
 }
 
 /// Type-erased ownership lets live queries and protocol drivers hold the same RAII lease
@@ -34,6 +35,8 @@ pub(crate) struct ResidentPin {
     _lease: Arc<dyn Send + Sync>,
 }
 
+/// A pin on one resident, with the view its holder reads: while any lease
+/// lives, the LRU keeps the resident.
 pub(crate) struct ResidentLease<CD: ContextData> {
     pub(super) resident: Arc<Resident<CD>>,
     pub(super) view: Arc<QueryView<CD>>,
@@ -106,8 +109,9 @@ impl<CD: ContextData> Drop for ResidentLease<CD> {
     }
 }
 
-/// Transport lifetime is separate from resident tree identity. Dropping this
-/// route stops its live delivery, while the idle tree stays maintained in the LRU.
+/// A peer's live route on a resident, and the lease that keeps the resident.
+/// Dropping it stops the route's delivery; the resident stays maintained in
+/// the LRU.
 pub(crate) struct ResidentSubscription<CD: ContextData> {
     pub(super) lease: ResidentLease<CD>,
     owner: Option<Arc<()>>,
@@ -134,10 +138,12 @@ impl<CD: ContextData> Drop for ResidentSubscription<CD> {
     }
 }
 
+/// A snapshot of a resident's view, and the source revision it reflects.
 pub(crate) struct ResidentSnapshot {
     pub(crate) revision: u64,
     pub(crate) snapshot: Snapshot,
 }
+/// What a lease asks its resident's actor to do, each answered on its own channel.
 pub(super) enum Command<CD: ContextData> {
     Snapshot {
         view: Arc<QueryView<CD>>,
@@ -173,8 +179,9 @@ impl<CD: ContextData> Command<CD> {
     }
 
     pub(super) fn reject(self, error: &anyhow::Error) {
+        // A source error keeps its kind for the retry checks; any other keeps its causes.
         let error =
-            error.downcast_ref::<SourceError>().map_or_else(|| anyhow::anyhow!(error.to_string()), |error| anyhow::anyhow!(error.clone()));
+            error.downcast_ref::<SourceError>().map_or_else(|| anyhow::anyhow!("{error:#}"), |error| anyhow::anyhow!(error.clone()));
         match self {
             Self::Snapshot { response, .. } => {
                 let _ = response.send(Err(error));

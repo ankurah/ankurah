@@ -6,7 +6,7 @@ pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::
     selection: Selection<Resolved>,
 ) -> anyhow::Result<Route<PA::ContextData>> {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let snapshot = view(actor, &selection, &node.catalog).await?;
+    let snapshot = view(actor, &selection, &node.catalog)?;
     let mut filtered = selection.clone();
     filtered.predicate = policy.filter_predicate(filtered.predicate)?;
     let members = RouteMembers::of(&snapshot, &selection);
@@ -43,7 +43,7 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
     }
     let spec = spec_for(&selection(Some(2)), &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    let frozen = view(&actor, &selection(Some(1)), &node.catalog).await?;
+    let frozen = view(&actor, &selection(Some(1)), &node.catalog)?;
     let mut one = route(&node, &actor, selection(Some(1))).await?;
     let mut two = route(&node, &actor, selection(Some(2))).await?;
     let moved = update(&events[0], "09")?;

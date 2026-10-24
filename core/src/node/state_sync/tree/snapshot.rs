@@ -137,7 +137,7 @@ impl Snapshot {
 
     /// Select a query view without changing the maintained tree. Scope gaps are
     /// empty query addresses even when the resident contains other leaves there.
-    pub async fn select(mut self, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Self> {
+    pub fn select(mut self, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Self> {
         anyhow::ensure!(self.ranges.is_none(), "a query view cannot be selected again");
         if self.physical_spec.predicate() == &selection.predicate && selection.limit.is_none() {
             return Ok(self);
@@ -147,10 +147,10 @@ impl Snapshot {
             return Ok(self);
         }
         anyhow::ensure!(!self.cannot_select(selection, catalog), UnsupportedTreeSelection);
-        self.select_request(&request_for(selection, catalog)?).await
+        self.select_request(&request_for(selection, catalog)?)
     }
 
-    pub(super) async fn select_request(mut self, request: &TreeRequest) -> anyhow::Result<Self> {
+    pub(super) fn select_request(mut self, request: &TreeRequest) -> anyhow::Result<Self> {
         let ranges = self.physical_spec.selected_spans(request, &self.members)?;
         self.restrict(ranges);
         Ok(self)

@@ -9,7 +9,7 @@ async fn maintenance_and_captures_retain_only_keys_and_cloned_heads() -> anyhow:
     let spec = spec_for(&selected, &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let id = original.entity_id;
-    let frozen = view(&actor, &selected, &node.catalog).await?;
+    let frozen = view(&actor, &selected, &node.catalog)?;
     assert_eq!(frozen.entries[&id].head, proto::Clock::singleton(&original));
     assert!(node.entities.get(&id).is_none(), "a resident tree must not pin an entity");
 

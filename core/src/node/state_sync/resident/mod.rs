@@ -206,7 +206,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         let cleanup = Arc::new(Notify::new());
         let resident = Arc::new(Resident {
             commands,
-            stop: Mutex::new(Some(stop)),
+            _stop: stop,
             cleanup: cleanup.clone(),
             alive: AtomicBool::new(true),
             pins: AtomicUsize::new(0),

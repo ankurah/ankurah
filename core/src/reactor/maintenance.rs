@@ -243,8 +243,8 @@ impl SourceCommit {
             self.finished = true;
             return;
         }
-        let Some(revision) = source.revision.checked_add(1) else { return };
-        source.revision = revision;
+        source.revision += 1;
+        let revision = source.revision;
         source.readers.retain(|_, reader| reader.strong_count() != 0);
         let catalog_changed = changes.iter().any(|change| change.entity().memberships().iter().any(crate::schema::is_catalog_model));
         let changes = Arc::new(changes.iter().collect::<Vec<_>>());
