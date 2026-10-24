@@ -7,7 +7,7 @@ mod common;
 
 use ankurah_core::storage::StorageEngine;
 use ankurah_proto::{ModelId, SystemModel, PROTOCOL_VERSION};
-use ankurah_storage_sqlite::SqliteStorageEngine;
+use ankurah_storage_sqlite::{SqliteError, SqliteStorageEngine};
 use common::TempDb;
 // The same tests run natively under tokio, and on wasm32 under wasm-bindgen-test in Node.
 #[cfg(not(target_arch = "wasm32"))]
@@ -81,6 +81,29 @@ async fn mismatched_version_refuses() -> anyhow::Result<()> {
         Err(e) => e.to_string(),
     };
     assert!(err.contains("999") && err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the found and expected versions: {err}");
+    Ok(())
+}
+
+/// A version record that is not TEXT fails the open with `SqliteError::Row`,
+/// on every driver, where main failed it with rusqlite's `InvalidColumnType`.
+#[engine_test]
+async fn a_version_record_that_is_not_text_refuses() -> anyhow::Result<()> {
+    let db = TempDb::new("not_text");
+    {
+        let _engine = common::open(db.path()).await?;
+    }
+
+    {
+        let conn = db.raw();
+        conn.execute(r#"UPDATE "_ankurah_meta" SET "value" = NULL WHERE "key" = 'protocol_version'"#, &[])?;
+    }
+
+    let err = match common::open(db.path()).await {
+        Ok(_) => panic!("expected a NULL version record to refuse the open"),
+        Err(e) => e,
+    };
+    assert!(matches!(err.downcast_ref::<SqliteError>(), Some(SqliteError::Row(_))), "{err:?}");
+    assert!(err.to_string().contains("column 0 holds NULL where TEXT was expected"), "{err}");
     Ok(())
 }
 

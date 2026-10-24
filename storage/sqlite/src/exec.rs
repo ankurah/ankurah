@@ -186,6 +186,9 @@ impl Row {
     }
 }
 
+/// The refusal of a value of another storage class, the same on both
+/// drivers. Changed from main, where rusqlite's typed getters refused it as
+/// `InvalidColumnType`, naming the column; this message names it by position.
 fn mismatch(index: usize, found: &SqliteValue, expected: &str) -> SqliteError {
     let found = if matches!(found, SqliteValue::Null) { "NULL" } else { found.sqlite_type() };
     SqliteError::Row(format!("column {index} holds {found} where {expected} was expected"))

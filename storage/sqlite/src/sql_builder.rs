@@ -158,6 +158,12 @@ impl SqlBuilder {
         self.params.push(value);
     }
 
+    /// The SQL and its parameters, in the engine's own value type, which every
+    /// driver binds; `build_where_clause` returns them alike. Changed from
+    /// main, which returned rusqlite's `Value`s and offered
+    /// `SqliteValue::to_sql`, neither of which a wasm32 build can name. A
+    /// native caller binds the parameters with
+    /// `rusqlite::params_from_iter(params.iter().map(SqliteValueRef::from))`.
     pub fn build(self) -> Result<(String, Vec<SqliteValue>), SqlGenerationError> {
         if self.fields.is_empty() || self.table_name.is_none() {
             // Just return WHERE clause

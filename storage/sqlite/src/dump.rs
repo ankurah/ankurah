@@ -132,7 +132,10 @@ fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
         )
     };
     // One read snapshot for the page, so each state's memberships are read as
-    // of the state itself.
+    // of the state itself. Main had that snapshot without a transaction: its
+    // page's statement was still stepping while each membership was read, and
+    // SQLite ends a read only when the connection's last statement finishes.
+    // The executor reads the whole page first, so here the transaction keeps it.
     let snapshot = conn.begin(Behavior::Deferred)?;
     let rows = snapshot.query(&query, &arguments)?;
     let mut last = None;

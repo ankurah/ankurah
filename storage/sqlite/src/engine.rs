@@ -294,6 +294,8 @@ impl SqliteStorageEngine {
                     )?;
                     // Re-read: if another process recorded between our scan and
                     // our insert, the store must still match this binary.
+                    // Changed from main, which reported a record gone by now
+                    // as rusqlite's QueryReturnedNoRows.
                     let reread = c
                         .query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])?
                         .ok_or_else(|| SqliteError::CorruptRecord("the protocol version record vanished after it was written".into()))?;
