@@ -1,6 +1,6 @@
-//! The subscription side of queries whose membership a remote peer's state stream decides:
-//! reconciling a query's rows with a stream's answer, and evaluating a stream's publication for
-//! the query that owns it.
+//! The subscription side of queries whose membership a remote peer's state stream decides: what
+//! one change, local or from a stream, does to a query's membership; reconciling a query's rows
+//! with a stream's answer; and evaluating a stream's publication for the query that owns it.
 
 use super::{membership_item, QueryState, Subscription};
 use crate::{

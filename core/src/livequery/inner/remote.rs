@@ -29,10 +29,14 @@ pub(super) struct RemoteStream {
     decides_membership: Arc<std::sync::atomic::AtomicBool>,
     /// The ids the stream admitted into the query.
     admitted: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
+    /// Recompares the query on this stream, once the stream's driver provides it.
     refresh: Option<crate::node::state_sync::RefreshHandle>,
 }
 
 impl LiveQueryInner {
+    /// Bind the stream opened for `version`, replacing any earlier one. The query is not
+    /// initialized from the new stream until it installs, and the stream starts out admitting the
+    /// query's current rows.
     pub(in crate::livequery) fn bind_remote_stream(
         &self,
         version: u32,
@@ -68,6 +72,7 @@ impl LiveQueryInner {
         drop(results);
     }
 
+    /// Replace the ids the stream admitted; `false` once the stream is superseded.
     pub(in crate::livequery) fn set_admitted(
         &self,
         version: u32,
@@ -92,6 +97,8 @@ impl LiveQueryInner {
         }
     }
 
+    /// Keep `version`'s resident tree pinned, so that the tree stays resident across peer
+    /// disconnections while that version is current.
     pub(in crate::livequery) fn retain_tree(&self, version: u32, pin: Option<crate::node::state_sync::ResidentPin>) {
         let _state = self.version_lock.lock().unwrap_or_else(|error| error.into_inner());
         if self.is_current(version) {
@@ -108,6 +115,7 @@ impl LiveQueryInner {
         self.remote_stream.lock().unwrap().as_ref().is_some_and(|stream| stream.version == version && stream.activated)
     }
 
+    /// Whether `version`'s stream is bound but has not completed initializing the query.
     pub(in crate::livequery) fn remote_stream_pending(&self, version: u32) -> bool {
         self.remote_stream.lock().unwrap().as_ref().is_some_and(|stream| stream.version == version && !stream.activated)
     }
@@ -119,6 +127,8 @@ impl LiveQueryInner {
             })
     }
 
+    /// The stream for `version` closed or failed: it stops deciding the query's membership, and
+    /// the query is no longer initialized or durably answered from it.
     pub(in crate::livequery) fn lose_remote_stream(&self, version: u32, origin: &proto::RequestId) {
         let mut results = self.resultset.write();
         let state = self.version_lock.lock().unwrap_or_else(|error| error.into_inner());
