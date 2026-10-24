@@ -16,9 +16,8 @@ use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, Ev
 use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
 
-use crate::driver::{self, Pool, PooledConnection};
 use crate::error::SqliteError;
-use crate::exec::{Behavior, Row, SqliteExecutor};
+use crate::executor::{self, Behavior, Pool, PooledConnection, Row, SqliteExecutor};
 use crate::value::{SqliteValue, SqliteValueRef};
 
 mod materialization;
@@ -180,10 +179,10 @@ impl SqliteStorageEngine {
     }
 
     /// Open a file-based SQLite database
-    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> { Self::new(driver::file_pool(path.as_ref()).await?).await }
+    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> { Self::new(executor::file_pool(path.as_ref()).await?).await }
 
     /// Open an in-memory SQLite database (for testing)
-    pub async fn open_in_memory() -> anyhow::Result<Self> { Self::new(driver::memory_pool().await?).await }
+    pub async fn open_in_memory() -> anyhow::Result<Self> { Self::new(executor::memory_pool().await?).await }
 
     /// Check whether a physical SQLite name uses only the supported characters.
     pub fn sane_name(name: &str) -> bool {
@@ -199,6 +198,18 @@ impl SqliteStorageEngine {
 
     /// Get a reference to the connection pool (for testing/diagnostics)
     pub fn pool(&self) -> &Pool { &self.pool }
+
+    /// Run a closure on one of the engine's connections through the executor
+    /// boundary: raw SQL access for embedders and tests, on every driver, with
+    /// the differences listed on [`SqliteExecutor`].
+    pub async fn with_executor<F, T>(&self, f: F) -> Result<T, SqliteError>
+    where
+        F: FnOnce(&dyn SqliteExecutor) -> Result<T, SqliteError> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = self.pool().get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
+        conn.with_executor(f).await
+    }
 
     pub(crate) async fn ensure_shared_tables(&self, conn: &PooledConnection) -> Result<(), SqliteError> {
         conn.with_executor(|c| {

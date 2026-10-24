@@ -5,7 +5,7 @@
 mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
-use ankurah_storage_sqlite::{exec::SqliteExecutor, NodeJsConnection, SqliteStorageEngine, SqliteValueRef};
+use ankurah_storage_sqlite::{executor::SqliteExecutor, NodeJsConnection, SqliteStorageEngine, SqliteValueRef};
 use anyhow::Result;
 use common::{host_database, on_better_sqlite3, Album, AlbumView};
 use js_sys::{Function, Reflect};

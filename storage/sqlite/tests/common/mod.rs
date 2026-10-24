@@ -260,12 +260,14 @@ impl TempDb {
 
     /// A second connection on the file, for edits behind the engine's back.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::exec::SqliteExecutor> { Box::new(rusqlite::Connection::open(&self.0).unwrap()) }
+    pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::executor::SqliteExecutor> {
+        Box::new(rusqlite::Connection::open(&self.0).unwrap())
+    }
 
     /// A second connection on the file, for edits behind the engine's back,
     /// on the engine's driver (see [`LOCK_HOLDER`] for why).
     #[cfg(target_arch = "wasm32")]
-    pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::exec::SqliteExecutor> {
+    pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::executor::SqliteExecutor> {
         Box::new(if driver::on_better_sqlite3() {
             ankurah_storage_sqlite::NodeJsConnection::from_database(driver::host_database(self.path_str())).unwrap()
         } else {

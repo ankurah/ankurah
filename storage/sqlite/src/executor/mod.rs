@@ -4,14 +4,35 @@
 //! SQLite driver. Everything above it decides *which* SQL to run: the shared
 //! tables, the per-model materializations and their column maps, the pushdown
 //! predicate, the exact-head commit. Everything below it runs that SQL on one
-//! SQLite connection: `native.rs` over rusqlite, and on wasm32 `nodejs.rs` over
+//! SQLite connection: `native` over rusqlite, and on wasm32 `nodejs` over
 //! Node.js's built-in `node:sqlite` module, or over a better-sqlite3 database
 //! that a host hands the engine through `SqliteStorageEngine::from_database`.
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod native;
+#[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
+pub(crate) mod nodejs;
+mod statement_scan;
+
+// The executor this target compiles: `native` over rusqlite, or on wasm32
+// `nodejs`, over Node.js's node:sqlite or a better-sqlite3 database the host
+// hands over. The engine reaches it only through four items, which each
+// executor provides:
+// - `Pool`, the engine's pool, whose `get()` hands out a pooled connection;
+// - `PooledConnection`, the connection it hands out, whose `with_executor`
+//   runs a closure on it through `SqliteExecutor`;
+// - `file_pool(path)`, the pool `SqliteStorageEngine::open` opens;
+// - `memory_pool()`, the pool `SqliteStorageEngine::open_in_memory` opens.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) use native::connection::{file_pool, memory_pool, Pool, PooledConnection};
+#[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
+pub(crate) use nodejs::{file_pool, memory_pool, Pool, PooledConnection};
+#[cfg(all(target_arch = "wasm32", not(feature = "nodejs")))]
+compile_error!("on wasm32, ankurah-storage-sqlite runs on a JavaScript SQLite: enable the `nodejs` feature for Node.js's node:sqlite");
 
 use crate::{
     error::SqliteError,
     value::{SqliteValue, SqliteValueRef},
-    SqliteStorageEngine,
 };
 
 /// One SQLite connection, driven synchronously and in order.
@@ -218,18 +239,4 @@ impl Row {
 fn mismatch(index: usize, found: &SqliteValue, expected: &str) -> SqliteError {
     let found = if matches!(found, SqliteValue::Null) { "NULL" } else { found.sqlite_type() };
     SqliteError::Row(format!("column {index} holds {found} where {expected} was expected"))
-}
-
-impl SqliteStorageEngine {
-    /// Run a closure on one of the engine's connections through the executor
-    /// boundary: raw SQL access for embedders and tests, on every driver, with
-    /// the differences listed on [`SqliteExecutor`].
-    pub async fn with_executor<F, T>(&self, f: F) -> Result<T, SqliteError>
-    where
-        F: FnOnce(&dyn SqliteExecutor) -> Result<T, SqliteError> + Send + 'static,
-        T: Send + 'static,
-    {
-        let conn = self.pool().get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
-        conn.with_executor(f).await
-    }
 }

@@ -5,7 +5,7 @@ mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
 use ankurah_storage_sqlite::{
-    exec::{Behavior, Row, SqliteExecutor},
+    executor::{Behavior, Row, SqliteExecutor},
     SqliteError, SqliteStorageEngine, SqliteValue, SqliteValueRef,
 };
 use anyhow::Result;

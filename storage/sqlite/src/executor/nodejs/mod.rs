@@ -1,0 +1,268 @@
+//! The Node.js executor: Node.js's built-in `node:sqlite` module, driven from WASM.
+//!
+//! The WASM build of an Ankurah node has no IndexedDB inside Node.js (a VS
+//! Code extension host, an Electron main process, a JavaScript CLI) and no
+//! native library either, but Node.js ships SQLite as `node:sqlite`. The
+//! engine reaches it through a `DatabaseSync`-shaped JavaScript object:
+//! `prepare(sql)` giving statements with `run(...params)`, `get(...params)`,
+//! `all(...params)`, `columns()` and `sourceSQL`, plus `exec(sql)`. Node.js's
+//! own `DatabaseSync` has that shape; the executor runs on Node.js 22.20.0 or
+//! later (see `NODE_FLOOR`). Compatible
+//! drivers must also support positional rows and BigInt INTEGER results; the
+//! adapter recognizes better-sqlite3's `raw` and `safeIntegers` methods for
+//! these capabilities, and its `source` for `sourceSQL`.
+//! Hosts can adopt an existing database with [`SqliteStorageEngine::from_database`];
+//! [`NodeJsConnection::open`] constructs Node.js's directly through
+//! `process.getBuiltinModule`. Every call is synchronous, which suits the
+//! single-threaded WASM host: the engine's closures simply run in place.
+
+mod adoption;
+mod kept_readers;
+mod parameters;
+mod runtime;
+mod statement;
+mod typed_reader;
+
+use std::{cell::RefCell, path::Path, rc::Rc};
+
+use js_sys::Reflect;
+use send_wrapper::SendWrapper;
+use wasm_bindgen::JsValue;
+
+use crate::{
+    error::SqliteError,
+    executor::{statement_scan, Row, SqliteExecutor},
+    value::SqliteValueRef,
+    SqliteStorageEngine,
+};
+use kept_readers::Readers;
+use parameters::{refuse_a_named_parameter, CheckedParameters};
+use statement::{
+    check_source, integer_from_js, js_error, js_params, method, refuse_a_second_statement, source, statement_method, take, width, Rows,
+};
+use typed_reader::{plain_row, typed_reader, typed_row};
+
+/// The engine names the connection its pool hands out `PooledConnection`;
+/// here the pool holds a single database.
+pub(crate) use NodeJsConnection as PooledConnection;
+/// The engine's pool on Node.js.
+pub(crate) type Pool = NodeJsPool;
+
+/// The pool behind `SqliteStorageEngine::open`.
+pub(crate) async fn file_pool(path: &Path) -> anyhow::Result<Pool> {
+    let path = path.to_str().ok_or_else(|| anyhow::anyhow!("the database path is not valid UTF-8"))?;
+    Ok(NodeJsPool::new(NodeJsConnection::open(path)?))
+}
+
+/// The pool behind `SqliteStorageEngine::open_in_memory`.
+pub(crate) async fn memory_pool() -> anyhow::Result<Pool> { Ok(NodeJsPool::new(NodeJsConnection::open(":memory:")?)) }
+
+impl SqliteStorageEngine {
+    /// Adopt a database object the host constructed: Node.js's `DatabaseSync`, or
+    /// a compatible driver whose statements support positional arrays and BigInt
+    /// INTEGER results. The host owns session settings, including busy timeout.
+    ///
+    /// A driver such as better-sqlite3 brings a copy of SQLite of its own, and
+    /// two copies in one process cannot coordinate the file locks SQLite
+    /// takes, which belong to the process: one copy closing the file can drop
+    /// the locks the other holds, which SQLite's notes on corruption list as a
+    /// way to corrupt it. So a host that adopts such a database on a file must
+    /// not open the same file with another copy in the same process, as
+    /// [`SqliteStorageEngine::open`] would with node:sqlite's.
+    pub async fn from_database(database: JsValue) -> anyhow::Result<Self> {
+        Self::new(NodeJsPool::new(NodeJsConnection::from_database(database)?)).await
+    }
+
+    /// The JavaScript database object this engine runs on, for a host that
+    /// wants to share it or reopen the engine over it.
+    pub fn database(&self) -> &JsValue { self.pool().connection().database() }
+}
+
+/// One `DatabaseSync`-shaped database. Clones share the same JavaScript
+/// object, the same kept typed readers and the same checked parameter counts.
+#[derive(Clone)]
+pub struct NodeJsConnection {
+    // The JavaScript handles are bound to the thread that made them; WASM has one.
+    database: SendWrapper<JsValue>,
+    readers: SendWrapper<Rc<RefCell<Readers>>>,
+    /// `None` on a database that refuses a call passing too few values itself.
+    parameters: Option<SendWrapper<CheckedParameters>>,
+}
+
+impl NodeJsConnection {
+    /// The JavaScript database object.
+    pub fn database(&self) -> &JsValue { &self.database }
+
+    /// Run one or more statements that yield nothing, as `exec` does.
+    pub fn exec(&self, sql: &str) -> Result<(), SqliteError> {
+        method(&self.database, "exec")?.call1(&self.database, &sql.into()).map_err(js_error)?;
+        Ok(())
+    }
+
+    /// Run a closure against this database through the executor boundary.
+    /// Everything happens synchronously on the calling thread.
+    pub async fn with_executor<F, T>(&self, f: F) -> Result<T, SqliteError>
+    where
+        F: FnOnce(&dyn SqliteExecutor) -> Result<T, SqliteError> + Send + 'static,
+        T: Send + 'static,
+    {
+        f(self)
+    }
+
+    /// The count of rows `run()` reports it changed, which must fit a usize:
+    /// SQLite's changes(), as rusqlite reports it. node:sqlite's `run()`
+    /// reports changes() itself, as a BigInt, since its statements here read
+    /// BigInts. better-sqlite3's reports it as a number whatever its
+    /// statements read, and as 0 after a statement that changed no rows
+    /// itself, where changes() is still the count of the last INSERT, UPDATE
+    /// or DELETE; for that 0, changes() is read.
+    fn changed_rows(&self, result: &JsValue) -> Result<usize, SqliteError> {
+        let changes = Reflect::get(result, &"changes".into()).map_err(js_error)?;
+        let count = match changes.as_f64() {
+            Some(0.0) => return self.changes(),
+            Some(count) if count.fract() == 0.0 => count as i64,
+            _ => integer_from_js(&changes)?,
+        };
+        usize::try_from(count).map_err(|_| SqliteError::Node(format!("`run()` reported {count} changed rows")))
+    }
+
+    /// SQLite's changes(): the count of rows the connection's last INSERT,
+    /// UPDATE or DELETE changed, read through one statement prepared once,
+    /// whose INTEGER needs no typed reader.
+    fn changes(&self) -> Result<usize, SqliteError> {
+        let prepared = self.readers.borrow().changes_statement.clone();
+        let statement = match prepared {
+            Some(statement) => statement,
+            None => {
+                let statement = self.prepare("SELECT changes()")?;
+                self.readers.borrow_mut().changes_statement = Some(statement.clone());
+                statement
+            }
+        };
+        let row =
+            take(&statement, &[], 1, Rows::First)?.pop().ok_or_else(|| SqliteError::Node("`SELECT changes()` returned no row".into()))?;
+        let changes = integer_from_js(&row.get(0))?;
+        usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
+    }
+}
+
+/// The Node.js executor's stand-in for a pool: one database, handed out by clone.
+#[derive(Clone)]
+pub struct NodeJsPool {
+    connection: NodeJsConnection,
+}
+
+impl NodeJsPool {
+    pub fn new(connection: NodeJsConnection) -> Self { Self { connection } }
+
+    pub async fn get(&self) -> Result<NodeJsConnection, SqliteError> { Ok(self.connection.clone()) }
+
+    pub fn connection(&self) -> &NodeJsConnection { &self.connection }
+}
+
+impl SqliteExecutor for NodeJsConnection {
+    /// Runs a statement as rusqlite's `execute` does: one step, refusing the
+    /// statement when that step yields a row, since a statement that returns
+    /// rows belongs to `query`. node:sqlite's `run` takes the step and
+    /// discards the row.
+    fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
+        refuse_a_second_statement(sql)?;
+        let statement = self.prepare(sql)?;
+        let source = source(&statement)?;
+        check_source(sql, &source)?;
+        refuse_a_named_parameter(&source)?;
+        let width = width(&statement)?;
+        self.check_parameters(sql, params.len())?;
+        if width == 0 {
+            // A statement without columns yields no row.
+            let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
+            return self.changed_rows(&result);
+        }
+        // `get` takes one step and resets the statement, returning the row
+        // the step yielded, or undefined when it finished the statement.
+        let row = statement_method(&statement, "get")?.apply(&statement, &js_params(params)).map_err(js_error)?;
+        if !row.is_undefined() {
+            // rusqlite's words for the same refusal.
+            return Err(SqliteError::Node("Execute returned results - did you mean to call query?".into()));
+        }
+        // rusqlite then reports the connection's count of changed rows, which
+        // a statement that yields rows leaves as the last change set it.
+        self.changes()
+    }
+
+    fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> { self.read(sql, params, Rows::All) }
+
+    /// Steps the statement's reader once, through `get()`, where a typed
+    /// reader has still computed every row of the statement it nests, which
+    /// it materializes; only the first is read and checked.
+    fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+        Ok(self.read(sql, params, Rows::First)?.into_iter().next())
+    }
+}
+
+impl NodeJsConnection {
+    /// Run the statement `sql` holds and read the rows `rows` names.
+    fn read(&self, sql: &str, params: &[SqliteValueRef<'_>], rows: Rows) -> Result<Vec<Row>, SqliteError> {
+        if let Some((reader, width)) = self.kept_reader(sql)? {
+            self.check_parameters(sql, params.len())?;
+            match take(&reader, params, 2 * width, rows) {
+                Ok(taken) => return taken.into_iter().map(typed_row).collect(),
+                // A kept reader can fail where one prepared afresh would not:
+                // the executor watches the schema versions of main and temp
+                // only, so a reader of an attached database's table can name
+                // fewer columns than SQLite now finds there. Its error is
+                // dropped, with the reader, and the statement read once more
+                // as on its first run, which returns its own error if it fails
+                // too; the query the reader nests only reads, so running it
+                // again changes nothing.
+                Err(_) => self.drop_reader(sql),
+            }
+        }
+        refuse_a_second_statement(sql)?;
+        let statement = self.prepare(sql)?;
+        let source = source(&statement)?;
+        check_source(sql, &source)?;
+        refuse_a_named_parameter(&source)?;
+        let width = width(&statement)?;
+        self.check_parameters(sql, params.len())?;
+        if width == 0 {
+            // A statement without columns yields no rows; it runs for its
+            // effect, through `run`, since better-sqlite3 refuses `all` on a
+            // statement it reports yields no rows.
+            statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
+            return Ok(Vec::new());
+        }
+        match self.prepare(&typed_reader(&source, width)) {
+            Ok(reader) => {
+                // Checked once for each SQL text, since a kept reader skips it.
+                self.refuse_a_compound_select(&source, params)?;
+                self.keep_reader(sql, &reader, width);
+                take(&reader, params, 2 * width, rows)?.into_iter().map(typed_row).collect()
+            }
+            // The typed reader reads each column as two, so SQLite refuses to
+            // prepare the reader of a query that yields more than half of its
+            // column limit, 2000 by default, though it prepared the query.
+            Err(too_wide) if too_wide.to_string().contains("too many columns in result set") => Err(SqliteError::Node(format!(
+                "the statement yields {width} columns, and the Node.js executor's typed reader reads each as two, its \
+                 storage class and its value, so it reads at most half of SQLite's column limit, 1000 of the default \
+                 2000 columns ({too_wide})"
+            ))),
+            // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
+            // in a WITH clause. A PRAGMA or an EXPLAIN is read as the database
+            // hands it over, its TEXT as a string (see `plain_row`). Any other
+            // statement that yields rows, such as one with a RETURNING clause,
+            // could write before a TEXT value in its rows were refused, so it
+            // is refused before it runs.
+            Err(nesting) => {
+                if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| statement_scan::first_keyword(&source).eq_ignore_ascii_case(keyword)) {
+                    return Err(SqliteError::Node(format!(
+                        "the Node.js executor reads rows exactly only from a query SQLite can nest in a WITH clause, which this \
+                         statement is not ({nesting}); a statement such as one with a RETURNING clause could write before a \
+                         value of its rows were refused, so it is not run: write with `execute` and read with a query"
+                    )));
+                }
+                take(&statement, params, width, rows)?.into_iter().map(|row| plain_row(row, &nesting)).collect()
+            }
+        }
+    }
+}

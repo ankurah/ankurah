@@ -11,9 +11,8 @@ use async_trait::async_trait;
 use futures_util::{stream, Stream};
 
 use crate::{
-    driver::Pool,
     engine::{ENTITY_MODEL_TABLE, ENTITY_TABLE, EVENT_TABLE},
-    exec::SqliteExecutor,
+    executor::{Pool, SqliteExecutor},
     value::SqliteValueRef,
     SqliteError, SqliteStorageEngine,
 };

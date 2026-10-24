@@ -13,7 +13,7 @@
 
 /// A token of SQL, as the scans tell tokens apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+enum TokenKind {
     /// Whitespace, a comment or a UTF-8 byte order mark: what SQLite skips.
     Space,
     Semicolon,
@@ -28,7 +28,7 @@ enum Kind {
 
 /// The tokens of `sql`, each with its text, up to the end or a NUL, where
 /// SQLite stops reading SQL.
-fn tokens(sql: &str) -> impl Iterator<Item = (Kind, &str)> {
+fn tokens(sql: &str) -> impl Iterator<Item = (TokenKind, &str)> {
     let mut at = 0;
     std::iter::from_fn(move || {
         let rest = &sql.as_bytes()[at..];
@@ -36,32 +36,34 @@ fn tokens(sql: &str) -> impl Iterator<Item = (Kind, &str)> {
             [] | [0, ..] => return None,
             // A run of whitespace begins with one of five characters and goes
             // on through any of six: the vertical tab only continues one.
-            [b' ' | b'\t' | b'\n' | b'\x0c' | b'\r', run @ ..] => (Kind::Space, 1 + run.iter().take_while(|&&byte| is_space(byte)).count()),
+            [b' ' | b'\t' | b'\n' | b'\x0c' | b'\r', run @ ..] => {
+                (TokenKind::Space, 1 + run.iter().take_while(|&&byte| is_space(byte)).count())
+            }
             // A UTF-8 byte order mark at the start of a token is whitespace.
-            [0xef, 0xbb, 0xbf, ..] => (Kind::Space, 3),
-            [b'-', b'-', comment @ ..] => (Kind::Space, 2 + comment.iter().take_while(|&&byte| byte != b'\n' && byte != 0).count()),
+            [0xef, 0xbb, 0xbf, ..] => (TokenKind::Space, 3),
+            [b'-', b'-', comment @ ..] => (TokenKind::Space, 2 + comment.iter().take_while(|&&byte| byte != b'\n' && byte != 0).count()),
             // `/*` with nothing after it is a slash, not a comment; a comment
             // with no `*/` runs to the end.
             [b'/', b'*', comment @ ..] if comment.first().is_some_and(|&byte| byte != 0) => {
                 let comment = &comment[..comment.iter().position(|&byte| byte == 0).unwrap_or(comment.len())];
-                (Kind::Space, 2 + comment.windows(2).position(|pair| pair == b"*/").map_or(comment.len(), |end| end + 2))
+                (TokenKind::Space, 2 + comment.windows(2).position(|pair| pair == b"*/").map_or(comment.len(), |end| end + 2))
             }
-            [b';', ..] => (Kind::Semicolon, 1),
-            [quote @ (b'\'' | b'"' | b'`'), ..] => (Kind::Other, quoted(rest, *quote)),
+            [b';', ..] => (TokenKind::Semicolon, 1),
+            [quote @ (b'\'' | b'"' | b'`'), ..] => (TokenKind::Other, quoted(rest, *quote)),
             [b'[', ..] => (
-                Kind::Other,
+                TokenKind::Other,
                 match rest.iter().position(|&byte| byte == b']' || byte == 0) {
                     Some(end) if rest[end] == b']' => end + 1,
                     Some(end) => end,
                     None => rest.len(),
                 },
             ),
-            [b':' | b'@' | b'#' | b'$', ..] => (Kind::Parameter, parameter(rest)),
-            [b'?', digits @ ..] => (Kind::Other, 1 + digits.iter().take_while(|byte| byte.is_ascii_digit()).count()),
+            [b':' | b'@' | b'#' | b'$', ..] => (TokenKind::Parameter, parameter(rest)),
+            [b'?', digits @ ..] => (TokenKind::Other, 1 + digits.iter().take_while(|byte| byte.is_ascii_digit()).count()),
             // An identifier, a keyword or a number, which a parameter cannot
             // begin inside: `$` continues an identifier.
-            [byte, ..] if is_identifier_byte(*byte) => (Kind::Word, rest.iter().take_while(|&&byte| is_identifier_byte(byte)).count()),
-            _ => (Kind::Other, 1),
+            [byte, ..] if is_identifier_byte(*byte) => (TokenKind::Word, rest.iter().take_while(|&&byte| is_identifier_byte(byte)).count()),
+            _ => (TokenKind::Other, 1),
         };
         let token = &sql[at..at + length];
         at += length;
@@ -120,7 +122,7 @@ fn offset(sql: &str, token: &str) -> usize { token.as_ptr() as usize - sql.as_pt
 
 /// Whether `sql` holds only what SQLite skips between statements:
 /// whitespace, comments and semicolons, up to the end or a NUL.
-pub(crate) fn is_filler(sql: &str) -> bool { tokens(sql).all(|(kind, _)| matches!(kind, Kind::Space | Kind::Semicolon)) }
+pub(crate) fn holds_no_statement(sql: &str) -> bool { tokens(sql).all(|(kind, _)| matches!(kind, TokenKind::Space | TokenKind::Semicolon)) }
 
 /// Where the first statement of `sql` ends: just past the semicolon that
 /// ends it, or where the SQL ends (at its end or a NUL) when none does. The
@@ -134,28 +136,29 @@ pub(crate) fn statement_end(sql: &str) -> usize {
     for (kind, token) in tokens(sql) {
         end = offset(sql, token) + token.len();
         let token = match kind {
-            Kind::Space => continue,
-            Kind::Semicolon => Token::Semicolon,
-            Kind::Word => Token::of_word(token),
-            Kind::Parameter | Kind::Other => Token::Other,
+            TokenKind::Space => continue,
+            TokenKind::Semicolon => CompletionToken::Semicolon,
+            TokenKind::Word => CompletionToken::of_word(token),
+            TokenKind::Parameter | TokenKind::Other => CompletionToken::Other,
         };
         state = NEXT[state as usize][token as usize];
-        if token == Token::Semicolon && state == State::Start && begun {
+        if token == CompletionToken::Semicolon && state == State::Start && begun {
             return end;
         }
-        begun |= token != Token::Semicolon;
+        begun |= token != CompletionToken::Semicolon;
     }
     end
 }
 
 /// Whether `sql` holds a second statement after its first.
-pub(crate) fn holds_a_second_statement(sql: &str) -> bool { !is_filler(&sql[statement_end(sql)..]) }
+pub(crate) fn holds_a_second_statement(sql: &str) -> bool { !holds_no_statement(&sql[statement_end(sql)..]) }
 
 /// `sql` past what SQLite skips before its first statement.
 #[cfg(any(test, all(target_arch = "wasm32", feature = "nodejs")))]
-pub(crate) fn past_filler(sql: &str) -> &str {
-    let start =
-        tokens(sql).find(|(kind, _)| !matches!(kind, Kind::Space | Kind::Semicolon)).map_or(sql.len(), |(_, token)| offset(sql, token));
+pub(crate) fn skip_to_statement(sql: &str) -> &str {
+    let start = tokens(sql)
+        .find(|(kind, _)| !matches!(kind, TokenKind::Space | TokenKind::Semicolon))
+        .map_or(sql.len(), |(_, token)| offset(sql, token));
     &sql[start..]
 }
 
@@ -163,8 +166,8 @@ pub(crate) fn past_filler(sql: &str) -> &str {
 /// an empty string when it begins with no word.
 #[cfg(any(test, all(target_arch = "wasm32", feature = "nodejs")))]
 pub(crate) fn first_keyword(sql: &str) -> &str {
-    match tokens(past_filler(sql)).next() {
-        Some((Kind::Word, word)) => word,
+    match tokens(skip_to_statement(sql)).next() {
+        Some((TokenKind::Word, word)) => word,
         _ => "",
     }
 }
@@ -175,7 +178,7 @@ pub(crate) fn first_keyword(sql: &str) -> &str {
 /// that form, and fails to prepare SQL that uses it.
 #[cfg(any(test, all(target_arch = "wasm32", feature = "nodejs")))]
 pub(crate) fn named_parameters(sql: &str) -> Vec<&str> {
-    tokens(sql).filter(|(kind, _)| *kind == Kind::Parameter).map(|(_, parameter)| parameter).collect()
+    tokens(sql).filter(|(kind, _)| *kind == TokenKind::Parameter).map(|(_, parameter)| parameter).collect()
 }
 
 /// The states of `sqlite3_complete`, which follows a statement to its end:
@@ -196,7 +199,7 @@ enum State {
 /// The tokens `sqlite3_complete` tells apart, past whitespace and comments,
 /// which change no state.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Token {
+enum CompletionToken {
     Semicolon,
     Other,
     Explain,
@@ -206,15 +209,15 @@ enum Token {
     End,
 }
 
-impl Token {
+impl CompletionToken {
     fn of_word(word: &str) -> Self {
         match word.to_ascii_lowercase().as_str() {
-            "explain" => Token::Explain,
-            "create" => Token::Create,
-            "temp" | "temporary" => Token::Temp,
-            "trigger" => Token::Trigger,
-            "end" => Token::End,
-            _ => Token::Other,
+            "explain" => CompletionToken::Explain,
+            "create" => CompletionToken::Create,
+            "temp" | "temporary" => CompletionToken::Temp,
+            "trigger" => CompletionToken::Trigger,
+            "end" => CompletionToken::End,
+            _ => CompletionToken::Other,
         }
     }
 }
@@ -235,13 +238,42 @@ const NEXT: [[State; 7]; 7] = {
     ]
 };
 
+/// SQL on either side of holding no statement, on which `holds_no_statement`
+/// is checked against SQLite's own reading, natively and on node:sqlite:
+/// whitespace, semicolons and comments, ended or not, byte order marks and
+/// SQL past a NUL, beside characters and statements SQLite does not skip.
+#[cfg(test)]
+const NO_STATEMENT_CANDIDATES: &[&str] = &[
+    "",
+    " \t\n\x0c\r",
+    " \x0b",
+    "\x0b",
+    ";",
+    " ; ;",
+    " ; ;; ",
+    "-- c",
+    "-- c\n;",
+    "-",
+    "/* c */",
+    "/**/",
+    "/*/",
+    "/* unended",
+    "/*",
+    "/",
+    "\u{FEFF}",
+    " \u{FEFF};\u{FEFF} ",
+    "\0 SELECT 1",
+    " SELECT 1",
+    "x",
+];
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::{collections::HashSet, ffi::CString};
 
     use rusqlite::{ffi, Batch, Connection};
 
-    use super::{first_keyword, is_filler, named_parameters, past_filler, statement_end};
+    use super::{first_keyword, holds_no_statement, named_parameters, skip_to_statement, statement_end, NO_STATEMENT_CANDIDATES};
 
     /// The tables the statements below read.
     const SCHEMA: &str = r#"CREATE TABLE t (a, "b:c", [d@e], `f$g`, "h""i", a$b, "x--y", "p/*q", `j``k`); CREATE TABLE x (a)"#;
@@ -293,7 +325,7 @@ mod tests {
     fn statements_end_where_sqlite3_complete_ends_them() {
         let complete = |sql: &str| unsafe { ffi::sqlite3_complete(CString::new(sql).unwrap().as_ptr()) == 1 };
         for sql in STATEMENTS {
-            let start = sql.len() - past_filler(sql).len();
+            let start = sql.len() - skip_to_statement(sql).len();
             let expected =
                 (start + 1..=sql.len()).find(|&end| sql.as_bytes()[end - 1] == b';' && complete(&sql[..end])).unwrap_or(sql.len());
             assert_eq!(statement_end(sql), expected, "{sql:?}");
@@ -338,35 +370,14 @@ mod tests {
         assert_eq!(first_keyword(";;"), "");
     }
 
-    /// `is_filler` holds of exactly the SQL in which SQLite's parser finds no
+    /// `holds_no_statement` holds of exactly the SQL in which SQLite's parser finds no
     /// statement.
     #[test]
-    fn filler_is_what_sqlite_finds_no_statement_in() {
+    fn sql_holds_no_statement_where_sqlite_finds_none() {
         let connection = Connection::open_in_memory().unwrap();
-        for sql in [
-            "",
-            " \t\n\x0c\r",
-            " \x0b",
-            "\x0b",
-            ";",
-            " ; ;; ",
-            "-- c",
-            "-- c\n;",
-            "-",
-            "/* c */",
-            "/**/",
-            "/*/",
-            "/* unended",
-            "/*",
-            "/",
-            "\u{FEFF}",
-            " \u{FEFF};\u{FEFF} ",
-            "\0 SELECT 1",
-            " SELECT 1",
-            "x",
-        ] {
+        for sql in NO_STATEMENT_CANDIDATES {
             let no_statement = matches!(Batch::new(&connection, sql).next(), Ok(None));
-            assert_eq!(is_filler(sql), no_statement, "{sql:?}");
+            assert_eq!(holds_no_statement(sql), no_statement, "{sql:?}");
         }
     }
 
@@ -437,6 +448,34 @@ mod tests {
             let mut scanned = named_parameters(sql);
             scanned.retain(|name| seen.insert(*name));
             assert_eq!(scanned, named, "{sql:?}");
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32", feature = "nodejs"))]
+mod node_sqlite_tests {
+    use js_sys::{Function, Reflect};
+    use wasm_bindgen::{JsCast, JsValue};
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::{holds_no_statement, NO_STATEMENT_CANDIDATES};
+
+    /// `holds_no_statement` holds of exactly what SQLite skips between
+    /// statements on node:sqlite's SQLite too: SQL it holds of prepares there
+    /// to no statement, and any other SQL to a statement or an error.
+    #[wasm_bindgen_test]
+    fn sql_holds_no_statement_where_node_sqlite_finds_none() {
+        let construct = Function::new_no_args("return new (process.getBuiltinModule('node:sqlite').DatabaseSync)(':memory:');");
+        let sqlite = construct.call0(&JsValue::NULL).unwrap();
+        let prepare: Function = Reflect::get(&sqlite, &"prepare".into()).unwrap().dyn_into().unwrap();
+        let prepares_to_no_statement = |sql: &str| match prepare.call1(&sqlite, &sql.into()) {
+            // node:sqlite hands SQL that holds no statement back as a statement
+            // already finalized, whose source cannot be read.
+            Ok(statement) => Reflect::get(&statement, &"sourceSQL".into()).is_err(),
+            Err(_) => false,
+        };
+        for sql in NO_STATEMENT_CANDIDATES {
+            assert_eq!(holds_no_statement(sql), prepares_to_no_statement(sql), "{sql:?}");
         }
     }
 }

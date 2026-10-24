@@ -10,9 +10,8 @@ use tracing::debug;
 
 use super::{SqliteStorageEngine, COLUMN_MAP_TABLE};
 use crate::{
-    driver::{Pool, PooledConnection},
     error::SqliteError,
-    exec::SqliteExecutor,
+    executor::{Pool, PooledConnection, SqliteExecutor},
     value::{SqliteValue, SqliteValueRef},
 };
 

@@ -1,6 +1,6 @@
 //! Connection manager for bb8 pool with rusqlite
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::{config::DbConfig, Connection};
@@ -52,7 +52,7 @@ impl SqliteConnectionManager {
         // double-quoted name that matched no column read as a string, in a
         // query and in DDL alike, and a stale name read as data instead of
         // failing. Off, such a name fails with "no such column", as it does
-        // on both Node.js drivers (see nodejs.rs).
+        // on both Node.js drivers (see nodejs/adoption.rs).
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
 
@@ -137,4 +137,23 @@ impl bb8::ManageConnection for SqliteConnectionManager {
     }
 
     fn has_broken(&self, _conn: &mut Self::Connection) -> bool { false }
+}
+
+/// The engine's pool of rusqlite connections.
+pub(crate) type Pool = bb8::Pool<SqliteConnectionManager>;
+
+/// Default connection pool size
+pub const DEFAULT_POOL_SIZE: u32 = 10;
+
+/// The pool behind `SqliteStorageEngine::open`.
+pub(crate) async fn file_pool(path: &Path) -> anyhow::Result<Pool> {
+    let manager = SqliteConnectionManager::file(path);
+    Ok(bb8::Pool::builder().max_size(DEFAULT_POOL_SIZE).build(manager).await?)
+}
+
+/// The pool behind `SqliteStorageEngine::open_in_memory`.
+pub(crate) async fn memory_pool() -> anyhow::Result<Pool> {
+    let manager = SqliteConnectionManager::memory();
+    // For in-memory, we use a single connection to keep the database alive
+    Ok(bb8::Pool::builder().max_size(1).build(manager).await?)
 }

@@ -6,7 +6,7 @@
 //! parameters and reading each column by its SQLite storage class, with no
 //! conversion.
 
-use std::path::Path;
+pub(crate) mod connection;
 
 use rusqlite::{
     params_from_iter,
@@ -14,33 +14,12 @@ use rusqlite::{
     Batch, Connection, Statement, ToSql,
 };
 
-pub(crate) use crate::connection::PooledConnection;
 use crate::{
     error::SqliteError,
-    exec::{Row, SqliteExecutor},
-    sql_text,
+    executor::{statement_scan, Row, SqliteExecutor},
     value::{SqliteValue, SqliteValueRef},
-    SqliteConnectionManager,
 };
-
-/// The engine's pool of rusqlite connections.
-pub(crate) type Pool = bb8::Pool<SqliteConnectionManager>;
-
-/// Default connection pool size
-pub const DEFAULT_POOL_SIZE: u32 = 10;
-
-/// The pool behind `SqliteStorageEngine::open`.
-pub(crate) async fn file_pool(path: &Path) -> anyhow::Result<Pool> {
-    let manager = SqliteConnectionManager::file(path);
-    Ok(bb8::Pool::builder().max_size(DEFAULT_POOL_SIZE).build(manager).await?)
-}
-
-/// The pool behind `SqliteStorageEngine::open_in_memory`.
-pub(crate) async fn memory_pool() -> anyhow::Result<Pool> {
-    let manager = SqliteConnectionManager::memory();
-    // For in-memory, we use a single connection to keep the database alive
-    Ok(bb8::Pool::builder().max_size(1).build(manager).await?)
-}
+use connection::PooledConnection;
 
 impl PooledConnection {
     /// Run a closure against this connection through the executor boundary.
@@ -91,7 +70,7 @@ fn row_of(row: &rusqlite::Row<'_>, width: usize) -> Result<Row, SqliteError> {
 /// engine prepared it, runs the first and ignores the rest without a word.
 /// Whitespace, semicolons and comments after the statement are no statement.
 fn one_statement<'c>(connection: &'c Connection, sql: &str) -> Result<Statement<'c>, SqliteError> {
-    if sql_text::holds_a_second_statement(sql) {
+    if statement_scan::holds_a_second_statement(sql) {
         return Err(rusqlite::Error::MultipleStatement.into());
     }
     let mut statements = Batch::new(connection, sql);

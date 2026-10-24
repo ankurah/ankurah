@@ -79,10 +79,10 @@ into AnkQL.
 ## Connections
 
 The engine writes its SQL once, for every driver, against the executor
-boundary (`exec.rs`): a `SqliteExecutor` runs one statement on one SQLite
-connection, and each `Row` it returns holds the values as SQLite stored them.
-Everything above the boundary decides which SQL to run; a driver below it
-runs that SQL.
+boundary (the `executor` module): a `SqliteExecutor` runs one statement on
+one SQLite connection, and each `Row` it returns holds the values as SQLite
+stored them. Everything above the boundary decides which SQL to run; a
+driver below it runs that SQL.
 
 - Natively, the engine uses a `bb8` pool around `rusqlite`. Synchronous
   connection work is run through the connection wrapper's blocking boundary.

@@ -10,7 +10,7 @@ use ankurah_storage_common::{
 use super::{load_states, SqliteStorageEngine, ENTITY_TABLE};
 use crate::{
     error::SqliteError,
-    exec::{Behavior, SqliteExecutor},
+    executor::{Behavior, SqliteExecutor},
     sql_builder::{split_predicate_for_sqlite, SqlBuilder},
     value::{SqliteValue, SqliteValueRef},
 };

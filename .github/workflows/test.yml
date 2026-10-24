@@ -100,8 +100,8 @@ jobs:
       fail-fast: false
       matrix:
         # ankurah-storage-sqlite's nodejs feature runs on Node.js 22.20.0 and
-        # later (NODE_FLOOR in storage/sqlite/src/nodejs.rs): the floor, and the
-        # current release.
+        # later (NODE_FLOOR in storage/sqlite/src/executor/nodejs/runtime.rs):
+        # the floor, and the current release.
         node: ["22.20.0", "24"]
 
     steps:
