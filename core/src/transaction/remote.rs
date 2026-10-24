@@ -101,8 +101,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         }
         source.publish(&changes, true);
         changes.retain(|change| !change.events().is_empty());
-        let failures = self.node.reactor.notify_change(changes).await;
-        self.node.live_queries.fail_notifications(&failures);
+        self.node.notify_reactor(changes).await;
         Ok(())
     }
 }

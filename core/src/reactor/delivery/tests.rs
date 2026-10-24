@@ -77,3 +77,52 @@ async fn concurrent_notifications_keep_a_minimal_frontier_and_suppress_ancestor_
     assert_eq!(accepted[0].payload.id(), merged.id());
     Ok(())
 }
+
+/// A change to a test entity carrying protocol events, whose parents place them in its history.
+#[derive(Debug)]
+struct EventChange(crate::reactor::tests::TestEntity, Vec<proto::Attested<proto::Event>>);
+impl std::fmt::Display for EventChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "EventChange({})", self.0.id) }
+}
+impl crate::reactor::ChangeNotification for EventChange {
+    type Entity = crate::reactor::tests::TestEntity;
+    type Event = proto::Attested<proto::Event>;
+    fn into_parts(self) -> (Self::Entity, Vec<Self::Event>) { (self.0, self.1) }
+    fn entity(&self) -> &Self::Entity { &self.0 }
+    fn events(&self) -> &[Self::Event] { &self.1 }
+}
+
+#[tokio::test]
+async fn an_unprovable_event_drops_only_its_entitys_subscription() {
+    use crate::reactor::{tests::TestEntity, Reactor, ReactorUpdate};
+    use ankurah_signals::Subscribe;
+    let reactor = Reactor::<TestEntity, proto::Attested<proto::Event>>::new_test();
+    let subscription = reactor.subscribe();
+    let (failing, healthy) = (TestEntity::new("failing", "pending"), TestEntity::new("healthy", "pending"));
+    subscription.add_entity_subscriptions([failing.id, healthy.id]);
+    let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = delivered.clone();
+    let _listener = subscription.subscribe(move |update: ReactorUpdate<TestEntity, proto::Attested<proto::Event>>| {
+        recorded.lock().unwrap().extend(update.items.into_iter().flat_map(|item| item.events).map(|event| event.payload.id()));
+    });
+    let genesis = || proto::Event::genesis(None, proto::AuthorId::Unknown, proto::OperationSet::default());
+    let after = |parent: &proto::Event| {
+        proto::Event::update(parent.entity_id, proto::Clock::singleton(parent), proto::AuthorId::Unknown, proto::OperationSet::default())
+    };
+    let (first, unrelated, other_first) = (genesis(), genesis(), genesis());
+    let notify = |entity: &TestEntity, event: &proto::Event| EventChange(entity.clone(), vec![proto::Attested::from(event.clone())]);
+    assert!(reactor.notify_change(vec![notify(&failing, &first), notify(&healthy, &other_first)]).await.is_empty());
+
+    // The failing entity's next event descends from neither delivered head, and this reactor
+    // has no history to trace it through. The healthy entity's event follows its head.
+    let (unprovable, healthy_next) = (after(&unrelated), after(&other_first));
+    let failures = reactor.notify_change(vec![notify(&failing, &unprovable), notify(&healthy, &healthy_next)]).await;
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].query, None);
+    assert_eq!(*delivered.lock().unwrap(), [first.id(), other_first.id(), healthy_next.id()], "the healthy entity still delivers");
+
+    let (failing_later, healthy_later) = (after(&unprovable), after(&healthy_next));
+    assert!(reactor.notify_change(vec![notify(&failing, &failing_later), notify(&healthy, &healthy_later)]).await.is_empty());
+    assert_eq!(delivered.lock().unwrap().last(), Some(&healthy_later.id()), "only the failing entity's subscription was dropped");
+    assert!(!delivered.lock().unwrap().contains(&failing_later.id()));
+}

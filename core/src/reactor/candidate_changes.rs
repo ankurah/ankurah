@@ -50,8 +50,11 @@ impl<C> CandidateChanges<C> {
 }
 
 impl<'a, C> QueryCandidate<'a, C> {
-    /// Iterate over the candidate changes for this query
-    pub fn iter(&self) -> impl Iterator<Item = &C> + '_ { self.offsets.iter().map(move |&offset| &self.changes[offset]) }
+    /// Iterate over the candidate changes for this query, borrowed from the shared change list
+    pub fn iter(&self) -> impl Iterator<Item = &'a C> + 'a {
+        let (changes, offsets) = (self.changes, self.offsets);
+        offsets.iter().map(move |&offset| &changes[offset])
+    }
 }
 
 impl<C> Clone for CandidateChanges<C> {

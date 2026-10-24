@@ -1,12 +1,14 @@
 //! The events a query still has to deliver for an entity. Each query keeps the
 //! frontier of the events it has delivered apart from the entity's current
 //! state, which an initial snapshot advances without delivering any events.
+use super::{AbstractEntity, NotificationFailure, ReactorUpdateItem};
 use crate::{
     error::RetrievalError,
     event_dag::{compare, AbstractCausalRelation, DEFAULT_BUDGET},
     retrieval::GetEvents,
 };
 use ankurah_proto as proto;
+use std::collections::HashMap;
 
 /// An event the reactor delivers. `causal_event` is the protocol event whose parents place it in
 /// its entity's history; an event without one is always delivered.
@@ -15,6 +17,117 @@ pub trait ReactorEvent: Clone + Send + 'static {
 }
 impl ReactorEvent for proto::Attested<proto::Event> {
     fn causal_event(&self) -> Option<&proto::Event> { Some(&self.payload) }
+}
+
+/// The head of the events delivered for each entity, kept by a query, or by a subscription for
+/// its explicit entity subscriptions.
+#[derive(Clone, Debug, Default)]
+pub(super) struct DeliveredHeads(HashMap<proto::EntityId, proto::Clock>);
+
+impl DeliveredHeads {
+    /// The heads of `ids`, as a copy to plan a delivery against.
+    pub(super) fn of(&self, ids: impl IntoIterator<Item = proto::EntityId>) -> Self {
+        Self(ids.into_iter().filter_map(|id| self.0.get(&id).map(|head| (id, head.clone()))).collect())
+    }
+
+    /// Record `head` as `id`'s delivered head; an empty head, which delivered nothing, changes nothing.
+    pub(super) fn advance(&mut self, id: proto::EntityId, head: proto::Clock) {
+        if !head.is_empty() {
+            self.0.insert(id, head);
+        }
+    }
+
+    /// Start `id`'s delivered head at `head`, unless events were already delivered for it.
+    pub(super) fn start(&mut self, id: proto::EntityId, head: proto::Clock) { self.0.entry(id).or_insert(head); }
+
+    pub(super) fn forget(&mut self, id: &proto::EntityId) { self.0.remove(id); }
+
+    pub(super) fn retain(&mut self, mut keep: impl FnMut(&proto::EntityId) -> bool) { self.0.retain(|id, _| keep(id)); }
+
+    pub(super) fn clear(&mut self) { self.0.clear(); }
+
+    /// Record the heads `staged` advanced, for the entities `keep` accepts.
+    pub(super) fn extend_from(&mut self, staged: DeliveredHeads, keep: impl Fn(&proto::EntityId) -> bool) {
+        self.0.extend(staged.0.into_iter().filter(|(id, _)| keep(id)));
+    }
+
+    /// The events among `events` not yet delivered for `id`, in order, and the head past them,
+    /// which also becomes `id`'s delivered head here.
+    pub(super) async fn take_undelivered<Ev: ReactorEvent>(
+        &mut self,
+        history: Option<&(dyn GetEvents + Send + Sync)>,
+        id: proto::EntityId,
+        events: &[Ev],
+    ) -> Result<(proto::Clock, Vec<Ev>), RetrievalError> {
+        let (head, events) = undelivered_events(history, self.0.get(&id).cloned().unwrap_or_default(), events).await?;
+        self.advance(id, head.clone());
+        Ok((head, events))
+    }
+}
+
+/// The changes one target will publish, planned under its subscription's lock: a query, or for
+/// `query: None` the subscription's explicit entity subscriptions. Rows borrow their events from
+/// the notified changes, so planning copies no events.
+pub(super) struct DeliveryPlan<'a, Ev> {
+    pub(super) query: Option<proto::QueryId>,
+    pub(super) version: u32,
+    /// The target's delivered heads for the planned entities.
+    pub(super) delivered: DeliveredHeads,
+    /// Each planned change's offset among the target's candidates, its entity, and its events.
+    pub(super) rows: Vec<(usize, proto::EntityId, &'a [Ev])>,
+}
+
+/// Each planned change's undelivered events and the head past them, by target and offset.
+pub(super) struct PreparedEvents<Ev> {
+    rows: HashMap<(Option<proto::QueryId>, usize), (proto::Clock, Vec<Ev>)>,
+}
+
+impl<Ev> PreparedEvents<Ev> {
+    /// Take the events prepared for `query`'s change at `offset`, if that change was planned.
+    pub(super) fn take(&mut self, query: Option<proto::QueryId>, offset: usize) -> Option<(proto::Clock, Vec<Ev>)> {
+        self.rows.remove(&(query, offset))
+    }
+}
+
+/// Resolve every plan's undelivered events through `history`, and return a failure for each
+/// entity whose history cannot be proven. A query's plan then prepares nothing, so the query
+/// publishes none of the batch; an entity subscription's plan loses only the failing entity.
+pub(super) async fn prepare<Ev: ReactorEvent>(
+    history: Option<&(dyn GetEvents + Send + Sync)>,
+    plans: Vec<DeliveryPlan<'_, Ev>>,
+) -> (PreparedEvents<Ev>, Vec<NotificationFailure>) {
+    let mut prepared = PreparedEvents { rows: HashMap::new() };
+    let mut failures = Vec::new();
+    for DeliveryPlan { query, version, mut delivered, rows } in plans {
+        let mut staged = Vec::new();
+        for (offset, entity, events) in rows {
+            match delivered.take_undelivered(history, entity, events).await {
+                Ok(row) => staged.push(((query, offset), row)),
+                Err(error) => {
+                    failures.push(NotificationFailure { query, version, entity, error });
+                    if query.is_some() {
+                        staged.clear();
+                        break;
+                    }
+                }
+            }
+        }
+        prepared.rows.extend(staged);
+    }
+    (prepared, failures)
+}
+
+/// Reduce each change's events to those not yet delivered for its entity, in order, advancing
+/// `delivered` past them.
+pub(super) async fn filter_changes<E: AbstractEntity, Ev: ReactorEvent>(
+    history: Option<&(dyn GetEvents + Send + Sync)>,
+    delivered: &mut DeliveredHeads,
+    changes: &mut [ReactorUpdateItem<E, Ev>],
+) -> Result<(), RetrievalError> {
+    for change in changes {
+        change.events = delivered.take_undelivered(history, change.entity.id(), &change.events).await?.1;
+    }
+    Ok(())
 }
 
 /// The events among `events` that `delivered` does not yet include, in order,

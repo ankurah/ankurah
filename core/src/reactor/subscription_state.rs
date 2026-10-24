@@ -1,5 +1,6 @@
 use crate::internal::prelude::*;
 use crate::reactor::{
+    delivery::{self, DeliveredHeads, DeliveryPlan, PreparedEvents},
     AbstractEntity, CandidateChanges, ChangeNotification, LocalEntitySource, MembershipChange, ReactorSubscriptionId, ReactorUpdate,
     ReactorUpdateItem, WatcherChange,
 };
@@ -13,40 +14,13 @@ use std::{
 };
 use tracing::debug;
 
-/// Collects query updates into a `Vec`, or discards them through `()`.
-pub(super) trait UpdateItemAccumulator<E> {
-    fn push_initial(&mut self, entity: &E, query_id: proto::QueryId);
-    fn push_add(&mut self, entity: &E, query_id: proto::QueryId);
-    fn push_remove(&mut self, entity: &E, query_id: proto::QueryId);
-}
+mod remote_query;
 
-impl<E: Clone, Ev> UpdateItemAccumulator<E> for Vec<ReactorUpdateItem<E, Ev>> {
-    fn push_initial(&mut self, entity: &E, query_id: proto::QueryId) {
-        Vec::push(
-            self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Initial)] },
-        );
-    }
+pub(super) use remote_query::RemotePublication;
 
-    fn push_add(&mut self, entity: &E, query_id: proto::QueryId) {
-        Vec::push(
-            self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Add)] },
-        );
-    }
-
-    fn push_remove(&mut self, entity: &E, query_id: proto::QueryId) {
-        Vec::push(
-            self,
-            ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, MembershipChange::Remove)] },
-        );
-    }
-}
-
-impl<E> UpdateItemAccumulator<E> for () {
-    fn push_initial(&mut self, _entity: &E, _query_id: proto::QueryId) {}
-    fn push_add(&mut self, _entity: &E, _query_id: proto::QueryId) {}
-    fn push_remove(&mut self, _entity: &E, _query_id: proto::QueryId) {}
+/// A notification that `entity` entered or left `query_id`'s results, carrying no events.
+fn membership_item<E: Clone, Ev>(entity: &E, query_id: proto::QueryId, change: MembershipChange) -> ReactorUpdateItem<E, Ev> {
+    ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, change)] }
 }
 
 type GapFillData<E> = (
@@ -71,7 +45,7 @@ pub(super) struct QueryState<E: AbstractEntity + Filterable + Send + 'static> {
     pub(crate) version: u32,
     /// Remains pending across partial publications of a replacement selection.
     initializing: bool,
-    delivered: HashMap<proto::EntityId, proto::Clock>,
+    delivered: DeliveredHeads,
 }
 
 // We would call this ReactorSubscription, but that name is reserved for the public API
@@ -101,14 +75,10 @@ struct State<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
     /// Explicit entity subscriptions, independent of the matches in `queries`.
     pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
-    entity_delivered: HashMap<proto::EntityId, proto::Clock>,
+    entity_delivered: DeliveredHeads,
     // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
-}
-
-pub(super) struct PreparedEvents<Ev> {
-    rows: HashMap<(Option<proto::QueryId>, usize), (proto::Clock, Vec<Ev>)>,
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> Subscription<E, Ev> {
@@ -121,7 +91,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             state: std::sync::Mutex::new(State {
                 queries: HashMap::new(),
                 entity_subscriptions: HashSet::new(),
-                entity_delivered: HashMap::new(),
+                entity_delivered: DeliveredHeads::default(),
                 entities: HashMap::new(),
                 broadcast,
             }),
@@ -139,7 +109,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
     pub fn remove_entity_subscription(&self, entity_id: proto::EntityId) {
         let mut state = self.state.lock().unwrap();
         state.entity_subscriptions.remove(&entity_id);
-        state.entity_delivered.remove(&entity_id);
+        state.entity_delivered.forget(&entity_id);
     }
 
     /// Check if any queries match this entity (for determining if entity watcher should be removed)
@@ -207,7 +177,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 resultset,
                 version: 0,
                 initializing: true,
-                delivered: HashMap::new(),
+                delivered: DeliveredHeads::default(),
             },
         );
         true
@@ -236,18 +206,17 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         let mut watcher_set = self.watcher_set.lock().unwrap();
         watcher_set.add_predicate_entity_watchers(self.id, query_id, entity_ids);
     }
-    /// Update a query, returning entities newly added to its result set.
-    pub fn update_query<A: UpdateItemAccumulator<E>>(
+    /// Update a query's selection and results, pushing the membership changes to `reactor_updates`.
+    pub fn update_query(
         &self,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         included_entities: Vec<E>,
         version: u32,
-        reactor_updates: &mut A,
-        authoritative: bool,
-        membership: Option<&crate::reactor::PeerQueryMembership>,
+        reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>,
+        remote: Option<&crate::reactor::RemoteMembership>,
         complete: bool,
-    ) -> anyhow::Result<Vec<E>> {
+    ) -> anyhow::Result<()> {
         let mut state_guard = self.state.lock().unwrap();
         let state = &mut *state_guard;
 
@@ -275,56 +244,18 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         let mut newly_added: Vec<E> = Vec::new();
 
         let mut removed_entities = Vec::new();
-        if authoritative {
-            let before: IndexMap<_, _> = rw_resultset.iter_entities().map(|(id, entity)| (id, entity.clone())).collect();
-            // Read the current public set while holding the notification lock,
-            // after any local/other-query notifications that raced capture.
-            let mut included: IndexMap<_, _> = before
-                .iter()
-                .filter(|(id, _)| membership.is_some_and(|membership| !membership.replace.contains(id) && !membership.remove.contains(id)))
-                .map(|(id, entity)| (*id, entity.clone()))
-                .collect();
-            for entity in included_entities {
-                if membership.is_none_or(|membership| !membership.remove.contains(&entity.id()))
-                    && query_state.source.admits_query_entity(&entity)
-                {
-                    included.insert(entity.id(), entity);
-                }
-            }
-            let included = included
-                .into_values()
-                .filter(|entity| {
-                    query_state.source.can_read(entity)
-                        && (membership
-                            .is_some_and(|membership| membership.preserve.contains(&entity.id()) && before.contains_key(&entity.id()))
-                            || evaluate_predicate(entity, &selection.predicate).unwrap_or(false))
-                })
-                .collect();
-            // Replace as a set before applying its order/limit. Adding to the
-            // old limited set first could evict an authoritative new member.
-            if let Some(membership) = membership {
-                rw_resultset.replace_all_preserving_keys(included, &membership.preserve);
-            } else {
-                rw_resultset.replace_all(included);
-            }
-            for (id, entity) in rw_resultset.iter_entities() {
-                if !before.contains_key(&id) {
-                    state.entities.insert(id, entity.clone());
-                    if membership.is_some() && !initial_baseline {
-                        reactor_updates.push_add(entity, query_id);
-                    } else {
-                        reactor_updates.push_initial(entity, query_id);
-                    }
-                    newly_added.push(entity.clone());
-                }
-            }
-            for (id, entity) in before {
-                if !rw_resultset.contains(&id) {
-                    removed_entities.push(id);
-                    if query_state.source.can_read(&entity) {
-                        reactor_updates.push_remove(&entity, query_id);
-                    }
-                }
+        if let Some(membership) = remote {
+            (newly_added, removed_entities) = query_state.reconcile_remote_rows(
+                query_id,
+                &mut rw_resultset,
+                included_entities,
+                membership,
+                &selection.predicate,
+                initial_baseline,
+                reactor_updates,
+            );
+            for entity in &newly_added {
+                state.entities.insert(entity.id(), entity.clone());
             }
         } else {
             rw_resultset.mark_all_dirty();
@@ -339,7 +270,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                     if !rw_resultset.contains(&entity_id) {
                         rw_resultset.add(entity.clone());
                         state.entities.insert(entity_id, entity.clone());
-                        reactor_updates.push_initial(&entity, query_id);
+                        reactor_updates.push(membership_item(&entity, query_id, MembershipChange::Initial));
                         newly_added.push(entity);
                     }
                 }
@@ -358,7 +289,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
                 removed_entities.push(entity_id);
                 if can_read {
-                    reactor_updates.push_remove(entity, query_id);
+                    reactor_updates.push(membership_item(entity, query_id, MembershipChange::Remove));
                 }
                 false
             });
@@ -366,11 +297,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
         // Existing event frontiers survive silent state repairs and refreshes.
         for (id, entity) in rw_resultset.iter_entities() {
-            if let Some(head) = membership.and_then(|m| m.baseline.get(&id)).cloned().or_else(|| entity.head()) {
-                query_state.delivered.entry(id).or_insert(head);
+            if let Some(head) = remote.and_then(|m| m.known_heads.get(&id)).cloned().or_else(|| entity.head()) {
+                query_state.delivered.start(id, head);
             }
         }
-        query_state.delivered.retain(|id, _| rw_resultset.contains(id));
+        query_state.delivered.retain(|id| rw_resultset.contains(id));
         query_state.paused = false;
         query_state.version = version;
         if complete {
@@ -397,19 +328,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             watcher_set.cleanup_removed_predicate_watchers(self.id, query_id, &removed_entities);
         }
 
-        Ok(newly_added)
+        Ok(())
     }
 
     /// Send ReactorUpdate with the given items
     pub fn send_update(&self, items: Vec<ReactorUpdateItem<E, Ev>>) {
         let broadcast = self.state.lock().unwrap().broadcast.clone();
         broadcast.send(ReactorUpdate { items });
-    }
-
-    /// Remove a query and return its state for cleanup
-    pub fn remove_query(&self, query_id: proto::QueryId) -> Option<QueryState<E>> {
-        let mut state = self.state.lock().unwrap();
-        state.queries.remove(&query_id)
     }
 
     /// Get all queries for cleanup (used by unsubscribe)
@@ -423,7 +348,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
     pub(super) async fn prepare_events<C: ChangeNotification<Entity = E, Event = Ev>>(
         &self,
         candidates: &CandidateChanges<C>,
-        preserve: Option<&HashSet<proto::EntityId>>,
+        publication: Option<&RemotePublication<'_>>,
         history: Option<&(dyn crate::retrieval::GetEvents + Send + Sync)>,
     ) -> (PreparedEvents<Ev>, Vec<crate::reactor::NotificationFailure>) {
         let plans = {
@@ -435,75 +360,41 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 let Some(selection) = query.selection.as_ref() else { continue };
                 let mut rows = Vec::new();
                 for (offset, change) in candidate.iter().enumerate() {
-                    let entity = change.entity();
-                    if !query.source.can_read(entity)
-                        || change.query_origin().is_some_and(|origin| {
-                            origin.query == id
-                                && (query.source.query_origin() != Some(origin)
-                                    || change.defers_query_membership()
-                                    || !query.source.admits_query_entity(entity))
-                        })
-                    {
-                        continue;
-                    }
-                    let did_match = query.resultset.contains_key(&entity.id());
-                    let matches = if preserve.is_some_and(|ids| ids.contains(&entity.id())) {
-                        did_match
-                    } else {
-                        evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
-                    };
-                    if matches || did_match || state.entity_subscriptions.contains(&entity.id()) {
-                        rows.push((offset, entity.id(), change.events().to_vec()));
+                    let entity_id = change.entity().id();
+                    let Some(effect) = query.effect_of(id, &selection.predicate, change, publication) else { continue };
+                    if effect.publishes(state.entity_subscriptions.contains(&entity_id)) {
+                        rows.push((offset, entity_id, change.events()));
                     }
                 }
-                let delivered: HashMap<_, _> =
-                    rows.iter().filter_map(|(_, id, _)| query.delivered.get(id).map(|head| (*id, head.clone()))).collect();
-                plans.push((Some(id), query.version, delivered, rows));
+                let delivered = query.delivered.of(rows.iter().map(|(_, id, _)| *id));
+                plans.push(DeliveryPlan { query: Some(id), version: query.version, delivered, rows });
             }
-            let rows = candidates
+            let rows: Vec<_> = candidates
                 .entity_iter()
                 .enumerate()
                 .filter(|(_, c)| state.entity_subscriptions.contains(&c.entity().id()))
-                .map(|(offset, c)| (offset, c.entity().id(), c.events().to_vec()))
+                .map(|(offset, c)| (offset, c.entity().id(), c.events()))
                 .collect();
-            let delivered = candidates
-                .entity_iter()
-                .filter_map(|c| state.entity_delivered.get(&c.entity().id()).map(|h| (c.entity().id(), h.clone())))
-                .collect();
-            plans.push((None, 0, delivered, rows));
+            let delivered = state.entity_delivered.of(rows.iter().map(|(_, id, _)| *id));
+            plans.push(DeliveryPlan { query: None, version: 0, delivered, rows });
             plans
         };
-        let mut prepared = PreparedEvents { rows: HashMap::new() };
-        let mut failures = Vec::new();
-        for (query, version, mut delivered, rows) in plans {
-            let mut staged = Vec::new();
-            let mut failure = None;
-            for (offset, id, events) in rows {
-                match super::delivery::undelivered_events(history, delivered.get(&id).cloned().unwrap_or_default(), &events).await {
-                    Ok((head, events)) => {
-                        if !head.is_empty() {
-                            delivered.insert(id, head.clone());
+        let (prepared, failures) = delivery::prepare(history, plans).await;
+        if !failures.is_empty() {
+            let mut state = self.state.lock().unwrap();
+            for failure in &failures {
+                match failure.query {
+                    Some(id) => {
+                        if let Some(query) = state.queries.get_mut(&id) {
+                            query.paused = true;
+                            query.resultset.set_loaded(false);
                         }
-                        staged.push(((query, offset), (head, events)));
                     }
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
+                    None => {
+                        state.entity_subscriptions.remove(&failure.entity);
+                        state.entity_delivered.forget(&failure.entity);
                     }
                 }
-            }
-            if let Some(error) = failure {
-                let mut state = self.state.lock().unwrap();
-                if let Some(query) = query.and_then(|id| state.queries.get_mut(&id)) {
-                    query.paused = true;
-                    query.resultset.set_loaded(false);
-                } else if query.is_none() {
-                    state.entity_subscriptions.clear();
-                    state.entity_delivered.clear();
-                }
-                failures.push(crate::reactor::NotificationFailure { query, version, error });
-            } else {
-                prepared.rows.extend(staged);
             }
         }
         (prepared, failures)
@@ -515,39 +406,26 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         changes: &mut [ReactorUpdateItem<E, Ev>],
         baseline: &HashMap<proto::EntityId, proto::Clock>,
         history: Option<&(dyn crate::retrieval::GetEvents + Send + Sync)>,
-    ) -> Result<HashMap<proto::EntityId, proto::Clock>, RetrievalError> {
+    ) -> Result<DeliveredHeads, RetrievalError> {
         let mut delivered = {
             let state = self.state.lock().unwrap();
             let query = state.queries.get(&query_id).ok_or_else(|| RetrievalError::Other("query disappeared".into()))?;
-            let mut delivered = HashMap::new();
+            let mut delivered = query.delivered.of(changes.iter().map(|change| change.entity.id()));
             for change in changes.iter() {
-                let id = change.entity.id();
-                if let Some(head) = query.delivered.get(&id).or_else(|| baseline.get(&id)) {
-                    delivered.insert(id, head.clone());
+                if let Some(head) = baseline.get(&change.entity.id()) {
+                    delivered.start(change.entity.id(), head.clone());
                 }
             }
             delivered
         };
-        let mut filtered = Vec::with_capacity(changes.len());
-        for change in changes.iter() {
-            let id = change.entity.id();
-            let (head, events) =
-                super::delivery::undelivered_events(history, delivered.get(&id).cloned().unwrap_or_default(), &change.events).await?;
-            if !head.is_empty() {
-                delivered.insert(id, head);
-            }
-            filtered.push(events);
-        }
-        for (change, events) in changes.iter_mut().zip(filtered) {
-            change.events = events;
-        }
+        delivery::filter_changes(history, &mut delivered, changes).await?;
         Ok(delivered)
     }
 
-    pub(super) fn commit_query_events(&self, query_id: proto::QueryId, delivered: HashMap<proto::EntityId, proto::Clock>) {
+    pub(super) fn commit_query_events(&self, query_id: proto::QueryId, delivered: DeliveredHeads) {
         let mut state = self.state.lock().unwrap();
         if let Some(query) = state.queries.get_mut(&query_id) {
-            query.delivered.extend(delivered.into_iter().filter(|(id, _)| query.resultset.contains_key(id)));
+            query.delivered.extend_from(delivered, |id| query.resultset.contains_key(id));
         }
     }
 
@@ -561,22 +439,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         self.evaluate_candidates(candidates, prepared, None, None)
     }
 
-    pub(super) fn evaluate_publication<C: ChangeNotification<Entity = E, Event = Ev>>(
-        self,
-        candidates: CandidateChanges<C>,
-        prepared: PreparedEvents<Ev>,
-        preserve: &HashSet<proto::EntityId>,
-    ) -> (Vec<WatcherChange>, HashSet<proto::EntityId>) {
-        let mut notified = HashSet::new();
-        let watchers = self.evaluate_candidates(candidates, prepared, Some(preserve), Some(&mut notified));
-        (watchers, notified)
-    }
-
     fn evaluate_candidates<C: ChangeNotification<Entity = E, Event = Ev>>(
         self,
         candidates: CandidateChanges<C>,
         mut prepared: PreparedEvents<Ev>,
-        preserve: Option<&HashSet<proto::EntityId>>,
+        publication: Option<&RemotePublication<'_>>,
         notified: Option<&mut HashSet<proto::EntityId>>,
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
@@ -603,7 +470,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             let mut current_publication = false;
             // Process all candidate changes for this query
             for (offset, change) in query_candidate.iter().enumerate() {
-                current_publication |= preserve.is_some()
+                current_publication |= publication.is_some()
                     && change
                         .query_origin()
                         .is_some_and(|origin| origin.query == query_id && query_state.source.query_origin() == Some(origin));
@@ -612,26 +479,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
                 debug!("Subscription {} evaluating entity {} for query {}", self.id(), entity_id, query_id);
 
-                let can_read = query_state.source.can_read(entity);
-                if can_read
-                    && change.query_origin().is_some_and(|origin| {
-                        origin.query == query_id
-                            && (query_state.source.query_origin() != Some(origin)
-                                || change.defers_query_membership()
-                                || !query_state.source.admits_query_entity(entity))
-                    })
-                {
-                    // An old own-stream repair must neither restore a removed
-                    // source member nor undo a later authorized local/Fetch view.
-                    continue;
-                }
-                let did_match = query_state.resultset.contains_key(&entity_id);
-                let matches = can_read
-                    && if preserve.is_some_and(|ids| ids.contains(&entity_id)) {
-                        did_match
-                    } else {
-                        evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
-                    };
+                let Some(effect) = query_state.effect_of(query_id, &selection.predicate, change, publication) else { continue };
+                let (did_match, matches) = (effect.did_match, effect.matches);
 
                 // Process membership change in one match
                 let membership_change = match (did_match, matches) {
@@ -660,14 +509,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                     }
                 };
 
-                // Emit if matches, matched before, or explicitly subscribed
-                let entity_subscribed = state.entity_subscriptions.contains(&entity_id);
                 // Removal currently carries state too; never send a newly denied state (#426 owns claw-back).
-                if can_read && (matches || did_match || entity_subscribed) {
-                    let (head, events) = prepared.rows.remove(&(Some(query_id), offset)).unwrap_or_default();
-                    if !head.is_empty() {
-                        query_state.delivered.insert(entity_id, head);
-                    }
+                if effect.publishes(state.entity_subscriptions.contains(&entity_id)) {
+                    // Planning made the same decision, so this change has prepared events unless
+                    // the query changed meanwhile (a gap fill can add a row while history is
+                    // read); then it publishes without events.
+                    let (head, events) = prepared.take(Some(query_id), offset).unwrap_or_default();
+                    query_state.delivered.advance(entity_id, head);
                     let duplicate = !change.events().is_empty() && events.is_empty();
                     if duplicate && membership_change.is_none() {
                         continue;
@@ -697,7 +545,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                     }
                 }
                 if !matches {
-                    query_state.delivered.remove(&entity_id);
+                    query_state.delivered.forget(&entity_id);
                 }
             }
             if current_publication {
@@ -711,10 +559,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             let entity_id = AbstractEntity::id(entity);
 
             if state.entity_subscriptions.contains(&entity_id) {
-                let (head, events) = prepared.rows.remove(&(None, offset)).unwrap_or_default();
-                if !head.is_empty() {
-                    state.entity_delivered.insert(entity_id, head);
-                }
+                let (head, events) = prepared.take(None, offset).unwrap_or_default();
+                state.entity_delivered.advance(entity_id, head);
                 if !items.contains_key(&entity_id) && (change.events().is_empty() || !events.is_empty()) {
                     items.insert(entity_id, ReactorUpdateItem { entity: entity.clone(), events, predicate_relevance: Vec::new() });
                 }
@@ -722,7 +568,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         }
 
         // Collect gap fill data while we have the state lock
-        let gaps_to_fill = if preserve.is_some() { Vec::new() } else { self.collect_gaps_to_fill_internal(&state) };
+        let gaps_to_fill = if publication.is_some() { Vec::new() } else { self.collect_gaps_to_fill_internal(&state) };
         let broadcast = state.broadcast.clone();
 
         // Drop the state lock before spawning
@@ -748,34 +594,9 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         state.queries.iter().filter_map(|(query_id, query_state)| self.extract_gap_data(*query_id, query_state)).collect()
     }
 
-    /// Fill gaps for a specific query and append entities to the provided vector
+    /// Fill gaps for a specific query and push ReactorUpdateItems to `reactor_updates`
     /// Also registers entity watchers for gap-filled entities
-    pub async fn fill_gaps_for_query_entities(&self, query_id: proto::QueryId, entities: &mut Vec<E>) {
-        let gap_data = {
-            let state = self.state.lock().unwrap();
-            state.queries.get(&query_id).and_then(|query_state| self.extract_gap_data(query_id, query_state))
-        };
-
-        let Some((query_id, gap_fetcher, selection, resultset, last_entity, gap_size)) = gap_data else {
-            return;
-        };
-
-        // Clear gap_dirty flag immediately
-        resultset.clear_gap_dirty();
-
-        // Process gap fill
-        let gap_filled_entities = self.process_gap_fill_entities(query_id, gap_fetcher, selection, resultset, last_entity, gap_size).await;
-
-        // Register entity watchers and append entities
-        if !gap_filled_entities.is_empty() {
-            self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| AbstractEntity::id(e)));
-            entities.extend(gap_filled_entities);
-        }
-    }
-
-    /// Fill gaps for a specific query and push ReactorUpdateItems to the accumulator
-    /// Also registers entity watchers for gap-filled entities
-    pub async fn fill_gaps_for_query<A: UpdateItemAccumulator<E>>(&self, query_id: proto::QueryId, reactor_updates: &mut A) {
+    pub async fn fill_gaps_for_query(&self, query_id: proto::QueryId, reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>) {
         let gap_data = {
             let state = self.state.lock().unwrap();
             state.queries.get(&query_id).and_then(|query_state| self.extract_gap_data(query_id, query_state))
@@ -796,13 +617,13 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             self.add_entity_watchers(query_id, gap_filled_entities.iter().map(|e| AbstractEntity::id(e)));
 
             for entity in gap_filled_entities {
-                reactor_updates.push_initial(&entity, query_id);
+                reactor_updates.push(membership_item(&entity, query_id, MembershipChange::Initial));
             }
         }
     }
 
-    // Keep the current source check and result mutation together: an old local
-    // gap fetch must not append outsiders after a peer installs its window.
+    // Keep the current source check and result mutation together: an old local gap fetch must
+    // not append rows the remote stream did not admit after the stream installs its answer.
     fn insert_gap_entities(
         &self,
         query_id: proto::QueryId,
@@ -951,40 +772,5 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         };
 
         (query_id, gap_items)
-    }
-}
-
-// Entity-specific methods for remote subscriptions
-impl Subscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Register a query if absent, installing the caller's gap fetcher,
-    /// or return the already-registered query's resultset. Idempotent
-    /// per query id: for an existing query every argument except the id
-    /// is ignored and the provided fetcher is dropped.
-    pub fn register_or_get_query(
-        &self,
-        query_id: proto::QueryId,
-        gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
-        source: Arc<dyn LocalEntitySource>,
-    ) -> EntityResultSet<crate::entity::Entity> {
-        let mut state = self.state.lock().unwrap();
-
-        use std::collections::hash_map::Entry;
-        match state.queries.entry(query_id) {
-            Entry::Vacant(v) => {
-                let resultset = EntityResultSet::empty();
-                v.insert(QueryState {
-                    selection: None,
-                    gap_fetcher,
-                    source,
-                    paused: false,
-                    resultset: resultset.clone(),
-                    version: 0,
-                    initializing: true,
-                    delivered: HashMap::new(),
-                });
-                resultset
-            }
-            Entry::Occupied(o) => o.get().resultset.clone(),
-        }
     }
 }

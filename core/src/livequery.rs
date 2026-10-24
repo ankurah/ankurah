@@ -87,7 +87,7 @@ impl EntityLiveQuery {
             if cached || !has_relay {
                 let inner = self.0.clone();
                 crate::task::spawn(async move {
-                    if inner.remote_activated_version.load(Ordering::Acquire) == version {
+                    if inner.remote_activated(version) {
                         return;
                     }
                     match inner.activate(version).await {
@@ -122,46 +122,56 @@ impl EntityLiveQuery {
 
     /// The current version's initialization error, cleared when a new version starts.
     pub fn error(&self) -> Read<Option<Arc<RetrievalError>>> { self.0.error.read() }
-    pub(crate) fn is_current(&self, version: u32) -> bool { self.0.current_version.load(Ordering::Acquire) == version }
-    /// Recompare this query on its current standing stream. Completion covers the
-    /// captured source round; later live publications do not move that goal.
+    pub(crate) fn is_current(&self, version: u32) -> bool { self.0.is_current(version) }
+    /// Recompare this query on its current standing stream. It completes with the comparison
+    /// round it starts; live publications that arrive meanwhile do not extend it.
     pub async fn refresh(&self) -> Result<(), RetrievalError> {
         self.0.refresh_handle().ok_or_else(|| RetrievalError::Other("query has no active remote stream".into()))?.refresh().await
     }
-    pub(crate) fn set_remote_candidates(
+    pub(crate) fn set_remote_admitted(
         &self,
         version: u32,
         origin: &proto::RequestId,
         ids: impl IntoIterator<Item = proto::EntityId>,
     ) -> bool {
-        self.0.set_candidates(version, origin, ids)
+        self.0.set_admitted(version, origin, ids)
     }
     pub(crate) fn set_refresh(&self, version: u32, origin: &proto::RequestId, refresh: crate::node::state_sync::RefreshHandle) {
         self.0.set_refresh(version, origin, refresh);
     }
     pub(crate) fn retain_tree(&self, version: u32, pin: Option<crate::node::state_sync::ResidentPin>) { self.0.retain_tree(version, pin); }
     pub(crate) fn resolved_selection(&self) -> Option<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.value() }
-    pub(crate) async fn activate_remote(
+    /// Install an answer from this query's remote stream; `complete` says whether it finishes
+    /// initializing the query. Returns the ids it notified, or `None` once the stream is superseded.
+    pub(crate) async fn install_remote(
         &self,
         version: u32,
         entities: Vec<Entity>,
-        membership: crate::reactor::PeerQueryMembership,
+        membership: crate::reactor::RemoteMembership,
         changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
+        complete: bool,
     ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
-        self.0.install_remote(version, entities, membership, changes, origin, canceled, true).await
+        self.0.install_remote(version, entities, membership, changes, origin, canceled, complete).await
     }
-    pub(crate) async fn install_remote_partial(
+    /// Publish a committed publication from this query's remote stream that only admits or
+    /// removes ids, without reinstalling the query. The `admitted` ids join the ids the stream
+    /// admitted; the `absent` ids leave them and the results, even as local additions. `changes`
+    /// carries the publication's applied changes, including one for every newly admitted id, and
+    /// `held` rows keep their visible membership and sort key. A LIMIT window changes membership
+    /// only by a full install, so a LIMIT selection is refused. Returns the ids notified, or
+    /// `None` once the stream is superseded.
+    pub(crate) async fn publish_remote_membership(
         &self,
         version: u32,
-        entities: Vec<Entity>,
-        membership: crate::reactor::PeerQueryMembership,
-        changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
-        canceled: &(dyn Fn() -> bool + Send + Sync),
+        admitted: std::collections::HashSet<proto::EntityId>,
+        absent: std::collections::HashSet<proto::EntityId>,
+        changes: Vec<crate::changes::EntityChange>,
+        held: std::collections::HashSet<proto::EntityId>,
     ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
-        self.0.install_remote(version, entities, membership, changes, origin, canceled, false).await
+        self.0.publish_remote_membership(version, origin, admitted, absent, changes, held).await
     }
     #[cfg(test)]
     pub(crate) fn listen_updates(
@@ -197,7 +207,7 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
             if inner.remote_stream_pending(version) {
                 return;
             }
-            if inner.remote_activated_version.load(Ordering::Acquire) == version {
+            if inner.remote_activated(version) {
                 inner.mark_durable_answered(version);
                 return;
             }

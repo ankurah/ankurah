@@ -81,8 +81,7 @@ impl NodeApplier {
                 }
             }
             if !batch.is_empty() {
-                let failures = node.reactor.notify_change(batch).await;
-                node.live_queries.fail_notifications(&failures);
+                node.notify_reactor(batch).await;
             }
         }
 

@@ -358,7 +358,7 @@ async fn live_present_for_known_but_ineligible_row_requires_an_install() -> anyh
     let (mut driver, _registry, query) = query_driver(&node, &entity).await?;
     query.resultset().clear();
     driver.eligible.clear();
-    query.set_remote_candidates(1, &driver.stream.request, []);
+    query.set_remote_admitted(1, &driver.stream.request, []);
     let owner = Some((query.query_id(), 1));
     assert!(driver.eligible.is_empty());
     driver
@@ -884,7 +884,7 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
     let subscription = node.reactor.subscribe();
     let query = proto::QueryId::new();
     node.reactor
-        .upsert_query_from_peer(
+        .install_remote_query(
             subscription.id(),
             query,
             ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None },
@@ -893,9 +893,12 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
             Arc::new(QueryGapFetcher::new(context.clone())),
             1,
             (),
-            vec![entity.clone()],
-            crate::reactor::PeerQueryMembership::default(),
-            vec![],
+            crate::reactor::RemoteInstall {
+                entities: vec![entity.clone()],
+                membership: crate::reactor::RemoteMembership::default(),
+                changes: vec![],
+                complete: true,
+            },
         )
         .await?;
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1104,7 +1107,7 @@ async fn first_peer_install_uses_captured_head_for_event_baseline_not_newer_enti
     let query = proto::QueryId::new();
     let context = Context::new(node.clone(), crate::policy::DEFAULT_CONTEXT);
     node.reactor
-        .upsert_query_from_peer(
+        .install_remote_query(
             subscription.id(),
             query,
             ankql::ast::Selection::from(ankql::ast::Predicate::True),
@@ -1113,9 +1116,15 @@ async fn first_peer_install_uses_captured_head_for_event_baseline_not_newer_enti
             Arc::new(QueryGapFetcher::new(context)),
             1,
             (),
-            vec![entity.clone()],
-            crate::reactor::PeerQueryMembership { baseline: [(entity.id(), baseline)].into_iter().collect(), ..Default::default() },
-            vec![],
+            crate::reactor::RemoteInstall {
+                entities: vec![entity.clone()],
+                membership: crate::reactor::RemoteMembership {
+                    known_heads: [(entity.id(), baseline)].into_iter().collect(),
+                    ..Default::default()
+                },
+                changes: vec![],
+                complete: true,
+            },
         )
         .await?;
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));
