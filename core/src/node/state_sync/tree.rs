@@ -21,9 +21,9 @@ const OFFER_BYTES: u64 = 16 * 1024;
 const OFFER_SPANS: usize = 128;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
-/// Builds of at least this many leaves run on a blocking thread: a build over
-/// memory maps never yields, and at about 5 µs to hash a leaf these hold a
-/// thread for 5 ms or more.
+/// Builds and bulk rebuilds over at least this many leaves run on a blocking
+/// thread: over memory maps they never yield, and at about 5 µs to hash a
+/// leaf, or 2.4 µs to decode a stored one, they hold a thread for milliseconds.
 #[cfg(not(target_arch = "wasm32"))]
 const BLOCKING_BUILD_LEAVES: usize = 1024;
 
@@ -209,15 +209,7 @@ fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
 impl Index {
     async fn build(spec: TreeSpec, entries: Entries) -> anyhow::Result<Self> {
         let leaves: Vec<LeafInput> = entries.values().map(TreeEntry::leaf).collect();
-        #[cfg(not(target_arch = "wasm32"))]
-        let tree = if leaves.len() >= BLOCKING_BUILD_LEAVES {
-            let spec = spec.clone();
-            tokio::task::spawn_blocking(move || futures::executor::block_on(build_tree(spec, leaves))).await??
-        } else {
-            build_tree(spec.clone(), leaves).await?
-        };
-        #[cfg(target_arch = "wasm32")]
-        let tree = build_tree(spec.clone(), leaves).await?;
+        let tree = run_blocking_if_large(leaves.len(), build_tree(spec.clone(), leaves)).await??;
         let mut missing_counts = vec![0; spec.key_spec().keyparts.len()];
         for entry in entries.values() {
             for index in missing_parts(&spec, entry) {
@@ -240,7 +232,9 @@ impl Index {
         if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= entries.len().div_ceil(4) {
             // A batch this large costs less to fold in by rebuilding every
             // tree node from the stored leaves than change by change.
-            tx.rebuild_with_changes(leaf_changes).await?;
+            let leaf_changes: Vec<LeafChange> = leaf_changes.collect();
+            let leaves = entries.len() + leaf_changes.len();
+            tx = run_blocking_if_large(leaves, async move { tx.rebuild_with_changes(leaf_changes).await.map(|()| tx) }).await??;
         } else {
             tx.apply_changes(leaf_changes).await?;
         }
@@ -280,6 +274,24 @@ impl Index {
         }
     }
 }
+
+/// Await `work`, an operation on a tree over memory maps that hashes or decodes
+/// about `leaves` leaves, on a blocking thread when they number at least
+/// [`BLOCKING_BUILD_LEAVES`], so that it holds no executor thread while it runs.
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_blocking_if_large<R: Send + 'static>(
+    leaves: usize,
+    work: impl std::future::Future<Output = R> + Send + 'static,
+) -> anyhow::Result<R> {
+    if leaves < BLOCKING_BUILD_LEAVES {
+        return Ok(work.await);
+    }
+    Ok(tokio::task::spawn_blocking(move || futures::executor::block_on(work)).await?)
+}
+
+/// Await `work` where it is: wasm32 has no thread to block.
+#[cfg(target_arch = "wasm32")]
+async fn run_blocking_if_large<R>(_leaves: usize, work: impl std::future::Future<Output = R>) -> anyhow::Result<R> { Ok(work.await) }
 
 /// A tree defined by `spec` holding `leaves`.
 async fn build_tree(spec: TreeSpec, leaves: Vec<LeafInput>) -> Result<DigestTree, TreeError> {
