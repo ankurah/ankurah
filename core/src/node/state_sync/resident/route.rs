@@ -168,6 +168,10 @@ impl LiveRead {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
+        // Read the states before awaiting anything else: a resident entity's
+        // state read now matches the publication, while a later commit could
+        // advance it past the events delivered with it.
+        let states = current_states(node, entities.iter().copied()).await?;
         let mut events: BTreeMap<proto::EntityId, Vec<proto::EventId>> = BTreeMap::new();
         for change in affected.iter().filter(|change| entities.contains(&change.entity_id)) {
             let ids = events.entry(change.entity_id).or_default();
@@ -183,7 +187,7 @@ impl LiveRead {
         } else {
             node.storage.get_events(wanted).await?.into_iter().map(|event| (event.payload.id(), event)).collect()
         };
-        Ok(Self { states: current_states(node, entities).await?, events, bodies })
+        Ok(Self { states, events, bodies })
     }
 
     /// The current state of `entity`, if it exists.
