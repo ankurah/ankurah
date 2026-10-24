@@ -1,3 +1,7 @@
+//! Maintenance windows: what each reader's queue holds between fences, and
+//! how it coalesces, lags and fails. Commit outcomes and watch routing sit in
+//! the child modules.
+
 use super::*;
 use crate::{
     node::{applier::NodeApplier, Node},
@@ -10,6 +14,9 @@ use crate::{
     value::Value,
 };
 use ankurah_proto::{self as proto, Attested, AuthorId, EntityId, Event, Membership, ModelId, Operation, OperationSet};
+
+mod commits;
+mod watches;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Head {
@@ -68,6 +75,20 @@ async fn apply(node: &Node<TestStorage, PermissiveAgent>, event: &Event) -> anyh
     )
     .await?;
     Ok(())
+}
+
+/// A resident entity at `event`'s head, holding only `model`'s membership.
+async fn entity_at(node: &Node<TestStorage, PermissiveAgent>, event: &Event, model: ModelId) -> anyhow::Result<Entity> {
+    let (_, entity) = node
+        .entities
+        .with_state(
+            &LocalStateGetter::new(node.storage.clone()),
+            &LocalEventGetter::new(node.storage.clone(), false),
+            event.entity_id,
+            proto::State { memberships: [model].into_iter().collect(), head: proto::Clock::singleton(event), ..Default::default() },
+        )
+        .await?;
+    Ok(entity)
 }
 
 #[tokio::test]
@@ -130,56 +151,6 @@ async fn a_fence_drains_its_finite_window_and_leaves_later_commits_for_the_next_
 }
 
 #[tokio::test]
-async fn cancellation_before_commit_does_not_invalidate_source() -> anyhow::Result<()> {
-    let node = node().await?;
-    let (_, mut cursor) = subscribe(&node).await?;
-    let (entered, wait) = tokio::sync::oneshot::channel();
-    let (_release, resume) = tokio::sync::oneshot::channel();
-    *node.storage.hold_set_state.lock().unwrap() = Some((entered, resume));
-    {
-        let event = genesis(3);
-        let applying = apply(&node, &event);
-        tokio::pin!(applying);
-        assert!(futures::poll!(&mut applying).is_pending());
-        wait.await?;
-    }
-    assert!(cursor.fence().await?.batch.is_none());
-    subscribe(&node).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn cancellation_after_storage_commit_invalidates_existing_and_new_subscriptions() -> anyhow::Result<()> {
-    let node = node().await?;
-    let (_, mut cursor) = subscribe(&node).await?;
-    apply(&node, &genesis(13)).await?;
-    // A commit dropped after storage committed it and before its publication must leave no
-    // successful read barrier.
-    let mut commit = node.reactor.begin_commit().await;
-    commit.record_storage_outcome(Ok(crate::storage::StorageCommitOutcome::Committed(Default::default())))?;
-    drop(commit);
-    assert!(matches!(cursor.next().await, Err(SourceError::Unavailable)));
-    assert!(matches!(cursor.fence().await, Err(SourceError::Unavailable)));
-    assert!(matches!(subscribe(&node).await, Err(SourceError::Unavailable)));
-    Ok(())
-}
-
-#[tokio::test]
-async fn definite_storage_rejection_does_not_poison_source() -> anyhow::Result<()> {
-    let source: crate::reactor::Reactor = crate::reactor::Reactor::new(ankurah_signals::Mut::new(true));
-    let (start, mut cursor) = source.subscribe_maintenance(project).await?;
-    let mut commit = source.begin_commit().await;
-    assert!(matches!(
-        commit.record_storage_outcome(Ok(crate::storage::StorageCommitOutcome::Conflict { observed: Default::default() }))?,
-        crate::storage::StorageCommitOutcome::Conflict { .. }
-    ));
-    drop(commit);
-    assert_eq!(cursor.fence().await?.revision, start);
-    source.subscribe_maintenance(project).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn lagged_reader_fails_without_invalidating_an_independent_reader() -> anyhow::Result<()> {
     let node = node().await?;
     let (_, mut slow) = node
@@ -212,20 +183,6 @@ async fn lagged_reader_fails_without_invalidating_an_independent_reader() -> any
     assert!(current.fence().await?.batch.is_none());
     subscribe(&node).await?;
     Ok(())
-}
-
-/// A resident entity at `event`'s head, holding only `model`'s membership.
-async fn entity_at(node: &Node<TestStorage, PermissiveAgent>, event: &Event, model: ModelId) -> anyhow::Result<Entity> {
-    let (_, entity) = node
-        .entities
-        .with_state(
-            &LocalStateGetter::new(node.storage.clone()),
-            &LocalEventGetter::new(node.storage.clone(), false),
-            event.entity_id,
-            proto::State { memberships: [model].into_iter().collect(), head: proto::Clock::singleton(event), ..Default::default() },
-        )
-        .await?;
-    Ok(entity)
 }
 
 #[tokio::test]
@@ -309,65 +266,6 @@ async fn coalescing_preserves_catalog_invalidation_before_later_ordinary_changes
 }
 
 #[tokio::test]
-async fn a_commit_batch_and_its_fence_cannot_be_half_published() -> anyhow::Result<()> {
-    let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await?;
-    node.wait_ready().await?;
-    let (_, mut cursor) = subscribe(&node).await?;
-    let events: Vec<_> = [11, 12]
-        .into_iter()
-        .map(|seed| {
-            Event::genesis(
-                node.system.root_id(),
-                AuthorId::Unknown,
-                OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([seed; 32]))))]),
-            )
-        })
-        .collect();
-    let (entered, wait) = tokio::sync::oneshot::channel();
-    let (release, resume) = tokio::sync::oneshot::channel();
-    *node.storage.hold_after_commit.lock().unwrap() = Some((entered, resume));
-    let transaction = crate::node::handler::commit_transaction(
-        &node,
-        &crate::policy::DEFAULT_CONTEXT,
-        proto::TransactionId::new(),
-        events.iter().cloned().map(Attested::from).collect(),
-    );
-    tokio::pin!(transaction);
-    assert!(futures::poll!(&mut transaction).is_pending());
-    wait.await?;
-    for event in &events {
-        assert_eq!(node.storage.get_state(event.entity_id).await?.payload.state.head, proto::Clock::singleton(event));
-    }
-    let fence = cursor.fence();
-    tokio::pin!(fence);
-    assert!(futures::poll!(&mut fence).is_pending(), "a source fence must wait for resident publication and index projection");
-    release.send(()).unwrap();
-    let (transaction, window) = tokio::join!(transaction, fence);
-    transaction?;
-    let window = window?;
-    assert!(window.batch.is_some());
-    assert_eq!(window.batch.as_ref().unwrap().changes.len(), 2);
-    for (change, event) in window.batch.as_ref().unwrap().changes.iter().zip(&events) {
-        assert_eq!(change.head, proto::Clock::singleton(event));
-    }
-    Ok(())
-}
-
-#[tokio::test]
-async fn an_unclassified_storage_error_requires_source_reconstruction() -> anyhow::Result<()> {
-    let node = node().await?;
-    let (_, mut cursor) = subscribe(&node).await?;
-    node.storage.fail_next_commit();
-    assert!(apply(&node, &genesis(6)).await.is_err());
-    // This fixture rejected before commit, but the generic storage error does
-    // not prove that outcome to its caller. It must not authorize a clean fence.
-    assert!(matches!(cursor.fence().await, Err(SourceError::Unavailable)));
-    assert!(matches!(subscribe(&node).await, Err(SourceError::Unavailable)));
-    Ok(())
-}
-
-#[tokio::test]
 async fn limited_read_validation_preserves_crossing_publications_for_retry() -> anyhow::Result<()> {
     let node = node().await?;
     let (start, mut cursor) = subscribe(&node).await?;
@@ -382,138 +280,6 @@ async fn limited_read_validation_preserves_crossing_publications_for_retry() -> 
 }
 
 #[tokio::test]
-async fn finishing_bootstrap_cannot_drop_a_commit_crossing_the_scan() -> anyhow::Result<()> {
-    let node = node().await?;
-    let (start, mut cursor) = subscribe(&node).await?;
-    let event = genesis(41);
-    apply(&node, &event).await?;
-    assert!(matches!(cursor.finish_bootstrap(Predicate::False, [], start).await, Err(SourceError::Changed)));
-    let window = cursor.fence().await?;
-    assert_eq!(window.batch.as_ref().unwrap().changes[0].head, proto::Clock::singleton(&event));
-    cursor.finish_bootstrap(Predicate::False, [event.entity_id], window.revision).await?;
-
-    // Even a predicate with no entry candidates must retain the explicitly
-    // installed membership watch until the projector observes a departure.
-    let later = Event::update(event.entity_id, proto::Clock::singleton(&event), AuthorId::Unknown, OperationSet::default());
-    apply(&node, &later).await?;
-    assert_eq!(cursor.next().await?.changes[0].head, proto::Clock::singleton(&later));
-    Ok(())
-}
-
-#[tokio::test]
-async fn maintenance_routes_model_candidates_and_removes_departed_entity_watches() -> anyhow::Result<()> {
-    let node = node().await?;
-    let model = ModelId::EntityId(EntityId::from_bytes([7; 32]));
-    let property = proto::PropertyId::EntityId(EntityId::from_bytes([31; 32]));
-    let predicate = Predicate::And(
-        Box::new(Predicate::MemberOf(model)),
-        Box::new(Predicate::Comparison {
-            left: Box::new(ankql::ast::Expr::Path(ankql::ast::PropertyPath::from(property))),
-            operator: ankql::ast::ComparisonOperator::Equal,
-            right: Box::new(ankql::ast::Expr::Literal(Value::String("inside".into()))),
-        }),
-    );
-    let project_predicate = predicate.clone();
-    let (revision, mut cursor) = node
-        .reactor
-        .subscribe_maintenance(move |entities| {
-            entities
-                .iter()
-                .map(|entity| {
-                    let mut projected = project_entity(entity)?;
-                    projected.member =
-                        entity.with_read(|read| crate::selection::filter::evaluate_predicate(read, &project_predicate))??;
-                    Ok(projected)
-                })
-                .collect()
-        })
-        .await?;
-    cursor.finish_bootstrap(predicate, [], revision).await?;
-
-    let unrelated = Event::genesis(
-        None,
-        AuthorId::Unknown,
-        OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([8; 32]))))]),
-    );
-    apply(&node, &unrelated).await?;
-    assert!(cursor.fence().await?.batch.is_none(), "other models are not projected");
-
-    let set = |value: &str| -> anyhow::Result<Operation> {
-        let backend = LWWBackend::new();
-        backend.set(property, Some(Value::String(value.into())));
-        Ok(Operation::Backend { backend: "lww".into(), operations: backend.to_operations()?.unwrap() })
-    };
-    let entered =
-        Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model)), set("inside")?]));
-    apply(&node, &entered).await?;
-    assert_eq!(cursor.next().await?.changes[0].key.as_deref(), Some("inside"));
-    assert!(cursor.maintenance.0.watchers.lock().unwrap().debug_data().2.contains_key(&entered.entity_id));
-    let departed =
-        Event::update(entered.entity_id, proto::Clock::singleton(&entered), AuthorId::Unknown, OperationSet(vec![set("outside")?]));
-    apply(&node, &departed).await?;
-    assert_eq!(cursor.next().await?.changes[0].key.as_deref(), Some("outside"));
-    assert!(!cursor.maintenance.0.watchers.lock().unwrap().debug_data().2.contains_key(&entered.entity_id));
-    Ok(())
-}
-
-#[tokio::test]
-async fn dropping_maintenance_unregisters_its_watchers_and_projector() -> anyhow::Result<()> {
-    let node = node().await?;
-    let owned = Arc::new(());
-    let weak = Arc::downgrade(&owned);
-    let (revision, mut cursor) = node
-        .reactor
-        .subscribe_maintenance(move |entities| {
-            let _ = &owned;
-            project(entities)
-        })
-        .await?;
-    let maintenance = cursor.maintenance.clone();
-    let id = cursor.reader.id;
-    cursor.finish_bootstrap(Predicate::True, [EntityId::from_bytes([32; 32])], revision).await?;
-    drop(cursor);
-    assert!(weak.upgrade().is_none(), "the subscription owns its projection closure");
-    assert!(!maintenance.0.state.lock().unwrap().readers.contains_key(&id));
-    let watchers = maintenance.0.watchers.lock().unwrap();
-    let (_, wildcard, entities) = watchers.debug_data();
-    assert!(!wildcard.iter().any(|(subscription, _)| *subscription == id));
-    assert!(entities.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn catalog_changes_reach_maintenance_without_any_predicate_candidate() -> anyhow::Result<()> {
-    let node = node().await?;
-    let (revision, mut cursor) = subscribe(&node).await?;
-    cursor.finish_bootstrap(Predicate::False, [], revision).await?;
-    let event = Event::genesis(
-        None,
-        AuthorId::Unknown,
-        OperationSet(vec![Operation::Membership(Membership::Add(crate::schema::CATALOG_MODELS[0]))]),
-    );
-    let state = proto::State {
-        memberships: [crate::schema::CATALOG_MODELS[0]].into_iter().collect(),
-        head: proto::Clock::singleton(&event),
-        ..Default::default()
-    };
-    let (_, entity) = node
-        .entities
-        .with_state(
-            &LocalStateGetter::new(node.storage.clone()),
-            &LocalEventGetter::new(node.storage.clone(), false),
-            event.entity_id,
-            state,
-        )
-        .await?;
-    node.reactor.begin_commit().await.publish([&entity]);
-    let window = cursor.fence().await?;
-    assert!(window.batch.is_some());
-    assert!(window.batch.as_ref().unwrap().catalog_changed);
-    assert!(window.batch.as_ref().unwrap().changes.is_empty());
-    Ok(())
-}
-
-#[tokio::test]
 async fn projection_failure_invalidates_only_the_affected_subscription() -> anyhow::Result<()> {
     let node = node().await?;
     let (_, mut failed) =
@@ -524,34 +290,5 @@ async fn projection_failure_invalidates_only_the_affected_subscription() -> anyh
     assert!(matches!(failed.next().await, Err(SourceError::Changed)));
     assert_eq!(healthy.next().await?.changes[0].head, proto::Clock::singleton(&event));
     assert!(subscribe(&node).await.is_ok());
-    Ok(())
-}
-
-#[tokio::test]
-async fn closing_the_reactor_fails_every_maintenance_reader() -> anyhow::Result<()> {
-    let source: crate::reactor::Reactor = crate::reactor::Reactor::new(ankurah_signals::Mut::new(true));
-    let (_, mut cursor) = source.subscribe_maintenance(project).await?;
-    // Closing clears the watchers that route changes to readers, so a reader
-    // that kept its window open would miss every later commit.
-    source.close().await;
-    assert!(matches!(cursor.next().await, Err(SourceError::Unavailable)));
-    assert!(matches!(source.subscribe_maintenance(project).await, Err(SourceError::Unavailable)));
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_local_transaction_publishes_its_entities_to_maintenance() -> anyhow::Result<()> {
-    let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await?;
-    node.wait_ready().await?;
-    let (_, mut cursor) = subscribe(&node).await?;
-    let transaction = node.privileged_context().begin();
-    let row = crate::schema::catalog::SysModelRow { label: "fixture".into(), name: "Fixture".into() };
-    let id = transaction.create(&row).await?.id();
-    transaction.commit().await?;
-    let head = node.storage.get_state(id).await?.payload.state.head;
-    let batch = cursor.next().await?;
-    assert!(batch.catalog_changed);
-    assert_eq!(batch.changes.iter().find(|change| change.id == id).map(|change| change.head.clone()), Some(head));
     Ok(())
 }
