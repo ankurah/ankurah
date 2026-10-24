@@ -92,16 +92,17 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         if self.failed {
             return Err(MutationError::TransactionFailed);
         }
-        let publication = self.node.commit_publication_lock.lock().await;
-        self.storage.commit().await?.committed()?;
+        let mut source = self.node.reactor.begin_commit().await;
+        source.record_storage_outcome(self.storage.commit().await)?.committed()?;
         let mut changes = Vec::new();
         for (_, entity) in self.entities.entries.drain(..) {
             let change = entity.fork.commit(&self.node.entities, &self.event_getter).await?;
-            if !change.events().is_empty() {
-                changes.push(change);
-            }
+            changes.push(change);
         }
-        drop(publication);
+        // Maintenance follows every committed head, including one a reader loaded before this
+        // commit published it; reactor subscribers hear only of new events.
+        source.publish(changes.iter().map(|change| change.entity()));
+        changes.retain(|change| !change.events().is_empty());
         self.node.reactor.notify_change(changes).await;
         Ok(())
     }

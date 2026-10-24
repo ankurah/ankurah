@@ -2,6 +2,56 @@ use super::*;
 use ankurah_proto::{AuthorId, EventId, EventStructureError};
 use std::sync::Mutex;
 
+#[test]
+fn borrowed_read_agrees_with_storage_evaluation_and_clones_only_requested_metadata() -> anyhow::Result<()> {
+    use crate::{
+        entity::TemporaryEntity,
+        property::backend::{lww::LWWBackend, yrs::YrsBackend},
+        selection::filter::{Filterable, ValueLookup},
+    };
+    use ankurah_proto::{EntityId, SystemProperty};
+    let state = EntityState::empty();
+    let lww = state.get_backend::<LWWBackend>()?;
+    let yrs = state.get_backend::<YrsBackend>()?;
+    let first = PropertyId::System(SystemProperty::Label);
+    let fallback = PropertyId::System(SystemProperty::Name);
+    let json_id = EntityId::from_bytes([8; 32]);
+    lww.set(first, Some(Value::String("first backend".into())));
+    lww.set(fallback, None);
+    lww.set(PropertyId::EntityId(json_id), Some(Value::Json(serde_json::json!({"nested": {"value": 7}}))));
+    let event = crate::test_helpers::commit_backend(&*lww, 1)?;
+    yrs.insert(&first, 0, "later backend")?;
+    yrs.insert(&fallback, 0, "fallback value")?;
+    let model = ModelId::EntityId(EntityId::from_bytes([3; 32]));
+    state.add_membership(model);
+    state.set_head(Clock::singleton(&event));
+    let copied_head = state.with_read(event.entity_id, |read| -> anyhow::Result<Clock> {
+        let oracle = TemporaryEntity::new(event.entity_id, &read.to_state()?)?;
+        for (property, expected) in [
+            (first, Some(Value::String("first backend".into()))),
+            (fallback, Some(Value::String("fallback value".into()))),
+            (PropertyId::Id, Some(Value::EntityId(event.entity_id))),
+        ] {
+            assert_eq!(read.value(&property), expected);
+            assert_eq!(read.value(&property), oracle.value(&property));
+        }
+        let path = ankql::ast::PropertyPath::registered(json_id, "json", vec!["nested".into(), "value".into()]);
+        assert_eq!(read.value_at(&path), Some(Value::I64(7)));
+        assert!(Filterable::is_member_of(read, &model)?);
+        assert_eq!(read.head(), &Clock::singleton(&event));
+        Ok(read.head().clone())
+    })?;
+    lww.set(first, Some(Value::String("new version".into())));
+    let changed = crate::test_helpers::commit_backend(&*lww, 2)?;
+    state.set_head(Clock::singleton(&changed));
+    state.with_read(event.entity_id, |read| {
+        assert_eq!(read.value(&first), Some(Value::String("new version".into())));
+        assert_eq!(read.head(), &Clock::singleton(&changed));
+    });
+    assert_eq!(copied_head, Clock::singleton(&event));
+    Ok(())
+}
+
 /// Serves the staged event and records attempts to read any other history.
 struct IncomingOnlyGetter {
     incoming: Event,

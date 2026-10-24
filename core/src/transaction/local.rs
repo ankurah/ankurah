@@ -229,17 +229,18 @@ impl Transaction {
                 }
                 relayed = true;
             }
-            let publication = node.commit_publication_lock.lock().await;
-            storage_trx.commit().await?.committed()?;
+            let mut source = node.reactor.begin_commit().await;
+            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             let mut changes = Vec::new();
             for (entity, fork) in forks {
                 let change = fork.commit(&node.entities, &event_getter).await?;
                 entity.committed(change.entity())?;
-                if !change.events().is_empty() {
-                    changes.push(change);
-                }
+                changes.push(change);
             }
-            drop(publication);
+            // Maintenance follows every committed head, including one a reader loaded before this
+            // commit published it; reactor subscribers hear only of new events.
+            source.publish(changes.iter().map(|change| change.entity()));
+            changes.retain(|change| !change.events().is_empty());
             node.reactor.notify_change(changes).await;
             Ok(attested_events.into_iter().map(|event| event.payload).collect())
         })

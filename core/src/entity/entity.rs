@@ -53,6 +53,12 @@ impl Entity {
     /// A rolled-back creation has no history, so its head is empty.
     pub fn head(&self) -> Clock { self.with_state(EntityState::head).unwrap_or_default() }
 
+    /// Run `read` over one coherent view of the committed head, memberships and property values.
+    pub(crate) fn with_read<T>(&self, read: impl FnOnce(&super::EntityRead<'_>) -> T) -> Result<T, PropertyError> {
+        let id = self.id();
+        self.with_state(|state| state.with_read(id, read))
+    }
+
     /// Model memberships visible through this handle, including transaction-local additions.
     /// A rolled-back creation has none.
     pub fn memberships(&self) -> BTreeSet<ModelId> { self.with_state(EntityState::memberships).unwrap_or_default() }

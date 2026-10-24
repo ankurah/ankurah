@@ -1,6 +1,7 @@
 mod candidate_changes;
 mod comparison_index;
 pub mod fetch_gap;
+pub(crate) mod maintenance;
 mod subscription;
 mod subscription_state;
 mod update;
@@ -79,6 +80,8 @@ pub struct Reactor<
 >(Arc<ReactorInner<E, Ev>>);
 
 struct ReactorInner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
+    /// The commit gate, and the indexes each commit publishes its changes to.
+    maintenance: maintenance::Maintenance,
     subscriptions: std::sync::Mutex<HashMap<ReactorSubscriptionId, Subscription<E, Ev>>>,
     // Shared with all subscriptions to allow them to manage their own watchers
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
@@ -100,9 +103,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
     /// Clear subscriptions when the owner stops running, without retaining the reactor while waiting.
     pub(crate) fn new(run: impl Wait<bool> + Send + Sync + 'static) -> Self {
+        let watcher_set = Arc::new(Mutex::new(WatcherSet::new()));
         let reactor = Self(Arc::new(ReactorInner {
+            maintenance: maintenance::Maintenance::new(watcher_set.clone()),
             subscriptions: Mutex::new(HashMap::new()),
-            watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
+            watcher_set,
             notify_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             publication_pause: Mutex::new(None),
@@ -355,6 +360,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Clear current subscription results and watchers when the owner stops running.
     pub(crate) async fn close(&self) {
         let _notify = self.0.notify_lock.lock().await;
+        self.0.maintenance.invalidate();
         {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             watcher_set.clear();

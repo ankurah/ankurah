@@ -216,12 +216,13 @@ impl NodeApplier {
         let mut storage_trx = node.storage.transaction();
         storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
         storage_trx.add_events(events).await?;
-        let _publication = node.commit_publication_lock.lock().await;
-        match storage_trx.commit().await? {
+        let mut source = node.reactor.begin_commit().await;
+        match source.record_storage_outcome(storage_trx.commit().await)? {
             crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
             crate::storage::StorageCommitOutcome::Committed(_) => {}
         }
         let (_, entity) = node.entities.with_state(state_getter, event_getter, state.entity_id, state.state.clone()).await?;
+        source.publish([&entity]);
         Ok(Some(entity))
     }
 
@@ -259,16 +260,18 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
-            let _publication = node.commit_publication_lock.lock().await;
-            storage_trx.commit().await?.committed()?;
+            let mut source = node.reactor.begin_commit().await;
+            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             if adopted {
                 let (_, entity) = node
                     .entities
                     .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
                     .await?;
+                source.publish([&entity]);
                 Ok(Some(EntityChange::new(entity, events)))
             } else {
                 let change = candidate.commit(&node.entities, event_getter).await?;
+                source.publish([change.entity()]);
                 Ok((!change.events().is_empty()).then_some(change))
             }
         })
@@ -299,9 +302,10 @@ impl NodeApplier {
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
             storage_trx.add_events(&events).await?;
-            let _publication = node.commit_publication_lock.lock().await;
-            storage_trx.commit().await?.committed()?;
+            let mut source = node.reactor.begin_commit().await;
+            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
             let change = candidate.commit(&node.entities, event_getter).await?;
+            source.publish([change.entity()]);
             Ok((!change.events().is_empty()).then_some(change))
         })
     }
