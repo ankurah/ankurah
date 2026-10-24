@@ -8,10 +8,10 @@ use js_sys::Array;
 use wasm_bindgen::JsValue;
 
 use super::{
-    statement::{js_error, method, statement_method},
+    statement::{integer_from_js, js_error, method, read_rows, statement_method, RowSelection},
     NodeJsConnection,
 };
-use crate::{error::SqliteError, executor::statement_scan};
+use crate::{error::SqliteError, executor::statement_scan, value::SqliteValueRef};
 
 /// On a database that binds NULL for a positional parameter a call does not
 /// pass, how many values each SQL text's statement was shown to take at
@@ -39,6 +39,25 @@ impl NodeJsConnection {
         // call passing that value runs.
         get.call1(&statement, &JsValue::NULL).map_err(js_error)?;
         Ok(false)
+    }
+
+    /// Whether the database binds a call's values to a numbered parameter
+    /// such as `?2` at its position, as rusqlite does: node:sqlite does from
+    /// Node.js 22.20.0 on 22 and 24.7.0 on 24, and on every later line. Before,
+    /// it skipped each numbered parameter as it bound a call's values in turn,
+    /// so that `?, ?3` given two values left `?3` NULL, and the check of a
+    /// call's values (`refuse_too_few_values`) misjudged it. The binding is
+    /// checked rather than the version, which cannot tell the releases apart:
+    /// given two values, `SELECT ?2` reads the second where the binding is
+    /// right, and where it skips `?2`, its second value lands past the
+    /// statement's last parameter, which SQLite refuses (SQLITE_RANGE).
+    pub(super) fn binds_a_numbered_parameter_at_its_position(&self) -> Result<bool, SqliteError> {
+        let statement = self.prepare("SELECT ?2")?;
+        match read_rows(&statement, &[SqliteValueRef::Integer(1), SqliteValueRef::Integer(2)], 1, RowSelection::First) {
+            Ok(rows) => Ok(matches!(rows.as_slice(), [row] if integer_from_js(&row.get(0)).is_ok_and(|value| value == 2))),
+            Err(SqliteError::NodeSqlite { code: SQLITE_RANGE, .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     /// Refuse a call to `sql` that passes fewer values than its statement

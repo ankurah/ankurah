@@ -269,6 +269,29 @@ fn refuses_a_row_of_the_wrong_width() {
     assert!(error.contains("returned a row of 3"), "{error}");
 }
 
+/// A database that skips a numbered parameter as it binds a call's values,
+/// as node:sqlite did before Node.js 22.20.0 on 22 and 24.7.0 on 24, is
+/// refused, naming the releases that bind one at its position. The fake's
+/// `SELECT ?2` refuses its second value as those releases do, since they
+/// bind it past the statement's last parameter: SQLITE_RANGE, 25.
+#[wasm_bindgen_test]
+#[cfg_attr(
+    ankurah_sqlite_better_sqlite3,
+    ignore = "better-sqlite3 binds no positional value to a numbered parameter and refuses the call itself, so the executor \
+              checks no binding of one there"
+)]
+fn refuses_a_database_that_skips_a_numbered_parameter() {
+    let error = refusal(
+        "return sql !== 'SELECT ?2' ? statement : new Proxy(statement, { get: (target, name) => name === 'get'
+             ? (...params) => {
+                   if (params.length < 2) return target.get(...params);
+                   throw Object.assign(new Error('column index out of range'), { code: 'ERR_SQLITE_ERROR', errcode: 25 });
+               }
+             : forward(target, name) });",
+    );
+    assert!(error.contains("Node.js 22.20.0 or later on 22, 24.7.0 or later on 24, or a later release line"), "{error}");
+}
+
 /// `undefined` is no storage class: it is refused, not read as NULL.
 #[wasm_bindgen_test]
 fn refuses_undefined_where_null_was_handed_over() {

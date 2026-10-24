@@ -99,10 +99,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ankurah-storage-sqlite's nodejs feature runs on Node.js 22.20.0 and
-        # later (NODE_FLOOR in storage/sqlite/src/executor/nodejs/runtime.rs):
-        # the floor, and the current release.
-        node: ["22.20.0", "24"]
+        # ankurah-storage-sqlite's nodejs feature runs on a node:sqlite that
+        # binds a numbered parameter at its position, which it checks as it
+        # adopts a database: Node.js 22.20.0 or later on 22, 24.7.0 or later
+        # on 24, and every later line. The matrix runs the oldest of those
+        # releases on each of the LTS lines 22 and 24, and the newest release
+        # of the newest line, 26.
+        node: ["22.20.0", "24.7.0", "26"]
 
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +135,9 @@ jobs:
           RUST_BACKTRACE: 1
 
       # The same suite runs again on better-sqlite3, at the release
-      # storage/sqlite/tests/package.json pins.
+      # storage/sqlite/tests/package.json pins, on every leg: that release
+      # ships prebuilt Node-API 10 binaries, which each leg's Node.js loads,
+      # so `npm ci` builds nothing.
       - name: Install better-sqlite3
         working-directory: storage/sqlite/tests
         run: npm ci

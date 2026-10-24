@@ -1,6 +1,6 @@
 //! What the Node.js executor needs of Node.js itself: the `process` global,
-//! a Node.js at or past the floor, and node:sqlite's `DatabaseSync`, opened
-//! with the busy timeout and the session settings of a native connection.
+//! and node:sqlite's `DatabaseSync`, opened with the busy timeout and the
+//! session settings of a native connection.
 
 use js_sys::{Array, Function, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
@@ -11,41 +11,13 @@ use super::{
 };
 use crate::{error::SqliteError, executor::SESSION_PRAGMAS};
 
-/// The oldest Node.js the Node.js executor runs on, on either driver: from
-/// 22.20.0, node:sqlite binds a positional value to a numbered parameter such
-/// as `?2` as rusqlite does, where before it bound none, leaving the
-/// parameter NULL.
-const NODE_FLOOR: [u32; 3] = [22, 20, 0];
-
 /// The `process` global, which exists only inside Node.js.
-pub(super) fn nodejs_process() -> Result<JsValue, SqliteError> {
+fn nodejs_process() -> Result<JsValue, SqliteError> {
     let process = Reflect::get(&js_sys::global(), &"process".into()).map_err(js_error)?;
     if process.is_undefined() || process.is_null() {
         return Err(SqliteError::Node("no `process` global: the Node.js executor runs only inside Node.js".into()));
     }
     Ok(process)
-}
-
-/// Refuse a Node.js older than [`NODE_FLOOR`].
-pub(super) fn require_node_floor(process: &JsValue) -> Result<(), SqliteError> {
-    let version =
-        Reflect::get(process, &"versions".into()).and_then(|versions| Reflect::get(&versions, &"node".into())).map_err(js_error)?;
-    let version = version.as_string().ok_or_else(|| SqliteError::Node(format!("`process.versions.node` is {version:?}, not a version")))?;
-    meets_node_floor(&version)
-}
-
-/// Refuse `version`, as `process.versions.node` gives it, when it is older
-/// than [`NODE_FLOOR`].
-fn meets_node_floor(version: &str) -> Result<(), SqliteError> {
-    let parts: Option<Vec<u32>> = version.split('.').map(|part| part.parse().ok()).collect();
-    match parts {
-        Some(parts) if parts.len() == 3 && parts.as_slice() >= NODE_FLOOR.as_slice() => Ok(()),
-        Some(parts) if parts.len() == 3 => Err(SqliteError::Node(format!(
-            "the Node.js executor needs Node.js 22.20.0 or later, whose node:sqlite binds a positional value to a numbered \
-             parameter such as `?2` as rusqlite does; this is Node.js {version}"
-        ))),
-        _ => Err(SqliteError::Node(format!("Node.js reports its version as {version:?}, which the Node.js executor cannot read"))),
-    }
 }
 
 /// The 5000 ms busy timeout rusqlite sets on every connection as it opens
@@ -60,14 +32,13 @@ impl NodeJsConnection {
     /// in-memory one. Applies the session settings a native connection has.
     pub fn open(path: &str) -> Result<Self, SqliteError> {
         let process = nodejs_process()?;
-        require_node_floor(&process)?;
-        // Node.js has had `process.getBuiltinModule` since 22.3, before the
-        // floor, so a runtime that reports a version past the floor without
+        // Node.js has had `process.getBuiltinModule` since 22.3, before any
+        // release whose node:sqlite the executor runs on, so a runtime without
         // it is no Node.js the executor runs on.
         let get_builtin: Function = Reflect::get(&process, &"getBuiltinModule".into()).map_err(js_error)?.dyn_into().map_err(|_| {
             SqliteError::Node(
                 "`process` has no `getBuiltinModule` method, which Node.js has from 22.3: the Node.js executor needs \
-                 Node.js 22.20.0 or later"
+                 Node.js 22.20.0 or later on 22, 24.7.0 or later on 24, or a later release line"
                     .into(),
             )
         })?;
@@ -87,28 +58,5 @@ impl NodeJsConnection {
         // Only a database the executor accepts is switched to WAL.
         connection.exec(SESSION_PRAGMAS)?;
         Ok(connection)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use wasm_bindgen_test::wasm_bindgen_test;
-
-    use super::*;
-
-    /// The executor runs on Node.js 22.20.0 or later, whose node:sqlite binds
-    /// numbered parameters as rusqlite does, and refuses an older one, naming
-    /// both versions.
-    #[wasm_bindgen_test]
-    fn refuses_a_node_older_than_its_floor() {
-        for version in ["22.20.0", "22.20.1", "22.21.0", "23.0.0", "24.13.0"] {
-            assert!(meets_node_floor(version).is_ok(), "{version}");
-        }
-        for version in ["22.19.9", "22.16.0", "21.99.99", "20.18.0"] {
-            let refusal = meets_node_floor(version).expect_err("an older Node.js is refused").to_string();
-            assert!(refusal.contains("Node.js 22.20.0 or later") && refusal.contains(version), "{refusal}");
-        }
-        assert!(meets_node_floor("22.20").is_err());
-        require_node_floor(&nodejs_process().unwrap()).expect("the Node.js running the tests meets the floor");
     }
 }

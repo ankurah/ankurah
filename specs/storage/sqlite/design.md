@@ -90,7 +90,10 @@ driver below it runs that SQL.
   pragmas; the in-memory engine uses a one-connection pool so all operations
   observe the same database.
 - On wasm32, behind the `nodejs` feature, the engine runs on one database
-  object of Node.js 22.20.0 or later, synchronously on the calling thread.
+  object, synchronously on the calling thread, on Node.js 22.20.0 or later on
+  22, 24.7.0 or later on 24, or a later release line: earlier releases'
+  node:sqlite skips a numbered parameter as it binds a call's values, and a
+  database that binds one so is refused.
   `open` and `open_in_memory` construct a node:sqlite `DatabaseSync` and give
   it the native connections' session settings. A host that built a database
   itself, a node:sqlite `DatabaseSync` or a better-sqlite3 `Database`, hands

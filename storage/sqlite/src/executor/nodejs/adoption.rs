@@ -6,11 +6,7 @@ use std::rc::Rc;
 use send_wrapper::SendWrapper;
 use wasm_bindgen::JsValue;
 
-use super::{
-    runtime::{nodejs_process, require_node_floor},
-    statement::method,
-    NodeJsConnection,
-};
+use super::{statement::method, NodeJsConnection};
 use crate::{error::SqliteError, executor::SqliteExecutor, value::SqliteValue};
 
 impl NodeJsConnection {
@@ -21,7 +17,6 @@ impl NodeJsConnection {
     /// another copy in the same process (see
     /// [`SqliteStorageEngine::from_database`](crate::SqliteStorageEngine::from_database)).
     pub fn from_database(database: JsValue) -> Result<Self, SqliteError> {
-        require_node_floor(&nodejs_process()?)?;
         if !database.is_object() {
             return Err(SqliteError::Node(format!(
                 "a database must be an object with prepare and exec methods, such as node:sqlite's DatabaseSync; got {database:?}"
@@ -45,6 +40,18 @@ impl NodeJsConnection {
         // the executor checks each statement's count of parameters itself.
         if connection.binds_null_for_a_missing_parameter()? {
             connection.parameters = Some(SendWrapper::new(Rc::default()));
+            // Such a database, node:sqlite, must also bind a numbered
+            // parameter at its position, or that check misjudges a statement
+            // that has one, and a parameter left without a value reads NULL.
+            if !connection.binds_a_numbered_parameter_at_its_position()? {
+                return Err(SqliteError::Node(
+                    "the database skips a numbered parameter such as `?2` as it binds a call's values, which can leave the \
+                     parameter NULL where rusqlite binds the value at its position, as node:sqlite did before Node.js \
+                     22.20.0 on 22 and 24.7.0 on 24: the Node.js executor needs Node.js 22.20.0 or later on 22, 24.7.0 or \
+                     later on 24, or a later release line"
+                        .into(),
+                ));
+            }
         }
         // The typed reader takes TEXT as the bytes SQLite stores, which are
         // UTF-8 only in a UTF-8 database. rusqlite has SQLite convert the TEXT

@@ -6,9 +6,11 @@
 //! engine reaches it through a `DatabaseSync`-shaped JavaScript object:
 //! `prepare(sql)` giving statements with `run(...params)`, `get(...params)`,
 //! `all(...params)`, `columns()` and `sourceSQL`, plus `exec(sql)`. Node.js's
-//! own `DatabaseSync` has that shape; the executor runs on Node.js 22.20.0 or
-//! later (see `NODE_FLOOR`). Compatible
-//! drivers must also support positional rows and BigInt INTEGER results; the
+//! own `DatabaseSync` has that shape; the executor runs on a node:sqlite that
+//! binds a numbered parameter at its position, Node.js 22.20.0 or later on 22,
+//! 24.7.0 or later on 24, or a later release line, and checks the binding when
+//! it adopts a database (see `binds_a_numbered_parameter_at_its_position`).
+//! Compatible drivers must also support positional rows and BigInt INTEGER results; the
 //! adapter recognizes better-sqlite3's `raw` and `safeIntegers` methods for
 //! these capabilities, and its `source` for `sourceSQL`.
 //! Hosts can adopt an existing database with [`SqliteStorageEngine::from_database`];
