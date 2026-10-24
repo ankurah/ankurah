@@ -1464,14 +1464,14 @@ impl Comparison {
                 work.push(Work::SendHeads(gap));
             }
             let point = TreeSpan::new(Included(address.clone()), Included(address.clone()));
-            if let Some((_, entry)) = self.snapshot.entries_in(&point, 1).next() {
+            if let Some((entity_id, entry)) = self.snapshot.entries_in(&point, 1).next() {
                 flush_removal(&mut removal, &mut work);
                 if !leaf.entity.head.equals(&entry.head) {
                     work.push(Work::Item(StateItem::Heads(proto::TreeSpanInventory {
                         bounds: point,
                         heads: vec![proto::KeyedEntityHead {
-                            key: entry.key.clone(),
-                            entity: proto::EntityHead { entity_id: entry.entity_id, head: entry.head.clone() },
+                            key: entry.key().to_vec(),
+                            entity: proto::EntityHead { entity_id, head: entry.head.clone() },
                         }]
                         .try_into()?,
                     })));

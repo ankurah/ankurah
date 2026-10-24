@@ -251,7 +251,7 @@ async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read(
     assert_eq!(actor.tree.entries().len(), 2);
     assert_eq!(captured.entries[&a.entity_id].head, proto::Clock::singleton(&moved));
     assert!(captured.entries.contains_key(&b.entity_id));
-    assert!(captured.entries[&b.entity_id].key < captured.entries[&a.entity_id].key);
+    assert!(captured.entries[&b.entity_id].key() < captured.entries[&a.entity_id].key());
     Ok(())
 }
 
@@ -272,7 +272,7 @@ async fn a_complete_id_keyed_tree_cannot_select_an_unindexed_ordered_limit() -> 
     assert!(view(&actor, &selection, &node.catalog).await.is_err(), "a complete tree cannot rank properties absent from its keys");
     assert_eq!(actor.tree.entries().len(), 2, "a failed scope never truncates the resident admission");
     assert_eq!(
-        actor.tree.snapshot().members().values().copied().collect::<Vec<_>>(),
+        actor.tree.snapshot().member_map().values().copied().collect::<Vec<_>>(),
         vec![last.entity_id, first.entity_id],
         "physical digest address order remains by ID"
     );

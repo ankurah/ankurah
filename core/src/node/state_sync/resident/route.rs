@@ -53,7 +53,7 @@ impl Route {
         let ordered = match selected.ordered_ids(&self.selection, &node.catalog) {
             Ok(ordered) => ordered,
             Err(error) if self.selection.limit.is_none() && error.is::<crate::node::state_sync::tree::UnsupportedTreeSelection>() => {
-                selected.members().into_values().collect()
+                selected.members().map(|(_, id)| id).collect()
             }
             Err(error) => return Err(error),
         };

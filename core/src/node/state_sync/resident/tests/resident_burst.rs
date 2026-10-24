@@ -71,11 +71,11 @@ async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update(
     })
     .await?;
     let moved = update(&events[0], "row-99999999")?;
-    let previous_key = resident.snapshot().await?.snapshot.entries[&moved.entity_id].key.clone();
+    let previous_key = resident.snapshot().await?.snapshot.entries[&moved.entity_id].key().to_vec();
     apply(&client, &moved).await?;
     expected.insert(moved.entity_id, proto::Clock::singleton(&moved));
     wait_for_original_tree(&resident, &expected).await?;
-    assert_ne!(resident.snapshot().await?.snapshot.entries[&moved.entity_id].key, previous_key);
+    assert_ne!(resident.snapshot().await?.snapshot.entries[&moved.entity_id].key(), previous_key);
     let reused = acquire(&client.resident_trees, &client, selection).await?;
     assert!(Weak::ptr_eq(&original, &reused.identity()), "maintenance keeps the same resident reusable");
     assert_eq!(client.storage.2.load(Ordering::Relaxed), scans);

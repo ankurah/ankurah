@@ -225,7 +225,9 @@ async fn canceled_build_never_becomes_reusable_and_halt_stops_idle_entries() -> 
 async fn an_idle_entry_that_grows_beyond_retention_is_evicted() -> anyhow::Result<()> {
     let node = node().await?;
     apply(&node, &genesis("01")?).await?;
-    let cache = ResidentTrees::with_limits(8, 7_000);
+    // Retain exactly what one member costs, so that more members cannot fit.
+    let budget = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?.accounted_bytes();
+    let cache = ResidentTrees::with_limits(8, budget);
     let resident = acquire(&cache, &node, selection(None)).await?;
     let frozen = resident.snapshot().await?.snapshot;
     assert_eq!(frozen.entries.len(), 1);

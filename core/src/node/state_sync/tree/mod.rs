@@ -1,19 +1,28 @@
-//! A resident's maintained digest tree and the frozen snapshots read from it.
+//! A resident's tree: each member's address and Clock, the digest tree over
+//! them, both changed together by every commit, and the frozen snapshots read
+//! from them.
+mod footprint;
 mod snapshot;
 mod spans;
 mod spec;
 
+pub(crate) use footprint::{CLOCK_ENTRY_BYTES, ID_ROW_BYTES};
 pub(crate) use snapshot::{Snapshot, UnsupportedTreeSelection};
 pub(crate) use spec::{accept_peer_spec, key_paths, request_for, serves, spec_for, tree_keys_rank_like_storage};
 
-use std::{collections::BTreeMap, sync::Arc};
-
+use self::footprint::Footprint;
+use ankurah_core_types::Value;
 use ankurah_digest_tree::{leaf_address, CanonicalCodec, DigestTree, HeadHash, LeafChange, LeafInput, TreeError};
 use ankurah_proto::{Clock, EntityId, TreeSpec};
+use std::{collections::BTreeMap, sync::Arc};
 
+/// Each member's entry, by entity id.
 type Entries = BTreeMap<EntityId, TreeEntry>;
-type Members = BTreeMap<Vec<u8>, EntityId>;
+/// Each member's entity id, by the address its entry holds.
+type Members = BTreeMap<Arc<[u8]>, EntityId>;
 
+/// A batch changing at least this many entries, and at least a quarter of the
+/// tree, is folded in by rebuilding the tree nodes from the stored leaves.
 const BULK_REFRESH_CHANGES: usize = 128;
 /// Builds and bulk rebuilds over at least this many leaves run on a blocking
 /// thread: over memory maps they never yield, and at about 5 µs to hash a
@@ -21,44 +30,58 @@ const BULK_REFRESH_CHANGES: usize = 128;
 #[cfg(not(target_arch = "wasm32"))]
 const BLOCKING_BUILD_LEAVES: usize = 1024;
 
-/// The entity metadata retained with a leaf. Payloads remain in entity/storage ownership.
+/// What a resident keeps of one member: its leaf address, the key its values
+/// encode followed by its entity id, and its Clock. Payloads stay in storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeEntry {
-    pub entity_id: EntityId,
-    pub key: Vec<u8>,
+    address: Arc<[u8]>,
     pub head: Clock,
 }
 
 impl TreeEntry {
-    fn address(&self) -> Vec<u8> { leaf_address(&self.key, self.entity_id) }
+    /// Entity `id`'s entry at `head`, filed under the key that `values`, one per
+    /// key part of `spec`, encode.
+    pub(crate) fn encode(spec: &TreeSpec, id: EntityId, values: &[Option<Value>], head: Clock) -> anyhow::Result<Self> {
+        let key = CanonicalCodec::encode_nullable(spec.key_spec(), values)?;
+        Ok(Self { address: leaf_address(&key, id).into(), head })
+    }
 
-    fn leaf(&self) -> LeafInput {
-        LeafInput { key: self.key.clone(), entity_id: self.entity_id, head: HeadHash::of(self.head.ids().map(|id| id.clone().to_bytes())) }
+    /// The leaf address: the key followed by the entity id.
+    pub(crate) fn address(&self) -> &[u8] { &self.address }
+
+    /// The key the entity is filed under.
+    pub(crate) fn key(&self) -> &[u8] { &self.address[..self.address.len() - EntityId::BYTE_LEN] }
+
+    fn leaf(&self, entity_id: EntityId) -> LeafInput {
+        LeafInput { key: self.key().to_vec(), entity_id, head: HeadHash::of(self.head.ids().map(|id| id.clone().to_bytes())) }
     }
 }
 
-/// A resident's index under one fixed TreeSpec: each admitted entity's key and
-/// Clock, and the digest tree over them, changed together by every commit its
-/// maintenance subscription applies.
+/// A resident's index under one fixed TreeSpec: each admitted entity's
+/// address and Clock, and the digest tree over them, changed together by
+/// every commit its maintenance subscription applies.
 pub(crate) struct QueryTree {
     tree: DigestTree,
     entries: Arc<Entries>,
     members: Arc<Members>,
+    footprint: Footprint,
 }
 
 impl QueryTree {
     /// A tree under `spec` holding `entries`.
-    pub(crate) async fn build(spec: TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Self> {
-        let entries = checked_entries(&spec, entries)?;
-        let leaves: Vec<LeafInput> = entries.values().map(TreeEntry::leaf).collect();
-        let tree = run_blocking_if_large(leaves.len(), build_tree(spec.clone(), leaves)).await??;
-        let members = entries.values().map(|entry| (entry.address(), entry.entity_id)).collect();
-        Ok(Self { tree, entries: Arc::new(entries), members: Arc::new(members) })
+    pub(crate) async fn build(spec: TreeSpec, entries: Entries) -> anyhow::Result<Self> {
+        let leaves: Vec<LeafInput> = entries.iter().map(|(id, entry)| entry.leaf(*id)).collect();
+        let tree = run_blocking_if_large(leaves.len(), build_tree(spec, leaves)).await??;
+        let members = entries.iter().map(|(id, entry)| (entry.address.clone(), *id)).collect();
+        let mut footprint = Footprint::default();
+        for entry in entries.values() {
+            footprint.add(entry);
+        }
+        Ok(Self { tree, entries: Arc::new(entries), members: Arc::new(members), footprint })
     }
 
     /// Make the tree hold exactly `entries`, changing only the entries that differ.
-    pub(crate) async fn replace(&mut self, entries: Vec<TreeEntry>) -> anyhow::Result<()> {
-        let entries = checked_entries(self.tree.spec(), entries)?;
+    pub(crate) async fn replace(&mut self, entries: Entries) -> anyhow::Result<()> {
         let mut changes = BTreeMap::new();
         for (id, before) in self.entries.iter() {
             let after = entries.get(id);
@@ -66,46 +89,25 @@ impl QueryTree {
                 changes.insert(*id, after.cloned());
             }
         }
-        for (id, after) in &entries {
-            if !self.entries.contains_key(id) {
-                changes.insert(*id, Some(after.clone()));
+        for (id, after) in entries {
+            if !self.entries.contains_key(&id) {
+                changes.insert(id, Some(after));
             }
         }
         self.apply_changes(changes).await
     }
 
-    /// Store `entries`, replacing any earlier entry of the same entity, and
-    /// remove the entities in `removed`.
-    pub(crate) async fn apply(&mut self, entries: Vec<TreeEntry>, removed: Vec<EntityId>) -> anyhow::Result<()> {
-        let entries = checked_entries(self.tree.spec(), entries)?;
-        let mut changes = BTreeMap::new();
-        for id in removed {
-            if self.entries.contains_key(&id) {
-                changes.insert(id, None);
-            }
-        }
-        for (id, entry) in entries {
-            if self.entries.get(&id) != Some(&entry) {
-                changes.insert(id, Some(entry));
-            } else {
-                changes.remove(&id);
-            }
-        }
+    /// Give each entity in `changes` its new entry, or remove it for `None`.
+    pub(crate) async fn apply(&mut self, changes: BTreeMap<EntityId, Option<TreeEntry>>) -> anyhow::Result<()> {
+        let changes = changes.into_iter().filter(|(id, after)| self.entries.get(id) != after.as_ref()).collect();
         self.apply_changes(changes).await
-    }
-
-    /// Conservative resident accounting for head/key metadata and digest-map rows.
-    pub fn accounted_bytes(&self) -> usize {
-        self.entries.values().fold(4096usize, |total, entry| {
-            total
-                .saturating_add(1024)
-                .saturating_add(entry.key.capacity().saturating_mul(4))
-                .saturating_add(entry.head.len().saturating_mul(36))
-        })
     }
 
     /// Each admitted entity's entry.
     pub(crate) fn entries(&self) -> &Entries { &self.entries }
+
+    /// The bytes the LRU charges this tree.
+    pub(crate) fn accounted_bytes(&self) -> usize { self.footprint.bytes(true) }
 
     /// A frozen view of the tree as it stands now; later changes do not reach it.
     pub(crate) fn snapshot(&self) -> Snapshot {
@@ -125,9 +127,10 @@ impl QueryTree {
             return Ok(());
         }
         let entries = &self.entries;
-        let leaf_changes = changes
-            .iter()
-            .map(|(id, after)| LeafChange { before: entries.get(id).map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) });
+        let leaf_changes = changes.iter().map(|(id, after)| LeafChange {
+            before: entries.get(id).map(|entry| entry.leaf(*id)),
+            after: after.as_ref().map(|entry| entry.leaf(*id)),
+        });
         let mut tx = self.tree.begin();
         if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= entries.len().div_ceil(4) {
             // A batch this large costs less to fold in by rebuilding every
@@ -145,26 +148,18 @@ impl QueryTree {
         let members = Arc::make_mut(&mut self.members);
         for (id, after) in changes {
             if let Some(before) = entries.remove(&id) {
-                members.remove(&before.address());
+                members.remove(&before.address);
+                self.footprint.remove(&before);
             }
             if let Some(after) = after {
-                members.insert(after.address(), id);
+                members.insert(after.address.clone(), id);
+                self.footprint.add(&after);
                 entries.insert(id, after);
             }
         }
         Ok(())
     }
 }
-
-fn checked_entries(spec: &TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Entries> {
-    let mut checked = Entries::new();
-    for entry in entries {
-        CanonicalCodec::split(spec.key_spec(), &entry.key)?;
-        anyhow::ensure!(checked.insert(entry.entity_id, entry).is_none(), "duplicate tree entity");
-    }
-    Ok(checked)
-}
-
 /// Await `work`, an operation on a tree over memory maps that hashes or decodes
 /// about `leaves` leaves, on a blocking thread when they number at least
 /// [`BLOCKING_BUILD_LEAVES`], so that it holds no executor thread while it runs.

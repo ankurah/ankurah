@@ -28,13 +28,8 @@ pub(super) struct Round {
 
 impl Round {
     pub fn new(descriptor: StateRound, snapshot: Snapshot) -> Self {
-        let addresses = snapshot.members();
-        let members = addresses
-            .iter()
-            .map(|(address, id)| {
-                (*id, QueryMember { key: address[..address.len() - EntityId::BYTE_LEN].to_vec(), head: snapshot.entries[id].head.clone() })
-            })
-            .collect();
+        let addresses = snapshot.members().map(|(address, id)| (address.to_vec(), id)).collect();
+        let members = snapshot.query_members();
         Self { descriptor, snapshot, members, addresses, overlay: BTreeMap::new(), overlay_bytes: 0, complete: false }
     }
 

@@ -1067,7 +1067,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
     let (node, peer, _) = node().await?;
     let first = stored_snapshot(&node, states(1, 8)).await?;
     let captured = Arc::downgrade(&first.entries);
-    let old = first.entries.values().next().unwrap().clone();
+    let (old_id, old) = first.entries.iter().next().map(|(id, entry)| (*id, entry.clone())).unwrap();
     let initial = start_state_stream(
         &node,
         peer,
@@ -1101,9 +1101,9 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         let comparison = state.comparison.as_ref().unwrap();
         assert!(comparison.work.is_empty());
         assert!(comparison.pending_repairs.is_empty());
-        (comparison.snapshot.members(), comparison.offered.clone())
+        (comparison.snapshot.member_map(), comparison.offered.clone())
     };
-    for answers in [vec![], vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: old.entity_id, target: old.head.clone() })]] {
+    for answers in [vec![], vec![StateAnswer::NeedRepair(proto::RepairRequest { entity_id: old_id, target: old.head.clone() })]] {
         assert!(
             matches!(
                 apply_state_feedback(
@@ -1124,7 +1124,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         let state = session.state.lock().await;
         let comparison = state.comparison.as_ref().unwrap();
         assert_eq!(state.round.number, 1);
-        assert_eq!(comparison.snapshot.members(), members);
+        assert_eq!(comparison.snapshot.member_map(), members);
         assert_eq!(comparison.offered, targets);
         assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
     }
@@ -1467,7 +1467,7 @@ async fn independent_coverage_retires_the_round_before_a_late_unavailable_repair
     let state = session.state.lock().await;
     let comparison = state.comparison.as_ref().unwrap();
     assert_eq!(state.round.number, 1);
-    assert!(comparison.snapshot.members().is_empty());
+    assert!(comparison.snapshot.member_map().is_empty());
     assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
     assert!(state.retained.iter().all(|retained| retained.frame.sequence > last));
     Ok(())
@@ -1752,7 +1752,7 @@ async fn captured_membership_and_current_payload_keep_both_targets_across_moves_
             panic!("metadata plus current data: {items:?}")
         };
         let head = &page.heads.to_vec()[0];
-        assert_eq!(head.key, captured_entry.key);
+        assert_eq!(head.key, captured_entry.key());
         assert_eq!(head.entity.head, captured.payload.state.head);
         assert_eq!(target, &current.payload.state.head);
         let proto::DeltaContent::StateSnapshot { state } = &delta.content else { panic!("current snapshot") };
@@ -1804,7 +1804,7 @@ async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs
     let known = old.offer().await?;
     assert_eq!(known.spans.len(), 1);
     let saved_offer = bincode::serialize(&known)?;
-    let mut members = old.members();
+    let mut members = old.member_map();
     let mut current = (0..256)
         .filter(|id| *id != 17)
         .map(|id| {
@@ -1828,7 +1828,7 @@ async fn initial_diff_keeps_cross_batch_moves_and_readable_former_member_repairs
         node.storage.set_state(state.clone());
     }
     let captured = query.refresh_states(current.clone()).await?;
-    let expected = captured.members();
+    let expected = captured.member_map();
     let mut comparison = Comparison::new(captured, known)?;
     assert_eq!(comparison.known_clocks.len(), 256, "all clocks are loaded before the first moved key is visited");
     let items = initial_items(&node, &mut comparison).await?;

@@ -5,7 +5,7 @@ use ankurah_digest_tree::{Digest, NodePrefix};
 use ankurah_proto::{
     self as proto,
     state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS, MAX_OFFER_SPANS, MAX_PAGE_BYTES, MAX_PAGE_HEADS},
-    EntityId, TreeSpanDigest,
+    TreeSpanDigest,
 };
 
 /// The encoded size an offer of span digests stays within while its frontier is refined.
@@ -72,17 +72,19 @@ impl Snapshot {
         if self.members.len() > MAX_OFFER_HEADS {
             return None;
         }
-        let mut minimum_bytes = 0usize;
-        for (address, id) in self.members.iter() {
-            let head = &self.entries[id].head;
-            minimum_bytes = minimum_bytes.saturating_add(address.len()).saturating_add(head.len().saturating_mul(32));
-            if minimum_bytes > MAX_OFFER_BYTES {
+        // The heads' own work bounds the inventory's from below; stop before
+        // encoding an inventory it already rules out.
+        let mut heads_work = 0usize;
+        for entry in self.entries.values() {
+            heads_work = heads_work.saturating_add(proto::PackedHeads::head_work_bytes(entry.key().len(), &entry.head));
+            if heads_work > MAX_OFFER_BYTES {
                 return None;
             }
         }
-        let heads = proto::PackedHeads::encode(
-            self.members.iter().map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), *id, &self.entries[id].head)),
-        )
+        let heads = proto::PackedHeads::encode(self.members.values().map(|id| {
+            let entry = &self.entries[id];
+            (entry.key(), *id, &entry.head)
+        }))
         .ok()?;
         let inventory = proto::KnownState {
             spec: self.spec.clone(),
@@ -93,25 +95,24 @@ impl Snapshot {
 
     pub fn page(&self, bounds: proto::TreeSpan) -> anyhow::Result<proto::TreeSpanInventory> {
         use std::ops::Bound;
-        let empty = match (&bounds.start, &bounds.end) {
-            (Bound::Included(start), Bound::Included(end)) => start > end,
-            (Bound::Included(start) | Bound::Excluded(start), Bound::Included(end) | Bound::Excluded(end)) => start >= end,
-            _ => false,
-        };
-        let rows = if empty {
+        let rows = if bounds.is_empty() {
             Vec::new()
         } else {
-            self.members.range((bounds.start.clone(), bounds.end.clone())).take(MAX_PAGE_HEADS + 1).collect::<Vec<_>>()
+            self.members
+                .range::<[u8], _>(bounds.bounds())
+                .take(MAX_PAGE_HEADS + 1)
+                .map(|(_, id)| (*id, &self.entries[id]))
+                .collect::<Vec<_>>()
         };
         let mut count = 0;
         let mut heads_work = 0;
-        for (index, (address, id)) in rows.iter().take(MAX_PAGE_HEADS).enumerate() {
-            let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included((*address).clone()) };
+        for (index, (_, entry)) in rows.iter().take(MAX_PAGE_HEADS).enumerate() {
+            let end = if index + 1 == rows.len() { bounds.end.clone() } else { Bound::Included(entry.address().to_vec()) };
             // An empty inventory over these bounds counts the bounds and the encoding's header.
             let bounds_work =
                 proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start.clone(), end), heads: Default::default() }
                     .work_bytes()?;
-            let work = proto::PackedHeads::head_work_bytes(address.len() - EntityId::BYTE_LEN, &self.entries[*id].head) as u64;
+            let work = proto::PackedHeads::head_work_bytes(entry.key().len(), &entry.head) as u64;
             if bounds_work + heads_work + work > MAX_PAGE_BYTES as u64 {
                 anyhow::ensure!(count > 0, "single head inventory exceeds byte limit");
                 break;
@@ -119,12 +120,8 @@ impl Snapshot {
             heads_work += work;
             count += 1;
         }
-        let end = if count == rows.len() { bounds.end } else { Bound::Included(rows[count - 1].0.clone()) };
-        let heads = proto::PackedHeads::encode(
-            rows.iter()
-                .take(count)
-                .map(|(address, id)| (address[..address.len() - EntityId::BYTE_LEN].as_ref(), **id, &self.entries[*id].head)),
-        )?;
+        let end = if count == rows.len() { bounds.end } else { Bound::Included(rows[count - 1].1.address().to_vec()) };
+        let heads = proto::PackedHeads::encode(rows.iter().take(count).map(|(id, entry)| (entry.key(), *id, &entry.head)))?;
         let page = proto::TreeSpanInventory { bounds: proto::TreeSpan::new(bounds.start, end), heads };
         anyhow::ensure!(page.work_bytes()? <= MAX_PAGE_BYTES as u64, "head inventory bounds exceed byte limit");
         Ok(page)

@@ -10,7 +10,7 @@ use super::{
 };
 use crate::{
     node::{
-        state_sync::{QueryTree, Snapshot},
+        state_sync::{tree::ID_ROW_BYTES, QueryTree, Snapshot},
         Node, WeakNode,
     },
     policy::{ContextPolicy, PolicyAgent},
@@ -65,7 +65,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     }
 
     /// The bytes this resident is charged against the LRU's idle allowance.
-    pub(super) fn accounted_bytes(&self) -> usize { self.tree.accounted_bytes().saturating_add(self.candidates.len() * 64) }
+    pub(super) fn accounted_bytes(&self) -> usize { self.tree.accounted_bytes().saturating_add(self.candidates.len() * ID_ROW_BYTES) }
 
     /// Fold `changes` into the candidates and the tree. With `delivery`, return
     /// the changes to entities that were or now are members, for live routes.
@@ -74,20 +74,12 @@ impl<CD: ContextData> ResidentActor<CD> {
         let mut latest = BTreeMap::new();
         for change in &changes {
             fold_candidate(&mut self.candidates, change);
-            latest.insert(change.entity_id, change.entry.as_ref());
+            latest.insert(change.entity_id, change.entry.clone());
             if delivery && (self.tree.entries().contains_key(&change.entity_id) || change.entry.is_some()) {
                 affected.insert(change.entity_id);
             }
         }
-        let mut entries = Vec::new();
-        let mut removed = Vec::new();
-        for (id, entry) in latest {
-            match entry {
-                Some(entry) => entries.push(entry.clone()),
-                None => removed.push(id),
-            }
-        }
-        self.tree.apply(entries, removed).await?;
+        self.tree.apply(latest).await?;
         Ok(changes.into_iter().filter(|change| affected.contains(&change.entity_id)).collect())
     }
 
@@ -243,7 +235,7 @@ impl<CD: ContextData> ResidentActor<CD> {
             }
         };
         self.candidates = read.candidates;
-        self.tree.replace(read.rows.into_values().collect()).await?;
+        self.tree.replace(read.rows).await?;
         let sources = pending.into_iter().flat_map(|batch| batch.changes).collect();
         let members = self.tree.snapshot().query_members();
         let prepared = self.routes.iter().map(|_| Ok((members.clone(), read.ordered.clone()))).collect();

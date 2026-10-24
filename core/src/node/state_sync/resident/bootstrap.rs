@@ -11,7 +11,7 @@ use crate::{
     entity::TemporaryEntity,
     node::{
         state_sync::{
-            tree::{key_paths, TreeEntry},
+            tree::{key_paths, TreeEntry, CLOCK_ENTRY_BYTES},
             QueryTree,
         },
         Node,
@@ -25,7 +25,6 @@ use crate::{
     session::ContextData,
     storage::StorageEngine,
 };
-use ankurah_digest_tree::CanonicalCodec;
 use ankurah_proto as proto;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +41,16 @@ pub(crate) struct TreeUpdate {
     pub entry: Option<TreeEntry>,
     pub matches: bool,
     pub events: Vec<proto::EventId>,
+}
+
+impl TreeUpdate {
+    /// The bytes this update holds in a maintenance queue: the update, its
+    /// entry's address and Clock entries, and its event ids.
+    fn queued_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.entry.as_ref().map_or(0, |entry| entry.address().len() + entry.head.len() * CLOCK_ENTRY_BYTES)
+            + self.events.len() * std::mem::size_of::<proto::EventId>()
+    }
 }
 
 /// One storage read of what a resident admits: the readable members' entries,
@@ -85,14 +94,7 @@ impl StorageRead {
                 read.ordered.push(id);
             }
             let values = paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
-            read.rows.insert(
-                id,
-                TreeEntry {
-                    entity_id: id,
-                    key: CanonicalCodec::encode_nullable(identity.spec.key_spec(), &values)?,
-                    head: state.payload.state.head,
-                },
-            );
+            read.rows.insert(id, TreeEntry::encode(&identity.spec, id, &values, state.payload.state.head)?);
         }
         Ok(read)
     }
@@ -178,7 +180,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 }
             }
         };
-        let tree = QueryTree::build(identity.spec.clone(), rows.into_values().collect()).await?;
+        let tree = QueryTree::build(identity.spec.clone(), rows).await?;
         Ok(Self { identity, candidates, tree, cursor, revision: revision.0, routes: Vec::new() })
     }
 }
@@ -225,17 +227,13 @@ where
                             || policy.check_read(&entity_id, &entity.to_state()?).is_ok());
                     let entry = if readable {
                         let values = paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
-                        Some(TreeEntry {
-                            entity_id,
-                            key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?,
-                            head: entity.head().clone(),
-                        })
+                        Some(TreeEntry::encode(&spec, entity_id, &values, entity.head().clone())?)
                     } else {
                         None
                     };
                     let events = if live_events { change.events().iter().map(|event| event.payload.id()).collect() } else { Vec::new() };
-                    let bytes = 128 + entry.as_ref().map_or(0, |entry| entry.key.len() + entry.head.len() * 40) + events.len() * 32;
-                    Ok(ProjectedChange { value: TreeUpdate { entity_id, entry, matches, events }, member: matches, bytes })
+                    let update = TreeUpdate { entity_id, entry, matches, events };
+                    Ok(ProjectedChange { bytes: update.queued_bytes(), value: update, member: matches })
                 })?
             })
             .collect()

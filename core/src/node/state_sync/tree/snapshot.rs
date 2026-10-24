@@ -8,13 +8,19 @@ use ankurah_digest_tree::{CanonicalCodec, TreeRequest, TreeTransaction};
 use ankurah_proto::{self as proto, EntityId, TreeSpec};
 use std::{collections::BTreeMap, sync::Arc};
 
+/// A frozen view of a resident's tree: the entries, members and digests it
+/// held when the view was taken, narrowed to one query's spans once selected.
 pub(crate) struct Snapshot {
-    // A peer may use a compatible admission without changing resident identity.
+    /// The spec a comparison describes this view under: the tree's own, or a
+    /// compatible spec the peer chose.
     pub spec: TreeSpec,
+    /// The resident this view came from, kept alive while the view is.
     pub(crate) resident: Option<crate::node::state_sync::ResidentPin>,
+    /// The spec the tree is built under, which addresses and digests follow.
     pub(super) physical_spec: TreeSpec,
     pub entries: Arc<Entries>,
     pub(super) tree: TreeTransaction,
+    /// The spans a selection narrowed the view to; none while the view is the whole tree.
     pub(super) ranges: Option<Vec<proto::TreeSpan>>,
     pub(super) members: Arc<Members>,
 }
@@ -71,7 +77,7 @@ impl Snapshot {
     fn restrict(&mut self, ranges: Vec<proto::TreeSpan>) {
         let mut members = Members::new();
         for range in ranges.iter().filter(|range| !range.is_empty()) {
-            members.extend(self.members.range((range.start.clone(), range.end.clone())).map(|(address, id)| (address.clone(), *id)));
+            members.extend(self.members.range::<[u8], _>(range.bounds()).map(|(address, id)| (address.clone(), *id)));
         }
         self.entries = Arc::new(members.values().map(|id| (*id, self.entries[id].clone())).collect());
         self.members = Arc::new(members);
@@ -111,9 +117,9 @@ impl Snapshot {
             .collect::<anyhow::Result<Vec<_>>>()?;
         let mut rows = Vec::new();
         for range in ranges.iter().filter(|range| !range.is_empty()) {
-            for (_, id) in self.members.range((range.start.clone(), range.end.clone())) {
+            for (_, id) in self.members.range::<[u8], _>(range.bounds()) {
                 let entry = &self.entries[id];
-                let parts = if order.is_empty() { Vec::new() } else { CanonicalCodec::split(self.physical_spec.key_spec(), &entry.key)? };
+                let parts = if order.is_empty() { Vec::new() } else { CanonicalCodec::split(self.physical_spec.key_spec(), entry.key())? };
                 rows.push((*id, parts));
             }
         }
@@ -135,24 +141,18 @@ impl Snapshot {
         Ok(rows.into_iter().map(|(id, _)| id).collect())
     }
 
-    pub fn members(&self) -> Members { (*self.members).clone() }
-
-    pub fn query_members(&self) -> BTreeMap<EntityId, proto::QueryMember> {
-        self.members
-            .iter()
-            .map(|(address, id)| {
-                (
-                    *id,
-                    proto::QueryMember { key: address[..address.len() - EntityId::BYTE_LEN].to_vec(), head: self.entries[id].head.clone() },
-                )
-            })
-            .collect()
+    /// Each member's address and entity id, in address order.
+    pub fn members(&self) -> impl Iterator<Item = (&[u8], EntityId)> + '_ {
+        self.members.iter().map(|(address, id)| (address.as_ref(), *id))
     }
 
-    pub fn entries_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (&[u8], &TreeEntry)> {
-        self.members
-            .range((bounds.start.clone(), bounds.end.clone()))
-            .take(limit)
-            .map(|(address, id)| (address.as_slice(), &self.entries[id]))
+    /// Each member as a query reports it: its key and Clock, by entity id.
+    pub fn query_members(&self) -> BTreeMap<EntityId, proto::QueryMember> {
+        self.entries.iter().map(|(id, entry)| (*id, proto::QueryMember { key: entry.key().to_vec(), head: entry.head.clone() })).collect()
+    }
+
+    /// At most `limit` members within `bounds`, in address order.
+    pub fn entries_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (EntityId, &TreeEntry)> {
+        self.members.range::<[u8], _>(bounds.bounds()).take(limit).map(|(_, id)| (*id, &self.entries[id]))
     }
 }
