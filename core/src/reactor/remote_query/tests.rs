@@ -879,3 +879,68 @@ async fn local_optimistic_member_can_enter_a_remote_sorted_limit() {
     assert_eq!(resultset.len(), 1);
     assert!(resultset.contains_key(&local.id), "a partial answer sorts and limits its rows together with local additions");
 }
+
+/// Delivery planning and evaluation take a change's effect on the query from one decision, so
+/// every change the query publishes carries the events planning prepared for it. If the two
+/// disagreed, a published change would arrive without its events, and an update that moves no
+/// membership would vanish.
+#[tokio::test]
+async fn published_changes_keep_the_events_planning_prepared() {
+    let reactor = Reactor::<TestEntity, TestEvent>::new_test();
+    let subscription = reactor.subscribe();
+    let query = QueryId::new();
+    let updated = TestEntity::new("updated", "pending");
+    let exiting = TestEntity::new("exiting", "pending");
+    let held = TestEntity::new("held by a pending publication", "pending");
+    let unadmitted = TestEntity::new("not admitted", "pending");
+    let local = TestEntity::new("written locally", "pending");
+    let resultset = EntityResultSet::empty();
+    let admitted = Arc::new(std::sync::RwLock::new([updated.id, exiting.id, held.id].into_iter().collect()));
+    let members = vec![updated.clone(), exiting.clone(), held.clone()];
+    reactor
+        .install_remote_query(
+            subscription.id(),
+            query,
+            sel("status = 'pending'"),
+            Arc::new(RemoteSource(admitted, origin(query))),
+            resultset.clone(),
+            Arc::new(MockGapFetcher::new()),
+            1,
+            (),
+            RemoteInstall { entities: members, membership: RemoteMembership::default(), changes: vec![], complete: true },
+        )
+        .await
+        .unwrap();
+    let (watch, updates) = watcher::<ReactorUpdate<TestEntity, TestEvent>>();
+    let _guard = subscription.subscribe(watch);
+    let event = |byte| TestEvent { id: proto::EventId::from_bytes([byte; 32]), changes: HashMap::new() };
+    let own = |entity: &TestEntity, byte| OwnChange {
+        change: TestChange { entity: entity.clone(), events: vec![event(byte)] },
+        origin: origin(query),
+    };
+    let published = || -> HashMap<_, _> {
+        updates()
+            .into_iter()
+            .flat_map(|update| update.items)
+            .map(|item| (item.entity.id, (item.events, item.predicate_relevance)))
+            .collect()
+    };
+    exiting.state.lock().unwrap().insert(prop("status"), "done".into());
+    held.state.lock().unwrap().insert(prop("status"), "done".into());
+    reactor
+        .notify_remote_publication(
+            subscription.id(),
+            query,
+            vec![own(&updated, 1), own(&exiting, 2), own(&held, 3), own(&unadmitted, 4)],
+            [held.id].into_iter().collect(),
+        )
+        .await
+        .unwrap();
+    let publication = published();
+    assert_eq!(publication[&updated.id], (vec![event(1)], vec![]), "an update that moves no membership keeps its events");
+    assert_eq!(publication[&exiting.id], (vec![event(2)], vec![(query, MembershipChange::Remove)]));
+    assert_eq!(publication[&held.id], (vec![event(3)], vec![]), "a held row keeps its membership and still delivers its events");
+    assert!(!publication.contains_key(&unadmitted.id), "the stream cannot add a row it did not admit");
+    reactor.notify_change(vec![TestChange { entity: local.clone(), events: vec![event(5)] }]).await;
+    assert_eq!(published()[&local.id], (vec![event(5)], vec![(query, MembershipChange::Add)]));
+}

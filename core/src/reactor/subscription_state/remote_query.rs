@@ -16,7 +16,57 @@ use ankurah_proto as proto;
 use indexmap::IndexMap;
 use std::collections::HashSet;
 
+/// What one change does to one query's membership. Delivery planning and evaluation both take it
+/// from [`QueryState::effect_of`], so every change evaluation publishes was planned the same way.
+pub(super) struct ChangeEffect {
+    /// Whether the query's owner may read the entity.
+    pub(super) readable: bool,
+    /// Whether the entity was a member before the change.
+    pub(super) did_match: bool,
+    /// Whether the entity is a member after the change.
+    pub(super) matches: bool,
+}
+
+impl ChangeEffect {
+    /// Whether the change reaches the query's owner: a readable row that is or was a member, or
+    /// one the subscription explicitly subscribes to.
+    pub(super) fn publishes(&self, subscribed: bool) -> bool { self.readable && (self.matches || self.did_match || subscribed) }
+}
+
 impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
+    /// What `change` does to this query's membership, or `None` when the change comes from the
+    /// query's own remote stream but may not move its membership: the stream was replaced, the
+    /// change waits for its publication to commit, or the stream did not admit the entity. Such a
+    /// change must neither restore a row the stream removed nor undo a later local or Fetch
+    /// admission. A `held` row keeps its membership until its publication commits.
+    pub(super) fn effect_of<C: ChangeNotification<Entity = E>>(
+        &self,
+        query_id: proto::QueryId,
+        predicate: &Predicate<Resolved>,
+        change: &C,
+        held: Option<&HashSet<proto::EntityId>>,
+    ) -> Option<ChangeEffect> {
+        let entity = change.entity();
+        let readable = self.source.can_read(entity);
+        let stream_may_not_move = change.query_origin().is_some_and(|origin| {
+            origin.query == query_id
+                && (self.source.query_origin() != Some(origin)
+                    || change.defers_query_membership()
+                    || !self.source.admits_query_entity(entity))
+        });
+        if readable && stream_may_not_move {
+            return None;
+        }
+        let did_match = self.resultset.contains_key(&entity.id());
+        let matches = readable
+            && if held.is_some_and(|ids| ids.contains(&entity.id())) {
+                did_match
+            } else {
+                evaluate_predicate(entity, predicate).unwrap_or(false)
+            };
+        Some(ChangeEffect { readable, did_match, matches })
+    }
+
     /// Replace this query's rows with a remote answer's as one set, and push the membership
     /// changes that makes. Returns the entities that entered and the ids of the rows that left.
     pub(super) fn reconcile_remote_rows<Ev>(

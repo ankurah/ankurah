@@ -358,25 +358,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 let Some(selection) = query.selection.as_ref() else { continue };
                 let mut rows = Vec::new();
                 for (offset, change) in candidate.iter().enumerate() {
-                    let entity = change.entity();
-                    if !query.source.can_read(entity)
-                        || change.query_origin().is_some_and(|origin| {
-                            origin.query == id
-                                && (query.source.query_origin() != Some(origin)
-                                    || change.defers_query_membership()
-                                    || !query.source.admits_query_entity(entity))
-                        })
-                    {
-                        continue;
-                    }
-                    let did_match = query.resultset.contains_key(&entity.id());
-                    let matches = if held.is_some_and(|ids| ids.contains(&entity.id())) {
-                        did_match
-                    } else {
-                        evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
-                    };
-                    if matches || did_match || state.entity_subscriptions.contains(&entity.id()) {
-                        rows.push((offset, entity.id(), change.events().to_vec()));
+                    let entity_id = change.entity().id();
+                    let Some(effect) = query.effect_of(id, &selection.predicate, change, held) else { continue };
+                    if effect.publishes(state.entity_subscriptions.contains(&entity_id)) {
+                        rows.push((offset, entity_id, change.events().to_vec()));
                     }
                 }
                 let delivered = query.delivered.of(rows.iter().map(|(_, id, _)| *id));
@@ -487,26 +472,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
                 debug!("Subscription {} evaluating entity {} for query {}", self.id(), entity_id, query_id);
 
-                let can_read = query_state.source.can_read(entity);
-                if can_read
-                    && change.query_origin().is_some_and(|origin| {
-                        origin.query == query_id
-                            && (query_state.source.query_origin() != Some(origin)
-                                || change.defers_query_membership()
-                                || !query_state.source.admits_query_entity(entity))
-                    })
-                {
-                    // An old own-stream repair must neither restore a removed
-                    // source member nor undo a later authorized local/Fetch view.
-                    continue;
-                }
-                let did_match = query_state.resultset.contains_key(&entity_id);
-                let matches = can_read
-                    && if held.is_some_and(|ids| ids.contains(&entity_id)) {
-                        did_match
-                    } else {
-                        evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
-                    };
+                let Some(effect) = query_state.effect_of(query_id, &selection.predicate, change, held) else { continue };
+                let (did_match, matches) = (effect.did_match, effect.matches);
 
                 // Process membership change in one match
                 let membership_change = match (did_match, matches) {
@@ -535,10 +502,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                     }
                 };
 
-                // Emit if matches, matched before, or explicitly subscribed
-                let entity_subscribed = state.entity_subscriptions.contains(&entity_id);
                 // Removal currently carries state too; never send a newly denied state (#426 owns claw-back).
-                if can_read && (matches || did_match || entity_subscribed) {
+                if effect.publishes(state.entity_subscriptions.contains(&entity_id)) {
+                    // Planning made the same decision, so this change has prepared events unless
+                    // the query changed meanwhile (a gap fill can add a row while history is
+                    // read); then it publishes without events.
                     let (head, events) = prepared.take(Some(query_id), offset).unwrap_or_default();
                     query_state.delivered.advance(entity_id, head);
                     let duplicate = !change.events().is_empty() && events.is_empty();
