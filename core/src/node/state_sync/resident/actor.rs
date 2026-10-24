@@ -3,7 +3,7 @@
 
 use super::{
     bootstrap::{ensure_catalog_unchanged, fold_candidate, StorageRead, TreeUpdate, MAX_READ_ATTEMPTS},
-    identity::{Coverage, Identity},
+    identity::{ensure_filter_unchanged, Coverage, Identity},
     lease::{Command, Resident, ResidentSnapshot},
     route::{current_state, Route},
     Lru,
@@ -60,12 +60,12 @@ impl<CD: ContextData> ResidentActor<CD> {
         if policy.allows_unrestricted_state_reads() {
             // A new grant must also admit candidates previously denied by policy.
             // Returning the old subset would silently lose newly readable rows.
-            anyhow::ensure!(entries.keys().eq(self.candidates.iter()), SourceError::Changed);
+            anyhow::ensure!(entries.keys().eq(self.candidates.iter()), SourceError::PolicyChanged);
             return Ok(());
         }
         for id in &self.candidates {
             let state = current_state(node, *id).await?.ok_or(SourceError::Changed)?;
-            anyhow::ensure!(policy.check_read(id, &state.state).is_ok() == entries.contains_key(id), SourceError::Changed);
+            anyhow::ensure!(policy.check_read(id, &state.state).is_ok() == entries.contains_key(id), SourceError::PolicyChanged);
         }
         Ok(())
     }
@@ -108,10 +108,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 continue;
             }
             let result = async {
-                anyhow::ensure!(
-                    policy.filter_predicate(route.selection.predicate.clone())? == route.filtered.predicate,
-                    SourceError::Changed
-                );
+                ensure_filter_unchanged(&policy, &route.selection, &route.filtered)?;
                 if let Some(membership) = membership {
                     let (next, ordered) = membership?;
                     route.changes_for_members(node, &policy, &sources, next, ordered).await
@@ -315,7 +312,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 batch = self.cursor.next() => {
                     let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                     node.system.check_not_halted()?;
-                    self.identity.check(&node)?;
+                    self.identity.ensure_policy_unchanged(&node)?;
                     self.publish(&node, batch?).await?;
                 }
                 _ = cleanup.notified() => { self.routes.retain(|route| route.owner.strong_count() != 0); }
@@ -341,7 +338,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     {
         let refreshed = async {
             node.system.check_not_halted()?;
-            self.identity.check(node)?;
+            self.identity.ensure_policy_unchanged(node)?;
             let snapshot = self.refresh(node).await?;
             self.check_authorization(node).await?;
             let lru = lru.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
@@ -364,7 +361,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         let selected = async {
             let view = command.view();
             let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
-            anyhow::ensure!(policy.filter_predicate(view.selection.predicate.clone())? == view.filtered.predicate, SourceError::Changed);
+            ensure_filter_unchanged(&policy, &view.selection, &view.filtered)?;
             self.identity.coverage.select(snapshot, &view.selection, &node.catalog).await?.with_spec(
                 view.spec.clone(),
                 &view.selection,

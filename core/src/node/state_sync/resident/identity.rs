@@ -1,5 +1,6 @@
 //! What a resident admits and which requests may share it.
 
+use super::bootstrap::ReadPolicy;
 use crate::{
     node::{
         state_sync::{
@@ -77,19 +78,30 @@ impl<CD: ContextData> Identity<CD> {
         QueryView { selection: self.selection.clone(), filtered: self.filtered.clone(), spec: self.spec.clone() }
     }
 
-    pub(super) fn check<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
+    /// Fail with `PolicyChanged` unless policy still gives this identity's
+    /// credentials the filtered selection and retrieval predicate it was
+    /// admitted with.
+    pub(super) fn ensure_policy_unchanged<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
-        anyhow::ensure!(
-            policy.filter_predicate(self.selection.predicate.clone())? == self.filtered.predicate
-                && policy.retrieval_predicate() == self.retrieval,
-            SourceError::Changed
-        );
+        ensure_filter_unchanged(&policy, &self.selection, &self.filtered)?;
+        anyhow::ensure!(policy.retrieval_predicate() == self.retrieval, SourceError::PolicyChanged);
         Ok(())
     }
+}
+
+/// Fail with `PolicyChanged` unless `policy` still filters `selection` to the
+/// predicate `filtered` recorded.
+pub(super) fn ensure_filter_unchanged<PA: PolicyAgent>(
+    policy: &ReadPolicy<'_, PA>,
+    selection: &Selection<Resolved>,
+    filtered: &Selection<Resolved>,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(policy.filter_predicate(selection.predicate.clone())? == filtered.predicate, SourceError::PolicyChanged);
+    Ok(())
 }
 
 /// Which of its predicate's matches a resident holds: all of them, or only a

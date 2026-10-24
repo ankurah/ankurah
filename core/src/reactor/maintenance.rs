@@ -27,6 +27,19 @@ pub(crate) enum SourceError {
     Changed,
     #[error("query catalog changed; reopen the query generation")]
     CatalogChanged,
+    #[error("access policy changed for the index's readers; reopen the query")]
+    PolicyChanged,
+}
+
+impl SourceError {
+    /// Whether `error` is a source error that admitting the index again can
+    /// recover from, unlike a source that is no longer available.
+    pub(crate) fn is_retryable(error: &anyhow::Error) -> bool {
+        matches!(
+            error.downcast_ref::<SourceError>(),
+            Some(SourceError::Changed | SourceError::Lagged | SourceError::CatalogChanged | SourceError::PolicyChanged)
+        )
+    }
 }
 
 /// Compact result of inspecting one committed entity. `member` controls the

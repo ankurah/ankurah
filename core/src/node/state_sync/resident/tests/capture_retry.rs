@@ -151,7 +151,7 @@ async fn catalog_churn_bounds_capture_retries_and_later_capture_recovers() -> an
     }
     let error = capture.await.err().expect("continued catalog churn must exhaust the bounded retry");
     assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
-    assert!(crate::node::state_sync::ResidentTrees::<&'static crate::policy::DefaultContext>::can_retry(&error));
+    assert!(SourceError::is_retryable(&error));
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
     assert_eq!(node.resident_trees.len(), 0);
     let current = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
@@ -168,7 +168,7 @@ async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() 
     add_catalog_model(&node, "existing_capture_fixture").await?;
     let error = source.refresh(&node).await.err().expect("an existing source cannot cross a catalog change");
     assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
-    assert!(crate::node::state_sync::ResidentTrees::<&'static crate::policy::DefaultContext>::can_retry(&error));
+    assert!(SourceError::is_retryable(&error));
     Ok(())
 }
 

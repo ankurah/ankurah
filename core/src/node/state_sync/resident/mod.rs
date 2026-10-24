@@ -59,9 +59,8 @@ impl<CD: ContextData> ResidentTrees<CD> {
             builds: tokio::sync::Mutex::new(()),
         }
     }
-    pub(crate) fn can_retry(error: &anyhow::Error) -> bool {
-        matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Changed | SourceError::Lagged | SourceError::CatalogChanged))
-    }
+    /// A snapshot of the resident that serves `selection` for `credentials`,
+    /// in a tree under `spec` when the peer chose one.
     pub(crate) async fn snapshot<SE, PA>(
         &self,
         node: &Node<SE, PA>,
@@ -73,19 +72,66 @@ impl<CD: ContextData> ResidentTrees<CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
+        self.with_lease(node, selection, spec, credentials, |lease| async move { lease.snapshot().await }).await
+    }
+
+    /// Open a live route for `peer` on the resident that serves `selection`
+    /// for `credentials` in a tree under the peer's `spec`, and its first
+    /// state reply.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn subscribe<SE, PA>(
+        &self,
+        node: &Node<SE, PA>,
+        selection: Selection<Resolved>,
+        spec: proto::TreeSpec,
+        credentials: Vec<CD>,
+        peer: proto::EntityId,
+        request: proto::RequestId,
+        fingerprint: Vec<u8>,
+        query: proto::QueryId,
+        version: u32,
+        catalog: bool,
+        known: proto::KnownState,
+    ) -> anyhow::Result<(proto::StateReply, ResidentSubscription<CD>)>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        self.with_lease(node, selection, Some(spec), credentials, |lease| {
+            let (request, fingerprint, known) = (request.clone(), fingerprint.clone(), known.clone());
+            async move { lease.subscribe(node, peer, request, fingerprint, query, version, catalog, known).await }
+        })
+        .await
+    }
+
+    /// Run `with` on a lease of the resident that serves `selection`, retrying
+    /// once: admitting again after a catalog change crossed the admission's
+    /// storage read, or after `with` failed with a retryable source error.
+    async fn with_lease<SE, PA, T, F, Fut>(
+        &self,
+        node: &Node<SE, PA>,
+        selection: Selection<Resolved>,
+        spec: Option<proto::TreeSpec>,
+        credentials: Vec<CD>,
+        with: F,
+    ) -> anyhow::Result<T>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+        F: Fn(ResidentLease<CD>) -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<T>>,
+    {
         for attempt in 0..2 {
-            let resident = match self.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await {
-                // Reopen admission and revalidate its layout and policy after a
-                // catalog publication crosses the initial storage read.
+            let lease = match self.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await {
                 Err(error) if attempt == 0 && matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)) => continue,
                 result => result?,
             };
-            match resident.snapshot().await {
-                Err(error) if attempt == 0 && Self::can_retry(&error) => continue,
+            match with(lease).await {
+                Err(error) if attempt == 0 && SourceError::is_retryable(&error) => continue,
                 result => return result,
             }
         }
-        unreachable!()
+        unreachable!("the second attempt returns")
     }
 
     pub(crate) async fn acquire<SE, PA>(

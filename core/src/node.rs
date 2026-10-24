@@ -401,17 +401,7 @@ where
                     let body = match cdata {
                         Ok(cdata) => match self.handle_request(&cdata, request).await {
                             Ok(result) => result,
-                            Err(e)
-                                if initial_state
-                                    && matches!(
-                                        e.downcast_ref::<crate::reactor::maintenance::SourceError>(),
-                                        Some(
-                                            crate::reactor::maintenance::SourceError::Changed
-                                                | crate::reactor::maintenance::SourceError::Lagged
-                                                | crate::reactor::maintenance::SourceError::CatalogChanged
-                                        )
-                                    ) =>
-                            {
+                            Err(e) if initial_state && crate::reactor::maintenance::SourceError::is_retryable(&e) => {
                                 proto::NodeResponseBody::StateSnapshotBusy
                             }
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
