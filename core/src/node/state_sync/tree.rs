@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, ops::Bound, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc};
 
 use ankql::ast::{Resolved, Selection};
-use ankurah_core_types::{KeySpec, PropertyPath, ValueType};
+use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyPath, ValueType};
 use ankurah_digest_tree::{
     leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafInput, NodePrefix, PropertyTypes, TreeError, TreeRequest,
     TreeTransaction,
@@ -128,17 +128,7 @@ impl QueryTree {
         Self::request(selection, catalog).ok().is_some_and(|request| spec.serves(&request).is_some())
     }
 
-    pub fn key_paths(spec: &TreeSpec) -> Vec<PropertyPath> {
-        spec.key_spec()
-            .keyparts
-            .iter()
-            .map(|part| {
-                let mut path = PropertyPath::from(part.key);
-                path.subpath = part.sub_path.clone().unwrap_or_default();
-                path
-            })
-            .collect()
-    }
+    pub fn key_paths(spec: &TreeSpec) -> Vec<PropertyPath> { spec.key_spec().keyparts.iter().map(IndexKeyPart::path).collect() }
 
     pub async fn refresh_entries(&self, spec: TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Snapshot> {
         let entries = checked_entries(&spec, entries)?;
@@ -378,7 +368,7 @@ impl Snapshot {
 
     pub async fn span_digest(&mut self, bounds: proto::TreeSpan) -> anyhow::Result<TreeSpanDigest> {
         let ranges = match &self.ranges {
-            Some(ranges) => ranges.iter().filter_map(|range| intersect_span(range, &bounds)).collect::<Vec<_>>(),
+            Some(ranges) => ranges.iter().filter_map(|range| range.intersect(&bounds)).collect::<Vec<_>>(),
             None => vec![bounds.clone()],
         };
         if ranges.is_empty() {
@@ -594,15 +584,6 @@ impl Snapshot {
             .take(limit)
             .map(|(address, id)| (address.as_slice(), &self.entries[id]))
     }
-}
-
-fn intersect_span(left: &proto::TreeSpan, right: &proto::TreeSpan) -> Option<proto::TreeSpan> {
-    let start = if left.cmp_start(right).is_ge() { left.start.clone() } else { right.start.clone() };
-    let left_end = proto::TreeSpan::new(Bound::Unbounded, left.end.clone());
-    let right_end = proto::TreeSpan::new(Bound::Unbounded, right.end.clone());
-    let end = if left_end.is_subset_of(&right_end) { left.end.clone() } else { right.end.clone() };
-    let result = proto::TreeSpan::new(start, end);
-    (!result.is_empty()).then_some(result)
 }
 
 #[cfg(test)]
