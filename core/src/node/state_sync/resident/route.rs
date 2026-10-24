@@ -168,9 +168,10 @@ impl LiveRead {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        // Read the states before awaiting anything else: a resident entity's
-        // state read now matches the publication, while a later commit could
-        // advance it past the events delivered with it.
+        // Read the states first: every await before them lets a later commit
+        // carry a state further past the events this publication delivers. A
+        // commit can still land before this read; the receiver then publishes
+        // these events anyway, and the next publication carries the later ones.
         let states = current_states(node, entities.iter().copied()).await?;
         let mut events: BTreeMap<proto::EntityId, Vec<proto::EventId>> = BTreeMap::new();
         for change in affected.iter().filter(|change| entities.contains(&change.entity_id)) {
