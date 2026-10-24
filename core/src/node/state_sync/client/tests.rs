@@ -205,7 +205,7 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_its_request
     let query_id = query.query_id();
     assert_eq!(query.resultset().len(), 64);
     let peer = server.peer_connections.get(&client.id).unwrap();
-    let (version, original_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
+    let (version, original_tree) = peer.subscription_handler.query_resident_for_test(query_id).await.unwrap();
     assert_eq!(version, 1);
     let (origin, comparison) = messages
         .lock()
@@ -241,17 +241,20 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_its_request
         })
         .await?;
     tokio::task::yield_now().await;
-    let (_, retained) =
-        peer.subscription_handler.query_tree_for_test(query_id).await.expect("replacement preparation cannot remove the standing query");
-    assert!(Arc::ptr_eq(&original_tree, &retained));
+    let (_, retained) = peer
+        .subscription_handler
+        .query_resident_for_test(query_id)
+        .await
+        .expect("replacement preparation cannot remove the standing query");
+    assert!(std::sync::Weak::ptr_eq(&original_tree, &retained));
     assert!(!messages.lock().unwrap().iter().any(|message| matches!(message,
         proto::NodeMessage::AbandonStateStream { stream: found, .. } if *found == comparison
     )));
     release.send(()).unwrap();
     query.wait_durable_answered().await?;
-    let (version, replacement_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
+    let (version, replacement_tree) = peer.subscription_handler.query_resident_for_test(query_id).await.unwrap();
     assert_eq!(version, 2);
-    assert!(Arc::ptr_eq(&original_tree, &replacement_tree));
+    assert!(std::sync::Weak::ptr_eq(&original_tree, &replacement_tree));
     assert_eq!(query.resultset().len(), 64);
     drop(query);
     until(|| {
@@ -263,7 +266,7 @@ async fn selection_replacement_keeps_the_active_responder_tree_while_its_request
     })
     .await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while peer.subscription_handler.query_tree_for_test(query_id).await.is_some() {
+        while peer.subscription_handler.query_resident_for_test(query_id).await.is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -314,7 +317,7 @@ async fn a_current_live_stream_failure_still_abandons_its_responder_query() -> a
     })
     .await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while peer.subscription_handler.query_tree_for_test(query_id).await.is_some() {
+        while peer.subscription_handler.query_resident_for_test(query_id).await.is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -335,7 +338,7 @@ async fn dropping_a_query_after_permanent_inventory_preparation_failure_cleans_i
     let (server, client, query, messages) = stream_fixture().await?;
     let query_id = query.query_id();
     let peer = server.peer_connections.get(&client.id).unwrap();
-    let (_, original_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
+    let (_, original_tree) = peer.subscription_handler.query_resident_for_test(query_id).await.unwrap();
     // This is a local preparation failure, before a replacement SubscribeQuery
     // can reach the peer. The previous remote generation still needs an owner.
     // An uncertain commit makes a new source capture permanently unavailable.
@@ -350,8 +353,8 @@ async fn dropping_a_query_after_permanent_inventory_preparation_failure_cleans_i
         )),
         "the failure must happen before sending replacement metadata"
     );
-    let (_, retained) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
-    assert!(Arc::ptr_eq(&original_tree, &retained));
+    let (_, retained) = peer.subscription_handler.query_resident_for_test(query_id).await.unwrap();
+    assert!(std::sync::Weak::ptr_eq(&original_tree, &retained));
     drop(query);
     until(|| {
         messages.lock().unwrap().iter().any(|message| {
@@ -362,7 +365,7 @@ async fn dropping_a_query_after_permanent_inventory_preparation_failure_cleans_i
     })
     .await;
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while peer.subscription_handler.query_tree_for_test(query_id).await.is_some() {
+        while peer.subscription_handler.query_resident_for_test(query_id).await.is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -381,8 +384,8 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     let query_id = query.query_id();
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
-    let tree = super::super::QueryTree::default();
-    let mut snapshot = tree.refresh(super::super::tree::spec_for(&selection, &client.catalog), states).await?;
+    let mut snapshot =
+        crate::node::state_sync::tree::fixtures::snapshot_of(super::super::tree::spec_for(&selection, &client.catalog), states).await?;
     // A mixed leaf/summary inventory requires per-region work. Thirty-three
     // positive spans exceed that budget, leaving a continuation on wire.
     let mut start = proto::TreeSpan::all().start;
@@ -415,7 +418,7 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     assert!(matches!(state.frame.body, proto::StateFrameBody::Round { progress: proto::ComparisonProgress::Continue, .. }));
     let comparison = state.frame.stream;
     let peer = server.peer_connections.get(&client.id).unwrap();
-    let (_, original_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
+    let (_, original_tree) = peer.subscription_handler.query_resident_for_test(query_id).await.unwrap();
     crate::peer_subscription::RemoteQuerySubscriber::stream_bound(&query.weak(), 1, stream.request.clone(), Arc::new(|| false));
     let receive = receive_state(&client, server.id, &credentials, snapshot, state, false, Some((query_id, 1)), stream);
     tokio::pin!(receive);
@@ -425,16 +428,16 @@ async fn replacement_during_initial_stream_keeps_its_responder_tree() -> anyhow:
     tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx).await??;
     assert!(receive.await.is_err(), "replacement must close the unfinished initial receiver");
     let (_, retained) =
-        peer.subscription_handler.query_tree_for_test(query_id).await.expect("superseded initial cleanup cannot erase the tree");
-    assert!(Arc::ptr_eq(&original_tree, &retained));
+        peer.subscription_handler.query_resident_for_test(query_id).await.expect("superseded initial cleanup cannot erase the tree");
+    assert!(std::sync::Weak::ptr_eq(&original_tree, &retained));
     assert!(!messages.lock().unwrap().iter().any(|message| matches!(message,
         proto::NodeMessage::AbandonStateStream { stream: found, .. } if *found == comparison
     )));
     gate.store(false, std::sync::atomic::Ordering::SeqCst);
     release.send(()).unwrap();
     query.wait_durable_answered().await?;
-    let (_, replacement_tree) = peer.subscription_handler.query_tree_for_test(query_id).await.unwrap();
-    assert!(Arc::ptr_eq(&original_tree, &replacement_tree));
+    let (_, replacement_tree) = peer.subscription_handler.query_resident_for_test(query_id).await.unwrap();
+    assert!(std::sync::Weak::ptr_eq(&original_tree, &replacement_tree));
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
     Ok(())
@@ -448,7 +451,7 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
     let mut snapshot =
-        super::super::QueryTree::default().refresh(super::super::tree::spec_for(&selection, &client.catalog), states).await?;
+        crate::node::state_sync::tree::fixtures::snapshot_of(super::super::tree::spec_for(&selection, &client.catalog), states).await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) = request_state(
         &client,
@@ -466,7 +469,7 @@ async fn a_current_initial_validation_error_still_abandons_its_comparison() -> a
     )));
     // One-way cleanup returns after sending, independently of remote teardown.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while server.peer_connections.get(&client.id).unwrap().subscription_handler.query_tree_for_test(query_id).await.is_some() {
+        while server.peer_connections.get(&client.id).unwrap().subscription_handler.query_resident_for_test(query_id).await.is_some() {
             tokio::task::yield_now().await;
         }
     })
@@ -484,10 +487,10 @@ async fn fetch_and_subscription_share_each_nodes_resident_tree() -> anyhow::Resu
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let spec = super::super::tree::spec_for(&selection, &client.catalog);
     let local = client.resident_trees.acquire(&client, selection.clone(), Some(spec.clone()), credentials.clone()).await?;
-    let local_tree = local.tree();
+    let local_tree = local.identity();
     drop(local);
     let connection = server.peer_connections.get(&client.id).unwrap();
-    let (_, serving_tree) = connection.subscription_handler.query_tree_for_test(query.query_id()).await.unwrap();
+    let (_, serving_tree) = connection.subscription_handler.query_resident_for_test(query.query_id()).await.unwrap();
     // Both roles retain an RAII lease after the initial comparison finishes.
     client.resident_trees.evict_idle();
     server.resident_trees.evict_idle();
@@ -495,8 +498,8 @@ async fn fetch_and_subscription_share_each_nodes_resident_tree() -> anyhow::Resu
     assert_eq!(rows.len(), 64);
     let local = client.resident_trees.acquire(&client, selection.clone(), Some(spec.clone()), credentials.clone()).await?;
     let serving = server.resident_trees.acquire(&server, selection, Some(spec), credentials).await?;
-    assert!(Arc::ptr_eq(&local_tree, &local.tree()), "making Fetch reuses the tree used to make SubscribeQuery");
-    assert!(Arc::ptr_eq(&serving_tree, &serving.tree()), "serving Fetch reuses the standing subscription tree");
+    assert!(std::sync::Weak::ptr_eq(&local_tree, &local.identity()), "making Fetch reuses the tree used to make SubscribeQuery");
+    assert!(std::sync::Weak::ptr_eq(&serving_tree, &serving.identity()), "serving Fetch reuses the standing subscription tree");
     client.deregister_peer(server.id);
     server.deregister_peer(client.id);
     Ok(())
@@ -510,7 +513,7 @@ async fn disconnected_query_pins_its_tree_until_selection_replacement_or_drop() 
         let selection = query.selection().peek().unwrap().0;
         let credentials = vec![crate::policy::DEFAULT_CONTEXT];
         let local = client.resident_trees.acquire(&client, selection.clone(), None, credentials.clone()).await?;
-        let tree = local.tree();
+        let tree = local.identity();
         drop(local);
         let streams = client.peer_connections.get(&server.id).unwrap().outgoing_state_streams.clone();
         client.deregister_peer(server.id);
@@ -519,7 +522,7 @@ async fn disconnected_query_pins_its_tree_until_selection_replacement_or_drop() 
         until(|| streams.is_empty()).await;
         client.resident_trees.evict_idle();
         let resident = client.resident_trees.acquire(&client, selection.clone(), None, credentials.clone()).await?;
-        assert!(Arc::ptr_eq(&tree, &resident.tree()), "the live query retains its tree while no stream exists");
+        assert!(std::sync::Weak::ptr_eq(&tree, &resident.identity()), "the live query retains its tree while no stream exists");
         drop(resident);
 
         if replace_selection {
@@ -529,7 +532,7 @@ async fn disconnected_query_pins_its_tree_until_selection_replacement_or_drop() 
         }
         client.resident_trees.evict_idle();
         let replacement = client.resident_trees.acquire(&client, selection, None, credentials).await?;
-        assert!(!Arc::ptr_eq(&tree, &replacement.tree()), "ending the query generation releases its tree pin");
+        assert!(!std::sync::Weak::ptr_eq(&tree, &replacement.identity()), "ending the query generation releases its tree pin");
     }
     Ok(())
 }

@@ -9,7 +9,7 @@ async fn an_unindexed_limit_builds_independently_without_blocking_the_shared_tre
     apply(&node, &second).await?;
     let broad_selection = selection(None);
     let broad = node.resident_trees.acquire(&node, broad_selection.clone(), None, vec![DEFAULT_CONTEXT]).await?;
-    let tree = broad.tree();
+    let tree = broad.identity();
     let mut snapshot = broad.snapshot().await?.snapshot;
     let by_id = snapshot.spec.clone();
     assert!(by_id.key_spec().keyparts.is_empty());
@@ -38,7 +38,7 @@ async fn an_unindexed_limit_builds_independently_without_blocking_the_shared_tre
     apply(&node, &changed).await?;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            if tree.current_snapshot().await?.entries[&initial.entity_id].head == proto::Clock::singleton(&changed) {
+            if broad.snapshot().await?.snapshot.entries[&initial.entity_id].head == proto::Clock::singleton(&changed) {
                 return Ok::<_, anyhow::Error>(());
             }
             tokio::task::yield_now().await;
@@ -47,15 +47,15 @@ async fn an_unindexed_limit_builds_independently_without_blocking_the_shared_tre
     .await??;
     release.send(()).unwrap();
     let limited = pending.await?;
-    assert!(!Arc::ptr_eq(&tree, &limited.tree()), "unindexed ordering cannot borrow the broad resident");
+    assert!(!Weak::ptr_eq(&tree, &limited.identity()), "unindexed ordering cannot borrow the broad resident");
     let after = limited.snapshot().await?;
     assert_eq!(after.snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![second.entity_id]);
 
     let current = broad.snapshot().await?;
     assert_eq!(current.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&changed));
     assert_eq!(node.resident_trees.len(), 2);
-    let (_, serving) = connection.subscription_handler.query_tree_for_test(query).await.expect("the other subscription remains active");
-    assert!(Arc::ptr_eq(&tree, &serving));
+    let (_, serving) = connection.subscription_handler.query_resident_for_test(query).await.expect("the other subscription remains active");
+    assert!(Weak::ptr_eq(&tree, &serving));
     connection.subscription_handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
     Ok(())

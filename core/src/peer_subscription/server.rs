@@ -134,7 +134,10 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
 
 #[cfg(test)]
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub(crate) async fn query_tree_for_test(&self, query: proto::QueryId) -> Option<(u32, Arc<crate::node::state_sync::QueryTree>)> {
-        self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.subscription.tree()))
+    pub(crate) async fn query_resident_for_test(
+        &self,
+        query: proto::QueryId,
+    ) -> Option<(u32, std::sync::Weak<dyn std::any::Any + Send + Sync>)> {
+        self.queries.lock().await.get(&query).map(|standing| (standing.version, standing.subscription.identity()))
     }
 }

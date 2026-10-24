@@ -1,7 +1,14 @@
 //! One subscribed peer's live view of a resident and its membership changes.
 
-use super::bootstrap::{QueryProjection, ReadPolicy, TreeUpdate};
-use crate::{node::Node, policy::PolicyAgent, storage::StorageEngine};
+use super::{
+    bootstrap::{ReadPolicy, TreeUpdate},
+    identity::Coverage,
+};
+use crate::{
+    node::{state_sync::QueryTree, Node},
+    policy::PolicyAgent,
+    storage::StorageEngine,
+};
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto::{self as proto, Attested};
 use std::{collections::BTreeMap, sync::Weak};
@@ -33,7 +40,8 @@ impl Route {
     pub(super) async fn changes<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
-        projection: &QueryProjection,
+        coverage: &Coverage,
+        tree: &QueryTree,
         policy: &ReadPolicy<'_, PA>,
         sources: &[TreeUpdate],
     ) -> anyhow::Result<Vec<proto::QueryChange>>
@@ -41,8 +49,7 @@ impl Route {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let snapshot = projection.tree.current_snapshot().await?;
-        let selected = projection.coverage.select(snapshot, &self.selection, &node.catalog).await?;
+        let selected = coverage.select(tree.snapshot(), &self.selection, &node.catalog).await?;
         let ordered = match selected.ordered_ids(&self.selection, &node.catalog) {
             Ok(ordered) => ordered,
             Err(error) if self.selection.limit.is_none() && error.is::<crate::node::state_sync::tree::UnsupportedTreeSelection>() => {

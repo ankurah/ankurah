@@ -164,10 +164,7 @@ async fn catalog_churn_bounds_capture_retries_and_later_capture_recovers() -> an
 async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() -> anyhow::Result<()> {
     let node = node().await?;
     let selected = selection(None);
-    let captured =
-        capture_query(&node, selected.clone(), spec_for(&selected, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default()))
-            .await?;
-    let mut source = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], captured);
+    let mut source = complete_resident(&node, spec_for(&selected, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
     add_catalog_model(&node, "existing_capture_fixture").await?;
     let error = source.refresh(&node).await.err().expect("an existing source cannot cross a catalog change");
     assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));

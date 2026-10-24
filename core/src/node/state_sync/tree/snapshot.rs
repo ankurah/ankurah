@@ -89,16 +89,6 @@ impl Snapshot {
         self.ranges = Some(ranges);
     }
 
-    /// Conservative resident accounting for head/key metadata and digest-map rows.
-    pub fn accounted_bytes(&self) -> usize {
-        self.entries.values().fold(4096usize, |total, entry| {
-            total
-                .saturating_add(1024)
-                .saturating_add(entry.key.capacity().saturating_mul(4))
-                .saturating_add(entry.head.len().saturating_mul(36))
-        })
-    }
-
     /// Order a view using its indexed key parts, without reading entity properties.
     pub fn ordered_ids(&self, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Vec<EntityId>> {
         if selection.limit == Some(0) {

@@ -22,8 +22,8 @@ async fn reactor_publication_evaluates_the_state_free_read_proof_for_each_change
     apply(&node, &current).await?;
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
-    let mut captured = capture_query(&node, selected, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
-    assert!(captured.snapshot.entries.contains_key(&current.entity_id));
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    assert!(view(&actor, &selected, &node.catalog).await?.entries.contains_key(&current.entity_id));
 
     for (readable, value) in [(true, "02"), (false, "03"), (true, "04")] {
         allowed.store(readable, Ordering::SeqCst);
@@ -31,16 +31,16 @@ async fn reactor_publication_evaluates_the_state_free_read_proof_for_each_change
         let before_proofs = proofs.load(Ordering::Relaxed);
         current = update(&current, value)?;
         apply(&node, &current).await?;
-        let batch = captured.cursor.next().await?;
+        let batch = actor.cursor.next().await?;
         assert_eq!(checks.load(Ordering::Relaxed) - before, usize::from(!readable), "only an unavailable proof needs a state check");
         assert_eq!(proofs.load(Ordering::Relaxed) - before_proofs, 1, "each publication evaluates permission afresh");
-        captured.projection.apply(&batch, false).await?;
-        let snapshot = captured.projection.tree.current_snapshot().await?;
+        actor.apply(&batch, false).await?;
+        let snapshot = actor.tree.snapshot();
         assert_eq!(snapshot.entries.contains_key(&current.entity_id), readable);
         if readable {
             assert_eq!(snapshot.entries[&current.entity_id].head, proto::Clock::singleton(&current));
         }
-        assert!(captured.projection.candidates.contains(&current.entity_id), "revoked candidates remain watched for reentry");
+        assert!(actor.candidates.contains(&current.entity_id), "revoked candidates remain watched for reentry");
     }
     Ok(())
 }
@@ -55,12 +55,12 @@ async fn unrestricted_reads_reuse_a_complete_tree_for_a_limit_without_reading_st
         events.push(event);
     }
     let full = acquire(&node.resident_trees, &node, above("", None)).await?;
-    let original = full.tree();
+    let original = full.identity();
     assert!(node.entities.get(&events[0].entity_id).is_none(), "the proof must not depend on resident payloads");
     let reads = node.storage.5.load(Ordering::Relaxed);
     let scans = node.storage.2.load(Ordering::Relaxed);
     let limited = acquire(&node.resident_trees, &node, above("row-00000031", Some(10))).await?;
-    assert!(Arc::ptr_eq(&original, &limited.tree()));
+    assert!(Weak::ptr_eq(&original, &limited.identity()));
     assert_eq!(
         limited.snapshot().await?.snapshot.entries.keys().copied().collect::<BTreeSet<_>>(),
         events[32..42].iter().map(|event| event.entity_id).collect(),
@@ -105,7 +105,7 @@ async fn state_free_read_proofs_are_fresh_and_do_not_hide_new_grants_or_revocati
     assert_eq!(node.storage.5.load(Ordering::Relaxed), reads);
 
     let no_credentials = node.resident_trees.acquire(&node, selection(None), None, vec![]).await?;
-    assert!(!Arc::ptr_eq(&granted.tree(), &no_credentials.tree()), "a credential change cannot borrow the earlier grant");
+    assert!(!Weak::ptr_eq(&granted.identity(), &no_credentials.identity()), "a credential change cannot borrow the earlier grant");
     assert!(no_credentials.snapshot().await?.snapshot.entries.is_empty());
     let reads = node.storage.5.load(Ordering::Relaxed);
     allowed.store(false, Ordering::SeqCst);

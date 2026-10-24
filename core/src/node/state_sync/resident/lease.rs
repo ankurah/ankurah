@@ -1,8 +1,6 @@
 //! The handles that pin a resident and the commands they send its actor.
 
 use super::{identity::QueryView, Lru};
-#[cfg(test)]
-use crate::node::state_sync::QueryTree;
 use crate::{
     node::{state_sync::Snapshot, Node},
     policy::PolicyAgent,
@@ -23,8 +21,6 @@ pub(super) struct Resident<CD: ContextData> {
     pub(super) cleanup: Arc<Notify>,
     pub(super) alive: AtomicBool,
     pub(super) pins: AtomicUsize,
-    #[cfg(test)]
-    pub(super) tree: Arc<QueryTree>,
     pub(super) lru: Weak<Mutex<Lru<CD>>>,
 }
 impl<CD: ContextData> Drop for Resident<CD> {
@@ -39,8 +35,8 @@ pub(crate) struct ResidentPin {
 }
 
 pub(crate) struct ResidentLease<CD: ContextData> {
-    resident: Arc<Resident<CD>>,
-    view: Arc<QueryView>,
+    pub(super) resident: Arc<Resident<CD>>,
+    pub(super) view: Arc<QueryView>,
 }
 impl<CD: ContextData> ResidentLease<CD> {
     pub(super) fn new(resident: Arc<Resident<CD>>, view: Arc<QueryView>) -> Self {
@@ -54,9 +50,9 @@ impl<CD: ContextData> ResidentLease<CD> {
             .send(Command::Snapshot { view: self.view.clone(), response })
             .await
             .map_err(|_| anyhow::anyhow!(SourceError::Changed))?;
-        let mut capture = result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))??;
-        capture.snapshot.resident = Some(ResidentPin { _lease: Arc::new(self.clone()) });
-        Ok(capture)
+        let mut taken = result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))??;
+        taken.snapshot.resident = Some(ResidentPin { _lease: Arc::new(self.clone()) });
+        Ok(taken)
     }
     pub(crate) async fn subscribe<SE, PA>(
         &self,
@@ -96,8 +92,6 @@ impl<CD: ContextData> ResidentLease<CD> {
         let subscription = ResidentSubscription { lease: self.clone(), owner: Some(owner), peer, stream: reply.frame.stream };
         Ok((reply, subscription))
     }
-    #[cfg(test)]
-    pub(crate) fn tree(&self) -> Arc<QueryTree> { self.resident.tree.clone() }
 }
 impl<CD: ContextData> Clone for ResidentLease<CD> {
     fn clone(&self) -> Self { Self::new(self.resident.clone(), self.view.clone()) }
@@ -115,7 +109,7 @@ impl<CD: ContextData> Drop for ResidentLease<CD> {
 /// Transport lifetime is separate from resident tree identity. Dropping this
 /// route stops its live delivery, while the idle tree stays maintained in the LRU.
 pub(crate) struct ResidentSubscription<CD: ContextData> {
-    lease: ResidentLease<CD>,
+    pub(super) lease: ResidentLease<CD>,
     owner: Option<Arc<()>>,
     peer: proto::EntityId,
     stream: proto::StateStreamId,
@@ -131,8 +125,6 @@ impl<CD: ContextData> ResidentSubscription<CD> {
             .map_err(|_| anyhow::anyhow!(SourceError::Changed))?;
         result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))?
     }
-    #[cfg(test)]
-    pub(crate) fn tree(&self) -> Arc<QueryTree> { self.lease.tree() }
 }
 impl<CD: ContextData> Drop for ResidentSubscription<CD> {
     fn drop(&mut self) {

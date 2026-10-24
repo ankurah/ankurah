@@ -143,7 +143,8 @@ async fn cancelled_fetch_during_bound_transfer_releases_the_remote_stream() -> a
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
     let mut snapshot =
-        super::super::super::QueryTree::default().refresh(super::super::super::tree::spec_for(&selection, &client.catalog), states).await?;
+        crate::node::state_sync::tree::fixtures::snapshot_of(super::super::super::tree::spec_for(&selection, &client.catalog), states)
+            .await?;
     // Force real refinement work beyond frame zero while holding its continuations.
     let mut start = proto::TreeSpan::all().start;
     let mut spans = Vec::new();
@@ -247,7 +248,8 @@ async fn fetch_validation_error_abandons_once() -> anyhow::Result<()> {
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
     let mut snapshot =
-        super::super::super::QueryTree::default().refresh(super::super::super::tree::spec_for(&selection, &client.catalog), states).await?;
+        crate::node::state_sync::tree::fixtures::snapshot_of(super::super::super::tree::spec_for(&selection, &client.catalog), states)
+            .await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (stream, response) =
         request_state(&client, server.id, &credentials, proto::NodeRequestBody::Fetch { selection, known_state: snapshot.offer().await? })
@@ -269,7 +271,8 @@ async fn queued_fetch_cleanup_cannot_send_on_a_replacement_connection() -> anyho
     let selection = query.selection().peek().unwrap().0;
     let states = client.storage.fetch_states(&selection).await?;
     let mut snapshot =
-        super::super::super::QueryTree::default().refresh(super::super::super::tree::spec_for(&selection, &client.catalog), states).await?;
+        crate::node::state_sync::tree::fixtures::snapshot_of(super::super::super::tree::spec_for(&selection, &client.catalog), states)
+            .await?;
     let credentials = vec![crate::policy::DEFAULT_CONTEXT];
     let (mut stream, response) =
         request_state(&client, server.id, &credentials, proto::NodeRequestBody::Fetch { selection, known_state: snapshot.offer().await? })

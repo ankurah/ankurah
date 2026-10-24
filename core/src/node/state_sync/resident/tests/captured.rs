@@ -7,20 +7,20 @@ async fn maintenance_and_captures_retain_only_keys_and_cloned_heads() -> anyhow:
     apply(&node, &original).await?;
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
-    let mut captured = capture_query(&node, selected, spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let id = original.entity_id;
-    let frozen = captured.snapshot;
+    let frozen = view(&actor, &selected, &node.catalog).await?;
     assert_eq!(frozen.entries[&id].head, proto::Clock::singleton(&original));
     assert!(node.entities.get(&id).is_none(), "a resident tree must not pin an entity");
 
     let moved = update(&original, "02")?;
     apply(&node, &moved).await?;
-    let batch = captured.cursor.next().await?;
+    let batch = actor.cursor.next().await?;
     let published = batch.changes.iter().find(|change| change.entity_id == id).unwrap();
     assert_eq!(published.entry.as_ref().unwrap().head, proto::Clock::singleton(&moved));
     assert_eq!(published.events, vec![moved.id()], "maintenance queues event IDs, not event bodies");
-    captured.projection.apply(&batch, true).await?;
-    let current = captured.projection.tree.current_snapshot().await?;
+    actor.apply(&batch, true).await?;
+    let current = actor.tree.snapshot();
     assert_eq!(current.entries[&id].head, proto::Clock::singleton(&moved));
     assert_eq!(frozen.entries[&id].head, proto::Clock::singleton(&original));
     assert!(node.entities.get(&id).is_none(), "maintenance must not retain an entity handle");

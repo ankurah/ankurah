@@ -1,16 +1,8 @@
 use super::*;
 
-async fn capture(node: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<CapturedQuery> {
+async fn limited(node: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<ResidentActor<&'static crate::policy::DefaultContext>> {
     let spec = spec_for(&selection, &node.catalog);
-    capture_filtered_query(
-        node,
-        selection.clone(),
-        spec,
-        vec![DEFAULT_CONTEXT],
-        Arc::new(QueryTree::default()),
-        Coverage::Limited(selection),
-    )
-    .await
+    resident(node, selection, spec).await
 }
 
 #[tokio::test]
@@ -22,8 +14,8 @@ async fn bounded_capture_retries_to_find_an_unchanged_replacement() -> anyhow::R
     apply(&node, &second).await?;
     let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
-    let captured = {
-        let capture = capture(&node, selection(Some(1)));
+    let actor = {
+        let capture = limited(&node, selection(Some(1)));
         tokio::pin!(capture);
         assert!(futures::poll!(&mut capture).is_pending());
         entered.await?;
@@ -31,23 +23,13 @@ async fn bounded_capture_retries_to_find_an_unchanged_replacement() -> anyhow::R
         release.send(()).unwrap();
         capture.await?
     };
-    assert_eq!(captured.snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![second.entity_id]);
-    assert_eq!(captured.projection.candidates.len(), 1);
+    assert_eq!(actor.tree.entries().keys().copied().collect::<Vec<_>>(), vec![second.entity_id]);
+    assert_eq!(actor.candidates.len(), 1);
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans + 2, "the raced bounded scan must be repeated");
     let mut different = selection(Some(2));
-    assert!(captured
-        .projection
-        .coverage
-        .select(captured.projection.tree.current_snapshot().await?, &different, &node.catalog)
-        .await
-        .is_err());
+    assert!(view(&actor, &different, &node.catalog).await.is_err());
     different.limit = None;
-    assert!(captured
-        .projection
-        .coverage
-        .select(captured.projection.tree.current_snapshot().await?, &different, &node.catalog)
-        .await
-        .is_err());
+    assert!(view(&actor, &different, &node.catalog).await.is_err());
     Ok(())
 }
 
@@ -73,9 +55,9 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
         apply(&node, event).await?;
     }
     let selected = selection(Some(2));
-    let captured = capture(&node, selected.clone()).await?;
-    let frozen = captured.projection.tree.current_snapshot().await?;
-    let mut snapshot = captured.projection.tree.current_snapshot().await?;
+    let mut actor = limited(&node, selected.clone()).await?;
+    let frozen = actor.tree.snapshot();
+    let mut snapshot = actor.tree.snapshot();
     let members = snapshot.query_members();
     let peer = proto::EntityId::from_bytes([91; 32]);
     let messages = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -93,14 +75,13 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
         vec![DEFAULT_CONTEXT],
         Some((proto::QueryId::new(), 1)),
         false,
-        captured.revision,
+        actor.revision,
         snapshot,
         known,
     )?;
     let stream = pending.id();
     pending.initialize(&node).await?;
     let owner = Arc::new(());
-    let mut actor = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], captured);
     actor.routes.push(Route { peer, stream, owner: Arc::downgrade(&owner), selection: selected.clone(), filtered: selected, members });
 
     let first = update(&initial[0], "09")?;
@@ -121,8 +102,8 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
     let revision = actor.revision;
     assert_eq!(current.entries.keys().copied().collect::<BTreeSet<_>>(), [initial[1].entity_id, initial[2].entity_id].into());
     assert_eq!(frozen.entries[&initial[0].entity_id].head, proto::Clock::singleton(&initial[0]));
-    assert_eq!(actor.projection.tree.current_snapshot().await?.entries.len(), 2);
-    assert_eq!(actor.projection.candidates.len(), 2);
+    assert_eq!(actor.tree.snapshot().entries.len(), 2);
+    assert_eq!(actor.candidates.len(), 2);
     assert_eq!(actor.routes.len(), 1);
     let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
     actor.refresh(&node).await?;
@@ -185,15 +166,14 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
 async fn zero_limit_ignores_application_publications_without_reads_or_retention() -> anyhow::Result<()> {
     let node = node().await?;
     let scans = node.storage.2.load(std::sync::atomic::Ordering::Relaxed);
-    let captured = capture(&node, selection(Some(0))).await?;
-    let mut actor = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], captured);
+    let mut actor = limited(&node, selection(Some(0))).await?;
     apply(&node, &genesis("01")?).await?;
     let before = actor.revision;
     let current = actor.refresh(&node).await?;
     assert!(actor.revision > before);
     assert!(current.entries.is_empty());
-    assert!(actor.projection.tree.current_snapshot().await?.entries.is_empty());
-    assert!(actor.projection.candidates.is_empty());
+    assert!(actor.tree.entries().is_empty());
+    assert!(actor.candidates.is_empty());
     assert_eq!(node.storage.2.load(std::sync::atomic::Ordering::Relaxed), scans);
     Ok(())
 }

@@ -2,11 +2,11 @@ use super::*;
 
 pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
     node: &Node<OrderedStorage, PA>,
-    projection: &QueryProjection,
+    actor: &ResidentActor<PA::ContextData>,
     selection: Selection<Resolved>,
 ) -> anyhow::Result<Route> {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let snapshot = projection.coverage.select(projection.tree.current_snapshot().await?, &selection, &node.catalog).await?;
+    let snapshot = view(actor, &selection, &node.catalog).await?;
     let mut filtered = selection.clone();
     filtered.predicate = policy.filter_predicate(filtered.predicate)?;
     Ok(Route {
@@ -40,18 +40,17 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
         apply(&node, event).await?;
     }
     let spec = spec_for(&selection(Some(2)), &node.catalog);
-    let tree = Arc::new(QueryTree::default());
-    let mut capture = capture_query(&node, selection(None), spec, vec![DEFAULT_CONTEXT], tree.clone()).await?;
-    let frozen = tree.current_snapshot().await?.select(&selection(Some(1)), &node.catalog).await?;
-    let mut one = route(&node, &capture.projection, selection(Some(1))).await?;
-    let mut two = route(&node, &capture.projection, selection(Some(2))).await?;
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let frozen = view(&actor, &selection(Some(1)), &node.catalog).await?;
+    let mut one = route(&node, &actor, selection(Some(1))).await?;
+    let mut two = route(&node, &actor, selection(Some(2))).await?;
     let moved = update(&events[0], "09")?;
     apply(&node, &moved).await?;
-    let batch = capture.cursor.next().await?;
-    let sources = capture.projection.apply(&batch, true).await?;
+    let batch = actor.cursor.next().await?;
+    let sources = actor.apply(&batch, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let changes_one = one.changes(&node, &capture.projection, &policy, &sources).await?;
-    let changes_two = two.changes(&node, &capture.projection, &policy, &sources).await?;
+    let changes_one = one.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
+    let changes_two = two.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
     assert_eq!(one.members.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id]));
     assert_eq!(two.members.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
     for changes in [&changes_one, &changes_two] {
@@ -72,7 +71,7 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
         }
     }
     assert_eq!(frozen.entries[&events[0].entity_id].head, proto::Clock::singleton(&events[0]));
-    assert_eq!(tree.current_snapshot().await?.entries.len(), 3, "neither limit truncates the resident tree");
+    assert_eq!(actor.tree.entries().len(), 3, "neither limit truncates the resident tree");
     Ok(())
 }
 
@@ -84,19 +83,19 @@ async fn shared_tree_routes_apply_different_membership_predicates() -> anyhow::R
     let mut admitted = above("00");
     admitted.order_by = None;
     let spec = spec_for(&admitted, &node.catalog);
-    let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
-    let mut all = route(&node, &capture.projection, admitted).await?;
-    let mut narrow = route(&node, &capture.projection, above("05")).await?;
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut all = route(&node, &actor, admitted).await?;
+    let mut narrow = route(&node, &actor, above("05")).await?;
     assert!(narrow.members.is_empty());
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     let mut current = initial.clone();
     for (value, narrow_present) in [("02", false), ("09", true), ("03", false)] {
         let next = update(&current, value)?;
         apply(&node, &next).await?;
-        let batch = capture.cursor.next().await?;
-        let sources = capture.projection.apply(&batch, true).await?;
-        let all_changes = all.changes(&node, &capture.projection, &policy, &sources).await?;
-        let narrow_changes = narrow.changes(&node, &capture.projection, &policy, &sources).await?;
+        let batch = actor.cursor.next().await?;
+        let sources = actor.apply(&batch, true).await?;
+        let all_changes = all.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
+        let narrow_changes = narrow.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
         assert_eq!(all_changes.len(), 1);
         assert!(all_changes[0].member.is_some());
         if value == "02" {
@@ -125,18 +124,18 @@ async fn a_denied_event_only_fails_routes_that_would_deliver_it() -> anyhow::Res
     apply(&node, &initial).await?;
     let admitted = above("00");
     let spec = spec_for(&admitted, &node.catalog);
-    let mut capture = capture_query(&node, admitted.clone(), spec, vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
-    let mut includes = route(&node, &capture.projection, admitted).await?;
-    let mut excludes = route(&node, &capture.projection, above("03")).await?;
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut includes = route(&node, &actor, admitted).await?;
+    let mut excludes = route(&node, &actor, above("03")).await?;
     let old = includes.members.clone();
     apply(&node, &denied).await?;
-    let batch = capture.cursor.next().await?;
-    let sources = capture.projection.apply(&batch, true).await?;
+    let batch = actor.cursor.next().await?;
+    let sources = actor.apply(&batch, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    assert!(includes.changes(&node, &capture.projection, &policy, &sources).await.is_err());
+    assert!(includes.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await.is_err());
     assert_eq!(includes.members, old, "a failed publication never partially advances route membership");
-    assert!(excludes.changes(&node, &capture.projection, &policy, &sources).await?.is_empty());
-    assert_eq!(capture.projection.tree.current_snapshot().await?.entries[&initial.entity_id].head, proto::Clock::singleton(&denied));
+    assert!(excludes.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?.is_empty());
+    assert_eq!(actor.tree.snapshot().entries[&initial.entity_id].head, proto::Clock::singleton(&denied));
     Ok(())
 }
 
@@ -152,10 +151,9 @@ async fn fallback_limit_ranks_only_authorized_current_rows() -> anyhow::Result<(
     let mut limited = selection(Some(1));
     limited.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), limited.predicate.clone());
-    let tree = Arc::new(QueryTree::default());
-    let capture = capture_limited(&node, limited, spec, tree).await?;
-    assert_eq!(capture.snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
-    assert_eq!(capture.projection.tree.current_snapshot().await?.entries.len(), 1, "only the authorized bounded result is retained");
+    let actor = resident(&node, limited, spec).await?;
+    assert_eq!(actor.tree.entries().keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
+    assert_eq!(actor.tree.snapshot().entries.len(), 1, "only the authorized bounded result is retained");
     Ok(())
 }
 
@@ -172,17 +170,16 @@ async fn unchanged_replacements_follow_query_order_after_commit_changes() -> any
     let mut limited = selection(Some(2));
     limited.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
     let spec = spec_for(&limited, &node.catalog);
-    let tree = Arc::new(QueryTree::default());
-    let mut capture = capture_query(&node, selection(None), spec, vec![DEFAULT_CONTEXT], tree).await?;
-    let mut route = route(&node, &capture.projection, limited).await?;
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut route = route(&node, &actor, limited).await?;
     for event in &events[2..] {
         apply(&node, &update(event, "00")?).await?;
     }
-    let batch = capture.cursor.next().await?;
+    let batch = actor.cursor.next().await?;
     assert_eq!(batch.changes.iter().map(|change| change.entity_id).collect::<Vec<_>>(), vec![events[2].entity_id, events[3].entity_id]);
-    let sources = capture.projection.apply(&batch, true).await?;
+    let sources = actor.apply(&batch, true).await?;
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let changes = route.changes(&node, &capture.projection, &policy, &sources).await?;
+    let changes = route.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
     assert_eq!(
         changes.iter().map(|change| (change.entity_id, change.member.is_some())).collect::<Vec<_>>(),
         vec![(events[2].entity_id, false), (events[3].entity_id, false), (events[1].entity_id, true), (events[0].entity_id, true)],
@@ -204,10 +201,9 @@ async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<(
     }
     let admitted = selection(None);
     let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), admitted.predicate.clone());
-    let tree = Arc::new(QueryTree::default());
     let selected = selection(Some(1));
-    let capture = capture_limited(&node, selected.clone(), spec, tree.clone()).await?;
-    let mut snapshot = tree.current_snapshot().await?;
+    let mut actor = resident(&node, selected.clone(), spec).await?;
+    let mut snapshot = actor.tree.snapshot();
     let members = snapshot.query_members();
     let peer = proto::EntityId::from_bytes([92; 32]);
     node.register_peer(
@@ -224,14 +220,13 @@ async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<(
         vec![DEFAULT_CONTEXT],
         Some((proto::QueryId::new(), 1)),
         false,
-        capture.revision,
+        actor.revision,
         snapshot,
         known,
     )?;
     let stream = pending.id();
     pending.initialize(&node).await?;
     let owner = Arc::new(());
-    let mut actor = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], capture);
     actor.routes.push(Route { peer, stream, owner: Arc::downgrade(&owner), selection: selected.clone(), filtered: selected, members });
     let first = update(&initial[0], "09")?;
     let second = update(&initial[1], "08")?;
@@ -243,16 +238,4 @@ async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<(
     assert_eq!(actor.routes[0].members.keys().copied().collect::<Vec<_>>(), vec![initial[2].entity_id]);
     node.deregister_peer(peer);
     Ok(())
-}
-
-async fn capture_limited<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
-    node: &Node<OrderedStorage, PA>,
-    selection: Selection<Resolved>,
-    spec: proto::TreeSpec,
-    tree: Arc<QueryTree>,
-) -> anyhow::Result<CapturedQuery> {
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let mut filtered = selection.clone();
-    filtered.predicate = policy.filter_predicate(filtered.predicate)?;
-    capture_filtered_query(node, filtered, spec, vec![DEFAULT_CONTEXT], tree, Coverage::Limited(selection)).await
 }

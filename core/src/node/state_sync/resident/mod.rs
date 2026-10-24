@@ -10,16 +10,9 @@ use self::{
     identity::{compatible_access, compatible_selection, Coverage, Identity, QueryView},
     lease::Resident,
 };
-use super::tree::{serves, spec_for, QueryTree};
-use crate::{
-    node::Node,
-    policy::{ContextPolicy, PolicyAgent},
-    reactor::maintenance::SourceError,
-    session::ContextData,
-    storage::StorageEngine,
-};
+use super::tree::{serves, spec_for};
+use crate::{node::Node, policy::PolicyAgent, reactor::maintenance::SourceError, session::ContextData, storage::StorageEngine};
 use ankql::ast::{Resolved, Selection};
-use ankurah_digest_tree::TreeSpec;
 use ankurah_proto as proto;
 pub(crate) use lease::{ResidentLease, ResidentPin, ResidentSnapshot, ResidentSubscription};
 use std::{
@@ -66,11 +59,6 @@ impl<CD: ContextData> ResidentTrees<CD> {
             builds: tokio::sync::Mutex::new(()),
         }
     }
-    #[cfg(test)]
-    pub(crate) fn evict_idle(&self) { self.lru.lock().unwrap().slots.retain(|slot| slot.resident.pins.load(Ordering::Acquire) != 0); }
-    #[cfg(test)]
-    pub(crate) fn len(&self) -> usize { self.lru.lock().unwrap().slots.len() }
-
     pub(crate) fn can_retry(error: &anyhow::Error) -> bool {
         matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Changed | SourceError::Lagged | SourceError::CatalogChanged))
     }
@@ -112,20 +100,10 @@ impl<CD: ContextData> ResidentTrees<CD> {
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         node.system.require_system_ready()?;
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-        let mut filtered = selection.clone();
-        filtered.predicate = policy.filter_predicate(filtered.predicate)?;
         let peer_spec = spec.is_some();
         let spec = spec.unwrap_or_else(|| spec_for(&selection, &node.catalog));
         anyhow::ensure!(serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
-        let requested = Identity {
-            coverage: Coverage::for_selection(&selection),
-            selection,
-            filtered,
-            retrieval: policy.retrieval_predicate(),
-            spec,
-            credentials,
-        };
+        let requested = Identity::requested(node, selection, spec, credentials)?;
         if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec) {
             return Ok(lease);
         }
@@ -133,34 +111,9 @@ impl<CD: ContextData> ResidentTrees<CD> {
         if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec) {
             return Ok(lease);
         }
-        let view = Arc::new(QueryView {
-            selection: requested.selection.clone(),
-            filtered: requested.filtered.clone(),
-            spec: requested.spec.clone(),
-        });
-        // A complete resident admits the whole predicate. A cold LIMIT keeps
-        // explicit bounded coverage; it cannot satisfy a different selection.
-        // The peer's layout does not require loading its broader predicate.
-        let spec = TreeSpec::new(requested.spec.key_spec().clone(), requested.selection.predicate.clone());
-        let (selection, filtered) = match &requested.coverage {
-            Coverage::Complete => {
-                (Selection::from(requested.selection.predicate.clone()), Selection::from(requested.filtered.predicate.clone()))
-            }
-            Coverage::Limited(_) => (requested.selection.clone(), requested.filtered.clone()),
-        };
-        let identity = Identity { selection, filtered, spec, ..requested };
-        let tree = Arc::new(QueryTree::default());
-        let captured = bootstrap::capture_filtered_query(
-            node,
-            identity.filtered.clone(),
-            identity.spec.clone(),
-            identity.credentials.clone(),
-            tree.clone(),
-            identity.coverage.clone(),
-        )
-        .await?;
+        let identity = requested.admission();
+        let actor = ResidentActor::bootstrap(node, identity.clone()).await?;
         node.system.check_not_halted()?;
-        let actor = ResidentActor::from_capture(identity.credentials.clone(), captured);
         let bytes = actor.accounted_bytes();
         let (commands, receiver) = mpsc::channel(8);
         let (stop, canceled) = oneshot::channel();
@@ -171,19 +124,17 @@ impl<CD: ContextData> ResidentTrees<CD> {
             cleanup: cleanup.clone(),
             alive: AtomicBool::new(true),
             pins: AtomicUsize::new(0),
-            #[cfg(test)]
-            tree,
             lru: Arc::downgrade(&self.lru),
         });
-        let lease = ResidentLease::new(resident.clone(), view);
+        let lease = ResidentLease::new(resident.clone(), Arc::new(requested.view()));
         let id = {
             let mut lru = self.lru.lock().unwrap();
             let id = lru.next_id;
             lru.next_id = id.checked_add(1).ok_or_else(|| anyhow::anyhow!("resident tree identity exhausted"))?;
-            lru.slots.push_back(Slot { id, identity: identity.clone(), resident: resident.clone(), bytes });
+            lru.slots.push_back(Slot { id, identity, resident: resident.clone(), bytes });
             id
         };
-        actor.spawn(node, receiver, canceled, cleanup, Arc::downgrade(&self.lru), Arc::downgrade(&resident), id, identity);
+        actor.spawn(node, receiver, canceled, cleanup, Arc::downgrade(&self.lru), Arc::downgrade(&resident), id);
         Ok(lease)
     }
 }

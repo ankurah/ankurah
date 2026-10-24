@@ -18,6 +18,10 @@ use ankurah_digest_tree::{TreeMatch, TreeSpec};
 use ankurah_proto as proto;
 use std::sync::Arc;
 
+/// What a resident admits and for whom: its coverage, the selection it was
+/// requested with and that selection filtered by policy, the retrieval
+/// predicate and the TreeSpec it was admitted under, and the credentials that
+/// admitted it.
 #[derive(Clone, PartialEq)]
 pub(super) struct Identity<CD> {
     pub(super) coverage: Coverage,
@@ -29,6 +33,50 @@ pub(super) struct Identity<CD> {
 }
 
 impl<CD: ContextData> Identity<CD> {
+    /// What `credentials` may read of `selection`, under the node's current
+    /// policy, in a tree under `spec`.
+    pub(super) fn requested<SE, PA>(
+        node: &Node<SE, PA>,
+        selection: Selection<Resolved>,
+        spec: proto::TreeSpec,
+        credentials: Vec<CD>,
+    ) -> anyhow::Result<Self>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
+        let mut filtered = selection.clone();
+        filtered.predicate = policy.filter_predicate(filtered.predicate)?;
+        Ok(Self {
+            coverage: Coverage::for_selection(&selection),
+            selection,
+            filtered,
+            retrieval: policy.retrieval_predicate(),
+            spec,
+            credentials,
+        })
+    }
+
+    /// The identity of the resident built for this request. A complete resident
+    /// admits the request's whole predicate, without its order or limit; a
+    /// limited one keeps the request's cut, which no other selection can share.
+    /// Either is keyed as the request asked, over the request's own predicate,
+    /// so a peer's broader spec does not widen what the resident loads.
+    pub(super) fn admission(&self) -> Self {
+        let (selection, filtered) = match &self.coverage {
+            Coverage::Complete => (Selection::from(self.selection.predicate.clone()), Selection::from(self.filtered.predicate.clone())),
+            Coverage::Limited(_) => (self.selection.clone(), self.filtered.clone()),
+        };
+        let spec = TreeSpec::new(self.spec.key_spec().clone(), self.selection.predicate.clone());
+        Self { selection, filtered, spec, ..self.clone() }
+    }
+
+    /// The view this request reads from whichever resident serves it.
+    pub(super) fn view(&self) -> QueryView {
+        QueryView { selection: self.selection.clone(), filtered: self.filtered.clone(), spec: self.spec.clone() }
+    }
+
     pub(super) fn check<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -44,7 +92,8 @@ impl<CD: ContextData> Identity<CD> {
     }
 }
 
-/// A limited resident cannot establish completeness for another rank cut.
+/// Which of its predicate's matches a resident holds: all of them, or only a
+/// limited selection's cut, which cannot answer any other cut.
 #[derive(Clone, PartialEq)]
 pub(super) enum Coverage {
     Complete,
@@ -80,7 +129,8 @@ impl Coverage {
     }
 }
 
-/// The query view is separate from the resident tree's admission and lifetime.
+/// What one lease reads from its resident: the selection it asked for, that
+/// selection filtered by policy, and the TreeSpec its comparisons describe.
 #[derive(Clone)]
 pub(super) struct QueryView {
     pub(super) selection: Selection<Resolved>,

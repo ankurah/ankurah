@@ -22,24 +22,14 @@ async fn idle_resident_updates_then_exact_reuse_avoids_another_scan() -> anyhow:
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
     let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
-    let tree = resident.tree();
+    let tree = resident.identity();
     let frozen = resident.snapshot().await?.snapshot;
     let scans = node.storage.2.load(Ordering::Relaxed);
     drop(resident);
     let next = update(&initial, "02")?;
     apply(&node, &next).await?;
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
-        loop {
-            let snapshot = tree.current_snapshot().await.unwrap();
-            if snapshot.entries[&initial.entity_id].head == proto::Clock::singleton(&next) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await?;
     let reused = acquire(&node.resident_trees, &node, selection(None)).await?;
-    assert!(Arc::ptr_eq(&tree, &reused.tree()));
+    assert!(Weak::ptr_eq(&tree, &reused.identity()));
     let current = reused.snapshot().await?;
     assert_eq!(current.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&next));
     assert_eq!(frozen.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
@@ -54,11 +44,11 @@ async fn count_limit_evicts_idle_trees_but_pins_preserve_active_owners() -> anyh
     apply(&node, &initial).await?;
     let cache = ResidentTrees::with_limits(1, 1024 * 1024);
     let first = acquire(&cache, &node, selection(None)).await?;
-    let tree = first.tree();
+    let tree = first.identity();
     let snapshot = first.snapshot().await?.snapshot;
     let second = acquire(&cache, &node, selection(Some(1))).await?;
     assert_eq!(cache.len(), 2, "active operations do not acquire a new artificial query limit");
-    assert!(Arc::ptr_eq(&tree, &acquire(&cache, &node, selection(None)).await?.tree()));
+    assert!(Weak::ptr_eq(&tree, &acquire(&cache, &node, selection(None)).await?.identity()));
     drop(first);
     drop(second);
     assert_eq!(cache.len(), 2, "the captured active comparison also pins its tree");
@@ -66,7 +56,7 @@ async fn count_limit_evicts_idle_trees_but_pins_preserve_active_owners() -> anyh
     drop(snapshot);
     assert_eq!(cache.len(), 1);
     let second = acquire(&cache, &node, selection(Some(1))).await?;
-    assert!(!Arc::ptr_eq(&tree, &second.tree()));
+    assert!(!Weak::ptr_eq(&tree, &second.identity()));
     Ok(())
 }
 
@@ -77,26 +67,24 @@ async fn oversized_miss_does_not_evict_a_useful_small_entry() -> anyhow::Result<
         apply(&node, &genesis(value)?).await?;
     }
     let small = above("03", None);
-    let capture =
-        capture_query(&node, small.clone(), spec_for(&small, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
-    assert_eq!(capture.projection.tree.current_snapshot().await?.entries.len(), 1);
-    let small_bytes = ResidentActor::from_capture(vec![DEFAULT_CONTEXT], capture).accounted_bytes();
+    let small_resident = complete_resident(&node, spec_for(&small, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(small_resident.tree.entries().len(), 1);
+    let small_bytes = small_resident.accounted_bytes();
     let budget = small_bytes + 1;
     assert!(small_bytes <= budget);
     let all = selection(None);
-    let full_capture =
-        capture_query(&node, all.clone(), spec_for(&all, &node.catalog), vec![DEFAULT_CONTEXT], Arc::new(QueryTree::default())).await?;
-    assert_eq!(full_capture.projection.tree.current_snapshot().await?.entries.len(), 4);
-    assert!(ResidentActor::from_capture(vec![DEFAULT_CONTEXT], full_capture).accounted_bytes() > budget);
+    let full_resident = complete_resident(&node, spec_for(&all, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(full_resident.tree.entries().len(), 4);
+    assert!(full_resident.accounted_bytes() > budget);
     let cache = ResidentTrees::with_limits(2, budget);
     let resident = acquire(&cache, &node, above("03", None)).await?;
-    let tree = resident.tree();
+    let tree = resident.identity();
     drop(resident);
     let oversized = acquire(&cache, &node, selection(None)).await?;
     assert_eq!(oversized.snapshot().await?.snapshot.entries.len(), 4);
     drop(oversized);
     assert_eq!(cache.len(), 1);
-    assert!(Arc::ptr_eq(&tree, &acquire(&cache, &node, above("03", None)).await?.tree()));
+    assert!(Weak::ptr_eq(&tree, &acquire(&cache, &node, above("03", None)).await?.identity()));
     Ok(())
 }
 
@@ -107,7 +95,7 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
     apply(&node, &event).await?;
     let selection = selection(None);
     let resident = acquire(&node.resident_trees, &node, selection.clone()).await?;
-    let original = resident.tree();
+    let original = resident.identity();
     drop(resident);
     let scans = node.storage.2.load(Ordering::Relaxed);
     let mut subscriptions = Vec::new();
@@ -133,8 +121,8 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
                 proto::KnownState { spec: spec_for(&selection, &node.catalog), spans: vec![] },
             )
             .await?;
-        let (_, tree) = handler.subscription_handler.query_tree_for_test(query).await.unwrap();
-        assert!(Arc::ptr_eq(&original, &tree));
+        let (_, tree) = handler.subscription_handler.query_resident_for_test(query).await.unwrap();
+        assert!(Weak::ptr_eq(&original, &tree));
         subscriptions.push((peer, query));
     }
     assert_eq!(node.resident_trees.len(), 1);
@@ -164,11 +152,11 @@ async fn an_idle_tree_does_not_require_event_delivery_permission() -> anyhow::Re
     node.wait_ready().await?;
     apply(&node, &initial).await?;
     let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
-    let tree = resident.tree();
+    let tree = resident.identity();
     drop(resident);
     apply(&node, &denied).await?;
     let reused = acquire(&node.resident_trees, &node, selection(None)).await?;
-    assert!(Arc::ptr_eq(&tree, &reused.tree()));
+    assert!(Weak::ptr_eq(&tree, &reused.identity()));
     assert_eq!(reused.snapshot().await?.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&denied));
     Ok(())
 }
@@ -403,8 +391,8 @@ async fn invalidation_reaches_another_peer_while_first_initial_reply_waits_for_h
         .subscribe_query(&node, proto::RequestId::new(), vec![], query, selected, Some(&DEFAULT_CONTEXT), 1, current.offer().await?)
         .await?;
     let proto::NodeResponseBody::QuerySubscribed { state, .. } = response else { panic!("expected healthy subscription") };
-    let (_, shared) = healthy_connection.subscription_handler.query_tree_for_test(query).await.unwrap();
-    assert!(Arc::ptr_eq(&shared, &resident.tree()));
+    let (_, shared) = healthy_connection.subscription_handler.query_resident_for_test(query).await.unwrap();
+    assert!(Weak::ptr_eq(&shared, &resident.identity()));
 
     let catalog_change = proto::Event::genesis(
         None,
@@ -424,7 +412,7 @@ async fn invalidation_reaches_another_peer_while_first_initial_reply_waits_for_h
             tokio::task::yield_now().await;
         }
     }).await?;
-    assert!(healthy_connection.subscription_handler.query_tree_for_test(query).await.is_none());
+    assert!(healthy_connection.subscription_handler.query_resident_for_test(query).await.is_none());
     assert_eq!(node.resident_trees.len(), 0);
     // The first peer's history read is still blocked. Cancel it only after the
     // healthy peer has received the independent invalidation.
@@ -459,7 +447,7 @@ async fn compatible_selections_share_full_resident_with_independent_scopes() -> 
         events.push(event);
     }
     let broad = acquire(&node.resident_trees, &node, above("07", None)).await?;
-    let full = broad.tree();
+    let full = broad.identity();
     let scans = node.storage.2.load(Ordering::Relaxed);
     let cases = [
         (above("07", None), vec![1, 2, 3, 4]),
@@ -476,21 +464,21 @@ async fn compatible_selections_share_full_resident_with_independent_scopes() -> 
     ];
     for (selected, expected) in cases {
         let lease = acquire(&node.resident_trees, &node, selected).await?;
-        assert!(Arc::ptr_eq(&full, &lease.tree()), "compatible selections use the same physical tree");
+        assert!(Weak::ptr_eq(&full, &lease.identity()), "compatible selections use the same physical tree");
         let snapshot = lease.snapshot().await?.snapshot;
         let expected: BTreeSet<_> = expected.into_iter().map(|index| events[index].entity_id).collect();
         assert_eq!(snapshot.entries.keys().copied().collect::<BTreeSet<_>>(), expected);
     }
     assert_eq!(node.resident_trees.len(), 1);
     assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "scopes do not scan storage again");
-    assert_eq!(full.current_snapshot().await?.entries.len(), 4, "query limits never truncate the resident");
+    assert_eq!(broad.snapshot().await?.snapshot.entries.len(), 4, "query limits never truncate the resident");
     let before = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
     let changed = update(&events[1], "15")?;
     apply(&node, &changed).await?;
     let after = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
     assert!(!before.entries.contains_key(&events[1].entity_id));
     assert!(after.entries.contains_key(&events[1].entity_id));
-    assert_eq!(full.current_snapshot().await?.entries.len(), 4);
+    assert_eq!(broad.snapshot().await?.snapshot.entries.len(), 4);
     Ok(())
 }
 
@@ -504,22 +492,21 @@ async fn limited_coverage_is_explicit_and_complete_coverage_is_preferred() -> an
         events.push(event);
     }
     let first = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
-    let tree = first.tree();
+    let tree = first.identity();
     let frozen = first.snapshot().await?.snapshot;
     assert_eq!(frozen.entries.len(), 1);
-    assert_eq!(tree.current_snapshot().await?.entries.len(), 1);
     let exact = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
-    assert!(Arc::ptr_eq(&tree, &exact.tree()));
+    assert!(Weak::ptr_eq(&tree, &exact.identity()));
     let all = node.resident_trees.acquire(&node, selection(None), Some(frozen.spec.clone()), vec![DEFAULT_CONTEXT]).await?;
-    assert!(!Arc::ptr_eq(&tree, &all.tree()), "bounded coverage cannot satisfy the unlimited request");
+    assert!(!Weak::ptr_eq(&tree, &all.identity()), "bounded coverage cannot satisfy the unlimited request");
     let preferred = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
-    assert!(Arc::ptr_eq(&all.tree(), &preferred.tree()), "prefer a compatible complete resident");
+    assert!(Weak::ptr_eq(&all.identity(), &preferred.identity()), "prefer a compatible complete resident");
     assert_eq!(all.snapshot().await?.snapshot.entries.len(), 3);
     apply(&node, &update(&events[0], "09")?).await?;
     let after = first.snapshot().await?.snapshot;
     assert_eq!(after.entries.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
     assert_eq!(frozen.entries.keys().copied().collect::<Vec<_>>(), vec![events[0].entity_id]);
-    assert_eq!(tree.current_snapshot().await?.entries.len(), 1);
+    assert_eq!(after.entries.len(), 1, "a refill keeps the bounded resident at its cut");
     assert_eq!(node.resident_trees.len(), 2);
     Ok(())
 }
@@ -532,12 +519,12 @@ async fn missing_coverage_or_unaddressable_order_requires_another_tree() -> anyh
     }
     let initial = acquire(&node.resident_trees, &node, above("07", None)).await?;
     let wider = acquire(&node.resident_trees, &node, above("03", None)).await?;
-    assert!(!Arc::ptr_eq(&initial.tree(), &wider.tree()), "narrow admission cannot cover a wider predicate");
+    assert!(!Weak::ptr_eq(&initial.identity(), &wider.identity()), "narrow admission cannot cover a wider predicate");
     let all = acquire(&node.resident_trees, &node, selection(None)).await?;
-    assert!(!Arc::ptr_eq(&initial.tree(), &all.tree()));
-    assert!(!Arc::ptr_eq(&wider.tree(), &all.tree()));
+    assert!(!Weak::ptr_eq(&initial.identity(), &all.identity()));
+    assert!(!Weak::ptr_eq(&wider.identity(), &all.identity()));
     let ordered_limit = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
-    assert!(!Arc::ptr_eq(&all.tree(), &ordered_limit.tree()), "an entity-ID tree cannot provide a label-ordered limit");
+    assert!(!Weak::ptr_eq(&all.identity(), &ordered_limit.identity()), "an entity-ID tree cannot provide a label-ordered limit");
     assert_eq!(node.resident_trees.len(), 4);
     Ok(())
 }
@@ -570,14 +557,16 @@ async fn cold_limit_bounds_physical_retention_and_zero_limit_reads_nothing() -> 
     let rows_read = node.storage.4.load(Ordering::Relaxed);
     let limited = acquire(&node.resident_trees, &node, selection(Some(3))).await?;
     assert_eq!(limited.snapshot().await?.snapshot.entries.len(), 3);
-    assert_eq!(limited.tree().current_snapshot().await?.entries.len(), 3, "the physical resident, not only its view, must be bounded");
-    assert_eq!(node.storage.4.load(Ordering::Relaxed) - rows_read, 3, "cold capture requests only the selected rows from storage");
+    assert_eq!(
+        node.storage.4.load(Ordering::Relaxed) - rows_read,
+        3,
+        "a cold limited resident reads, and so holds, only the selected rows"
+    );
 
     let scans = node.storage.2.load(Ordering::Relaxed);
     let rows_read = node.storage.4.load(Ordering::Relaxed);
     let empty = acquire(&node.resident_trees, &node, selection(Some(0))).await?;
     assert!(empty.snapshot().await?.snapshot.entries.is_empty());
-    assert!(empty.tree().current_snapshot().await?.entries.is_empty());
     assert_eq!(node.storage.2.load(Ordering::Relaxed), scans, "LIMIT 0 must not start an application scan");
     assert_eq!(node.storage.4.load(Ordering::Relaxed), rows_read);
     Ok(())
@@ -591,7 +580,7 @@ async fn limited_coverage_rejects_other_selections_and_shares_exact_responder_re
     }
     let selected = selection(Some(1));
     let limited = acquire(&node.resident_trees, &node, selected.clone()).await?;
-    let tree = limited.tree();
+    let tree = limited.identity();
     let mut original = limited.snapshot().await?.snapshot;
     let peer = proto::EntityId::from_bytes([90; 32]);
     node.register_peer(
@@ -605,17 +594,17 @@ async fn limited_coverage_rejects_other_selections_and_shares_exact_responder_re
         .subscription_handler
         .subscribe_query(&node, proto::RequestId::new(), vec![], query, selected, Some(&DEFAULT_CONTEXT), 1, original.offer().await?)
         .await?;
-    let (_, serving) = connection.subscription_handler.query_tree_for_test(query).await.unwrap();
-    assert!(Arc::ptr_eq(&tree, &serving), "requesting and serving use the same bounded resident");
+    let (_, serving) = connection.subscription_handler.query_resident_for_test(query).await.unwrap();
+    assert!(Weak::ptr_eq(&tree, &serving), "requesting and serving use the same bounded resident");
     let mut opposite = selection(Some(1));
     opposite.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
     let mut narrower = above("01", None);
     narrower.limit = Some(1);
     for other in [selection(None), selection(Some(2)), selection(Some(0)), opposite, narrower] {
         let other = acquire(&node.resident_trees, &node, other).await?;
-        assert!(!Arc::ptr_eq(&tree, &other.tree()), "bounded coverage never proves another selection complete");
+        assert!(!Weak::ptr_eq(&tree, &other.identity()), "bounded coverage never proves another selection complete");
     }
-    assert_eq!(tree.current_snapshot().await?.entries.len(), 1);
+    assert_eq!(limited.snapshot().await?.snapshot.entries.len(), 1);
     connection.subscription_handler.remove_predicate(&node, query).await?;
     node.deregister_peer(peer);
     Ok(())

@@ -1,61 +1,97 @@
-//! The task that owns a resident's tree: it applies maintenance, answers commands and delivers live routes.
+//! The task that owns a resident: it applies the resident's maintenance,
+//! answers its leases' commands and delivers its live routes.
 
 use super::{
-    bootstrap::{CapturedQuery, QueryProjection, TreeUpdate, MAX_READ_ATTEMPTS},
+    bootstrap::{ensure_catalog_unchanged, fold_candidate, StorageRead, TreeUpdate, MAX_READ_ATTEMPTS},
     identity::{Coverage, Identity},
     lease::{Command, Resident, ResidentSnapshot},
     route::{current_state, Route},
     Lru,
 };
 use crate::{
-    node::{state_sync::Snapshot, Node, WeakNode},
+    node::{
+        state_sync::{QueryTree, Snapshot},
+        Node, WeakNode,
+    },
     policy::{ContextPolicy, PolicyAgent},
-    reactor::maintenance::{MaintenanceSubscription, SourceBatch, SourceError, MAX_PENDING_BYTES},
+    reactor::maintenance::{MaintenanceSubscription, SourceBatch, SourceError, SourceRevision, MAX_PENDING_BYTES},
     session::ContextData,
     storage::StorageEngine,
 };
 use ankurah_proto as proto;
 use ankurah_signals::Wait;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{atomic::Ordering, Arc, Mutex, Weak},
 };
 use tokio::sync::{mpsc, oneshot, Notify};
 
 type RouteMembership = (BTreeMap<proto::EntityId, proto::QueryMember>, Vec<proto::EntityId>);
 
-pub(crate) struct ResidentActor<CD: ContextData> {
-    credentials: Vec<CD>,
-    pub(super) projection: QueryProjection,
+/// A resident's state, owned by its actor task: what it admits, every
+/// candidate its predicate matches, its tree, its maintenance subscription and
+/// the live routes it delivers to.
+pub(super) struct ResidentActor<CD: ContextData> {
+    pub(super) identity: Identity<CD>,
+    // IDs only: denied candidates must also be rechecked when opaque policy changes.
+    pub(super) candidates: BTreeSet<proto::EntityId>,
+    pub(super) tree: QueryTree,
     pub(super) cursor: MaintenanceSubscription<TreeUpdate>,
     pub(super) revision: u64,
     pub(super) routes: Vec<Route>,
 }
+
 impl<CD: ContextData> ResidentActor<CD> {
-    pub(super) fn credentials(&self) -> &[CD] { &self.credentials }
-    pub(super) fn from_capture(credentials: Vec<CD>, capture: CapturedQuery) -> Self {
-        Self { credentials, projection: capture.projection, cursor: capture.cursor, revision: capture.revision, routes: Vec::new() }
-    }
+    /// Fail with `Changed` unless the tree holds exactly the candidates the
+    /// admitting credentials may read now.
     pub(super) async fn check_authorization<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
-        let snapshot = self.projection.tree.current_snapshot().await?;
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
+        let entries = self.tree.entries();
         if policy.allows_unrestricted_state_reads() {
             // A new grant must also admit candidates previously denied by policy.
             // Returning the old subset would silently lose newly readable rows.
-            anyhow::ensure!(snapshot.entries.keys().eq(self.projection.candidates.iter()), SourceError::Changed);
+            anyhow::ensure!(entries.keys().eq(self.candidates.iter()), SourceError::Changed);
             return Ok(());
         }
-        for id in &self.projection.candidates {
+        for id in &self.candidates {
             let state = current_state(node, *id).await?.ok_or(SourceError::Changed)?;
-            anyhow::ensure!(policy.check_read(id, &state.state).is_ok() == snapshot.entries.contains_key(id), SourceError::Changed);
+            anyhow::ensure!(policy.check_read(id, &state.state).is_ok() == entries.contains_key(id), SourceError::Changed);
         }
         Ok(())
     }
-    pub(super) fn accounted_bytes(&self) -> usize { self.projection.bytes.saturating_add(self.projection.candidates.len() * 64) }
+
+    /// The bytes this resident is charged against the LRU's idle allowance.
+    pub(super) fn accounted_bytes(&self) -> usize { self.tree.accounted_bytes().saturating_add(self.candidates.len() * 64) }
+
+    /// Fold `batch` into the candidates and the tree. With `delivery`, return
+    /// the changes to entities that were or now are members, for live routes.
+    pub(super) async fn apply(&mut self, batch: &SourceBatch<TreeUpdate>, delivery: bool) -> anyhow::Result<Vec<TreeUpdate>> {
+        let mut affected = BTreeSet::new();
+        let mut latest = BTreeMap::new();
+        for change in &batch.changes {
+            fold_candidate(&mut self.candidates, change);
+            latest.insert(change.entity_id, change.entry.clone());
+            if delivery && (self.tree.entries().contains_key(&change.entity_id) || change.entry.is_some()) {
+                affected.insert(change.entity_id);
+            }
+        }
+        let mut entries = Vec::new();
+        let mut removed = Vec::new();
+        for (id, entry) in latest {
+            if let Some(entry) = entry {
+                entries.push(entry);
+            } else {
+                removed.push(id);
+            }
+        }
+        self.tree.apply(entries, removed).await?;
+        Ok(batch.changes.iter().filter(|change| affected.contains(&change.entity_id)).cloned().collect())
+    }
+
     async fn deliver<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
@@ -66,7 +102,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
         let mut retained = Vec::with_capacity(self.routes.len());
         let mut prepared = prepared.map(Vec::into_iter);
         for mut route in std::mem::take(&mut self.routes) {
@@ -83,7 +119,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                     let (next, ordered) = membership?;
                     route.changes_for_members(node, &policy, &sources, next, ordered).await
                 } else {
-                    route.changes(node, &self.projection, &policy, &sources).await
+                    route.changes(node, &self.identity.coverage, &self.tree, &policy, &sources).await
                 }
             }
             .await;
@@ -107,15 +143,18 @@ impl<CD: ContextData> ResidentActor<CD> {
         }
         self.routes = retained;
     }
+
+    /// Bring the resident up to `batch`, the next committed changes, and
+    /// deliver them to its live routes.
     pub(super) async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Arc<SourceBatch<TreeUpdate>>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        self.projection.check_catalog(&batch)?;
+        ensure_catalog_unchanged(&self.identity, &batch)?;
         self.routes.retain(|route| route.owner.strong_count() != 0);
-        if matches!(self.projection.coverage, Coverage::Limited(_)) {
-            if self.projection.selection.limit != Some(0) && self.relevant(&batch) {
+        if matches!(self.identity.coverage, Coverage::Limited(_)) {
+            if self.identity.filtered.limit != Some(0) && self.relevant(&batch) {
                 return self.refill(node, vec![batch]).await;
             }
         } else {
@@ -142,16 +181,15 @@ impl<CD: ContextData> ResidentActor<CD> {
         let mut bytes = 0usize;
         let mut changes = Vec::new();
         for batch in pending {
-            self.projection.check_catalog(&batch)?;
+            ensure_catalog_unchanged(&self.identity, &batch)?;
             anyhow::ensure!(batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes), SourceError::Lagged);
             bytes += batch.bytes;
             changes.extend(batch.changes.iter().cloned());
         }
         self.routes.retain(|route| route.owner.strong_count() != 0);
         if !changes.is_empty() {
-            let batch =
-                SourceBatch { revision: crate::reactor::maintenance::SourceRevision(revision), changes, catalog_changed: false, bytes };
-            let sources = self.projection.apply(&batch, !self.routes.is_empty()).await?;
+            let batch = SourceBatch { revision: SourceRevision(revision), changes, catalog_changed: false, bytes };
+            let sources = self.apply(&batch, !self.routes.is_empty()).await?;
             if !sources.is_empty() {
                 self.deliver(node, revision, sources, None).await;
             }
@@ -159,28 +197,32 @@ impl<CD: ContextData> ResidentActor<CD> {
         self.revision = revision;
         Ok(())
     }
+
     fn relevant(&self, batch: &SourceBatch<TreeUpdate>) -> bool {
-        batch.changes.iter().any(|change| change.matches || self.projection.candidates.contains(&change.entity_id))
+        batch.changes.iter().any(|change| change.matches || self.candidates.contains(&change.entity_id))
     }
+
+    /// Read a limited resident's cut again after `pending` touched it, fence
+    /// the read, replace the tree's entries and deliver the new cut.
     async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>, mut pending: Vec<Arc<SourceBatch<TreeUpdate>>>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let mut bytes = pending.iter().map(|batch| batch.bytes).sum::<usize>();
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
+        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
         let mut attempts = 0;
-        let (rows, candidates, ordered, revision) = loop {
+        let (read, revision) = loop {
             attempts += 1;
             anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
             let window = self.cursor.fence().await?;
             for batch in window.batches {
-                self.projection.check_catalog(&batch)?;
+                ensure_catalog_unchanged(&self.identity, &batch)?;
                 anyhow::ensure!(batch.bytes <= MAX_PENDING_BYTES.saturating_sub(bytes), SourceError::Lagged);
                 bytes += batch.bytes;
                 pending.push(batch);
             }
-            let (rows, candidates, ordered) = self.projection.read(node, &policy).await?;
+            let read = StorageRead::of(node, &self.identity, &policy).await?;
             match self.cursor.fence_unchanged_since(window.revision).await {
                 Err(SourceError::Changed) => continue,
                 result => {
@@ -189,39 +231,40 @@ impl<CD: ContextData> ResidentActor<CD> {
                     // too; predicate routing still observes future entrants.
                     match self
                         .cursor
-                        .finish_bootstrap(self.projection.selection.predicate.clone(), candidates.iter().copied(), revision)
+                        .finish_bootstrap(self.identity.filtered.predicate.clone(), read.candidates.iter().copied(), revision)
                         .await
                     {
                         Err(SourceError::Changed) => continue,
                         result => {
                             result?;
-                            break (rows, candidates, ordered, revision.0);
+                            break (read, revision.0);
                         }
                     }
                 }
             }
         };
-        self.projection.candidates = candidates;
-        let snapshot = self.projection.tree.refresh_entries(self.projection.spec.clone(), rows.into_values().collect()).await?;
-        self.projection.bytes = snapshot.accounted_bytes();
+        self.candidates = read.candidates;
+        self.tree.replace(read.rows.into_values().collect()).await?;
         let sources = pending.into_iter().flat_map(|batch| batch.changes.clone()).collect();
-        let members = snapshot.query_members();
-        let prepared = self.routes.iter().map(|_| Ok((members.clone(), ordered.clone()))).collect();
+        let members = self.tree.snapshot().query_members();
+        let prepared = self.routes.iter().map(|_| Ok((members.clone(), read.ordered.clone()))).collect();
         self.deliver(node, revision, sources, Some(prepared)).await;
         self.revision = revision;
         Ok(())
     }
+
+    /// Apply every commit published so far, and snapshot the tree.
     pub(super) async fn refresh<SE, PA>(&mut self, node: &Node<SE, PA>) -> anyhow::Result<Snapshot>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let window = self.cursor.fence().await?;
-        if matches!(self.projection.coverage, Coverage::Limited(_)) {
+        if matches!(self.identity.coverage, Coverage::Limited(_)) {
             let mut relevant = false;
             for batch in &window.batches {
-                self.projection.check_catalog(batch)?;
-                relevant |= self.projection.selection.limit != Some(0) && self.relevant(batch);
+                ensure_catalog_unchanged(&self.identity, batch)?;
+                relevant |= self.identity.filtered.limit != Some(0) && self.relevant(batch);
             }
             if relevant {
                 self.refill(node, window.batches).await?;
@@ -231,14 +274,11 @@ impl<CD: ContextData> ResidentActor<CD> {
         } else {
             self.advance_complete(node, window.batches, window.revision.0).await?;
         }
-        self.projection.tree.current_snapshot().await
+        Ok(self.tree.snapshot())
     }
-}
 
-impl<CD: ContextData> ResidentActor<CD> {
     /// Run this actor until its resident is dropped or the node stops, then
-    /// remove its entry and invalidate the routes it still serves.
-    #[allow(clippy::too_many_arguments)]
+    /// remove its slot and invalidate the routes it still serves.
     pub(super) fn spawn<SE, PA>(
         self,
         node: &Node<SE, PA>,
@@ -248,7 +288,6 @@ impl<CD: ContextData> ResidentActor<CD> {
         lru: Weak<Mutex<Lru<CD>>>,
         resident: Weak<Resident<CD>>,
         id: u64,
-        identity: Identity<CD>,
     ) where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -261,7 +300,7 @@ impl<CD: ContextData> ResidentActor<CD> {
             let result = tokio::select! {
                 _ = canceled => Ok(()),
                 _ = run.wait_value(false) => Ok(()),
-                result = run_resident(&mut actor, weak.clone(), receiver, cleanup, &lru, id, &identity) => result,
+                result = run_resident(&mut actor, weak.clone(), receiver, cleanup, &lru, id) => result,
             };
             if let Some(resident) = resident.upgrade() {
                 resident.alive.store(false, Ordering::Release);
@@ -299,7 +338,6 @@ async fn run_resident<SE, PA>(
     cleanup: Arc<Notify>,
     lru: &Weak<Mutex<Lru<PA::ContextData>>>,
     id: u64,
-    identity: &Identity<PA::ContextData>,
 ) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -311,16 +349,16 @@ where
             command = commands.recv() => {
                 let Some(command) = command else { return Ok(()); };
                 let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
-                let captured = async {
+                let refreshed = async {
                     node.system.check_not_halted()?;
-                    identity.check(&node)?;
+                    actor.identity.check(&node)?;
                     let snapshot = actor.refresh(&node).await?;
                     actor.check_authorization(&node).await?;
                     let lru = lru.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                     lru.lock().unwrap().update_bytes(id, actor.accounted_bytes())?;
                     Ok::<_, anyhow::Error>(snapshot)
                 }.await;
-                let snapshot = match captured {
+                let snapshot = match refreshed {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
                         // A retry must not reacquire the failed source before
@@ -334,9 +372,9 @@ where
                 };
                 let selected = async {
                     let view = command.view();
-                    let policy = ContextPolicy::from_credentials(&node.policy_agent, &actor.credentials().to_vec());
+                    let policy = ContextPolicy::from_credentials(&node.policy_agent, &actor.identity.credentials);
                     anyhow::ensure!(policy.filter_predicate(view.selection.predicate.clone())? == view.filtered.predicate, SourceError::Changed);
-                    actor.projection.coverage.select(snapshot, &view.selection, &node.catalog).await?
+                    actor.identity.coverage.select(snapshot, &view.selection, &node.catalog).await?
                         .with_spec(view.spec.clone(), &view.selection, &node.catalog)
                 }.await;
                 let snapshot = match selected {
@@ -353,7 +391,7 @@ where
                     Command::Subscribe { view, peer, request, fingerprint, query, version, catalog, known, owner, response } => {
                         if response.is_closed() || owner.strong_count() == 0 { continue; }
                         let members = snapshot.query_members();
-                        let result = crate::node::state_sync::prepare_state_stream(&node, peer, request, fingerprint, actor.credentials().to_vec(), Some((query, version)), catalog, actor.revision, snapshot, known);
+                        let result = crate::node::state_sync::prepare_state_stream(&node, peer, request, fingerprint, actor.identity.credentials.clone(), Some((query, version)), catalog, actor.revision, snapshot, known);
                         if let Ok(pending) = &result {
                             actor.routes.push(Route { peer, stream: pending.id(), owner, selection: view.selection.clone(), filtered: view.filtered.clone(), members });
                         }
@@ -370,7 +408,7 @@ where
             batch = actor.cursor.next() => {
                 let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                 node.system.check_not_halted()?;
-                identity.check(&node)?;
+                actor.identity.check(&node)?;
                 actor.publish(&node, batch?).await?;
             }
             _ = cleanup.notified() => { actor.routes.retain(|route| route.owner.strong_count() != 0); }

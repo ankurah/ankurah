@@ -8,11 +8,7 @@ pub(crate) use spec::{accept_peer_spec, key_paths, request_for, serves, spec_for
 
 use std::{collections::BTreeMap, sync::Arc};
 
-#[cfg(test)]
-use crate::{entity::TemporaryEntity, selection::filter::ValueLookup};
 use ankurah_digest_tree::{leaf_address, CanonicalCodec, DigestTree, HeadHash, LeafChange, LeafInput, TreeError};
-#[cfg(test)]
-use ankurah_proto::{Attested, EntityState};
 use ankurah_proto::{Clock, EntityId, TreeSpec};
 
 type Entries = BTreeMap<EntityId, TreeEntry>;
@@ -41,12 +37,10 @@ impl TreeEntry {
     }
 }
 
-/// A resident's fixed-spec index, updated by its reactor maintenance subscription.
-/// Initialization and every subsequent update publish a complete digest and matching heads.
-#[derive(Default)]
-pub(crate) struct QueryTree(tokio::sync::Mutex<Option<Index>>);
-
-struct Index {
+/// A resident's index under one fixed TreeSpec: each admitted entity's key and
+/// Clock, and the digest tree over them, changed together by every commit its
+/// maintenance subscription applies.
+pub(crate) struct QueryTree {
     tree: DigestTree,
     entries: Arc<Entries>,
     members: Arc<Members>,
@@ -54,84 +48,9 @@ struct Index {
 }
 
 impl QueryTree {
-    pub async fn refresh_entries(&self, spec: TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Snapshot> {
+    /// A tree under `spec` holding `entries`.
+    pub(crate) async fn build(spec: TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Self> {
         let entries = checked_entries(&spec, entries)?;
-        let mut current = self.0.lock().await;
-        match current.as_mut() {
-            Some(index) => {
-                anyhow::ensure!(index.tree.spec() == &spec, "different TreeSpec requires a different tree");
-                let mut changes = BTreeMap::new();
-                for (id, before) in index.entries.iter() {
-                    let after = entries.get(id);
-                    if after != Some(before) {
-                        changes.insert(*id, after.cloned());
-                    }
-                }
-                for (id, after) in &entries {
-                    if !index.entries.contains_key(id) {
-                        changes.insert(*id, Some(after.clone()));
-                    }
-                }
-                index.apply(changes).await?;
-            }
-            None => *current = Some(Index::build(spec, entries).await?),
-        }
-        Ok(current.as_ref().unwrap().snapshot())
-    }
-
-    pub async fn apply_entries(&self, entries: Vec<TreeEntry>, removed: Vec<EntityId>) -> anyhow::Result<Snapshot> {
-        let mut current = self.0.lock().await;
-        let index = current.as_mut().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?;
-        let entries = checked_entries(index.tree.spec(), entries)?;
-        let mut changes = BTreeMap::new();
-        for id in removed {
-            if index.entries.contains_key(&id) {
-                changes.insert(id, None);
-            }
-        }
-        for (id, entry) in entries {
-            if index.entries.get(&id) != Some(&entry) {
-                changes.insert(id, Some(entry));
-            } else {
-                changes.remove(&id);
-            }
-        }
-        index.apply(changes).await?;
-        Ok(index.snapshot())
-    }
-
-    pub async fn current_snapshot(&self) -> anyhow::Result<Snapshot> {
-        let current = self.0.lock().await;
-        Ok(current.as_ref().ok_or_else(|| anyhow::anyhow!("query tree is not initialized"))?.snapshot())
-    }
-
-    #[cfg(test)]
-    pub async fn refresh(&self, spec: TreeSpec, states: Vec<Attested<EntityState>>) -> anyhow::Result<Snapshot> {
-        let entries = states.into_iter().map(|state| entry_from_state(&spec, &state)).collect::<anyhow::Result<Vec<_>>>()?;
-        self.refresh_entries(spec, entries).await
-    }
-}
-
-fn checked_entries(spec: &TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Entries> {
-    let mut checked = Entries::new();
-    for entry in entries {
-        CanonicalCodec::split(spec.key_spec(), &entry.key)?;
-        anyhow::ensure!(checked.insert(entry.entity_id, entry).is_none(), "duplicate tree entity");
-    }
-    Ok(checked)
-}
-
-fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
-    CanonicalCodec::split(spec.key_spec(), &entry.key)
-        .expect("tree entries have validated canonical keys")
-        .iter()
-        .enumerate()
-        .filter_map(|(index, part)| (part[0] == 0).then_some(index))
-        .collect()
-}
-
-impl Index {
-    async fn build(spec: TreeSpec, entries: Entries) -> anyhow::Result<Self> {
         let leaves: Vec<LeafInput> = entries.values().map(TreeEntry::leaf).collect();
         let tree = run_blocking_if_large(leaves.len(), build_tree(spec.clone(), leaves)).await??;
         let mut missing_counts = vec![0; spec.key_spec().keyparts.len()];
@@ -144,7 +63,72 @@ impl Index {
         Ok(Self { tree, entries: Arc::new(entries), members: Arc::new(members), missing_counts })
     }
 
-    async fn apply(&mut self, changes: BTreeMap<EntityId, Option<TreeEntry>>) -> anyhow::Result<()> {
+    /// Make the tree hold exactly `entries`, changing only the entries that differ.
+    pub(crate) async fn replace(&mut self, entries: Vec<TreeEntry>) -> anyhow::Result<()> {
+        let entries = checked_entries(self.tree.spec(), entries)?;
+        let mut changes = BTreeMap::new();
+        for (id, before) in self.entries.iter() {
+            let after = entries.get(id);
+            if after != Some(before) {
+                changes.insert(*id, after.cloned());
+            }
+        }
+        for (id, after) in &entries {
+            if !self.entries.contains_key(id) {
+                changes.insert(*id, Some(after.clone()));
+            }
+        }
+        self.apply_changes(changes).await
+    }
+
+    /// Store `entries`, replacing any earlier entry of the same entity, and
+    /// remove the entities in `removed`.
+    pub(crate) async fn apply(&mut self, entries: Vec<TreeEntry>, removed: Vec<EntityId>) -> anyhow::Result<()> {
+        let entries = checked_entries(self.tree.spec(), entries)?;
+        let mut changes = BTreeMap::new();
+        for id in removed {
+            if self.entries.contains_key(&id) {
+                changes.insert(id, None);
+            }
+        }
+        for (id, entry) in entries {
+            if self.entries.get(&id) != Some(&entry) {
+                changes.insert(id, Some(entry));
+            } else {
+                changes.remove(&id);
+            }
+        }
+        self.apply_changes(changes).await
+    }
+
+    /// Conservative resident accounting for head/key metadata and digest-map rows.
+    pub fn accounted_bytes(&self) -> usize {
+        self.entries.values().fold(4096usize, |total, entry| {
+            total
+                .saturating_add(1024)
+                .saturating_add(entry.key.capacity().saturating_mul(4))
+                .saturating_add(entry.head.len().saturating_mul(36))
+        })
+    }
+
+    /// Each admitted entity's entry.
+    pub(crate) fn entries(&self) -> &Entries { &self.entries }
+
+    /// A frozen view of the tree as it stands now; later changes do not reach it.
+    pub(crate) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            spec: self.tree.spec().clone(),
+            resident: None,
+            physical_spec: self.tree.spec().clone(),
+            tree: self.tree.begin(),
+            ranges: None,
+            entries: self.entries.clone(),
+            members: self.members.clone(),
+            missing_counts: self.missing_counts.clone(),
+        }
+    }
+
+    async fn apply_changes(&mut self, changes: BTreeMap<EntityId, Option<TreeEntry>>) -> anyhow::Result<()> {
         if changes.is_empty() {
             return Ok(());
         }
@@ -162,8 +146,8 @@ impl Index {
         } else {
             tx.apply_changes(leaf_changes).await?;
         }
-        // Memory commit has no suspension after publication; metadata is replaced
-        // under the same owner lock before another reader can capture the index.
+        // Commit the digests before changing the entries, so that a failed
+        // commit leaves both as they were.
         tx.commit().await?;
         let entries = Arc::make_mut(&mut self.entries);
         let members = Arc::make_mut(&mut self.members);
@@ -184,19 +168,24 @@ impl Index {
         }
         Ok(())
     }
+}
 
-    fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            spec: self.tree.spec().clone(),
-            resident: None,
-            physical_spec: self.tree.spec().clone(),
-            tree: self.tree.begin(),
-            ranges: None,
-            entries: self.entries.clone(),
-            members: self.members.clone(),
-            missing_counts: self.missing_counts.clone(),
-        }
+fn checked_entries(spec: &TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Entries> {
+    let mut checked = Entries::new();
+    for entry in entries {
+        CanonicalCodec::split(spec.key_spec(), &entry.key)?;
+        anyhow::ensure!(checked.insert(entry.entity_id, entry).is_none(), "duplicate tree entity");
     }
+    Ok(checked)
+}
+
+fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
+    CanonicalCodec::split(spec.key_spec(), &entry.key)
+        .expect("tree entries have validated canonical keys")
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| (part[0] == 0).then_some(index))
+        .collect()
 }
 
 /// Await `work`, an operation on a tree over memory maps that hashes or decodes
@@ -227,15 +216,6 @@ async fn build_tree(spec: TreeSpec, leaves: Vec<LeafInput>) -> Result<DigestTree
 }
 
 #[cfg(test)]
-fn entry_from_state(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::Result<TreeEntry> {
-    let entity = TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
-    let values = key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
-    Ok(TreeEntry {
-        entity_id: state.payload.entity_id,
-        key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?,
-        head: state.payload.state.head.clone(),
-    })
-}
-
+pub(crate) mod fixtures;
 #[cfg(test)]
 mod tests;
