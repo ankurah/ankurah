@@ -18,7 +18,7 @@ use crate::util::safeset::SafeSet;
 /// Query lifecycle callbacks used by SubscriptionRelay.
 #[async_trait::async_trait]
 pub trait RemoteQuerySubscriber: Clone + Send + Sync + 'static {
-    /// Called after remote subscription deltas have been applied.
+    /// Called once the initial round of the query's state stream has been applied and installed.
     async fn subscription_established(&self, version: u32);
 
     /// Record a permanent failure for this subscription version.
@@ -381,6 +381,11 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         self.setup_remote_subscriptions();
     }
 
+    /// Bind the state stream that `origin` opened to the query's current subscription attempt and tell the
+    /// subscriber, so that the stream's later failure reaches this query. Returns false, binding nothing, when
+    /// the attempt is no longer current: the query was removed or re-versioned, the attempt was canceled, or
+    /// the node has replaced the stream. The node's check runs under the relay lock, so a stream that a
+    /// same-version replacement superseded cannot bind after that replacement.
     pub(crate) fn bind_stream(&self, peer: proto::EntityId, query: proto::QueryId, version: u32, origin: proto::RequestId) -> bool {
         let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|error| error.into_inner());
         let Some(info) = subscriptions.get_mut(&query) else { return false };
@@ -402,6 +407,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         true
     }
 
+    /// Handle a retryable failure of the stream bound to this query version: unless another stream has
+    /// replaced it, cancel the attempt, tell the subscriber the subscription was lost, and subscribe again
+    /// through the connected durable peers.
     pub(crate) fn stream_failed(&self, peer: proto::EntityId, query: proto::QueryId, version: u32, origin: &proto::RequestId) {
         let subscriber = {
             let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|error| error.into_inner());
@@ -422,6 +430,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         self.setup_remote_subscriptions();
     }
 
+    /// Handle a failure of the bound stream that retrying cannot fix: unless another stream has replaced it,
+    /// mark the subscription failed, tell the subscriber it was lost, and record the error for this version.
     pub(crate) fn stream_terminal(
         &self,
         peer: proto::EntityId,

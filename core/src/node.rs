@@ -592,8 +592,9 @@ where
         Ok(())
     }
 
-    /// Build a repair from a selectively requested clock, or a snapshot if no bridge is available.
-    /// Equal clocks need no repair.
+    /// Build the delta that brings a requester from the clock it reported for this entity in `known_map`
+    /// to `entity_state`: none when the clocks are equal, an event bridge when local history connects
+    /// them, and otherwise a state snapshot.
     pub(crate) async fn generate_entity_delta<C>(
         &self,
         known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,

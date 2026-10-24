@@ -30,7 +30,7 @@ pub(crate) enum Delivery {
 /// What applying one delta did.
 ///
 /// `change` is set only when the entity advanced and carries what this
-/// delivery publishes. A failed delta returns an error without persisting a prefix.
+/// delivery publishes.
 #[derive(Debug)]
 pub(crate) struct DeltaOutcome {
     pub entity: Option<Entity>,
@@ -394,8 +394,10 @@ impl NodeApplier {
         Ok(())
     }
 
-    /// Apply one delta of any content. Errors before anything is persisted are
-    /// returned as `Err`; everything that applied is described by the outcome.
+    /// Apply one delta of any content and describe what it did. A refused delta changes nothing:
+    /// structure, policy and lineage checks run before anything is written, and the delta's
+    /// state and events commit in one storage transaction. An error from that commit or after it
+    /// is returned as well, but it does not prove that nothing persisted.
     pub(crate) async fn apply_delta<SE, PA, E, S>(
         node: &Node<SE, PA>,
         from_peer_id: &proto::EntityId,
