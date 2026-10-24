@@ -29,8 +29,14 @@ impl PropertyTypes for CatalogTypes<'_> {
 pub(crate) fn spec_for(selection: &Selection<Resolved>, catalog: &CatalogManager) -> TreeSpec {
     TreeSpec::for_selection(selection, &CatalogTypes(catalog)).unwrap_or_else(|error| {
         tracing::debug!(%error, "query uses entity-id digest keys");
-        TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone())
+        entity_id_spec(selection)
     })
+}
+
+/// The TreeSpec keyed by entity id alone that admits `selection`'s predicate,
+/// which every catalog serves.
+pub(crate) fn entity_id_spec(selection: &Selection<Resolved>) -> TreeSpec {
+    TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone())
 }
 
 /// The spec a peer built its known state under, accepted when a tree under it

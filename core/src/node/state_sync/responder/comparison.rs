@@ -5,7 +5,7 @@
 #[cfg(test)]
 mod tests;
 
-use super::Snapshot;
+use crate::node::state_sync::Snapshot;
 use ankurah_digest_tree::{leaf_address, Digest};
 use ankurah_proto::{Clock, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory};
 use anyhow::ensure;

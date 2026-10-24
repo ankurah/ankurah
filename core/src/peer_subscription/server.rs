@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// Owns one peer's reactor subscription and per-query credential sources.
 pub struct SubscriptionHandler<CD: ContextData> {
-    _peer_id: proto::EntityId,
+    peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
     /// Tracks each standing query's version and the credential source shared with its gap fetcher.
@@ -57,7 +57,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             }
         });
 
-        Self { _peer_id: peer_id, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
+        Self { peer_id, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
     }
 
     /// Get the subscription ID for this peer.
@@ -81,10 +81,10 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
-        mut selection: ankql::ast::Selection<Resolved>,
+        requested: ankql::ast::Selection<Resolved>,
         cdata: Option<&PA::ContextData>,
         version: u32,
-        known_matches: Vec<proto::KnownEntity>,
+        known_state: proto::KnownState,
     ) -> anyhow::Result<proto::NodeResponseBody>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -97,6 +97,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let credentials: Vec<CD> = cdata.cloned().into_iter().collect();
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
         // Re-subscribes revalidate; #426 owns denied-update claw-back.
+        let mut selection = requested.clone();
         selection.predicate = policy.filter_predicate(selection.predicate)?;
 
         use std::collections::hash_map::Entry;
@@ -119,7 +120,16 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             }
         };
 
-        let response = self.subscribe_query_inner(node, query_id, selection, &sessions, &credentials, version, known_matches).await;
+        // Install before the snapshot the answer reads: a commit after the
+        // install reaches the peer live, one before the snapshot is in it, and
+        // one between travels both ways, which applying twice tolerates.
+        let response = async {
+            self.install(node, query_id, selection, &sessions, version).await?;
+            let initial = vec![(query_id, proto::MembershipChange::Initial)];
+            let target = crate::node::state_sync::answer_offer(node, self.peer_id, requested, known_state, credentials, initial).await?;
+            Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target })
+        }
+        .await;
 
         if response.is_err() && query_created {
             queries.remove(&query_id);
@@ -128,17 +138,15 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         response
     }
 
-    /// Install the query and build its versioned initial delta response.
-    async fn subscribe_query_inner<SE, PA>(
+    /// Install the query in this peer's reactor subscription, seeded with its local matches.
+    async fn install<SE, PA>(
         &self,
         node: &Node<SE, PA>,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         sessions: &SessionSet<CD>,
-        credentials: &Vec<CD>,
         version: u32,
-        known_matches: Vec<proto::KnownEntity>,
-    ) -> anyhow::Result<proto::NodeResponseBody>
+    ) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -147,44 +155,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let gap_fetcher: std::sync::Arc<dyn GapFetcher<Entity>> = std::sync::Arc::new(QueryGapFetcher::new(context.clone()));
 
         let included_entities = context.0.fetch_entities_from_local(&selection).await?;
-        let matching_entities =
-            self.subscription.upsert_query(query_id, selection.clone(), included_entities, gap_fetcher, context.0, version).await?;
-
-        // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
-
-        // TASK: Optimize to avoid re-attesting entities fetched from storage https://github.com/ankurah/ankurah/issues/148
-        let initial_states: Vec<_> = matching_entities
-            .into_iter()
-            .filter_map(|e| {
-                let entity_state = e.to_entity_state().ok()?;
-                let attestation = node.policy_agent.attest_state(node, &entity_state);
-                Some(Attested::opt(entity_state, attestation))
-            })
-            .collect();
-
-        let expanded_states = crate::util::expand_states::expand_states(
-            initial_states,
-            known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-            node.storage.as_ref(),
-        )
-        .await?;
-
-        let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
-
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, credentials);
-        let mut deltas = Vec::with_capacity(expanded_states.len());
-        for state in expanded_states {
-            // `known_matches` may resurface rows outside the current policy.
-            if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
-                continue;
-            }
-
-            if let Some(delta) = node.generate_entity_delta(&known_map, state, credentials).await? {
-                deltas.push(delta);
-            }
-        }
-
-        Ok(proto::NodeResponseBody::QuerySubscribed { query_id, deltas })
+        self.subscription.upsert_query(query_id, selection, included_entities, gap_fetcher, context.0, version).await?;
+        Ok(())
     }
 }
 

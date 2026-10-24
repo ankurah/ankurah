@@ -505,30 +505,16 @@ where
                     Err(e) => Ok(proto::NodeResponseBody::Error(e.to_string())),
                 }
             }
-            proto::NodeRequestBody::Fetch { mut selection, known_matches } => {
-                let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
-                selection.predicate = policy.filter_predicate(selection.predicate)?;
-
-                let expanded_states = crate::util::expand_states::expand_states(
-                    self.storage.fetch_states(&selection).await?,
-                    known_matches.iter().map(|k| k.entity_id).collect::<Vec<_>>(),
-                    self.storage.as_ref(),
-                )
-                .await?;
-
-                let known_map: std::collections::HashMap<_, _> = known_matches.into_iter().map(|k| (k.entity_id, k.head)).collect();
-
-                let mut deltas = Vec::new();
-                for state in expanded_states {
-                    if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
-                        continue;
-                    }
-
-                    if let Some(delta) = self.generate_entity_delta(&known_map, state, cdata).await? {
-                        deltas.push(delta);
-                    }
-                }
-                Ok(proto::NodeResponseBody::Fetch(deltas))
+            proto::NodeRequestBody::Fetch { selection, known_state } => {
+                let credentials = cdata.iterable().cloned().collect();
+                let target = state_sync::answer_offer(self, request.from, selection, known_state, credentials, Vec::new()).await?;
+                Ok(proto::NodeResponseBody::Fetch(target))
+            }
+            proto::NodeRequestBody::CompareSpans { selection, spec, questions } => {
+                state_sync::compare_spans(self, selection, spec, questions, cdata.iterable().cloned().collect()).await
+            }
+            proto::NodeRequestBody::SyncEntities { selection, entities } => {
+                state_sync::sync_entities(self, request.from, selection, entities, cdata.iterable().cloned().collect()).await
             }
             proto::NodeRequestBody::Get { ids } => {
                 let policy = ContextPolicy::from_credentials(&self.policy_agent, cdata);
@@ -538,7 +524,7 @@ where
                 Ok(proto::NodeResponseBody::Get(results))
             }
             proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
-            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
+            proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_state } => {
                 let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
                 // Catalog subscriptions carry no credential; others carry exactly one.
                 let cdata = match cdata.iterable().at_most_one() {
@@ -549,7 +535,7 @@ where
                         ));
                     }
                 };
-                peer_state.subscription_handler.subscribe_query(self, query_id, selection, cdata, version, known_matches).await
+                peer_state.subscription_handler.subscribe_query(self, query_id, selection, cdata, version, known_state).await
             }
         }
     }
@@ -596,8 +582,8 @@ where
         Ok(())
     }
 
-    /// Generate EntityDelta for an entity state, using known_matches to decide between StateSnapshot and EventBridge
-    /// Returns None if the entity is in known_matches with equal heads (client already has current state)
+    /// Generate EntityDelta for an entity state, using the receiver's known heads to decide between StateSnapshot and EventBridge
+    /// Returns None if the receiver's known head equals the current one (client already has current state)
     pub(crate) async fn generate_entity_delta<C>(
         &self,
         known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
@@ -613,7 +599,7 @@ where
         let proto::Attested { payload: proto::EntityState { entity_id, state }, attestations } = entity_state;
         let current_head = &state.head;
 
-        // Entity is in known_matches - try to optimize the response
+        // The receiver knows a head of the entity - try to optimize the response
         if let Some(known_head) = known_map.get(&entity_id) {
             // Case 1: Heads equal → return None (omit entity, client already has current state) ✓
             if known_head == current_head {
@@ -638,7 +624,7 @@ where
             }
         }
 
-        // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
+        // Case 3: No known head OR bridge building failed → send full StateSnapshot ✓
         let state_fragment = proto::StateFragment { state, attestations };
         Ok(Some(proto::EntityDelta { entity_id, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
