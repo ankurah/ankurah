@@ -122,7 +122,7 @@ impl EntityLiveQuery {
 
     /// The current version's initialization error, cleared when a new version starts.
     pub fn error(&self) -> Read<Option<Arc<RetrievalError>>> { self.0.error.read() }
-    pub(crate) fn is_current(&self, version: u32) -> bool { self.0.current_version.load(Ordering::Acquire) == version }
+    pub(crate) fn is_current(&self, version: u32) -> bool { self.0.is_current(version) }
     /// Recompare this query on its current standing stream. It completes with the comparison
     /// round it starts; live publications that arrive meanwhile do not extend it.
     pub async fn refresh(&self) -> Result<(), RetrievalError> {

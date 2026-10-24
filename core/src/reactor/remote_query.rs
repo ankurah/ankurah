@@ -164,6 +164,7 @@ fn merge_carried_changes<E: AbstractEntity + Filterable + Send + 'static, Ev>(
     let mut membership_items: Vec<_> = membership.into_iter().map(Some).collect();
     let mut ordered = Vec::with_capacity(membership_items.len() + changes.len());
     for mut change in changes {
+        // Read policy can change while delivery reads history, so the change is checked again.
         if !source.can_read(&change.entity) {
             continue;
         }

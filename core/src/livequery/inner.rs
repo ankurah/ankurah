@@ -48,7 +48,7 @@ pub(super) struct LiveQueryInner {
 }
 
 impl LiveQueryInner {
-    fn is_current(&self, version: u32) -> bool { self.current_version.load(Ordering::Acquire) == version }
+    pub(super) fn is_current(&self, version: u32) -> bool { self.current_version.load(Ordering::Acquire) == version }
 
     /// Create the shared inner before its resolved selection is installed.
     pub(super) fn new(context: Arc<dyn DynContextInner>, subscription: ReactorSubscription, cache_policy: CachePolicy) -> Self {
@@ -222,8 +222,9 @@ impl LiveQueryInner {
     }
 }
 
-// A cached initialization may be in flight when the peer answers. It must
-// not replace the peer's authoritative membership after that installation.
+/// Publishes a local activation's readiness, unless the query's remote stream has installed its
+/// membership for the same version: a cached initialization still in flight when the peer answers
+/// must not replace that membership.
 struct LocalActivation<'a>(&'a LiveQueryInner);
 impl PreNotifyHook for LocalActivation<'_> {
     fn is_current(&self, version: u32) -> bool { self.0.is_current(version) && !self.0.remote_installed(version) }
