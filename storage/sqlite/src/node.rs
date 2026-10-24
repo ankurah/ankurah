@@ -559,9 +559,17 @@ fn typed_reader(statement: &str, width: usize) -> String {
         .map(|index| format!("typeof(c{index}), CASE typeof(c{index}) WHEN 'text' THEN CAST(c{index} AS BLOB) ELSE c{index} END"))
         .collect::<Vec<_>>()
         .join(", ");
+    // The reader's name occurs nowhere in the statement's text, so that it
+    // cannot stand in for a table the statement names, such as a model's
+    // table of the same name; SQLite reads names without regard to ASCII case.
+    let text = statement.to_ascii_lowercase();
+    let reader = std::iter::once("_ankurah_typed_rows".to_owned())
+        .chain((1..).map(|suffix| format!("_ankurah_typed_rows_{suffix}")))
+        .find(|name| !text.contains(name.as_str()))
+        .expect("a finite statement leaves some suffix unused");
     // The statement stands on lines of its own, so that a comment ending it
     // cannot swallow the parenthesis that closes it.
-    format!("WITH _ankurah_typed_rows({names}) AS MATERIALIZED (\n{statement}\n) SELECT {columns} FROM _ankurah_typed_rows")
+    format!("WITH {reader}({names}) AS MATERIALIZED (\n{statement}\n) SELECT {columns} FROM {reader}")
 }
 
 /// A statement's SQL, which is one statement alone: node:sqlite's

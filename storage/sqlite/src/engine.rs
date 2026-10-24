@@ -828,6 +828,37 @@ mod tests {
         assert_eq!(found[0].payload.entity_id, entity);
     }
 
+    /// A model whose table takes the name the node executor's typed reader
+    /// starts from, `_ankurah_typed_rows`, is written and read back on every
+    /// driver: the reader takes a name its query does not use.
+    #[engine_test]
+    async fn a_model_named_like_the_typed_reader_is_written_and_read() {
+        let engine = test_driver::open_in_memory().await.unwrap();
+        let model = ModelId::EntityId(entity_id(0xa1));
+        let property = PropertyId::EntityId(entity_id(0xa2));
+        let resolver: Arc<dyn CatalogResolver> = Arc::new(TestResolver {
+            model_names: BTreeMap::from([(model, "_ankurah_typed_rows".to_owned())]),
+            property_names: BTreeMap::from([(property, "name".to_owned())]),
+        });
+        let _resolver = install_resolver(&engine, resolver);
+        let entity = entity_id(0xa3);
+        commit_state(&engine, Clock::default(), model, state_with_strings(entity, 1, &[(property, "alpha")])).await;
+        assert_eq!(engine.materialization(&model).await.unwrap().table(), "_ankurah_typed_rows");
+
+        let selection = ankql::ast::Selection {
+            predicate: ankql::ast::Predicate::Comparison {
+                left: Box::new(ankql::ast::Expr::Path(property.into())),
+                operator: ankql::ast::ComparisonOperator::Equal,
+                right: Box::new(ankql::ast::Expr::Literal(Value::String("alpha".into()))),
+            },
+            order_by: None,
+            limit: None,
+        };
+        let found = engine.fetch_states(&selection.and_member_of(model)).await.unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].payload.entity_id, entity);
+    }
+
     #[engine_test]
     async fn stale_head_rolls_back_the_complete_batch() {
         let engine = test_driver::open_in_memory().await.unwrap();
