@@ -49,7 +49,7 @@ impl TreeSpec {
                 };
                 let Some((address, _)) = next else { break };
                 let address: &[u8] = address.borrow();
-                address_parts(self.key_spec(), address)?;
+                CanonicalCodec::check(self.key_spec(), address_key(address)?)?;
                 first.get_or_insert(address);
                 if scan.leaves {
                     last = Some(address);
@@ -157,9 +157,15 @@ impl<'a> TierWalk<'a> {
     }
 }
 
-fn address_parts<'a>(spec: &KeySpec<PropertyId>, address: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
+/// The canonical key a leaf address begins with, before its entity id.
+fn address_key(address: &[u8]) -> Result<&[u8], TreeError> {
     let key_len = address.len().checked_sub(EntityId::BYTE_LEN).ok_or(TreeError::InvalidKey("truncated leaf address"))?;
-    CanonicalCodec::split(spec, &address[..key_len])
+    Ok(&address[..key_len])
+}
+
+/// The encoded parts of the canonical key a leaf address begins with.
+fn address_parts<'a>(spec: &KeySpec<PropertyId>, address: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
+    CanonicalCodec::split(spec, address_key(address)?)
 }
 
 // A lexicographic cut has one interval for each earlier differing tuple part

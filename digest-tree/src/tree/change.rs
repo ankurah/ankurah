@@ -158,7 +158,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     ) -> Result<Option<ResolvedChange<G>>, TreeError> {
         let keys = before.iter().map(|input| &input.key).chain(after.iter().map(|leaf| &leaf.row().key));
         for key in keys {
-            CanonicalCodec::split(self.spec.key_spec(), key)?;
+            CanonicalCodec::check(self.spec.key_spec(), key)?;
         }
         let before = match before {
             Some(expected) => Some(self.expected_leaf(expected).await?),
