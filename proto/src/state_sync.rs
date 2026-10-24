@@ -66,6 +66,16 @@ pub enum SpanContent {
     Heads(TreeSpanInventory),
 }
 
+impl SpanContent {
+    /// The span this content describes.
+    pub fn bounds(&self) -> &TreeSpan {
+        match self {
+            SpanContent::Digest(digest) => &digest.bounds,
+            SpanContent::Heads(inventory) => &inventory.bounds,
+        }
+    }
+}
+
 /// One captured query version. Revisions order publications in this stream,
 /// not entity histories or other peers. Round numbers start at zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

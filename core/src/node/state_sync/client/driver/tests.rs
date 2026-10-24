@@ -1,4 +1,5 @@
 use super::*;
+use ankurah_proto::state_sync::limits::MAX_PAGE_BYTES;
 
 fn id(n: u8) -> proto::EntityId { proto::EntityId::from_bytes([n; 32]) }
 fn head(n: u8) -> proto::Clock { proto::Clock::genesis(proto::EventId::from_bytes([n; 32])) }
@@ -32,7 +33,9 @@ async fn malformed_inventories_do_not_change_the_round_projection() -> anyhow::R
         }),
     ];
     for item in invalid {
-        assert!(driver.round_items(&node, id(90), &[], 0, vec![item]).await.is_err());
+        let body = StateFrameBody::Round { round: 0, items: vec![item], progress: ComparisonProgress::Continue };
+        let frame = proto::StateFrame { stream: driver.stream_id, sequence: 1, body };
+        assert!(driver.frame(&node, id(90), &[], frame).await.is_err());
         assert_eq!(driver.projection.round.as_ref().unwrap().members, original);
         assert!(driver.goals.rows.is_empty());
         assert!(driver.jobs.is_empty());

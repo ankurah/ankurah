@@ -6,6 +6,7 @@ use crate::{
     test_utils::TestStorage,
 };
 use ankurah_digest_tree::CanonicalCodec;
+use ankurah_proto::state_sync::limits::MAX_FEEDBACK_ANSWERS;
 
 type TestNode = Node<TestStorage, PermissiveAgent>;
 #[derive(Clone)]
@@ -1127,6 +1128,14 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
         assert_eq!(comparison.offered, targets);
         assert!(comparison.work.is_empty() && comparison.pending_repairs.is_empty());
     }
+    // A retired round's answers are dropped, but only after their structure is checked.
+    let unordered = [2, 1].map(|n| proto::KeyedEntityHead {
+        key: vec![],
+        entity: proto::EntityHead { entity_id: proto::EntityId::from_bytes([n; 32]), head: old.head.clone() },
+    });
+    let page = proto::TreeSpanInventory { bounds: TreeSpan::all(), heads: unordered.to_vec().try_into()? };
+    let malformed = Some(proto::FeedbackAnswers::Round { round: 0, answers: vec![StateAnswer::Heads(page)] });
+    assert!(apply_state_feedback(&node, peer, proto::RequestId::new(), id, 0, None, malformed, vec![]).await.is_err());
     assert!(
         apply_state_feedback(
             &node,
@@ -2020,7 +2029,7 @@ async fn compressed_initial_spans_share_one_uncompressed_work_budget() -> anyhow
     let known = proto::KnownState { spec: spec(), spans: vec![proto::SpanContent::Heads(page); 8] };
     assert!(bincode::serialized_size(&known)? < MAX_OFFER_BYTES as u64);
     let error = Comparison::new(snapshot(vec![]).await?, known).err().expect("aggregate work must be rejected before span validation");
-    assert!(error.to_string().contains("initial inventory exceeds limit"));
+    assert!(error.to_string().contains("work limit"), "{error}");
     Ok(())
 }
 

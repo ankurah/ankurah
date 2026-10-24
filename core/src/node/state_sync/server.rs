@@ -9,8 +9,8 @@ use ankurah_digest_tree::{leaf_address, NodePrefix};
 use ankurah_proto::{
     self as proto,
     state_sync::limits::{
-        CONTROL_BYTES, MAX_DELTA_BYTES, MAX_FEEDBACK_ANSWERS, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_BYTES, MAX_FRAME_ITEMS, MAX_OFFER_BYTES,
-        MAX_OFFER_HEADS, MAX_OFFER_SPANS, MAX_OPEN_STREAMS, MAX_PAGE_BYTES, MAX_PAGE_HEADS, STREAM_TTL, WINDOW_BYTES,
+        CONTROL_BYTES, MAX_DELTA_BYTES, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_BYTES, MAX_FRAME_ITEMS, MAX_OFFER_BYTES, MAX_OPEN_STREAMS,
+        MAX_PAGE_BYTES, MAX_PAGE_HEADS, STREAM_TTL, WINDOW_BYTES,
     },
     ComparisonProgress, RepairItem, StateAnswer, StateFrame, StateFrameBody, StateItem, StateStreamId, TreeSpan,
 };
@@ -750,11 +750,11 @@ where
         });
     };
     ensure!(session.permits(&credentials), "state stream credentials changed");
-    ensure!(answers.as_ref().is_none_or(|answers| answers.len() <= MAX_FEEDBACK_ANSWERS), "too many comparison answers");
+    if let Some(answers) = &answers {
+        answers.validate(&session.spec)?;
+    }
     let encoded = bincode::serialize(&(processed_through, applied_through, &answers))?;
     ensure!(encoded.len() <= MAX_FRAME_BYTES, "state feedback exceeds limit");
-    let work = answers.as_ref().map(proto::FeedbackAnswers::work_bytes).transpose()?.unwrap_or(0);
-    ensure!(work <= MAX_PAGE_BYTES as u64, "state feedback answers exceed their work limit");
     let mut state = session.state.lock().await;
     if !connection.state_streams.get(&id).is_some_and(|current| Arc::ptr_eq(&current, &session)) {
         return Ok(proto::NodeResponseBody::StateStreamUnavailable);
@@ -959,14 +959,11 @@ where
     let session = connection.state_streams.get(&id).ok_or_else(|| anyhow::anyhow!("live stream unavailable"))?;
     ensure!(session.query.is_some(), "Fetch has no live route");
     ensure!(revision > session.initial_round.revision, "live publication does not follow the initial cut");
-    ensure!(
-        items.iter().all(|item| !matches!(item.delta, Some(proto::DeltaContent::StateAndRelation { .. }))),
-        "StateAndRelation is not supported"
-    );
-    ensure!(
-        items.iter().all(|item| item.member.is_some() || !matches!(item.delta, Some(proto::DeltaContent::EventBridge { .. }))),
-        "absent live bridge has no explicit causal target"
-    );
+    for item in &items {
+        if let Some(delta) = &item.delta {
+            delta.live_target(item.member.as_ref())?;
+        }
+    }
     let sizes = items.iter().map(|item| bincode::serialized_size(item).map(|size| size as usize)).collect::<Result<Vec<_>, _>>()?;
     let bytes = sizes.iter().sum::<usize>();
     let mut queue = session.live.lock().unwrap();
@@ -1339,30 +1336,14 @@ impl Comparison {
             unavailable: false,
         };
         ensure!(known.spec == comparison.snapshot.spec, "unsupported comparison tree spec");
-        ensure!(known.spans.len() <= MAX_OFFER_SPANS && known.work_bytes()? <= MAX_OFFER_BYTES as u64, "initial inventory exceeds limit");
+        known.validate()?;
+        // A valid offer's spans are disjoint and within the tree; plan them in address order.
         let mut spans = known.spans;
-        spans.sort_by(|a, b| {
-            fn bounds(span: &proto::SpanContent) -> &TreeSpan {
-                match span {
-                    proto::SpanContent::Digest(head) => &head.bounds,
-                    proto::SpanContent::Heads(page) => &page.bounds,
-                }
-            }
-            bounds(a).cmp_start(bounds(b))
-        });
+        spans.sort_by(|a, b| a.bounds().cmp_start(b.bounds()));
         let mut start = super::whole().start;
         let mut frontier = Some(Vec::new());
-        let mut head_count = 0;
         for region in spans {
-            ensure!(!matches!(start, std::ops::Bound::Unbounded), "initial inventory extends past scope");
-            let bounds = match &region {
-                proto::SpanContent::Digest(head) => &head.bounds,
-                proto::SpanContent::Heads(page) => &page.bounds,
-            };
-            ensure!(
-                !bounds.is_empty() && bounds.is_subset_of(&TreeSpan::new(start.clone(), super::whole().end)),
-                "initial spans overlap or exceed scope"
-            );
+            let bounds = region.bounds();
             if start != bounds.start {
                 frontier = None;
                 let gap = TreeSpan::new(start.clone(), opposite(&bounds.start));
@@ -1373,7 +1354,6 @@ impl Comparison {
             start = opposite(&bounds.end);
             match region {
                 proto::SpanContent::Digest(head) => {
-                    head.validate()?;
                     if let Some(frontier) = &mut frontier {
                         frontier.push(head.clone());
                     }
@@ -1381,15 +1361,9 @@ impl Comparison {
                 }
                 proto::SpanContent::Heads(page) => {
                     frontier = None;
-                    head_count += page.heads.len();
-                    ensure!(head_count <= MAX_OFFER_HEADS, "initial inventory exceeds head limit");
-                    page.validate(&comparison.snapshot.spec)?;
                     let mut cursor = page.heads.cursor();
                     while let Some(head) = cursor.next() {
-                        ensure!(
-                            comparison.known_clocks.insert(head.entity.entity_id, head.entity.head.to_owned()).is_none(),
-                            "duplicate entity in initial inventory"
-                        );
+                        comparison.known_clocks.insert(head.entity.entity_id, head.entity.head.to_owned());
                     }
                     comparison.work.push_back(Work::InitialHeads(InitialHeads { bounds: page.bounds, heads: page.heads.cursor() }));
                 }
@@ -1407,8 +1381,8 @@ impl Comparison {
         Ok(comparison)
     }
 
+    /// Takes this round's answers, which `FeedbackAnswers::validate` already checked.
     fn answer(&mut self, answers: Vec<StateAnswer>) -> anyhow::Result<()> {
-        ensure!(answers.len() <= MAX_FEEDBACK_ANSWERS, "too many comparison answers");
         for answer in answers {
             match answer {
                 StateAnswer::NeedRepair(proto::RepairRequest { entity_id, target }) => {
@@ -1425,14 +1399,11 @@ impl Comparison {
                     self.work.push_front(Work::History { entity_id, target });
                 }
                 StateAnswer::Digest(head) => {
-                    head.validate()?;
                     let prefix =
                         self.summaries.remove(&range_id(&head.bounds)).ok_or_else(|| anyhow::anyhow!("unsolicited summary bounds"))?;
                     self.work.push_back(Work::Compare { head, prefix });
                 }
                 StateAnswer::Heads(page) => {
-                    ensure!(page.heads.len() <= MAX_PAGE_HEADS, "too many heads in one page");
-                    ensure!(page.work_bytes()? <= MAX_PAGE_BYTES as u64, "head inventory exceeds its work limit");
                     let index = self
                         .head_requests
                         .iter()
@@ -1440,13 +1411,12 @@ impl Comparison {
                         .ok_or_else(|| anyhow::anyhow!("unsolicited head inventory"))?;
                     let requested = self.head_requests[index].clone();
                     ensure!(page.bounds.is_subset_of(&requested), "head inventory exceeds requested bounds");
-                    page.validate(&self.snapshot.spec)?;
                     let mut last_address = None;
-                    let mut ids = HashSet::new();
                     let mut cursor = page.heads.cursor();
+                    let mut seen = 0;
                     while let Some(leaf) = cursor.next() {
-                        ensure!(ids.insert(leaf.entity.entity_id), "duplicate entity in head inventory");
-                        if ids.len() == page.heads.len() {
+                        seen += 1;
+                        if seen == page.heads.len() {
                             last_address = Some(leaf_address(leaf.key, leaf.entity.entity_id));
                         }
                     }

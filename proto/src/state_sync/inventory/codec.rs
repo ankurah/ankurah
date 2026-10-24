@@ -36,6 +36,9 @@ pub enum InventoryError {
     /// A head's address does not follow the preceding head's.
     #[error("inventory heads out of address order")]
     Unordered,
+    /// One entity appears under two keys.
+    #[error("entity {0} appears twice in one inventory")]
+    DuplicateEntity(EntityId),
 }
 
 /// How the payload writes each key: whole, or as a suffix of the preceding key.

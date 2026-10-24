@@ -1,9 +1,6 @@
 use super::*;
 use crate::{changes::EntityChange, node::applier::Delivery, reactor::ChangeNotification};
-use ankurah_digest_tree::CanonicalCodec;
-use ankurah_proto::state_sync::limits::{
-    MAX_DELTA_BYTES, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_ITEMS, MAX_PAGE_BYTES, MAX_PAGE_HEADS, WINDOW_BYTES,
-};
+use ankurah_proto::state_sync::limits::{MAX_DELTA_BYTES, MAX_FRAMES_IN_FLIGHT, MAX_FRAME_ITEMS, WINDOW_BYTES};
 use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -668,22 +665,17 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(items.len() <= MAX_FRAME_ITEMS, "state item limit exceeded");
         let owner = Owner::Round(round);
         let mut answers = Vec::new();
         for item in items {
             match item {
                 StateItem::Digest(head) => {
-                    head.validate()?;
                     answers.push(StateAnswer::Digest(self.projection.round.as_mut().unwrap().snapshot.span_digest(head.bounds).await?));
                 }
                 StateItem::NeedHeads(bounds) => {
                     answers.push(StateAnswer::Heads(self.projection.round.as_ref().unwrap().snapshot.page(bounds)?));
                 }
                 StateItem::Heads(page) => {
-                    ensure!(page.work_bytes()? <= MAX_PAGE_BYTES as u64, "peer head inventory exceeds its work limit");
-                    ensure!(page.heads.len() <= MAX_PAGE_HEADS, "peer sent too many heads");
-                    page.validate(&self.spec)?;
                     let mut cursor = page.heads.cursor();
                     while let Some(leaf) = cursor.next() {
                         self.add_goal(owner, leaf.entity.entity_id, leaf.entity.head.to_owned())?;
@@ -748,15 +740,11 @@ impl Driver {
         content: Option<&proto::DeltaContent>,
     ) -> anyhow::Result<()> {
         if let Some(member) = member {
-            CanonicalCodec.split(self.spec.key_spec(), &member.key)?;
             self.add_goal(Owner::Live(revision), id, member.head.clone())?;
         }
         if let Some(content) = content {
-            ensure!(!matches!(content, proto::DeltaContent::StateAndRelation { .. }), "unsupported live delta");
-            let target = match content.state_head() {
-                Some(head) => head.clone(),
-                None => member.as_ref().ok_or_else(|| anyhow::anyhow!("absent event bridge has no target"))?.head.clone(),
-            };
+            // A reassembled chunk reaches this check only now; whole live items passed it on receipt.
+            let target = content.live_target(member.as_ref())?.clone();
             self.add_goal(Owner::Live(revision), id, target)?;
         }
         Ok(())
@@ -783,7 +771,6 @@ impl Driver {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        ensure!(items.len() <= MAX_FRAME_ITEMS, "live item limit exceeded");
         for item in items {
             self.add_live_delta_targets(revision, item.entity_id, &item.member, item.delta.as_ref())?;
             if let Some(content) = item.delta {
@@ -821,6 +808,7 @@ impl Driver {
         PA: PolicyAgent + Send + Sync + 'static,
     {
         ensure!(frame.stream == self.stream_id, "state stream identity changed");
+        frame.body.validate(&self.spec)?;
         self.through = frame.sequence;
         let mut answers = None;
         match frame.body {
@@ -854,15 +842,12 @@ impl Driver {
                 let target = None::<proto::Clock>;
                 // Absent chunk data must be snapshot-bearing: decode before learning its data target.
                 let target = target.unwrap_or_default();
-                let last = chunk.last;
                 self.chunk(node, peer, credentials, Owner::Live(revision), target, member, chunk)?;
-                ensure!(last || !complete, "publication completed inside a chunk");
                 if complete {
                     self.live(node, peer, credentials, revision, vec![], true).await?;
                 }
             }
             StateFrameBody::LiveRepair { items } => {
-                ensure!(items.len() <= MAX_FRAME_ITEMS, "state item limit exceeded");
                 for repair in items {
                     self.receive_repair(node, peer, credentials, Owner::Repair, repair).await?;
                 }

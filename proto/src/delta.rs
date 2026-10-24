@@ -1,9 +1,12 @@
 //! Entity payloads shared by query initialization, repair and live updates.
 
-use anyhow::{bail, ensure};
+use anyhow::{anyhow, bail, ensure};
 use serde::{Deserialize, Serialize};
 
-use crate::{Attested, CausalAssertionFragment, Clock, EntityId, EntityState, Event, EventFragment, GetFailure, GetResult, StateFragment};
+use crate::{
+    Attested, CausalAssertionFragment, Clock, EntityId, EntityState, Event, EventFragment, GetFailure, GetResult, QueryMember,
+    StateFragment,
+};
 
 mod chunk;
 pub use chunk::{DeltaAssembler, DeltaChunks, EntityDeltaChunk};
@@ -44,6 +47,17 @@ impl DeltaContent {
             }
         }
         Ok(())
+    }
+
+    /// The head a live delta brings its entity to: the head of state it carries, or
+    /// for an event bridge the head of the member it belongs to. An event bridge for
+    /// an absent entity has no target.
+    pub fn live_target<'a>(&'a self, member: Option<&'a QueryMember>) -> anyhow::Result<&'a Clock> {
+        match self {
+            Self::StateAndRelation { .. } => bail!("StateAndRelation is not supported"),
+            Self::EventBridge { .. } => Ok(&member.ok_or_else(|| anyhow!("absent event bridge has no target"))?.head),
+            Self::StateSnapshot { state } | Self::StateAndEvents { state, .. } => Ok(&state.state.head),
+        }
     }
 }
 

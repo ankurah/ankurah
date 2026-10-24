@@ -1,7 +1,9 @@
 //! Packed, independently decodable inventories. Binary serde retains the validated
 //! byte buffer; JSON keeps the readable list of keyed entity heads.
 
-use ankurah_digest_tree::CanonicalCodec;
+use std::collections::HashSet;
+
+use ankurah_digest_tree::{CanonicalCodec, TreeError};
 use bytes::Bytes;
 use serde::{de::Visitor, ser::SerializeSeq, Deserialize, Deserializer, Serialize, Serializer};
 
@@ -25,18 +27,23 @@ pub struct TreeSpanInventory {
 }
 
 impl TreeSpanInventory {
-    /// Check canonical keys, nonempty bounds and strictly increasing addresses
-    /// within those bounds. Reads borrowed heads without rebuilding their clocks.
-    /// Message budgets and correspondence to a requested span belong to the caller.
+    /// Check canonical keys, nonempty bounds, strictly increasing addresses within
+    /// those bounds, and each entity at most once. Reads borrowed heads without
+    /// rebuilding their clocks. Message limits and correspondence to a requested
+    /// span belong to the caller.
     pub fn validate(&self, spec: &TreeSpec) -> Result<(), InventoryError> {
         if self.bounds.is_empty() {
             return Err(InventoryError::EmptyBounds);
         }
         let mut previous = Vec::new();
         let mut address = Vec::new();
+        let mut entities = HashSet::with_capacity(self.heads.len());
         let mut cursor = self.heads.cursor();
         while let Some(head) = cursor.next() {
-            CanonicalCodec.split(spec.key_spec(), head.key)?;
+            check_key(spec, head.key)?;
+            if !entities.insert(head.entity.entity_id) {
+                return Err(InventoryError::DuplicateEntity(head.entity.entity_id));
+            }
             address.clear();
             address.extend_from_slice(head.key);
             address.extend_from_slice(&head.entity.entity_id.to_bytes());
@@ -50,6 +57,12 @@ impl TreeSpanInventory {
         }
         Ok(())
     }
+}
+
+/// Checks that `key` is canonical under the spec's key parts.
+pub(crate) fn check_key(spec: &TreeSpec, key: &[u8]) -> Result<(), TreeError> {
+    CanonicalCodec.split(spec.key_spec(), key)?;
+    Ok(())
 }
 
 /// An entity's identity and causal frontier.

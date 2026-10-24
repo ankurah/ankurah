@@ -216,3 +216,17 @@ fn inventory_validation_checks_bounds_order_duplicates_and_canonical_keys() {
     let inventory = TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(heads) };
     assert!(inventory.validate(&keyed).is_err(), "an inventory valid under another key spec is not sufficient");
 }
+
+#[test]
+fn an_inventory_lists_each_entity_once() {
+    use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
+    use ankurah_digest_tree::CanonicalCodec;
+
+    // Under a keyed spec one entity can sit at two addresses in address order.
+    let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(PropertyId::Id, ValueType::I64)]), ankql::ast::Predicate::True);
+    let key = |n| CanonicalCodec.encode_nullable(spec.key_spec(), &[Some(Value::I64(n))]).unwrap();
+    let mut heads = keyed_heads(&[key(1), key(2)], 1);
+    heads[1].entity.entity_id = heads[0].entity.entity_id;
+    let inventory = TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(heads) };
+    assert!(matches!(inventory.validate(&spec), Err(InventoryError::DuplicateEntity(_))));
+}
