@@ -13,7 +13,7 @@ use futures_util::{stream, Stream};
 use crate::{
     driver::Pool,
     engine::{ENTITY_MODEL_TABLE, ENTITY_TABLE, EVENT_TABLE},
-    exec::{Behavior, SqliteExecutor},
+    exec::SqliteExecutor,
     value::SqliteValueRef,
     SqliteError, SqliteStorageEngine,
 };
@@ -132,12 +132,29 @@ fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
         )
     };
     // One read snapshot for the page, so each state's memberships are read as
-    // of the state itself. Main had that snapshot without a transaction: its
+    // of the state itself. Main had that snapshot without asking for one: its
     // page's statement was still stepping while each membership was read, and
     // SQLite ends a read only when the connection's last statement finishes.
-    // The executor reads the whole page first, so here the transaction keeps it.
-    let snapshot = conn.begin(Behavior::Deferred)?;
-    let rows = snapshot.query(&query, &arguments)?;
+    // The executor reads the whole page first, so a savepoint keeps it here: it
+    // begins a transaction on a connection outside one, and nests in one an
+    // embedder left open, which main's page read within too.
+    conn.execute("SAVEPOINT _ankurah_dump_page", &[])?;
+    let page = states_of_page(conn, &query, &arguments);
+    // Released after a failed read too, since a read leaves nothing to undo;
+    // the read's own error is the one reported.
+    let released = conn.execute("RELEASE _ankurah_dump_page", &[]);
+    let page = page?;
+    released?;
+    Ok(page)
+}
+
+/// The states of a page, and the id of its last, read through `snapshot`.
+fn states_of_page(
+    snapshot: &dyn SqliteExecutor,
+    query: &str,
+    arguments: &[SqliteValueRef<'_>],
+) -> Result<(Option<String>, Vec<StorageDumpItem>), SqliteError> {
+    let rows = snapshot.query(query, arguments)?;
     let mut last = None;
     let mut page = Vec::new();
     for row in &rows {
@@ -219,6 +236,39 @@ mod tests {
         }
         assert_eq!(events, expected);
         assert_eq!(states, expected);
+        Ok(())
+    }
+
+    /// A dump on a connection an embedder left inside an open transaction
+    /// reads its states within that transaction, as main's dump did, and
+    /// leaves the transaction open for the embedder to end: each page's
+    /// snapshot is a savepoint, which nests in it.
+    #[engine_test]
+    async fn dump_reads_within_a_transaction_left_open() -> anyhow::Result<()> {
+        let storage = test_driver::open_in_memory().await?;
+        let event = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+        let entity_id = event.entity_id;
+        let head = Clock::singleton(&event);
+        let state = Attested::opt(
+            EntityState { entity_id, state: State { state_buffers: StateBuffers::default(), memberships: BTreeSet::new(), head } },
+            None,
+        );
+        let mut transaction = storage.transaction();
+        transaction.add_events(&[Attested::opt(event, None)]).await?;
+        transaction.set_state(&Clock::default(), &state).await?;
+        assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+
+        storage.with_executor(|executor| executor.execute("BEGIN", &[]).map(drop)).await?;
+        let items = storage.dump().await?;
+        pin_mut!(items);
+        let mut states = Vec::new();
+        while let Some(item) = items.next().await {
+            if let StorageDumpItem::State(state) = item? {
+                states.push(state.payload.entity_id);
+            }
+        }
+        assert_eq!(states, [entity_id]);
+        storage.with_executor(|executor| executor.execute("COMMIT", &[]).map(drop)).await?;
         Ok(())
     }
 }
