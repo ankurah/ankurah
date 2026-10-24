@@ -6,7 +6,7 @@ mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 use ankurah_storage_sqlite::{
-    executor::SqliteExecutor, DatabaseRefusal, NodeJsConnection, Refusal, SqliteError, SqliteStorageEngine, SqliteValueRef,
+    executor::SqliteExecutor, DatabaseRefusal, NodeJsConnection, Refusal, SqliteError, SqliteFailure, SqliteStorageEngine, SqliteValueRef,
 };
 use anyhow::Result;
 use common::{host_database, on_better_sqlite3, Album, AlbumView};
@@ -139,7 +139,8 @@ async fn text_from_a_statement_sqlite_cannot_nest_is_read_as_a_string() -> Resul
 
 /// A statement SQLite cannot nest that is neither a PRAGMA nor an EXPLAIN,
 /// such as one with a RETURNING clause, is refused before it runs, so that
-/// it writes nothing it could not then report.
+/// it writes nothing it could not then report. The refusal keeps SQLite's
+/// error, and so its code, SQLITE_ERROR.
 #[wasm_bindgen_test]
 async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -150,12 +151,12 @@ async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
                 "INSERT INTO things (v) VALUES ('x') RETURNING v",
                 "/* a comment */ WITH value (v) AS (VALUES ('y')) INSERT INTO things (v) SELECT v FROM value RETURNING rowid",
             ]
-            .map(|sql| executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| error.refusal()));
+            .map(|sql| executor.query(sql, &[]).map(|rows| rows.len()).map_err(|error| (error.refusal(), error.sqlite_code())));
             Ok((refusals, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
         })
         .await?;
     for refusal in refusals {
-        assert!(matches!(refusal, Err(Some(Refusal::NotNestable(_)))), "a RETURNING statement is refused on Node.js: {refusal:?}");
+        assert!(matches!(refusal, Err((Some(Refusal::NotNestable(_)), Some(1)))), "a RETURNING statement is refused: {refusal:?}");
     }
     assert_eq!(count, 0, "neither insert ran");
     Ok(())
@@ -326,6 +327,32 @@ fn refuses_a_database_that_skips_a_numbered_parameter() {
              : forward(target, name) });",
     );
     assert_eq!(refusal, refused_database(DatabaseRefusal::SkipsNumberedParameters));
+}
+
+/// An error thrown as better-sqlite3 throws one SQLite raised, as its
+/// `SqliteError`, is read as SQLite's error with the code its `code` names:
+/// `UNKNOWN_SQLITE_ERROR_` and the number, as better-sqlite3 names a code it
+/// has no name of its own for, gives the number, and a name that no SQLite
+/// release up to the crate's table defines gives no code. The fake throws
+/// each from `prepare`.
+#[wasm_bindgen_test]
+fn reads_the_code_a_better_sqlite3_error_names() {
+    let connection = NodeJsConnection::from_database(tampered_database(
+        "const names = { 'SELECT 773': 'UNKNOWN_SQLITE_ERROR_773', 'SELECT 0': 'SQLITE_DEFINED_LATER' };
+         if (Object.hasOwn(names, sql)) {
+             class SqliteError extends Error {}
+             Object.defineProperty(SqliteError.prototype, 'name', { value: 'SqliteError' });
+             throw Object.assign(new SqliteError('raised by the fake'), { code: names[sql] });
+         }
+         return statement;",
+    ))
+    .expect("the fake throws for neither of the queries `from_database` runs");
+    let failure = |sql: &str| match connection.query(sql, &[]) {
+        Err(SqliteError::Sqlite(failure)) => failure,
+        other => panic!("{sql}: {other:?}"),
+    };
+    assert_eq!(failure("SELECT 773"), SqliteFailure { code: Some(773), message: "raised by the fake".into() });
+    assert_eq!(failure("SELECT 0"), SqliteFailure { code: None, message: "raised by the fake".into() });
 }
 
 /// `undefined` is no storage class: it is refused, not read as NULL.

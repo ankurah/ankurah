@@ -141,37 +141,33 @@ async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
     Ok(())
 }
 
-/// An error SQLite raises carries its extended result code on rusqlite and
-/// on node:sqlite alike, and none on better-sqlite3, which names the code
-/// without its number.
+/// An error SQLite raises carries its extended result code, the same on
+/// every driver: better-sqlite3 names the code, and the name reads as its
+/// number.
 #[engine_test]
 async fn errors_carry_the_extended_result_code() -> Result<()> {
     let storage = common::open_in_memory().await?;
     let codes = storage
         .with_executor(|executor| {
-            executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY, v TEXT UNIQUE)", &[])?;
-            executor.execute("INSERT INTO things (k, v) VALUES (1, 'a')", &[])?;
+            executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY, v TEXT UNIQUE, n CHECK (n > 0))", &[])?;
+            executor.execute("INSERT INTO things (k, v, n) VALUES (1, 'a', 1)", &[])?;
             let key = executor.execute("INSERT INTO things (k, v) VALUES (1, 'b')", &[]).expect_err("a duplicate key is refused");
             let unique = executor.execute("INSERT INTO things (k, v) VALUES (2, 'a')", &[]).expect_err("a duplicate value is refused");
+            let check = executor.execute("INSERT INTO things (k, n) VALUES (3, 0)", &[]).expect_err("the CHECK is refused");
             let syntax = executor.query("SELEC 1", &[]).expect_err("a misspelt statement is refused");
             let row = executor.query_row("SELECT 'text'", &[])?.expect("one row").integer(0).expect_err("TEXT is not an INTEGER");
             let seven = SqliteValueRef::Integer(7);
             let too_many = executor.query("SELECT ?", &[seven, seven]).expect_err("a value no parameter takes is refused");
             let too_few = executor.query("SELECT ?, ?", &[seven]).expect_err("a parameter without a value is refused");
-            Ok([key, unique, syntax, row, too_many, too_few].map(|error| error.sqlite_code()))
+            Ok([key, unique, check, syntax, row, too_many, too_few].map(|error| error.sqlite_code()))
         })
         .await?;
-    // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR, no
-    // code for an error SQLite did not raise, and for a call passing too many
-    // values SQLITE_RANGE on node:sqlite alone, which lets SQLite refuse it.
-    let expected = if common::on_better_sqlite3() {
-        [None; 6]
-    } else if cfg!(target_arch = "wasm32") {
-        [Some(1555), Some(2067), Some(1), None, Some(25), None]
-    } else {
-        [Some(1555), Some(2067), Some(1), None, None, None]
-    };
-    assert_eq!(codes, expected);
+    // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
+    // SQLITE_CONSTRAINT_CHECK, SQLITE_ERROR, no code for an error SQLite did
+    // not raise, and for a call passing too many values SQLITE_RANGE on
+    // node:sqlite alone, which lets SQLite refuse it.
+    let too_many = if cfg!(target_arch = "wasm32") && !common::on_better_sqlite3() { Some(25) } else { None };
+    assert_eq!(codes, [Some(1555), Some(2067), Some(275), Some(1), None, too_many, None]);
     Ok(())
 }
 
@@ -195,8 +191,7 @@ async fn a_double_quoted_name_that_matches_no_column_is_refused() -> Result<()> 
     for refusal in refusals {
         let (code, message) = refusal.expect_err("the name matches no column");
         assert!(message.contains(r#"no such column: "missing""#), "{message}");
-        // SQLITE_ERROR, which better-sqlite3 names without its number.
-        assert_eq!(code, if common::on_better_sqlite3() { None } else { Some(1) });
+        assert_eq!(code, Some(1), "SQLITE_ERROR");
     }
     Ok(())
 }

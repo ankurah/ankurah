@@ -72,13 +72,15 @@ const SQLITE_MISUSE: i32 = 21;
 impl SqliteError {
     /// SQLite's extended result code when SQLite itself refused a statement,
     /// such as 1555 for a duplicate primary key or 5 for a lock held past the
-    /// busy timeout, read the same way whether rusqlite or node:sqlite ran the
-    /// statement. better-sqlite3 hands the code over only by name, which is
-    /// not read, so its errors have `None`. On Node.js the executor's refusal
-    /// of SQL that holds no statement answers 21, SQLITE_MISUSE, the code
-    /// SQLite refuses it with natively, and its refusal of a statement SQLite
-    /// cannot nest answers the code of SQLite's error. `None` for every other
-    /// error.
+    /// busy timeout, the same whichever driver ran the statement: rusqlite
+    /// and node:sqlite hand the code over as its number, and better-sqlite3
+    /// by its name, which is read as the number sqlite3.h gives it. On
+    /// better-sqlite3 a name that no SQLite release up to the crate's table
+    /// of names defines, as a later release could add, has `None`. On Node.js
+    /// the executor's refusal of SQL that holds no statement answers 21,
+    /// SQLITE_MISUSE, the code SQLite refuses it with natively, and its
+    /// refusal of a statement SQLite cannot nest answers the code of SQLite's
+    /// error. `None` for every other error.
     ///
     /// A call that passes more values than its statement takes parameters
     /// differs between drivers: rusqlite and better-sqlite3 refuse it
@@ -144,8 +146,10 @@ impl SqliteError {
 #[error("{message}")]
 pub struct SqliteFailure {
     /// SQLite's extended result code, such as 1555 for
-    /// SQLITE_CONSTRAINT_PRIMARYKEY, as node:sqlite hands it over; `None` on
-    /// better-sqlite3, which hands it over only by its name.
+    /// SQLITE_CONSTRAINT_PRIMARYKEY: node:sqlite hands it over as its number,
+    /// and better-sqlite3 by its name, which is read as the number sqlite3.h
+    /// gives it. `None` for a name better-sqlite3 gives that no SQLite release
+    /// up to the crate's table of names defines.
     pub code: Option<i32>,
     /// SQLite's message, such as "UNIQUE constraint failed: things.k".
     pub message: String,

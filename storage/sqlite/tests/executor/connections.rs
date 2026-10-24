@@ -58,6 +58,25 @@ async fn a_writer_waits_for_a_lock_another_connection_holds() -> Result<()> {
     Ok(())
 }
 
+/// A writer refused the lock another connection holds, past its busy
+/// timeout, fails with SQLITE_BUSY, 5, on every driver. The test cuts the
+/// timeout to none, so that the writer fails at once.
+#[engine_test]
+async fn a_lock_held_past_the_busy_timeout_fails_with_sqlite_busy() -> Result<()> {
+    let db = TempDb::new("writer_busy");
+    let storage = common::open(db.path()).await?;
+    let holder = LockHolder::take(&db, "BEGIN IMMEDIATE", HOLD_MS).await;
+    let refused = storage
+        .with_executor(|executor| {
+            executor.query_row("PRAGMA busy_timeout = 0", &[])?;
+            Ok(executor.begin(TransactionBehavior::Immediate).map(drop).map_err(|error| error.sqlite_code()))
+        })
+        .await?;
+    holder.released().await;
+    assert_eq!(refused, Err(Some(5)));
+    Ok(())
+}
+
 /// Opening a store waits for a lock another connection holds on its file
 /// rather than failing at once: the busy timeout is set before any statement
 /// that needs the file.
