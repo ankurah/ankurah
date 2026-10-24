@@ -78,32 +78,53 @@ into AnkQL.
 
 ## Connections
 
-The engine writes its SQL once, for every driver, against the executor
-boundary (the `executor` module): a `SqliteExecutor` runs one statement on
-one SQLite connection, and each `Row` it returns holds the values as SQLite
-stored them. Everything above the boundary decides which SQL to run; a
-driver below it runs that SQL.
+The engine writes its SQL once, against the executor boundary (the
+`executor` module), so that one engine serves every SQLite driver. A
+`SqliteExecutor` runs one statement per call on one SQLite connection, and
+each `Row` it returns holds each value with the storage class SQLite reports
+for it, unconverted. Everything above the boundary decides which SQL to run;
+an executor below it runs that SQL on one driver's connection. The module
+holds what every executor shares: the trait and its contract, `Row`,
+transactions and savepoints, the session pragmas, and the scan
+(`executor/statement_scan`) that finds where a statement ends before SQLite
+prepares it, so that SQL holding a second statement is refused on every
+driver. Each target compiles one executor:
 
-- Natively, the engine uses a `bb8` pool around `rusqlite`. Synchronous
-  connection work is run through the connection wrapper's blocking boundary.
-  File-backed databases enable WAL and the engine's standard performance
-  pragmas; the in-memory engine uses a one-connection pool so all operations
-  observe the same database.
-- On wasm32, behind the `nodejs` feature, the engine runs on one database
-  object, synchronously on the calling thread. Its node:sqlite must bind a
-  numbered parameter at its position, as it does from Node.js 22.20.0 on 22,
-  24.7.0 on 24, and on every later release line: a database that skips one
-  as it binds a call's values, as earlier releases' node:sqlite does, is
-  refused.
-  `open` and `open_in_memory` construct a node:sqlite `DatabaseSync` and give
-  it the native connections' session settings. A host that built a database
-  itself, a node:sqlite `DatabaseSync` or a better-sqlite3 `Database`, hands
-  it to `SqliteStorageEngine::from_database`, which keeps the host's session
-  settings and refuses a database the executor cannot read exactly. The
-  executor reads each query's rows through a typed reader, a WITH clause
-  that nests the query and reads each value with its storage class; where
-  that cannot read as rusqlite does, the query is refused before it runs.
-  `SqliteExecutor`'s documentation lists each way the drivers differ.
+- `executor/native`: natively, the engine uses a `bb8` pool around
+  `rusqlite`. Synchronous connection work is run through the connection
+  wrapper's blocking boundary. File-backed databases enable WAL and the
+  engine's standard performance pragmas; the in-memory engine uses a
+  one-connection pool so all operations observe the same database.
+- `executor/nodejs`: on wasm32, behind the `nodejs` feature, the engine runs
+  inside Node.js on one database object, synchronously on the calling
+  thread. `open` and `open_in_memory` construct a node:sqlite `DatabaseSync`
+  and give it the native connections' session settings. A host that built a
+  database itself, a node:sqlite `DatabaseSync` or a better-sqlite3
+  `Database`, hands it to `SqliteStorageEngine::from_database`, which keeps
+  the host's session settings and refuses a database the executor cannot
+  read exactly. Among those is a database whose node:sqlite skips a numbered
+  parameter as it binds a call's values, as node:sqlite does before Node.js
+  22.20.0 on 22 and 24.7.0 on 24: the executor binds one and reads it back,
+  whatever the release. The executor reads each query's rows through a
+  typed reader, a WITH clause that nests the query and reads each value with
+  its storage class; where that cannot read as rusqlite does, the query is
+  refused before it runs. A PRAGMA or an EXPLAIN, which SQLite does not
+  nest, is the exception: its TEXT is read as the driver's string, and
+  refused after it runs if it holds U+FFFD, which both drivers put in place
+  of a byte that is not UTF-8. `SqliteExecutor`'s documentation lists each
+  way the drivers differ.
+
+Every driver's errors are typed. Natively they are rusqlite's, as
+`SqliteError::Rusqlite`. On Node.js an error SQLite raised is a
+`SqliteError::Sqlite`, with SQLite's extended result code; a refusal of the
+executor's, of a call or a database it cannot run or read as rusqlite does,
+is a `SqliteError::Refused`; and any other JavaScript exception is a
+`SqliteError::JavaScript`. `SqliteError::sqlite_code` gives SQLite's
+extended result code, reading better-sqlite3's name for a code as its
+number, and `SqliteError::refusal` gives a refused call's `Refusal`,
+natively by mapping each of rusqlite's own refusals to the one the Node.js
+executor raises for the same call. Both answer the same on every driver,
+except where their documentation says.
 
 Every connection the engine opens has double-quoted string literals off, for
 DML and DDL, so that a double-quoted name that matches no column fails with
@@ -113,4 +134,16 @@ unless constructed with them on. `from_database` refuses a database that reads
 such a name as a string. A schema stored with the literals on still opens, but
 a view or trigger whose body relies on one fails when used, and SQLite then
 refuses to rename any table on that file, or to rename or drop any column,
-since each of those reads every view and trigger again; it still adds one.
+since each of those reads every view and trigger again. ADD COLUMN, the only
+change the engine makes to a table, still runs.
+
+## Dump
+
+The dump pages through the events and then the states, each page read
+through a connection the pool hands out for it. A page of states reads its
+states and their memberships in one snapshot, so that each state's
+memberships are read as of the state itself. The engine takes the snapshot
+through the executor's savepoint, which begins a transaction on a
+connection outside one, and nests in one an embedder left open. Each page is
+a snapshot of its own, so a dump of a store that is being written is
+consistent within each page, not across the dump.
