@@ -50,7 +50,10 @@ use crate::{
 ///   does: the typed reader nests the SQL better-sqlite3 prepared, and
 ///   better-sqlite3 keeps what follows the semicolon in it.
 pub trait SqliteExecutor {
-    /// Run one statement that yields no rows; returns the number of rows it changed.
+    /// Run one statement that yields no rows; returns SQLite's changes(), as
+    /// rusqlite does: the number of rows the statement changed when it is an
+    /// INSERT, UPDATE or DELETE, and after any other statement, such as DDL
+    /// or BEGIN, still the number the last of those changed.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError>;
 
     /// Run one statement and collect every row it yields, in order.

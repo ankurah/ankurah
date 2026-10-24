@@ -372,6 +372,35 @@ impl NodeConnection {
         Ok(())
     }
 
+    /// The count of rows `run()` reports it changed, which must fit a usize:
+    /// SQLite's changes(), as rusqlite reports it. node:sqlite's `run()`
+    /// reports changes() itself, as a BigInt, since its statements here read
+    /// BigInts. better-sqlite3's reports it as a number whatever its
+    /// statements read, and as 0 after a statement that changed no rows
+    /// itself, where changes() is still the count of the last INSERT, UPDATE
+    /// or DELETE; for that 0, changes() is read.
+    fn changed_rows(&self, result: &JsValue) -> Result<usize, SqliteError> {
+        let changes = Reflect::get(result, &"changes".into()).map_err(js_error)?;
+        let count = match changes.as_f64() {
+            Some(0.0) => return self.changes(),
+            Some(count) if count.fract() == 0.0 => count as i64,
+            _ => integer_from_js(&changes)?,
+        };
+        usize::try_from(count).map_err(|_| SqliteError::Node(format!("`run()` reported {count} changed rows")))
+    }
+
+    /// SQLite's changes(): the count of rows the connection's last INSERT,
+    /// UPDATE or DELETE changed.
+    fn changes(&self) -> Result<usize, SqliteError> {
+        match self.query("SELECT changes()", &[])?.as_slice() {
+            [row] => {
+                let changes = row.integer(0)?;
+                usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
+            }
+            rows => Err(SqliteError::Node(format!("`SELECT changes()` returned {} rows", rows.len()))),
+        }
+    }
+
     /// Prepare a statement that hands rows over as the executor reads them.
     fn prepare(&self, sql: &str) -> Result<JsValue, SqliteError> {
         let statement = method(&self.database, "prepare")?.call1(&self.database, &sql.into()).map_err(js_error)?;
@@ -410,7 +439,7 @@ impl SqliteExecutor for NodeConnection {
         if width == 0 {
             // A statement without columns yields no row.
             let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
-            return changed_rows(&result);
+            return self.changed_rows(&result);
         }
         // `get` takes one step and resets the statement, returning the row
         // the step yielded, or undefined when it finished the statement.
@@ -421,13 +450,7 @@ impl SqliteExecutor for NodeConnection {
         }
         // rusqlite then reports the connection's count of changed rows, which
         // a statement that yields rows leaves as the last change set it.
-        match self.query("SELECT changes()", &[])?.as_slice() {
-            [row] => {
-                let changes = row.integer(0)?;
-                usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
-            }
-            rows => Err(SqliteError::Node(format!("`SELECT changes()` returned {} rows", rows.len()))),
-        }
+        self.changes()
     }
 
     fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
@@ -695,19 +718,6 @@ fn all(statement: &JsValue, params: &[SqliteValueRef<'_>], width: usize) -> Resu
             Ok(row)
         })
         .collect()
-}
-
-/// The count of rows `run()` reports it changed, which must fit a usize: a
-/// BigInt from node:sqlite, whose statements here read BigInts, or a number
-/// from better-sqlite3, which counts changes as a number whatever its
-/// statements read.
-fn changed_rows(result: &JsValue) -> Result<usize, SqliteError> {
-    let changes = Reflect::get(result, &"changes".into()).map_err(js_error)?;
-    let count = match changes.as_f64() {
-        Some(count) if count.fract() == 0.0 => count as i64,
-        _ => integer_from_js(&changes)?,
-    };
-    usize::try_from(count).map_err(|_| SqliteError::Node(format!("`run()` reported {count} changed rows")))
 }
 
 fn js_params(params: &[SqliteValueRef<'_>]) -> Array { params.iter().map(js_param).collect() }

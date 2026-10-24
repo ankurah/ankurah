@@ -247,6 +247,30 @@ async fn query_runs_a_statement_that_yields_no_rows() -> Result<()> {
     Ok(())
 }
 
+/// `execute` returns SQLite's changes() on every driver: the rows an INSERT,
+/// UPDATE or DELETE changed, and after any other statement the number the
+/// last of those changed, as rusqlite returns it (better-sqlite3's own count
+/// for such a statement is 0).
+#[engine_test]
+async fn execute_returns_the_count_of_changes_rusqlite_returns() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let counts = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (k INTEGER PRIMARY KEY)", &[])?;
+            Ok([
+                executor.execute("INSERT INTO things (k) VALUES (1), (2), (3)", &[])?,
+                executor.execute("CREATE TABLE others (k)", &[])?,
+                executor.execute("BEGIN", &[])?,
+                executor.execute("COMMIT", &[])?,
+                executor.execute("UPDATE things SET k = k WHERE k > 5", &[])?,
+                executor.execute("CREATE INDEX others_k ON others (k)", &[])?,
+            ])
+        })
+        .await?;
+    assert_eq!(counts, [3, 3, 3, 3, 0, 0]);
+    Ok(())
+}
+
 /// An error SQLite raises carries its extended result code on rusqlite and
 /// on node:sqlite alike, and none on better-sqlite3, which names the code
 /// without its number.
