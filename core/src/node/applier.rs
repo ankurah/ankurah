@@ -80,7 +80,7 @@ impl NodeApplier {
     }
 
     /// What a delivery publishes for an advanced entity.
-    fn publish(entity: Entity, events: Vec<Attested<proto::Event>>, delivery: Delivery) -> EntityChange {
+    fn change_for_delivery(entity: Entity, events: Vec<Attested<proto::Event>>, delivery: Delivery) -> EntityChange {
         match delivery {
             Delivery::Initial => EntityChange::new(entity, Vec::new()),
             Delivery::Live => EntityChange::new(entity, events),
@@ -116,7 +116,7 @@ impl NodeApplier {
         node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
         if let Some(entity) = Self::save_new_entity(node, &state.payload, &events, delivery, event_getter, state_getter).await? {
-            let change = Self::publish(entity.clone(), events, delivery);
+            let change = Self::change_for_delivery(entity.clone(), events, delivery);
             return Ok(DeltaOutcome { entity: Some(entity), change: Some(change), live_events });
         }
         let entity = node
@@ -128,7 +128,7 @@ impl NodeApplier {
         let change = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?;
         let change = change.map(|change| {
             let (entity, events) = change.into_parts();
-            Self::publish(entity, events, delivery)
+            Self::change_for_delivery(entity, events, delivery)
         });
         Ok(DeltaOutcome { entity: Some(entity), change, live_events })
     }
@@ -156,7 +156,7 @@ impl NodeApplier {
         let live_events = if delivery == Delivery::Live { events.clone() } else { Vec::new() };
         let change = Self::apply_and_commit_events(node, &events, delivery, event_getter).await?.map(|change| {
             let (entity, events) = change.into_parts();
-            Self::publish(entity, events, delivery)
+            Self::change_for_delivery(entity, events, delivery)
         });
         let entity = match &change {
             Some(change) => Some(change.entity().clone()),

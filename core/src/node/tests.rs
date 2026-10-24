@@ -51,7 +51,7 @@ async fn unsubscribe_during_snapshot_construction_releases_the_comparison() -> a
     let connection = node.peer_connections.get(&peer).unwrap();
     let session = Arc::downgrade(&connection.state_streams.get(&comparison).unwrap());
     unsubscribe.await?;
-    assert!(session.upgrade().is_none(), "unsubscribe must release the frozen snapshot and its timer");
+    assert!(session.upgrade().is_none(), "unsubscribe must release the stream's snapshot and its timer");
     assert!(matches!(
         state_sync::apply_state_feedback(&node, peer, proto::RequestId::new(), comparison, 0, None, None, vec![]).await?,
         proto::NodeResponseBody::StateStreamUnavailable

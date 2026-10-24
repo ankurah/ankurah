@@ -108,10 +108,10 @@ async fn concurrent_identical_live_states_publish_once() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The stream owner applies a delta with its captured credential source; no
-/// unrelated relay subscription is required by the shared entity applier.
+/// A live state-and-events delta applies without any subscription relay state, because the state
+/// stream that received it admitted it: its state and its event are stored and the resident advances.
 #[tokio::test]
-async fn live_delta_application_uses_its_captured_event_source() -> anyhow::Result<()> {
+async fn a_live_state_and_events_delta_stores_its_state_and_event() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let incoming =
         Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));

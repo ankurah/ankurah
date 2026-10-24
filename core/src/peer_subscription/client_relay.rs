@@ -1221,7 +1221,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_busy_is_retryable_but_policy_and_generic_server_errors_are_terminal() {
+    async fn snapshot_busy_is_retryable_but_policy_and_generic_server_errors_are_terminal() {
         for (error, retryable) in [
             (RequestError::StateSnapshotBusy, true),
             (RequestError::AccessDenied(crate::policy::AccessDenied::ByPolicy("fixture denies query")), false),

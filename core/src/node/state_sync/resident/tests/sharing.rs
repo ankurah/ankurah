@@ -41,14 +41,14 @@ async fn shared_responder_routes_reuse_the_same_tree_and_detach_independently() 
     assert_eq!(node.resident_trees.len(), 1);
     assert_eq!(node.storage.fetches.load(Ordering::Relaxed), scans);
     let (peer, query) = subscriptions.remove(0);
-    node.peer_connections.get(&peer).unwrap().subscription_handler.remove_predicate(&node, query).await?;
+    node.peer_connections.get(&peer).unwrap().subscription_handler.remove_query(&node, query).await;
     node.deregister_peer(peer);
     let next = update(&event, "02")?;
     apply(&node, &next).await?;
     let resident = acquire(&node.resident_trees, &node, selection).await?;
     assert_eq!(resident.snapshot().await?.snapshot.entries[&event.entity_id].head, proto::Clock::singleton(&next));
     let (peer, query) = subscriptions.remove(0);
-    node.peer_connections.get(&peer).unwrap().subscription_handler.remove_predicate(&node, query).await?;
+    node.peer_connections.get(&peer).unwrap().subscription_handler.remove_query(&node, query).await;
     node.deregister_peer(peer);
     Ok(())
 }
@@ -308,7 +308,7 @@ async fn limited_coverage_rejects_other_selections_and_shares_exact_responder_re
         assert!(!Weak::ptr_eq(&tree, &other.identity()), "bounded coverage never proves another selection complete");
     }
     assert_eq!(limited.snapshot().await?.snapshot.entries.len(), 1);
-    connection.subscription_handler.remove_predicate(&node, query).await?;
+    connection.subscription_handler.remove_query(&node, query).await;
     node.deregister_peer(peer);
     Ok(())
 }
@@ -371,7 +371,7 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
     let snapshot = snapshot.select(&selection(Some(1)), &node.catalog)?;
     assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
     assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans);
-    handler.remove_predicate(&node, query).await?;
+    handler.remove_query(&node, query).await;
     node.deregister_peer(peer);
     Ok(())
 }
