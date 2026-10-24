@@ -64,7 +64,7 @@ fn an_offer_holds_disjoint_spans_within_the_tree_and_each_entity_once() {
 fn an_offer_lists_each_entity_once_across_inventories() {
     // Under a keyed spec one entity can sit at two addresses, one in each inventory.
     let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(PropertyId::Id, ValueType::I64)]), ankql::ast::Predicate::True);
-    let key = |n| CanonicalCodec.encode_nullable(spec.key_spec(), &[Some(Value::I64(n))]).unwrap();
+    let key = |n| CanonicalCodec::encode_nullable(spec.key_spec(), &[Some(Value::I64(n))]).unwrap();
     let split = leaf_address(&key(2), id(0));
     let keyed = |bounds, key| {
         let heads = vec![KeyedEntityHead { key, entity: EntityHead { entity_id: id(7), head: head(1) } }];

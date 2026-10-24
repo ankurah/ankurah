@@ -1,39 +1,21 @@
-//! Canonical, ascending key encoding. Every part is self-delimiting, including
-//! strings containing NUL, so a tuple prefix names one contiguous address range.
+//! Canonical, ascending key encoding. Every part is self-delimiting, strings
+//! containing NUL included, so a tuple prefix names one contiguous range of
+//! addresses.
 
-use crate::TreeError;
-use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, PropertyPath, Value, ValueType};
-use std::collections::HashMap;
+use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
 
-/// Resolve the type of an exact property path without a node or a catalog.
-pub trait PropertyTypes {
-    /// The type at this path, or `None` when it is unknown.
-    fn value_type(&self, path: &PropertyPath) -> Option<ValueType>;
-}
-impl PropertyTypes for HashMap<PropertyId, ValueType> {
-    fn value_type(&self, path: &PropertyPath) -> Option<ValueType> {
-        if !path.subpath.is_empty() {
-            return None;
-        }
-        if path.property_id() == PropertyId::Id {
-            return Some(ValueType::EntityId);
-        }
-        self.get(&path.property_id()).copied()
-    }
-}
+use crate::error::TreeError;
 
-/// The standalone crate's canonical codec. Missing values sort before present
+/// This crate's canonical key codec. Missing values sort before present
 /// ones and do not change admission. NaNs and JSON ordering are unsupported;
 /// floating zero has one encoding, and strings use UTF-8 byte order.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct CanonicalCodec;
+///
+/// The type has no values: it names the codec its functions belong to.
+pub enum CanonicalCodec {}
 
 impl CanonicalCodec {
-    /// Encoding version, to negotiate before comparing keys across versions.
-    pub const VERSION: u8 = 1;
-
     /// Encode a tuple prefix, explicitly representing missing/null values.
-    pub fn encode_nullable(&self, spec: &KeySpec<PropertyId>, values: &[Option<Value>]) -> Result<Vec<u8>, TreeError> {
+    pub fn encode_nullable(spec: &KeySpec<PropertyId>, values: &[Option<Value>]) -> Result<Vec<u8>, TreeError> {
         if values.len() > spec.keyparts.len() {
             return Err(TreeError::InvalidKey("too many tuple parts"));
         }
@@ -43,8 +25,9 @@ impl CanonicalCodec {
         }
         Ok(bytes)
     }
+
     /// Encode the first `values.len()` parts of a key spec.
-    pub fn encode_prefix(&self, spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
+    pub fn encode_prefix(spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
         if values.len() > spec.keyparts.len() {
             return Err(TreeError::InvalidKey("too many tuple parts"));
         }
@@ -54,10 +37,23 @@ impl CanonicalCodec {
         }
         Ok(bytes)
     }
+
     /// Split a complete key into its self-delimiting encoded parts, rejecting
     /// malformed, noncanonical or trailing bytes.
-    pub fn split<'a>(&self, spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
-        let mut parts = Vec::new();
+    pub fn split<'a>(spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
+        let mut parts = Vec::with_capacity(spec.keyparts.len());
+        Self::walk(spec, key, |part| parts.push(part))?;
+        Ok(parts)
+    }
+
+    /// Check that `key` is a complete key of `spec`, refusing what
+    /// [`CanonicalCodec::split`] refuses, without allocating: for a caller
+    /// that validates many keys and needs none of their parts.
+    pub fn check(spec: &KeySpec<PropertyId>, key: &[u8]) -> Result<(), TreeError> { Self::walk(spec, key, |_| {}) }
+
+    /// Hand each of `key`'s encoded parts to `each`, in order, checking that
+    /// each is canonical and that no bytes follow the last.
+    fn walk<'a>(spec: &KeySpec<PropertyId>, key: &'a [u8], mut each: impl FnMut(&'a [u8])) -> Result<(), TreeError> {
         let mut rest = key;
         for part in &spec.keyparts {
             validate_part(part)?;
@@ -88,23 +84,32 @@ impl CanonicalCodec {
                     }
                 }
                 if part.value_type == ValueType::String {
-                    let mut raw = Vec::new();
-                    let mut i = 1;
-                    while i < encoded.len() - 2 {
-                        raw.push(encoded[i]);
-                        i += if encoded[i] == 0 { 2 } else { 1 };
-                    }
-                    std::str::from_utf8(&raw).map_err(|_| TreeError::InvalidKey("invalid UTF-8"))?;
+                    check_utf8(&encoded[1..encoded.len() - 2])?;
                 }
             }
-            parts.push(encoded);
+            each(encoded);
             rest = tail;
         }
         if !rest.is_empty() {
             return Err(TreeError::InvalidKey("trailing key bytes"));
         }
-        Ok(parts)
+        Ok(())
     }
+}
+
+/// Check that an escaped string's body, its bytes with each zero byte
+/// followed by 255, unescapes to UTF-8. A zero byte is a whole character of
+/// its own, never inside another's encoding, so the string is UTF-8 when
+/// each run between its zero bytes is.
+fn check_utf8(body: &[u8]) -> Result<(), TreeError> {
+    let mut runs = body.split(|byte| *byte == 0);
+    let first = runs.next().unwrap_or_default();
+    // Every later run begins with the 255 that completes its zero byte's
+    // escape.
+    for run in std::iter::once(first).chain(runs.map(|run| &run[1..])) {
+        std::str::from_utf8(run).map_err(|_| TreeError::InvalidKey("invalid UTF-8"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn validate_part(part: &IndexKeyPart<PropertyId>) -> Result<(), TreeError> {
@@ -174,6 +179,7 @@ fn escaped(out: &mut Vec<u8>, raw: &[u8]) {
     }
     out.extend([0, 0]);
 }
+
 fn variable_len(bytes: &[u8]) -> Result<usize, TreeError> {
     let mut i = 0;
     while i < bytes.len() {
@@ -187,16 +193,4 @@ fn variable_len(bytes: &[u8]) -> Result<usize, TreeError> {
         i += 1;
     }
     Err(TreeError::InvalidKey("unterminated variable-length part"))
-}
-
-/// First byte string after every string starting with `prefix`.
-pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
-    let mut end = prefix.to_vec();
-    while let Some(byte) = end.pop() {
-        if byte != 255 {
-            end.push(byte + 1);
-            return Some(end);
-        }
-    }
-    None
 }

@@ -4,8 +4,8 @@
 //!
 //! A tree keeps its rows in the three maps a [`MapName`] names, and reads and
 //! writes them through [`MapAccess`] within a transaction. The tree encodes
-//! every key and value itself ([`layout`](crate::layout)), so the maps hold
-//! bytes and nothing else.
+//! every key and value itself, in the layouts of the `layout` module, so the
+//! maps hold bytes and nothing else.
 //!
 //! A transaction is the unit of consistency. Every read within it observes one
 //! consistent state of all three maps, the state the transaction began with,
@@ -14,22 +14,22 @@
 //! two. Every write is conditional on what the transaction read, so that
 //! nothing depends on the order in which concurrent transactions commit, and a
 //! transaction that fails leaves nothing half-applied:
-//! [`insert`](MapAccess::insert) needs the key absent, and
-//! [`put_if`](MapAccess::put_if) and
-//! [`delete_if`](MapAccess::delete_if) need the value the transaction
-//! sees there. [`commit`](MapTransaction::commit) applies every write
-//! together, and only if every condition still holds against the maps as they
-//! stand then. A condition that fails, when its write is made or at the
-//! commit, fails the whole transaction with [`TreeError::Conflict`] and
-//! applies nothing, and the writer retries from fresh reads in a new
-//! transaction. Dropping a transaction without committing it rolls it back. A
-//! value that only ever accumulates beside others goes in by
-//! [`append`](MapAccess::append), under a key no other append takes, so
-//! that appends never conflict.
+//! [`insert`](MapAccess::insert) needs the key absent, and both
+//! [`put_if`](MapAccess::put_if) and [`delete_if`](MapAccess::delete_if)
+//! need the value the transaction sees there.
+//! [`commit`](MapTransaction::commit) applies every write together, and only
+//! if every condition still holds against the maps as they stand then. A
+//! condition that fails, when its write is made or at the commit, fails the
+//! whole transaction with [`TreeError::Conflict`] and applies nothing, and the
+//! writer retries from fresh reads in a new transaction. Dropping a
+//! transaction without committing it rolls it back. A value that only ever
+//! accumulates beside others goes in by [`append`](MapAccess::append), under a
+//! key no other append takes, so that appends never conflict.
 //!
-//! [`MemoryTransaction`](crate::MemoryTransaction) implements both traits
-//! today, and other storage can implement them later. Map access is async
-//! for that storage's sake; in memory the operations complete at once.
+//! A storage engine implements both traits to keep a tree in its own store;
+//! access is async so that such an implementation can await I/O.
+//! [`MemoryTransaction`] implements them in memory, where every operation
+//! completes at once.
 
 use std::ops::Bound;
 
@@ -37,23 +37,55 @@ use async_trait::async_trait;
 
 use crate::error::TreeError;
 
+pub(crate) mod layout;
+mod memory;
+mod rows;
+
+pub use memory::{MemoryMaps, MemoryTransaction};
+pub(crate) use rows::EncodedLeaf;
+pub use rows::LeafRow;
+
 /// The bounds of a range scan: a lower and an upper bound on the key, as
 /// [`std::ops::RangeBounds`] gives them.
 pub type ByteBounds<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 
 /// The three maps that hold a tree's rows, each an ordered map of byte keys to
-/// byte values in the layout [`layout`](crate::layout) gives.
+/// byte values in the layout the tree gives them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MapName {
     /// The leaf rows, by leaf address.
     Leaves,
-    /// The keys each entity is filed under, by entity id, so that a change,
-    /// which names only the entity, finds the leaves it must subtract or
-    /// move. Its reserved empty key counts entities with multiple keys.
+    /// The keys each entity is filed under, by entity id, which
+    /// [`entity_leaves`](crate::TreeTransaction::entity_leaves) reads and an
+    /// audit checks against the leaves. Every leaf insertion and removal keeps
+    /// it in step, and with it the count, under its reserved empty key, of
+    /// entities filed under more than one key, which a Selection's scope
+    /// requires to be zero.
     Lookup,
     /// The tree node rows, by prefix: a base row per tree node and the delta
     /// rows appended since its base was last compacted.
     Nodes,
+}
+
+/// Why a transaction can no longer commit, which its commit reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Failure {
+    /// A write's condition failed, or an operation found what it expected
+    /// changed: the commit reports [`TreeError::Conflict`], and the writer
+    /// retries from fresh reads.
+    Conflict,
+    /// An operation failed for another reason, or was cancelled or panicked
+    /// before it finished: the commit reports [`TreeError::Poisoned`].
+    Poisoned,
+}
+
+impl From<Failure> for TreeError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Conflict => TreeError::Conflict,
+            Failure::Poisoned => TreeError::Poisoned,
+        }
+    }
 }
 
 /// Access to one tree's three maps within a transaction.
@@ -64,10 +96,11 @@ pub enum MapName {
 /// [`MapTransaction`] additionally owns the right to commit.
 #[async_trait]
 pub trait MapAccess: Send {
-    /// Permanently prevent the owning transaction from committing any writes.
-    /// A borrowed adapter must forward this to its owner, so dropping the
-    /// adapter or opening another view cannot clear a failed operation.
-    fn poison(&mut self);
+    /// Permanently prevent the owning transaction from committing any writes,
+    /// its commit reporting the first failure recorded. A borrowed adapter
+    /// must forward this to its owner, so dropping the adapter or opening
+    /// another view cannot clear a failed operation.
+    fn poison(&mut self, failure: Failure);
 
     /// Keep the tree topology this transaction read valid until commit.
     /// Ordinary leaf changes may still commit concurrently.
@@ -128,7 +161,7 @@ pub trait MapTransaction: MapAccess {
 
 #[async_trait]
 impl<T: MapAccess + ?Sized> MapAccess for &mut T {
-    fn poison(&mut self) { (**self).poison(); }
+    fn poison(&mut self, failure: Failure) { (**self).poison(failure); }
     fn watch_structure(&mut self) { (**self).watch_structure(); }
     fn change_structure(&mut self) { (**self).change_structure(); }
 

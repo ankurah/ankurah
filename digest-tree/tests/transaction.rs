@@ -1,13 +1,17 @@
-//! A fake outer transaction with canonical records and two trees. All records
-//! share one MemoryTransaction; committing separate MemoryMaps would not test
-//! atomicity. Its topology fence is deliberately global, as in the memory
-//! reference adapter, rather than a proposed database locking strategy.
+//! Two trees and entity records that commit atomically through one outer
+//! transaction. The records and both trees share one `MemoryTransaction`,
+//! each tree under a key namespace of its own, so the outer commit lands
+//! everything or nothing; separate `MemoryMaps` would not test that. The
+//! topology fence is the memory maps' own, which covers the whole outer
+//! transaction.
+
+use std::borrow::BorrowMut;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
 use ankurah_digest_tree::{
-    ByteBounds, HeadHash, LeafChange, LeafData, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodePrefix,
+    ByteBounds, Failure, HeadHash, LeafChange, LeafInput, MapAccess, MapName, MapTransaction, MemoryMaps, MemoryTransaction, NodePrefix,
     Ristretto255, TreeError, TreeSpan, TreeSpec, TreeTransaction, BUCKET_CAPACITY,
 };
 use async_trait::async_trait;
@@ -19,10 +23,12 @@ type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Default)]
 struct Store(MemoryMaps);
+
 struct Transaction {
     maps: MemoryTransaction,
     fault: Option<Fault>,
 }
+
 #[derive(Clone, Copy, Debug)]
 enum Fault {
     Error,
@@ -43,12 +49,19 @@ impl Store {
 }
 
 impl Transaction {
-    fn tree(&mut self, id: u8, spec: &TreeSpec) -> TreeTransaction<Ristretto255, TreeMaps<'_>> {
+    /// A view of the tree `id` that borrows this transaction.
+    fn tree(&mut self, id: u8, spec: &TreeSpec) -> TreeTransaction<Ristretto255, TreeMaps<&mut Transaction>> {
         assert!(id == FIRST || id == SECOND);
         TreeTransaction::bind(spec, TreeMaps { owner: self, id })
     }
 
-    async fn set_state(&mut self, expected: Option<HeadHash>, leaf: &LeafData) -> Result<(), TreeError> {
+    /// A view of the tree `id` that owns this transaction, and so commits it.
+    fn into_tree(self, id: u8, spec: &TreeSpec) -> TreeTransaction<Ristretto255, TreeMaps<Transaction>> {
+        assert!(id == FIRST || id == SECOND);
+        TreeTransaction::bind(spec, TreeMaps { owner: self, id })
+    }
+
+    async fn set_state(&mut self, expected: Option<HeadHash>, leaf: &LeafInput) -> Result<(), TreeError> {
         let key = [b"\0".as_slice(), &leaf.entity_id.to_bytes()].concat();
         self.maps.put_if(MapName::Leaves, &key, expected.as_ref().map(|head| head.as_bytes().as_slice()), leaf.head.as_bytes()).await
     }
@@ -61,21 +74,22 @@ impl Transaction {
 
     async fn after_write(&mut self) -> Result<(), TreeError> {
         match self.fault.take() {
-            Some(Fault::Error) => Err(TreeError::Audit("injected write failure")),
+            Some(Fault::Error) => Err(TreeError::Inconsistent("injected write failure")),
             Some(Fault::Suspend) => std::future::pending().await,
             None => Ok(()),
         }
     }
 }
 
-// Each tree has its own key namespace. This adapter borrows its owner and
-// implements only map access: it cannot commit the outer transaction.
-struct TreeMaps<'a> {
-    owner: &'a mut Transaction,
+// Each tree has its own key namespace. An adapter that borrows its owner
+// implements only map access: it cannot commit the outer transaction. One
+// that owns it commits it.
+struct TreeMaps<O> {
+    owner: O,
     id: u8,
 }
 
-impl TreeMaps<'_> {
+impl<O: BorrowMut<Transaction> + Send> TreeMaps<O> {
     fn key(&self, key: &[u8]) -> Vec<u8> { [&[self.id], key].concat() }
 
     async fn scan_page(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize, reverse: bool) -> Result<Rows, TreeError> {
@@ -88,23 +102,21 @@ impl TreeMaps<'_> {
             bound => bound.map(|key| self.key(key)),
         };
         let bounds = (start.as_ref().map(Vec::as_slice), end.as_ref().map(Vec::as_slice));
-        let rows = if reverse {
-            self.owner.maps.scan_reverse(map, bounds, limit).await?
-        } else {
-            self.owner.maps.scan(map, bounds, limit).await?
-        };
+        let maps = &mut self.owner.borrow_mut().maps;
+        let rows = if reverse { maps.scan_reverse(map, bounds, limit).await? } else { maps.scan(map, bounds, limit).await? };
         Ok(rows.into_iter().map(|(key, value)| (key[1..].to_vec(), value)).collect())
     }
 }
 
 #[async_trait]
-impl MapAccess for TreeMaps<'_> {
-    fn poison(&mut self) { self.owner.maps.poison(); }
-    fn watch_structure(&mut self) { self.owner.maps.watch_structure(); }
-    fn change_structure(&mut self) { self.owner.maps.change_structure(); }
+impl<O: BorrowMut<Transaction> + Send> MapAccess for TreeMaps<O> {
+    fn poison(&mut self, failure: Failure) { self.owner.borrow_mut().maps.poison(failure); }
+    fn watch_structure(&mut self) { self.owner.borrow_mut().maps.watch_structure(); }
+    fn change_structure(&mut self) { self.owner.borrow_mut().maps.change_structure(); }
 
     async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> {
-        self.owner.maps.get(map, &self.key(key)).await
+        let key = self.key(key);
+        self.owner.borrow_mut().maps.get(map, &key).await
     }
 
     async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Rows, TreeError> {
@@ -116,35 +128,48 @@ impl MapAccess for TreeMaps<'_> {
     }
 
     async fn insert(&mut self, map: MapName, key: &[u8], value: &[u8]) -> Result<(), TreeError> {
-        self.owner.maps.insert(map, &self.key(key), value).await?;
-        self.owner.after_write().await
+        let key = self.key(key);
+        let owner = self.owner.borrow_mut();
+        owner.maps.insert(map, &key, value).await?;
+        owner.after_write().await
     }
 
     async fn put_if(&mut self, map: MapName, key: &[u8], expected: Option<&[u8]>, value: &[u8]) -> Result<(), TreeError> {
-        self.owner.maps.put_if(map, &self.key(key), expected, value).await?;
-        self.owner.after_write().await
+        let key = self.key(key);
+        let owner = self.owner.borrow_mut();
+        owner.maps.put_if(map, &key, expected, value).await?;
+        owner.after_write().await
     }
 
     async fn delete_if(&mut self, map: MapName, key: &[u8], expected: &[u8]) -> Result<(), TreeError> {
-        self.owner.maps.delete_if(map, &self.key(key), expected).await?;
-        self.owner.after_write().await
+        let key = self.key(key);
+        let owner = self.owner.borrow_mut();
+        owner.maps.delete_if(map, &key, expected).await?;
+        owner.after_write().await
     }
 
     async fn append(&mut self, map: MapName, key_prefix: &[u8], value: &[u8]) -> Result<(), TreeError> {
-        self.owner.maps.append(map, &self.key(key_prefix), value).await?;
-        self.owner.after_write().await
+        let key_prefix = self.key(key_prefix);
+        let owner = self.owner.borrow_mut();
+        owner.maps.append(map, &key_prefix, value).await?;
+        owner.after_write().await
     }
+}
+
+#[async_trait]
+impl MapTransaction for TreeMaps<Transaction> {
+    async fn commit(self) -> Result<(), TreeError> { self.owner.commit().await }
 }
 
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![]), Predicate::True) }
 
-fn leaf(n: u32, version: u8) -> LeafData {
+fn leaf(n: u32, version: u8) -> LeafInput {
     let mut id = [0; 32];
     id[..4].copy_from_slice(&n.to_be_bytes());
-    LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
+    LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
 }
 
-async fn update(tx: &mut Transaction, spec: &TreeSpec, before: Option<LeafData>, after: LeafData) {
+async fn update(tx: &mut Transaction, spec: &TreeSpec, before: Option<LeafInput>, after: LeafInput) {
     tx.set_state(before.as_ref().map(|leaf| leaf.head), &after).await.unwrap();
     for id in [FIRST, SECOND] {
         tx.tree(id, spec).apply_change(LeafChange { before: before.clone(), after: Some(after.clone()) }).await.unwrap();
@@ -165,10 +190,10 @@ async fn populated(count: usize) -> (Store, TreeSpec) {
     (store, spec)
 }
 
-async fn assert_tree(tx: &mut Transaction, id: u8, spec: &TreeSpec, expected: &[LeafData]) {
+async fn assert_tree(tx: &mut Transaction, id: u8, spec: &TreeSpec, expected: &[LeafInput]) {
     let mut tree = tx.tree(id, spec);
     let rows = tree.leaves(&TreeSpan::all(), usize::MAX).await.unwrap();
-    let actual: Vec<_> = rows.into_iter().map(|row| LeafData { key: row.key, entity_id: row.entity_id, head: row.head }).collect();
+    let actual: Vec<_> = rows.into_iter().map(|row| LeafInput { key: row.key, entity_id: row.entity_id, head: row.head }).collect();
     assert_eq!(actual, expected);
     assert_eq!(tree.audit().await.unwrap().leaves, expected.len());
 }
@@ -217,11 +242,11 @@ async fn dropping_the_owner_rolls_back_successful_tree_and_entity_writes() {
 async fn scopes_cannot_cross_reopened_views_or_tree_namespaces() {
     let (store, spec) = populated(1).await;
     let mut tx = store.begin();
-    let old = tx.tree(FIRST, &spec).scope_ranges([TreeSpan::all()]);
+    let old = tx.tree(FIRST, &spec).scope_spans([TreeSpan::all()]);
     for id in [FIRST, SECOND] {
         let mut tree = tx.tree(id, &spec);
         assert!(matches!(tree.count(&old).await, Err(TreeError::StaleScope)));
-        let scope = tree.scope_ranges([TreeSpan::all()]);
+        let scope = tree.scope_spans([TreeSpan::all()]);
         assert_eq!(tree.count(&scope).await.unwrap(), 1);
     }
     tx.commit().await.unwrap();
@@ -233,38 +258,52 @@ fn cancel_after_yield(future: impl std::future::Future) {
     assert!(future.as_mut().poll(&mut context).is_pending());
 }
 
+/// Run `operation` on `tree` with its owner's fault armed, so that it fails at
+/// its first write or is cancelled there.
+async fn fail<T: MapAccess>(tree: &mut TreeTransaction<Ristretto255, T>, operation: &str, fault: Fault) {
+    let work = async {
+        match operation {
+            "change" => tree.apply_change(LeafChange { before: Some(leaf(0, 1)), after: Some(leaf(0, 2)) }).await,
+            "build" => tree.build([leaf(0, 2)]).await,
+            "compact" => tree.compact_node(&NodePrefix::root()).await.map(|_| ()),
+            _ => unreachable!(),
+        }
+    };
+    match fault {
+        Fault::Error => assert!(matches!(work.await, Err(TreeError::Inconsistent("injected write failure")))),
+        Fault::Suspend => cancel_after_yield(work),
+    }
+}
+
 #[tokio::test]
-async fn failure_and_cancellation_poison_the_owner_after_the_view_is_gone() {
-    for fault in [Fault::Error, Fault::Suspend] {
-        for operation in ["change", "build", "compact"] {
-            let (store, spec) = populated(1).await;
-            let mut setup = store.begin();
-            update(&mut setup, &spec, Some(leaf(0, 0)), leaf(0, 1)).await;
-            setup.commit().await.unwrap();
-            let before = store.rows().await;
-            let mut tx = store.begin();
-            tx.set_state(Some(leaf(0, 1).head), &leaf(0, 2)).await.unwrap();
-            tx.tree(SECOND, &spec).apply_change(LeafChange { before: Some(leaf(0, 1)), after: Some(leaf(0, 2)) }).await.unwrap();
-            tx.fault = Some(fault);
-            {
-                let mut tree = tx.tree(FIRST, &spec);
-                let work = async {
-                    match operation {
-                        "change" => tree.apply_change(LeafChange { before: Some(leaf(0, 1)), after: Some(leaf(0, 2)) }).await,
-                        "build" => tree.build([leaf(0, 2)]).await,
-                        "compact" => tree.compact_node(&NodePrefix::root()).await.map(|_| ()),
-                        _ => unreachable!(),
-                    }
+async fn failure_and_cancellation_poison_the_owner_whether_the_view_borrows_or_owns_it() {
+    for owned in [false, true] {
+        for fault in [Fault::Error, Fault::Suspend] {
+            for operation in ["change", "build", "compact"] {
+                let (store, spec) = populated(1).await;
+                let mut setup = store.begin();
+                update(&mut setup, &spec, Some(leaf(0, 0)), leaf(0, 1)).await;
+                setup.commit().await.unwrap();
+                let before = store.rows().await;
+                let mut tx = store.begin();
+                tx.set_state(Some(leaf(0, 1).head), &leaf(0, 2)).await.unwrap();
+                tx.tree(SECOND, &spec).apply_change(LeafChange { before: Some(leaf(0, 1)), after: Some(leaf(0, 2)) }).await.unwrap();
+                tx.fault = Some(fault);
+                // A successful no-op afterwards cannot clear the poison, nor,
+                // for a borrowed view, can opening a new view.
+                let committed = if owned {
+                    let mut tree = tx.into_tree(FIRST, &spec);
+                    fail(&mut tree, operation, fault).await;
+                    tree.apply_change(LeafChange { before: None, after: None }).await.unwrap();
+                    tree.commit().await
+                } else {
+                    fail(&mut tx.tree(FIRST, &spec), operation, fault).await;
+                    tx.tree(FIRST, &spec).apply_change(LeafChange { before: None, after: None }).await.unwrap();
+                    tx.commit().await
                 };
-                match fault {
-                    Fault::Error => assert!(matches!(work.await, Err(TreeError::Audit("injected write failure")))),
-                    Fault::Suspend => cancel_after_yield(work),
-                }
+                assert!(matches!(committed, Err(TreeError::Poisoned)), "owned {owned}, {fault:?}: {operation}");
+                assert_eq!(store.rows().await, before, "owned {owned}, {fault:?}: {operation}");
             }
-            // A new view and successful no-op cannot clear the owner's poison.
-            tx.tree(FIRST, &spec).apply_change(LeafChange { before: None, after: None }).await.unwrap();
-            assert!(matches!(tx.commit().await, Err(TreeError::Conflict)), "{fault:?}: {operation}");
-            assert_eq!(store.rows().await, before, "{fault:?}: {operation}");
         }
     }
 }
@@ -277,7 +316,8 @@ async fn semantic_tree_failure_also_poisons_a_borrowed_memory_owner() {
     {
         let mut tree = TreeTransaction::<Ristretto255, _>::bind(&spec, &mut owner);
         tree.build([leaf(0, 0)]).await.unwrap();
-        // This fails in the tree before any conditional map write can poison it.
+        // This fails in the tree before any conditional map write can poison
+        // it.
         assert!(matches!(tree.apply_change(LeafChange { before: Some(leaf(0, 1)), after: None }).await, Err(TreeError::Conflict)));
     }
     TreeTransaction::<Ristretto255, _>::bind(&spec, &mut owner).apply_change(LeafChange { before: None, after: None }).await.unwrap();

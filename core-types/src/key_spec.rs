@@ -1,12 +1,11 @@
 //! Key specs: the ordered parts an index sorts entities by, each with a
-//! direction and a place for nulls. A walk over a digest tree follows one too.
+//! direction and a place for nulls.
 
-use crate::ValueType;
+use crate::{PropertyId, PropertyPath, ValueType};
 use serde::{Deserialize, Serialize};
 
-/// The composite key an index orders entities by, and the order a walk over
-/// a digest tree follows: its parts in order, each with its direction and
-/// where its nulls go.
+/// The composite key an index orders entities by: its parts in order, each
+/// with its direction and where its nulls go.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KeySpec<K> {
     /// The parts, most significant first.
@@ -61,6 +60,23 @@ impl<K> IndexKeyPart<K> {
     /// A descending part on `key` with no sub-path, nulls order or collation.
     pub fn desc(key: impl Into<K>, value_type: ValueType) -> Self {
         Self { key: key.into(), sub_path: None, direction: IndexDirection::Desc, value_type, nulls: None, collation: None }
+    }
+}
+
+impl IndexKeyPart<PropertyId> {
+    /// The property path this part sorts on: its property and sub-path.
+    pub fn path(&self) -> PropertyPath {
+        let mut path = PropertyPath::from(self.key);
+        path.subpath = self.sub_path.clone().unwrap_or_default();
+        path
+    }
+
+    /// An ascending part on the property and sub-path of `path`, with no
+    /// nulls order or collation.
+    pub fn asc_on(path: &PropertyPath, value_type: ValueType) -> Self {
+        let mut part = Self::asc(path.property_id(), value_type);
+        part.sub_path = (!path.subpath.is_empty()).then(|| path.subpath.clone());
+        part
     }
 }
 

@@ -10,7 +10,10 @@
 //!   bytes in all.
 //! - lookup: the key is the entity id (32 bytes); the value is every key the
 //!   entity is filed under, each preceded by its length as an unsigned 32-bit
-//!   big-endian integer, in ascending order and each once.
+//!   big-endian integer, in ascending order and each once. Under the empty
+//!   key, which no entity id can be, the value is the count of entities filed
+//!   under more than one key, an unsigned 64-bit big-endian integer, and the
+//!   row is present only while the count is not zero.
 //! - nodes: a tree node's base row is keyed by its prefix's encoding
 //!   ([`NodePrefix::to_bytes`]) and holds the digest in the row codec
 //!   ([`Digest::ROW_LEN`] bytes); each of its delta rows is keyed by the
@@ -30,33 +33,27 @@
 
 use std::collections::BTreeSet;
 
+use ankurah_core_types::EntityId;
+
+use super::rows::LeafRow;
+use crate::address::NodePrefix;
+use crate::digest::{exact, DecodeError, Digest, DigestGroup, HeadHash, LeafElement};
+use crate::error::TreeError;
+
+const HEAD_LEN: usize = 32;
+const KEY_LEN_LEN: usize = 4;
+const COUNT_LEN: usize = 8;
+
 /// The empty lookup key holds a big-endian u64 count of entities with more
 /// than one leaf. All other lookup keys are 32-byte entity identities.
 pub(crate) const MULTIPLE_KEYS: &[u8] = b"";
 
-use ankurah_core_types::EntityId;
-
-use crate::digest::{DecodeError, Digest, DigestGroup, HeadHash, LeafElement};
-use crate::error::TreeError;
-use crate::prefix::NodePrefix;
-use crate::rows::LeafRow;
-
-const HEAD_LEN: usize = 32;
-const KEY_LEN_LEN: usize = 4;
-
 /// The length of a leaf row's value in the group `G`: the head hash and the
 /// leaf element's row bytes.
-pub const fn leaf_value_len<G: DigestGroup>() -> usize { HEAD_LEN + LeafElement::<G>::ROW_LEN }
+pub(crate) const fn leaf_value_len<G: DigestGroup>() -> usize { HEAD_LEN + LeafElement::<G>::ROW_LEN }
 
 /// The byte between a prefix's encoding and the suffix in a delta key.
-pub const DELTA_SEPARATOR: u8 = 0xff;
-
-fn exact<'a>(what: &'static str, bytes: &'a [u8], len: usize) -> Result<&'a [u8], TreeError> {
-    match bytes.len() == len {
-        true => Ok(bytes),
-        false => Err(TreeError::unreadable(what, DecodeError::Length { expected: len, found: bytes.len() })),
-    }
-}
+pub(crate) const DELTA_SEPARATOR: u8 = 0xff;
 
 /// The key and the entity id an address is made of.
 fn split_address<'a>(what: &'static str, address: &'a [u8]) -> Result<(&'a [u8], EntityId), TreeError> {
@@ -77,7 +74,7 @@ pub(crate) fn leaf_value<G: DigestGroup>(row: &LeafRow<G>) -> Vec<u8> {
 /// The leaf row filed at `address` with `value`.
 pub(crate) fn leaf_row<G: DigestGroup>(address: &[u8], value: &[u8]) -> Result<LeafRow<G>, TreeError> {
     let (key, entity_id) = split_address("leaf address", address)?;
-    let value = exact("leaf value", value, leaf_value_len::<G>())?;
+    let value = exact(value, leaf_value_len::<G>()).map_err(|source| TreeError::unreadable("leaf value", source))?;
     let (head, element) = value.split_at(HEAD_LEN);
     Ok(LeafRow {
         key: key.to_vec(),
@@ -96,13 +93,13 @@ pub(crate) fn digest<G: DigestGroup>(what: &'static str, value: &[u8]) -> Result
     Digest::from_row_bytes(value).map_err(|source| TreeError::unreadable(what, source))
 }
 
-/// The first key a delta of `prefix` can have, which its deltas are appended
-/// under, and the first key past them all (`None` when nothing follows, as
-/// for the root): the range its deltas fill, which no other tree node's rows
-/// enter.
-pub(crate) fn delta_key_bounds(prefix: &NodePrefix) -> (Vec<u8>, Option<Vec<u8>>) {
-    let mut encoding = prefix.to_bytes();
-    let first = [encoding.as_slice(), &[DELTA_SEPARATOR]].concat();
+/// The first key a delta of the prefix encoded as `encoding` can have, which
+/// its deltas are appended under, and the first key past them all (`None`
+/// when nothing follows, as for the root): the range its deltas fill, which
+/// no other tree node's rows enter.
+pub(crate) fn delta_key_bounds(encoding: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+    let first = [encoding, &[DELTA_SEPARATOR]].concat();
+    let mut encoding = encoding.to_vec();
     // Every key beginning with the encoding and the separator lies before the
     // encoding with its last byte raised by one; encoding bytes stop at 253.
     let past = encoding.pop().map(|last| {
@@ -112,11 +109,42 @@ pub(crate) fn delta_key_bounds(prefix: &NodePrefix) -> (Vec<u8>, Option<Vec<u8>>
     (first, past)
 }
 
-/// The prefix a key of the nodes map names, whether a base key or a delta
-/// key.
-pub(crate) fn node_key_prefix(key: &[u8]) -> Result<NodePrefix, TreeError> {
-    let encoding = key.iter().position(|byte| *byte == DELTA_SEPARATOR).map_or(key, |separator| &key[..separator]);
-    NodePrefix::from_bytes(encoding).map_err(|source| TreeError::unreadable("node key", source))
+/// What a key of the nodes map names: the base row of the tree node at a
+/// prefix, or one of its delta rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NodeKey {
+    /// The key is the prefix's encoding.
+    Base(NodePrefix),
+    /// The key is the prefix's encoding, the separator and a suffix.
+    Delta(NodePrefix),
+}
+
+impl NodeKey {
+    /// The prefix of the tree node whose row the key names.
+    pub(crate) fn into_prefix(self) -> NodePrefix {
+        match self {
+            NodeKey::Base(prefix) | NodeKey::Delta(prefix) => prefix,
+        }
+    }
+}
+
+/// What the key `key` of the nodes map names.
+pub(crate) fn node_key(key: &[u8]) -> Result<NodeKey, TreeError> {
+    let separator = key.iter().position(|byte| *byte == DELTA_SEPARATOR);
+    let encoding = separator.map_or(key, |separator| &key[..separator]);
+    let prefix = NodePrefix::from_bytes(encoding).map_err(|source| TreeError::unreadable("node key", source))?;
+    Ok(if separator.is_some() { NodeKey::Delta(prefix) } else { NodeKey::Base(prefix) })
+}
+
+/// The value of the multi-key count row: the count of entities filed under
+/// more than one key.
+pub(crate) fn multiple_keys_value(count: u64) -> Vec<u8> { count.to_be_bytes().to_vec() }
+
+/// The count the multi-key count row holds; zero where there is no row.
+pub(crate) fn multiple_keys_count(value: Option<&[u8]>) -> Result<u64, TreeError> {
+    let Some(value) = value else { return Ok(0) };
+    let count = exact(value, COUNT_LEN).map_err(|source| TreeError::unreadable("multi-key count", source))?;
+    Ok(u64::from_be_bytes(count.try_into().expect("eight bytes")))
 }
 
 pub(crate) fn lookup_value(keys: &BTreeSet<Vec<u8>>) -> Vec<u8> {
@@ -157,14 +185,14 @@ mod tests {
 
     /// A delta key of `prefix` with a suffix of one to sixteen random bytes.
     fn random_delta_key(rng: &mut SmallRng, prefix: &NodePrefix) -> Vec<u8> {
-        let (mut key, _) = delta_key_bounds(prefix);
+        let (mut key, _) = delta_key_bounds(&prefix.to_bytes());
         key.extend((0..rng.gen_range(1..=16)).map(|_| rng.gen::<u8>()));
         key
     }
 
     /// Whether `key` lies within the range of `prefix`'s delta keys.
     fn among_deltas_of(prefix: &NodePrefix, key: &[u8]) -> bool {
-        let (first, past) = delta_key_bounds(prefix);
+        let (first, past) = delta_key_bounds(&prefix.to_bytes());
         first.as_slice() <= key && past.is_none_or(|past| key < past.as_slice())
     }
 
@@ -196,11 +224,11 @@ mod tests {
             }
             assert!(!among_deltas_of(&descendant, &own_delta), "{descendant:?} against {prefix:?}");
 
-            assert_eq!(node_key_prefix(&prefix.to_bytes()).unwrap(), prefix);
-            assert_eq!(node_key_prefix(&own_delta).unwrap(), prefix);
-            assert_eq!(node_key_prefix(&descendant_delta).unwrap(), descendant);
+            assert_eq!(node_key(&prefix.to_bytes()).unwrap(), NodeKey::Base(prefix.clone()));
+            assert_eq!(node_key(&own_delta).unwrap(), NodeKey::Delta(prefix));
+            assert_eq!(node_key(&descendant_delta).unwrap(), NodeKey::Delta(descendant));
         }
-        assert_eq!(delta_key_bounds(&NodePrefix::root()), (vec![DELTA_SEPARATOR], None), "the root's deltas run to the end");
+        assert_eq!(delta_key_bounds(&NodePrefix::root().to_bytes()), (vec![DELTA_SEPARATOR], None), "the root's deltas run to the end");
     }
 
     /// In the group `G`, a leaf row's value and a digest's round-trip, and

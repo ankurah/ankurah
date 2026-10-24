@@ -48,7 +48,7 @@ fn fixture(kind: &str, count: usize, tips: usize, clipped: bool) -> Fixture {
             "nullable" => vec![if n % 8 == 0 { None } else { Some(Value::String(format!("a\0{:02}/{}", n % 16, "z".repeat(n % 20)))) }],
             _ => panic!("unknown fixture"),
         };
-        let key = CanonicalCodec.encode_nullable(&key_spec, &value).unwrap();
+        let key = CanonicalCodec::encode_nullable(&key_spec, &value).unwrap();
         let head = Clock::new(
             (0..tips)
                 .map(|tip| {

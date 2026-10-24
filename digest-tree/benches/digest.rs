@@ -1,16 +1,13 @@
-//! What the digest primitives cost in each group, to compare ristretto255, the
-//! default, with LtHash16, and ristretto255 with the figures the digest tree
-//! design rests on: 5.0 µs to hash a leaf into ristretto255, 66 ns to update a
-//! tree node whose digest is held uncompressed, and 5.1 µs to update a tree
-//! node through the compressed encoding.
+//! What the digest primitives cost in each group, ristretto255, the default,
+//! against LtHash16: hashing a head and a leaf, updating a tree node in memory
+//! and through its stored row, decoding and encoding a digest row, and reading
+//! a tree node from its base and its deltas. The figures the `digest` module
+//! documentation quotes are these benchmarks'.
 //!
 //! `cargo bench -p ankurah-digest-tree --bench digest`. Each benchmark cycles
-//! through 4,096 fixed inputs rather than repeating one. ristretto255's
-//! benchmarks keep the names they had before LtHash16's joined them, so their
-//! figures compare with earlier runs; LtHash16's carry its name in front.
-//! Earlier runs reported ristretto255's leaf hash, the one renamed since, as
-//! "leaf point (hash_to_ristretto255 of one leaf)", and its figures compare
-//! all the same. Each group prints its row sizes before its benchmarks.
+//! through 4,096 fixed inputs rather than repeating one, and carries its
+//! group's name in front. Each group prints its row sizes before its
+//! benchmarks.
 
 use std::hint::black_box;
 
@@ -70,22 +67,23 @@ fn primitives(c: &mut Criterion) {
         })
     });
 
-    group::<Ristretto255>(c, &leaves, "ristretto255", "", "leaf element (hash_to_ristretto255 of one leaf)");
-    group::<LtHash16>(c, &leaves, "lthash16", "lthash16: ", "leaf element (BLAKE3 extendable output of one leaf)");
+    group::<Ristretto255>(c, &leaves, "ristretto255", "leaf element (hash_to_ristretto255 of one leaf)");
+    group::<LtHash16>(c, &leaves, "lthash16", "leaf element (BLAKE3 extendable output of one leaf)");
 }
 
-/// The benchmarks of the group `G`, called `label`, each named with `prefix`
+/// The benchmarks of the group `G`, called `label`, each named with `label`
 /// in front.
-fn group<G: DigestGroup>(c: &mut Criterion, leaves: &Leaves, label: &str, prefix: &str, leaf_hash: &str) {
+fn group<G: DigestGroup>(c: &mut Criterion, leaves: &Leaves, label: &str, leaf_hash: &str) {
     println!(
         "{label}: an element encodes in {} bytes, a digest row is {} bytes, a leaf element row {} bytes",
         G::ELEMENT_LEN,
         Digest::<G>::ROW_LEN,
         LeafElement::<G>::ROW_LEN
     );
-    let name = |benchmark: &str| format!("{prefix}{benchmark}");
+    let name = |benchmark: &str| format!("{label}: {benchmark}");
     let elements: Vec<LeafElement<G>> = (0..INPUTS).map(|i| leaves.leaf(i).element()).collect();
-    // One change's difference to a tree node: the new leaf's element minus the old.
+    // One change's difference to a tree node: the new leaf's element minus
+    // the old one's.
     let differences: Vec<Digest<G>> = (0..INPUTS).map(|i| Digest::from(elements[i]) - Digest::from(elements[(i + 1) % INPUTS])).collect();
 
     c.bench_function(&name(leaf_hash), |b| {

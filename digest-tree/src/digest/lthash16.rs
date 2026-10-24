@@ -24,7 +24,7 @@ const LANES: usize = 1024;
 /// a digest's count records 65,536 leaves: 65,536 copies of one leaf and
 /// 65,536 copies of another have equal digests, zero lanes and equal counts.
 /// A tree's sums never meet this, because a tree never repeats a leaf; the
-/// crate documentation explains why the guarantee is for sets.
+/// [module documentation](super) explains why the guarantee is for sets.
 ///
 /// A leaf's element is BLAKE3 in its key derivation mode, under
 /// [`LTHASH16_LEAF_CONTEXT`], over the encoded leaf: 2,048 bytes of its
@@ -216,8 +216,8 @@ mod tests {
         }
     }
 
-    /// Rows carry any count exactly, beside lanes at the
-    /// edges of their range, and a decoded count at a limit refuses to pass it.
+    /// Rows carry any count exactly, beside lanes at the edges of their range,
+    /// and a decoded count at a limit refuses to pass it.
     #[test]
     fn rows_carry_extreme_counts_exactly() {
         let lanes: [u16; LANES] = std::array::from_fn(|i| [0xffff, 0, 1, 0x8000][i % 4]);

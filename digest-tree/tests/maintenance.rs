@@ -1,20 +1,27 @@
+//! Tree maintenance checked against a model of the leaves: change after
+//! change, bucket splits, merges and branch insertions keep every summary
+//! right, and changes that race with them retry.
+
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
-use ankurah_digest_tree::{Digest, DigestGroup, DigestTree, HeadHash, Leaf, LeafChange, LeafData, NodePrefix, TreeError, TreeSpec};
+use ankurah_digest_tree::{Digest, DigestGroup, DigestTree, HeadHash, Leaf, LeafChange, LeafInput, NodePrefix, TreeError, TreeSpec};
 use std::collections::BTreeMap;
 
 fn empty_tree<G: DigestGroup>() -> DigestTree<G> { DigestTree::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True)) }
-fn leaf(n: u16, version: u8) -> LeafData {
+
+fn leaf(n: u16, version: u8) -> LeafInput {
     let mut id = [0; 32];
     id[..2].copy_from_slice(&n.to_be_bytes());
-    LeafData { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
+    LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
 }
-async fn check<G: DigestGroup>(tree: &DigestTree<G>, expected: &BTreeMap<u16, LeafData>) {
+
+async fn check<G: DigestGroup>(tree: &DigestTree<G>, expected: &BTreeMap<u16, LeafInput>) {
     let mut tx = tree.begin();
     assert_eq!(tx.audit().await.unwrap().leaves, expected.len());
     let digest: Digest<G> = expected.values().map(|v| Digest::from(Leaf::new(&v.key, v.entity_id, v.head).element())).sum();
-    assert_eq!(tx.node(&NodePrefix::root()).await.unwrap().unwrap().digest, digest);
+    assert_eq!(tx.node(&NodePrefix::root()).await.unwrap().unwrap(), digest);
 }
+
 async fn maintenance<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let mut model = BTreeMap::new();
@@ -52,8 +59,10 @@ async fn maintenance<G: DigestGroup>() {
     tx.commit().await.unwrap();
     check(&rebuilt, &model).await;
 }
+
 #[tokio::test]
 async fn split_merge_replace_and_build_ristretto() { maintenance::<ankurah_digest_tree::Ristretto255>().await; }
+
 #[tokio::test]
 async fn split_merge_replace_and_build_lthash() { maintenance::<ankurah_digest_tree::LtHash16>().await; }
 
@@ -92,32 +101,52 @@ async fn concurrent_updates_commute_but_rebuilds_and_stale_changes_retry() {
     assert!(tree.begin().entity_leaves(leaf(100, 1).entity_id).await.unwrap().is_empty());
 }
 
+/// A bucket split, a merge, and a branch inserted above compressed children
+/// each conflict with a concurrent head update in either commit order, and
+/// the loser's retry from fresh reads lands.
 #[tokio::test]
-async fn split_and_merge_conflict_with_updates_in_both_commit_orders() {
-    for split in [true, false] {
+async fn structural_changes_conflict_with_updates_in_both_commit_orders() {
+    for structural in ["split", "merge", "branch"] {
         for structural_first in [true, false] {
             let tree = empty_tree::<ankurah_digest_tree::Ristretto255>();
-            let initial = if split { 64 } else { 65 };
+            let initial = if structural == "split" { 64 } else { 65 };
             let mut setup = tree.begin();
             setup.build((0..initial).map(|n| leaf(n, 1))).await.unwrap();
             setup.commit().await.unwrap();
+            let structural_changes: Vec<LeafChange> = match structural {
+                "split" => vec![LeafChange { before: None, after: Some(leaf(64, 1)) }],
+                "merge" => (32..65).map(|n| LeafChange { before: Some(leaf(n, 1)), after: None }).collect(),
+                // The root's children hold the addresses beginning 0x00; this
+                // one begins 0xff, beneath neither of them.
+                _ => vec![LeafChange { before: None, after: Some(leaf(0xff00, 1)) }],
+            };
+            let head_update = LeafChange { before: Some(leaf(1, 1)), after: Some(leaf(1, 2)) };
             let (mut structure, mut update) = (tree.begin(), tree.begin());
-            if split {
-                structure.apply_change(LeafChange { before: None, after: Some(leaf(64, 1)) }).await.unwrap();
-            } else {
-                for n in 32..65 {
-                    structure.apply_change(LeafChange { before: Some(leaf(n, 1)), after: None }).await.unwrap();
-                }
+            for change in structural_changes.clone() {
+                structure.apply_change(change).await.unwrap();
             }
-            update.apply_change(LeafChange { before: Some(leaf(1, 1)), after: Some(leaf(1, 2)) }).await.unwrap();
-            if structural_first {
+            update.apply_change(head_update.clone()).await.unwrap();
+            let retry = if structural_first {
                 structure.commit().await.unwrap();
-                assert!(matches!(update.commit().await, Err(TreeError::Conflict)));
+                assert!(matches!(update.commit().await, Err(TreeError::Conflict)), "{structural}");
+                vec![head_update]
             } else {
                 update.commit().await.unwrap();
-                assert!(matches!(structure.commit().await, Err(TreeError::Conflict)));
+                assert!(matches!(structure.commit().await, Err(TreeError::Conflict)), "{structural}");
+                structural_changes
+            };
+            let mut tx = tree.begin();
+            for change in retry {
+                tx.apply_change(change).await.unwrap();
             }
-            tree.begin().audit().await.unwrap();
+            tx.commit().await.unwrap();
+            let expected = match structural {
+                "split" => 65,
+                "merge" => 32,
+                _ => 66,
+            };
+            assert_eq!(tree.begin().audit().await.unwrap().leaves, expected, "{structural}");
+            assert_eq!(tree.begin().leaf(&[], leaf(1, 2).entity_id).await.unwrap().unwrap().head, leaf(1, 2).head);
         }
     }
 }
@@ -139,7 +168,7 @@ async fn seeded_updates_moves_and_deletes_match_an_independent_model() {
         let before = model.get(&n).cloned();
         let after = rng.gen_bool(0.8).then(|| {
             let mut row = leaf(n, rng.gen());
-            row.key = CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::I64(rng.gen_range(-50..50))]).unwrap();
+            row.key = CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::I64(rng.gen_range(-50..50))]).unwrap();
             row
         });
         let mut tx = tree.begin();

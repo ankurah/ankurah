@@ -1,13 +1,9 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    ops::Bound,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, sync::Arc};
 
 use ankql::ast::{Resolved, Selection};
-use ankurah_core_types::{KeySpec, PropertyPath, ValueType};
+use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyPath, ValueType};
 use ankurah_digest_tree::{
-    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafData, NodePrefix, PropertyTypes, TreeRequest,
+    leaf_address, CanonicalCodec, Digest, DigestTree, HeadHash, LeafChange, LeafInput, NodePrefix, PropertyTypes, TreeError, TreeRequest,
     TreeTransaction,
 };
 use ankurah_proto::{
@@ -29,7 +25,11 @@ type Members = BTreeMap<Vec<u8>, EntityId>;
 const FRONTIER_BYTES: u64 = 16 * 1024;
 const OFFER_REFINEMENTS: usize = 32;
 const BULK_REFRESH_CHANGES: usize = 128;
-const COMPACT_AFTER_CHANGES: usize = 128;
+/// Builds and bulk rebuilds over at least this many leaves run on a blocking
+/// thread: over memory maps they never yield, and at about 5 µs to hash a
+/// leaf, or 2.4 µs to decode a stored one, they hold a thread for milliseconds.
+#[cfg(not(target_arch = "wasm32"))]
+const BLOCKING_BUILD_LEAVES: usize = 1024;
 
 /// The entity metadata retained with a leaf. Payloads remain in entity/storage ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,8 +42,8 @@ pub(crate) struct TreeEntry {
 impl TreeEntry {
     fn address(&self) -> Vec<u8> { leaf_address(&self.key, self.entity_id) }
 
-    fn leaf(&self) -> LeafData {
-        LeafData { key: self.key.clone(), entity_id: self.entity_id, head: HeadHash::of(self.head.ids().map(|id| id.clone().to_bytes())) }
+    fn leaf(&self) -> LeafInput {
+        LeafInput { key: self.key.clone(), entity_id: self.entity_id, head: HeadHash::of(self.head.ids().map(|id| id.clone().to_bytes())) }
     }
 }
 
@@ -119,7 +119,7 @@ impl QueryTree {
     pub fn serves(spec: &TreeSpec, selection: &Selection<Resolved>, catalog: &CatalogManager) -> bool {
         let types = CatalogTypes(catalog);
         if Self::key_paths(spec).iter().zip(&spec.key_spec().keyparts).any(|(path, part)| types.value_type(path) != Some(part.value_type))
-            || CanonicalCodec.encode_nullable(spec.key_spec(), &vec![None; spec.key_spec().keyparts.len()]).is_err()
+            || CanonicalCodec::encode_nullable(spec.key_spec(), &vec![None; spec.key_spec().keyparts.len()]).is_err()
         {
             return false;
         }
@@ -132,17 +132,7 @@ impl QueryTree {
         Self::request(selection, catalog).ok().is_some_and(|request| spec.serves(&request).is_some())
     }
 
-    pub fn key_paths(spec: &TreeSpec) -> Vec<PropertyPath> {
-        spec.key_spec()
-            .keyparts
-            .iter()
-            .map(|part| {
-                let mut path = PropertyPath::from(part.key);
-                path.subpath = part.sub_path.clone().unwrap_or_default();
-                path
-            })
-            .collect()
-    }
+    pub fn key_paths(spec: &TreeSpec) -> Vec<PropertyPath> { spec.key_spec().keyparts.iter().map(IndexKeyPart::path).collect() }
 
     pub async fn refresh_entries(&self, spec: TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Snapshot> {
         let entries = checked_entries(&spec, entries)?;
@@ -205,15 +195,14 @@ impl QueryTree {
 fn checked_entries(spec: &TreeSpec, entries: Vec<TreeEntry>) -> anyhow::Result<Entries> {
     let mut checked = Entries::new();
     for entry in entries {
-        CanonicalCodec.split(spec.key_spec(), &entry.key)?;
+        CanonicalCodec::split(spec.key_spec(), &entry.key)?;
         anyhow::ensure!(checked.insert(entry.entity_id, entry).is_none(), "duplicate tree entity");
     }
     Ok(checked)
 }
 
 fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
-    CanonicalCodec
-        .split(spec.key_spec(), &entry.key)
+    CanonicalCodec::split(spec.key_spec(), &entry.key)
         .expect("tree entries have validated canonical keys")
         .iter()
         .enumerate()
@@ -223,10 +212,8 @@ fn missing_parts(spec: &TreeSpec, entry: &TreeEntry) -> Vec<usize> {
 
 impl Index {
     async fn build(spec: TreeSpec, entries: Entries) -> anyhow::Result<Self> {
-        let tree = DigestTree::new(spec.clone());
-        let mut tx = tree.begin();
-        tx.build(entries.values().map(TreeEntry::leaf)).await?;
-        tx.commit().await?;
+        let leaves: Vec<LeafInput> = entries.values().map(TreeEntry::leaf).collect();
+        let tree = run_blocking_if_large(leaves.len(), build_tree(spec.clone(), leaves)).await??;
         let mut missing_counts = vec![0; spec.key_spec().keyparts.len()];
         for entry in entries.values() {
             for index in missing_parts(&spec, entry) {
@@ -241,35 +228,20 @@ impl Index {
         if changes.is_empty() {
             return Ok(());
         }
-        if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= self.entries.len().div_ceil(4) {
-            let mut entries = (*self.entries).clone();
-            for (id, after) in changes {
-                match after {
-                    Some(entry) => {
-                        entries.insert(id, entry);
-                    }
-                    None => {
-                        entries.remove(&id);
-                    }
-                }
-            }
-            // Construct the new maps before publishing them. No reader can observe
-            // a digest whose metadata belongs to another version, including cancellation.
-            *self = Self::build(self.tree.spec().clone(), entries).await?;
-            return Ok(());
-        }
+        let entries = &self.entries;
+        let leaf_changes = changes
+            .iter()
+            .map(|(id, after)| LeafChange { before: entries.get(id).map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) });
         let mut tx = self.tree.begin();
-        let mut addresses = BTreeSet::new();
-        for (index, (id, after)) in changes.iter().enumerate() {
-            let before = self.entries.get(id);
-            addresses.extend(before.into_iter().chain(after.iter()).map(TreeEntry::address));
-            tx.apply_change(LeafChange { before: before.map(TreeEntry::leaf), after: after.as_ref().map(TreeEntry::leaf) }).await?;
-            if (index + 1) % COMPACT_AFTER_CHANGES == 0 {
-                compact_paths(&mut tx, &addresses).await?;
-                addresses.clear();
-            }
+        if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= entries.len().div_ceil(4) {
+            // A batch this large costs less to fold in by rebuilding every
+            // tree node from the stored leaves than change by change.
+            let leaf_changes: Vec<LeafChange> = leaf_changes.collect();
+            let leaves = entries.len() + leaf_changes.len();
+            tx = run_blocking_if_large(leaves, async move { tx.rebuild_with_changes(leaf_changes).await.map(|()| tx) }).await??;
+        } else {
+            tx.apply_changes(leaf_changes).await?;
         }
-        compact_paths(&mut tx, &addresses).await?;
         // Memory commit has no suspension after publication; metadata is replaced
         // under the same owner lock before another reader can capture the index.
         tx.commit().await?;
@@ -307,22 +279,31 @@ impl Index {
     }
 }
 
-/// Resident memory trees serialize their writes, so compact touched paths before
-/// publishing instead of retaining an ever-growing history of digest deltas.
-async fn compact_paths(tree: &mut TreeTransaction, addresses: &BTreeSet<Vec<u8>>) -> anyhow::Result<()> {
-    if addresses.is_empty() {
-        return Ok(());
+/// Await `work`, an operation on a tree over memory maps that hashes or decodes
+/// about `leaves` leaves, on a blocking thread when they number at least
+/// [`BLOCKING_BUILD_LEAVES`], so that it holds no executor thread while it runs.
+#[cfg(not(target_arch = "wasm32"))]
+async fn run_blocking_if_large<R: Send + 'static>(
+    leaves: usize,
+    work: impl std::future::Future<Output = R> + Send + 'static,
+) -> anyhow::Result<R> {
+    if leaves < BLOCKING_BUILD_LEAVES {
+        return Ok(work.await);
     }
-    let mut pending = vec![NodePrefix::root()];
-    while let Some(prefix) = pending.pop() {
-        anyhow::ensure!(!tree.compact_node(&prefix).await?, "resident digest compaction exceeded its maintenance batch");
-        for child in tree.child_prefixes(&prefix).await? {
-            if addresses.iter().any(|address| child.contains_address(address)) {
-                pending.push(child);
-            }
-        }
-    }
-    Ok(())
+    Ok(tokio::task::spawn_blocking(move || futures::executor::block_on(work)).await?)
+}
+
+/// Await `work` where it is: wasm32 has no thread to block.
+#[cfg(target_arch = "wasm32")]
+async fn run_blocking_if_large<R>(_leaves: usize, work: impl std::future::Future<Output = R>) -> anyhow::Result<R> { Ok(work.await) }
+
+/// A tree defined by `spec` holding `leaves`.
+async fn build_tree(spec: TreeSpec, leaves: Vec<LeafInput>) -> Result<DigestTree, TreeError> {
+    let tree = DigestTree::new(spec);
+    let mut tx = tree.begin();
+    tx.build(leaves).await?;
+    tx.commit().await?;
+    Ok(tree)
 }
 
 #[cfg(test)]
@@ -331,7 +312,7 @@ fn entry_from_state(spec: &TreeSpec, state: &Attested<EntityState>) -> anyhow::R
     let values = QueryTree::key_paths(spec).iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
     Ok(TreeEntry {
         entity_id: state.payload.entity_id,
-        key: CanonicalCodec.encode_nullable(spec.key_spec(), &values)?,
+        key: CanonicalCodec::encode_nullable(spec.key_spec(), &values)?,
         head: state.payload.state.head.clone(),
     })
 }
@@ -375,7 +356,7 @@ impl Snapshot {
     }
 
     async fn select_request(mut self, request: &TreeRequest) -> anyhow::Result<Self> {
-        let ranges = self.physical_spec.scope_addresses(request, &self.members)?;
+        let ranges = self.physical_spec.selected_spans(request, &self.members)?;
         self.restrict(ranges);
         Ok(self)
     }
@@ -403,14 +384,14 @@ impl Snapshot {
 
     pub async fn span_digest(&mut self, bounds: proto::TreeSpan) -> anyhow::Result<TreeSpanDigest> {
         let ranges = match &self.ranges {
-            Some(ranges) => ranges.iter().filter_map(|range| intersect_span(range, &bounds)).collect::<Vec<_>>(),
+            Some(ranges) => ranges.iter().filter_map(|range| range.intersect(&bounds)).collect::<Vec<_>>(),
             None => vec![bounds.clone()],
         };
         if ranges.is_empty() {
             return Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: Digest::empty() });
         }
         let tree = &mut self.tree;
-        let scope = tree.scope_ranges(ranges);
+        let scope = tree.scope_spans(ranges);
         Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
     }
 
@@ -556,7 +537,7 @@ impl Snapshot {
         let ranges = if self.physical_spec.predicate() == &membership.predicate {
             vec![super::whole()]
         } else {
-            self.physical_spec.scope_addresses(&QueryTree::request(&membership, catalog)?, &self.members)?
+            self.physical_spec.selected_spans(&QueryTree::request(&membership, catalog)?, &self.members)?
         };
         let paths = QueryTree::key_paths(&self.physical_spec);
         let order = selection
@@ -576,7 +557,7 @@ impl Snapshot {
         for range in ranges.iter().filter(|range| !range.is_empty()) {
             for (_, id) in self.members.range((range.start.clone(), range.end.clone())) {
                 let entry = &self.entries[id];
-                let parts = if order.is_empty() { Vec::new() } else { CanonicalCodec.split(self.physical_spec.key_spec(), &entry.key)? };
+                let parts = if order.is_empty() { Vec::new() } else { CanonicalCodec::split(self.physical_spec.key_spec(), &entry.key)? };
                 rows.push((*id, parts));
             }
         }
@@ -618,15 +599,6 @@ impl Snapshot {
             .take(limit)
             .map(|(address, id)| (address.as_slice(), &self.entries[id]))
     }
-}
-
-fn intersect_span(left: &proto::TreeSpan, right: &proto::TreeSpan) -> Option<proto::TreeSpan> {
-    let start = if left.cmp_start(right).is_ge() { left.start.clone() } else { right.start.clone() };
-    let left_end = proto::TreeSpan::new(Bound::Unbounded, left.end.clone());
-    let right_end = proto::TreeSpan::new(Bound::Unbounded, right.end.clone());
-    let end = if left_end.is_subset_of(&right_end) { left.end.clone() } else { right.end.clone() };
-    let result = proto::TreeSpan::new(start, end);
-    (!result.is_empty()).then_some(result)
 }
 
 #[cfg(test)]

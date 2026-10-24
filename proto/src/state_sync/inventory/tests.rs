@@ -224,7 +224,7 @@ fn an_inventory_lists_each_entity_once() {
 
     // Under a keyed spec one entity can sit at two addresses in address order.
     let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(PropertyId::Id, ValueType::I64)]), ankql::ast::Predicate::True);
-    let key = |n| CanonicalCodec.encode_nullable(spec.key_spec(), &[Some(Value::I64(n))]).unwrap();
+    let key = |n| CanonicalCodec::encode_nullable(spec.key_spec(), &[Some(Value::I64(n))]).unwrap();
     let mut heads = keyed_heads(&[key(1), key(2)], 1);
     heads[1].entity.entity_id = heads[0].entity.entity_id;
     let inventory = TreeSpanInventory { bounds: TreeSpan::all(), heads: packed(heads) };

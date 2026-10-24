@@ -4,7 +4,7 @@ use std::error::Error;
 
 use ankurah_core_types::EntityId;
 
-use crate::prefix::NodePrefix;
+use crate::address::NodePrefix;
 
 /// Why an operation on a tree could not read or write.
 #[derive(Debug, thiserror::Error)]
@@ -18,22 +18,36 @@ pub enum TreeError {
     /// This request exceeds the supported predicate proof or ordering subset.
     #[error("this tree cannot serve the selection with exact bounds and ordering")]
     UnsupportedSelection,
-    /// The audit found a mismatch between derived rows and leaves.
-    #[error("tree audit failed: {0}")]
-    Audit(&'static str),
+    /// Rows the tree derives from its leaves, the entity lookup and the tree
+    /// node rows, disagree with each other or with the leaves: the rows are
+    /// damaged, and the tree is rebuilt from its leaves.
+    #[error("tree rows are inconsistent: {0}")]
+    Inconsistent(&'static str),
     /// A build supplied the same leaf address twice.
     #[error("duplicate leaf address")]
     DuplicateLeaf,
     /// A key or value cannot be encoded under this key spec.
     #[error("invalid key: {0}")]
     InvalidKey(&'static str),
+    /// A span or page argument is unusable: a span that holds no address, a
+    /// span digest whose bounds leave its prefix or whose count is negative,
+    /// a span digest of an unknown version, or a page of no leaves.
+    #[error("invalid span: {0}")]
+    InvalidSpan(&'static str),
     /// A conditional write found another value under its key than the writer
-    /// expected, when the write was made or when its transaction committed:
-    /// another transaction wrote there since the writer read. The whole
-    /// transaction fails and nothing it wrote lands; the writer retries from
-    /// fresh reads in a new transaction.
+    /// expected, when the write was made or when its transaction committed,
+    /// or a change found its leaf other than it expected: another transaction
+    /// wrote there since the writer read. The whole transaction fails and
+    /// nothing it wrote lands; the writer retries from fresh reads in a new
+    /// transaction.
     #[error("a conditional write found another value than expected")]
     Conflict,
+    /// An earlier operation in the transaction failed for a reason other than
+    /// a conflict, or was cancelled or panicked before it finished, so the
+    /// transaction cannot commit. Nothing it wrote lands, and a retry can meet
+    /// the same failure.
+    #[error("an earlier operation failed, so the transaction cannot commit")]
+    Poisoned,
     /// Deltas exist without the base that says what they changed. They cannot
     /// be read as a subtree summary or compacted into a new base.
     #[error("tree node {0:?} has deltas but no base")]
@@ -52,7 +66,7 @@ pub enum TreeError {
     /// leaves, so it is rebuilt from them.
     #[error("a stored {what} does not decode")]
     Unreadable {
-        /// Which key or value, as the [`layout`](crate::layout) names them:
+        /// Which key or value, as the tree's layout of its rows names them:
         /// "leaf value", "node key" and so on.
         what: &'static str,
         /// What was wrong with the bytes, when a decoder said.

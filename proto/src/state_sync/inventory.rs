@@ -63,10 +63,7 @@ impl TreeSpanInventory {
 }
 
 /// Checks that `key` is canonical under the spec's key parts.
-pub(crate) fn check_key(spec: &TreeSpec, key: &[u8]) -> Result<(), TreeError> {
-    CanonicalCodec.split(spec.key_spec(), key)?;
-    Ok(())
-}
+pub(crate) fn check_key(spec: &TreeSpec, key: &[u8]) -> Result<(), TreeError> { CanonicalCodec::check(spec.key_spec(), key) }
 
 /// An entity's identity and causal frontier.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

@@ -1,7 +1,11 @@
+//! Scoped reads checked against models of the leaves: counts, digests, pages
+//! and refinements of the scope a Selection makes, under mixed directions,
+//! limits, disjunctions, nulls and bucket edges.
+
 mod common;
 use ankql::ast::{OrderByItem, OrderDirection, Selection};
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyPath, Value, ValueType};
-use ankurah_digest_tree::{CanonicalCodec, Digest, DigestTree, HeadHash, Leaf, LeafChange, LeafData, TreeError, TreeRequest, TreeSpec};
+use ankurah_digest_tree::{CanonicalCodec, Digest, DigestTree, HeadHash, Leaf, LeafChange, LeafInput, TreeError, TreeRequest, TreeSpec};
 use common::{entity, property, types};
 
 #[tokio::test]
@@ -13,13 +17,12 @@ async fn mixed_directions_limits_and_pages_match_a_sorted_model() {
         IndexKeyPart::asc(property("bar"), ValueType::I64),
     ]);
     let tree = DigestTree::new(TreeSpec::new(key, admission.predicate.clone()));
-    let codec = CanonicalCodec;
     let mut model = Vec::new();
     let mut build = tree.begin();
     for n in 0..150u8 {
         let (foo, bar) = (i64::from(n % 7), i64::from((n / 7) % 5));
-        let key = codec.encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(foo), Value::I64(bar)]).unwrap();
-        model.push((foo, bar, LeafData { key, entity_id: entity(n), head: HeadHash::of([[n; 32]]) }));
+        let key = CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(foo), Value::I64(bar)]).unwrap();
+        model.push((foo, bar, LeafInput { key, entity_id: entity(n), head: HeadHash::of([[n; 32]]) }));
     }
     build.build(model.iter().map(|(_, _, leaf)| leaf.clone())).await.unwrap();
     build.commit().await.unwrap();
@@ -61,9 +64,9 @@ async fn mixed_directions_limits_and_pages_match_a_sorted_model() {
                     }
                 }
                 assert_eq!(rows, expected.iter().map(|(_, _, leaf)| leaf.entity_id).collect::<Vec<_>>());
-                for head in tx.span_digests(&scope).await.unwrap() {
-                    let refined: Digest = tx.refine(&head).await.unwrap().iter().map(|head| head.digest).sum();
-                    assert_eq!(refined, head.digest);
+                for span_digest in tx.span_digests(&scope).await.unwrap() {
+                    let refined: Digest = tx.refine(&span_digest).await.unwrap().iter().map(|child| child.digest).sum();
+                    assert_eq!(refined, span_digest.digest);
                 }
             }
         }
@@ -79,8 +82,8 @@ async fn disjunctions_nulls_and_embedded_nuls_have_exact_bounds() {
     let model: Vec<_> = values
         .iter()
         .enumerate()
-        .map(|(n, value)| LeafData {
-            key: CanonicalCodec.encode_nullable(tree.spec().key_spec(), &[value.map(Value::from)]).unwrap(),
+        .map(|(n, value)| LeafInput {
+            key: CanonicalCodec::encode_nullable(tree.spec().key_spec(), &[value.map(Value::from)]).unwrap(),
             entity_id: entity(n as u8),
             head: HeadHash::of([[n as u8; 32]]),
         })
@@ -115,7 +118,7 @@ async fn scope_lifetime_and_multiplicity_are_checked() {
     let scope = tx.scope(&request).await.unwrap();
     assert!(matches!(tree.begin().count(&scope).await, Err(TreeError::StaleScope)));
     let row = tx.entity_leaves(entity(2)).await.unwrap().pop().unwrap();
-    tx.apply_change(LeafChange { before: Some(LeafData { key: row.key, entity_id: row.entity_id, head: row.head }), after: None })
+    tx.apply_change(LeafChange { before: Some(LeafInput { key: row.key, entity_id: row.entity_id, head: row.head }), after: None })
         .await
         .unwrap();
     assert!(matches!(tx.count(&scope).await, Err(TreeError::StaleScope)));
@@ -125,8 +128,8 @@ async fn scope_lifetime_and_multiplicity_are_checked() {
     let mut other = tree.begin();
     let other_scope = other.scope(&request).await.unwrap();
     assert_eq!(other.count(&other_scope).await.unwrap(), 2);
-    let duplicate = LeafData {
-        key: CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(20)]).unwrap(),
+    let duplicate = LeafInput {
+        key: CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::from("acme"), Value::I64(20)]).unwrap(),
         entity_id: entity(3),
         head: HeadHash::of([[1; 32]]),
     };
@@ -142,8 +145,8 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
     let model: Vec<_> = (0..200u8)
         .map(|n| {
             let value = i64::from(n) - 100;
-            let row = LeafData {
-                key: CanonicalCodec.encode_prefix(tree.spec().key_spec(), &[Value::I64(value)]).unwrap(),
+            let row = LeafInput {
+                key: CanonicalCodec::encode_prefix(tree.spec().key_spec(), &[Value::I64(value)]).unwrap(),
                 entity_id: entity(n),
                 head: HeadHash::of([[n; 32]]),
             };
@@ -188,41 +191,12 @@ async fn bounded_queries_match_a_numeric_model_across_bucket_edges() {
     });
     let scope = tx.scope(&TreeRequest::for_selection(&query, &types()).unwrap()).await.unwrap();
     assert_eq!(tx.count(&scope).await.unwrap(), 20);
-    let scope = tx.scope_ranges([ankurah_digest_tree::TreeSpan::all()]);
+    let scope = tx.scope_spans([ankurah_digest_tree::TreeSpan::all()]);
     let root = tx.span_digests(&scope).await.unwrap().pop().unwrap();
     let children = tx.refine(&root).await.unwrap();
-    assert_eq!(children.iter().map(|head| head.digest).sum::<Digest>(), root.digest);
-    for head in children {
-        let subset = tx.scope_ranges([head.bounds.clone()]);
-        assert_eq!(tx.digest(&subset).await.unwrap(), head.digest);
-        let mut invalid = head.to_bytes();
-        invalid.push(0);
-        assert!(ankurah_digest_tree::TreeSpanDigest::<ankurah_digest_tree::Ristretto255>::from_bytes(&invalid).is_err());
-    }
-}
-
-#[test]
-fn typed_and_decoded_span_digests_reject_the_same_invalid_bounds_and_counts() {
-    use ankurah_digest_tree::{NodePrefix, TreeSpan, TreeSpanDigest};
-    use std::ops::Bound::{Excluded, Included};
-
-    let prefix = NodePrefix::of(&[0x80], 1);
-    let valid = TreeSpanDigest::<ankurah_digest_tree::Ristretto255> {
-        prefix: prefix.clone(),
-        bounds: TreeSpan::under(&prefix),
-        digest: Digest::empty(),
-    };
-    valid.validate().unwrap();
-    assert_eq!(TreeSpanDigest::from_bytes(&valid.to_bytes()).unwrap(), valid);
-    let leaf = Digest::from(Leaf::new(&[], entity(1), HeadHash::of([[1; 32]])).element());
-    let invalid = [
-        TreeSpanDigest { bounds: TreeSpan::new(Excluded(vec![0x80]), Included(vec![0x80])), ..valid.clone() },
-        TreeSpanDigest { bounds: TreeSpan::new(Included(vec![0x90]), Included(vec![0x80])), ..valid.clone() },
-        TreeSpanDigest { bounds: TreeSpan::all(), ..valid.clone() },
-        TreeSpanDigest { digest: -leaf, ..valid },
-    ];
-    for head in invalid {
-        assert!(head.validate().is_err());
-        assert!(TreeSpanDigest::<ankurah_digest_tree::Ristretto255>::from_bytes(&head.to_bytes()).is_err());
+    assert_eq!(children.iter().map(|child| child.digest).sum::<Digest>(), root.digest);
+    for child in children {
+        let subset = tx.scope_spans([child.bounds.clone()]);
+        assert_eq!(tx.digest(&subset).await.unwrap(), child.digest);
     }
 }

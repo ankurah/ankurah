@@ -1,4 +1,8 @@
-//! Reuse examples checked against independently specified membership.
+//! Compatible Selections share one tree: a tree serves its own Selection
+//! whole, and a narrower Selection, whose members its admission covers, as
+//! exact spans of its leaves in its key order, so serving it builds no second
+//! tree. Each example is checked against membership written out by hand.
+
 mod common;
 use ankurah_digest_tree::{Digest, Leaf, TreeMatch, TreeRequest};
 use common::{populated_tree, types};
@@ -28,9 +32,6 @@ async fn one_tree_serves_its_own_selection_whole_and_a_narrower_one_as_a_span() 
         );
         let expected: Digest = page.leaves.iter().map(|row| Digest::from(Leaf::new(&row.key, row.entity_id, row.head).element())).sum();
         assert_eq!(tx.digest(&scope).await.unwrap(), expected);
-        for head in tx.span_digests(&scope).await.unwrap() {
-            assert_eq!(ankurah_digest_tree::TreeSpanDigest::from_bytes(&head.to_bytes()).unwrap(), head);
-        }
     }
 }
 
