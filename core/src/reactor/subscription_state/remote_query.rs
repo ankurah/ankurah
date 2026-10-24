@@ -2,10 +2,11 @@
 //! reconciling a query's rows with a stream's answer, and evaluating a stream's publication for
 //! the query that owns it.
 
-use super::{membership_item, PreparedEvents, QueryState, Subscription};
+use super::{membership_item, QueryState, Subscription};
 use crate::{
     reactor::{
-        AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, PeerQueryMembership, ReactorUpdateItem, WatcherChange,
+        delivery::PreparedEvents, AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, PeerQueryMembership,
+        ReactorUpdateItem, WatcherChange,
     },
     resultset::ResultSetWrite,
     selection::filter::{evaluate_predicate, Filterable},

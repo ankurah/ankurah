@@ -1,5 +1,6 @@
 use crate::internal::prelude::*;
 use crate::reactor::{
+    delivery::{self, DeliveredHeads, DeliveryPlan, PreparedEvents},
     AbstractEntity, CandidateChanges, ChangeNotification, LocalEntitySource, MembershipChange, ReactorSubscriptionId, ReactorUpdate,
     ReactorUpdateItem, WatcherChange,
 };
@@ -42,7 +43,7 @@ pub(super) struct QueryState<E: AbstractEntity + Filterable + Send + 'static> {
     pub(crate) version: u32,
     /// Remains pending across partial publications of a replacement selection.
     initializing: bool,
-    delivered: HashMap<proto::EntityId, proto::Clock>,
+    delivered: DeliveredHeads,
 }
 
 // We would call this ReactorSubscription, but that name is reserved for the public API
@@ -72,14 +73,10 @@ struct State<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     pub(crate) queries: HashMap<proto::QueryId, QueryState<E>>,
     /// Explicit entity subscriptions, independent of the matches in `queries`.
     pub(crate) entity_subscriptions: HashSet<proto::EntityId>,
-    entity_delivered: HashMap<proto::EntityId, proto::Clock>,
+    entity_delivered: DeliveredHeads,
     // not sure if we actually need this
     pub(crate) entities: HashMap<proto::EntityId, E>,
     pub(crate) broadcast: ankurah_signals::broadcast::Broadcast<ReactorUpdate<E, Ev>>,
-}
-
-pub(super) struct PreparedEvents<Ev> {
-    rows: HashMap<(Option<proto::QueryId>, usize), (proto::Clock, Vec<Ev>)>,
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> Subscription<E, Ev> {
@@ -92,7 +89,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             state: std::sync::Mutex::new(State {
                 queries: HashMap::new(),
                 entity_subscriptions: HashSet::new(),
-                entity_delivered: HashMap::new(),
+                entity_delivered: DeliveredHeads::default(),
                 entities: HashMap::new(),
                 broadcast,
             }),
@@ -110,7 +107,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
     pub fn remove_entity_subscription(&self, entity_id: proto::EntityId) {
         let mut state = self.state.lock().unwrap();
         state.entity_subscriptions.remove(&entity_id);
-        state.entity_delivered.remove(&entity_id);
+        state.entity_delivered.forget(&entity_id);
     }
 
     /// Check if any queries match this entity (for determining if entity watcher should be removed)
@@ -178,7 +175,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 resultset,
                 version: 0,
                 initializing: true,
-                delivered: HashMap::new(),
+                delivered: DeliveredHeads::default(),
             },
         );
         true
@@ -300,10 +297,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         // Existing event frontiers survive silent state repairs and refreshes.
         for (id, entity) in rw_resultset.iter_entities() {
             if let Some(head) = membership.and_then(|m| m.baseline.get(&id)).cloned().or_else(|| entity.head()) {
-                query_state.delivered.entry(id).or_insert(head);
+                query_state.delivered.start(id, head);
             }
         }
-        query_state.delivered.retain(|id, _| rw_resultset.contains(id));
+        query_state.delivered.retain(|id| rw_resultset.contains(id));
         query_state.paused = false;
         query_state.version = version;
         if complete {
@@ -383,54 +380,30 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                         rows.push((offset, entity.id(), change.events().to_vec()));
                     }
                 }
-                let delivered: HashMap<_, _> =
-                    rows.iter().filter_map(|(_, id, _)| query.delivered.get(id).map(|head| (*id, head.clone()))).collect();
-                plans.push((Some(id), query.version, delivered, rows));
+                let delivered = query.delivered.of(rows.iter().map(|(_, id, _)| *id));
+                plans.push(DeliveryPlan { query: Some(id), version: query.version, delivered, rows });
             }
-            let rows = candidates
+            let rows: Vec<_> = candidates
                 .entity_iter()
                 .enumerate()
                 .filter(|(_, c)| state.entity_subscriptions.contains(&c.entity().id()))
                 .map(|(offset, c)| (offset, c.entity().id(), c.events().to_vec()))
                 .collect();
-            let delivered = candidates
-                .entity_iter()
-                .filter_map(|c| state.entity_delivered.get(&c.entity().id()).map(|h| (c.entity().id(), h.clone())))
-                .collect();
-            plans.push((None, 0, delivered, rows));
+            let delivered = state.entity_delivered.of(rows.iter().map(|(_, id, _)| *id));
+            plans.push(DeliveryPlan { query: None, version: 0, delivered, rows });
             plans
         };
-        let mut prepared = PreparedEvents { rows: HashMap::new() };
-        let mut failures = Vec::new();
-        for (query, version, mut delivered, rows) in plans {
-            let mut staged = Vec::new();
-            let mut failure = None;
-            for (offset, id, events) in rows {
-                match super::delivery::undelivered_events(history, delivered.get(&id).cloned().unwrap_or_default(), &events).await {
-                    Ok((head, events)) => {
-                        if !head.is_empty() {
-                            delivered.insert(id, head.clone());
-                        }
-                        staged.push(((query, offset), (head, events)));
-                    }
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                }
-            }
-            if let Some(error) = failure {
-                let mut state = self.state.lock().unwrap();
-                if let Some(query) = query.and_then(|id| state.queries.get_mut(&id)) {
+        let (prepared, failures) = delivery::prepare(history, plans).await;
+        if !failures.is_empty() {
+            let mut state = self.state.lock().unwrap();
+            for failure in &failures {
+                if let Some(query) = failure.query.and_then(|id| state.queries.get_mut(&id)) {
                     query.paused = true;
                     query.resultset.set_loaded(false);
-                } else if query.is_none() {
+                } else if failure.query.is_none() {
                     state.entity_subscriptions.clear();
                     state.entity_delivered.clear();
                 }
-                failures.push(crate::reactor::NotificationFailure { query, version, error });
-            } else {
-                prepared.rows.extend(staged);
             }
         }
         (prepared, failures)
@@ -442,39 +415,26 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         changes: &mut [ReactorUpdateItem<E, Ev>],
         baseline: &HashMap<proto::EntityId, proto::Clock>,
         history: Option<&(dyn crate::retrieval::GetEvents + Send + Sync)>,
-    ) -> Result<HashMap<proto::EntityId, proto::Clock>, RetrievalError> {
+    ) -> Result<DeliveredHeads, RetrievalError> {
         let mut delivered = {
             let state = self.state.lock().unwrap();
             let query = state.queries.get(&query_id).ok_or_else(|| RetrievalError::Other("query disappeared".into()))?;
-            let mut delivered = HashMap::new();
+            let mut delivered = query.delivered.of(changes.iter().map(|change| change.entity.id()));
             for change in changes.iter() {
-                let id = change.entity.id();
-                if let Some(head) = query.delivered.get(&id).or_else(|| baseline.get(&id)) {
-                    delivered.insert(id, head.clone());
+                if let Some(head) = baseline.get(&change.entity.id()) {
+                    delivered.start(change.entity.id(), head.clone());
                 }
             }
             delivered
         };
-        let mut filtered = Vec::with_capacity(changes.len());
-        for change in changes.iter() {
-            let id = change.entity.id();
-            let (head, events) =
-                super::delivery::undelivered_events(history, delivered.get(&id).cloned().unwrap_or_default(), &change.events).await?;
-            if !head.is_empty() {
-                delivered.insert(id, head);
-            }
-            filtered.push(events);
-        }
-        for (change, events) in changes.iter_mut().zip(filtered) {
-            change.events = events;
-        }
+        delivery::filter_changes(history, &mut delivered, changes).await?;
         Ok(delivered)
     }
 
-    pub(super) fn commit_query_events(&self, query_id: proto::QueryId, delivered: HashMap<proto::EntityId, proto::Clock>) {
+    pub(super) fn commit_query_events(&self, query_id: proto::QueryId, delivered: DeliveredHeads) {
         let mut state = self.state.lock().unwrap();
         if let Some(query) = state.queries.get_mut(&query_id) {
-            query.delivered.extend(delivered.into_iter().filter(|(id, _)| query.resultset.contains_key(id)));
+            query.delivered.extend_from(delivered, |id| query.resultset.contains_key(id));
         }
     }
 
@@ -580,10 +540,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 let entity_subscribed = state.entity_subscriptions.contains(&entity_id);
                 // Removal currently carries state too; never send a newly denied state (#426 owns claw-back).
                 if can_read && (matches || did_match || entity_subscribed) {
-                    let (head, events) = prepared.rows.remove(&(Some(query_id), offset)).unwrap_or_default();
-                    if !head.is_empty() {
-                        query_state.delivered.insert(entity_id, head);
-                    }
+                    let (head, events) = prepared.take(Some(query_id), offset).unwrap_or_default();
+                    query_state.delivered.advance(entity_id, head);
                     let duplicate = !change.events().is_empty() && events.is_empty();
                     if duplicate && membership_change.is_none() {
                         continue;
@@ -613,7 +571,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                     }
                 }
                 if !matches {
-                    query_state.delivered.remove(&entity_id);
+                    query_state.delivered.forget(&entity_id);
                 }
             }
             if current_publication {
@@ -627,10 +585,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             let entity_id = AbstractEntity::id(entity);
 
             if state.entity_subscriptions.contains(&entity_id) {
-                let (head, events) = prepared.rows.remove(&(None, offset)).unwrap_or_default();
-                if !head.is_empty() {
-                    state.entity_delivered.insert(entity_id, head);
-                }
+                let (head, events) = prepared.take(None, offset).unwrap_or_default();
+                state.entity_delivered.advance(entity_id, head);
                 if !items.contains_key(&entity_id) && (change.events().is_empty() || !events.is_empty()) {
                     items.insert(entity_id, ReactorUpdateItem { entity: entity.clone(), events, predicate_relevance: Vec::new() });
                 }
