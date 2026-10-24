@@ -119,7 +119,10 @@ struct ReactorInner<E: AbstractEntity + Filterable + Send + 'static, Ev> {
     watcher_set: Arc<std::sync::Mutex<WatcherSet>>,
     /// Prevent query installation or clearing from interleaving with change dispatch's
     /// watcher lookup, result updates, and watcher maintenance. The map locks protect
-    /// individual accesses, not that sequence. Fetch and gap-fill I/O stay outside this lock.
+    /// individual accesses, not that sequence. Local fetches and gap fills read storage outside
+    /// this lock, but the proof of which events a query has yet to deliver reads event history
+    /// under it, because that proof must see the delivered heads the same dispatch then
+    /// advances. One slow history walk therefore delays every other notification and install.
     notify_lock: tokio::sync::Mutex<()>,
     #[cfg(test)]
     publication_pause: Mutex<Option<(proto::ModelId, tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>)>>,
