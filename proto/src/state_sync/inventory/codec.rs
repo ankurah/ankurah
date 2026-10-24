@@ -1,3 +1,5 @@
+//! The packed inventory's byte format, with its writer and its validating reader.
+//!
 //! Payload: encoding tag, head count, then key, entity ID and clock for each head.
 //! Counts, lengths and clock generations use unsigned little-endian bincode varints.
 //! The prefix encoding adds the shared-byte count before each key suffix. IDs are

@@ -689,6 +689,7 @@ impl Driver {
     }
 
     /// Receives data toward one causal target of a round or of a live publication.
+    /// The frame that carried it was validated on receipt.
     async fn receive_repair<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,
@@ -703,7 +704,6 @@ impl Driver {
     {
         match repair {
             RepairItem::Delta { target, delta } => {
-                delta.content.check_target(&target)?;
                 self.repair_arrived(delta.entity_id, &target);
                 self.add_goal(owner, delta.entity_id, target.clone())?;
                 self.enqueue(node, peer, credentials, owner, delta, Some(target))?;

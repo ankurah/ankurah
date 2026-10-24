@@ -182,9 +182,9 @@ pub enum NodeResponseBody {
     GetEvents(Vec<Attested<Event>>),
     QuerySubscribed {
         query_id: QueryId,
-        /// The stream's first frame. The subscription exists once this reply arrives;
-        /// its first round completes later, and live publications follow the revision
-        /// that round's snapshot reflects.
+        /// The stream's opening reply. The subscription exists once it arrives; its
+        /// first round completes later, and live publications follow the revision that
+        /// round's snapshot reflects.
         state: StateReply,
     },
     /// The resolved schema, with build ids echoed for descriptor binding.

@@ -70,14 +70,13 @@ impl Pending {
     fn take_run<T>(&mut self, mut take: impl FnMut(PendingAnswer) -> Result<T, PendingAnswer>) -> anyhow::Result<Vec<T>> {
         let mut run = Vec::new();
         let mut bytes = 0;
-        while let Some(answer) = self.answers.pop_front() {
+        while let Some(answer) = self.answers.front() {
             let size = answer.bytes()? as usize;
             ensure!(size <= MAX_PAGE_BYTES, "state answer exceeds limit");
             if run.len() == MAX_FEEDBACK_ANSWERS || bytes + size > MAX_PAGE_BYTES {
-                self.answers.push_front(answer);
                 break;
             }
-            match take(answer) {
+            match take(self.answers.pop_front().unwrap()) {
                 Ok(item) => {
                     bytes += size;
                     run.push(item);

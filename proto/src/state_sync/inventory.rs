@@ -30,7 +30,7 @@ pub struct TreeSpanInventory {
 }
 
 impl TreeSpanInventory {
-    /// Check canonical keys, nonempty bounds, strictly increasing addresses within
+    /// Checks canonical keys, nonempty bounds, strictly increasing addresses within
     /// those bounds, and each entity at most once. Reads borrowed heads without
     /// rebuilding their clocks. Message limits and correspondence to a requested
     /// span belong to the caller.
@@ -84,7 +84,8 @@ pub struct KeyedEntityHead {
     /// It belongs to this tree: another KeySpec can place the same EntityHead
     /// under a different key.
     pub key: Vec<u8>,
-    /// The actual clock avoids another round trip when constructing an EventBridge.
+    /// The entity's whole head, so a responder can build an event bridge from it
+    /// without another round trip.
     pub entity: EntityHead,
 }
 

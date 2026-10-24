@@ -1113,7 +1113,7 @@ async fn applied_releases_only_its_round_snapshot_and_old_controls_cannot_retire
                     id,
                     0,
                     None,
-                    Some(proto::FeedbackAnswers::Round { round: 0, answers: answers }),
+                    Some(proto::FeedbackAnswers::Round { round: 0, answers }),
                     vec![]
                 )
                 .await?,
