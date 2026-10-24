@@ -343,6 +343,45 @@ async fn a_top_level_compound_select_reads_exactly_or_is_refused() -> Result<()>
     Ok(())
 }
 
+/// A call passes a value for every parameter of its statement, and no more,
+/// on every driver: one passing too few is refused before it runs, where
+/// node:sqlite would bind NULL for each value missing, and so is one passing
+/// too many. A numbered parameter counts as its number.
+#[engine_test]
+async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (passed, refused, stored) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE pairs (a, b)", &[])?;
+            let seven = SqliteValueRef::Integer(7);
+            // Each statement runs first with every value it takes, so that a
+            // count kept from that run cannot let a shorter call through.
+            let passed = [
+                executor.query("SELECT ?, ?", &[seven, seven]).map(|rows| rows.len()),
+                executor.execute("INSERT INTO pairs VALUES (?, ?)", &[seven, seven]),
+            ];
+            let refused = [
+                executor.query("SELECT ?, ?", &[seven]).map(|rows| rows.len()),
+                executor.query("SELECT ?, ?", &[]).map(|rows| rows.len()),
+                executor.execute("INSERT INTO pairs VALUES (?, ?)", &[seven]),
+                executor.query("SELECT ?3", &[seven, seven]).map(|rows| rows.len()),
+                executor.query("SELECT ?, ?", &[seven; 3]).map(|rows| rows.len()),
+                executor.execute("INSERT INTO pairs VALUES (?, ?)", &[seven; 3]),
+            ];
+            let stored = executor.query_row("SELECT count(*), count(b) FROM pairs", &[])?.expect("one row");
+            Ok((
+                passed.map(|outcome| outcome.map_err(|error| error.to_string())),
+                refused.map(|outcome| outcome.is_err()),
+                (stored.integer(0)?, stored.integer(1)?),
+            ))
+        })
+        .await?;
+    assert_eq!(passed, [Ok(1), Ok(1)]);
+    assert_eq!(refused, [true; 6]);
+    assert_eq!(stored, (1, 1), "only the insert given both values wrote a row");
+    Ok(())
+}
+
 /// A connection the engine opens on a file takes the session settings
 /// connection.rs gives a native one, on every driver.
 #[engine_test]

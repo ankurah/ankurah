@@ -80,16 +80,30 @@ impl SqliteStorageEngine {
 }
 
 /// One `DatabaseSync`-shaped database. Clones share the same JavaScript
-/// object and the same kept typed readers.
+/// object, the same kept typed readers and the same checked parameter counts.
 #[derive(Clone)]
 pub struct NodeConnection {
     // The JavaScript handles are bound to the thread that made them; WASM has one.
     database: SendWrapper<JsValue>,
     readers: SendWrapper<Rc<RefCell<Readers>>>,
+    /// `None` on a database that refuses a call passing too few values itself.
+    parameters: Option<SendWrapper<CheckedParameters>>,
 }
+
+/// On a database that binds NULL for a positional parameter a call does not
+/// pass, how many values each SQL text's statement was shown to take at
+/// most, by that text (see `check_parameters`).
+type CheckedParameters = Rc<RefCell<HashMap<String, usize>>>;
 
 /// How many typed readers a connection keeps prepared.
 const KEPT_READERS: usize = 64;
+
+/// How many SQL texts' parameter counts a connection keeps; past that it
+/// forgets them all, and checks each statement again when it next runs.
+const CHECKED_PARAMETERS: usize = 256;
+
+/// SQLite's result code for a parameter index out of range.
+const SQLITE_RANGE: i32 = 25;
 
 /// The typed readers a connection has prepared, by the SQL text of the
 /// statement each reads, so that a query run again skips both prepares,
@@ -129,12 +143,17 @@ impl NodeConnection {
         }
         method(&database, "prepare")?;
         method(&database, "exec")?;
-        let connection = Self { database: SendWrapper::new(database), readers: SendWrapper::new(Rc::default()) };
+        let mut connection = Self { database: SendWrapper::new(database), readers: SendWrapper::new(Rc::default()), parameters: None };
         // A database whose statements do not hand rows over as the executor
         // reads them is refused here rather than at its first query.
         let probe = connection.query("SELECT 1", &[])?;
         if !matches!(probe.as_slice(), [row] if matches!(row.values(), [SqliteValue::Integer(1)])) {
             return Err(SqliteError::Node(format!("`SELECT 1` read back as {probe:?}, not as one row holding the INTEGER 1")));
+        }
+        // On a database that binds NULL for a parameter a call does not pass,
+        // the executor checks each statement's count of parameters itself.
+        if connection.binds_null_for_a_missing_parameter()? {
+            connection.parameters = Some(SendWrapper::new(Rc::default()));
         }
         // The typed reader takes TEXT as the bytes SQLite stores, which are
         // UTF-8 only in a UTF-8 database. rusqlite has SQLite convert the TEXT
@@ -268,6 +287,59 @@ impl NodeConnection {
         Ok(versions)
     }
 
+    /// Whether the database binds NULL for a positional parameter a call does
+    /// not pass, as node:sqlite does, rather than refusing the call, as
+    /// rusqlite and better-sqlite3 do.
+    fn binds_null_for_a_missing_parameter(&self) -> Result<bool, SqliteError> {
+        let statement = method(&self.database, "prepare")?.call1(&self.database, &"SELECT ?".into()).map_err(js_error)?;
+        let get = statement_method(&statement, "get")?;
+        if get.call0(&statement).is_ok() {
+            return Ok(true);
+        }
+        // The call was refused for the value it did not pass only if the same
+        // call passing that value runs.
+        get.call1(&statement, &JsValue::NULL).map_err(js_error)?;
+        Ok(false)
+    }
+
+    /// Refuse a call to `sql` that passes fewer values than its statement
+    /// takes parameters, on a database that would bind NULL for each one
+    /// missing, before it runs; rusqlite refuses such a call. The statement's
+    /// EXPLAIN, which runs nothing, is bound one value more than the call
+    /// passes, and SQLite refuses the extra value (SQLITE_RANGE) exactly when
+    /// the statement takes no more parameters than were passed. A call that
+    /// passes too many, node:sqlite refuses itself. The count shown is kept by
+    /// SQL text, so a statement run again with as many values is only looked up.
+    fn check_parameters(&self, sql: &str, passed: usize) -> Result<(), SqliteError> {
+        let Some(checked) = &self.parameters else { return Ok(()) };
+        if checked.borrow().get(sql).is_some_and(|&most| most <= passed) {
+            return Ok(());
+        }
+        // EXPLAIN goes before the statement, past what SQLite skips before it,
+        // and an EXPLAIN takes no second one.
+        let statement = &sql[filler(sql)..];
+        let explain =
+            if first_keyword(statement).eq_ignore_ascii_case("EXPLAIN") { statement.into() } else { format!("EXPLAIN {statement}") };
+        let probe = method(&self.database, "prepare")?.call1(&self.database, &explain.into()).map_err(js_error)?;
+        let values: Array = (0..=passed).map(|_| JsValue::NULL).collect();
+        match statement_method(&probe, "get")?.apply(&probe, &values).map_err(js_error) {
+            Err(SqliteError::NodeSqlite { code: SQLITE_RANGE, .. }) => {}
+            Err(error) => return Err(error),
+            Ok(_) => {
+                return Err(SqliteError::Node(format!(
+                    "the statement takes more parameters than the {passed} passed, and this database binds NULL for each one \
+                     not passed, where rusqlite refuses the call: pass a value for every parameter"
+                )))
+            }
+        }
+        let mut checked = checked.borrow_mut();
+        if checked.len() >= CHECKED_PARAMETERS {
+            checked.clear();
+        }
+        checked.insert(sql.to_owned(), passed);
+        Ok(())
+    }
+
     /// Refuse a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
     /// top level of a query, before it runs. Nested in the typed reader, a
     /// compound SELECT's rows take the affinity of its first SELECT's
@@ -332,7 +404,9 @@ impl SqliteExecutor for NodeConnection {
     /// discards the row.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
         let statement = self.prepare(sql)?;
-        if width(&statement)? == 0 {
+        let width = width(&statement)?;
+        self.check_parameters(sql, params.len())?;
+        if width == 0 {
             // A statement without columns yields no row.
             let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
             return changed_rows(&result);
@@ -357,10 +431,12 @@ impl SqliteExecutor for NodeConnection {
 
     fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
         if let Some((reader, width)) = self.kept_reader(sql)? {
+            self.check_parameters(sql, params.len())?;
             return all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect();
         }
         let statement = self.prepare(sql)?;
         let width = width(&statement)?;
+        self.check_parameters(sql, params.len())?;
         if width == 0 {
             // A statement without columns yields no rows; it runs for its
             // effect, through `run`, since better-sqlite3 refuses `all` on a
@@ -412,6 +488,34 @@ fn first_keyword(sql: &str) -> &str {
     }
     let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
     &rest[..end]
+}
+
+/// How many bytes at the start of `sql` SQLite skips before a statement:
+/// whitespace, semicolons and comments, read as SQLite's tokenizer reads
+/// them. SQLite reads SQL only up to a NUL, so a NUL ends them as the end of
+/// the text does.
+fn filler(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        at += match &bytes[at..] {
+            // A run of whitespace begins with one of five characters and goes
+            // on through any of six: the vertical tab only continues one.
+            [b' ' | b'\t' | b'\n' | b'\x0c' | b'\r', rest @ ..] => {
+                1 + rest.iter().take_while(|c| matches!(c, b'\t'..=b'\r' | b' ')).count()
+            }
+            [b';', ..] => 1,
+            [b'-', b'-', rest @ ..] => 2 + rest.iter().take_while(|&&c| c != b'\n' && c != 0).count(),
+            // `/*` with nothing after it is a slash, not a comment; a comment
+            // with no `*/` runs to the end.
+            [b'/', b'*', rest @ ..] if rest.first().is_some_and(|&c| c != 0) => {
+                let body = &rest[..rest.iter().position(|&c| c == 0).unwrap_or(rest.len())];
+                2 + body.windows(2).position(|pair| pair == b"*/").map_or(body.len(), |end| end + 2)
+            }
+            _ => break,
+        };
+    }
+    at
 }
 
 /// The SQL of a typed reader for `statement`, whose rows have `width`
