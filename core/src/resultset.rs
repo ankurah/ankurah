@@ -20,14 +20,14 @@ use std::{
 
 /// Efficient storage for sort keys - uses fixed array for small keys, Vec for larger ones
 #[derive(Debug, Clone)]
-enum IVec {
+enum SortKey {
     /// Keys <= 16 bytes stored inline with their actual length.
     Small { bytes: [u8; 16], len: u8 },
     /// Keys > 16 bytes stored in Vec
     Large(Vec<u8>),
 }
 
-impl IVec {
+impl SortKey {
     /// Create from byte slice
     fn from_slice(bytes: &[u8]) -> Self {
         if bytes.len() <= 16 {
@@ -47,18 +47,20 @@ impl IVec {
     }
 }
 
-impl PartialEq for IVec {
+// Keys compare by their bytes alone; the variant and the inline array's unused tail are storage details that must not
+// affect order or equality.
+impl PartialEq for SortKey {
     fn eq(&self, other: &Self) -> bool { self.as_slice() == other.as_slice() }
 }
-impl Eq for IVec {}
-impl PartialOrd for IVec {
+impl Eq for SortKey {}
+impl PartialOrd for SortKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
-impl Ord for IVec {
+impl Ord for SortKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.as_slice().cmp(other.as_slice()) }
 }
 
-impl From<Vec<u8>> for IVec {
+impl From<Vec<u8>> for SortKey {
     fn from(vec: Vec<u8>) -> Self { Self::from_slice(&vec) }
 }
 
@@ -105,7 +107,7 @@ struct State<E: AbstractEntity> {
 #[derive(Debug, Clone)]
 struct EntityEntry<E: AbstractEntity> {
     entity: E,
-    sort_key: Option<IVec>,
+    sort_key: Option<SortKey>,
     dirty: bool,
 }
 // TODO - figure out how to maintain ordering of entities
@@ -341,7 +343,7 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
     }
 
     /// Compute sort key for an entity using the current key spec
-    fn compute_sort_key(entity: &E, key_spec: &KeySpec<PropertyId>) -> IVec {
+    fn compute_sort_key(entity: &E, key_spec: &KeySpec<PropertyId>) -> SortKey {
         let mut values = Vec::new();
 
         // Extract values for each key part
@@ -353,13 +355,13 @@ impl<'a, E: AbstractEntity> ResultSetWrite<'a, E> {
                 values.push(v);
             } else {
                 // Skip this entity for now if any field is NULL
-                return IVec::from_slice(&[]); // Empty key sorts first
+                return SortKey::from_slice(&[]); // Empty key sorts first
             }
         }
 
         // Encode the tuple - if this fails, return empty key (will sort first)
         let encoded = encode_tuple_values_with_key_spec(&values, key_spec).unwrap_or_default();
-        IVec::from(encoded)
+        SortKey::from(encoded)
     }
 
     /// Set the loaded flag as part of this write transaction.
@@ -867,8 +869,8 @@ mod tests {
         ];
         for a in &keys {
             for b in &keys {
-                let left = IVec::from_slice(a);
-                let right = IVec::from_slice(b);
+                let left = SortKey::from_slice(a);
+                let right = SortKey::from_slice(b);
                 assert_eq!(left.cmp(&right), a.cmp(b), "keys {a:?} and {b:?}");
                 assert_eq!(left == right, a == b, "key equality must retain short-key lengths");
             }
@@ -877,6 +879,7 @@ mod tests {
 
     #[test]
     fn string_order_survives_sort_key_growth_across_inline_boundary() {
+        let grown_name = "row-00000005-with-a-longer-key";
         for direction in [IndexDirection::Asc, IndexDirection::Desc] {
             let key_spec = KeySpec {
                 keyparts: vec![IndexKeyPart {
@@ -890,70 +893,77 @@ mod tests {
             };
             let mut entities =
                 (0..10u8).map(|id| TestEntity::new(id, [(prop("name"), Value::String(format!("row-{id:08}")))].into())).collect::<Vec<_>>();
+            let mut expected = entities.iter().map(|entity| entity.id).collect::<Vec<_>>();
+            if direction.is_desc() {
+                expected.reverse();
+            }
+
             let resultset = EntityResultSet::empty();
             resultset.order_by(Some(key_spec.clone()));
             resultset.write().replace_all(entities.clone());
-            let expected = resultset.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>();
+            assert_eq!(resultset.keys().collect::<Vec<_>>(), expected, "{direction:?}");
+
             let short = encode_tuple_values_with_key_spec(&[Value::String("row-00000005".into())], &key_spec).unwrap();
-            let long = encode_tuple_values_with_key_spec(&[Value::String("row-00000005-offline-edit".into())], &key_spec).unwrap();
+            let long = encode_tuple_values_with_key_spec(&[Value::String(grown_name.into())], &key_spec).unwrap();
             assert!(short.len() <= 16 && long.len() > 16, "fixture must cross the inline-key boundary");
-            entities[5].properties.insert(prop("name"), Value::String("row-00000005-offline-edit".into()));
+            entities[5].properties.insert(prop("name"), Value::String(grown_name.into()));
             resultset.write().replace_all(entities.clone());
-            assert_eq!(resultset.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>(), expected, "{direction:?}");
+            assert_eq!(resultset.keys().collect::<Vec<_>>(), expected, "{direction:?}");
+
             let added = EntityResultSet::empty();
             added.order_by(Some(key_spec));
             for entity in entities.into_iter().rev() {
                 added.write().add(entity);
             }
-            assert_eq!(added.read().iter_entities().map(|(id, _)| id).collect::<Vec<_>>(), expected, "{direction:?}");
+            assert_eq!(added.keys().collect::<Vec<_>>(), expected, "{direction:?}");
         }
     }
 
     #[test]
-    fn test_ivec_small_keys() {
+    fn test_sort_key_small_keys() {
         // Test that small keys (<=16 bytes) use the Small variant
-        let small_key = IVec::from_slice(b"hello");
-        let another_small = IVec::from_slice(b"world");
-        let empty_key = IVec::from_slice(b"");
+        let small_key = SortKey::from_slice(b"hello");
+        let another_small = SortKey::from_slice(b"world");
+        let empty_key = SortKey::from_slice(b"");
 
         // Inline storage preserves the original byte order.
         assert!(small_key < another_small); // "hello" < "world"
         assert!(empty_key < small_key); // empty sorts first
 
         // A shorter prefix sorts before its extension.
-        let key_ab = IVec::from_slice(b"ab");
-        let key_abc = IVec::from_slice(b"abc");
+        let key_ab = SortKey::from_slice(b"ab");
+        let key_abc = SortKey::from_slice(b"abc");
         assert!(key_ab < key_abc); // "ab" < "abc" even with zero padding
     }
 
     #[test]
-    fn test_ivec_large_keys() {
+    fn test_sort_key_large_keys() {
         // Test that large keys (>16 bytes) use the Large variant
-        let large_key = IVec::from_slice(&[1u8; 20]); // 20 bytes
-        let small_key = IVec::from_slice(&[1u8; 10]); // 10 bytes
+        let large_key = SortKey::from_slice(&[1u8; 20]); // 20 bytes
+        let small_key = SortKey::from_slice(&[1u8; 10]); // 10 bytes
 
         // Verify they can be compared
-        assert!(small_key < large_key); // smaller array should sort first
+        assert!(small_key < large_key); // a prefix sorts before its extension
     }
 
     #[test]
-    fn test_ivec_boundary() {
+    fn test_sort_key_boundary() {
         // Test the 16-byte boundary
-        let exactly_16 = IVec::from_slice(&[1u8; 16]);
-        let exactly_17 = IVec::from_slice(&[1u8; 17]);
+        let exactly_16 = SortKey::from_slice(&[1u8; 16]);
+        let exactly_17 = SortKey::from_slice(&[1u8; 17]);
 
         // Both should work and be comparable
         assert!(exactly_16 < exactly_17);
 
         // Verify 16-byte keys use Small variant (this is implicit in the implementation)
         match exactly_16 {
-            IVec::Small { .. } => (), // Expected
-            IVec::Large(_) => panic!("16-byte key should use Small variant"),
+            SortKey::Small { .. } => (), // Expected
+            SortKey::Large(_) => panic!("16-byte key should use Small variant"),
         }
 
         match exactly_17 {
-            IVec::Large(_) => (), // Expected
-            IVec::Small { .. } => panic!("17-byte key should use Large variant"),
+            SortKey::Large(_) => (), // Expected
+            SortKey::Small { .. } => panic!("17-byte key should use Large variant"),
         }
     }
 }
