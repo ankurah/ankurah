@@ -65,3 +65,9 @@ ctor               = "0.2"
 wasm-bindgen-test    = "0.3"
 wasm-bindgen-futures = "0.4"
 ankurah              = { path = "../../ankurah", version = "=0.10.0", features = ["derive", "wasm", "test-helpers"] }
+
+[lints.rust]
+# scripts/run-wasm-tests.sh builds the suite's better-sqlite3 run with this
+# cfg (see tests/common/driver.rs), so that a test that cannot run on
+# better-sqlite3 reports as ignored there.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ankurah_sqlite_better_sqlite3)"] }

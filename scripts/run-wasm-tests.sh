@@ -138,7 +138,11 @@ run_node_sqlite_tests() {
 # never builds one itself, so the same suite runs again with better-sqlite3
 # building each database the tests build (see
 # storage/sqlite/tests/common/driver.rs). storage/sqlite/tests/package.json
-# pins the release.
+# pins the release. The suite is built for the driver, with the cfg
+# ankurah_sqlite_better_sqlite3, so that a test that cannot run on it
+# reports as ignored; the cfg goes in the wasm32 target's rustflags, which
+# cargo joins with those .cargo/config.toml gives every wasm32 build, where
+# RUSTFLAGS would replace them.
 run_better_sqlite3_tests() {
     if [ ! -d "$PROJECT_ROOT/storage/sqlite/tests/node_modules/better-sqlite3" ]; then
         print_error "better-sqlite3 is not installed. Please install it first:"
@@ -147,7 +151,9 @@ run_better_sqlite3_tests() {
     fi
     print_status "Running WASM tests in Node for ankurah-storage-sqlite (node feature) on better-sqlite3..."
     cd "$PROJECT_ROOT/storage/sqlite"
-    if ANKURAH_SQLITE_TEST_DRIVER=better-sqlite3 wasm-pack test --node -- --features node; then
+    if ANKURAH_SQLITE_TEST_DRIVER=better-sqlite3 \
+        CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="--cfg ankurah_sqlite_better_sqlite3" \
+        wasm-pack test --node -- --features node; then
         print_status "✅ WASM tests passed for storage-sqlite on better-sqlite3"
     else
         print_error "❌ WASM tests failed for storage-sqlite on better-sqlite3"

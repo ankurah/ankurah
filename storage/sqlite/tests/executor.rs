@@ -100,12 +100,11 @@ async fn a_pragma_that_sets_a_value_reports_it() -> Result<()> {
 /// on each connection it opens, and the node executor sets it with its
 /// session pragmas.
 #[engine_test]
+#[cfg_attr(
+    ankurah_sqlite_better_sqlite3,
+    ignore = "the engine opens no better-sqlite3 database, and one it adopts keeps the busy timeout its host set"
+)]
 async fn connections_wait_five_seconds_for_a_lock() -> Result<()> {
-    // The engine opens no better-sqlite3 database, and one it adopts keeps
-    // the busy timeout its host set, so the better-sqlite3 run skips this.
-    if common::on_better_sqlite3() {
-        return Ok(());
-    }
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let timeout = storage.with_executor(|executor| executor.query_row("PRAGMA busy_timeout", &[])?.expect("one row").integer(0)).await?;
     assert_eq!(timeout, 5000);
@@ -181,14 +180,24 @@ async fn text_keeps_an_embedded_nul_and_refuses_bytes_that_are_not_utf8() -> Res
     Ok(())
 }
 
-/// A row lends its TEXT and BLOB values, each read pointing at the one copy
-/// the row holds rather than at a fresh one.
+/// Empty TEXT and an empty BLOB, bound or written as literals, read back as
+/// they were stored on every driver: the node executor's typed reader reads
+/// TEXT as the BLOB of its bytes, and SQLite hands a zero-length BLOB over
+/// with a null pointer, which a driver could read as NULL.
 #[engine_test]
-async fn rows_lend_their_text_and_blob_values() -> Result<()> {
+async fn empty_text_and_an_empty_blob_read_back_as_stored() -> Result<()> {
     let storage = common::open_in_memory().await?;
-    let row = storage.with_executor(|executor| Ok(executor.query_row("SELECT 'text', x'0102'", &[])?.expect("one row"))).await?;
-    assert!(std::ptr::eq(row.text(0)?, row.text(0)?));
-    assert!(std::ptr::eq(row.blob(1)?, row.blob(1)?));
+    let (literals, stored) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE empties (t TEXT, b BLOB)", &[])?;
+            executor.execute("INSERT INTO empties VALUES (?, ?)", &[SqliteValueRef::Text(""), SqliteValueRef::Blob(&[])])?;
+            let literals = executor.query_row("SELECT '', x'', zeroblob(0)", &[])?.expect("one row");
+            let stored = executor.query_row("SELECT t, b, typeof(t), typeof(b) FROM empties", &[])?.expect("one row");
+            Ok((format!("{:?}", literals.values()), format!("{:?}", stored.values())))
+        })
+        .await?;
+    assert_eq!(literals, r#"[Text(""), Blob([]), Blob([])]"#);
+    assert_eq!(stored, r#"[Text(""), Blob([]), Text("text"), Text("blob")]"#);
     Ok(())
 }
 
@@ -461,6 +470,37 @@ async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
     Ok(())
 }
 
+/// A numbered parameter takes the value at its position on rusqlite and
+/// node:sqlite, given a value for every position up to its number, one that
+/// no parameter takes included; better-sqlite3 binds no positional value to
+/// one, and refuses the call (see `SqliteExecutor`).
+#[engine_test]
+async fn a_numbered_parameter_takes_the_value_at_its_position() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (selected, inserted, stored) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE pairs (a, b)", &[])?;
+            let [seven, eight, nine] = [7, 8, 9].map(SqliteValueRef::Integer);
+            let selected = executor.query("SELECT ?2, ?1", &[seven, eight]).map(|rows| format!("{:?}", rows[0].values()));
+            let inserted = executor.execute("INSERT INTO pairs VALUES (?, ?3)", &[seven, eight, nine]);
+            let stored = executor.query("SELECT a, b FROM pairs", &[])?;
+            let stored = stored.iter().map(|row| Ok((row.integer(0)?, row.integer(1)?))).collect::<Result<Vec<_>, SqliteError>>()?;
+            Ok((selected.map_err(|error| error.to_string()), inserted.map_err(|error| error.to_string()), stored))
+        })
+        .await?;
+    if common::on_better_sqlite3() {
+        for refusal in [selected.expect_err("better-sqlite3 refuses ?2"), inserted.expect_err("better-sqlite3 refuses ?3")] {
+            assert!(refusal.ends_with("Too many parameter values were provided"), "{refusal}");
+        }
+        assert_eq!(stored, []);
+    } else {
+        assert_eq!(selected.as_deref(), Ok("[Integer(8), Integer(7)]"));
+        assert_eq!(inserted, Ok(1));
+        assert_eq!(stored, [(7, 9)]);
+    }
+    Ok(())
+}
+
 /// SQL that holds a second statement is refused before either runs, on
 /// every driver, where rusqlite and node:sqlite ran the first and ignored the
 /// rest. Whitespace, semicolons and comments after a statement are no second
@@ -569,12 +609,11 @@ async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Re
 /// A connection the engine opens on a file takes the session settings
 /// connection.rs gives a native one, on every driver.
 #[engine_test]
+#[cfg_attr(
+    ankurah_sqlite_better_sqlite3,
+    ignore = "the engine opens no better-sqlite3 database, and one it adopts keeps the session settings its host chose"
+)]
 async fn a_connection_on_a_file_takes_the_session_settings() -> Result<()> {
-    // The engine opens no better-sqlite3 database, and one it adopts keeps
-    // the session settings its host chose, so the better-sqlite3 run skips this.
-    if common::on_better_sqlite3() {
-        return Ok(());
-    }
     let db = TempDb::new("settings");
     let storage = SqliteStorageEngine::open(db.path()).await?;
     assert_eq!(session_settings(&storage).await?, (5000, "wal".to_owned(), 1, 1, -64000, 268_435_456, 2));
@@ -604,12 +643,11 @@ async fn a_writer_waits_for_another_connection_s_lock() -> Result<()> {
 /// rather than failing at once: the busy timeout is set before any statement
 /// that needs the file.
 #[engine_test]
+#[cfg_attr(
+    ankurah_sqlite_better_sqlite3,
+    ignore = "the engine opens no better-sqlite3 database, and one it adopts keeps the busy timeout its host set"
+)]
 async fn opening_a_store_waits_for_a_lock_on_its_file() -> Result<()> {
-    // The engine opens no better-sqlite3 database, and one it adopts keeps
-    // the busy timeout its host set, so the better-sqlite3 run skips this.
-    if common::on_better_sqlite3() {
-        return Ok(());
-    }
     let db = TempDb::new("open_waits");
     // EXCLUSIVE in the file's first, rollback journal keeps out readers too.
     let holder = LockHolder::take(&db, "BEGIN EXCLUSIVE", HOLD_MS).await;

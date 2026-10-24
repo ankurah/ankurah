@@ -71,6 +71,42 @@ async fn refuses_a_driver_without_exact_integers() {
     assert!(error.to_string().contains("exact INTEGER"), "{error}");
 }
 
+// Hand over a copy of each statement of the run's driver that holds all but
+// its SQL (node:sqlite's `sourceSQL`, better-sqlite3's `source`), each method
+// bound to the actual statement: both drivers make the SQL a property that
+// cannot be redefined, nor hidden behind a Proxy for better-sqlite3, whose
+// `source` is a value that cannot change.
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
+export function withoutStatementSource(database) {
+    return {
+        prepare(sql) {
+            const statement = database.prepare(sql);
+            const copy = {};
+            for (let object = statement; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {
+                for (const name of Object.getOwnPropertyNames(object)) {
+                    if (name === 'sourceSQL' || name === 'source' || name === 'constructor' || name in copy) continue;
+                    const value = statement[name];
+                    copy[name] = typeof value === 'function' ? value.bind(statement) : value;
+                }
+            }
+            return copy;
+        },
+        exec(sql) { return database.exec(sql); }
+    };
+}
+")]
+extern "C" {
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = withoutStatementSource)]
+    fn without_statement_source(database: JsValue) -> JsValue;
+}
+
+#[wasm_bindgen_test]
+async fn refuses_a_driver_whose_statements_report_no_sql() {
+    let database = without_statement_source(host_database(":memory:"));
+    let error = SqliteStorageEngine::from_database(database).await.err().expect("the executor reads each statement's SQL");
+    assert!(error.to_string().contains("report no `sourceSQL` (better-sqlite3's `source`)"), "{error}");
+}
+
 /// TEXT from a statement SQLite cannot nest in the typed reader, such as a
 /// PRAGMA, is read as the driver's string, and the PRAGMA's other storage
 /// classes as ever; a string holding U+FFFD, which a driver may have put in
@@ -152,12 +188,11 @@ async fn a_named_parameter_is_refused_before_it_runs() -> Result<()> {
 /// connection it opens natively; node:sqlite's DatabaseSync reads them so
 /// when constructed with `enableDoubleQuotedStringLiterals`.
 #[wasm_bindgen_test]
+#[cfg_attr(
+    ankurah_sqlite_better_sqlite3,
+    ignore = "better-sqlite3 is built with double-quoted string literals off, and offers no way to turn them on"
+)]
 fn refuses_a_database_that_reads_double_quoted_names_as_strings() {
-    // better-sqlite3 is built with double-quoted string literals off, and
-    // offers no way to turn them on.
-    if on_better_sqlite3() {
-        return;
-    }
     let construct = Function::new_no_args(
         "const { DatabaseSync } = process.getBuiltinModule('node:sqlite');
          return new DatabaseSync(':memory:', { enableDoubleQuotedStringLiterals: true });",

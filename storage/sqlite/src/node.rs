@@ -969,4 +969,52 @@ mod tests {
             assert_eq!(sql_text::is_filler(sql), prepares_to_no_statement(sql), "{sql:?}");
         }
     }
+
+    /// A connection keeps the typed readers of at most [`KEPT_READERS`]
+    /// queries, making room by dropping the least recently used, and reads a
+    /// query whose reader it dropped as before, keeping it again.
+    #[wasm_bindgen_test]
+    fn keeps_the_typed_readers_of_the_most_recently_used_queries() {
+        let connection = NodeConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();
+        // SQL texts of the test's own, so that the readers of the queries
+        // `from_database` ran leave first.
+        let sql = |index: usize| format!("SELECT {index} AS kept");
+        let read = |index: usize| connection.query(&sql(index), &[]).unwrap()[0].integer(0).unwrap();
+        let kept = |index: usize| connection.readers.borrow().kept.contains_key(&sql(index));
+        for index in 0..KEPT_READERS {
+            read(index);
+        }
+        // The first query becomes the most recently used, so the second leaves first.
+        read(0);
+        read(KEPT_READERS);
+        assert_eq!(connection.readers.borrow().kept.len(), KEPT_READERS);
+        assert!(kept(0) && !kept(1) && kept(KEPT_READERS));
+        assert_eq!(read(1), 1);
+        assert!(kept(1) && !kept(2));
+    }
+
+    /// A node:sqlite connection keeps the parameter counts of at most
+    /// [`CHECKED_PARAMETERS`] SQL texts, forgetting them all to keep the next,
+    /// and shows the count of a statement it forgot again.
+    #[wasm_bindgen_test]
+    #[cfg_attr(
+        ankurah_sqlite_better_sqlite3,
+        ignore = "better-sqlite3 refuses a call that passes too few values itself, so its connections keep no counts"
+    )]
+    fn forgets_the_parameter_counts_past_its_limit() {
+        let connection = NodeConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();
+        let checked = connection.parameters.as_ref().expect("node:sqlite binds NULL for a value a call does not pass");
+        // Without the counts of the queries `from_database` ran.
+        checked.borrow_mut().clear();
+        let seven = SqliteValueRef::Integer(7);
+        let read = |sql: &str| connection.query(sql, &[seven]).unwrap();
+        for index in 0..CHECKED_PARAMETERS {
+            read(&format!("SELECT ?, {index}"));
+        }
+        assert_eq!(checked.borrow().len(), CHECKED_PARAMETERS);
+        read("SELECT ?, 'one more'");
+        assert_eq!(checked.borrow().len(), 1);
+        read("SELECT ?, 0");
+        assert_eq!(checked.borrow().get("SELECT ?, 0"), Some(&1));
+    }
 }

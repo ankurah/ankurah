@@ -2,11 +2,18 @@
 //! the engine's support for better-sqlite3, a driver its own constructors
 //! never build, runs under the same tests as node:sqlite. Natively the driver
 //! is rusqlite. On wasm32 it is Node.js's node:sqlite, or better-sqlite3 when
-//! `ANKURAH_SQLITE_TEST_DRIVER` is `better-sqlite3`, as
-//! scripts/run-wasm-tests.sh sets it for the suite's second run in Node. On
-//! that run a test's engine adopts a better-sqlite3 database through
+//! the suite is built with `--cfg ankurah_sqlite_better_sqlite3` and run
+//! with `ANKURAH_SQLITE_TEST_DRIVER` set to `better-sqlite3`, as
+//! scripts/run-wasm-tests.sh builds and runs it for the suite's second run in
+//! Node. On that run a test's engine adopts a better-sqlite3 database through
 //! `SqliteStorageEngine::from_database`, because `open` and `open_in_memory`
-//! always build node:sqlite's.
+//! always build node:sqlite's. The driver is chosen when the suite is built,
+//! so that a test that cannot run on better-sqlite3 reports as ignored on
+//! that run, through `#[cfg_attr(ankurah_sqlite_better_sqlite3, ignore =
+//! "…")]`, rather than pass without testing anything; the variable is
+//! checked against the build, so that a build whose cfg went missing, as it
+//! does when `RUSTFLAGS` replaces the target's rustflags, fails rather than
+//! test node:sqlite again.
 //!
 //! The unit tests in src/ include this file as well (see src/lib.rs), so it
 //! names this crate as the integration tests do and uses nothing else of
@@ -25,15 +32,24 @@ use wasm_bindgen::{JsCast, JsValue};
 pub fn on_better_sqlite3() -> bool { false }
 
 /// Whether this run builds its databases with better-sqlite3 rather than
-/// node:sqlite, as `ANKURAH_SQLITE_TEST_DRIVER` names the driver.
+/// node:sqlite, as the suite was built to and `ANKURAH_SQLITE_TEST_DRIVER`
+/// names the driver; a run whose variable names another driver than the
+/// build's fails.
 #[cfg(target_arch = "wasm32")]
 pub fn on_better_sqlite3() -> bool {
     let env = Reflect::get(&process(), &"env".into()).unwrap();
-    match Reflect::get(&env, &"ANKURAH_SQLITE_TEST_DRIVER".into()).unwrap().as_string().as_deref() {
+    let named = match Reflect::get(&env, &"ANKURAH_SQLITE_TEST_DRIVER".into()).unwrap().as_string().as_deref() {
         None | Some("node:sqlite") => false,
         Some("better-sqlite3") => true,
         Some(other) => panic!("ANKURAH_SQLITE_TEST_DRIVER names node:sqlite or better-sqlite3, not {other:?}"),
-    }
+    };
+    let built = cfg!(ankurah_sqlite_better_sqlite3);
+    assert_eq!(
+        named, built,
+        "ANKURAH_SQLITE_TEST_DRIVER names better-sqlite3 exactly when the suite is built with \
+         `--cfg ankurah_sqlite_better_sqlite3`, as scripts/run-wasm-tests.sh does both"
+    );
+    built
 }
 
 /// The engine a test runs on in memory: the one `open_in_memory` opens, or on

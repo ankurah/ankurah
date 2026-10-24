@@ -117,3 +117,43 @@ async fn test_cache_refresh_after_column_creation() -> Result<()> {
 
     Ok(())
 }
+
+/// A materialized column whose name SQLite cannot hand over as UTF-8 TEXT
+/// fails the query that first uses its model after an open, where main left
+/// the column out of the engine's list of columns without an error, so that
+/// a query on it read as one on a missing column, NULL. SQLite never stores
+/// such a name itself; the test plants one, a lone 0xFF byte, through
+/// `writable_schema`.
+#[engine_test]
+#[cfg_attr(
+    ankurah_sqlite_better_sqlite3,
+    ignore = "better-sqlite3 opens its databases in SQLite's defensive mode, which refuses `writable_schema`"
+)]
+async fn a_column_name_the_scan_cannot_read_fails_the_query() -> Result<()> {
+    let db = common::TempDb::new("unreadable_column");
+    {
+        let node = Node::new_durable(Arc::new(common::open(db.path()).await?), PermissiveAgent::new());
+        node.system.create().await?;
+        let ctx = node.context_async(c).await.unwrap();
+        let trx = ctx.begin();
+        trx.create(&Task { name: "Write".to_string(), status: "active".to_string(), created: "2026".to_string() }).await?;
+        trx.commit().await?;
+    }
+    {
+        let conn = db.raw();
+        conn.execute("PRAGMA writable_schema = ON", &[])?;
+        let planted = conn.execute(
+            r#"UPDATE sqlite_master SET sql = substr(sql, 1, length(sql) - 1) || ', "' || CAST(x'ff' AS TEXT) || '" TEXT)'
+               WHERE name = 'task' AND sql LIKE '%)'"#,
+            &[],
+        )?;
+        assert_eq!(planted, 1, "the task table's SQL gains the column");
+        conn.execute("PRAGMA writable_schema = OFF", &[])?;
+    }
+
+    let node = Node::new_durable(Arc::new(common::open(db.path()).await?), PermissiveAgent::new());
+    let fetched = async { Ok::<_, anyhow::Error>(node.context_async(c).await?.fetch::<TaskView>("status = 'active'").await?) }.await;
+    let error = format!("{:#}", fetched.expect_err("the column scan cannot read the planted name"));
+    assert!(error.contains("Conversion error from type Text"), "{error}");
+    Ok(())
+}

@@ -151,12 +151,11 @@ async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
 /// name itself; the test plants one, the name's bytes as a BLOB, through
 /// `writable_schema`.
 #[engine_test]
+#[cfg_attr(
+    ankurah_sqlite_better_sqlite3,
+    ignore = "better-sqlite3 opens its databases in SQLite's defensive mode, which refuses `writable_schema`"
+)]
 async fn a_table_name_the_check_cannot_read_fails_the_open() -> anyhow::Result<()> {
-    // better-sqlite3 opens its databases in SQLite's defensive mode, which
-    // refuses `writable_schema`.
-    if common::on_better_sqlite3() {
-        return Ok(());
-    }
     let db = TempDb::new("unreadable_name");
     {
         let conn = db.raw();
@@ -171,5 +170,31 @@ async fn a_table_name_the_check_cannot_read_fails_the_open() -> anyhow::Result<(
         Err(e) => e.to_string(),
     };
     assert!(err.contains("column 0 holds BLOB where TEXT was expected"), "{err}");
+    Ok(())
+}
+
+/// A protocol version record the engine wrote but cannot read back fails
+/// the open as `SqliteError::CorruptRecord`, where main failed it as
+/// rusqlite's QueryReturnedNoRows. The test makes the record vanish without
+/// a hook in the engine: a view takes the meta table's name, so the check's
+/// scan of tables does not list it, CREATE TABLE IF NOT EXISTS leaves it in
+/// place, and its INSTEAD OF trigger drops the record the engine inserts.
+#[engine_test]
+async fn a_protocol_record_gone_after_its_write_fails_the_open() -> anyhow::Result<()> {
+    let db = TempDb::new("vanished_record");
+    {
+        let conn = db.raw();
+        conn.execute(r#"CREATE VIEW "_ankurah_meta" ("key", "value") AS SELECT NULL, NULL WHERE 0"#, &[])?;
+        conn.execute(r#"CREATE TRIGGER "drop_the_record" INSTEAD OF INSERT ON "_ankurah_meta" BEGIN SELECT 1; END"#, &[])?;
+    }
+
+    let err = match common::open(db.path()).await {
+        Ok(_) => panic!("expected a record gone after its write to refuse the open"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err.downcast_ref::<SqliteError>(), Some(SqliteError::CorruptRecord(reason)) if reason.contains("vanished")),
+        "{err:?}"
+    );
     Ok(())
 }
