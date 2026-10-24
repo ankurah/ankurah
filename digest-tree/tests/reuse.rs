@@ -2,6 +2,7 @@
 //! whole, and a narrower Selection, whose members its admission covers, as
 //! exact spans of its leaves in its key order, so serving it builds no second
 //! tree. Each example is checked against membership written out by hand.
+
 mod common;
 use ankurah_digest_tree::{Digest, Leaf, TreeMatch, TreeRequest};
 use common::{populated_tree, types};

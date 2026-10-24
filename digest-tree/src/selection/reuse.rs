@@ -33,9 +33,9 @@ pub(crate) struct ReusePlan {
 
 impl TreeSpec {
     /// Prove that this tree contains every requested member and that exact
-    /// address bounds and, under a limit, the requested order can select them.
-    /// `None` includes cases the conservative implication proof cannot establish.
-    /// Selection scopes additionally check that each entity has only one leaf.
+    /// address bounds and, under a limit, the requested order can select
+    /// them: `None` where the proof, which is conservative, cannot establish
+    /// it. A Selection's scope also requires each entity to have one leaf.
     ///
     /// A tree serves a narrower request when it admits every entity the
     /// request asks for and the rest of the request is exactly a set of bounds
@@ -148,9 +148,10 @@ fn clause_span(key: &KeySpec<PropertyId>, query: &Clause, admission: &[Clause]) 
     }
     required.is_empty().then_some(span)
 }
-// Convert a value interval into the addresses of all tuples with this
-// leading prefix. An inclusive upper value ends after every suffix of it;
-// an exclusive lower value starts there instead.
+
+/// The addresses of every key that begins with `prefix` and continues with a
+/// value in `domain`: an included upper value ends the span after every key
+/// that continues past it, and an excluded lower value starts it there.
 fn value_span(prefix: &[u8], domain: &TreeSpan, implicit_id: bool) -> Option<TreeSpan> {
     let address = |value: &[u8]| -> Option<Vec<u8>> {
         let value = if implicit_id { value.get(1..)? } else { value };

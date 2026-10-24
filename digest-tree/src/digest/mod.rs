@@ -92,8 +92,7 @@ pub use leaf::{HeadHash, Leaf, HEAD_TAG};
 pub use lthash16::{LtHash16, LTHASH16_LEAF_CONTEXT};
 pub use ristretto255::{Ristretto255, LEAF_DST};
 
-/// One leaf's element of the group `G`, made by
-/// [`Leaf::element`].
+/// One leaf's element of the group `G`, made by [`Leaf::element`].
 ///
 /// A digest gains it when the leaf enters a tree and loses it when the leaf
 /// leaves or is replaced.
@@ -119,10 +118,10 @@ pub struct LeafElement<G: DigestGroup = Ristretto255>(pub(crate) G::Element);
 /// [`Digest::checked_neg`] and [`Digest::checked_sum`]) return
 /// [`CountOverflow`] when the count would leave the range of `i64`; use them
 /// whenever a digest decoded from a row takes part, since its count may be any
-/// `i64`. The operators (`+`, `-`, unary `-`,
-/// `+=`, `-=` and [`Sum`]) are for digests built from leaves this process
-/// hashed, whose counts cannot come near the limit: they panic on overflow, in
-/// debug and release builds alike, rather than wrap.
+/// `i64`. The operators (`+`, `-`, unary `-`, `+=`, `-=` and [`Sum`]) are for
+/// digests built from leaves this process hashed, whose counts cannot come
+/// near the limit: they panic on overflow, in debug and release builds alike,
+/// rather than wrap.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Digest<G: DigestGroup = Ristretto255> {
     pub(crate) element: G::Element,

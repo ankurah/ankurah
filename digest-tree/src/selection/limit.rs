@@ -21,10 +21,11 @@ impl TreeSpec {
     /// reading digests. An underfilled limit keeps the membership's spans, just
     /// as [`TreeTransaction::scope`](crate::TreeTransaction::scope) does.
     ///
-    /// The caller must supply this spec's admitted members, with exactly one
-    /// canonical address (complete key followed by entity ID) per entity. Only
-    /// addresses encountered while selecting the limit are validated; checking
-    /// admission and uniqueness requires the caller's maintained membership index.
+    /// The caller supplies this spec's admitted members, with exactly one
+    /// canonical address (complete key followed by entity id) per entity.
+    /// Only the addresses the limit's walk meets are validated; admission and
+    /// uniqueness are the caller's to keep, in the membership index it
+    /// maintains.
     pub fn selected_spans<K: Borrow<[u8]> + Ord, V>(
         &self,
         request: &TreeRequest,
@@ -76,6 +77,7 @@ pub(crate) struct TierWalk<'a> {
     seen: usize,
     tiers: Vec<Tier>,
 }
+
 /// The spans of one key part's tier still to walk, the part's depth, and
 /// the place of the next span to walk among them.
 struct Tier {
@@ -168,8 +170,11 @@ fn address_parts<'a>(spec: &KeySpec<PropertyId>, address: &'a [u8]) -> Result<Ve
     CanonicalCodec::split(spec, address_key(address)?)
 }
 
-// A lexicographic cut has one interval for each earlier differing tuple part
-// and one for the entity-id tie. All intervals use ascending physical bytes.
+/// The spans of the leaves at or before `address` in the walk's order when
+/// `before`, and of the leaves after it otherwise: one span for each key part
+/// at which a leaf first differs from `address`, and one for the entity id,
+/// which breaks a tie. Every span runs in ascending address order, whatever
+/// the walk's directions.
 pub(crate) fn order_cut(
     spec: &KeySpec<PropertyId>,
     directions: &[IndexDirection],

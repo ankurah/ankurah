@@ -82,7 +82,8 @@ fn group<G: DigestGroup>(c: &mut Criterion, leaves: &Leaves, label: &str, leaf_h
     );
     let name = |benchmark: &str| format!("{label}: {benchmark}");
     let elements: Vec<LeafElement<G>> = (0..INPUTS).map(|i| leaves.leaf(i).element()).collect();
-    // One change's difference to a tree node: the new leaf's element minus the old.
+    // One change's difference to a tree node: the new leaf's element minus
+    // the old one's.
     let differences: Vec<Digest<G>> = (0..INPUTS).map(|i| Digest::from(elements[i]) - Digest::from(elements[(i + 1) % INPUTS])).collect();
 
     c.bench_function(&name(leaf_hash), |b| {

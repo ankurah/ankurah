@@ -25,6 +25,7 @@ use crate::store::{Failure, MapAccess, MapTransaction, MemoryMaps, MemoryTransac
 mod audit;
 mod build;
 mod change;
+
 #[cfg(test)]
 mod fixtures;
 mod leaves;
@@ -66,12 +67,12 @@ impl<G: DigestGroup> DigestTree<G> {
 /// Every operation runs within the transaction: its reads observe the state
 /// the transaction began with and the transaction's own earlier writes, and
 /// its writes land, all together, only when the owning transaction commits.
-/// [`TreeTransaction::commit`] is available when this view owns its maps.
-/// A borrowed view leaves commit to its outer owner.
-/// A [`TreeError::Conflict`] from any operation or from the commit
-/// fails the transaction whole, and the caller retries from fresh reads in a
-/// new one. The tree's operations are the only writers of the maps' contents,
-/// every key and value in the tree's own byte layout.
+/// [`TreeTransaction::commit`] is available when this view owns its maps; a
+/// borrowed view leaves commit to its outer owner. A [`TreeError::Conflict`]
+/// from any operation or from the commit fails the transaction whole, and the
+/// caller retries from fresh reads in a new one. The tree's operations are the
+/// only writers of the maps' contents, every key and value in the tree's own
+/// byte layout.
 #[derive(Debug)]
 pub struct TreeTransaction<G: DigestGroup = Ristretto255, T = MemoryTransaction> {
     pub(crate) transaction: T,
@@ -133,12 +134,12 @@ impl<G: DigestGroup, T: MapAccess> Drop for MutationGuard<'_, G, T> {
 const PAGE: usize = 1024;
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
-    /// Use these transaction-bound maps as the tree described by `spec`.
-    /// The caller supplies this tree's maps and matching spec. Admission is
-    /// still the caller's responsibility; the tree validates canonical keys.
-    /// Passing a borrowed adapter leaves commit with the outer transaction.
-    /// Scopes and cursors belong to this view and must be resolved again when
-    /// a new view is opened, even within the same outer transaction.
+    /// Use `maps`, bound to a transaction, as the tree `spec` defines. The
+    /// caller supplies the tree's maps and its matching spec, and decides
+    /// admission; the tree validates canonical keys. A borrowed adapter leaves
+    /// commit with the outer transaction. Scopes and cursors belong to this
+    /// view, and are resolved again in a new view, even within the same outer
+    /// transaction.
     ///
     /// ```
     /// # async fn example() -> Result<(), ankurah_digest_tree::TreeError> {

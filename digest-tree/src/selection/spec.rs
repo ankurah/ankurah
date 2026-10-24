@@ -113,16 +113,16 @@ impl TreeSpec {
                 }
             }
         } else {
-            let ranges: BTreeSet<_> = request
+            let ranged: BTreeSet<_> = request
                 .clauses
                 .iter()
                 .flat_map(|c| c.fields.keys())
                 .filter(|p| p.property_id() != PropertyId::Id && !paths.contains(p))
                 .cloned()
                 .collect();
-            let ordered = request.order.keyparts.iter().map(IndexKeyPart::path).find(|p| ranges.contains(p));
-            if let Some(range) = ordered.or_else(|| ranges.into_iter().next()) {
-                paths.push(range);
+            let ordered = request.order.keyparts.iter().map(IndexKeyPart::path).find(|p| ranged.contains(p));
+            if let Some(path) = ordered.or_else(|| ranged.into_iter().next()) {
+                paths.push(path);
             }
         }
         let parts = paths.iter().map(|p| IndexKeyPart::asc_on(p, request.types[p])).collect();
@@ -159,12 +159,12 @@ pub(super) fn unlabeled(predicate: &Predicate<Resolved>) -> Predicate<Resolved> 
     .predicate
 }
 
-/// Two specs are equal when their identity bytes agree. Display labels do not
-/// participate. A float literal compares by
-/// its bits, so 0.0 and -0.0, or two NaNs with different payloads, make
-/// different specs, and a NaN equals itself: canonicalizing literals, so that
-/// equal Selections share a tree, is the caller's job, done before it builds
-/// the spec. So is the order of a conjunction's terms, which the bytes keep.
+/// Two specs are equal when their identity bytes agree, display labels aside.
+/// A float literal compares by its bits, so 0.0 and -0.0, or two NaNs with
+/// different payloads, make different specs, and a NaN equals itself:
+/// canonicalizing literals, so that equal Selections share a tree, is the
+/// caller's job, done before it builds the spec. So is the order of a
+/// conjunction's terms, which the bytes keep.
 impl PartialEq for TreeSpec {
     fn eq(&self, other: &Self) -> bool { self.identity == other.identity }
 }

@@ -11,11 +11,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 #[tokio::test]
 async fn insert_and_remove_encode_one_delta_for_all_ancestors() {
     static ENCODES: AtomicUsize = AtomicUsize::new(0);
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CountEncodes;
+
     impl Hook for CountEncodes {
         fn encode() { ENCODES.fetch_add(1, Ordering::Relaxed); }
     }
+
     type CountedEncode = Hooked<CountEncodes>;
     let leaf = |n: u64| {
         let mut id = [0; EntityId::BYTE_LEN];
@@ -101,11 +104,14 @@ async fn moves_give_shared_and_separate_ancestors_their_own_deltas() {
 #[tokio::test]
 async fn topology_counts_do_not_decode_neighboring_leaves() {
     static DECODES: AtomicUsize = AtomicUsize::new(0);
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CountDecodes;
+
     impl Hook for CountDecodes {
         fn decode() { DECODES.fetch_add(1, Ordering::Relaxed); }
     }
+
     type CountedDecode = Hooked<CountDecodes>;
     let leaf = |n: u8| LeafInput { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
     for removing in [false, true] {
@@ -133,7 +139,8 @@ async fn topology_counts_do_not_decode_neighboring_leaves() {
 #[tokio::test]
 async fn counting_defers_neighbor_validation_but_leaf_reads_and_rebuilds_reject_corruption() {
     let leaf = |n: u8| LeafInput { key: vec![], entity_id: EntityId::from_bytes([n; 32]), head: HeadHash::of([[1; 32]]) };
-    // A plain insertion, an insertion causing a split, and a removal causing a merge.
+    // A plain insertion, an insertion that splits a bucket, and a removal that
+    // merges a subtree.
     for (initial, removing) in [(32, false), (64, false), (65, true)] {
         let tree = DigestTree::<Ristretto255>::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True));
         let mut setup = tree.begin();
@@ -308,11 +315,14 @@ mod map_costs {
         appends: usize,
         write_bytes: usize,
     }
+
     type Counts = Arc<Mutex<[Cost; 3]>>;
+
     struct Counted {
         inner: MemoryTransaction,
         counts: Counts,
     }
+
     impl Counted {
         fn scanned(&self, map: MapName, rows: &[(Vec<u8>, Vec<u8>)]) {
             let mut counts = self.counts.lock().unwrap();
@@ -322,12 +332,14 @@ mod map_costs {
             cost.read_bytes += rows.iter().map(|(key, value)| key.len() + value.len()).sum::<usize>();
         }
     }
+
     #[async_trait]
     impl MapAccess for Counted {
         fn poison(&mut self, failure: Failure) { self.inner.poison(failure); }
 
         fn watch_structure(&mut self) { self.inner.watch_structure(); }
         fn change_structure(&mut self) { self.inner.change_structure(); }
+
         async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> {
             let value = self.inner.get(map, key).await?;
             let mut counts = self.counts.lock().unwrap();
@@ -337,16 +349,19 @@ mod map_costs {
             cost.read_bytes += value.as_ref().map_or(0, |value| key.len() + value.len());
             Ok(value)
         }
+
         async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
             let rows = self.inner.scan(map, bounds, limit).await?;
             self.scanned(map, &rows);
             Ok(rows)
         }
+
         async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
             let rows = self.inner.scan_reverse(map, bounds, limit).await?;
             self.scanned(map, &rows);
             Ok(rows)
         }
+
         async fn insert(&mut self, map: MapName, key: &[u8], value: &[u8]) -> Result<(), TreeError> {
             {
                 let mut counts = self.counts.lock().unwrap();
@@ -355,6 +370,7 @@ mod map_costs {
             }
             self.inner.insert(map, key, value).await
         }
+
         async fn put_if(&mut self, map: MapName, key: &[u8], expected: Option<&[u8]>, value: &[u8]) -> Result<(), TreeError> {
             {
                 let mut counts = self.counts.lock().unwrap();
@@ -363,6 +379,7 @@ mod map_costs {
             }
             self.inner.put_if(map, key, expected, value).await
         }
+
         async fn delete_if(&mut self, map: MapName, key: &[u8], expected: &[u8]) -> Result<(), TreeError> {
             {
                 let mut counts = self.counts.lock().unwrap();
@@ -371,6 +388,7 @@ mod map_costs {
             }
             self.inner.delete_if(map, key, expected).await
         }
+
         async fn append(&mut self, map: MapName, key: &[u8], value: &[u8]) -> Result<(), TreeError> {
             {
                 let mut counts = self.counts.lock().unwrap();
@@ -392,6 +410,7 @@ mod map_costs {
             Predicate::True,
         )
     }
+
     fn leaf(value: i64, version: u8) -> LeafInput {
         let mut id = [0; 32];
         id[..8].copy_from_slice(&value.to_be_bytes());
@@ -401,9 +420,11 @@ mod map_costs {
             head: HeadHash::of([[version; 32]]),
         }
     }
+
     fn begin(maps: &MemoryMaps, counts: &Counts) -> TreeTransaction<Ristretto255, Counted> {
         TreeTransaction::bind(&spec(), Counted { inner: maps.begin(), counts: counts.clone() })
     }
+
     async fn populated(size: i64) -> (MemoryMaps, Counts) {
         let maps = MemoryMaps::new();
         let counts = Counts::default();
@@ -413,6 +434,7 @@ mod map_costs {
         reset(&counts);
         (maps, counts)
     }
+
     fn reset(counts: &Counts) { *counts.lock().unwrap() = Default::default(); }
 
     #[tokio::test]

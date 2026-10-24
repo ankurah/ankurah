@@ -137,7 +137,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         self.write_leaves(&change).await?;
         match (&change.before, &change.after) {
             (Some(before), Some(after)) if before.address() == after.address() => {
-                // Changing only the head preserves both the lookup and topology.
+                // A change of head alone keeps the lookup and the topology.
                 let path = self.path(after.address()).await?;
                 let difference = Digest::from(after.row().element) - Digest::from(before.row().element);
                 self.record(differences, &path.prefixes, difference).await
@@ -298,7 +298,8 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
                     self.insert_branch(&prefix, &children, address, element).await?;
                 }
                 Some(_) if children.is_empty() && !removed_beneath => {
-                    // Topology depends on row count; reading or rebuilding a leaf validates its contents.
+                    // The topology depends on the count of leaves alone, which
+                    // decodes none; reading or rebuilding a leaf validates it.
                     let leaves =
                         self.transaction.count_up_to(MapName::Leaves, TreeSpan::under(&prefix).bounds(), BUCKET_CAPACITY + 1).await?;
                     if leaves > BUCKET_CAPACITY {

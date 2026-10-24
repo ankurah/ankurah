@@ -82,7 +82,8 @@ impl TreeSpan {
         self.is_empty() || (cmp_starts(&self.start, &other.start).is_ge() && cmp_ends(&self.end, &other.end).is_le())
     }
 
-    /// Compare lower bounds in address order, including open and unbounded ends.
+    /// Compare this span's start with `other`'s in address order, excluded and
+    /// unbounded starts included.
     pub fn cmp_start(&self, other: &Self) -> Ordering { cmp_starts(&self.start, &other.start) }
 
     /// The addresses in both this span and `other`; `None` when the
@@ -211,10 +212,12 @@ pub(crate) fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// A tree span and the digest of its leaves, cached or computed for clipped bounds.
-/// Bounds are complete addresses, so another tree can compute the same span independently.
-/// A peer must also establish compatible keys, digest groups and admitted
-/// membership; a span digest alone does not carry those proofs.
+/// A span of a tree and the digest of its leaves, which two peers compare:
+/// the stored digest of a tree node the span covers whole, or else the sum of
+/// the leaves within the span. The bounds are complete addresses, so another
+/// tree can compute the digest of the same span independently. A peer must
+/// also establish compatible keys, digest groups and admitted membership; a
+/// span digest alone does not carry those proofs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TreeSpanDigest<G: DigestGroup = Ristretto255> {
     /// The containing subtree from which refinement continues. Bounds alone
@@ -237,12 +240,15 @@ impl<'de, G: DigestGroup> Deserialize<'de> for TreeSpanDigest<G> {
         Self::from_bytes(&bytes).map_err(serde::de::Error::custom)
     }
 }
+
 impl<G: DigestGroup> TreeSpanDigest<G> {
-    /// Encode a versioned span digest for a peer, independent of a local snapshot.
+    /// Encode the span digest for a peer, behind a version byte.
     pub(crate) fn to_bytes(&self) -> Vec<u8> {
         bincode::serialize(&(1u8, self.prefix.to_bytes(), &self.bounds.start, &self.bounds.end, self.digest.to_row_bytes())).unwrap()
     }
-    /// Decode a span digest and validate its prefix, bounds, count and group encoding.
+
+    /// Decode a span digest a peer encoded, validating its prefix, bounds,
+    /// count and group encoding.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, TreeError> {
         use bincode::Options;
         type EncodedSpanDigest = (u8, Vec<u8>, std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>, Vec<u8>);

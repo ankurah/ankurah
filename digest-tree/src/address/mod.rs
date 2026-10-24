@@ -17,10 +17,10 @@ pub use span::{TreeSpan, TreeSpanDigest};
 /// Leaf rows are ordered by it, and a tree node's prefix is a run of its
 /// leading bits.
 ///
-/// [`CanonicalCodec`](crate::CanonicalCodec) makes complete keys prefix-free
-/// for a given spec, including strings containing NUL. Thus each key's leaves
-/// occupy a contiguous interval and tuple bounds extend to address bounds
-/// without admitting rows of a neighboring key.
+/// [`CanonicalCodec`] makes complete keys prefix-free for a given spec,
+/// strings containing NUL included, so each key's leaves occupy a contiguous
+/// interval, and tuple bounds extend to address bounds without admitting rows
+/// of a neighboring key.
 pub fn leaf_address(key: &[u8], entity_id: EntityId) -> Vec<u8> {
     let mut address = Vec::with_capacity(key.len() + EntityId::BYTE_LEN);
     address.extend_from_slice(key);

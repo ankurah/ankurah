@@ -65,9 +65,9 @@ async fn a_leaf_is_written_against_the_row_the_writer_read<G: DigestGroup>() {
     assert!(matches!(tree.begin().delete_leaf(&encoded(later.clone())).await, Err(TreeError::Conflict)), "gone already");
 }
 
-/// The lookup from an entity to its rows follows every put and delete,
-/// and lists the rows in address order even where one key is a prefix
-/// of another.
+/// The lookup from an entity to its rows follows every put and delete, and
+/// lists the rows in address order even where one key is a prefix of
+/// another.
 async fn the_leaves_of_one_entity_follow_its_keys<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     // An id of 0xff bytes: against a longer key's next byte, the id's

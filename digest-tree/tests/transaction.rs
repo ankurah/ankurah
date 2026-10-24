@@ -4,6 +4,7 @@
 //! everything or nothing; separate `MemoryMaps` would not test that. The
 //! topology fence is the memory maps' own, which covers the whole outer
 //! transaction.
+
 use std::borrow::BorrowMut;
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
@@ -22,10 +23,12 @@ type Rows = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Default)]
 struct Store(MemoryMaps);
+
 struct Transaction {
     maps: MemoryTransaction,
     fault: Option<Fault>,
 }
+
 #[derive(Clone, Copy, Debug)]
 enum Fault {
     Error,
@@ -313,7 +316,8 @@ async fn semantic_tree_failure_also_poisons_a_borrowed_memory_owner() {
     {
         let mut tree = TreeTransaction::<Ristretto255, _>::bind(&spec, &mut owner);
         tree.build([leaf(0, 0)]).await.unwrap();
-        // This fails in the tree before any conditional map write can poison it.
+        // This fails in the tree before any conditional map write can poison
+        // it.
         assert!(matches!(tree.apply_change(LeafChange { before: Some(leaf(0, 1)), after: None }).await, Err(TreeError::Conflict)));
     }
     TreeTransaction::<Ristretto255, _>::bind(&spec, &mut owner).apply_change(LeafChange { before: None, after: None }).await.unwrap();

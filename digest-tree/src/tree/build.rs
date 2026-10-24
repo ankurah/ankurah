@@ -35,8 +35,9 @@ fn prepare_leaves<G: DigestGroup>(leaves: Vec<(Vec<u8>, LeafInput)>) -> Vec<Enco
     leaves.into_iter().map(|(address, leaf)| EncodedLeaf::new(address, leaf.into_row())).collect()
 }
 
-/// The target maximum number of leaves in a terminal bucket.
-/// Merging at half this size avoids repeatedly splitting and merging near the threshold.
+/// The most leaves a bucket holds: a bucket that grows past it splits. A
+/// subtree merges back into one bucket only once it shrinks to half this, so
+/// that a bucket near the threshold does not split and merge over and over.
 pub const BUCKET_CAPACITY: usize = 64;
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
@@ -63,7 +64,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         let mut admitted = BTreeMap::new();
         for leaf in leaves {
             CanonicalCodec::check(self.spec.key_spec(), &leaf.key)?;
-            let address = crate::leaf_address(&leaf.key, leaf.entity_id);
+            let address = leaf_address(&leaf.key, leaf.entity_id);
             if admitted.insert(address, leaf).is_some() {
                 return Err(TreeError::DuplicateLeaf);
             }
@@ -147,6 +148,7 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         for (key, value) in entries {
             self.transaction.delete_if(MapName::Nodes, &key, &value).await?;
         }
+
         enum Step {
             Build { prefix: NodePrefix, from: usize, to: usize },
             Join(NodePrefix),

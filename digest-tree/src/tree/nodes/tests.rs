@@ -72,9 +72,11 @@ impl<T: MapAccess> MapAccess for Interleaved<T> {
     fn poison(&mut self, failure: Failure) { self.inner.poison(failure); }
     fn watch_structure(&mut self) { self.inner.watch_structure(); }
     fn change_structure(&mut self) { self.inner.change_structure(); }
+
     async fn scan_reverse(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {
         self.inner.scan_reverse(map, bounds, limit).await
     }
+
     async fn get(&mut self, map: MapName, key: &[u8]) -> Result<Option<Vec<u8>>, TreeError> { self.inner.get(map, key).await }
 
     async fn scan(&mut self, map: MapName, bounds: ByteBounds<'_>, limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>, TreeError> {

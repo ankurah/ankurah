@@ -3,6 +3,7 @@
 //! digests, refines where they differ, and repairs the leaves in the spans
 //! that still differ. Comparison and repair are tested here, not how events
 //! resolve conflicts.
+
 mod common;
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound::{Excluded, Included};
@@ -18,15 +19,19 @@ use common::Types;
 fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([1; 32])) }
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(property(), ValueType::I64)]), Predicate::True) }
 fn key(value: i64) -> Vec<u8> { CanonicalCodec::encode_prefix(spec().key_spec(), &[Value::I64(value)]).unwrap() }
+
 fn leaf(value: i64, version: u8) -> LeafInput {
     let mut id = [0; 32];
     id[..8].copy_from_slice(&value.to_be_bytes());
     LeafInput { key: key(value), entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
 }
+
 fn address(leaf: &LeafInput) -> Vec<u8> { leaf_address(&leaf.key, leaf.entity_id) }
+
 fn model(leaves: impl IntoIterator<Item = LeafInput>) -> BTreeMap<Vec<u8>, LeafInput> {
     leaves.into_iter().map(|leaf| (address(&leaf), leaf)).collect()
 }
+
 async fn build<G: DigestGroup>(leaves: impl IntoIterator<Item = LeafInput>) -> DigestTree<G> {
     let tree = DigestTree::new(spec());
     let mut tx = tree.begin();
@@ -34,6 +39,7 @@ async fn build<G: DigestGroup>(leaves: impl IntoIterator<Item = LeafInput>) -> D
     tx.commit().await.unwrap();
     tree
 }
+
 async fn rows<G: DigestGroup>(tx: &mut TreeTransaction<G>, span: &TreeSpan) -> BTreeMap<Vec<u8>, LeafInput> {
     let scope = tx.scope_spans([span.clone()]);
     let mut result = BTreeMap::new();

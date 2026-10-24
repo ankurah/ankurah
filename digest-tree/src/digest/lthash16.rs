@@ -216,8 +216,8 @@ mod tests {
         }
     }
 
-    /// Rows carry any count exactly, beside lanes at the
-    /// edges of their range, and a decoded count at a limit refuses to pass it.
+    /// Rows carry any count exactly, beside lanes at the edges of their range,
+    /// and a decoded count at a limit refuses to pass it.
     #[test]
     fn rows_carry_extreme_counts_exactly() {
         let lanes: [u16; LANES] = std::array::from_fn(|i| [0xffff, 0, 1, 0x8000][i % 4]);

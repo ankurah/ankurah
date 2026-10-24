@@ -44,6 +44,7 @@ macro_rules! in_each_group {
             $(#[tokio::test]
             async fn $test() { super::$test::<crate::digest::Ristretto255>().await })*
         }
+
         mod lthash16 {
             $(#[tokio::test]
             async fn $test() { super::$test::<crate::digest::LtHash16>().await })*
@@ -71,20 +72,25 @@ impl<H: Hook> DigestGroup for Hooked<H> {
     const ROW_VERSION: u8 = Ristretto255::ROW_VERSION;
     const ELEMENT_LEN: usize = Ristretto255::ELEMENT_LEN;
     fn zero() -> Self::Element { Ristretto255::zero() }
+
     fn add(sum: &mut Self::Element, other: &Self::Element) {
         H::add();
         Ristretto255::add(sum, other);
     }
+
     fn sub(sum: &mut Self::Element, other: &Self::Element) { Ristretto255::sub(sum, other); }
     fn neg(element: &mut Self::Element) { Ristretto255::neg(element); }
+
     fn hash_leaf(encoded_leaf: &[u8]) -> Self::Element {
         H::hash_leaf(encoded_leaf);
         Ristretto255::hash_leaf(encoded_leaf)
     }
+
     fn encode(element: &Self::Element, out: &mut [u8]) {
         H::encode();
         Ristretto255::encode(element, out);
     }
+
     fn decode(bytes: &[u8]) -> Result<Self::Element, DecodeError> {
         H::decode();
         Ristretto255::decode(bytes)

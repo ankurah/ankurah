@@ -20,7 +20,7 @@ pub struct AuditCounts {
     pub leaves: usize,
     /// Number of entities with at least one leaf.
     pub entities: usize,
-    /// Number of cached summaries.
+    /// Number of tree nodes.
     pub nodes: usize,
 }
 

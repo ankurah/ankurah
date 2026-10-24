@@ -197,13 +197,16 @@ pub(super) fn clauses(predicate: &Predicate<Resolved>, types: &BTreeMap<Property
         _ => Ok(opaque_clause(predicate)),
     }
 }
+
 fn field_clause(path: &PropertyPath, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Clause {
     Clause { fields: BTreeMap::from([(path.clone(), TreeSpan::new(start, end))]), opaque: BTreeSet::new() }
 }
+
 fn opaque_clause(predicate: &Predicate<Resolved>) -> Vec<Clause> {
     let opaque = bincode::serialize(&unlabeled(predicate)).expect("a predicate serializes");
     vec![Clause { fields: BTreeMap::new(), opaque: BTreeSet::from([opaque]) }]
 }
+
 fn collect_paths(predicate: &Predicate<Resolved>, out: &mut BTreeSet<PropertyPath>) {
     match predicate {
         Predicate::And(a, b) | Predicate::Or(a, b) => {

@@ -55,15 +55,14 @@ struct StoredBase<G: DigestGroup> {
 }
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
-    /// The tree node at `prefix`: its base row plus the deltas appended
-    /// since, summed a page at a time as they are read; `None` where it has
-    /// neither.
+    /// The digest of the tree node at `prefix`: its base row plus the deltas
+    /// appended since, summed a page at a time as they are read; `None` where
+    /// there is neither, which means no stored tree node, not an empty subtree.
     ///
-    /// Deltas without a base report [`TreeError::IncompleteNode`]. This can
-    /// happen in damaged or incompletely maintained rows: the remaining
-    /// changes do not summarize the leaves still beneath the prefix.
-    /// An empty baseline must be stored explicitly before appending
-    /// changes to it. `None` means no stored summary, not an empty subtree.
+    /// Deltas without a base report [`TreeError::IncompleteNode`]: the rows
+    /// are damaged or incompletely maintained, and the deltas alone do not sum
+    /// the leaves beneath the prefix. So the base of an empty tree node is
+    /// stored, holding the empty digest, before any delta is appended to it.
     pub async fn node(&mut self, prefix: &NodePrefix) -> Result<Option<Digest<G>>, TreeError> {
         let base = self.base(prefix).await?;
         let exists = base.is_some();
@@ -186,20 +185,19 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     }
 
     /// Fold the tree node's first deltas in key order, a batch of at most
-    /// 1,024, into its base row and remove them, so that reads sum fewer
-    /// rows. Deltas without a base report [`TreeError::IncompleteNode`]
-    /// without changing any rows. Returns whether deltas
-    /// remain beyond the batch, which a later compaction, in a transaction of
-    /// its own, folds. The base is written only if it is still the one read,
-    /// and each delta removed only if it is still there:
-    /// [`TreeError::Conflict`] otherwise, so the transaction fails whole and
-    /// the compaction retries from fresh reads.
-    ///
-    /// Addition commutes, so the sum a reader gets is the same whichever
-    /// deltas have been folded: a delta appended after compaction read is
-    /// not among those it removes, stays in its row, and a later round folds
-    /// it.
+    /// 1,024, into its base row and remove them, so that reads sum fewer rows,
+    /// and return whether deltas remain beyond the batch, for a later
+    /// compaction, in a transaction of its own, to fold. Deltas without a base
+    /// report [`TreeError::IncompleteNode`] without changing any rows. The base
+    /// is written only if it is still the one read, and each delta removed only
+    /// if it is still there: [`TreeError::Conflict`] otherwise, so the
+    /// transaction fails whole and the compaction retries from fresh reads.
     /// Failure or cancellation prevents this transaction from committing.
+    ///
+    /// Addition commutes, so the sum a reader gets is the same whichever deltas
+    /// have been folded: a delta appended after the compaction read is not
+    /// among those it removes, stays in its row, and a later compaction folds
+    /// it.
     pub async fn compact_node(&mut self, prefix: &NodePrefix) -> Result<bool, TreeError> {
         let mut guard = self.mutation_guard();
         let result = guard.fold_deltas(prefix).await;

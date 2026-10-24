@@ -13,8 +13,10 @@ use crate::selection::{order_cut, ReusePlan, TierWalk, TreeRequest};
 use crate::store::layout;
 use crate::store::{LeafRow, MapAccess, MapName};
 
-/// Exact disjoint address spans belonging to one transaction view and its
-/// current leaf state. A mutation invalidates the scope; another transaction cannot use it.
+/// What a read of a tree covers: exact, disjoint spans of leaf addresses and
+/// the order to walk them in, bound to the transaction view that made them.
+/// A mutation in that view invalidates the scope, and no other view can use
+/// it.
 #[derive(Debug, Clone)]
 pub struct TreeScope {
     spans: Vec<TreeSpan>,
@@ -24,12 +26,13 @@ pub struct TreeScope {
     view: Arc<()>,
     generation: u64,
 }
+
 impl TreeScope {
-    /// The disjoint spans of leaf addresses left after membership and limit
-    /// have been applied.
-    /// Constraints already guaranteed by the serving tree's admission may
-    /// be absent here. Reusing these bounds on another tree requires proving
-    /// that both trees describe the same admitted selection in these bounds.
+    /// The disjoint spans of leaf addresses left once membership and limit
+    /// are applied. A constraint the serving tree's admission already
+    /// guarantees may be absent from them, so reusing these bounds on another
+    /// tree requires proving that both trees admit the same members within
+    /// them.
     pub fn spans(&self) -> &[TreeSpan] { &self.spans }
 }
 
@@ -39,6 +42,7 @@ pub struct LeafCursor {
     remaining: Vec<TreeSpan>,
     scope: TreeScope,
 }
+
 /// One page of leaves and, when more remain, the continuation to use next.
 #[derive(Debug)]
 pub struct LeafPage<G: DigestGroup = Ristretto255> {
@@ -49,9 +53,10 @@ pub struct LeafPage<G: DigestGroup = Ristretto255> {
 }
 
 impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
-    /// Read exact spans of leaf addresses directly, including a subtree via
-    /// `TreeSpan::under`. Unlike Selection scopes these count leaves,
-    /// including multiple keys for one entity, and walk in address order.
+    /// A scope of exact spans of leaf addresses, such as a subtree's
+    /// [`TreeSpan::under`]. Unlike a Selection's scope, it counts leaves, an
+    /// entity filed under several keys once for each, and walks them in
+    /// address order.
     pub fn scope_spans(&self, spans: impl IntoIterator<Item = TreeSpan>) -> TreeScope {
         TreeScope {
             spans: TreeSpan::normalize(spans.into_iter().collect()),
@@ -62,11 +67,15 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         }
     }
 
-    /// Match a request and resolve its limit against this transaction view. An
-    /// underfilled positive limit retains the membership bounds so a peer
-    /// can supply the missing members, including when this tree is empty.
-    /// Limited traversal walks each tuple tier in its requested direction; ties use
-    /// ascending entity identity unless explicitly ordered otherwise.
+    /// The scope of `request`: the spans of this tree that serve it, with its
+    /// limit resolved against this transaction view. A positive limit the
+    /// leaves do not fill keeps the membership's spans whole, so that a peer
+    /// can supply the missing members, even when this tree is empty. Under a
+    /// limit, the walk takes each key part's tier in the request's direction,
+    /// and breaks ties by ascending entity id unless the request orders it.
+    /// [`TreeError::UnsupportedSelection`] when the tree does not serve the
+    /// request, and [`TreeError::MultipleKeys`] when it files an entity under
+    /// more than one key.
     pub async fn scope(&mut self, request: &TreeRequest) -> Result<TreeScope, TreeError> {
         let spec = self.spec.clone();
         let ReusePlan { mut spans, directions, id_direction, .. } = spec.plan(request).ok_or(TreeError::UnsupportedSelection)?;
@@ -98,10 +107,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(())
     }
 
-    /// Span digests that tile the scope without overlap. Fully covered cached
-    /// nodes contribute their stored digest; boundary buckets are clipped by
-    /// reading only their leaves inside the requested address bounds. Empty
-    /// regions remain in the cover: a peer may have leaves there.
+    /// Span digests that tile the scope without overlap: a tree node the scope
+    /// covers whole contributes its stored digest, and a bucket the scope cuts
+    /// the sum of its leaves within the scope. Spans that hold no leaf here
+    /// stay in the cover, since a peer may have leaves there.
     pub async fn span_digests(&mut self, scope: &TreeScope) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         self.check_scope(scope)?;
         let mut span_digests = Vec::new();
@@ -122,8 +131,11 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Digest::checked_sum(self.span_digests(scope).await?.iter().map(|span_digest| span_digest.digest)).map_err(Into::into)
     }
 
-    /// Refine a span digest into the nearest cached descendants, keeping its address
-    /// clip. At a terminal bucket, returns its exact clipped span digest again.
+    /// Refine a span digest into the span digests of the nearest tree nodes
+    /// beneath its prefix and of the gaps between them, within its bounds; a
+    /// tree node the bounds cut gives the span digests that tile its part. At
+    /// a bucket, which has no tree node beneath it, the span digest of its
+    /// leaves within the bounds.
     pub async fn refine(&mut self, span_digest: &TreeSpanDigest<G>) -> Result<Vec<TreeSpanDigest<G>>, TreeError> {
         let bounds =
             TreeSpan::under(&span_digest.prefix).intersect(&span_digest.bounds).ok_or(TreeError::InvalidSpan("empty tree span"))?;
@@ -170,8 +182,10 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
         Ok(span_digests)
     }
 
-    /// Read a page without restarting at earlier leaves. A cursor belongs to
-    /// this scope and transaction; mutations invalidate it along with the scope.
+    /// The next page of at most `limit` leaves in the scope's order: from the
+    /// start, or from `cursor`, which an earlier page returned. A cursor
+    /// belongs to its scope and transaction view, and a mutation invalidates
+    /// both.
     pub async fn page(&mut self, scope: &TreeScope, cursor: Option<&LeafCursor>, limit: usize) -> Result<LeafPage<G>, TreeError> {
         self.check_scope(scope)?;
         if limit == 0 {
@@ -229,8 +243,9 @@ impl<G: DigestGroup, T: MapAccess> TreeTransaction<G, T> {
     }
 }
 
-/// Children cover the locally stored leaves, but compressed prefixes need
-/// not cover their parent's addresses. Represent the rest explicitly.
+/// The parts of `bounds` that no child of the tree node at `prefix` covers,
+/// each as a span digest of no leaves: the children hold every stored leaf,
+/// but path compression can leave addresses of their parent outside them.
 fn empty_gaps<G: DigestGroup>(prefix: &NodePrefix, bounds: &TreeSpan, children: &[NodePrefix]) -> Vec<TreeSpanDigest<G>> {
     let covered: Vec<_> = children.iter().map(TreeSpan::under).collect();
     bounds.gaps(&covered).into_iter().map(|bounds| TreeSpanDigest { prefix: prefix.clone(), bounds, digest: Digest::empty() }).collect()

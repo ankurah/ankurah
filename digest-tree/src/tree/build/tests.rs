@@ -210,12 +210,15 @@ fn later_preparation_panic_poisons_prior_buffered_batches() {
 async fn a_rebuild_with_changes_hashes_only_the_leaves_the_batch_files() {
     static HASHES: AtomicUsize = AtomicUsize::new(0);
     static DECODES: AtomicUsize = AtomicUsize::new(0);
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CountHashesAndDecodes;
+
     impl Hook for CountHashesAndDecodes {
         fn hash_leaf(_encoded_leaf: &[u8]) { HASHES.fetch_add(1, Ordering::Relaxed); }
         fn decode() { DECODES.fetch_add(1, Ordering::Relaxed); }
     }
+
     type Counted = Hooked<CountHashesAndDecodes>;
 
     let leaf = |n: u64, version: u8| {

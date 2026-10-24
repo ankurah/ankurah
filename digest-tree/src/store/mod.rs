@@ -4,8 +4,8 @@
 //!
 //! A tree keeps its rows in the three maps a [`MapName`] names, and reads and
 //! writes them through [`MapAccess`] within a transaction. The tree encodes
-//! every key and value itself, in the `layout` module's layouts, so the maps hold
-//! bytes and nothing else.
+//! every key and value itself, in the layouts of the `layout` module, so the
+//! maps hold bytes and nothing else.
 //!
 //! A transaction is the unit of consistency. Every read within it observes one
 //! consistent state of all three maps, the state the transaction began with,
@@ -14,23 +14,22 @@
 //! two. Every write is conditional on what the transaction read, so that
 //! nothing depends on the order in which concurrent transactions commit, and a
 //! transaction that fails leaves nothing half-applied:
-//! [`insert`](MapAccess::insert) needs the key absent, and
-//! [`put_if`](MapAccess::put_if) and
-//! [`delete_if`](MapAccess::delete_if) need the value the transaction
-//! sees there. [`commit`](MapTransaction::commit) applies every write
-//! together, and only if every condition still holds against the maps as they
-//! stand then. A condition that fails, when its write is made or at the
-//! commit, fails the whole transaction with [`TreeError::Conflict`] and
-//! applies nothing, and the writer retries from fresh reads in a new
-//! transaction. Dropping a transaction without committing it rolls it back. A
-//! value that only ever accumulates beside others goes in by
-//! [`append`](MapAccess::append), under a key no other append takes, so
-//! that appends never conflict.
+//! [`insert`](MapAccess::insert) needs the key absent, and both
+//! [`put_if`](MapAccess::put_if) and [`delete_if`](MapAccess::delete_if)
+//! need the value the transaction sees there.
+//! [`commit`](MapTransaction::commit) applies every write together, and only
+//! if every condition still holds against the maps as they stand then. A
+//! condition that fails, when its write is made or at the commit, fails the
+//! whole transaction with [`TreeError::Conflict`] and applies nothing, and the
+//! writer retries from fresh reads in a new transaction. Dropping a
+//! transaction without committing it rolls it back. A value that only ever
+//! accumulates beside others goes in by [`append`](MapAccess::append), under a
+//! key no other append takes, so that appends never conflict.
 //!
 //! A storage engine implements both traits to keep a tree in its own store;
 //! access is async so that such an implementation can await I/O.
-//! [`MemoryTransaction`](crate::MemoryTransaction) implements them in memory,
-//! where every operation completes at once.
+//! [`MemoryTransaction`] implements them in memory, where every operation
+//! completes at once.
 
 use std::ops::Bound;
 
@@ -56,12 +55,12 @@ pub type ByteBounds<'a> = (Bound<&'a [u8]>, Bound<&'a [u8]>);
 pub enum MapName {
     /// The leaf rows, by leaf address.
     Leaves,
-    /// The keys each entity is filed under, by entity id: what
-    /// [`TreeTransaction::entity_leaves`](crate::TreeTransaction::entity_leaves)
-    /// reads, what keeps the count of entities filed under more than one key,
-    /// which a Selection's scope requires to be zero, and what an audit checks
-    /// against the leaves. Every leaf insertion and removal keeps it in step.
-    /// Its reserved empty key holds that count.
+    /// The keys each entity is filed under, by entity id, which
+    /// [`entity_leaves`](crate::TreeTransaction::entity_leaves) reads and an
+    /// audit checks against the leaves. Every leaf insertion and removal keeps
+    /// it in step, and with it the count, under its reserved empty key, of
+    /// entities filed under more than one key, which a Selection's scope
+    /// requires to be zero.
     Lookup,
     /// The tree node rows, by prefix: a base row per tree node and the delta
     /// rows appended since its base was last compacted.

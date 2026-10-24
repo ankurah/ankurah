@@ -1,5 +1,6 @@
 //! Fixtures for the API tests: a resolved `selection!`, the property types,
 //! and a tree filled with a few entities.
+
 #![allow(dead_code)]
 
 use ankql::ast::{Parsed, Resolved, Selection};
@@ -8,7 +9,8 @@ use ankurah_digest_tree::digest::HeadHash;
 use ankurah_digest_tree::{CanonicalCodec, DigestTree, LeafChange, LeafInput, PropertyTypes, Ristretto255, TreeSpec};
 use std::collections::HashMap;
 
-/// `selection!` bound to the fixture's properties: project, foo and bar are properties 1, 2 and 3.
+/// `selection!` bound to the fixture's properties: project, foo and bar are
+/// properties 1, 2 and 3.
 #[macro_export]
 macro_rules! selection {
     ($($tokens:tt)*) => { $crate::common::resolve(ankurah_derive::selection!($($tokens)*)) };
@@ -55,8 +57,8 @@ pub fn types() -> Types {
     Types(HashMap::from([(property("project"), ValueType::String), (property("foo"), ValueType::I64), (property("bar"), ValueType::I64)]))
 }
 
-/// Four acme entities with foo 9, 10, 12, 15, each at its own head.
-/// All satisfy the example's admission predicate, project = 'acme' AND foo > 7.
+/// Four acme entities with foo 9, 10, 12, 15, each at its own head. All
+/// satisfy the example's admission predicate, project = 'acme' AND foo > 7.
 pub async fn populated_tree(selection: &Selection<Resolved>) -> DigestTree<Ristretto255> {
     let tree = DigestTree::new(TreeSpec::for_selection(selection, &types()).unwrap());
     let mut tx = tree.begin();

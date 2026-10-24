@@ -1,9 +1,11 @@
 //! The canonical key codec: its encodings sort as their values do, are
 //! prefix-free, split back into their parts, and refuse what has no
 //! canonical order.
+
 use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
 use ankurah_digest_tree::CanonicalCodec;
 use proptest::prelude::*;
+
 fn spec(types: &[ValueType]) -> KeySpec<PropertyId> {
     KeySpec::new(
         types.iter().enumerate().map(|(i, t)| IndexKeyPart::asc(PropertyId::EntityId(EntityId::from_bytes([i as u8; 32])), *t)).collect(),
@@ -21,6 +23,7 @@ proptest! {
         prop_assert!(CanonicalCodec::check(&spec, &first).is_ok());
         if first != second { prop_assert!(!first.starts_with(&second) && !second.starts_with(&first)); }
     }
+
     #[test]
     fn integer_and_float_encodings_follow_numeric_order(a in any::<i64>(), b in any::<i64>(), x in any::<f64>(), y in any::<f64>()) {
         let ints = spec(&[ValueType::I64]);
@@ -33,6 +36,7 @@ proptest! {
         }
     }
 }
+
 #[test]
 fn null_zero_escapes_and_bad_encodings_are_explicit() {
     let strings = spec(&[ValueType::String]);

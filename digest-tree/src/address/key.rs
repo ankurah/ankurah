@@ -1,5 +1,6 @@
-//! Canonical, ascending key encoding. Every part is self-delimiting, including
-//! strings containing NUL, so a tuple prefix names one contiguous address range.
+//! Canonical, ascending key encoding. Every part is self-delimiting, strings
+//! containing NUL included, so a tuple prefix names one contiguous range of
+//! addresses.
 
 use ankurah_core_types::{EntityId, IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
 
@@ -24,6 +25,7 @@ impl CanonicalCodec {
         }
         Ok(bytes)
     }
+
     /// Encode the first `values.len()` parts of a key spec.
     pub fn encode_prefix(spec: &KeySpec<PropertyId>, values: &[Value]) -> Result<Vec<u8>, TreeError> {
         if values.len() > spec.keyparts.len() {
@@ -35,6 +37,7 @@ impl CanonicalCodec {
         }
         Ok(bytes)
     }
+
     /// Split a complete key into its self-delimiting encoded parts, rejecting
     /// malformed, noncanonical or trailing bytes.
     pub fn split<'a>(spec: &KeySpec<PropertyId>, key: &'a [u8]) -> Result<Vec<&'a [u8]>, TreeError> {
@@ -101,7 +104,8 @@ impl CanonicalCodec {
 fn check_utf8(body: &[u8]) -> Result<(), TreeError> {
     let mut runs = body.split(|byte| *byte == 0);
     let first = runs.next().unwrap_or_default();
-    // Every later run begins with the 255 that completes its zero byte's escape.
+    // Every later run begins with the 255 that completes its zero byte's
+    // escape.
     for run in std::iter::once(first).chain(runs.map(|run| &run[1..])) {
         std::str::from_utf8(run).map_err(|_| TreeError::InvalidKey("invalid UTF-8"))?;
     }
@@ -175,6 +179,7 @@ fn escaped(out: &mut Vec<u8>, raw: &[u8]) {
     }
     out.extend([0, 0]);
 }
+
 fn variable_len(bytes: &[u8]) -> Result<usize, TreeError> {
     let mut i = 0;
     while i < bytes.len() {

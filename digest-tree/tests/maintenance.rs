@@ -1,23 +1,27 @@
 //! Tree maintenance checked against a model of the leaves: change after
 //! change, bucket splits, merges and branch insertions keep every summary
 //! right, and changes that race with them retry.
+
 use ankql::ast::Predicate;
 use ankurah_core_types::{EntityId, KeySpec};
 use ankurah_digest_tree::{Digest, DigestGroup, DigestTree, HeadHash, Leaf, LeafChange, LeafInput, NodePrefix, TreeError, TreeSpec};
 use std::collections::BTreeMap;
 
 fn empty_tree<G: DigestGroup>() -> DigestTree<G> { DigestTree::new(TreeSpec::new(KeySpec::new(vec![]), Predicate::True)) }
+
 fn leaf(n: u16, version: u8) -> LeafInput {
     let mut id = [0; 32];
     id[..2].copy_from_slice(&n.to_be_bytes());
     LeafInput { key: vec![], entity_id: EntityId::from_bytes(id), head: HeadHash::of([[version; 32]]) }
 }
+
 async fn check<G: DigestGroup>(tree: &DigestTree<G>, expected: &BTreeMap<u16, LeafInput>) {
     let mut tx = tree.begin();
     assert_eq!(tx.audit().await.unwrap().leaves, expected.len());
     let digest: Digest<G> = expected.values().map(|v| Digest::from(Leaf::new(&v.key, v.entity_id, v.head).element())).sum();
     assert_eq!(tx.node(&NodePrefix::root()).await.unwrap().unwrap(), digest);
 }
+
 async fn maintenance<G: DigestGroup>() {
     let tree = empty_tree::<G>();
     let mut model = BTreeMap::new();
@@ -55,8 +59,10 @@ async fn maintenance<G: DigestGroup>() {
     tx.commit().await.unwrap();
     check(&rebuilt, &model).await;
 }
+
 #[tokio::test]
 async fn split_merge_replace_and_build_ristretto() { maintenance::<ankurah_digest_tree::Ristretto255>().await; }
+
 #[tokio::test]
 async fn split_merge_replace_and_build_lthash() { maintenance::<ankurah_digest_tree::LtHash16>().await; }
 
