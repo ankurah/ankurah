@@ -40,7 +40,6 @@ impl LiveQueryInner {
             // Its pending state must already invalidate that earlier answer.
             if stream.as_ref().is_some_and(|stream| stream.version == version && stream.activated) {
                 self.initialized_version.store(version.saturating_sub(1), Ordering::Release);
-                self.remote_activated_version.store(0, Ordering::Release);
                 results.set_loaded(false);
             }
             self.durable_version.store(version.saturating_sub(1), Ordering::Release);
@@ -97,6 +96,11 @@ impl LiveQueryInner {
         self.remote_stream.lock().unwrap().as_ref().filter(|stream| stream.activated).and_then(|stream| stream.refresh.clone())
     }
 
+    /// Whether `version`'s stream has completed initializing the query.
+    pub(in crate::livequery) fn remote_activated(&self, version: u32) -> bool {
+        self.remote_stream.lock().unwrap().as_ref().is_some_and(|stream| stream.version == version && stream.activated)
+    }
+
     pub(in crate::livequery) fn remote_stream_pending(&self, version: u32) -> bool {
         self.remote_stream.lock().unwrap().as_ref().is_some_and(|stream| stream.version == version && !stream.activated)
     }
@@ -120,7 +124,6 @@ impl LiveQueryInner {
         stream.installed = false;
         stream.refresh = None;
         stream.decides_membership.store(false, Ordering::Release);
-        self.remote_activated_version.store(0, Ordering::Release);
         self.initialized_version.store(version.saturating_sub(1), Ordering::Release);
         self.durable_version.store(version.saturating_sub(1), Ordering::Release);
         results.set_loaded(false);
@@ -273,7 +276,6 @@ impl crate::reactor::PreNotifyHook for RemoteActivation<'_> {
             return;
         }
         current.activated = true;
-        self.query.remote_activated_version.store(version, Ordering::Release);
         self.query.initialized_version.fetch_max(version, Ordering::AcqRel);
         drop(stream);
         if self.query.error.with(Option::is_some) {

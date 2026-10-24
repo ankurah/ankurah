@@ -87,7 +87,7 @@ impl EntityLiveQuery {
             if cached || !has_relay {
                 let inner = self.0.clone();
                 crate::task::spawn(async move {
-                    if inner.remote_activated_version.load(Ordering::Acquire) == version {
+                    if inner.remote_activated(version) {
                         return;
                     }
                     match inner.activate(version).await {
@@ -141,7 +141,9 @@ impl EntityLiveQuery {
     }
     pub(crate) fn retain_tree(&self, version: u32, pin: Option<crate::node::state_sync::ResidentPin>) { self.0.retain_tree(version, pin); }
     pub(crate) fn resolved_selection(&self) -> Option<(ankql::ast::Selection<Resolved>, u32)> { self.0.selection.value() }
-    pub(crate) async fn activate_remote(
+    /// Install an answer from this query's remote stream; `complete` says whether it finishes
+    /// initializing the query. Returns the ids it notified, or `None` once the stream is superseded.
+    pub(crate) async fn install_remote(
         &self,
         version: u32,
         entities: Vec<Entity>,
@@ -149,19 +151,9 @@ impl EntityLiveQuery {
         changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
+        complete: bool,
     ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
-        self.0.install_remote(version, entities, membership, changes, origin, canceled, true).await
-    }
-    pub(crate) async fn install_remote_partial(
-        &self,
-        version: u32,
-        entities: Vec<Entity>,
-        membership: crate::reactor::RemoteMembership,
-        changes: Vec<crate::changes::EntityChange>,
-        origin: &proto::RequestId,
-        canceled: &(dyn Fn() -> bool + Send + Sync),
-    ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
-        self.0.install_remote(version, entities, membership, changes, origin, canceled, false).await
+        self.0.install_remote(version, entities, membership, changes, origin, canceled, complete).await
     }
     #[cfg(test)]
     pub(crate) fn listen_updates(
@@ -197,7 +189,7 @@ impl crate::peer_subscription::RemoteQuerySubscriber for WeakEntityLiveQuery {
             if inner.remote_stream_pending(version) {
                 return;
             }
-            if inner.remote_activated_version.load(Ordering::Acquire) == version {
+            if inner.remote_activated(version) {
                 inner.mark_durable_answered(version);
                 return;
             }

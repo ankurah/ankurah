@@ -17,7 +17,6 @@ use remote::RemoteStream;
 
 /// Shared query state; versions identify selection attempts, not system epochs.
 pub(super) struct LiveQueryInner {
-    pub(super) remote_activated_version: AtomicU32,
     remote_stream: std::sync::Mutex<Option<RemoteStream>>,
     /// The current selection keeps its tree resident across peer disconnections.
     resident_tree: std::sync::Mutex<Option<crate::node::state_sync::ResidentPin>>,
@@ -57,7 +56,6 @@ impl LiveQueryInner {
         let gap_fetcher: Arc<dyn GapFetcher<Entity>> = Arc::new(QueryGapFetcher::new(Context(context.clone())));
 
         Self {
-            remote_activated_version: AtomicU32::new(0),
             remote_stream: std::sync::Mutex::new(None),
             resident_tree: std::sync::Mutex::new(None),
             query_id,

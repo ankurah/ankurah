@@ -294,11 +294,7 @@ impl Driver {
             held: preserve,
             known_heads: baseline,
         };
-        let installed = if complete {
-            query.activate_remote(version, entities, membership, changes, origin, &canceled).await?
-        } else {
-            query.install_remote_partial(version, entities, membership, changes, origin, &canceled).await?
-        };
+        let installed = query.install_remote(version, entities, membership, changes, origin, &canceled, complete).await?;
         let notified = installed.ok_or_else(|| anyhow::anyhow!("query stream superseded during installation"))?;
         self.partial_removals.clear();
         Ok(notified)
