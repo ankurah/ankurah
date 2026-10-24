@@ -7,7 +7,7 @@ use js_sys::Array;
 use wasm_bindgen::{JsCast, JsValue};
 
 use super::{
-    statement::{integer_from_js, js_error, statement_method},
+    statement::{integer_from_js, js_error, statement_method, width},
     NodeJsConnection,
 };
 use crate::error::SqliteError;
@@ -22,10 +22,11 @@ const KEPT_READERS_MAX: usize = 64;
 /// SQLite prepares a kept statement again when the schema changes, but a
 /// typed reader names its statement's columns, which a `SELECT *` may have
 /// gained or lost; so every kept reader is dropped when the schema version
-/// of main or temp changes, and one that fails, as a reader of an attached
-/// database's table can, is dropped and its statement read afresh (see
-/// `read`). A reader is kept only for a statement that
-/// `refuse_a_compound_select` lets through.
+/// of main or temp changes, and one that fails because its statement now
+/// yields another number of columns, as a reader of an attached database's
+/// table can, is dropped and its statement read afresh (see `read`). A
+/// reader is kept only for a statement that `refuse_a_compound_select` lets
+/// through.
 #[derive(Default)]
 pub(super) struct KeptReaders {
     /// The schema versions the kept readers were prepared at.
@@ -101,15 +102,85 @@ impl NodeJsConnection {
     /// Drop the typed reader kept for `sql`, so that its statement is read
     /// afresh, as on its first run.
     pub(super) fn drop_reader(&self, sql: &str) { self.readers.borrow_mut().kept.remove(sql); }
+
+    /// Whether the statement `sql`, prepared afresh, yields another number of
+    /// columns than the `kept_width` its kept reader names, which is why
+    /// SQLite fails to prepare that reader again. A statement that no longer
+    /// prepares yields no other width, so that the reader's own failure is
+    /// reported.
+    pub(super) fn yields_another_width(&self, sql: &str, kept_width: usize) -> bool {
+        self.prepare(sql).and_then(|statement| width(&statement)).is_ok_and(|width| width != kept_width)
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use js_sys::{Function, Reflect};
     use wasm_bindgen_test::wasm_bindgen_test;
 
-    use crate::executor::SqliteExecutor;
+    use crate::{executor::SqliteExecutor, test_driver};
 
     use super::*;
+
+    /// A connection on a database that has a host function `tick()`, which
+    /// returns NULL and throws on its fourth call, over a table `f` of three
+    /// rows; and a count of the function's calls so far.
+    fn ticking_connection() -> (NodeJsConnection, impl Fn() -> f64) {
+        let database = test_driver::host_database(":memory:");
+        let register = Function::new_with_args(
+            "database",
+            "let calls = 0;
+             database.function('tick', () => {
+                 calls += 1;
+                 if (calls === 4) throw new Error('tick refuses its fourth call');
+                 return null;
+             });
+             return () => calls;",
+        );
+        let calls: Function = register.call1(&JsValue::NULL, &database).unwrap().dyn_into().unwrap();
+        let connection = NodeJsConnection::from_database(database).unwrap();
+        connection.execute("CREATE TABLE f (a)", &[]).unwrap();
+        connection.execute("INSERT INTO f VALUES (1), (2), (3)", &[]).unwrap();
+        (connection, move || calls.call0(&JsValue::NULL).unwrap().as_f64().unwrap())
+    }
+
+    /// The query the tests run on `f`, which calls `tick()` once for each row.
+    const TICKING_QUERY: &str = "SELECT a, tick() FROM f ORDER BY a";
+
+    /// A kept reader whose statement fails as it runs, in a host function
+    /// that throws on one call, reports that failure, and does not run the
+    /// statement again, which would call the function once more for each row.
+    /// The reader stays kept, and reads the statement once the function
+    /// stops throwing.
+    #[wasm_bindgen_test]
+    fn a_kept_reader_that_fails_as_it_runs_reports_the_failure() {
+        let (connection, calls) = ticking_connection();
+        assert_eq!(connection.query(TICKING_QUERY, &[]).unwrap().len(), 3, "the first run calls tick() three times");
+        let error = connection.query(TICKING_QUERY, &[]).expect_err("the kept reader's run calls tick() a fourth time");
+        assert!(error.to_string().contains("tick refuses its fourth call"), "{error}");
+        assert_eq!(calls(), 4.0, "the failed run called tick() once, and nothing ran it again");
+        assert!(connection.readers.borrow().kept.contains_key(TICKING_QUERY));
+        assert_eq!(connection.query(TICKING_QUERY, &[]).unwrap().len(), 3);
+    }
+
+    /// A kept reader that fails inside an open transaction reports the
+    /// failure without running its statement again, and leaves the
+    /// transaction as SQLite left it, open after a host function's failure:
+    /// node:sqlite reports that as `isTransaction`, better-sqlite3 as
+    /// `inTransaction`.
+    #[wasm_bindgen_test]
+    fn a_kept_reader_that_fails_in_a_transaction_leaves_it_as_sqlite_left_it() {
+        let (connection, calls) = ticking_connection();
+        connection.query(TICKING_QUERY, &[]).unwrap();
+        connection.execute("BEGIN", &[]).unwrap();
+        connection.execute("INSERT INTO f VALUES (4)", &[]).unwrap();
+        connection.query(TICKING_QUERY, &[]).expect_err("the kept reader's run calls tick() a fourth time");
+        assert_eq!(calls(), 4.0, "the failed run called tick() once, and nothing ran it again");
+        let open = if test_driver::on_better_sqlite3() { "inTransaction" } else { "isTransaction" };
+        assert_eq!(Reflect::get(connection.database(), &open.into()).unwrap().as_bool(), Some(true), "the transaction is open");
+        connection.execute("ROLLBACK", &[]).unwrap();
+        assert_eq!(connection.query_row("SELECT count(*) FROM f", &[]).unwrap().unwrap().integer(0).unwrap(), 3);
+    }
 
     /// A connection keeps the typed readers of at most [`KEPT_READERS_MAX`]
     /// queries, making room by dropping the least recently used, and reads a

@@ -223,14 +223,17 @@ impl NodeJsConnection {
             self.refuse_too_few_values(sql, params.len())?;
             match read_rows(&reader, params, 2 * width, selection) {
                 Ok(taken) => return taken.into_iter().map(typed_row).collect(),
-                // A kept reader can fail where one prepared afresh would not:
-                // the executor watches the schema versions of main and temp
+                // The executor watches the schema versions of main and temp
                 // only, so a reader of an attached database's table can name
-                // fewer columns than SQLite now finds there. Its error is
-                // dropped, with the reader, and the statement read once more
-                // as on its first run, which returns its own error if it fails
-                // too; the query the reader nests only reads, so running it
-                // again changes nothing.
+                // fewer or more columns than its statement now yields. SQLite
+                // then fails to prepare the reader again, before it runs
+                // anything, and so only such a reader is dropped and its
+                // statement read afresh, as on its first run. Any other failure
+                // is reported as it came, and the reader kept: the statement may
+                // have run in part, calling a host function, and SQLite may
+                // have rolled back the transaction it ran in, so running it
+                // again could repeat that part, or run outside the transaction.
+                Err(error) if !self.yields_another_width(sql, width) => return Err(error),
                 Err(_) => self.drop_reader(sql),
             }
         }
