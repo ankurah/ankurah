@@ -155,6 +155,24 @@ impl EntityLiveQuery {
     ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
         self.0.install_remote(version, entities, membership, changes, origin, canceled, complete).await
     }
+    /// Publish a committed publication from this query's remote stream that only admits or
+    /// removes ids, without reinstalling the query. The `admitted` ids join the ids the stream
+    /// admitted; the `absent` ids leave them and the results, even as local additions. `changes`
+    /// carries the publication's applied changes, including one for every newly admitted id, and
+    /// `held` rows keep their visible membership and sort key. A LIMIT window changes membership
+    /// only by a full install, so a LIMIT selection is refused. Returns the ids notified, or
+    /// `None` once the stream is superseded.
+    pub(crate) async fn publish_remote_membership(
+        &self,
+        version: u32,
+        origin: &proto::RequestId,
+        admitted: std::collections::HashSet<proto::EntityId>,
+        absent: std::collections::HashSet<proto::EntityId>,
+        changes: Vec<crate::changes::EntityChange>,
+        held: std::collections::HashSet<proto::EntityId>,
+    ) -> Result<Option<std::collections::HashSet<proto::EntityId>>, RetrievalError> {
+        self.0.publish_remote_membership(version, origin, admitted, absent, changes, held).await
+    }
     #[cfg(test)]
     pub(crate) fn listen_updates(
         &self,

@@ -16,6 +16,8 @@ use tracing::debug;
 
 mod remote_query;
 
+pub(super) use remote_query::RemotePublication;
+
 /// A notification that `entity` entered or left `query_id`'s results, carrying no events.
 fn membership_item<E: Clone, Ev>(entity: &E, query_id: proto::QueryId, change: MembershipChange) -> ReactorUpdateItem<E, Ev> {
     ReactorUpdateItem { entity: entity.clone(), events: vec![], predicate_relevance: vec![(query_id, change)] }
@@ -346,7 +348,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
     pub(super) async fn prepare_events<C: ChangeNotification<Entity = E, Event = Ev>>(
         &self,
         candidates: &CandidateChanges<C>,
-        held: Option<&HashSet<proto::EntityId>>,
+        publication: Option<&RemotePublication<'_>>,
         history: Option<&(dyn crate::retrieval::GetEvents + Send + Sync)>,
     ) -> (PreparedEvents<Ev>, Vec<crate::reactor::NotificationFailure>) {
         let plans = {
@@ -359,7 +361,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 let mut rows = Vec::new();
                 for (offset, change) in candidate.iter().enumerate() {
                     let entity_id = change.entity().id();
-                    let Some(effect) = query.effect_of(id, &selection.predicate, change, held) else { continue };
+                    let Some(effect) = query.effect_of(id, &selection.predicate, change, publication) else { continue };
                     if effect.publishes(state.entity_subscriptions.contains(&entity_id)) {
                         rows.push((offset, entity_id, change.events()));
                     }
@@ -441,7 +443,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         self,
         candidates: CandidateChanges<C>,
         mut prepared: PreparedEvents<Ev>,
-        held: Option<&HashSet<proto::EntityId>>,
+        publication: Option<&RemotePublication<'_>>,
         notified: Option<&mut HashSet<proto::EntityId>>,
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
@@ -468,7 +470,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             let mut current_publication = false;
             // Process all candidate changes for this query
             for (offset, change) in query_candidate.iter().enumerate() {
-                current_publication |= held.is_some()
+                current_publication |= publication.is_some()
                     && change
                         .query_origin()
                         .is_some_and(|origin| origin.query == query_id && query_state.source.query_origin() == Some(origin));
@@ -477,7 +479,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
                 debug!("Subscription {} evaluating entity {} for query {}", self.id(), entity_id, query_id);
 
-                let Some(effect) = query_state.effect_of(query_id, &selection.predicate, change, held) else { continue };
+                let Some(effect) = query_state.effect_of(query_id, &selection.predicate, change, publication) else { continue };
                 let (did_match, matches) = (effect.did_match, effect.matches);
 
                 // Process membership change in one match
@@ -566,7 +568,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         }
 
         // Collect gap fill data while we have the state lock
-        let gaps_to_fill = if held.is_some() { Vec::new() } else { self.collect_gaps_to_fill_internal(&state) };
+        let gaps_to_fill = if publication.is_some() { Vec::new() } else { self.collect_gaps_to_fill_internal(&state) };
         let broadcast = state.broadcast.clone();
 
         // Drop the state lock before spawning

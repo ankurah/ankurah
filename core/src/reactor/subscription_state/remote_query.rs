@@ -33,33 +33,43 @@ impl ChangeEffect {
     pub(super) fn publishes(&self, subscribed: bool) -> bool { self.readable && (self.matches || self.did_match || subscribed) }
 }
 
+/// What a committed publication from a query's remote stream decides beyond its changes' states.
+pub(in crate::reactor) struct RemotePublication<'a> {
+    /// Rows whose own publication has not committed: they keep their visible membership and sort
+    /// key until it does.
+    pub(in crate::reactor) held: &'a HashSet<proto::EntityId>,
+    /// Rows the publication removes, even local additions.
+    pub(in crate::reactor) absent: &'a HashSet<proto::EntityId>,
+}
+
 impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
     /// What `change` does to this query's membership, or `None` when the change comes from the
     /// query's own remote stream but may not move its membership: the stream was replaced, the
     /// change waits for its publication to commit, or the stream did not admit the entity. Such a
     /// change must neither restore a row the stream removed nor undo a later local or Fetch
-    /// admission. A `held` row keeps its membership until its publication commits.
+    /// admission. Within the stream's own `publication`, an absent row leaves and a held row keeps
+    /// its membership.
     pub(super) fn effect_of<C: ChangeNotification<Entity = E>>(
         &self,
         query_id: proto::QueryId,
         predicate: &Predicate<Resolved>,
         change: &C,
-        held: Option<&HashSet<proto::EntityId>>,
+        publication: Option<&RemotePublication<'_>>,
     ) -> Option<ChangeEffect> {
         let entity = change.entity();
         let readable = self.source.can_read(entity);
-        let stream_may_not_move = change.query_origin().is_some_and(|origin| {
-            origin.query == query_id
-                && (self.source.query_origin() != Some(origin)
-                    || change.defers_query_membership()
-                    || !self.source.admits_query_entity(entity))
-        });
-        if readable && stream_may_not_move {
-            return None;
-        }
         let did_match = self.resultset.contains_key(&entity.id());
+        if let Some(origin) = change.query_origin().filter(|origin| origin.query == query_id) {
+            let current = self.source.query_origin() == Some(origin) && !change.defers_query_membership();
+            if current && publication.is_some_and(|publication| publication.absent.contains(&entity.id())) {
+                return Some(ChangeEffect { readable, did_match, matches: false });
+            }
+            if readable && (!current || !self.source.admits_query_entity(entity)) {
+                return None;
+            }
+        }
         let matches = readable
-            && if held.is_some_and(|ids| ids.contains(&entity.id())) {
+            && if publication.is_some_and(|publication| publication.held.contains(&entity.id())) {
                 did_match
             } else {
                 evaluate_predicate(entity, predicate).unwrap_or(false)
@@ -131,10 +141,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         self,
         candidates: CandidateChanges<C>,
         prepared: PreparedEvents<Ev>,
-        held: &HashSet<proto::EntityId>,
+        publication: &RemotePublication<'_>,
     ) -> (Vec<WatcherChange>, HashSet<proto::EntityId>) {
         let mut notified = HashSet::new();
-        let watchers = self.evaluate_candidates(candidates, prepared, Some(held), Some(&mut notified));
+        let watchers = self.evaluate_candidates(candidates, prepared, Some(publication), Some(&mut notified));
         (watchers, notified)
     }
 }

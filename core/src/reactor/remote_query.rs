@@ -3,8 +3,10 @@
 //! only the query that owns the stream.
 
 use super::{
-    delivery::DeliveredHeads, subscription_state::Subscription, AbstractEntity, CandidateChanges, ChangeNotification, GapFetcher,
-    LocalEntitySource, PreNotifyHook, Reactor, ReactorEvent, ReactorSubscriptionId, ReactorUpdateItem,
+    delivery::DeliveredHeads,
+    subscription_state::{RemotePublication, Subscription},
+    AbstractEntity, CandidateChanges, ChangeNotification, GapFetcher, LocalEntitySource, PreNotifyHook, Reactor, ReactorEvent,
+    ReactorSubscriptionId, ReactorUpdateItem,
 };
 use crate::{resultset::EntityResultSet, selection::filter::Filterable};
 use ankql::ast::{Resolved, Selection};
@@ -110,6 +112,21 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         changes: Vec<C>,
         held: HashSet<proto::EntityId>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
+        self.notify_remote_membership(subscription_id, query, changes, held, HashSet::new()).await
+    }
+
+    /// Publish a remote stream's committed publication that also removes rows: each `absent` row
+    /// leaves the query, even a local addition, with the events of its change. `changes` must
+    /// hold a change for every absent row in the results, and the stream must already admit the
+    /// rows the publication adds. Returns the ids notified.
+    pub(crate) async fn notify_remote_membership<C: ChangeNotification<Entity = E, Event = Ev>>(
+        &self,
+        subscription_id: ReactorSubscriptionId,
+        query: proto::QueryId,
+        changes: Vec<C>,
+        held: HashSet<proto::EntityId>,
+        absent: HashSet<proto::EntityId>,
+    ) -> anyhow::Result<HashSet<proto::EntityId>> {
         let _notify = self.0.notify_lock.lock().await;
         let Some(subscription) = self.subscription(subscription_id) else { return Ok(HashSet::new()) };
         let changes = Arc::new(changes);
@@ -117,11 +134,12 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         for offset in 0..changes.len() {
             candidates.add_query(query, offset);
         }
-        let (prepared, failures) = subscription.prepare_events(&candidates, Some(&held), self.0.history.as_deref()).await;
+        let publication = RemotePublication { held: &held, absent: &absent };
+        let (prepared, failures) = subscription.prepare_events(&candidates, Some(&publication), self.0.history.as_deref()).await;
         if let Some(failure) = failures.into_iter().next() {
             return Err(failure.error.into());
         }
-        let (changes, notified) = subscription.evaluate_publication(candidates, prepared, &held);
+        let (changes, notified) = subscription.evaluate_publication(candidates, prepared, &publication);
         let mut watchers = self.0.watcher_set.lock().unwrap();
         for change in changes {
             watchers.apply_watcher_change(change);

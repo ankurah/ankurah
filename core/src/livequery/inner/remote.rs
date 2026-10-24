@@ -2,11 +2,18 @@
 //! query's membership, the ids that stream admitted, and installing what it sends.
 
 use super::LiveQueryInner;
+use crate::changes::EntityChange;
 use crate::context::{Context, DynContextInner};
 use crate::internal::prelude::*;
-use crate::reactor::fetch_gap::{GapFetcher, QueryGapFetcher};
+use crate::reactor::{
+    fetch_gap::{GapFetcher, QueryGapFetcher},
+    ChangeNotification, QueryOrigin,
+};
 use ankql::ast::Resolved;
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    collections::HashSet,
+    sync::{atomic::Ordering, Arc},
+};
 
 /// The remote state stream bound to a live query's selection version.
 pub(super) struct RemoteStream {
@@ -193,6 +200,47 @@ impl LiveQueryInner {
         Ok(Some(notified))
     }
 
+    /// Publish a committed publication from `version`'s stream that only admits or removes ids,
+    /// without reinstalling the query; see [`crate::livequery::EntityLiveQuery::publish_remote_membership`].
+    pub(in crate::livequery) async fn publish_remote_membership(
+        &self,
+        version: u32,
+        origin: &proto::RequestId,
+        admitted: HashSet<proto::EntityId>,
+        absent: HashSet<proto::EntityId>,
+        changes: Vec<EntityChange>,
+        held: HashSet<proto::EntityId>,
+    ) -> Result<Option<HashSet<proto::EntityId>>, RetrievalError> {
+        let Some((selection, stored_version)) = self.selection.value() else { return Ok(None) };
+        if version != stored_version || !self.remote_stream_current(version, origin) {
+            return Ok(None);
+        }
+        if selection.limit.is_some() {
+            return Err(RetrievalError::Other("a LIMIT selection changes its remote membership only by a full install".into()));
+        }
+        {
+            let stream = self.remote_stream.lock().unwrap();
+            let Some(stream) = stream.as_ref().filter(|stream| stream.version == version && &stream.origin == origin) else {
+                return Ok(None);
+            };
+            let mut ids = stream.admitted.write().unwrap();
+            ids.extend(admitted);
+            ids.retain(|id| !absent.contains(id));
+        }
+        let origin = QueryOrigin { query: self.query_id, version, request: origin.clone() };
+        let changed: HashSet<_> = changes.iter().map(|change| change.entity().id()).collect();
+        // An absent row the publication did not change still leaves, with its current state.
+        let unchanged_absent = absent
+            .iter()
+            .filter(|id| !changed.contains(id))
+            .filter_map(|id| self.resultset.by_id(id))
+            .map(|entity| EntityChange::new(entity, vec![]));
+        let changes =
+            changes.into_iter().chain(unchanged_absent).map(|change| PublishedChange { change, origin: origin.clone() }).collect();
+        let reactor = self.context.node()?.reactor().clone();
+        Ok(Some(reactor.notify_remote_membership(self.subscription.id(), self.query_id, changes, held, absent).await?))
+    }
+
     /// Stop the stream bound for `version` deciding membership, because that version failed.
     pub(super) fn release_failed_stream(&self, version: u32) {
         if let Some(stream) = self.remote_stream.lock().unwrap().as_ref().filter(|stream| stream.version == version) {
@@ -251,6 +299,26 @@ impl GapFetcher<Entity> for RemoteQuerySource {
         // predicate matches outside it.
         Ok(Vec::new())
     }
+}
+
+/// A committed change from a query's own remote stream, which may move that query's membership.
+#[derive(Debug)]
+struct PublishedChange {
+    change: EntityChange,
+    origin: QueryOrigin,
+}
+
+impl std::fmt::Display for PublishedChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.change.fmt(f) }
+}
+
+impl ChangeNotification for PublishedChange {
+    type Entity = Entity;
+    type Event = proto::Attested<proto::Event>;
+    fn into_parts(self) -> (Entity, Vec<Self::Event>) { self.change.into_parts() }
+    fn entity(&self) -> &Entity { self.change.entity() }
+    fn events(&self) -> &[Self::Event] { self.change.events() }
+    fn query_origin(&self) -> Option<&QueryOrigin> { Some(&self.origin) }
 }
 
 /// Publishes a remote install's readiness to its live query, unless the stream was superseded.

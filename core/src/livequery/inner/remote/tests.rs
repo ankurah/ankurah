@@ -121,3 +121,31 @@ async fn replacement_binding_invalidates_readiness_before_the_old_loss_callback(
     query.0.mark_durable_answered(1);
     waiting.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_membership_publication_updates_its_streams_admitted_ids() {
+    let query = query();
+    let origin = proto::RequestId::new();
+    query.0.selection.set(Some((ankql::ast::Selection::from(ankql::ast::Predicate::True), 1)));
+    query.0.bind_remote_stream(1, origin.clone(), &|| false);
+    let admitted = || query.0.remote_stream.lock().unwrap().as_ref().unwrap().admitted.read().unwrap().clone();
+    let (first, second) = (proto::EntityId::random(), proto::EntityId::random());
+    let publish = |admitted: Vec<proto::EntityId>, absent: Vec<proto::EntityId>, origin: proto::RequestId| {
+        let query = query.clone();
+        async move {
+            query
+                .publish_remote_membership(1, &origin, admitted.into_iter().collect(), absent.into_iter().collect(), vec![], HashSet::new())
+                .await
+        }
+    };
+    assert!(publish(vec![first, second], vec![], origin.clone()).await.unwrap().is_some());
+    assert_eq!(admitted(), [first, second].into_iter().collect());
+    assert!(publish(vec![], vec![first], origin.clone()).await.unwrap().is_some());
+    assert_eq!(admitted(), [second].into_iter().collect());
+    assert!(publish(vec![first], vec![], proto::RequestId::new()).await.unwrap().is_none(), "another stream's publication is ignored");
+    assert_eq!(admitted(), [second].into_iter().collect());
+
+    let limited = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: Some(1) };
+    query.0.selection.set(Some((limited, 1)));
+    assert!(publish(vec![first], vec![], origin).await.is_err(), "a LIMIT window changes membership only by a full install");
+}
