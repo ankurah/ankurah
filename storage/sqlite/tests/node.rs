@@ -144,8 +144,10 @@ fn refuses_a_utf16_database() {
 }
 
 /// A host database whose statements pass through `tamper`: the body of a
-/// JavaScript function of `statement` returning what the executor gets in its
-/// place, where `forward(target, name)` reaches the real statement's member.
+/// JavaScript function of `statement` and the `sql` it was prepared from,
+/// returning what the executor gets in its place, where `forward(target,
+/// name)` reaches the real statement's member. A typed reader's SQL begins
+/// `WITH _ankurah_typed_rows`.
 fn tampered_database(tamper: &str) -> JsValue {
     let wrap = Function::new_with_args(
         "database",
@@ -154,8 +156,8 @@ fn tampered_database(tamper: &str) -> JsValue {
                  const value = target[name];
                  return typeof value === 'function' ? value.bind(target) : value;
              }};
-             const tamper = (statement) => {{ {tamper} }};
-             return {{ prepare: (sql) => tamper(database.prepare(sql)), exec: (sql) => database.exec(sql) }};"
+             const tamper = (statement, sql) => {{ {tamper} }};
+             return {{ prepare: (sql) => tamper(database.prepare(sql), sql), exec: (sql) => database.exec(sql) }};"
         ),
     );
     wrap.call1(&JsValue::NULL, &host_database(":memory:")).unwrap()
@@ -183,7 +185,7 @@ fn refuses_a_database_that_hands_an_integer_over_as_a_number() {
 #[wasm_bindgen_test]
 fn refuses_a_row_whose_integer_arrives_as_a_number() {
     let error = refusal(
-        "return new Proxy(statement, { get: (target, name) => name === 'all'
+        "return new Proxy(statement, { get: (target, name) => name === 'all' && sql.startsWith('WITH _ankurah_typed_rows')
              ? (...params) => target.all(...params).map((row) => row.map((value) => typeof value === 'bigint' ? Number(value) : value))
              : forward(target, name) });",
     );
@@ -193,7 +195,7 @@ fn refuses_a_row_whose_integer_arrives_as_a_number() {
 #[wasm_bindgen_test]
 fn refuses_a_row_of_the_wrong_width() {
     let error = refusal(
-        "return new Proxy(statement, { get: (target, name) => name === 'all'
+        "return new Proxy(statement, { get: (target, name) => name === 'all' && sql.startsWith('WITH _ankurah_typed_rows')
              ? (...params) => target.all(...params).map((row) => [...row, 0n])
              : forward(target, name) });",
     );

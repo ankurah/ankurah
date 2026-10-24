@@ -98,7 +98,8 @@ const KEPT_READERS: usize = 64;
 /// SQLite prepares a kept statement again when the schema changes, but a
 /// typed reader names its statement's columns, which a `SELECT *` may have
 /// gained or lost; so every kept reader is dropped when the schema version
-/// of main or temp changes.
+/// of main or temp changes. A reader is kept only for a statement that is not
+/// a compound SELECT at its top level (see `refuse_a_compound_select`).
 #[derive(Default)]
 struct Readers {
     /// `PRAGMA main.schema_version` and `PRAGMA temp.schema_version`, prepared once.
@@ -267,6 +268,38 @@ impl NodeConnection {
         Ok(versions)
     }
 
+    /// Refuse a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
+    /// top level of a query, before it runs. Nested in the typed reader, a
+    /// compound SELECT's rows take the affinity of its first SELECT's
+    /// columns, which can change a value from a later SELECT: an INTEGER past
+    /// 2^53 read through a REAL column reads as the nearest REAL. rusqlite
+    /// reads the compound directly, where no affinity applies. SQLite's plan
+    /// shows a compound at its top level as a COMPOUND QUERY, or as a MERGE
+    /// when SQLite codes it as a merge of its SELECTs, as it does under an
+    /// ORDER BY and, in SQLite 3.53, for UNION, INTERSECT and EXCEPT. A
+    /// compound in a subquery or a CTE takes that affinity natively too, and
+    /// is let through, unless SQLite flattens it into the query.
+    fn refuse_a_compound_select(&self, source: &str, params: &[SqliteValueRef<'_>]) -> Result<(), SqliteError> {
+        // Each step of the plan is id, parent, notused, detail. better-sqlite3
+        // plans a statement only with its parameters bound.
+        let plan = self.prepare(&format!("EXPLAIN QUERY PLAN {source}"))?;
+        for step in all(&plan, params, 4)? {
+            let detail = step.get(3);
+            let detail = detail.as_string().ok_or_else(|| SqliteError::Node(format!("a step of a query plan reads {detail:?}")))?;
+            if integer_from_js(&step.get(1))? == 0 && (detail == "COMPOUND QUERY" || detail.starts_with("MERGE (")) {
+                return Err(SqliteError::Node(
+                    "a compound SELECT at the top level of a query is refused on Node, before it runs: the node executor \
+                     reads rows through a typed reader that nests the query, where every row of a compound SELECT takes \
+                     the affinity of its first SELECT's columns, which can change a value from a later SELECT, as an \
+                     INTEGER past 2^53 read through a REAL column changes to the nearest REAL; select from it as \
+                     `WITH x AS MATERIALIZED (…) SELECT * FROM x`, which reads the same on every driver"
+                        .into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare a statement that hands rows over as the executor reads them.
     fn prepare(&self, sql: &str) -> Result<JsValue, SqliteError> {
         let statement = method(&self.database, "prepare")?.call1(&self.database, &sql.into()).map_err(js_error)?;
@@ -338,6 +371,8 @@ impl SqliteExecutor for NodeConnection {
         let source = source(&statement)?;
         match self.prepare(&typed_reader(&source, width)) {
             Ok(reader) => {
+                // Checked once for each SQL text, since a kept reader skips it.
+                self.refuse_a_compound_select(&source, params)?;
                 self.keep_reader(sql, &reader, width);
                 all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect()
             }

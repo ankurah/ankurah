@@ -22,13 +22,16 @@ use crate::{
 ///
 /// # Where the node executor differs from the native one
 ///
-/// - A query's rows are read on Node through a typed reader that nests the
-///   query in a WITH clause, and a compound SELECT nested there takes the
-///   affinity SQLite gives the nested column, its first SELECT's. So a value
-///   from a top-level compound SELECT can read in another storage class than
-///   natively: where the first SELECT's column is a REAL column, an INTEGER 2
-///   from a later SELECT reads as the REAL 2.0. No statement of the engine's
-///   own is a compound SELECT.
+/// - On Node a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
+///   top level of a query is refused before it runs. Node reads a query's
+///   rows through a typed reader that nests the query in a WITH clause, where
+///   a compound SELECT takes the affinity of its first SELECT's columns,
+///   which can change a value from a later SELECT: an INTEGER past 2^53 read
+///   through a REAL column would read as the nearest REAL. Selected as `WITH
+///   x AS MATERIALIZED (…) SELECT * FROM x`, a compound SELECT reads the same
+///   on every driver. SQLite's query plan decides what is at the top level,
+///   so a compound in a subquery that SQLite flattens into the query is
+///   refused too. No statement of the engine's own is a compound SELECT.
 /// - On node:sqlite a positional parameter the caller did not pass binds
 ///   NULL, where rusqlite refuses a statement given too few parameters:
 ///   node:sqlite does not report how many parameters a statement takes.

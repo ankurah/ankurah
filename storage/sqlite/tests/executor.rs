@@ -5,7 +5,7 @@ mod common;
 
 use ankurah::{policy::DEFAULT_CONTEXT as c, Model, Node, PermissiveAgent};
 use ankurah_storage_sqlite::{
-    exec::{Behavior, SqliteExecutor},
+    exec::{Behavior, Row, SqliteExecutor},
     SqliteError, SqliteStorageEngine, SqliteValue, SqliteValueRef,
 };
 use anyhow::Result;
@@ -294,6 +294,52 @@ async fn a_double_quoted_name_that_matches_no_column_is_refused() -> Result<()> 
         // SQLITE_ERROR, which better-sqlite3 names without its number.
         assert_eq!(code, if common::on_better_sqlite3() { None } else { Some(1) });
     }
+    Ok(())
+}
+
+/// A compound SELECT at the top level of a query is refused on Node before
+/// it runs, where rusqlite reads its values directly: Node's typed reader
+/// would read a later SELECT's INTEGER past 2^53 with the affinity of the
+/// first SELECT's REAL column, as the nearest REAL. Selected from a
+/// materialized CTE, where SQLite applies that affinity on every driver, the
+/// compound reads the same everywhere.
+#[engine_test]
+async fn a_top_level_compound_select_reads_exactly_or_is_refused() -> Result<()> {
+    fn values(rows: Vec<Row>) -> Vec<String> {
+        let mut values: Vec<String> = rows.iter().flat_map(|row| row.values().iter().map(|value| format!("{value:?}"))).collect();
+        values.sort();
+        values
+    }
+    let storage = common::open_in_memory().await?;
+    let (compounds, materialized) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE reals (r REAL)", &[])?;
+            executor.execute("INSERT INTO reals VALUES (1.5)", &[])?;
+            executor.execute("CREATE TABLE integers (i INTEGER)", &[])?;
+            executor.execute("INSERT INTO integers VALUES (9007199254740993)", &[])?;
+            let compounds = [
+                "SELECT r FROM reals UNION ALL SELECT i FROM integers",
+                // SQLite plans these two as a merge of their SELECTs: the
+                // first for its ORDER BY, the second in SQLite 3.53, the
+                // release better-sqlite3 bundles.
+                "SELECT r FROM reals UNION ALL SELECT i FROM integers ORDER BY 1",
+                "SELECT r FROM reals UNION SELECT i FROM integers",
+            ]
+            .map(|sql| executor.query(sql, &[]).map(values).map_err(|error| error.to_string()));
+            let materialized =
+                executor.query("WITH x AS MATERIALIZED (SELECT r FROM reals UNION ALL SELECT i FROM integers) SELECT * FROM x", &[])?;
+            Ok((compounds, values(materialized)))
+        })
+        .await?;
+    for compound in compounds {
+        if cfg!(target_arch = "wasm32") {
+            let refusal = compound.expect_err("Node refuses a compound SELECT at the top level");
+            assert!(refusal.contains("WITH x AS MATERIALIZED"), "{refusal}");
+        } else {
+            assert_eq!(compound.expect("rusqlite reads a compound SELECT directly"), ["Integer(9007199254740993)", "Real(1.5)"]);
+        }
+    }
+    assert_eq!(materialized, ["Real(1.5)", "Real(9007199254740992.0)"]);
     Ok(())
 }
 
