@@ -29,6 +29,7 @@ use std::{
 mod bounded;
 mod capture_retry;
 mod captured;
+mod digests;
 mod resident;
 mod routes;
 mod view_isolation;

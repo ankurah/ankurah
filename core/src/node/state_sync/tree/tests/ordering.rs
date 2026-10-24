@@ -33,7 +33,7 @@ async fn unknown_and_nested_ordering_cannot_select_a_complete_tree() -> anyhow::
                 with_values(id, &[(property, value)])
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        let mut cache = QueryTree::build(spec(), Entries::new()).await?;
+        let mut cache = QueryTree::new(spec(), Entries::new());
         cache.refresh_states(rows).await?;
         for (direction, limit) in [(OrderDirection::Asc, 3), (OrderDirection::Desc, 2), (OrderDirection::Desc, 3)] {
             let selection = Selection {
@@ -67,7 +67,7 @@ async fn descending_scalar_limit_with_missing_values_requires_storage_ordering()
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, value.map(|value| Value::String(value.into())))]))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut cache = QueryTree::build(spec, Entries::new()).await?;
+    let mut cache = QueryTree::new(spec, Entries::new());
     let view = cache.refresh_states(rows).await?;
     assert!(view.cannot_select(&selection, &catalog));
     assert!(view.select(&selection, &catalog).await.err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
@@ -106,7 +106,7 @@ async fn narrower_descending_null_scope_cannot_select_a_complete_tree() -> anyho
             )
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut cache = QueryTree::build(spec.clone(), Entries::new()).await?;
+    let mut cache = QueryTree::new(spec.clone(), Entries::new());
     let snapshot = cache.refresh_states(rows).await?;
     assert!(snapshot.cannot_select(&selection, &catalog));
     assert!(snapshot.select(&selection, &catalog).await.err().unwrap().downcast_ref::<UnsupportedTreeSelection>().is_some());
@@ -128,7 +128,7 @@ async fn descending_scalar_limit_cannot_select_a_complete_tree_even_without_miss
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, Some(Value::String(value.into())))]))
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut tree = QueryTree::build(spec, Entries::new()).await?;
+    let mut tree = QueryTree::new(spec, Entries::new());
     let snapshot = tree.refresh_states(rows).await?;
     // The rule reads the selection alone: whether today's rows happen to
     // carry the value cannot decide how a shared tree ranks them tomorrow.
@@ -151,7 +151,7 @@ async fn indexed_route_order_preserves_directions_nulls_and_entity_ties() -> any
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, value.map(|value| Value::String(value.into())))]))
         .collect::<anyhow::Result<_>>()?;
-    let mut tree = QueryTree::build(spec, Entries::new()).await?;
+    let mut tree = QueryTree::new(spec, Entries::new());
     let snapshot = tree.refresh_states(rows).await?;
     for (direction, id_desc, expected) in [
         (OrderDirection::Asc, false, [1, 4, 2, 3]),
@@ -185,7 +185,7 @@ async fn descending_range_reuses_a_broader_tree_with_nulls_outside_the_range() -
         order_by: Some(vec![OrderByItem { path: PropertyPath::from(property), direction: OrderDirection::Desc }]),
         limit: Some(1),
     };
-    let mut tree = QueryTree::build(spec, Entries::new()).await?;
+    let mut tree = QueryTree::new(spec, Entries::new());
     let rows = [(1, None), (2, Some("20")), (3, Some("30"))]
         .into_iter()
         .map(|(id, value)| with_values(id, &[(property, value.map(|value| Value::String(value.into())))]))

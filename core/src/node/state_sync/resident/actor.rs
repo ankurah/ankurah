@@ -10,7 +10,10 @@ use super::{
 };
 use crate::{
     node::{
-        state_sync::{tree::ID_ROW_BYTES, QueryTree, Snapshot},
+        state_sync::{
+            tree::{DigestRequest, DigestRequests, ID_ROW_BYTES},
+            QueryTree, Snapshot,
+        },
         Node, WeakNode,
     },
     policy::{ContextPolicy, PolicyAgent},
@@ -39,6 +42,9 @@ pub(super) struct ResidentActor<CD: ContextData> {
     pub(super) cursor: MaintenanceSubscription<TreeUpdate>,
     pub(super) revision: u64,
     pub(super) routes: Vec<Route>,
+    /// How the snapshots this actor hands out ask it for the tree's digests,
+    /// once the actor runs.
+    pub(super) digest_requests: Option<DigestRequests>,
 }
 
 impl<CD: ContextData> ResidentActor<CD> {
@@ -265,7 +271,17 @@ impl<CD: ContextData> ResidentActor<CD> {
         } else {
             self.advance_complete(node, window.batch.into_iter().collect(), window.revision.0).await?;
         }
-        Ok(self.tree.snapshot())
+        Ok(self.snapshot())
+    }
+
+    /// A snapshot of the tree whose first digest read asks this actor for the
+    /// tree's digests.
+    fn snapshot(&self) -> Snapshot {
+        let snapshot = self.tree.snapshot();
+        match &self.digest_requests {
+            Some(requests) => snapshot.asking(requests),
+            None => snapshot,
+        }
     }
 
     /// Answer commands and apply published batches until the resident's last
@@ -274,6 +290,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         &mut self,
         weak: WeakNode<SE, PA>,
         mut commands: mpsc::Receiver<Command<CD>>,
+        mut digest_requests: mpsc::Receiver<DigestRequest>,
         cleanup: Arc<Notify>,
         lru: &Weak<Mutex<Lru<CD>>>,
         id: u64,
@@ -289,6 +306,11 @@ impl<CD: ContextData> ResidentActor<CD> {
                     let Some(command) = command else { return Ok(()); };
                     let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                     self.handle_command(&node, command, lru, id).await?;
+                }
+                request = digest_requests.recv() => {
+                    if let Some(request) = request {
+                        self.tree.answer(request).await?;
+                    }
                 }
                 batch = self.cursor.next() => {
                     let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
@@ -408,7 +430,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     /// Run this actor until its resident is dropped or the node stops, then
     /// remove its slot and invalidate the routes it still serves.
     pub(super) fn spawn<SE, PA>(
-        self,
+        mut self,
         node: &Node<SE, PA>,
         receiver: mpsc::Receiver<Command<CD>>,
         canceled: oneshot::Receiver<()>,
@@ -422,13 +444,17 @@ impl<CD: ContextData> ResidentActor<CD> {
     {
         let weak = node.weak();
         let run = node.run.clone();
+        let (requests, digest_requests) = mpsc::channel(8);
+        self.digest_requests = Some(DigestRequests::new(&requests));
         let actor = self;
         crate::task::spawn(async move {
+            // Holding the sender keeps the snapshots' requests answerable while this task runs.
+            let _requests = requests;
             let mut actor = actor;
             let result = tokio::select! {
                 _ = canceled => Ok(()),
                 _ = run.wait_value(false) => Ok(()),
-                result = actor.run(weak.clone(), receiver, cleanup, &lru, id) => result,
+                result = actor.run(weak.clone(), receiver, digest_requests, cleanup, &lru, id) => result,
             };
             if let Some(resident) = resident.upgrade() {
                 resident.alive.store(false, Ordering::Release);

@@ -21,7 +21,7 @@ impl Snapshot {
         if ranges.is_empty() {
             return Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: Digest::empty() });
         }
-        let tree = &mut self.tree;
+        let tree = self.digests().await?;
         let scope = tree.scope_spans(ranges);
         Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
     }
@@ -131,7 +131,7 @@ impl Snapshot {
         if self.ranges.as_ref().is_some_and(Vec::is_empty) {
             return Ok(vec![TreeSpanDigest { digest: Digest::empty(), ..head.clone() }]);
         }
-        let mut children = self.tree.refine(head).await?;
+        let mut children = self.digests().await?.refine(head).await?;
         if self.ranges.is_some() {
             for child in &mut children {
                 child.digest = self.span_digest(child.bounds.clone()).await?.digest;

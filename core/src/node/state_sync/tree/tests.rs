@@ -75,15 +75,15 @@ fn entries(spec: &TreeSpec, rows: Vec<(Attested<EntityState>, Vec<Option<Value>>
 impl QueryTree {
     async fn of_values(spec: TreeSpec, rows: Vec<(Attested<EntityState>, Vec<Option<Value>>)>) -> anyhow::Result<Self> {
         let entries = entries(&spec, rows)?;
-        Self::build(spec, entries).await
+        Ok(Self::new(spec, entries))
     }
     async fn replace_values(&mut self, rows: Vec<(Attested<EntityState>, Vec<Option<Value>>)>) -> anyhow::Result<Snapshot> {
-        self.replace(entries(self.tree.spec(), rows)?).await?;
+        self.replace(entries(&self.spec, rows)?).await?;
         Ok(self.snapshot())
     }
     async fn apply_values(&mut self, rows: Vec<(Attested<EntityState>, Vec<Option<Value>>)>, removed: Vec<EntityId>) -> anyhow::Result<()> {
         let mut changes: BTreeMap<_, _> = removed.into_iter().map(|id| (id, None)).collect();
-        changes.extend(entries(self.tree.spec(), rows)?.into_iter().map(|(id, entry)| (id, Some(entry))));
+        changes.extend(entries(&self.spec, rows)?.into_iter().map(|(id, entry)| (id, Some(entry))));
         self.apply(changes).await
     }
 }
@@ -94,7 +94,7 @@ async fn values_snapshot(spec: TreeSpec, rows: Vec<(Attested<EntityState>, Vec<O
 
 #[tokio::test]
 async fn digest_and_cloned_heads_advance_together_without_retaining_payloads() -> anyhow::Result<()> {
-    let mut tree = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut tree = QueryTree::new(keyed_spec(), Entries::new());
     let mut input = keyed_state(1, 1, Some(Value::I64(5)))?.0;
     let original_head = input.payload.state.head.clone();
     let mut old = tree.refresh_states(vec![input.clone()]).await?;
@@ -115,7 +115,7 @@ async fn digest_and_cloned_heads_advance_together_without_retaining_payloads() -
 
 #[tokio::test]
 async fn wide_clock_changes_offer_policy_without_changing_the_maintained_tree() -> anyhow::Result<()> {
-    let mut tree = QueryTree::build(spec(), Entries::new()).await?;
+    let mut tree = QueryTree::new(spec(), Entries::new());
     for count in [3000, 10000] {
         let mut input = state(1, 1);
         input.payload.state.head = proto::Clock::new(
@@ -142,11 +142,11 @@ async fn wide_clock_changes_offer_policy_without_changing_the_maintained_tree() 
 async fn projected_keys_match_transient_decoding_across_sparse_movement_and_dense_refresh() -> anyhow::Result<()> {
     let initial =
         (0..256).map(|id| keyed_state(id, 1, (id != 11).then_some(Value::I64(id as i64 - 128)))).collect::<anyhow::Result<Vec<_>>>()?;
-    let mut query = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut query = QueryTree::new(keyed_spec(), Entries::new());
     let mut old = query.replace_values(initial.clone()).await?;
     let original = old.span_digest(proto::TreeSpan::all()).await?;
     let original_members = old.member_map();
-    let mut oracle = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut oracle = QueryTree::new(keyed_spec(), Entries::new());
     let mut decoded = oracle.refresh_states(initial.iter().map(|(state, _)| state.clone()).collect()).await?;
     assert_eq!(original, decoded.span_digest(proto::TreeSpan::all()).await?);
     assert_eq!(original_members, decoded.member_map());
@@ -166,7 +166,7 @@ async fn projected_keys_match_transient_decoding_across_sparse_movement_and_dens
     for rows in [sparse, dense] {
         let mut captured = query.replace_values(rows.clone()).await?;
 
-        let mut oracle = QueryTree::build(keyed_spec(), Entries::new()).await?;
+        let mut oracle = QueryTree::new(keyed_spec(), Entries::new());
         let mut decoded = oracle.refresh_states(rows.into_iter().map(|(state, _)| state).collect()).await?;
         assert_eq!(captured.member_map(), decoded.member_map());
         assert_eq!(captured.span_digest(proto::TreeSpan::all()).await?, decoded.span_digest(proto::TreeSpan::all()).await?);
@@ -179,7 +179,7 @@ async fn projected_keys_match_transient_decoding_across_sparse_movement_and_dens
 #[tokio::test]
 async fn small_and_empty_inventories_offer_exact_heads_from_the_maintained_tree() -> anyhow::Result<()> {
     for count in [0, 32] {
-        let mut query = QueryTree::build(spec(), Entries::new()).await?;
+        let mut query = QueryTree::new(spec(), Entries::new());
         let states = (0..count).rev().map(|id| state(id as u8, 1)).collect();
         let mut snapshot = query.refresh_states(states).await?;
         let inventory = snapshot.offer().await?;
@@ -219,7 +219,7 @@ async fn leaf_pages_budget_the_exact_answer_and_preserve_old_wide_key_snapshots(
             Ok(row)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    let mut query = QueryTree::build(wide_spec.clone(), Entries::new()).await?;
+    let mut query = QueryTree::new(wide_spec.clone(), Entries::new());
     let mut old = query.replace_values(rows).await?;
     let mut remaining = proto::TreeSpan::all();
     let mut pages = Vec::new();
@@ -281,7 +281,7 @@ async fn canonical_pages_cover_requested_bounds() -> anyhow::Result<()> {
         KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(proto::PropertyId::Id, ValueType::EntityId)]),
         ankql::ast::Predicate::True,
     );
-    let mut query = QueryTree::build(spec, Entries::new()).await?;
+    let mut query = QueryTree::new(spec, Entries::new());
     let snapshot = query.refresh_states((0..70).rev().map(|id| state(id, 1)).collect()).await?;
     let members = snapshot.member_map();
     let addresses = members.keys().cloned().collect::<Vec<_>>();
@@ -311,7 +311,7 @@ async fn canonical_pages_cover_requested_bounds() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() -> anyhow::Result<()> {
-    let mut query = QueryTree::build(spec(), Entries::new()).await?;
+    let mut query = QueryTree::new(spec(), Entries::new());
     let initial = (0..70).map(|id| state(id, 1)).collect::<Vec<_>>();
     let mut old = query.refresh_states(initial.clone()).await?;
     let inventory = old.offer().await?;
@@ -329,7 +329,7 @@ async fn retained_tree_changes_match_recomputation_and_preserve_old_snapshots() 
     ] {
         let mut incremental = query.refresh_states(states.clone()).await?;
 
-        let mut recomputed_query = QueryTree::build(spec(), Entries::new()).await?;
+        let mut recomputed_query = QueryTree::new(spec(), Entries::new());
         let mut recomputed = recomputed_query.refresh_states(states).await?;
         assert_eq!(incremental.member_map(), recomputed.member_map());
         assert_eq!(incremental.span_digest(proto::TreeSpan::all()).await?, recomputed.span_digest(proto::TreeSpan::all()).await?);
@@ -349,7 +349,7 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
             state
         })
         .collect::<Vec<_>>();
-    let mut query = QueryTree::build(spec(), Entries::new()).await?;
+    let mut query = QueryTree::new(spec(), Entries::new());
     let mut snapshot = query.refresh_states(states.clone()).await?;
     let inventory = snapshot.offer().await?;
     assert!(inventory.spans.len() > 1, "a new large tree must offer its bounded cached descendants");
@@ -391,7 +391,7 @@ async fn a_new_summary_frontier_is_bounded_and_covers_the_entire_snapshot_includ
 #[tokio::test]
 async fn complete_initial_inventories_are_bounded_and_immutable() -> anyhow::Result<()> {
     for count in [256, MAX_OFFER_HEADS] {
-        let mut query = QueryTree::build(spec(), Entries::new()).await?;
+        let mut query = QueryTree::new(spec(), Entries::new());
         let mut old = query.refresh_states((0..count as u32).map(|id| numbered_state(id, 1)).collect()).await?;
         let offer = old.offer().await?;
         assert!(bincode::serialized_size(&offer)? <= MAX_OFFER_BYTES as u64);
@@ -415,7 +415,7 @@ async fn complete_initial_inventories_are_bounded_and_immutable() -> anyhow::Res
 
 #[tokio::test]
 async fn incomplete_initial_inventory_falls_back_for_count_or_total_bytes() -> anyhow::Result<()> {
-    let mut query = QueryTree::build(spec(), Entries::new()).await?;
+    let mut query = QueryTree::new(spec(), Entries::new());
     let mut too_many = query.refresh_states((0..2049).map(|id| numbered_state(id, 1)).collect()).await?;
     let offer = too_many.offer().await?;
     assert!(offer.spans.iter().all(|region| matches!(region, proto::SpanContent::Digest(_))));
@@ -467,7 +467,7 @@ async fn incomplete_initial_inventory_falls_back_for_count_or_total_bytes() -> a
 #[tokio::test]
 async fn source_row_deltas_preserve_frozen_snapshots_across_sparse_and_dense_changes() -> anyhow::Result<()> {
     let initial = (0..192).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
-    let mut tree = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut tree = QueryTree::new(keyed_spec(), Entries::new());
     let mut old = tree.replace_values(initial.clone()).await?;
     let old_head = old.span_digest(proto::TreeSpan::all()).await?;
     let old_members = old.member_map();
@@ -495,7 +495,7 @@ async fn source_row_deltas_preserve_frozen_snapshots_across_sparse_and_dense_cha
             tree.apply_values(changes, Vec::new()).await?;
         }
         let mut current = tree.snapshot();
-        let mut oracle = QueryTree::build(keyed_spec(), Entries::new()).await?;
+        let mut oracle = QueryTree::new(keyed_spec(), Entries::new());
         let mut rebuilt = oracle.refresh_states(expected.iter().map(|(state, _)| state.clone()).collect()).await?;
         assert_eq!(current.member_map(), rebuilt.member_map());
         assert_eq!(current.span_digest(proto::TreeSpan::all()).await?, rebuilt.span_digest(proto::TreeSpan::all()).await?);
@@ -555,7 +555,7 @@ async fn catalog_arrival_preserves_an_accepted_entity_id_fallback() -> anyhow::R
 #[tokio::test]
 async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyhow::Result<()> {
     let rows = (0..256).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
-    let mut cache = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut cache = QueryTree::new(keyed_spec(), Entries::new());
     let mut view = cache.replace_values(rows.clone()).await?.select_request(&range_request(200, None, false)).await?;
     assert_eq!(view.entries.len(), 55);
     assert_eq!(
@@ -567,7 +567,7 @@ async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyho
     assert_eq!(inventory.bounds, proto::TreeSpan::all(), "scope gaps remain known-empty query addresses");
     assert_eq!(inventory.heads.len(), 55);
 
-    let mut oracle = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut oracle = QueryTree::new(keyed_spec(), Entries::new());
     let mut selected = oracle.replace_values(rows[201..].to_vec()).await?;
     let expected = selected.span_digest(proto::TreeSpan::all()).await?;
     let digest = view.span_digest(proto::TreeSpan::all()).await?;
@@ -590,7 +590,7 @@ async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyho
 #[tokio::test]
 async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Result<()> {
     let rows = (0..8).map(|id| keyed_state(id, 1, Some(Value::I64(id as i64)))).collect::<anyhow::Result<Vec<_>>>()?;
-    let mut cache = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut cache = QueryTree::new(keyed_spec(), Entries::new());
     cache.replace_values(rows).await?;
     let mut low = cache.snapshot().select_request(&range_request(-1000, Some(2), false)).await?;
     let mut high = cache.snapshot().select_request(&range_request(-1000, Some(3), true)).await?;
@@ -623,8 +623,8 @@ async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Re
 
 #[tokio::test]
 async fn limited_peers_answer_bounds_using_their_own_cut() -> anyhow::Result<()> {
-    let mut requester = QueryTree::build(keyed_spec(), Entries::new()).await?;
-    let mut responder = QueryTree::build(keyed_spec(), Entries::new()).await?;
+    let mut requester = QueryTree::new(keyed_spec(), Entries::new());
+    let mut responder = QueryTree::new(keyed_spec(), Entries::new());
     let request = range_request(-1, Some(2), false);
     let rows = |ids: &[u32]| ids.iter().map(|id| keyed_state(*id, 1, Some(Value::I64(*id as i64)))).collect::<anyhow::Result<Vec<_>>>();
     let mut left = requester.replace_values(rows(&[0, 3, 4])?).await?.select_request(&request).await?;
@@ -659,13 +659,13 @@ async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> 
     let selection = Selection::from(predicate.clone());
     let wire_spec = TreeSpec::new(KeySpec::new(vec![]), predicate);
     let catalog = CatalogManager::default();
-    let mut cache = QueryTree::build(spec(), Entries::new()).await?;
+    let mut cache = QueryTree::new(spec(), Entries::new());
     let full = cache.refresh_states((0..3).map(|id| state(id, 1)).collect()).await?;
 
     let mut view = full.with_spec(wire_spec.clone(), &selection, &catalog)?.select(&selection, &catalog).await?;
     assert_eq!(view.spec, wire_spec);
     assert_eq!(view.span_digest(proto::TreeSpan::all()).await?.digest.count(), 2);
-    assert_eq!(cache.tree.spec(), &spec());
+    assert_eq!(&*cache.spec, &spec());
     assert_eq!(cache.entries().len(), 3);
     assert_eq!(cache.snapshot().span_digest(proto::TreeSpan::all()).await?.digest.count(), 3);
     Ok(())
@@ -673,7 +673,7 @@ async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> 
 
 #[tokio::test]
 async fn zero_limit_view_does_not_empty_the_resident_tree() -> anyhow::Result<()> {
-    let mut cache = QueryTree::build(spec(), Entries::new()).await?;
+    let mut cache = QueryTree::new(spec(), Entries::new());
     let full = cache.refresh_states((0..8).map(|id| state(id, 1)).collect()).await?;
     let mut selection = Selection::from(ankql::ast::Predicate::True);
     selection.limit = Some(0);

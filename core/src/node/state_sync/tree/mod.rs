@@ -1,13 +1,14 @@
-//! A resident's tree: each member's address and Clock, the digest tree over
-//! them, both changed together by every commit, and the frozen snapshots read
-//! from them.
+//! A resident's tree: each member's address and Clock, kept current on every
+//! commit; the digest tree over them, built the first time anything reads a
+//! digest and maintained on every commit after; and the frozen snapshots read
+//! from both.
 mod footprint;
 mod snapshot;
 mod spans;
 mod spec;
 
 pub(crate) use footprint::{CLOCK_ENTRY_BYTES, ID_ROW_BYTES};
-pub(crate) use snapshot::{Snapshot, UnsupportedTreeSelection};
+pub(crate) use snapshot::{DigestRequest, DigestRequests, Snapshot, UnsupportedTreeSelection};
 pub(crate) use spec::{accept_peer_spec, key_paths, request_for, serves, spec_for, tree_keys_rank_like_storage};
 
 use self::footprint::Footprint;
@@ -58,26 +59,30 @@ impl TreeEntry {
 }
 
 /// A resident's index under one fixed TreeSpec: each admitted entity's
-/// address and Clock, and the digest tree over them, changed together by
-/// every commit its maintenance subscription applies.
+/// address and Clock, kept current by every commit its maintenance
+/// subscription applies, and the digest tree over them once anything has read
+/// a digest. After its first build the digest tree changes with every commit,
+/// so it is never stale.
 pub(crate) struct QueryTree {
-    tree: DigestTree,
+    spec: Arc<TreeSpec>,
     entries: Arc<Entries>,
     members: Arc<Members>,
     footprint: Footprint,
+    digests: Option<DigestTree>,
+    /// How many times the entries have changed: a snapshot taken at another
+    /// version cannot read this tree's digests.
+    version: u64,
 }
 
 impl QueryTree {
-    /// A tree under `spec` holding `entries`.
-    pub(crate) async fn build(spec: TreeSpec, entries: Entries) -> anyhow::Result<Self> {
-        let leaves: Vec<LeafInput> = entries.iter().map(|(id, entry)| entry.leaf(*id)).collect();
-        let tree = run_blocking_if_large(leaves.len(), build_tree(spec, leaves)).await??;
+    /// A tree under `spec` holding `entries`, with no digests until one is read.
+    pub(crate) fn new(spec: TreeSpec, entries: Entries) -> Self {
         let members = entries.iter().map(|(id, entry)| (entry.address.clone(), *id)).collect();
         let mut footprint = Footprint::default();
         for entry in entries.values() {
             footprint.add(entry);
         }
-        Ok(Self { tree, entries: Arc::new(entries), members: Arc::new(members), footprint })
+        Self { spec: Arc::new(spec), entries: Arc::new(entries), members: Arc::new(members), footprint, digests: None, version: 0 }
     }
 
     /// Make the tree hold exactly `entries`, changing only the entries that differ.
@@ -106,44 +111,61 @@ impl QueryTree {
     /// Each admitted entity's entry.
     pub(crate) fn entries(&self) -> &Entries { &self.entries }
 
-    /// The bytes the LRU charges this tree.
-    pub(crate) fn accounted_bytes(&self) -> usize { self.footprint.bytes(true) }
+    /// The bytes the LRU charges this tree: its digest rows only once they are built.
+    pub(crate) fn accounted_bytes(&self) -> usize { self.footprint.bytes(self.digests.is_some()) }
 
     /// A frozen view of the tree as it stands now; later changes do not reach it.
     pub(crate) fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            spec: self.tree.spec().clone(),
-            resident: None,
-            physical_spec: self.tree.spec().clone(),
-            tree: self.tree.begin(),
-            ranges: None,
-            entries: self.entries.clone(),
-            members: self.members.clone(),
-        }
+        Snapshot::new(
+            self.spec.clone(),
+            self.entries.clone(),
+            self.members.clone(),
+            self.digests.as_ref().map(DigestTree::begin),
+            self.version,
+        )
+    }
+
+    /// Answer a snapshot's request for this tree's digests: build them if
+    /// nothing has read a digest yet, and hand back a read view of them,
+    /// unless the entries have changed since the snapshot.
+    pub(crate) async fn answer(&mut self, request: DigestRequest) -> anyhow::Result<()> {
+        let digests = if request.version == self.version { Some(self.digests().await?.begin()) } else { None };
+        request.answer(digests);
+        Ok(())
+    }
+
+    async fn digests(&mut self) -> anyhow::Result<&DigestTree> {
+        let tree = match self.digests.take() {
+            Some(tree) => tree,
+            None => build_tree_over(&self.spec, &self.entries).await?,
+        };
+        Ok(self.digests.insert(tree))
     }
 
     async fn apply_changes(&mut self, changes: BTreeMap<EntityId, Option<TreeEntry>>) -> anyhow::Result<()> {
         if changes.is_empty() {
             return Ok(());
         }
-        let entries = &self.entries;
-        let leaf_changes = changes.iter().map(|(id, after)| LeafChange {
-            before: entries.get(id).map(|entry| entry.leaf(*id)),
-            after: after.as_ref().map(|entry| entry.leaf(*id)),
-        });
-        let mut tx = self.tree.begin();
-        if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= entries.len().div_ceil(4) {
-            // A batch this large costs less to fold in by rebuilding every
-            // tree node from the stored leaves than change by change.
-            let leaf_changes: Vec<LeafChange> = leaf_changes.collect();
-            let leaves = entries.len() + leaf_changes.len();
-            tx = run_blocking_if_large(leaves, async move { tx.rebuild_with_changes(leaf_changes).await.map(|()| tx) }).await??;
-        } else {
-            tx.apply_changes(leaf_changes).await?;
+        if let Some(tree) = &self.digests {
+            let entries = &self.entries;
+            let leaf_changes = changes.iter().map(|(id, after)| LeafChange {
+                before: entries.get(id).map(|entry| entry.leaf(*id)),
+                after: after.as_ref().map(|entry| entry.leaf(*id)),
+            });
+            let mut tx = tree.begin();
+            if changes.len() >= BULK_REFRESH_CHANGES && changes.len() >= entries.len().div_ceil(4) {
+                // A batch this large costs less to fold in by rebuilding every
+                // tree node from the stored leaves than change by change.
+                let leaf_changes: Vec<LeafChange> = leaf_changes.collect();
+                let leaves = entries.len() + leaf_changes.len();
+                tx = run_blocking_if_large(leaves, async move { tx.rebuild_with_changes(leaf_changes).await.map(|()| tx) }).await??;
+            } else {
+                tx.apply_changes(leaf_changes).await?;
+            }
+            // Commit the digests before changing the entries, so that a failed
+            // commit leaves both as they were.
+            tx.commit().await?;
         }
-        // Commit the digests before changing the entries, so that a failed
-        // commit leaves both as they were.
-        tx.commit().await?;
         let entries = Arc::make_mut(&mut self.entries);
         let members = Arc::make_mut(&mut self.members);
         for (id, after) in changes {
@@ -157,9 +179,18 @@ impl QueryTree {
                 entries.insert(id, after);
             }
         }
+        self.version += 1;
         Ok(())
     }
 }
+
+/// A digest tree under `spec` holding `entries`, built on a blocking thread
+/// when it is large.
+async fn build_tree_over(spec: &TreeSpec, entries: &Entries) -> anyhow::Result<DigestTree> {
+    let leaves: Vec<LeafInput> = entries.iter().map(|(id, entry)| entry.leaf(*id)).collect();
+    Ok(run_blocking_if_large(leaves.len(), build_tree(spec.clone(), leaves)).await??)
+}
+
 /// Await `work`, an operation on a tree over memory maps that hashes or decodes
 /// about `leaves` leaves, on a blocking thread when they number at least
 /// [`BLOCKING_BUILD_LEAVES`], so that it holds no executor thread while it runs.

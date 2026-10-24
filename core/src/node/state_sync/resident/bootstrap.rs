@@ -180,8 +180,8 @@ impl<CD: ContextData> ResidentActor<CD> {
                 }
             }
         };
-        let tree = QueryTree::build(identity.spec.clone(), rows).await?;
-        Ok(Self { identity, candidates, tree, cursor, revision: revision.0, routes: Vec::new() })
+        let tree = QueryTree::new(identity.spec.clone(), rows);
+        Ok(Self { identity, candidates, tree, cursor, revision: revision.0, routes: Vec::new(), digest_requests: None })
     }
 }
 

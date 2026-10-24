@@ -10,13 +10,13 @@ impl QueryTree {
     /// keys them.
     pub(crate) async fn of_states(spec: TreeSpec, states: Vec<Attested<EntityState>>) -> anyhow::Result<Self> {
         let entries = states.iter().map(|state| Ok((state.payload.entity_id, entry_of(&spec, state)?))).collect::<anyhow::Result<_>>()?;
-        Self::build(spec, entries).await
+        Ok(Self::new(spec, entries))
     }
 
     /// Make the tree hold exactly `states`, and snapshot it.
     pub(crate) async fn refresh_states(&mut self, states: Vec<Attested<EntityState>>) -> anyhow::Result<Snapshot> {
         let entries =
-            states.iter().map(|state| Ok((state.payload.entity_id, entry_of(self.tree.spec(), state)?))).collect::<anyhow::Result<_>>()?;
+            states.iter().map(|state| Ok((state.payload.entity_id, entry_of(&self.spec, state)?))).collect::<anyhow::Result<_>>()?;
         self.replace(entries).await?;
         Ok(self.snapshot())
     }
