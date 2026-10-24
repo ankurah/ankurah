@@ -350,15 +350,9 @@ impl StorageEngine for SqliteStorageEngine {
             })
             .await
             .map_err(RetrievalError::storage)?;
-        let events = rows
-            .iter()
-            .map(event_from_sqlite_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(RetrievalError::storage)?
-            .into_iter()
-            .map(decode_event_row)
-            .collect::<Result<_, _>>()?;
-        Ok(events)
+        // Each row is decoded and then dropped, so that the rows read and the
+        // events decoded are not all held at once.
+        rows.into_iter().map(|row| decode_event_row(event_from_sqlite_row(&row).map_err(RetrievalError::storage)?)).collect()
     }
 
     async fn dump_entity_events(&self, entity_id: EntityId) -> Result<Vec<Attested<Event>>, RetrievalError> {
@@ -377,13 +371,7 @@ impl StorageEngine for SqliteStorageEngine {
             })
             .await
             .map_err(RetrievalError::storage)?;
-        rows.iter()
-            .map(event_from_sqlite_row)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(RetrievalError::storage)?
-            .into_iter()
-            .map(decode_event_row)
-            .collect()
+        rows.into_iter().map(|row| decode_event_row(event_from_sqlite_row(&row).map_err(RetrievalError::storage)?)).collect()
     }
 
     fn set_catalog_resolver(&self, resolver: std::sync::Weak<dyn CatalogResolver>) {
@@ -500,10 +488,12 @@ fn load_states(snapshot: &dyn SqliteExecutor, ids: &[EntityId]) -> Result<Vec<At
         &id_strings.iter().map(|id| SqliteValueRef::Text(id)).collect::<Vec<_>>(),
     )?;
     let mut by_id = BTreeMap::new();
-    for row in &rows {
-        let row = raw_state_from_sqlite_row(row)?;
-        let memberships = memberships_from_sqlite_connection(snapshot, row.0)?;
-        let state = decode_state_row(row, memberships)?;
+    // Each row is decoded and then dropped, so that the rows read and the
+    // states decoded are not all held at once.
+    for row in rows {
+        let fields = raw_state_from_sqlite_row(&row)?;
+        let memberships = memberships_from_sqlite_connection(snapshot, fields.0)?;
+        let state = decode_state_row(fields, memberships)?;
         by_id.insert(state.payload.entity_id, state);
     }
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())

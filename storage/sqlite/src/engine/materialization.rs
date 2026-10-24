@@ -439,6 +439,13 @@ impl Materialization {
                 missing.push((column.clone(), value.sqlite_type()));
             }
             let is_jsonb = value.is_jsonb();
+            // JSON is written as its text, for the jsonb(?) that wraps its
+            // placeholder; serialized here, it is not serialized while the
+            // write transaction holds the lock.
+            let value = match value {
+                SqliteValue::Jsonb(json) => SqliteValue::Text(json.to_string()),
+                value => value,
+            };
             materialized.push((column, value, is_jsonb));
         }
         let conn = self.pool.get().await.map_err(|e| MutationError::General(Box::new(SqliteError::Pool(e.to_string()))))?;

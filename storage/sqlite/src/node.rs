@@ -157,6 +157,8 @@ const SQLITE_RANGE: i32 = 25;
 struct Readers {
     /// `PRAGMA main.schema_version` and `PRAGMA temp.schema_version`, prepared once.
     version_statements: Option<[JsValue; 2]>,
+    /// `SELECT changes()`, prepared once.
+    changes_statement: Option<JsValue>,
     /// The schema versions the kept readers were prepared at.
     versions: Option<[i64; 2]>,
     kept: HashMap<String, KeptReader>,
@@ -430,15 +432,22 @@ impl NodeConnection {
     }
 
     /// SQLite's changes(): the count of rows the connection's last INSERT,
-    /// UPDATE or DELETE changed.
+    /// UPDATE or DELETE changed, read through one statement prepared once,
+    /// whose INTEGER needs no typed reader.
     fn changes(&self) -> Result<usize, SqliteError> {
-        match self.query("SELECT changes()", &[])?.as_slice() {
-            [row] => {
-                let changes = row.integer(0)?;
-                usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
+        let prepared = self.readers.borrow().changes_statement.clone();
+        let statement = match prepared {
+            Some(statement) => statement,
+            None => {
+                let statement = self.prepare("SELECT changes()")?;
+                self.readers.borrow_mut().changes_statement = Some(statement.clone());
+                statement
             }
-            rows => Err(SqliteError::Node(format!("`SELECT changes()` returned {} rows", rows.len()))),
-        }
+        };
+        let row =
+            take(&statement, &[], 1, Rows::First)?.pop().ok_or_else(|| SqliteError::Node("`SELECT changes()` returned no row".into()))?;
+        let changes = integer_from_js(&row.get(0))?;
+        usize::try_from(changes).map_err(|_| SqliteError::Node(format!("`changes()` reported {changes} changed rows")))
     }
 
     /// Prepare a statement that hands rows over as the executor reads them.

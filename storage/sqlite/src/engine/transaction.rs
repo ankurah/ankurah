@@ -12,7 +12,11 @@ struct EntityRow {
     entity_key: String,
     expected_head: Clock,
     head: Clock,
+    /// `head` as the JSON it is stored as.
+    head_json: String,
     memberships: BTreeSet<ModelId>,
+    /// Each of `memberships` as the key it is stored by.
+    membership_keys: Vec<Vec<u8>>,
     state_buffers: Vec<u8>,
     attestations: Vec<u8>,
     materializations: Vec<PreparedMaterialization>,
@@ -93,7 +97,9 @@ impl StorageTransaction for SqliteTransaction<'_> {
             entity_key: entity_id.to_base64(),
             expected_head: expected_head.clone(),
             head: state.payload.state.head.clone(),
+            head_json: serde_json::to_string(&state.payload.state.head).map_err(SqliteError::from)?,
             memberships: state.payload.state.memberships.clone(),
+            membership_keys: state.payload.state.memberships.iter().map(bincode::serialize).collect::<Result<_, _>>()?,
             state_buffers: bincode::serialize(&state.payload.state.state_buffers)?,
             attestations: bincode::serialize(&state.attestations)?,
             materializations,
@@ -125,18 +131,17 @@ impl StorageTransaction for SqliteTransaction<'_> {
             let mut conflict = false;
             for (_, write) in &ordered {
                 let entity_id = write.entity_id;
-                let entity_key = entity_id.to_base64();
                 let current_row = tx.query_row(
                     &format!(
                         r#"SELECT "id", "state_buffer", "head", "attestations"
                                FROM "{ENTITY_TABLE}" WHERE "id" = ?"#
                     ),
-                    &[SqliteValueRef::Text(&entity_key)],
+                    &[SqliteValueRef::Text(&write.entity_key)],
                 )?;
                 let current = current_row
                     .map(|row| {
                         let row = raw_state_from_sqlite_row(&row)?;
-                        let memberships = memberships_from_sqlite_connection(&tx, &entity_key)?;
+                        let memberships = memberships_from_sqlite_connection(&tx, &write.entity_key)?;
                         decode_state_row(row, memberships)
                     })
                     .transpose()?;
@@ -153,21 +158,19 @@ impl StorageTransaction for SqliteTransaction<'_> {
 
             for (_, write) in &ordered {
                 let entity_id = write.entity_id;
-                let entity_key = entity_id.to_base64();
                 let target = &write.memberships;
                 if observed[&entity_id].as_ref().is_some_and(|state| !state.payload.state.memberships.is_subset(target)) {
                     return Err(SqliteError::CorruptRecord(format!(
                         "canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported"
                     )));
                 }
-                for model in target {
-                    let model_key = bincode::serialize(model)?;
+                for model_key in &write.membership_keys {
                     tx.execute(
                         &format!(
                             r#"INSERT OR IGNORE INTO "{ENTITY_MODEL_TABLE}" ("entity_id", "model_key")
                                VALUES (?, ?)"#
                         ),
-                        &[SqliteValueRef::Text(&entity_key), SqliteValueRef::Blob(&model_key)],
+                        &[SqliteValueRef::Text(&write.entity_key), SqliteValueRef::Blob(model_key)],
                     )?;
                 }
             }
@@ -188,7 +191,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
                     &[
                         SqliteValueRef::Text(&write.entity_key),
                         SqliteValueRef::Blob(&write.state_buffers),
-                        SqliteValueRef::Text(&serde_json::to_string(&write.head)?),
+                        SqliteValueRef::Text(&write.head_json),
                         SqliteValueRef::Blob(&write.attestations),
                     ],
                 )?;

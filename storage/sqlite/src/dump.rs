@@ -96,7 +96,9 @@ fn event_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
     let rows = conn.query(&query, &arguments)?;
     let mut last = None;
     let mut page = Vec::new();
-    for row in &rows {
+    // Each row is decoded and then dropped, so that the rows read and the
+    // events decoded are not all held at once.
+    for row in rows {
         let stored_id = row.text(0)?;
         let declared_id = EventId::from_base64(stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let entity_id = EntityId::from_base64(row.text(1)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
@@ -157,7 +159,8 @@ fn states_of_page(
     let rows = snapshot.query(query, arguments)?;
     let mut last = None;
     let mut page = Vec::new();
-    for row in &rows {
+    // Each row is decoded and then dropped, as the events are.
+    for row in rows {
         let stored_id = row.text(0)?;
         let entity_id = EntityId::from_base64(stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let state_buffers = bincode::deserialize::<StateBuffers>(row.blob(1)?)?;
