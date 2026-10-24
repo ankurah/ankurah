@@ -87,19 +87,52 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
-      # ankurah-storage-sqlite's node feature binds `node:sqlite`, built into Node.js 22.16 and later.
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-
+      # ankurah-storage-sqlite's suites on Node run in the sqlite-node job.
       - name: Run WASM tests
-        run: ./scripts/run-wasm-tests.sh
+        run: ./scripts/run-wasm-tests.sh browser
         env:
           RUST_BACKTRACE: 1
 
-      # ankurah-storage-sqlite's Node suite runs again on better-sqlite3, at the
-      # release storage/sqlite/tests/package.json pins.
+  sqlite-node:
+    name: SQLite on Node.js ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ankurah-storage-sqlite's node feature runs on Node.js 22.20.0 and
+        # later (NODE_FLOOR in storage/sqlite/src/node.rs): the floor, and the
+        # current release.
+        node: ["22.20.0", "24"]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
+      - name: Add wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Run WASM tests on node:sqlite
+        run: ./scripts/run-wasm-tests.sh storage_sqlite_node
+        env:
+          RUST_BACKTRACE: 1
+
+      # The same suite runs again on better-sqlite3, at the release
+      # storage/sqlite/tests/package.json pins.
       - name: Install better-sqlite3
         working-directory: storage/sqlite/tests
         run: npm ci

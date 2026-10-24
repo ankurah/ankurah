@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
 # Script to run WASM tests for Ankurah project
-# Usage: ./scripts/run-wasm-tests.sh [package_name|storage_sqlite_node|storage_sqlite_better_sqlite3|--discover]
+# Usage: ./scripts/run-wasm-tests.sh [package_name|browser|storage_sqlite_node|storage_sqlite_better_sqlite3|--discover]
 # If no package name is provided, runs tests for all discovered wasm packages
 # (in headless Chrome) and then ankurah-storage-sqlite's suite on node:sqlite (in Node)
+# browser runs only the discovered packages, in headless Chrome
 # storage_sqlite_better_sqlite3 runs that suite again on better-sqlite3, which
 # `npm ci` in storage/sqlite/tests installs
 # Use --discover to only show discovered packages without running tests
@@ -197,6 +198,16 @@ main() {
         exit 0
     fi
     
+    if [ "$target_package" = "browser" ]; then
+        print_status "Running tests for all WASM packages in the browser..."
+        while IFS=':' read -r package_name package_dir; do
+            [ -z "$package_name" ] && continue
+            run_wasm_tests "$package_dir" "$package_name"
+        done <<< "$wasm_packages"
+        print_status "🎉 All WASM tests completed successfully!"
+        exit 0
+    fi
+
     if [ "$target_package" = "storage_sqlite_node" ]; then
         run_node_sqlite_tests
         print_status "🎉 All WASM tests completed successfully!"

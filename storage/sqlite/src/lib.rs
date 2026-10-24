@@ -23,10 +23,11 @@
 //!
 //! The engine's SQL is written once, against [`exec::SqliteExecutor`].
 //! Natively it runs on rusqlite connections from a bb8 pool. On wasm32, with
-//! the `node` feature, it runs on Node.js's built-in `node:sqlite` (Node.js
-//! 22.16 or later), for a node inside Node.js where IndexedDB does not exist:
-//! a VS Code extension host, an Electron main process, a JavaScript CLI. The
-//! tables are the same, so a database file opens under either driver.
+//! the `node` feature, it runs on Node.js's built-in `node:sqlite`, or on a
+//! better-sqlite3 database the host adopts (Node.js 22.20.0 or later), for a
+//! node inside Node.js where IndexedDB does not exist: a VS Code extension
+//! host, an Electron main process, a JavaScript CLI. The tables are the same,
+//! so a database file opens under any of them.
 //!
 //! # Example
 //!
