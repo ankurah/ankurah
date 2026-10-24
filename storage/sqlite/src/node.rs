@@ -151,8 +151,8 @@ const SQLITE_RANGE: i32 = 25;
 /// SQLite prepares a kept statement again when the schema changes, but a
 /// typed reader names its statement's columns, which a `SELECT *` may have
 /// gained or lost; so every kept reader is dropped when the schema version
-/// of main or temp changes. A reader is kept only for a statement that is not
-/// a compound SELECT at its top level (see `refuse_a_compound_select`).
+/// of main or temp changes. A reader is kept only for a statement that
+/// `refuse_a_compound_select` lets through.
 #[derive(Default)]
 struct Readers {
     /// `PRAGMA main.schema_version` and `PRAGMA temp.schema_version`, prepared once.
@@ -383,33 +383,59 @@ impl NodeConnection {
     }
 
     /// Refuse a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
-    /// top level of a query, before it runs. Nested in the typed reader, a
-    /// compound SELECT's rows take the affinity of its first SELECT's
-    /// columns, which can change a value from a later SELECT: an INTEGER past
-    /// 2^53 read through a REAL column reads as the nearest REAL. rusqlite
-    /// reads the compound directly, where no affinity applies. SQLite's plan
-    /// shows a compound at its top level as a COMPOUND QUERY, or as a MERGE
+    /// top level of a query, or as the SELECT of a scalar subquery there,
+    /// before it runs. Nested in the typed reader, each column of the query
+    /// takes an affinity, which can change a value: a compound's column takes
+    /// its first SELECT's, and a scalar subquery takes its last SELECT's,
+    /// whichever SELECT the value came from, so that an INTEGER past 2^53
+    /// read through a REAL one reads as the nearest REAL, and a small one as
+    /// a REAL. rusqlite reads each value as SQLite computed it. A compound in
+    /// a subquery or a CTE that SQLite does not flatten into the query, which
+    /// the plan shows under a CO-ROUTINE or a MATERIALIZE, takes its first
+    /// SELECT's affinity natively too, and a compound in an IN has its values
+    /// only compared, so both are let through. The plan does not show whether
+    /// a scalar subquery computes a column of the query, so one that computes
+    /// a value no row holds, in a WHERE clause or as an EXISTS, is refused
+    /// too. SQLite's plan shows a compound as a COMPOUND QUERY, or as a MERGE
     /// when SQLite codes it as a merge of its SELECTs, as it does under an
-    /// ORDER BY and, in SQLite 3.53, for UNION, INTERSECT and EXCEPT. A
-    /// compound in a subquery or a CTE takes that affinity natively too, and
-    /// is let through, unless SQLite flattens it into the query.
+    /// ORDER BY and, in SQLite 3.53, for UNION, INTERSECT and EXCEPT.
     fn refuse_a_compound_select(&self, source: &str, params: &[SqliteValueRef<'_>]) -> Result<(), SqliteError> {
         // Each step of the plan is id, parent, notused, detail. better-sqlite3
         // plans a statement only with its parameters bound.
         let plan = self.prepare(&format!("EXPLAIN QUERY PLAN {source}"))?;
+        let mut steps = Vec::new();
         for step in all(&plan, params, 4)? {
             let detail = step.get(3);
             let detail = detail.as_string().ok_or_else(|| SqliteError::Node(format!("a step of a query plan reads {detail:?}")))?;
-            if integer_from_js(&step.get(1))? == 0 && (detail == "COMPOUND QUERY" || detail.starts_with("MERGE (")) {
-                return Err(SqliteError::Node(
-                    "a compound SELECT at the top level of a query is refused on Node, before it runs: the node executor \
-                     reads rows through a typed reader that nests the query, where every row of a compound SELECT takes \
-                     the affinity of its first SELECT's columns, which can change a value from a later SELECT, as an \
-                     INTEGER past 2^53 read through a REAL column changes to the nearest REAL; select from it as \
-                     `WITH x AS MATERIALIZED (…) SELECT * FROM x`, which reads the same on every driver"
-                        .into(),
-                ));
+            steps.push((integer_from_js(&step.get(0))?, integer_from_js(&step.get(1))?, detail));
+        }
+        // The query (0), and each scalar subquery that stands in the query or
+        // in another such subquery, found without relying on the order of
+        // the steps.
+        let mut top_level = vec![0];
+        loop {
+            let found = top_level.len();
+            for (id, parent, detail) in &steps {
+                let scalar = detail.strip_prefix("CORRELATED ").unwrap_or(detail).starts_with("SCALAR SUBQUERY");
+                if scalar && top_level.contains(parent) && !top_level.contains(id) {
+                    top_level.push(*id);
+                }
             }
+            if top_level.len() == found {
+                break;
+            }
+        }
+        let compound = |detail: &String| detail == "COMPOUND QUERY" || detail.starts_with("MERGE (");
+        if steps.iter().any(|(_, parent, detail)| top_level.contains(parent) && compound(detail)) {
+            return Err(SqliteError::Node(
+                "a compound SELECT at the top level of a query, or in a scalar subquery or an EXISTS there, is refused on \
+                 Node, before it runs: the node executor reads rows through a typed reader that nests the query, which \
+                 gives each column the affinity of a compound's first SELECT, or of a scalar subquery's last, whichever \
+                 SELECT a value came from, and so can change it, as an INTEGER past 2^53 read through a REAL column \
+                 changes to the nearest REAL; select from the compound as `WITH x AS MATERIALIZED (…) SELECT * FROM x`, \
+                 which reads the same on every driver"
+                    .into(),
+            ));
         }
         Ok(())
     }

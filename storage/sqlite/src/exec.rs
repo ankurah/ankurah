@@ -29,15 +29,21 @@ use crate::{
 /// # Where the node executor differs from the native one
 ///
 /// - On Node a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
-///   top level of a query is refused before it runs. Node reads a query's
-///   rows through a typed reader that nests the query in a WITH clause, where
-///   a compound SELECT takes the affinity of its first SELECT's columns,
-///   which can change a value from a later SELECT: an INTEGER past 2^53 read
-///   through a REAL column would read as the nearest REAL. Selected as `WITH
-///   x AS MATERIALIZED (…) SELECT * FROM x`, a compound SELECT reads the same
-///   on every driver. SQLite's query plan decides what is at the top level,
-///   so a compound in a subquery that SQLite flattens into the query is
-///   refused too. No statement of the engine's own is a compound SELECT.
+///   top level of a query, or in a scalar subquery there, is refused before
+///   it runs. Node reads a query's rows through a typed reader that nests the
+///   query in a WITH clause, which gives each column an affinity: a
+///   compound's first SELECT's, or a scalar subquery's last SELECT's,
+///   whichever SELECT the value came from. That can change a value: an
+///   INTEGER past 2^53 read through a REAL column would read as the nearest
+///   REAL. Selected as `WITH x AS MATERIALIZED (…) SELECT * FROM x`, a
+///   compound SELECT reads the same on every driver, as does one in a
+///   subquery or CTE that SQLite does not flatten into the query, or in an
+///   IN. SQLite's query plan decides where a compound stands, so one in a
+///   subquery that SQLite flattens into the query is refused too. The plan
+///   does not show whether a scalar subquery computes a column of the query,
+///   so a compound in an EXISTS or in a WHERE clause's scalar subquery is
+///   refused as well, though it reads the same everywhere. No statement of
+///   the engine's own holds a compound SELECT.
 /// - On Node a statement with a named parameter (`:a`, `@a`, `#a` or `$a`)
 ///   is refused before it runs, where rusqlite binds a call's values to
 ///   named parameters in turn too: node:sqlite would bind no positional value

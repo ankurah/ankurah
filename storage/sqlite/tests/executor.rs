@@ -356,49 +356,69 @@ async fn a_double_quoted_name_that_matches_no_column_is_refused() -> Result<()> 
     Ok(())
 }
 
-/// A compound SELECT at the top level of a query is refused on Node before
-/// it runs, where rusqlite reads its values directly: Node's typed reader
-/// would read a later SELECT's INTEGER past 2^53 with the affinity of the
-/// first SELECT's REAL column, as the nearest REAL. Selected from a
-/// materialized CTE, where SQLite applies that affinity on every driver, the
-/// compound reads the same everywhere.
+/// A compound SELECT at the top level of a query, or in a scalar subquery
+/// there, is refused on Node before it runs, where rusqlite reads its values
+/// directly: Node's typed reader would read a later SELECT's INTEGER past
+/// 2^53 with the affinity of the first SELECT's REAL column, or of a scalar
+/// subquery's last SELECT's, as the nearest REAL. A compound in an EXISTS is
+/// refused on Node too, though it reads the same everywhere. Selected from a
+/// materialized CTE, or from a subquery or CTE that SQLite does not flatten,
+/// where SQLite applies the first SELECT's affinity on every driver, or in
+/// an IN, the compound reads the same everywhere.
 #[engine_test]
-async fn a_top_level_compound_select_reads_exactly_or_is_refused() -> Result<()> {
+async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
     fn values(rows: Vec<Row>) -> Vec<String> {
         let mut values: Vec<String> = rows.iter().flat_map(|row| row.values().iter().map(|value| format!("{value:?}"))).collect();
         values.sort();
         values
     }
     let storage = common::open_in_memory().await?;
-    let (compounds, materialized) = storage
+    let (refused, same) = storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE reals (r REAL)", &[])?;
             executor.execute("INSERT INTO reals VALUES (1.5)", &[])?;
             executor.execute("CREATE TABLE integers (i INTEGER)", &[])?;
             executor.execute("INSERT INTO integers VALUES (9007199254740993)", &[])?;
-            let compounds = [
-                "SELECT r FROM reals UNION ALL SELECT i FROM integers",
+            // Each statement Node refuses, with the values rusqlite reads.
+            static EXACT: [&str; 2] = ["Integer(9007199254740993)", "Real(1.5)"];
+            let refused = [
+                ("SELECT r FROM reals UNION ALL SELECT i FROM integers", &EXACT[..]),
                 // SQLite plans these two as a merge of their SELECTs: the
                 // first for its ORDER BY, the second in SQLite 3.53, the
                 // release better-sqlite3 bundles.
-                "SELECT r FROM reals UNION ALL SELECT i FROM integers ORDER BY 1",
-                "SELECT r FROM reals UNION SELECT i FROM integers",
+                ("SELECT r FROM reals UNION ALL SELECT i FROM integers ORDER BY 1", &EXACT[..]),
+                ("SELECT r FROM reals UNION SELECT i FROM integers", &EXACT[..]),
+                ("SELECT (SELECT i FROM integers UNION ALL SELECT r FROM reals)", &EXACT[..1]),
+                ("SELECT (SELECT (SELECT i FROM integers UNION ALL SELECT r FROM reals))", &EXACT[..1]),
+                ("SELECT EXISTS (SELECT i FROM integers UNION ALL SELECT r FROM reals)", &["Integer(1)"][..]),
             ]
-            .map(|sql| executor.query(sql, &[]).map(values).map_err(|error| error.to_string()));
-            let materialized =
-                executor.query("WITH x AS MATERIALIZED (SELECT r FROM reals UNION ALL SELECT i FROM integers) SELECT * FROM x", &[])?;
-            Ok((compounds, values(materialized)))
+            .map(|(sql, native)| (executor.query(sql, &[]).map(values).map_err(|error| error.to_string()), native));
+            // Each statement every driver reads, with the values it reads.
+            static ROUNDED: [&str; 2] = ["Real(1.5)", "Real(9007199254740992.0)"];
+            let same = [
+                ("WITH x AS MATERIALIZED (SELECT r FROM reals UNION ALL SELECT i FROM integers) SELECT * FROM x", &ROUNDED[..]),
+                // SQLite flattens neither, since the columns of the
+                // compound's SELECTs differ in affinity.
+                ("SELECT * FROM (SELECT r FROM reals UNION ALL SELECT i FROM integers)", &ROUNDED[..]),
+                ("WITH x AS (SELECT r FROM reals UNION ALL SELECT i FROM integers) SELECT * FROM x", &ROUNDED[..]),
+                ("SELECT v FROM (SELECT (SELECT i FROM integers UNION ALL SELECT r FROM reals) AS v)", &ROUNDED[1..]),
+                ("SELECT 9007199254740993 IN (SELECT r FROM reals UNION ALL SELECT i FROM integers)", &["Integer(1)"][..]),
+            ]
+            .map(|(sql, expected)| (sql, executor.query(sql, &[]).map(values), expected));
+            Ok((refused, same))
         })
         .await?;
-    for compound in compounds {
+    for (read, native) in refused {
         if cfg!(target_arch = "wasm32") {
-            let refusal = compound.expect_err("Node refuses a compound SELECT at the top level");
+            let refusal = read.expect_err("Node refuses the compound SELECT");
             assert!(refusal.contains("WITH x AS MATERIALIZED"), "{refusal}");
         } else {
-            assert_eq!(compound.expect("rusqlite reads a compound SELECT directly"), ["Integer(9007199254740993)", "Real(1.5)"]);
+            assert_eq!(read.expect("rusqlite reads a compound SELECT directly"), native);
         }
     }
-    assert_eq!(materialized, ["Real(1.5)", "Real(9007199254740992.0)"]);
+    for (sql, read, expected) in same {
+        assert_eq!(read?, expected, "{sql}");
+    }
     Ok(())
 }
 
