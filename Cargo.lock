@@ -343,6 +343,7 @@ version = "0.10.0"
 dependencies = [
  "ankql",
  "ankurah-core-types",
+ "ankurah-digest-tree",
  "anyhow",
  "base64 0.22.1",
  "bincode",
