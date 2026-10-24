@@ -29,24 +29,42 @@ use std::{
         Arc, Mutex,
     },
 };
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, watch, Notify};
 
 const MAX_ENTRIES: usize = 32;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
 
-/// A single cache holds active and idle residents. Active leases pin their
-/// entries under the existing operation/stream bounds; the LRU count and byte
-/// allowances bound additional idle retention. Frozen rounds remain independent.
+/// The node's one LRU of resident trees, shared by every requester and
+/// responder. A lease pins its resident; idle residents stay maintained until
+/// the LRU's count or byte allowance evicts them.
 pub(crate) struct ResidentTrees<CD: ContextData> {
     lru: Arc<Mutex<Lru<CD>>>,
-    // Only misses serialize. Hits never wait for an unrelated storage scan.
-    builds: tokio::sync::Mutex<()>,
 }
 struct Lru<CD: ContextData> {
     slots: VecDeque<Slot<CD>>,
+    /// The misses being admitted now, which a compatible miss waits for
+    /// rather than reading storage again.
+    building: Vec<Building<CD>>,
     next_id: u64,
     max_entries: usize,
     max_bytes: usize,
+}
+/// A miss being admitted: its identity, and a signal that ends when the build
+/// completes, fails or is dropped.
+struct Building<CD: ContextData> {
+    id: u64,
+    identity: Identity<CD>,
+    ended: watch::Receiver<()>,
+}
+/// Withdraws a build from the LRU's in-progress list, and wakes the misses
+/// waiting on it, when the build ends however it ends.
+struct BuildRegistration<CD: ContextData> {
+    lru: Arc<Mutex<Lru<CD>>>,
+    id: u64,
+    _ended: watch::Sender<()>,
+}
+impl<CD: ContextData> Drop for BuildRegistration<CD> {
+    fn drop(&mut self) { self.lru.lock().unwrap().building.retain(|build| build.id != self.id); }
 }
 struct Slot<CD: ContextData> {
     id: u64,
@@ -61,10 +79,7 @@ impl<CD: ContextData> Default for ResidentTrees<CD> {
 
 impl<CD: ContextData> ResidentTrees<CD> {
     pub(super) fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
-        Self {
-            lru: Arc::new(Mutex::new(Lru { slots: VecDeque::new(), next_id: 0, max_entries, max_bytes })),
-            builds: tokio::sync::Mutex::new(()),
-        }
+        Self { lru: Arc::new(Mutex::new(Lru { slots: VecDeque::new(), building: Vec::new(), next_id: 0, max_entries, max_bytes })) }
     }
     /// A snapshot of the resident that serves `selection` for `credentials`,
     /// in a tree under `spec` when the peer chose one.
@@ -160,14 +175,29 @@ impl<CD: ContextData> ResidentTrees<CD> {
         let proof = |credentials: &[CD]| {
             ContextPolicy::from_credentials(&node.policy_agent, &credentials.to_vec()).allows_unrestricted_state_reads()
         };
-        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec, proof) {
-            return Ok(lease);
-        }
-        let _build = self.builds.lock().await;
-        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec, proof) {
-            return Ok(lease);
-        }
         let identity = requested.admission();
+        // Wait out any compatible build in progress, then look again; build
+        // only when nothing admitted or being admitted serves the request.
+        let _registration = loop {
+            let mut ended = {
+                let mut lru = self.lru.lock().unwrap();
+                if let Some(lease) = lru.get(&requested, &node.catalog, peer_spec, proof) {
+                    return Ok(lease);
+                }
+                match lru.building.iter().find(|build| compatible(&build.identity, &requested, &node.catalog, peer_spec, &proof)) {
+                    Some(build) => build.ended.clone(),
+                    None => {
+                        let id = lru.next_id;
+                        lru.next_id = id.checked_add(1).ok_or_else(|| anyhow::anyhow!("resident tree identity exhausted"))?;
+                        let (sender, ended) = watch::channel(());
+                        lru.building.push(Building { id, identity: identity.clone(), ended });
+                        break BuildRegistration { lru: self.lru.clone(), id, _ended: sender };
+                    }
+                }
+            };
+            // The sender only ever drops: `changed` returns once the build ends.
+            let _ = ended.changed().await;
+        };
         let actor = ResidentActor::bootstrap(node, identity.clone()).await?;
         node.system.check_not_halted()?;
         let bytes = actor.accounted_bytes();
@@ -207,21 +237,13 @@ impl<CD: ContextData> Lru<CD> {
         proof: impl Fn(&[CD]) -> bool,
     ) -> Option<ResidentLease<CD>> {
         self.slots.retain(|slot| slot.resident.alive.load(Ordering::Acquire));
-        let compatible = |slot: &Slot<CD>| {
-            let existing = &slot.identity;
-            existing.coverage.permits(&requested.selection)
-                && existing.retrieval == requested.retrieval
-                && (!peer_spec || existing.spec.key_spec() == requested.spec.key_spec())
-                && existing.shares_access(requested, &proof)
-                && compatible_selection(existing, requested, catalog)
-                && compatible_access(existing, requested, catalog)
-        };
+        let serves = |slot: &Slot<CD>| compatible(&slot.identity, requested, catalog, peer_spec, &proof);
         let position = self
             .slots
             .iter()
-            .rposition(|slot| matches!(slot.identity.coverage, Coverage::Complete) && compatible(slot))
-            .or_else(|| self.slots.iter().rposition(|slot| slot.identity.spec == requested.spec && compatible(slot)))
-            .or_else(|| self.slots.iter().rposition(compatible))?;
+            .rposition(|slot| matches!(slot.identity.coverage, Coverage::Complete) && serves(slot))
+            .or_else(|| self.slots.iter().rposition(|slot| slot.identity.spec == requested.spec && serves(slot)))
+            .or_else(|| self.slots.iter().rposition(serves))?;
         let slot = self.slots.remove(position)?;
         let view = Arc::new(QueryView {
             selection: requested.selection.clone(),
@@ -254,6 +276,22 @@ impl<CD: ContextData> Lru<CD> {
         self.trim_idle();
         Ok(())
     }
+}
+
+/// Whether a resident admitted under `existing` can serve `requested`.
+fn compatible<CD: ContextData>(
+    existing: &Identity<CD>,
+    requested: &Identity<CD>,
+    catalog: &crate::schema::catalog::CatalogManager,
+    peer_spec: bool,
+    proof: impl Fn(&[CD]) -> bool,
+) -> bool {
+    existing.coverage.permits(&requested.selection)
+        && existing.retrieval == requested.retrieval
+        && (!peer_spec || existing.spec.key_spec() == requested.spec.key_spec())
+        && existing.shares_access(requested, proof)
+        && compatible_selection(existing, requested, catalog)
+        && compatible_access(existing, requested, catalog)
 }
 
 #[cfg(test)]
