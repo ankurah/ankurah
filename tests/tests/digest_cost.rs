@@ -252,8 +252,8 @@ fn record(label: &str, n: usize, server: &TestNode, client: &TestNode, meter: &A
         assert!(meter.errors.is_empty(), "peer errors: {:?}", meter.errors);
         meter.take()
     };
-    assert!(traffic.max_reply_items <= 128);
-    assert!(traffic.max_reply_item_bytes <= 64 * 1024);
+    assert!(traffic.max_reply_items <= proto::state_sync::limits::MAX_FRAME_ITEMS);
+    assert!(traffic.max_reply_item_bytes <= proto::state_sync::limits::MAX_PAGE_BYTES);
     println!(
         "DIGEST_COST {}",
         serde_json::json!({"case":label,"entities":n,"one_way_ms":meter.lock().unwrap().one_way_ms,"wire":traffic,"server_materialization":server.storage.take(),"client_materialization":client.storage.take()})
