@@ -45,84 +45,6 @@ impl DeltaOutcome {
 }
 
 impl NodeApplier {
-    /// Apply initial-transfer deltas concurrently, notifying the reactor for each
-    /// batch that completes together. A concurrent bare snapshot may leave the
-    /// local entity unchanged; callers needing causal coverage use apply_delta
-    /// and check coverage against the resulting entity head.
-    pub(crate) async fn apply_deltas<SE, PA, E, S>(
-        node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
-        deltas: Vec<proto::EntityDelta>,
-        event_getter: &E,
-        state_getter: &S,
-    ) -> Result<(), ApplyError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-        E: SuspenseEvents + Send + Sync,
-        S: crate::retrieval::GetState + Send + Sync,
-    {
-        // Stragglers do not hold back the rest: every batch of futures that is
-        // ready together is notified together.
-        let mut ready_chunks = ReadyChunks::new(deltas.into_iter().map(|delta| async move {
-            let entity_id = delta.entity_id;
-            (entity_id, Self::apply_delta(node, from_peer_id, delta, Delivery::Initial, event_getter, state_getter).await)
-        }));
-
-        let mut errors = Vec::new();
-        while let Some(results) = ready_chunks.next().await {
-            let mut batch = Vec::new();
-            for (entity_id, result) in results {
-                match result {
-                    Ok(outcome) => {
-                        batch.extend(outcome.change);
-                    }
-                    Err(cause) => errors.push(ApplyErrorItem { entity_id, cause }),
-                }
-            }
-            if !batch.is_empty() {
-                let failures = node.reactor.notify_change(batch).await;
-                node.live_queries.fail_notifications(&failures);
-            }
-        }
-
-        if !errors.is_empty() {
-            return Err(ApplyError::Items(errors));
-        }
-        Ok(())
-    }
-
-    /// Apply one delta of any content. Errors before anything is persisted are
-    /// returned as `Err`; everything that applied is described by the outcome.
-    pub(crate) async fn apply_delta<SE, PA, E, S>(
-        node: &Node<SE, PA>,
-        from_peer_id: &proto::EntityId,
-        delta: proto::EntityDelta,
-        delivery: Delivery,
-        event_getter: &E,
-        state_getter: &S,
-    ) -> Result<DeltaOutcome, MutationError>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent + Send + Sync + 'static,
-        E: SuspenseEvents + Send + Sync,
-        S: crate::retrieval::GetState + Send + Sync,
-    {
-        let entity_id = delta.entity_id;
-        match delta.content {
-            proto::DeltaContent::StateSnapshot { state } => {
-                Self::apply_snapshot(node, from_peer_id, entity_id, state, Vec::new(), delivery, event_getter, state_getter).await
-            }
-            proto::DeltaContent::StateAndEvents { state, events } => {
-                Self::apply_snapshot(node, from_peer_id, entity_id, state, events, delivery, event_getter, state_getter).await
-            }
-            proto::DeltaContent::EventBridge { events } => {
-                Self::apply_bridge(node, from_peer_id, entity_id, events, delivery, event_getter, state_getter).await
-            }
-            proto::DeltaContent::StateAndRelation { .. } => Err(MutationError::InvalidUpdate("StateAndRelation is not supported")),
-        }
-    }
-
     /// Validate each event fragment structurally and against policy, then
     /// stage it for causal comparison. Every delta that carries events admits them
     /// here and nowhere else.
@@ -350,14 +272,14 @@ impl NodeApplier {
             let candidate = RemoteTrxEntity::edit(entity)?;
             let expected_head = candidate.head();
             let adopted = candidate.apply_state(event_getter, &snapshot.state).await?;
+            if !adopted && events.is_empty() {
+                return Ok(None);
+            }
             let mut events = events.to_vec();
             if adopted {
                 Self::check_snapshot_events(node, snapshot, &expected_head, &events, event_getter).await?;
             } else {
                 candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
-            }
-            if !adopted && events.is_empty() {
-                return Ok(None);
             }
             let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
@@ -415,6 +337,94 @@ impl NodeApplier {
             source.publish(std::slice::from_ref(&change), delivery == Delivery::Live);
             Ok((!change.events().is_empty()).then_some(change))
         })
+    }
+
+    /// Apply multiple EntityDeltas in parallel with batched reactor notification
+    /// Drains all ready futures per wake and calls reactor.notify_change for each batch
+    /// Collects all errors and returns them at the end - caller decides whether to fail or log
+    pub(crate) async fn apply_deltas<SE, PA, E, S>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        deltas: Vec<proto::EntityDelta>,
+        event_getter: &E,
+        state_getter: &S,
+    ) -> Result<(), ApplyError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        E: SuspenseEvents + Send + Sync,
+        S: crate::retrieval::GetState + Send + Sync,
+    {
+        // do not wait for all apply_delta futures to complete - we need to apply all updates in a timely fashion
+        // if there are stragglers, they will be picked up on the next wake
+        // this should in theory be deterministic for eventbridge cases where all events are immediately available
+        let mut ready_chunks = ReadyChunks::new(deltas.into_iter().map(|delta| {
+            let entity_id = delta.entity_id;
+            async move {
+                Self::apply_delta(node, from_peer_id, delta, Delivery::Initial, event_getter, state_getter)
+                    .await
+                    .map_err(|cause| ApplyErrorItem { entity_id, cause })
+            }
+        }));
+
+        let mut all_errors = Vec::new();
+
+        while let Some(results) = ready_chunks.next().await {
+            let mut batch = Vec::new();
+
+            for result in results {
+                match result {
+                    Ok(outcome) => batch.extend(outcome.change),
+                    Err(error_item) => {
+                        all_errors.push(error_item);
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                let failures = node.reactor.notify_change(batch).await;
+                node.live_queries.fail_notifications(&failures);
+            }
+        }
+
+        if !all_errors.is_empty() {
+            return Err(ApplyError::Items(all_errors));
+        }
+
+        Ok(())
+    }
+
+    /// Apply one delta of any content. Errors before anything is persisted are
+    /// returned as `Err`; everything that applied is described by the outcome.
+    pub(crate) async fn apply_delta<SE, PA, E, S>(
+        node: &Node<SE, PA>,
+        from_peer_id: &proto::EntityId,
+        delta: proto::EntityDelta,
+        delivery: Delivery,
+        event_getter: &E,
+        state_getter: &S,
+    ) -> Result<DeltaOutcome, MutationError>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+        E: SuspenseEvents + Send + Sync,
+        S: crate::retrieval::GetState + Send + Sync,
+    {
+        let entity_id = delta.entity_id;
+        match delta.content {
+            proto::DeltaContent::StateSnapshot { state } => {
+                Self::apply_snapshot(node, from_peer_id, entity_id, state, Vec::new(), delivery, event_getter, state_getter).await
+            }
+            proto::DeltaContent::StateAndEvents { state, events } => {
+                Self::apply_snapshot(node, from_peer_id, entity_id, state, events, delivery, event_getter, state_getter).await
+            }
+
+            proto::DeltaContent::EventBridge { events } => {
+                Self::apply_bridge(node, from_peer_id, entity_id, events, delivery, event_getter, state_getter).await
+            }
+
+            proto::DeltaContent::StateAndRelation { .. } => Err(MutationError::InvalidUpdate("StateAndRelation not yet implemented")),
+        }
     }
 }
 
