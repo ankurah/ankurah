@@ -81,6 +81,20 @@ async fn integral_reals_read_as_reals() -> Result<()> {
     Ok(())
 }
 
+/// A PRAGMA that sets a value and reports it as TEXT returns the TEXT on
+/// every driver: on Node, which cannot nest a PRAGMA in its typed reader, as
+/// the driver's string.
+#[engine_test]
+async fn a_pragma_that_sets_a_value_reports_it() -> Result<()> {
+    let db = TempDb::new("journal_mode");
+    let storage = common::open(db.path()).await?;
+    let mode = storage
+        .with_executor(|executor| Ok(executor.query_row("PRAGMA journal_mode=DELETE", &[])?.expect("one row").text(0)?.to_owned()))
+        .await?;
+    assert_eq!(mode, "delete");
+    Ok(())
+}
+
 /// A connection the engine opens waits up to five seconds for another
 /// writer's lock before failing, on every driver: rusqlite sets that timeout
 /// on each connection it opens, and the node executor sets it with its

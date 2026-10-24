@@ -536,10 +536,10 @@ impl NodeConnection {
             }
             // SQLite nests only a query (SELECT, VALUES, or WITH and a SELECT)
             // in a WITH clause. A PRAGMA or an EXPLAIN is read as the database
-            // hands it over, with its TEXT refused. Any other statement that
-            // yields rows, such as one with a RETURNING clause, could write
-            // before a TEXT value in its rows were refused, so it is refused
-            // before it runs.
+            // hands it over, its TEXT as a string (see `plain_row`). Any other
+            // statement that yields rows, such as one with a RETURNING clause,
+            // could write before a TEXT value in its rows were refused, so it
+            // is refused before it runs.
             Err(nesting) => {
                 if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| sql_text::first_keyword(&source).eq_ignore_ascii_case(keyword)) {
                     return Err(SqliteError::Node(format!(
@@ -679,23 +679,23 @@ fn typed_row(row: Array) -> Result<Row, SqliteError> {
 }
 
 /// A row of a PRAGMA or an EXPLAIN, which SQLite would not nest in a typed
-/// reader, read as the database hands it over. Its TEXT arrives only as a
-/// JavaScript string that may have lost bytes, so a TEXT value is refused,
-/// naming why the statement could not be nested.
+/// reader, read as the database hands it over. Its TEXT arrives as a
+/// JavaScript string, read as the TEXT: SQLite makes a PRAGMA's or an
+/// EXPLAIN's TEXT of C strings, so it holds no NUL for node:sqlite to cut it
+/// at, but a string holding U+FFFD is refused, since both Node drivers put
+/// that character in place of each byte that is not UTF-8.
 fn plain_row(row: Array, nesting: &SqliteError) -> Result<Row, SqliteError> {
     row.iter()
         .enumerate()
-        .map(|(index, value)| {
-            if value.is_string() {
-                return Err(SqliteError::Node(format!(
-                    "column {index} is TEXT, which the database hands over only as a string that may have lost bytes (both \
-                     Node drivers replace every byte that is not UTF-8, and node:sqlite cuts the string at its first NUL); the \
-                     node executor reads TEXT exactly only from a query SQLite can nest in a WITH clause, which this statement \
-                     is not ({nesting}), so select the value through a query instead, such as a table-valued pragma function \
-                     like pragma_table_info"
-                )));
-            }
-            value_from_js(index, value)
+        .map(|(index, value)| match value.as_string() {
+            Some(text) if text.contains('\u{FFFD}') => Err(SqliteError::Node(format!(
+                "column {index} is TEXT holding U+FFFD, which both Node drivers put in place of each byte that is not UTF-8 \
+                 when they hand TEXT over as a string; the node executor reads TEXT as its bytes only from a query SQLite can \
+                 nest in a WITH clause, which this statement is not ({nesting}), so select the value through such a query, \
+                 such as a table-valued pragma function like pragma_table_info"
+            ))),
+            Some(text) => Ok(SqliteValue::Text(text)),
+            None => value_from_js(index, value),
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Row::new)

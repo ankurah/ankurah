@@ -71,21 +71,26 @@ async fn refuses_a_driver_without_exact_integers() {
     assert!(error.to_string().contains("exact INTEGER"), "{error}");
 }
 
-/// TEXT is read exactly only from a statement SQLite can nest in the typed
-/// reader; from a PRAGMA it is refused, pointing at the table-valued
-/// function, while the PRAGMA's other storage classes read as ever.
+/// TEXT from a statement SQLite cannot nest in the typed reader, such as a
+/// PRAGMA, is read as the driver's string, and the PRAGMA's other storage
+/// classes as ever; a string holding U+FFFD, which a driver may have put in
+/// place of bytes that are not UTF-8, is refused, pointing at the
+/// table-valued function, which reads TEXT as its bytes.
 #[wasm_bindgen_test]
-async fn text_from_a_statement_sqlite_cannot_nest_is_refused() -> Result<()> {
+async fn text_from_a_statement_sqlite_cannot_nest_is_read_as_a_string() -> Result<()> {
     let storage = common::open_in_memory().await?;
-    let (table_info, timeout) = storage
+    let (names, marked, timeout) = storage
         .with_executor(|executor| {
-            let table_info =
-                executor.query(r#"PRAGMA table_info("_ankurah_meta")"#, &[]).map(|rows| rows.len()).map_err(|error| error.to_string());
-            Ok((table_info, executor.query_row("PRAGMA busy_timeout", &[])?.expect("one row").integer(0)?))
+            let names = executor.query(r#"PRAGMA table_info("_ankurah_meta")"#, &[])?;
+            let names = names.iter().map(|row| row.text(1).map(str::to_owned)).collect::<Result<Vec<_>, _>>()?;
+            executor.execute("CREATE TABLE marked (\"\u{FFFD}\" TEXT)", &[])?;
+            let marked = executor.query("PRAGMA table_info(marked)", &[]).map(|rows| rows.len()).map_err(|error| error.to_string());
+            Ok((names, marked, executor.query_row("PRAGMA busy_timeout", &[])?.expect("one row").integer(0)?))
         })
         .await?;
-    let refusal = table_info.expect_err("TEXT from a PRAGMA is refused");
-    assert!(refusal.contains("column 1 is TEXT") && refusal.contains("pragma_table_info"), "{refusal}");
+    assert_eq!(names, ["key", "value"]);
+    let refusal = marked.expect_err("a string holding U+FFFD is refused");
+    assert!(refusal.contains("column 1 is TEXT holding U+FFFD") && refusal.contains("pragma_table_info"), "{refusal}");
     assert_eq!(timeout, 5000);
     Ok(())
 }

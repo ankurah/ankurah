@@ -46,8 +46,10 @@ use crate::{
 ///   `?1`, and refuses the call; rusqlite and node:sqlite bind the value at
 ///   that position.
 /// - On Node a query that SQLite cannot nest in a WITH clause is refused,
-///   before it runs, unless it is a PRAGMA or an EXPLAIN, and TEXT in the
-///   rows of a PRAGMA or an EXPLAIN is refused.
+///   before it runs, unless it is a PRAGMA or an EXPLAIN. A PRAGMA's or an
+///   EXPLAIN's TEXT is read as the driver's JavaScript string, and a string
+///   holding U+FFFD is refused, since both Node drivers put that character in
+///   place of each byte that is not UTF-8.
 /// - better-sqlite3 refuses a query whose SQL holds more than whitespace
 ///   after the semicolon that ends its statement, as `SELECT 1; -- note`
 ///   does: the typed reader nests the SQL better-sqlite3 prepared, and
