@@ -11,7 +11,13 @@ use self::{
     lease::Resident,
 };
 use super::tree::{serves, spec_for};
-use crate::{node::Node, policy::PolicyAgent, reactor::maintenance::SourceError, session::ContextData, storage::StorageEngine};
+use crate::{
+    node::Node,
+    policy::{ContextPolicy, PolicyAgent},
+    reactor::maintenance::SourceError,
+    session::ContextData,
+    storage::StorageEngine,
+};
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto as proto;
 pub(crate) use lease::{ResidentLease, ResidentPin, ResidentSnapshot, ResidentSubscription};
@@ -150,11 +156,14 @@ impl<CD: ContextData> ResidentTrees<CD> {
         let spec = spec.unwrap_or_else(|| spec_for(&selection, &node.catalog));
         anyhow::ensure!(serves(&spec, &selection, &node.catalog), "tree cannot serve selection");
         let requested = Identity::requested(node, selection, spec, credentials)?;
-        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec) {
+        let proof = |credentials: &[CD]| {
+            ContextPolicy::from_credentials(&node.policy_agent, &credentials.to_vec()).allows_unrestricted_state_reads()
+        };
+        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec, proof) {
             return Ok(lease);
         }
         let _build = self.builds.lock().await;
-        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec) {
+        if let Some(lease) = self.lru.lock().unwrap().get(&requested, &node.catalog, peer_spec, proof) {
             return Ok(lease);
         }
         let identity = requested.admission();
@@ -186,19 +195,23 @@ impl<CD: ContextData> ResidentTrees<CD> {
 }
 
 impl<CD: ContextData> Lru<CD> {
+    /// A lease of the resident that best serves `requested`: a complete one
+    /// first, then one keyed as requested, then any compatible one. `proof`
+    /// tells whether credentials hold a fresh proof of unrestricted state reads.
     fn get(
         &mut self,
         requested: &Identity<CD>,
         catalog: &crate::schema::catalog::CatalogManager,
         peer_spec: bool,
+        proof: impl Fn(&[CD]) -> bool,
     ) -> Option<ResidentLease<CD>> {
         self.slots.retain(|slot| slot.resident.alive.load(Ordering::Acquire));
         let compatible = |slot: &Slot<CD>| {
             let existing = &slot.identity;
             existing.coverage.permits(&requested.selection)
-                && existing.credentials == requested.credentials
                 && existing.retrieval == requested.retrieval
                 && (!peer_spec || existing.spec.key_spec() == requested.spec.key_spec())
+                && existing.shares_access(requested, &proof)
                 && compatible_selection(existing, requested, catalog)
                 && compatible_access(existing, requested, catalog)
         };
@@ -213,6 +226,7 @@ impl<CD: ContextData> Lru<CD> {
             selection: requested.selection.clone(),
             filtered: requested.filtered.clone(),
             spec: if peer_spec { requested.spec.clone() } else { slot.identity.spec.clone() },
+            credentials: requested.credentials.clone(),
         });
         let lease = ResidentLease::new(slot.resident.clone(), view);
         self.slots.push_back(slot);

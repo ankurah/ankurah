@@ -4,7 +4,7 @@ pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::
     node: &Node<OrderedStorage, PA>,
     actor: &ResidentActor<PA::ContextData>,
     selection: Selection<Resolved>,
-) -> anyhow::Result<Route> {
+) -> anyhow::Result<Route<PA::ContextData>> {
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
     let snapshot = view(actor, &selection, &node.catalog).await?;
     let mut filtered = selection.clone();
@@ -15,6 +15,7 @@ pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::
         owner: Weak::new(),
         selection,
         filtered,
+        credentials: vec![DEFAULT_CONTEXT],
         members: snapshot.query_members(),
     })
 }
@@ -229,7 +230,15 @@ async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<(
     let stream = pending.id();
     pending.initialize(&node).await?;
     let owner = Arc::new(());
-    actor.routes.push(Route { peer, stream, owner: Arc::downgrade(&owner), selection: selected.clone(), filtered: selected, members });
+    actor.routes.push(Route {
+        peer,
+        stream,
+        owner: Arc::downgrade(&owner),
+        selection: selected.clone(),
+        filtered: selected,
+        credentials: vec![DEFAULT_CONTEXT],
+        members,
+    });
     let first = update(&initial[0], "09")?;
     let second = update(&initial[1], "08")?;
     apply(&node, &first).await?;

@@ -13,12 +13,16 @@ use ankql::ast::{Resolved, Selection};
 use ankurah_proto::{self as proto, Attested};
 use std::{collections::BTreeMap, sync::Weak};
 
-pub(super) struct Route {
+/// One peer's live view of a resident: the stream it is delivered on, the
+/// selection it subscribed with and that selection filtered for its
+/// principal, the principal's credentials, and the members it last delivered.
+pub(super) struct Route<CD> {
     pub(super) peer: proto::EntityId,
     pub(super) stream: proto::StateStreamId,
     pub(super) owner: Weak<()>,
     pub(super) selection: Selection<Resolved>,
     pub(super) filtered: Selection<Resolved>,
+    pub(super) credentials: Vec<CD>,
     pub(super) members: BTreeMap<proto::EntityId, proto::QueryMember>,
 }
 
@@ -61,7 +65,7 @@ where
     Ok(states)
 }
 
-impl Route {
+impl<CD> Route<CD> {
     pub(super) async fn changes<SE, PA>(
         &mut self,
         node: &Node<SE, PA>,

@@ -2,8 +2,10 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 #[tokio::test]
-async fn reactor_publication_evaluates_the_state_free_read_proof_for_each_change() -> anyhow::Result<()> {
-    let allowed = Arc::new(AtomicBool::new(true));
+async fn a_restricted_residents_publications_evaluate_its_admitting_proof_afresh() -> anyhow::Result<()> {
+    // Admitted without the proof, the resident keeps asking its admitting
+    // credentials' policy, which may grant the proof later.
+    let allowed = Arc::new(AtomicBool::new(false));
     let checks = Arc::new(AtomicUsize::new(0));
     let proofs = Arc::new(AtomicUsize::new(0));
     let node = Node::new_durable(
@@ -23,7 +25,7 @@ async fn reactor_publication_evaluates_the_state_free_read_proof_for_each_change
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    assert!(view(&actor, &selected, &node.catalog).await?.entries.contains_key(&current.entity_id));
+    assert!(!view(&actor, &selected, &node.catalog).await?.entries.contains_key(&current.entity_id));
 
     for (readable, value) in [(true, "02"), (false, "03"), (true, "04")] {
         allowed.store(readable, Ordering::SeqCst);
@@ -111,12 +113,13 @@ async fn state_free_read_proofs_are_fresh_and_do_not_hide_new_grants_or_revocati
     let no_credentials = node.resident_trees.acquire(&node, selection(None), None, vec![]).await?;
     assert!(!Weak::ptr_eq(&granted.identity(), &no_credentials.identity()), "a credential change cannot borrow the earlier grant");
     assert!(no_credentials.snapshot().await?.snapshot.entries.is_empty());
-    let reads = node.storage.state_reads.load(Ordering::Relaxed);
     allowed.store(false, Ordering::SeqCst);
     assert!(granted.snapshot().await.is_err(), "the proof is not retained after revocation");
-    assert!(node.storage.state_reads.load(Ordering::Relaxed) > reads, "a false proof falls back to actual state checks");
     let revoked = acquire(&node.resident_trees, &node, selection(None)).await?;
+    assert!(!Weak::ptr_eq(&granted.identity(), &revoked.identity()), "a revoked proof cannot reuse the unrestricted resident");
+    let reads = node.storage.state_reads.load(Ordering::Relaxed);
     assert!(revoked.snapshot().await?.snapshot.entries.is_empty());
+    assert!(node.storage.state_reads.load(Ordering::Relaxed) > reads, "without the proof, reads fall back to actual state checks");
     Ok(())
 }
 
@@ -178,13 +181,21 @@ async fn policies_without_a_state_free_proof_keep_their_state_checks() -> anyhow
 #[tokio::test]
 async fn one_publication_evaluates_the_state_free_read_proof_once_for_all_its_changes() -> anyhow::Result<()> {
     let proofs = Arc::new(AtomicUsize::new(0));
+    let allowed = Arc::new(AtomicBool::new(false));
     let node = Node::new_durable(
         Arc::new(OrderedStorage::default()),
-        RestrictedDiscovery { state_free_reads: true, state_free_proofs: Some(proofs.clone()), ..Default::default() },
+        RestrictedDiscovery {
+            read_allowed: Some(allowed.clone()),
+            state_free_reads: true,
+            state_free_proofs: Some(proofs.clone()),
+            ..Default::default()
+        },
     );
     node.system.create().await?;
     node.wait_ready().await?;
+    // Admitted without the proof, so that its projector asks for it.
     let mut actor = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    allowed.store(true, Ordering::SeqCst);
     let mut changes = Vec::new();
     for value in ["01", "02", "03"] {
         let event = genesis(value)?;
@@ -236,5 +247,60 @@ async fn a_command_reads_its_candidates_states_in_one_storage_call() -> anyhow::
     let batches = node.storage.state_batches.load(Ordering::Relaxed);
     assert_eq!(resident.snapshot().await?.snapshot.entries.len(), 3);
     assert_eq!(node.storage.state_batches.load(Ordering::Relaxed) - batches, 1, "the per-candidate read check reads every state at once");
+    Ok(())
+}
+
+async fn restricted_node(policy: RestrictedDiscovery) -> anyhow::Result<Node<OrderedStorage, RestrictedDiscovery>> {
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
+    node.system.create().await?;
+    node.wait_ready().await?;
+    for value in ["01", "02", "03"] {
+        apply(&node, &genesis(value)?).await?;
+    }
+    Ok(node)
+}
+
+#[tokio::test]
+async fn principals_with_equal_effective_access_share_one_resident() -> anyhow::Result<()> {
+    let node = restricted_node(RestrictedDiscovery { state_free_reads: true, ..Default::default() }).await?;
+    let one = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    let fetches = node.storage.fetches.load(Ordering::Relaxed);
+    let two = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT, DEFAULT_CONTEXT]).await?;
+    assert!(Weak::ptr_eq(&one.identity(), &two.identity()), "both principals read every candidate without state checks");
+    assert_eq!(node.storage.fetches.load(Ordering::Relaxed), fetches, "the second principal admits nothing again");
+    assert_eq!(two.snapshot().await?.snapshot.entries.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn principals_whose_read_checks_could_differ_do_not_share() -> anyhow::Result<()> {
+    let node = restricted_node(RestrictedDiscovery::default()).await?;
+    let one = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    let two = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT, DEFAULT_CONTEXT]).await?;
+    assert!(!Weak::ptr_eq(&one.identity(), &two.identity()), "without the proof, each principal's own read checks decide");
+    assert!(Weak::ptr_eq(
+        &one.identity(),
+        &node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?.identity()
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn revoking_one_holders_proof_ends_only_that_holders_sharing() -> anyhow::Result<()> {
+    let proof_up_to = Arc::new(AtomicUsize::new(2));
+    let node =
+        restricted_node(RestrictedDiscovery { state_free_reads: true, proof_up_to: Some(proof_up_to.clone()), ..Default::default() })
+            .await?;
+    let one = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    let two = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT, DEFAULT_CONTEXT]).await?;
+    assert!(Weak::ptr_eq(&one.identity(), &two.identity()));
+    proof_up_to.store(1, Ordering::SeqCst);
+    let Err(error) = two.snapshot().await else { panic!("a holder whose proof is revoked cannot read the shared resident") };
+    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::PolicyChanged)));
+    assert_eq!(one.snapshot().await?.snapshot.entries.len(), 3, "a holder whose proof holds keeps the resident");
+    // Asking the LRU again admits the revoked principal a resident of its own.
+    let own = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT, DEFAULT_CONTEXT]).await?;
+    assert_eq!(own.snapshot.entries.len(), 3, "its own read checks still allow every candidate");
+    assert_eq!(node.resident_trees.len(), 2);
     Ok(())
 }

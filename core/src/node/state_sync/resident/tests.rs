@@ -386,6 +386,8 @@ struct RestrictedDiscovery {
     state_free_proofs: Option<Arc<std::sync::atomic::AtomicUsize>>,
     state_checks: Option<Arc<std::sync::atomic::AtomicUsize>>,
     retrieval_error: bool,
+    /// When set, only credential lists no longer than this hold the proof.
+    proof_up_to: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 #[async_trait::async_trait]
 impl PolicyAgent for RestrictedDiscovery {
@@ -399,6 +401,7 @@ impl PolicyAgent for RestrictedDiscovery {
             && self.retrieval.as_ref().is_none_or(|predicate| *predicate == Predicate::True)
             && !(self.deny_empty && data.iterable().next().is_none())
             && self.read_allowed.as_ref().is_none_or(|allowed| allowed.load(std::sync::atomic::Ordering::SeqCst))
+            && self.proof_up_to.as_ref().is_none_or(|longest| data.iterable().count() <= longest.load(std::sync::atomic::Ordering::SeqCst))
     }
     fn sign_request<SE: StorageEngine, C: crate::util::Iterable<Self::ContextData>>(
         &self,

@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 /// What a resident admits and for whom: its coverage, the selection it was
 /// requested with and that selection filtered by policy, the retrieval
-/// predicate and the TreeSpec it was admitted under, and the credentials that
-/// admitted it.
+/// predicate and the TreeSpec it was admitted under, whose read checks decide
+/// which candidates it admits, and the credentials that admitted it.
 #[derive(Clone, PartialEq)]
 pub(super) struct Identity<CD> {
     pub(super) coverage: Coverage,
@@ -30,7 +30,25 @@ pub(super) struct Identity<CD> {
     pub(super) filtered: Selection<Resolved>,
     pub(super) retrieval: Arc<Predicate<Resolved>>,
     pub(super) spec: proto::TreeSpec,
+    pub(super) access: Access,
+    /// The credentials that admitted the resident. A restricted resident's
+    /// candidates are admitted by their read checks; any resident's batches
+    /// are checked against their policy.
     pub(super) credentials: Vec<CD>,
+}
+
+/// Whose read checks decide which of a resident's candidates it admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Access {
+    /// The admitting credentials held a fresh proof of unrestricted state
+    /// reads: the resident admits every candidate, so it may serve any
+    /// principal whose own proof holds, checked when it takes a lease and on
+    /// every use.
+    Unrestricted,
+    /// The admitting credentials' per-entity read checks decide: only the same
+    /// credentials can share the resident, since another principal's checks
+    /// could differ.
+    Restricted,
 }
 
 impl<CD: ContextData> Identity<CD> {
@@ -55,6 +73,7 @@ impl<CD: ContextData> Identity<CD> {
             filtered,
             retrieval: policy.retrieval_predicate(),
             spec,
+            access: if policy.allows_unrestricted_state_reads() { Access::Unrestricted } else { Access::Restricted },
             credentials,
         })
     }
@@ -74,18 +93,49 @@ impl<CD: ContextData> Identity<CD> {
     }
 
     /// The view this request reads from whichever resident serves it.
-    pub(super) fn view(&self) -> QueryView {
-        QueryView { selection: self.selection.clone(), filtered: self.filtered.clone(), spec: self.spec.clone() }
+    pub(super) fn view(&self) -> QueryView<CD> {
+        QueryView {
+            selection: self.selection.clone(),
+            filtered: self.filtered.clone(),
+            spec: self.spec.clone(),
+            credentials: self.credentials.clone(),
+        }
     }
 
-    /// Fail with `PolicyChanged` unless policy still gives this identity's
-    /// credentials the filtered selection and retrieval predicate it was
-    /// admitted with.
+    /// Whether a resident admitted under this identity may serve `requested`'s
+    /// principal: a restricted resident only the same credentials, and an
+    /// unrestricted one any principal for which both `requested`'s and this
+    /// identity's credentials hold a fresh proof of unrestricted state reads.
+    pub(super) fn shares_access(&self, requested: &Self, proof: impl Fn(&[CD]) -> bool) -> bool {
+        match self.access {
+            Access::Restricted => self.credentials == requested.credentials,
+            Access::Unrestricted => requested.access == Access::Unrestricted && proof(&self.credentials),
+        }
+    }
+
+    /// Fail with `PolicyChanged` unless `holder`, the policy of a principal this
+    /// resident serves, still reads what the resident admitted: the same
+    /// retrieval predicate and, for an unrestricted resident, a fresh proof of
+    /// unrestricted state reads.
+    pub(super) fn ensure_holder_admitted<PA: PolicyAgent<ContextData = CD>>(&self, holder: &ReadPolicy<'_, PA>) -> anyhow::Result<()> {
+        anyhow::ensure!(holder.retrieval_predicate() == self.retrieval, SourceError::PolicyChanged);
+        anyhow::ensure!(self.access == Access::Restricted || holder.allows_unrestricted_state_reads(), SourceError::PolicyChanged);
+        Ok(())
+    }
+
+    /// Fail with `PolicyChanged` unless policy still gives a restricted
+    /// resident's admitting credentials the filtered selection and retrieval
+    /// predicate it was admitted with. An unrestricted resident's admission
+    /// depends on no one principal; each principal it serves is checked on its
+    /// own.
     pub(super) fn ensure_policy_unchanged<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
+        if self.access == Access::Unrestricted {
+            return Ok(());
+        }
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.credentials);
         ensure_filter_unchanged(&policy, &self.selection, &self.filtered)?;
         anyhow::ensure!(policy.retrieval_predicate() == self.retrieval, SourceError::PolicyChanged);
@@ -142,12 +192,14 @@ impl Coverage {
 }
 
 /// What one lease reads from its resident: the selection it asked for, that
-/// selection filtered by policy, and the TreeSpec its comparisons describe.
+/// selection filtered by policy, the TreeSpec its comparisons describe, and the
+/// credentials of the principal it reads for.
 #[derive(Clone)]
-pub(super) struct QueryView {
+pub(super) struct QueryView<CD> {
     pub(super) selection: Selection<Resolved>,
     pub(super) filtered: Selection<Resolved>,
     pub(super) spec: proto::TreeSpec,
+    pub(super) credentials: Vec<CD>,
 }
 
 pub(super) fn compatible_selection<CD: ContextData>(

@@ -3,7 +3,7 @@
 
 use super::{
     bootstrap::{ensure_catalog_unchanged, fold_candidate, StorageRead, TreeUpdate, MAX_READ_ATTEMPTS},
-    identity::{ensure_filter_unchanged, Coverage, Identity},
+    identity::{ensure_filter_unchanged, Access, Coverage, Identity},
     lease::{Command, Resident, ResidentSnapshot},
     route::{current_states, Route},
     Lru,
@@ -41,15 +41,17 @@ pub(super) struct ResidentActor<CD: ContextData> {
     pub(super) tree: QueryTree,
     pub(super) cursor: MaintenanceSubscription<TreeUpdate>,
     pub(super) revision: u64,
-    pub(super) routes: Vec<Route>,
+    pub(super) routes: Vec<Route<CD>>,
     /// How the snapshots this actor hands out ask it for the tree's digests,
     /// once the actor runs.
     pub(super) digest_requests: Option<DigestRequests>,
 }
 
 impl<CD: ContextData> ResidentActor<CD> {
-    /// Fail with `Changed` unless the tree holds exactly the candidates the
-    /// admitting credentials may read now.
+    /// Fail with `PolicyChanged` unless the tree holds exactly the candidates
+    /// the resident's access admits now: every candidate for an unrestricted
+    /// resident, and for a restricted one those its admitting credentials may
+    /// read.
     pub(super) async fn check_authorization<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -57,7 +59,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
         let entries = self.tree.entries();
-        if policy.allows_unrestricted_state_reads() {
+        if self.identity.access == Access::Unrestricted || policy.allows_unrestricted_state_reads() {
             // A new grant must also admit candidates previously denied by policy.
             // Returning the old subset would silently lose newly readable rows.
             anyhow::ensure!(entries.keys().eq(self.candidates.iter()), SourceError::PolicyChanged);
@@ -100,7 +102,6 @@ impl<CD: ContextData> ResidentActor<CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
         let mut retained = Vec::with_capacity(self.routes.len());
         let mut prepared = prepared.map(Vec::into_iter);
         for mut route in std::mem::take(&mut self.routes) {
@@ -109,7 +110,10 @@ impl<CD: ContextData> ResidentActor<CD> {
                 continue;
             }
             let result = async {
+                // Each route reads for its own principal, checked afresh.
+                let policy = ContextPolicy::from_credentials(&node.policy_agent, &route.credentials);
                 ensure_filter_unchanged(&policy, &route.selection, &route.filtered)?;
+                self.identity.ensure_holder_admitted(&policy)?;
                 if let Some(membership) = membership {
                     let (next, ordered) = membership?;
                     route.changes_for_members(node, &policy, &sources, next, ordered).await
@@ -361,8 +365,9 @@ impl<CD: ContextData> ResidentActor<CD> {
         };
         let selected = async {
             let view = command.view();
-            let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
+            let policy = ContextPolicy::from_credentials(&node.policy_agent, &view.credentials);
             ensure_filter_unchanged(&policy, &view.selection, &view.filtered)?;
+            self.identity.ensure_holder_admitted(&policy)?;
             self.identity.coverage.select(snapshot, &view.selection, &node.catalog).await?.with_spec(
                 view.spec.clone(),
                 &view.selection,
@@ -393,7 +398,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                     peer,
                     request,
                     fingerprint,
-                    self.identity.credentials.clone(),
+                    view.credentials.clone(),
                     Some((query, version)),
                     catalog,
                     self.revision,
@@ -407,6 +412,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                         owner,
                         selection: view.selection.clone(),
                         filtered: view.filtered.clone(),
+                        credentials: view.credentials.clone(),
                         members,
                     });
                 }

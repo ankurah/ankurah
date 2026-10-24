@@ -82,7 +82,15 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
     let stream = pending.id();
     pending.initialize(&node).await?;
     let owner = Arc::new(());
-    actor.routes.push(Route { peer, stream, owner: Arc::downgrade(&owner), selection: selected.clone(), filtered: selected, members });
+    actor.routes.push(Route {
+        peer,
+        stream,
+        owner: Arc::downgrade(&owner),
+        selection: selected.clone(),
+        filtered: selected,
+        credentials: vec![DEFAULT_CONTEXT],
+        members,
+    });
 
     let first = update(&initial[0], "09")?;
     let other = update(&initial[1], "05")?;

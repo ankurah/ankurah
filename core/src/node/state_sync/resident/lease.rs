@@ -36,10 +36,10 @@ pub(crate) struct ResidentPin {
 
 pub(crate) struct ResidentLease<CD: ContextData> {
     pub(super) resident: Arc<Resident<CD>>,
-    pub(super) view: Arc<QueryView>,
+    pub(super) view: Arc<QueryView<CD>>,
 }
 impl<CD: ContextData> ResidentLease<CD> {
-    pub(super) fn new(resident: Arc<Resident<CD>>, view: Arc<QueryView>) -> Self {
+    pub(super) fn new(resident: Arc<Resident<CD>>, view: Arc<QueryView<CD>>) -> Self {
         resident.pins.fetch_add(1, Ordering::AcqRel);
         Self { resident, view }
     }
@@ -140,11 +140,11 @@ pub(crate) struct ResidentSnapshot {
 }
 pub(super) enum Command<CD: ContextData> {
     Snapshot {
-        view: Arc<QueryView>,
+        view: Arc<QueryView<CD>>,
         response: oneshot::Sender<anyhow::Result<ResidentSnapshot>>,
     },
     Subscribe {
-        view: Arc<QueryView>,
+        view: Arc<QueryView<CD>>,
         peer: proto::EntityId,
         request: proto::RequestId,
         fingerprint: Vec<u8>,
@@ -156,7 +156,7 @@ pub(super) enum Command<CD: ContextData> {
         response: oneshot::Sender<anyhow::Result<crate::node::state_sync::PendingStateStream<CD>>>,
     },
     Refresh {
-        view: Arc<QueryView>,
+        view: Arc<QueryView<CD>>,
         peer: proto::EntityId,
         stream: proto::StateStreamId,
         number: u64,
@@ -166,7 +166,7 @@ pub(super) enum Command<CD: ContextData> {
 }
 
 impl<CD: ContextData> Command<CD> {
-    pub(super) fn view(&self) -> &QueryView {
+    pub(super) fn view(&self) -> &QueryView<CD> {
         match self {
             Self::Snapshot { view, .. } | Self::Subscribe { view, .. } | Self::Refresh { view, .. } => view,
         }

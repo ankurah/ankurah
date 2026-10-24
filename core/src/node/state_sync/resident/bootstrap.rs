@@ -4,7 +4,7 @@
 
 use super::{
     actor::ResidentActor,
-    identity::{Coverage, Identity},
+    identity::{Access, Coverage, Identity},
 };
 use crate::{
     changes::EntityChange,
@@ -87,7 +87,7 @@ impl StorageRead {
                 continue;
             }
             read.candidates.insert(id);
-            if policy.check_read(&id, &state.payload.state).is_err() {
+            if identity.access == Access::Restricted && policy.check_read(&id, &state.payload.state).is_err() {
                 continue;
             }
             if matches!(identity.coverage, Coverage::Limited(_)) {
@@ -198,7 +198,9 @@ pub(super) fn fold_candidate(candidates: &mut BTreeSet<proto::EntityId>, change:
 /// `identity` admits: for each committed entity, whether it matches the
 /// resident's predicate, its tree entry when `identity`'s credentials may read
 /// it, and the committed events' ids. One policy, and at most one evaluation of
-/// its unrestricted-read proof, serves the whole publication.
+/// its unrestricted-read proof, serves the whole publication; an unrestricted
+/// resident checks no principal's reads, since each principal it serves holds
+/// its own proof.
 fn projector<SE, PA>(
     node: &Node<SE, PA>,
     identity: &Identity<PA::ContextData>,
@@ -212,6 +214,7 @@ where
     let spec = identity.spec.clone();
     let paths = key_paths(&spec);
     let credentials = identity.credentials.clone();
+    let access = identity.access;
     move |changes, live_events| {
         let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
@@ -222,8 +225,11 @@ where
                 let entity_id = change.entity().id();
                 change.entity().with_read(|entity| {
                     let matches = evaluate_predicate(entity, &predicate)?;
+                    // An unrestricted resident admits every match; a restricted
+                    // one asks its admitting credentials' policy afresh.
                     let readable = matches
-                        && (*unrestricted.get_or_init(|| policy.allows_unrestricted_state_reads())
+                        && (access == Access::Unrestricted
+                            || *unrestricted.get_or_init(|| policy.allows_unrestricted_state_reads())
                             || policy.check_read(&entity_id, &entity.to_state()?).is_ok());
                     let entry = if readable {
                         let values = paths.iter().map(|path| entity.value_at(path)).collect::<Vec<_>>();
