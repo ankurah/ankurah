@@ -31,6 +31,9 @@ pub struct Outbound {
 pub struct Captured {
     queue: Arc<Mutex<Vec<Outbound>>>,
     streams: Arc<Mutex<std::collections::HashMap<proto::StateStreamId, ScriptedRoute>>>,
+    /// Wakes a scheduler waiting for a receiver's answer, which arrives as an
+    /// emitted message after storage work the scheduler cannot observe.
+    emitted: Arc<tokio::sync::Notify>,
 }
 struct ScriptedRoute {
     request: proto::RequestId,
@@ -43,10 +46,19 @@ struct ScriptedRoute {
     next_revision: u64,
     scripted: bool,
     abandoned: bool,
+    /// The last revision a scenario published on this route.
+    published_through: Option<u64>,
+    /// The last revision the receiver's feedback reported applied.
+    applied_through: Option<u64>,
 }
 impl Captured {
     pub fn new() -> Self { Self::default() }
     fn push(&self, out: Outbound) {
+        self.capture(out);
+        // After recording, so a woken waiter sees what this message changed.
+        self.emitted.notify_one();
+    }
+    fn capture(&self, out: Outbound) {
         let mut streams = self.streams.lock().unwrap();
         match &out.message {
             proto::NodeMessage::Response(response) => {
@@ -64,6 +76,8 @@ impl Captured {
                             next_revision: state.round.revision + 1,
                             scripted: false,
                             abandoned: false,
+                            published_through: None,
+                            applied_through: None,
                         },
                     );
                 }
@@ -92,6 +106,9 @@ impl Captured {
                     _ => None,
                 };
                 if let Some(stream) = comparison.and_then(|id| streams.get_mut(&id)).filter(|stream| stream.scripted) {
+                    if let proto::NodeRequestBody::StateFeedback { applied_through, .. } = request.body {
+                        stream.applied_through = stream.applied_through.max(applied_through);
+                    }
                     // This scenario has become a malicious source. Its control
                     // responses still cross the same seeded transport scheduler.
                     self.queue.lock().unwrap().push(Outbound {
@@ -123,6 +140,17 @@ impl Captured {
     pub fn origin_failed(&self, comparison: proto::StateStreamId) -> bool {
         self.streams.lock().unwrap().get(&comparison).is_some_and(|stream| stream.abandoned)
     }
+    /// Whether a receiver still owes an answer to a scripted publication: its
+    /// feedback has not reported the publication applied and it has not
+    /// abandoned the stream.
+    pub fn scripted_publication_unanswered(&self) -> bool {
+        self.streams.lock().unwrap().values().any(|route| {
+            !route.abandoned
+                && route.published_through.is_some_and(|published| route.applied_through.is_none_or(|applied| applied < published))
+        })
+    }
+    /// Wait until some node emits a message.
+    pub async fn next_emission(&self) { self.emitted.notified().await }
     pub fn begin_scripted(&self, comparison: proto::StateStreamId) {
         self.streams.lock().unwrap().get_mut(&comparison).expect("captured origin").scripted = true;
     }
@@ -139,6 +167,7 @@ impl Captured {
                 complete: true,
             },
         };
+        stream.published_through = Some(stream.next_revision);
         stream.next_sequence += 1;
         stream.next_revision += 1;
         proto::NodeMessage::StateFrame { from: stream.from, to: stream.to, request_id: stream.request.clone(), frame }
