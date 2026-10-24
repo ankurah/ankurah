@@ -113,8 +113,9 @@ fn tests_require() -> Function {
     create_require.call1(&module, &concat!(env!("CARGO_MANIFEST_DIR"), "/tests/").into()).unwrap().dyn_into().unwrap()
 }
 
+/// The Node.js built-in module `name`, such as `node:fs`.
 #[cfg(target_arch = "wasm32")]
-fn builtin(name: &str) -> JsValue {
+pub fn builtin(name: &str) -> JsValue {
     let get_builtin: Function = Reflect::get(&process(), &"getBuiltinModule".into()).unwrap().dyn_into().unwrap();
     get_builtin.call1(&process(), &name.into()).unwrap()
 }
