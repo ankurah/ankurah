@@ -688,3 +688,30 @@ async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<(
     assert!(matches!(error.downcast_ref::<crate::policy::AccessDenied>(), Some(crate::policy::AccessDenied::ByPolicy(_))));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_complete_resident_applies_a_published_batch_while_another_commit_is_in_flight() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let mut actor = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    let first = update(&initial, "02")?;
+    apply(&node, &first).await?;
+    let batch = actor.cursor.next().await?;
+    // Hold the next commit after its storage write, while it holds the commit gate.
+    let (committed, stored) = oneshot::channel();
+    let (admit, admission) = oneshot::channel();
+    *node.storage.0.hold_after_commit.lock().unwrap() = Some((committed, admission));
+    let second = update(&first, "03")?;
+    let publishing = apply(&node, &second);
+    tokio::pin!(publishing);
+    assert!(futures::poll!(&mut publishing).is_pending());
+    stored.await?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), actor.publish(&node, batch))
+        .await
+        .expect("a published batch does not wait for a commit in flight")?;
+    assert_eq!(actor.tree.entries()[&initial.entity_id].head, proto::Clock::singleton(&first));
+    admit.send(()).unwrap();
+    publishing.await?;
+    Ok(())
+}

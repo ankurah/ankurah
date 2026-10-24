@@ -144,7 +144,8 @@ impl<CD: ContextData> ResidentActor<CD> {
     }
 
     /// Bring the resident up to `batch`, the next committed changes, and
-    /// deliver them to its live routes.
+    /// deliver them to its live routes. A complete resident applies the batch
+    /// as it stands, without a fence that would wait for a commit in flight.
     pub(super) async fn publish<SE, PA>(&mut self, node: &Node<SE, PA>, batch: SourceBatch<TreeUpdate>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -152,17 +153,17 @@ impl<CD: ContextData> ResidentActor<CD> {
     {
         ensure_catalog_unchanged(&self.identity, &batch)?;
         self.routes.retain(|route| route.owner.strong_count() != 0);
-        if matches!(self.identity.coverage, Coverage::Limited(_)) {
-            if self.identity.filtered.limit != Some(0) && self.relevant(&batch) {
-                return self.refill(node, vec![batch]).await;
+        let revision = batch.revision.0;
+        match self.identity.coverage {
+            Coverage::Complete => self.advance_complete(node, vec![batch], revision).await,
+            Coverage::Limited(_) if self.identity.filtered.limit != Some(0) && self.relevant(&batch) => {
+                self.refill(node, vec![batch]).await
             }
-        } else {
-            let window = self.cursor.fence().await?;
-            let pending = std::iter::once(batch).chain(window.batch).collect();
-            return self.advance_complete(node, pending, window.revision.0).await;
+            Coverage::Limited(_) => {
+                self.revision = revision;
+                Ok(())
+            }
         }
-        self.revision = batch.revision.0;
-        Ok(())
     }
 
     /// Apply a finite metadata window before publishing its net membership.
