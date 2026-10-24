@@ -468,14 +468,26 @@ mod node_sqlite_tests {
         let construct = Function::new_no_args("return new (process.getBuiltinModule('node:sqlite').DatabaseSync)(':memory:');");
         let sqlite = construct.call0(&JsValue::NULL).unwrap();
         let prepare: Function = Reflect::get(&sqlite, &"prepare".into()).unwrap().dyn_into().unwrap();
-        let prepares_to_no_statement = |sql: &str| match prepare.call1(&sqlite, &sql.into()) {
+        // node:sqlite can crash the process, in a later sqlite3_step, when a
+        // statement prepared from SQL that holds no statement is collected
+        // while its database is open, as Node.js 24.13.0 does. So the test
+        // holds every statement it prepares until it has closed the database.
+        let mut statements = Vec::new();
+        let mut prepares_to_no_statement = |sql: &str| match prepare.call1(&sqlite, &sql.into()) {
             // node:sqlite hands SQL that holds no statement back as a statement
             // already finalized, whose source cannot be read.
-            Ok(statement) => Reflect::get(&statement, &"sourceSQL".into()).is_err(),
+            Ok(statement) => {
+                let finalized = Reflect::get(&statement, &"sourceSQL".into()).is_err();
+                statements.push(statement);
+                finalized
+            }
             Err(_) => false,
         };
         for sql in NO_STATEMENT_CANDIDATES {
             assert_eq!(holds_no_statement(sql), prepares_to_no_statement(sql), "{sql:?}");
         }
+        let close: Function = Reflect::get(&sqlite, &"close".into()).unwrap().dyn_into().unwrap();
+        close.call0(&sqlite).unwrap();
+        drop(statements);
     }
 }
