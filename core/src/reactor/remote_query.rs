@@ -14,7 +14,9 @@ use std::{
     sync::Arc,
 };
 
-/// A query stream's notification authority, including same-version retries.
+/// Identifies the remote state stream that applied a change: the query, its selection version,
+/// and the request that opened the stream. Only the query's current stream may change that
+/// query's membership.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryOrigin {
     pub query: proto::QueryId,
@@ -22,19 +24,29 @@ pub struct QueryOrigin {
     pub request: proto::RequestId,
 }
 
-/// Reconcile the source's captured identities while retaining independent local
-/// additions. Explicit live absences also remove identities outside that capture.
+/// How a remote stream's answer changes a query's rows. The peer decides the membership of the
+/// rows the requester offered; other rows stay as local additions unless the stream removes them.
 #[derive(Default)]
-pub(crate) struct PeerQueryMembership {
-    pub replace: HashSet<proto::EntityId>,
-    pub remove: HashSet<proto::EntityId>,
-    pub preserve: HashSet<proto::EntityId>,
-    /// Captured membership heads, before newer initial payloads were applied.
-    pub baseline: HashMap<proto::EntityId, proto::Clock>,
+pub(crate) struct RemoteMembership {
+    /// The ids the requester offered, whose membership the answer decides: an offered row the
+    /// answer omits leaves the results.
+    pub offered: HashSet<proto::EntityId>,
+    /// The ids the stream removed, including rows it never admitted: they leave the results even
+    /// as local additions.
+    pub absent: HashSet<proto::EntityId>,
+    /// Rows whose publication has not committed yet: they keep their visible membership and sort
+    /// key until it does.
+    pub held: HashSet<proto::EntityId>,
+    /// The heads the stream's comparison holds for its rows. Delivery for a row without delivered
+    /// events starts there, so the events between that head and a newer applied state are still
+    /// delivered when they arrive.
+    pub known_heads: HashMap<proto::EntityId, proto::Clock>,
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<E, Ev> {
-    pub(crate) async fn upsert_query_from_peer<H: PreNotifyHook>(
+    /// Install a remote stream's answer into a query, notifying its owner before listeners, and
+    /// return the ids whose notifications this installation published.
+    pub(crate) async fn install_remote_query<H: PreNotifyHook>(
         &self,
         subscription_id: ReactorSubscriptionId,
         query_id: proto::QueryId,
@@ -45,7 +57,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         version: u32,
         pre_notify_hook: H,
         entities: Vec<E>,
-        membership: PeerQueryMembership,
+        membership: RemoteMembership,
         changes: Vec<ReactorUpdateItem<E, Ev>>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
         self.install_query(
@@ -64,14 +76,16 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         .await
     }
 
-    /// Publish an already applied source publication to its owning query only.
-    /// Other queries and direct entity subscribers received the application once.
-    pub(crate) async fn notify_query_changes<C: ChangeNotification<Entity = E, Event = Ev>>(
+    /// Publish a remote stream's committed publication, whose changes are already applied, to the
+    /// query that owns the stream, and return the ids it notified. Other queries and entity
+    /// subscriptions were notified when the changes were applied. `held` rows keep their visible
+    /// membership and sort key.
+    pub(crate) async fn notify_remote_publication<C: ChangeNotification<Entity = E, Event = Ev>>(
         &self,
         subscription_id: ReactorSubscriptionId,
         query: proto::QueryId,
         changes: Vec<C>,
-        preserve: HashSet<proto::EntityId>,
+        held: HashSet<proto::EntityId>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
         let _notify = self.0.notify_lock.lock().await;
         let Some(subscription) = self.subscription(subscription_id) else { return Ok(HashSet::new()) };
@@ -80,11 +94,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         for offset in 0..changes.len() {
             candidates.add_query(query, offset);
         }
-        let (prepared, failures) = subscription.prepare_events(&candidates, Some(&preserve), self.0.history.as_deref()).await;
+        let (prepared, failures) = subscription.prepare_events(&candidates, Some(&held), self.0.history.as_deref()).await;
         if let Some(failure) = failures.into_iter().next() {
             return Err(failure.error.into());
         }
-        let (changes, notified) = subscription.evaluate_publication(candidates, prepared, &preserve);
+        let (changes, notified) = subscription.evaluate_publication(candidates, prepared, &held);
         let mut watchers = self.0.watcher_set.lock().unwrap();
         for change in changes {
             watchers.apply_watcher_change(change);

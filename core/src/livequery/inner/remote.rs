@@ -8,13 +8,20 @@ use crate::reactor::fetch_gap::{GapFetcher, QueryGapFetcher};
 use ankql::ast::Resolved;
 use std::sync::{atomic::Ordering, Arc};
 
+/// The remote state stream bound to a live query's selection version.
 pub(super) struct RemoteStream {
     version: u32,
+    /// The request that opened the stream.
     origin: proto::RequestId,
+    /// A complete install has initialized the query from this stream.
     activated: bool,
+    /// An install, complete or partial, has published this stream's membership.
     installed: bool,
-    admission: Arc<std::sync::atomic::AtomicBool>,
-    candidates: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
+    /// Cleared when the stream is lost, fails or is replaced: from then on it no longer decides
+    /// the query's membership, and local data may enter the query again.
+    decides_membership: Arc<std::sync::atomic::AtomicBool>,
+    /// The ids the stream admitted into the query.
+    admitted: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
     refresh: Option<crate::node::state_sync::RefreshHandle>,
 }
 
@@ -38,15 +45,15 @@ impl LiveQueryInner {
             }
             self.durable_version.store(version.saturating_sub(1), Ordering::Release);
             if let Some(previous) = stream.as_ref() {
-                previous.admission.store(false, Ordering::Release);
+                previous.decides_membership.store(false, Ordering::Release);
             }
             *stream = Some(RemoteStream {
                 version,
                 origin,
                 activated: false,
                 installed: false,
-                admission: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-                candidates: Arc::new(std::sync::RwLock::new(results.iter_entities().map(|(id, _)| id).collect())),
+                decides_membership: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                admitted: Arc::new(std::sync::RwLock::new(results.iter_entities().map(|(id, _)| id).collect())),
                 refresh: None,
             });
         }
@@ -55,7 +62,7 @@ impl LiveQueryInner {
         drop(results);
     }
 
-    pub(in crate::livequery) fn set_candidates(
+    pub(in crate::livequery) fn set_admitted(
         &self,
         version: u32,
         origin: &proto::RequestId,
@@ -63,7 +70,7 @@ impl LiveQueryInner {
     ) -> bool {
         let stream = self.remote_stream.lock().unwrap();
         let Some(stream) = stream.as_ref().filter(|stream| stream.version == version && &stream.origin == origin) else { return false };
-        *stream.candidates.write().unwrap() = ids.into_iter().collect();
+        *stream.admitted.write().unwrap() = ids.into_iter().collect();
         true
     }
 
@@ -96,12 +103,9 @@ impl LiveQueryInner {
 
     fn remote_stream_current(&self, version: u32, origin: &proto::RequestId) -> bool {
         self.is_current(version)
-            && self
-                .remote_stream
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|stream| stream.version == version && &stream.origin == origin && stream.admission.load(Ordering::Acquire))
+            && self.remote_stream.lock().unwrap().as_ref().is_some_and(|stream| {
+                stream.version == version && &stream.origin == origin && stream.decides_membership.load(Ordering::Acquire)
+            })
     }
 
     pub(in crate::livequery) fn lose_remote_stream(&self, version: u32, origin: &proto::RequestId) {
@@ -115,7 +119,7 @@ impl LiveQueryInner {
         stream.activated = false;
         stream.installed = false;
         stream.refresh = None;
-        stream.admission.store(false, Ordering::Release);
+        stream.decides_membership.store(false, Ordering::Release);
         self.remote_activated_version.store(0, Ordering::Release);
         self.initialized_version.store(version.saturating_sub(1), Ordering::Release);
         self.durable_version.store(version.saturating_sub(1), Ordering::Release);
@@ -131,7 +135,7 @@ impl LiveQueryInner {
         &self,
         version: u32,
         entities: Vec<Entity>,
-        membership: crate::reactor::PeerQueryMembership,
+        membership: crate::reactor::RemoteMembership,
         changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
@@ -146,18 +150,18 @@ impl LiveQueryInner {
             let Some(stream) = stream.as_ref().filter(|stream| stream.version == version && &stream.origin == origin) else {
                 return Ok(None);
             };
-            Arc::new(PeerQuerySource {
+            Arc::new(RemoteQuerySource {
                 origin: crate::reactor::QueryOrigin { query: self.query_id, version, request: origin.clone() },
                 context: self.context.clone(),
-                candidates: stream.candidates.clone(),
-                admission: stream.admission.clone(),
+                admitted: stream.admitted.clone(),
+                decides_membership: stream.decides_membership.clone(),
             })
         };
         let notified = self
             .context
             .node()?
             .reactor()
-            .upsert_query_from_peer(
+            .install_remote_query(
                 self.subscription.id(),
                 self.query_id,
                 selection,
@@ -186,14 +190,14 @@ impl LiveQueryInner {
     /// Stop the stream bound for `version` deciding membership, because that version failed.
     pub(super) fn release_failed_stream(&self, version: u32) {
         if let Some(stream) = self.remote_stream.lock().unwrap().as_ref().filter(|stream| stream.version == version) {
-            stream.admission.store(false, Ordering::Release);
+            stream.decides_membership.store(false, Ordering::Release);
         }
     }
 
     /// Stop the bound stream deciding membership, because a newer selection version replaces it.
     pub(super) fn release_replaced_stream(&self) {
         if let Some(stream) = self.remote_stream.lock().unwrap().as_ref() {
-            stream.admission.store(false, Ordering::Release);
+            stream.decides_membership.store(false, Ordering::Release);
         }
     }
 
@@ -204,42 +208,46 @@ impl LiveQueryInner {
     }
 }
 
-/// The source owns the remote candidate window. Local merge/policy evaluation
-/// may remove candidates, but a local cache scan cannot invent a source winner.
-struct PeerQuerySource {
+/// The local source of a query whose membership a remote stream decides. While the stream
+/// decides, local data enters the query only for the ids the stream admitted, so a local scan
+/// can drop a row the peer selected but cannot add one it did not.
+struct RemoteQuerySource {
     origin: crate::reactor::QueryOrigin,
     context: Arc<dyn DynContextInner>,
-    candidates: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
-    admission: Arc<std::sync::atomic::AtomicBool>,
+    admitted: Arc<std::sync::RwLock<std::collections::HashSet<proto::EntityId>>>,
+    decides_membership: Arc<std::sync::atomic::AtomicBool>,
 }
 #[async_trait::async_trait]
-impl crate::reactor::LocalEntitySource for PeerQuerySource {
-    fn query_origin(&self) -> Option<&crate::reactor::QueryOrigin> { self.admission.load(Ordering::Acquire).then_some(&self.origin) }
+impl crate::reactor::LocalEntitySource for RemoteQuerySource {
+    fn query_origin(&self) -> Option<&crate::reactor::QueryOrigin> {
+        self.decides_membership.load(Ordering::Acquire).then_some(&self.origin)
+    }
     fn can_read(&self, entity: &Entity) -> bool { self.context.can_read(entity) }
     fn admits_query_entity(&self, entity: &Entity) -> bool {
-        !self.admission.load(Ordering::Acquire) || self.candidates.read().unwrap().contains(&entity.id())
+        !self.decides_membership.load(Ordering::Acquire) || self.admitted.read().unwrap().contains(&entity.id())
     }
     async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         Ok(self.context.fetch_entities_from_local(selection).await?.into_iter().filter(|entity| self.admits_query_entity(entity)).collect())
     }
 }
 #[async_trait::async_trait]
-impl GapFetcher<Entity> for PeerQuerySource {
+impl GapFetcher<Entity> for RemoteQuerySource {
     async fn fetch_gap(
         &self,
         selection: &ankql::ast::Selection<Resolved>,
         last: Option<&Entity>,
         size: usize,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        if !self.admission.load(Ordering::Acquire) {
+        if !self.decides_membership.load(Ordering::Acquire) {
             return QueryGapFetcher::new(Context(self.context.clone())).fetch_gap(selection, last, size).await;
         }
-        // A remote LIMIT window is refilled by coherent source publications.
-        // Local storage can contain predicate matches outside that window.
+        // The stream's publications refill a remote LIMIT window; local storage can hold
+        // predicate matches outside it.
         Ok(Vec::new())
     }
 }
 
+/// Publishes a remote install's readiness to its live query, unless the stream was superseded.
 struct RemoteActivation<'a> {
     query: &'a LiveQueryInner,
     origin: &'a proto::RequestId,
@@ -256,7 +264,7 @@ impl crate::reactor::PreNotifyHook for RemoteActivation<'_> {
         let state = self.query.version_lock.lock().unwrap_or_else(|error| error.into_inner());
         let mut stream = self.query.remote_stream.lock().unwrap();
         let Some(current) = stream.as_mut().filter(|stream| stream.version == version && &stream.origin == self.origin) else { return };
-        if (self.canceled)() || !self.query.is_current(version) || !current.admission.load(Ordering::Acquire) {
+        if (self.canceled)() || !self.query.is_current(version) || !current.decides_membership.load(Ordering::Acquire) {
             return;
         }
         current.installed = true;

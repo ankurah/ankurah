@@ -13,7 +13,7 @@ mod watcherset;
 pub use self::remote_query::QueryOrigin;
 pub(crate) use self::{
     candidate_changes::CandidateChanges,
-    remote_query::PeerQueryMembership,
+    remote_query::RemoteMembership,
     subscription::{ReactorSubscription, ReactorSubscriptionId},
     update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
     watcherset::{WatcherChange, WatcherSet},
@@ -65,9 +65,12 @@ pub trait LocalEntitySource<E: AbstractEntity + Filterable + Send + 'static = En
     /// Recheck an entity before publishing it, including changes arriving after the initial fetch.
     fn can_read(&self, _entity: &E) -> bool { true }
 
+    /// The remote stream that decides this query's membership, while one does.
     fn query_origin(&self) -> Option<&QueryOrigin> { None }
 
-    /// Membership authority is separate from readability: a readable removal still notifies.
+    /// Whether `entity` may enter the query's results from local data: while a remote stream
+    /// decides membership, only the ids it admitted may. Reads are checked apart from this, so a
+    /// readable row the stream stops admitting still notifies its removal.
     fn admits_query_entity(&self, _entity: &E) -> bool { true }
 
     async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<E>, RetrievalError>;
@@ -82,10 +85,12 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
     fn entity(&self) -> &Self::Entity;
     fn events(&self) -> &[Self::Event];
 
-    /// Only notifications authored by this query's stream use its source
-    /// candidate restriction. Local writes and other retrievals remain local facts.
+    /// The remote stream that applied this change, if one did. Only the owning query's current
+    /// stream changes that query's membership with it; every other query evaluates it as it would
+    /// a local write.
     fn query_origin(&self) -> Option<&QueryOrigin> { None }
-    /// Applied stream data is visible to other queries before its source's publication commits.
+    /// Whether this change belongs to a publication its stream has not committed yet: other
+    /// queries see the applied state now, while the owning query waits for the publication.
     fn defers_query_membership(&self) -> bool { false }
 }
 
@@ -319,7 +324,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         version: u32,
         pre_notify_hook: H,
         entities: Option<Vec<E>>,
-        membership: Option<PeerQueryMembership>,
+        membership: Option<RemoteMembership>,
         mut changes: Vec<ReactorUpdateItem<E, Ev>>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
         let authoritative = entities.is_some();
@@ -351,7 +356,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
             .filter_query_events(
                 query_id,
                 &mut changes,
-                membership.as_ref().map(|m| &m.baseline).unwrap_or(&empty_baseline),
+                membership.as_ref().map(|m| &m.known_heads).unwrap_or(&empty_baseline),
                 self.0.history.as_deref(),
             )
             .await?;

@@ -5,8 +5,8 @@
 use super::{membership_item, QueryState, Subscription};
 use crate::{
     reactor::{
-        delivery::PreparedEvents, AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, PeerQueryMembership,
-        ReactorUpdateItem, WatcherChange,
+        delivery::PreparedEvents, AbstractEntity, CandidateChanges, ChangeNotification, MembershipChange, ReactorUpdateItem,
+        RemoteMembership, WatcherChange,
     },
     resultset::ResultSetWrite,
     selection::filter::{evaluate_predicate, Filterable},
@@ -24,7 +24,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
         query_id: proto::QueryId,
         rows: &mut ResultSetWrite<'_, E>,
         answer: Vec<E>,
-        membership: Option<&PeerQueryMembership>,
+        membership: Option<&RemoteMembership>,
         predicate: &Predicate<Resolved>,
         initial_baseline: bool,
         reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>,
@@ -32,15 +32,15 @@ impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
         let mut entered = Vec::new();
         let mut left = Vec::new();
         let before: IndexMap<_, _> = rows.iter_entities().map(|(id, entity)| (id, entity.clone())).collect();
-        // Read the current public set while holding the notification lock,
-        // after any local/other-query notifications that raced capture.
+        // Start from the rows visible now, under the notification lock: they include every local
+        // or other-query change notified since the requester took the snapshot it offered.
         let mut included: IndexMap<_, _> = before
             .iter()
-            .filter(|(id, _)| membership.is_some_and(|membership| !membership.replace.contains(id) && !membership.remove.contains(id)))
+            .filter(|(id, _)| membership.is_some_and(|membership| !membership.offered.contains(id) && !membership.absent.contains(id)))
             .map(|(id, entity)| (*id, entity.clone()))
             .collect();
         for entity in answer {
-            if membership.is_none_or(|membership| !membership.remove.contains(&entity.id())) && self.source.admits_query_entity(&entity) {
+            if membership.is_none_or(|membership| !membership.absent.contains(&entity.id())) && self.source.admits_query_entity(&entity) {
                 included.insert(entity.id(), entity);
             }
         }
@@ -48,15 +48,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
             .into_values()
             .filter(|entity| {
                 self.source.can_read(entity)
-                    && (membership
-                        .is_some_and(|membership| membership.preserve.contains(&entity.id()) && before.contains_key(&entity.id()))
+                    && (membership.is_some_and(|membership| membership.held.contains(&entity.id()) && before.contains_key(&entity.id()))
                         || evaluate_predicate(entity, predicate).unwrap_or(false))
             })
             .collect();
         // Replace as a set before applying its order/limit. Adding to the
         // old limited set first could evict an authoritative new member.
         if let Some(membership) = membership {
-            rows.replace_all_preserving_keys(included, &membership.preserve);
+            rows.replace_all_preserving_keys(included, &membership.held);
         } else {
             rows.replace_all(included);
         }
@@ -80,14 +79,16 @@ impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
 }
 
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::ReactorEvent> Subscription<E, Ev> {
+    /// Evaluate a remote stream's publication for the query that owns the stream, returning the
+    /// watcher changes to apply and the ids it notified.
     pub(in crate::reactor) fn evaluate_publication<C: ChangeNotification<Entity = E, Event = Ev>>(
         self,
         candidates: CandidateChanges<C>,
         prepared: PreparedEvents<Ev>,
-        preserve: &HashSet<proto::EntityId>,
+        held: &HashSet<proto::EntityId>,
     ) -> (Vec<WatcherChange>, HashSet<proto::EntityId>) {
         let mut notified = HashSet::new();
-        let watchers = self.evaluate_candidates(candidates, prepared, Some(preserve), Some(&mut notified));
+        let watchers = self.evaluate_candidates(candidates, prepared, Some(held), Some(&mut notified));
         (watchers, notified)
     }
 }

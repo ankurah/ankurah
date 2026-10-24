@@ -94,13 +94,13 @@ async fn maintenance_projects_committed_metadata_before_public_notifications_wit
     // apply_delta returns the reactor notification to its caller. No reactor
     // dispatch has run, but maintenance metadata must already be queued.
     apply(&node, &a, Delivery::Live).await?;
-    let captured = first.fence().await?;
-    assert!(captured.revision > start);
-    assert!(captured.batch.is_some());
-    let row = captured.batch.as_ref().unwrap().changes[0].clone();
+    let first_window = first.fence().await?;
+    assert!(first_window.revision > start);
+    assert!(first_window.batch.is_some());
+    let row = first_window.batch.as_ref().unwrap().changes[0].clone();
     assert!(node.entities.get(&a.entity_id).is_none(), "queued metadata must not pin the resident entity");
     assert_eq!(row.head, proto::Clock::singleton(&a));
-    assert_eq!(captured.batch.as_ref().unwrap().changes[0].events[0], a.id());
+    assert_eq!(first_window.batch.as_ref().unwrap().changes[0].events[0], a.id());
 
     let b = Event::update(a.entity_id, proto::Clock::singleton(&a), AuthorId::Unknown, OperationSet(vec![set("after")?]));
     apply(&node, &b, Delivery::Initial).await?;
@@ -109,7 +109,7 @@ async fn maintenance_projects_committed_metadata_before_public_notifications_wit
     let subsequent = first.next().await?;
     let current = &subsequent.changes[0];
     assert_eq!(current.key.clone().map(Value::String), Some(Value::String("after".into())));
-    assert!(subsequent.revision > captured.revision);
+    assert!(subsequent.revision > first_window.revision);
     assert_eq!(subsequent.changes[0].head, proto::Clock::singleton(&b));
     assert!(subsequent.changes[0].events.is_empty(), "initial application must not become a live event update");
     let second_window = second.fence().await?;

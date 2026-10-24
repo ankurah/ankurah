@@ -264,7 +264,7 @@ impl Driver {
     {
         let Some((id, version)) = query else { return Ok(HashSet::new()) };
         let query = node.live_queries.get(id).ok_or_else(|| anyhow::anyhow!("query disappeared"))?;
-        ensure!(query.set_remote_candidates(version, &self.stream.request, self.eligible.iter().copied()), "query stream superseded");
+        ensure!(query.set_remote_admitted(version, &self.stream.request, self.eligible.iter().copied()), "query stream superseded");
         let state_getter = LocalStateGetter::new(node.storage.clone());
         let event_getter = LocalEventGetter::new(node.storage.clone(), node.durable);
         let mut entities = Vec::with_capacity(self.eligible.len());
@@ -288,7 +288,12 @@ impl Driver {
             .as_ref()
             .map(|round| round.members.iter().map(|(id, member)| (*id, member.head.clone())).collect())
             .unwrap_or_default();
-        let membership = crate::reactor::PeerQueryMembership { replace, remove: self.partial_removals.clone(), preserve, baseline };
+        let membership = crate::reactor::RemoteMembership {
+            offered: replace,
+            absent: self.partial_removals.clone(),
+            held: preserve,
+            known_heads: baseline,
+        };
         let installed = if complete {
             query.activate_remote(version, entities, membership, changes, origin, &canceled).await?
         } else {
@@ -1060,7 +1065,7 @@ impl Driver {
                     let changes =
                         changes.into_iter().map(|change| StreamChange { change, origin: Some(origin.clone()), deferred: false }).collect();
                     let preserve = self.publications.iter().flat_map(|publication| publication.changes.keys()).copied().collect();
-                    node.reactor.notify_query_changes(query.subscription_id(), id, changes, preserve).await?
+                    node.reactor.notify_remote_publication(query.subscription_id(), id, changes, preserve).await?
                 } else {
                     HashSet::new()
                 }

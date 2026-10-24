@@ -213,7 +213,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         version: u32,
         reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>,
         authoritative: bool,
-        membership: Option<&crate::reactor::PeerQueryMembership>,
+        membership: Option<&crate::reactor::RemoteMembership>,
         complete: bool,
     ) -> anyhow::Result<()> {
         let mut state_guard = self.state.lock().unwrap();
@@ -296,7 +296,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
         // Existing event frontiers survive silent state repairs and refreshes.
         for (id, entity) in rw_resultset.iter_entities() {
-            if let Some(head) = membership.and_then(|m| m.baseline.get(&id)).cloned().or_else(|| entity.head()) {
+            if let Some(head) = membership.and_then(|m| m.known_heads.get(&id)).cloned().or_else(|| entity.head()) {
                 query_state.delivered.start(id, head);
             }
         }
@@ -347,7 +347,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
     pub(super) async fn prepare_events<C: ChangeNotification<Entity = E, Event = Ev>>(
         &self,
         candidates: &CandidateChanges<C>,
-        preserve: Option<&HashSet<proto::EntityId>>,
+        held: Option<&HashSet<proto::EntityId>>,
         history: Option<&(dyn crate::retrieval::GetEvents + Send + Sync)>,
     ) -> (PreparedEvents<Ev>, Vec<crate::reactor::NotificationFailure>) {
         let plans = {
@@ -371,7 +371,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                         continue;
                     }
                     let did_match = query.resultset.contains_key(&entity.id());
-                    let matches = if preserve.is_some_and(|ids| ids.contains(&entity.id())) {
+                    let matches = if held.is_some_and(|ids| ids.contains(&entity.id())) {
                         did_match
                     } else {
                         evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
@@ -452,7 +452,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         self,
         candidates: CandidateChanges<C>,
         mut prepared: PreparedEvents<Ev>,
-        preserve: Option<&HashSet<proto::EntityId>>,
+        held: Option<&HashSet<proto::EntityId>>,
         notified: Option<&mut HashSet<proto::EntityId>>,
     ) -> Vec<WatcherChange> {
         let mut watcher_changes = Vec::new();
@@ -479,7 +479,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
             let mut current_publication = false;
             // Process all candidate changes for this query
             for (offset, change) in query_candidate.iter().enumerate() {
-                current_publication |= preserve.is_some()
+                current_publication |= held.is_some()
                     && change
                         .query_origin()
                         .is_some_and(|origin| origin.query == query_id && query_state.source.query_origin() == Some(origin));
@@ -503,7 +503,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 }
                 let did_match = query_state.resultset.contains_key(&entity_id);
                 let matches = can_read
-                    && if preserve.is_some_and(|ids| ids.contains(&entity_id)) {
+                    && if held.is_some_and(|ids| ids.contains(&entity_id)) {
                         did_match
                     } else {
                         evaluate_predicate(entity, &selection.predicate).unwrap_or(false)
@@ -594,7 +594,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         }
 
         // Collect gap fill data while we have the state lock
-        let gaps_to_fill = if preserve.is_some() { Vec::new() } else { self.collect_gaps_to_fill_internal(&state) };
+        let gaps_to_fill = if held.is_some() { Vec::new() } else { self.collect_gaps_to_fill_internal(&state) };
         let broadcast = state.broadcast.clone();
 
         // Drop the state lock before spawning
@@ -648,8 +648,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         }
     }
 
-    // Keep the current source check and result mutation together: an old local
-    // gap fetch must not append outsiders after a peer installs its window.
+    // Keep the current source check and result mutation together: an old local gap fetch must
+    // not append rows the remote stream did not admit after the stream installs its answer.
     fn insert_gap_entities(
         &self,
         query_id: proto::QueryId,

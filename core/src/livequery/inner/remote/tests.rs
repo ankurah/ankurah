@@ -22,28 +22,28 @@ async fn partial_install_blocks_stale_local_activation_without_marking_ready() {
 }
 
 #[tokio::test]
-async fn admission_is_released_only_for_the_current_lost_failed_or_replaced_stream() {
+async fn a_stream_decides_membership_until_it_is_lost_failed_or_replaced() {
     let query = query();
     let origin = proto::RequestId::new();
     let replacement = proto::RequestId::new();
     query.0.bind_remote_stream(1, origin.clone(), &|| false);
-    let old_gate = query.0.remote_stream.lock().unwrap().as_ref().unwrap().admission.clone();
-    assert!(old_gate.load(Ordering::Acquire));
+    let old_decides = query.0.remote_stream.lock().unwrap().as_ref().unwrap().decides_membership.clone();
+    assert!(old_decides.load(Ordering::Acquire));
     query.0.bind_remote_stream(1, replacement.clone(), &|| false);
-    assert!(!old_gate.load(Ordering::Acquire));
-    let current_gate = query.0.remote_stream.lock().unwrap().as_ref().unwrap().admission.clone();
+    assert!(!old_decides.load(Ordering::Acquire));
+    let current_decides = query.0.remote_stream.lock().unwrap().as_ref().unwrap().decides_membership.clone();
     query.0.lose_remote_stream(1, &origin);
-    assert!(current_gate.load(Ordering::Acquire), "old cleanup cannot release the replacement's restriction");
+    assert!(current_decides.load(Ordering::Acquire), "the old stream's loss cannot end the replacement's membership decision");
     query.0.lose_remote_stream(1, &replacement);
-    assert!(!current_gate.load(Ordering::Acquire));
+    assert!(!current_decides.load(Ordering::Acquire));
     let late = RemoteActivation { query: &query.0, origin: &replacement, canceled: &|| false, complete: true };
     assert!(!late.is_current(1));
     late.pre_notify(1);
     assert!(query.0.remote_stream_pending(1), "a late completion cannot restore lost readiness");
     query.0.bind_remote_stream(1, replacement, &|| false);
-    let failed_gate = query.0.remote_stream.lock().unwrap().as_ref().unwrap().admission.clone();
+    let failed_decides = query.0.remote_stream.lock().unwrap().as_ref().unwrap().decides_membership.clone();
     query.0.fail_initialization(1, RetrievalError::Other("unavailable".into()));
-    assert!(!failed_gate.load(Ordering::Acquire));
+    assert!(!failed_decides.load(Ordering::Acquire));
 }
 
 #[tokio::test]

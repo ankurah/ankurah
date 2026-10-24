@@ -123,18 +123,18 @@ impl EntityLiveQuery {
     /// The current version's initialization error, cleared when a new version starts.
     pub fn error(&self) -> Read<Option<Arc<RetrievalError>>> { self.0.error.read() }
     pub(crate) fn is_current(&self, version: u32) -> bool { self.0.current_version.load(Ordering::Acquire) == version }
-    /// Recompare this query on its current standing stream. Completion covers the
-    /// captured source round; later live publications do not move that goal.
+    /// Recompare this query on its current standing stream. It completes with the comparison
+    /// round it starts; live publications that arrive meanwhile do not extend it.
     pub async fn refresh(&self) -> Result<(), RetrievalError> {
         self.0.refresh_handle().ok_or_else(|| RetrievalError::Other("query has no active remote stream".into()))?.refresh().await
     }
-    pub(crate) fn set_remote_candidates(
+    pub(crate) fn set_remote_admitted(
         &self,
         version: u32,
         origin: &proto::RequestId,
         ids: impl IntoIterator<Item = proto::EntityId>,
     ) -> bool {
-        self.0.set_candidates(version, origin, ids)
+        self.0.set_admitted(version, origin, ids)
     }
     pub(crate) fn set_refresh(&self, version: u32, origin: &proto::RequestId, refresh: crate::node::state_sync::RefreshHandle) {
         self.0.set_refresh(version, origin, refresh);
@@ -145,7 +145,7 @@ impl EntityLiveQuery {
         &self,
         version: u32,
         entities: Vec<Entity>,
-        membership: crate::reactor::PeerQueryMembership,
+        membership: crate::reactor::RemoteMembership,
         changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
@@ -156,7 +156,7 @@ impl EntityLiveQuery {
         &self,
         version: u32,
         entities: Vec<Entity>,
-        membership: crate::reactor::PeerQueryMembership,
+        membership: crate::reactor::RemoteMembership,
         changes: Vec<crate::changes::EntityChange>,
         origin: &proto::RequestId,
         canceled: &(dyn Fn() -> bool + Send + Sync),
