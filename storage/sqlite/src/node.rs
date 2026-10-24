@@ -404,6 +404,7 @@ impl SqliteExecutor for NodeConnection {
     /// discards the row.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
         let statement = self.prepare(sql)?;
+        refuse_a_second_statement(sql, &source(&statement)?)?;
         let width = width(&statement)?;
         self.check_parameters(sql, params.len())?;
         if width == 0 {
@@ -435,6 +436,8 @@ impl SqliteExecutor for NodeConnection {
             return all(&reader, params, 2 * width)?.into_iter().map(typed_row).collect();
         }
         let statement = self.prepare(sql)?;
+        let source = source(&statement)?;
+        refuse_a_second_statement(sql, &source)?;
         let width = width(&statement)?;
         self.check_parameters(sql, params.len())?;
         if width == 0 {
@@ -444,7 +447,6 @@ impl SqliteExecutor for NodeConnection {
             statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
             return Ok(Vec::new());
         }
-        let source = source(&statement)?;
         match self.prepare(&typed_reader(&source, width)) {
             Ok(reader) => {
                 // Checked once for each SQL text, since a kept reader skips it.
@@ -553,6 +555,23 @@ fn source(statement: &JsValue) -> Result<String, SqliteError> {
     Err(SqliteError::Node(
         "the database's statements report no `sourceSQL` (better-sqlite3's `source`), which the node executor needs".into(),
     ))
+}
+
+/// Refuse SQL that holds a second statement after the one prepared from it,
+/// before either runs, as the native executor refuses it: node:sqlite runs
+/// the first and ignores the rest without a word. Its `source` is the SQL up
+/// to the end of the first statement. better-sqlite3 refuses a second
+/// statement itself, and its `source` is the whole SQL. Whitespace,
+/// semicolons and comments after the statement are no statement.
+fn refuse_a_second_statement(sql: &str, source: &str) -> Result<(), SqliteError> {
+    let rest = sql
+        .strip_prefix(source)
+        .ok_or_else(|| SqliteError::Node(format!("the database reports {source:?} as the SQL of a statement prepared from {sql:?}")))?;
+    if rest.as_bytes().get(filler(rest)).is_some_and(|&byte| byte != 0) {
+        // rusqlite's words for the same refusal.
+        return Err(SqliteError::Node("Multiple statements provided".into()));
+    }
+    Ok(())
 }
 
 /// A row of a typed reader, a storage class and a value for each column of
@@ -772,5 +791,50 @@ fn js_error(value: JsValue) -> SqliteError {
             SqliteError::NodeSqlite { code: code as i32, message }
         }
         _ => SqliteError::Node(message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    use super::*;
+
+    /// `filler` skips exactly what SQLite skips between statements: SQL that
+    /// is filler to its end prepares on node:sqlite to no statement, and any
+    /// other SQL to a statement or an error.
+    #[wasm_bindgen_test]
+    fn filler_skips_what_sqlite_skips_between_statements() {
+        let construct = Function::new_no_args("return new (process.getBuiltinModule('node:sqlite').DatabaseSync)(':memory:');");
+        let sqlite = construct.call0(&JsValue::NULL).unwrap();
+        let prepares_to_no_statement = |sql: &str| match method(&sqlite, "prepare").unwrap().call1(&sqlite, &sql.into()) {
+            // node:sqlite hands SQL that holds no statement back as a statement
+            // already finalized, whose source cannot be read.
+            Ok(statement) => Reflect::get(&statement, &"sourceSQL".into()).is_err(),
+            Err(_) => false,
+        };
+        for sql in [
+            "",
+            " \t\n\x0c\r",
+            " \x0b",
+            "\x0b",
+            ";",
+            " ; ;",
+            "-- c",
+            "-- c\n;",
+            "-",
+            "/* c */",
+            "/**/",
+            "/*/",
+            "/* unended",
+            "/*",
+            "/",
+            "\0 SELECT 1",
+            " SELECT 1",
+            "x",
+        ] {
+            let filler_to_its_end = sql.as_bytes().get(filler(sql)).is_none_or(|&byte| byte == 0);
+            assert_eq!(filler_to_its_end, prepares_to_no_statement(sql), "{sql:?}");
+        }
     }
 }

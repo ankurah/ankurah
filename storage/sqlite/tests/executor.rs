@@ -382,6 +382,56 @@ async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
     Ok(())
 }
 
+/// SQL that holds a second statement is refused before either runs, on
+/// every driver, where rusqlite and node:sqlite ran the first and ignored the
+/// rest. Whitespace, semicolons and comments after a statement are no second
+/// statement, except that better-sqlite3 refuses a query with a comment after
+/// its semicolon (see `SqliteExecutor`).
+#[engine_test]
+async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (refused, created, accepted, commented) = storage
+        .with_executor(|executor| {
+            let refused = [
+                executor.execute("CREATE TABLE a (x); CREATE TABLE b (x)", &[]),
+                // The second statement cannot even be prepared until the first has run.
+                executor.execute("CREATE TABLE c (x); INSERT INTO c VALUES (1)", &[]),
+                executor.query("SELECT 1; SELECT 2", &[]).map(|rows| rows.len()),
+            ]
+            .map(|outcome| outcome.map_err(|error| error.to_string()));
+            let created = executor
+                .query_row("SELECT count(*) FROM sqlite_master WHERE name IN ('a', 'b', 'c')", &[])?
+                .expect("one row")
+                .integer(0)?;
+            executor.execute("CREATE TABLE d (x)", &[])?;
+            let accepted = [
+                executor.execute("INSERT INTO d VALUES (1);  ;; /* a comment */ -- and another", &[]),
+                executor.query("SELECT 1; \n", &[]).map(|rows| rows.len()),
+            ]
+            .map(|outcome| outcome.map_err(|error| error.to_string()));
+            let commented = executor.query("SELECT 1; -- a note", &[]).map(|rows| rows.len()).map_err(|error| error.to_string());
+            Ok((refused, created, accepted, commented))
+        })
+        .await?;
+    let refusal = if common::on_better_sqlite3() {
+        "The supplied SQL string contains more than one statement"
+    } else {
+        "Multiple statements provided"
+    };
+    for outcome in refused {
+        let error = outcome.expect_err("a second statement is refused");
+        assert!(error.ends_with(refusal), "{error}");
+    }
+    assert_eq!(created, 0, "no statement of a refused string ran");
+    assert_eq!(accepted, [Ok(1), Ok(1)]);
+    if common::on_better_sqlite3() {
+        commented.expect_err("the typed reader cannot nest the comment better-sqlite3 keeps after the semicolon");
+    } else {
+        assert_eq!(commented, Ok(1));
+    }
+    Ok(())
+}
+
 /// A connection the engine opens on a file takes the session settings
 /// connection.rs gives a native one, on every driver.
 #[engine_test]

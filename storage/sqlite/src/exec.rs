@@ -20,6 +20,10 @@ use crate::{
 /// [`SqliteValueRef::Jsonb`] parameter is bound as its JSON text, because the
 /// SQL that carries one always wraps its placeholder in `jsonb(?)`.
 ///
+/// Each call runs one statement: SQL that holds a second one is refused
+/// before either runs. Whitespace, semicolons and comments after the
+/// statement are no second statement.
+///
 /// # Where the node executor differs from the native one
 ///
 /// - On Node a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
@@ -41,6 +45,10 @@ use crate::{
 /// - On Node a query that SQLite cannot nest in a WITH clause is refused,
 ///   before it runs, unless it is a PRAGMA or an EXPLAIN, and TEXT in the
 ///   rows of a PRAGMA or an EXPLAIN is refused.
+/// - better-sqlite3 refuses a query whose SQL holds more than whitespace
+///   after the semicolon that ends its statement, as `SELECT 1; -- note`
+///   does: the typed reader nests the SQL better-sqlite3 prepared, and
+///   better-sqlite3 keeps what follows the semicolon in it.
 pub trait SqliteExecutor {
     /// Run one statement that yields no rows; returns the number of rows it changed.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError>;

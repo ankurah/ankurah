@@ -11,7 +11,7 @@ use std::path::Path;
 use rusqlite::{
     params_from_iter,
     types::{ToSqlOutput, Type, ValueRef},
-    Connection, ToSql,
+    Batch, Connection, Statement, ToSql,
 };
 
 pub(crate) use crate::connection::PooledConnection;
@@ -56,11 +56,11 @@ impl PooledConnection {
 
 impl SqliteExecutor for Connection {
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
-        Ok(Connection::execute(self, sql, params_from_iter(params))?)
+        Ok(one_statement(self, sql)?.execute(params_from_iter(params))?)
     }
 
     fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
-        let mut statement = self.prepare(sql)?;
+        let mut statement = one_statement(self, sql)?;
         let width = statement.column_count();
         let mut rows = statement.query(params_from_iter(params))?;
         let mut collected = Vec::new();
@@ -68,6 +68,24 @@ impl SqliteExecutor for Connection {
             collected.push(Row::new((0..width).map(|index| value_from_ref(index, row.get_ref(index)?)).collect::<Result<_, _>>()?));
         }
         Ok(collected)
+    }
+}
+
+/// The statement `sql` holds, prepared. SQL that holds a second statement is
+/// refused before either runs: a defect fix, since rusqlite, prepared as
+/// main's engine prepared it, runs the first and ignores the rest without a
+/// word. SQLite reads what follows the first statement; whitespace,
+/// semicolons and comments are no statement.
+fn one_statement<'c>(connection: &'c Connection, sql: &str) -> Result<Statement<'c>, SqliteError> {
+    let mut statements = Batch::new(connection, sql);
+    // SQL that holds no statement at all is prepared as before, and SQLite
+    // refuses it when it runs.
+    let Some(statement) = statements.next()? else { return Ok(connection.prepare(sql)?) };
+    match statements.next() {
+        Ok(None) => Ok(statement),
+        // What follows the first statement holds a second one, whether or
+        // not SQLite can prepare it, and it would not run either way.
+        Ok(Some(_)) | Err(_) => Err(rusqlite::Error::MultipleStatement.into()),
     }
 }
 
