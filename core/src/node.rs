@@ -831,16 +831,35 @@ where
                 Err(RetrievalError::RequestError(RequestError::ConnectionLost)) if attempt == 0 => continue,
                 result => result?,
             };
-            let ids: std::collections::HashSet<_> = remote.ids.iter().copied().collect();
-            // Filter before applying LIMIT: an unreadable or former result in the
-            // local cache must not displace an authoritative peer result.
-            let mut local_selection = selection.clone();
-            local_selection.limit = None;
-            let mut entities = self.fetch_entities_from_local(&local_selection).await?;
-            entities.retain(|entity| ids.contains(&entity.id()));
-            if let Some(limit) = selection.limit {
-                entities.truncate(limit as usize);
-            }
+            // Only the peer's answer counts: a local match it did not name, such as a former or
+            // unreadable result, must not displace one.
+            let entities = match selection.limit {
+                // An empty answer names nothing to read, and an empty IN list is not valid SQL.
+                Some(_) if remote.ids.is_empty() => Vec::new(),
+                // A limited answer names at most `limit` entities, so storage reads only those, in order.
+                Some(_) => {
+                    use ankql::ast::{ComparisonOperator, Expr, Predicate, PropertyPath};
+                    let answered = Predicate::Comparison {
+                        left: Box::new(Expr::Path(PropertyPath::id())),
+                        operator: ComparisonOperator::In,
+                        right: Box::new(Expr::ExprList(
+                            remote.ids.iter().map(|id| Expr::Literal(crate::value::Value::EntityId(*id))).collect(),
+                        )),
+                    };
+                    let mut local_selection = selection.clone();
+                    local_selection.predicate = Predicate::And(Box::new(selection.predicate.clone()), Box::new(answered));
+                    self.fetch_entities_from_local(&local_selection).await?
+                }
+                // An unlimited answer can name more ids than one IN list should carry: SQL engines bind
+                // each one, and in-memory filtering scans the list for every row. Read every local
+                // match instead and keep the answered ones.
+                None => {
+                    let ids: std::collections::HashSet<_> = remote.ids.iter().copied().collect();
+                    let mut entities = self.fetch_entities_from_local(&selection).await?;
+                    entities.retain(|entity| ids.contains(&entity.id()));
+                    entities
+                }
+            };
             state_sync::finish_state(self, peer_id, cdata.clone(), remote, None);
             return Ok(entities);
         }
