@@ -160,10 +160,9 @@ impl SqlBuilder {
 
     /// The SQL and its parameters, in the engine's own value type, which every
     /// driver binds; `build_where_clause` returns them alike. Changed from
-    /// main, which returned rusqlite's `Value`s and offered
-    /// `SqliteValue::to_sql`, neither of which a wasm32 build can name. A
-    /// native caller binds the parameters with
-    /// `rusqlite::params_from_iter(params.iter().map(SqliteValueRef::from))`.
+    /// main, which returned rusqlite's `Value`s, a type a wasm32 build cannot
+    /// name. A native caller turns them into rusqlite's values with
+    /// `params.iter().map(SqliteValue::to_sql)`, as main's callers had them.
     pub fn build(self) -> Result<(String, Vec<SqliteValue>), SqlGenerationError> {
         if self.fields.is_empty() || self.table_name.is_none() {
             // Just return WHERE clause
@@ -398,6 +397,31 @@ mod tests {
 
         assert_eq!(sql_string, r#"SELECT "id", "name", "age" FROM "users" WHERE "name" = ? AND "age" = ?"#);
         assert_eq!(params.len(), 2);
+    }
+
+    /// A native caller of `build` binds its values to rusqlite after one
+    /// `.map(SqliteValue::to_sql)`, as it bound the rusqlite values main's
+    /// `build` returned.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn built_values_bind_to_rusqlite_through_to_sql() {
+        let mut sql = SqlBuilder::with_fields(vec!["name"]);
+        sql.table_name("users");
+        sql.selection(&lowered("name = 'Alice' AND age > 30")).unwrap();
+        let (sql_string, params) = sql.build().unwrap();
+        let connection = rusqlite::Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE users (name TEXT, age INTEGER); INSERT INTO users VALUES ('Alice', 31), ('Alice', 29);")
+            .unwrap();
+        let values: Vec<rusqlite::types::Value> = params.iter().map(SqliteValue::to_sql).collect();
+        let names: Vec<String> = connection
+            .prepare(&sql_string)
+            .unwrap()
+            .query_map(rusqlite::params_from_iter(values), |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(names, ["Alice"]);
     }
 
     #[test]

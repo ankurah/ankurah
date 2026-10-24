@@ -46,6 +46,21 @@ impl SqliteValue {
             _ => None,
         }
     }
+
+    /// Convert to a rusqlite parameter value
+    /// Note: For JSONB, this returns the JSON text - the caller must wrap with jsonb()
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn to_sql(&self) -> rusqlite::types::Value {
+        match self {
+            SqliteValue::Text(s) => rusqlite::types::Value::Text(s.clone()),
+            SqliteValue::Integer(i) => rusqlite::types::Value::Integer(*i),
+            SqliteValue::Real(f) => rusqlite::types::Value::Real(*f),
+            SqliteValue::Blob(b) => rusqlite::types::Value::Blob(b.clone()),
+            // Return as text - the SQL query will wrap this with jsonb()
+            SqliteValue::Jsonb(j) => rusqlite::types::Value::Text(j.to_string()),
+            SqliteValue::Null => rusqlite::types::Value::Null,
+        }
+    }
 }
 
 /// A parameter the executor binds by reference, as rusqlite's `ValueRef` is
