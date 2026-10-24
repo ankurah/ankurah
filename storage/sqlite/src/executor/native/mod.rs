@@ -16,7 +16,10 @@ use rusqlite::{
 
 use crate::{
     error::SqliteError,
-    executor::{statement_scan, Row, SqliteExecutor},
+    executor::{
+        statement_scan::{self, Statements},
+        Row, SqliteExecutor,
+    },
     value::{SqliteValue, SqliteValueRef},
 };
 use connection::PooledConnection;
@@ -70,7 +73,7 @@ fn row_of(row: &rusqlite::Row<'_>, width: usize) -> Result<Row, SqliteError> {
 /// engine prepared it, runs the first and ignores the rest without a word.
 /// Whitespace, semicolons and comments after the statement are no statement.
 fn one_statement<'c>(connection: &'c Connection, sql: &str) -> Result<Statement<'c>, SqliteError> {
-    if statement_scan::holds_a_second_statement(sql) {
+    if statement_scan::statements(sql) == Statements::Several {
         return Err(rusqlite::Error::MultipleStatement.into());
     }
     let mut statements = Batch::new(connection, sql);

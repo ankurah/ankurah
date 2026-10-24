@@ -513,8 +513,7 @@ fn load_states(snapshot: &dyn SqliteExecutor, ids: &[EntityId]) -> Result<Vec<At
 fn memberships_of(executor: &dyn SqliteExecutor, entity_id: &str) -> Result<BTreeSet<ModelId>, SqliteError> {
     let rows = executor
         .query(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ?"#), &[SqliteValueRef::Text(entity_id)])?;
-    let model_keys = rows.iter().map(|row| row.blob(0)).collect::<Result<Vec<_>, _>>()?;
-    model_keys.into_iter().map(|key| bincode::deserialize(key).map_err(SqliteError::from)).collect()
+    rows.into_iter().map(|row| Ok(bincode::deserialize(row.blob(0)?)?)).collect()
 }
 
 /// An event row's columns, lent from the row they were read into.

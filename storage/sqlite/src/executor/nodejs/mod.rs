@@ -182,11 +182,11 @@ impl SqliteExecutor for NodeJsConnection {
     /// rows belongs to `query`. node:sqlite's `run` takes the step and
     /// discards the row.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
-        refuse_a_second_statement(sql)?;
+        let named_parameter = refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
         refuse_sql_past_its_statement(sql, &source)?;
-        refuse_a_named_parameter(&source)?;
+        refuse_a_named_parameter(named_parameter)?;
         let width = width(&statement)?;
         self.refuse_too_few_values(sql, params.len())?;
         if width == 0 {
@@ -237,11 +237,11 @@ impl NodeJsConnection {
                 Err(_) => self.drop_reader(sql),
             }
         }
-        refuse_a_second_statement(sql)?;
+        let named_parameter = refuse_a_second_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
         refuse_sql_past_its_statement(sql, &source)?;
-        refuse_a_named_parameter(&source)?;
+        refuse_a_named_parameter(named_parameter)?;
         let width = width(&statement)?;
         self.refuse_too_few_values(sql, params.len())?;
         if width == 0 {

@@ -104,12 +104,15 @@ impl NodeJsConnection {
     }
 }
 
-/// Refuse a statement that has a named parameter, before it runs:
-/// node:sqlite binds no positional value to one, leaving it NULL, where
+/// Refuse a statement that has a named parameter, the first of which the
+/// scan before preparing found (see `refuse_a_second_statement`), before it
+/// runs: node:sqlite binds no positional value to one, leaving it NULL, where
 /// rusqlite binds a call's values to every parameter in turn. better-sqlite3
 /// binds a named parameter only by name, which a positional call cannot give.
-pub(super) fn refuse_a_named_parameter(source: &str) -> Result<(), SqliteError> {
-    match statement_scan::named_parameters(source).first() {
+/// It is refused once SQLite has prepared the statement, so that SQL SQLite
+/// cannot prepare fails with SQLite's own error, as it does natively.
+pub(super) fn refuse_a_named_parameter(named_parameter: Option<&str>) -> Result<(), SqliteError> {
+    match named_parameter {
         None => Ok(()),
         Some(name) => Err(SqliteError::Node(format!(
             "the statement has the named parameter {name}, which the Node.js executor does not bind, since node:sqlite would \

@@ -9,7 +9,7 @@ use wasm_bindgen::{JsCast, JsValue};
 use super::NodeJsConnection;
 use crate::{
     error::SqliteError,
-    executor::statement_scan,
+    executor::statement_scan::{self, Statements},
     value::{SqliteValue, SqliteValueRef},
 };
 
@@ -96,13 +96,16 @@ pub(super) fn source(statement: &JsValue) -> Result<String, SqliteError> {
 /// as the native executor refuses it: SQLite applies some PRAGMAs while it
 /// prepares them, and node:sqlite runs the first statement and ignores the
 /// rest without a word. Whitespace, semicolons and comments after the
-/// statement are no statement.
-pub(super) fn refuse_a_second_statement(sql: &str) -> Result<(), SqliteError> {
-    if statement_scan::holds_a_second_statement(sql) {
+/// statement are no statement. Returns the statement's first named
+/// parameter, which the same pass over the SQL finds, for
+/// `refuse_a_named_parameter`.
+pub(super) fn refuse_a_second_statement(sql: &str) -> Result<Option<&str>, SqliteError> {
+    match statement_scan::statements(sql) {
         // rusqlite's words for the same refusal.
-        return Err(SqliteError::Node("Multiple statements provided".into()));
+        Statements::Several => Err(SqliteError::Node("Multiple statements provided".into())),
+        Statements::One { named_parameter } => Ok(named_parameter),
+        Statements::None => Ok(None),
     }
-    Ok(())
 }
 
 /// Check where SQLite ended the statement it prepared from `sql`, which the

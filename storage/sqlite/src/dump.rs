@@ -162,15 +162,14 @@ fn states_of_page(
         let state_buffers = bincode::deserialize::<StateBuffers>(row.blob(1)?)?;
         let head = serde_json::from_str::<Clock>(row.text(2)?)?;
         let attestations = bincode::deserialize::<AttestationSet>(row.blob(3)?)?;
-        let mut memberships = std::collections::BTreeSet::new();
-        let keys = snapshot.query(
-            &format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ? ORDER BY "model_key""#),
-            &[SqliteValueRef::Text(stored_id)],
-        )?;
-        let keys = keys.iter().map(|row| row.blob(0)).collect::<Result<Vec<_>, _>>()?;
-        for key in keys {
-            memberships.insert(bincode::deserialize::<ModelId>(key)?);
-        }
+        let memberships = snapshot
+            .query(
+                &format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ? ORDER BY "model_key""#),
+                &[SqliteValueRef::Text(stored_id)],
+            )?
+            .into_iter()
+            .map(|row| Ok(bincode::deserialize::<ModelId>(row.blob(0)?)?))
+            .collect::<Result<_, SqliteError>>()?;
         let state = State { state_buffers, memberships, head };
         page.push(StorageDumpItem::State(Attested { payload: EntityState { entity_id, state }, attestations }));
         last = Some(stored_id.to_owned());
