@@ -5,7 +5,7 @@ use super::{
     bootstrap::{ensure_catalog_unchanged, fold_candidate, StorageRead, TreeUpdate, MAX_READ_ATTEMPTS},
     identity::{ensure_filter_unchanged, Coverage, Identity},
     lease::{Command, Resident, ResidentSnapshot},
-    route::{current_state, Route},
+    route::{current_states, Route},
     Lru,
 };
 use crate::{
@@ -63,8 +63,9 @@ impl<CD: ContextData> ResidentActor<CD> {
             anyhow::ensure!(entries.keys().eq(self.candidates.iter()), SourceError::PolicyChanged);
             return Ok(());
         }
+        let states = current_states(node, self.candidates.iter().copied()).await?;
         for id in &self.candidates {
-            let state = current_state(node, *id).await?.ok_or(SourceError::Changed)?;
+            let state = states.get(id).ok_or(SourceError::Changed)?;
             anyhow::ensure!(policy.check_read(id, &state.state).is_ok() == entries.contains_key(id), SourceError::PolicyChanged);
         }
         Ok(())

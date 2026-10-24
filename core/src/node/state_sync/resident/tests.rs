@@ -50,6 +50,8 @@ struct OrderedStorage {
     returned_rows: std::sync::atomic::AtomicUsize,
     /// Individual state reads, including those each `get_states` call makes.
     state_reads: std::sync::atomic::AtomicUsize,
+    /// `get_states` calls.
+    state_batches: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -60,6 +62,22 @@ impl StorageEngine for OrderedStorage {
     async fn get_state(&self, id: proto::EntityId) -> Result<Attested<proto::EntityState>, RetrievalError> {
         self.state_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.inner.get_state(id).await
+    }
+    async fn get_states(
+        &self,
+        ids: Vec<proto::EntityId>,
+        predicate: &Predicate<Resolved>,
+    ) -> Result<Vec<crate::storage::GetStateResult>, RetrievalError> {
+        self.state_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut states = Vec::with_capacity(ids.len());
+        for id in ids {
+            states.push(match self.get_state(id).await {
+                Ok(state) => crate::storage::GetStateResult::matching(state, predicate)?,
+                Err(RetrievalError::EntityNotFound(_)) => crate::storage::GetStateResult::NotFound(id),
+                Err(error) => return Err(error),
+            });
+        }
+        Ok(states)
     }
     async fn fetch_states(&self, selection: &Selection<Resolved>) -> Result<Vec<Attested<proto::EntityState>>, RetrievalError> {
         self.fetches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

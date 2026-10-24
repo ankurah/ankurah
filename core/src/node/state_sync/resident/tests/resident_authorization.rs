@@ -216,3 +216,25 @@ async fn one_publication_evaluates_the_state_free_read_proof_once_for_all_its_ch
     assert_eq!(actor.tree.entries().len(), 3);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_command_reads_its_candidates_states_in_one_storage_call() -> anyhow::Result<()> {
+    let node = Node::new_durable(
+        Arc::new(OrderedStorage::default()),
+        RestrictedDiscovery { read_allowed: Some(Arc::new(AtomicBool::new(true))), ..Default::default() },
+    );
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let mut events = Vec::new();
+    for value in ["01", "02", "03"] {
+        let event = genesis(value)?;
+        apply(&node, &event).await?;
+        events.push(event);
+    }
+    let resident = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    assert!(events.iter().all(|event| node.entities.get(&event.entity_id).is_none()), "every candidate's state is in storage alone");
+    let batches = node.storage.state_batches.load(Ordering::Relaxed);
+    assert_eq!(resident.snapshot().await?.snapshot.entries.len(), 3);
+    assert_eq!(node.storage.state_batches.load(Ordering::Relaxed) - batches, 1, "the per-candidate read check reads every state at once");
+    Ok(())
+}

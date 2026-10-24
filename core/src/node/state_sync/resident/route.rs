@@ -22,18 +22,43 @@ pub(super) struct Route {
     pub(super) members: BTreeMap<proto::EntityId, proto::QueryMember>,
 }
 
+/// The node's current state of `id`, if the entity exists.
 pub(super) async fn current_state<SE, PA>(node: &Node<SE, PA>, id: proto::EntityId) -> anyhow::Result<Option<proto::EntityState>>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    if let Some(entity) = node.entities.get(&id) {
-        return Ok(Some(entity.to_entity_state()?));
+    Ok(current_states(node, [id]).await?.remove(&id))
+}
+
+/// The node's current state of each of `ids` that exists: a resident
+/// entity's from memory, and the rest from one storage read.
+pub(super) async fn current_states<SE, PA>(
+    node: &Node<SE, PA>,
+    ids: impl IntoIterator<Item = proto::EntityId>,
+) -> anyhow::Result<BTreeMap<proto::EntityId, proto::EntityState>>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let mut states = BTreeMap::new();
+    let mut stored = Vec::new();
+    for id in ids {
+        match node.entities.get(&id) {
+            Some(entity) => {
+                states.insert(id, entity.to_entity_state()?);
+            }
+            None => stored.push(id),
+        }
     }
-    Ok(node.storage.get_states(vec![id], &ankql::ast::Predicate::True).await?.into_iter().next().and_then(|result| match result {
-        crate::storage::GetStateResult::Found(state) => Some(state.payload),
-        _ => None,
-    }))
+    if !stored.is_empty() {
+        for result in node.storage.get_states(stored, &ankql::ast::Predicate::True).await? {
+            if let crate::storage::GetStateResult::Found(state) = result {
+                states.insert(state.payload.entity_id, state.payload);
+            }
+        }
+    }
+    Ok(states)
 }
 
 impl Route {
