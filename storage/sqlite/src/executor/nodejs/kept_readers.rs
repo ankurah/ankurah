@@ -21,17 +21,17 @@ const KEPT_READERS_MAX: usize = 64;
 const SQLITE_ERROR: i32 = 1;
 
 /// The typed readers a connection has prepared, by the SQL text of the
-/// statement each reads, so that a query run again skips both prepares,
-/// which cost a point lookup several times what reading its row does. At
-/// most [`KEPT_READERS_MAX`] are kept, the least recently used leaving first.
-/// SQLite prepares a kept statement again when the schema changes, but a
-/// typed reader names its statement's columns, which a `SELECT *` may have
-/// gained or lost; so every kept reader is dropped when the schema version
-/// of main or temp changes, and one that fails because its statement now
-/// yields another number of columns, as a reader of an attached database's
-/// table can, is dropped and its statement read afresh (see
-/// `reader_went_stale`). A reader is kept only for a statement that
-/// `refuse_a_compound_select` lets through.
+/// statement each reads, so that a query run again skips preparing its
+/// statement and its reader, which cost a point lookup several times what
+/// reading its row does. At most [`KEPT_READERS_MAX`] are kept, the least
+/// recently used leaving first. SQLite prepares a kept statement again when
+/// the schema changes, but a typed reader names its statement's columns,
+/// which a `SELECT *` may have gained or lost; so every kept reader is
+/// dropped when the schema version of `main` or `temp` changes, and one
+/// that fails because its statement now yields another number of columns,
+/// as a reader of an attached database's table can, is dropped and its
+/// statement read afresh (see `reader_went_stale`). A reader is kept only
+/// for a statement that `refuse_a_compound_select` lets through.
 #[derive(Default)]
 pub(super) struct KeptReaders {
     /// The schema versions the kept readers were prepared at.
@@ -50,9 +50,9 @@ struct KeptReader {
 }
 
 impl NodeJsConnection {
-    /// The typed reader kept for `sql` and its statement's width, once every
-    /// kept reader has been dropped if the schema changed since they were
-    /// prepared.
+    /// The typed reader kept for `sql`, with its statement's width. It first
+    /// reads the schema versions of `main` and `temp`, and drops every kept
+    /// reader when either has changed since they were prepared.
     pub(super) fn kept_reader(&self, sql: &str) -> Result<Option<(JsValue, usize)>, SqliteError> {
         let versions = self.schema_versions()?;
         let mut readers = self.readers.borrow_mut();
@@ -83,7 +83,7 @@ impl NodeJsConnection {
         readers.kept.insert(sql.to_owned(), KeptReader { statement: statement.clone(), width, name, used });
     }
 
-    /// The schema versions of main and temp, which change whenever their schemas do.
+    /// The schema versions of `main` and `temp`, which change whenever their schemas do.
     fn schema_versions(&self) -> Result<[i64; 2], SqliteError> {
         let prepared = self.statements.borrow().version_statements.clone();
         let statements = match prepared {
@@ -112,10 +112,10 @@ impl NodeJsConnection {
 
     /// Whether `error` is SQLite's failure to prepare the typed reader kept
     /// for `sql` again because its statement no longer yields as many columns
-    /// as the reader names: SQLite reports that as an SQLITE_ERROR, "table
-    /// <reader> has <N> values for <M> columns", naming the reader's CTE and
-    /// the width it was kept at. A failure SQLite words otherwise is not
-    /// such a failure, so that it is reported as it came.
+    /// as the reader names: SQLite reports that as an SQLITE_ERROR,
+    /// `table <reader> has <N> values for <M> columns`, naming the reader's
+    /// CTE and the width it was kept at. A failure SQLite words otherwise is
+    /// not such a failure, so that it is reported as it came.
     pub(super) fn reader_went_stale(&self, sql: &str, error: &SqliteError) -> bool {
         let SqliteError::Sqlite(SqliteFailure { code: Some(SQLITE_ERROR), message }) = error else {
             return false;
@@ -228,8 +228,9 @@ mod tests {
     }
 
     /// A connection keeps the typed readers of at most [`KEPT_READERS_MAX`]
-    /// queries, making room by dropping the least recently used, and reads a
-    /// query whose reader it dropped as before, keeping it again.
+    /// queries, making room by dropping the least recently used, and a query
+    /// whose reader it dropped reads as it did on its first run, its reader
+    /// prepared and kept again.
     #[wasm_bindgen_test]
     fn keeps_the_typed_readers_of_the_most_recently_used_queries() {
         let connection = NodeJsConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();

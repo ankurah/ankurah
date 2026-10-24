@@ -1,10 +1,11 @@
-//! The native executor: the engine's SQL run on rusqlite connections.
+//! The native executor, which runs the engine's SQL on rusqlite.
 //!
-//! The bb8 pool and the `spawn_blocking` hop stay in `connection.rs`, which
-//! also runs the session pragmas; this file only lets the engine reach a
-//! pooled rusqlite connection through [`SqliteExecutor`], binding
-//! [`SqliteValueRef`] parameters and reading each column by its SQLite
-//! storage class, with no conversion.
+//! It implements [`SqliteExecutor`] for rusqlite's `Connection`, binding
+//! [`SqliteValueRef`] parameters and reading each column as its SQLite
+//! storage class says it is, with no conversion, and lets the engine reach a
+//! pooled connection through it. `connection` opens the connections with
+//! the session settings, pools them for the engine, and runs each closure on
+//! one through tokio's blocking pool.
 
 pub(crate) mod connection;
 
@@ -68,13 +69,12 @@ fn row_of(row: &rusqlite::Row<'_>, width: usize) -> Result<Row, SqliteError> {
 }
 
 /// The statement `sql` holds, prepared. SQL that holds a second statement is
-/// refused before SQLite prepares either, since SQLite applies some PRAGMAs
-/// while it prepares them: a defect fix, since rusqlite, prepared as main's
-/// engine prepared it, runs the first and ignores the rest without a word.
-/// Whitespace, semicolons and comments after the statement are no statement;
-/// anything else after it is, a byte SQLite cannot read among it. The scan
-/// alone finds a second statement, so SQLite prepares the first statement,
-/// past what it skips before it, and nothing after. SQL that holds no
+/// refused before SQLite prepares either: SQLite applies some PRAGMAs while
+/// it prepares them, and rusqlite, given SQL of several statements, runs the
+/// first and ignores the rest without a word. Whitespace, semicolons and
+/// comments after the statement are no statement; anything else after it
+/// is, even a byte SQLite cannot read. Once the scan has found one
+/// statement, SQLite prepares it from the SQL as it is. SQL that holds no
 /// statement is prepared too, and SQLite refuses it when it runs, with
 /// SQLITE_MISUSE.
 fn one_statement<'c>(connection: &'c Connection, sql: &str) -> Result<Statement<'c>, SqliteError> {

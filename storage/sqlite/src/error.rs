@@ -48,7 +48,10 @@ pub enum SqliteError {
     #[error("corrupt durable record: {0}")]
     CorruptRecord(String),
 
-    #[error("unexpected row shape: {0}")]
+    /// A value that a [`Row`](crate::executor::Row) getter refuses, the same
+    /// on every driver: one of another storage class than the getter reads,
+    /// or a column the row does not have.
+    #[error("unexpected value: {0}")]
     Row(String),
 
     #[error("SQL generation error: {0}")]
@@ -117,9 +120,9 @@ impl SqliteError {
     ///
     /// `None` for every other error. That includes a call that passes too
     /// many values (see `sqlite_code`), on better-sqlite3 a call that passes
-    /// too few, which better-sqlite3 refuses itself as a
-    /// [`SqliteError::JavaScript`], and natively SQL that holds no statement,
-    /// which SQLite refuses itself (see `sqlite_code`).
+    /// too few, which better-sqlite3 refuses itself, as a JavaScript
+    /// exception, and natively SQL that holds no statement, which SQLite
+    /// refuses itself (see `sqlite_code`).
     pub fn refusal(&self) -> Option<Refusal> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]

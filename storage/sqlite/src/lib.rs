@@ -21,15 +21,17 @@
 //!
 //! # Drivers
 //!
-//! The engine's SQL is written once, against [`executor::SqliteExecutor`].
-//! Natively it runs on rusqlite connections from a bb8 pool. On wasm32, with
-//! the `nodejs` feature, it runs on Node.js's built-in `node:sqlite` (from
-//! Node.js 22.20.0 on 22, 24.7.0 on 24, or any later release line, whose
-//! node:sqlite binds a numbered parameter at its position), or on a
-//! better-sqlite3 database the host adopts, for a node inside Node.js where
-//! IndexedDB does not exist: a VS Code extension host, an Electron main
-//! process, a JavaScript CLI. The tables are the same, so a database file
-//! opens under any of them.
+//! The engine's SQL is written once, against [`executor::SqliteExecutor`],
+//! so that one engine serves every SQLite driver. Natively it runs on
+//! rusqlite connections from a bb8 pool. On wasm32, with the `nodejs`
+//! feature, it serves an Ankurah node running inside Node.js, where
+//! IndexedDB does not exist (a VS Code extension host, an Electron main
+//! process, a JavaScript CLI): on Node.js's built-in `node:sqlite`, from
+//! Node.js 22.20.0 on 22, 24.7.0 on 24, or any later release line, or on a
+//! better-sqlite3 database the host hands to `from_database`. Every driver
+//! reads and writes the same tables, so a database file opens under any of
+//! them, except that the Node.js executor refuses one whose text encoding
+//! is UTF-16.
 //!
 //! # Example
 //!
@@ -43,7 +45,7 @@
 //! let storage = SqliteStorageEngine::open_in_memory().await?;
 //!
 //! // On wasm32 with the `nodejs` feature: adopt a database the host constructed
-//! // (DatabaseSync, or a compatible driver with positional rows and BigInt INTEGERs)
+//! // (node:sqlite's DatabaseSync, or better-sqlite3's Database)
 //! let storage = SqliteStorageEngine::from_database(database).await?;
 //! ```
 

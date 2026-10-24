@@ -132,14 +132,14 @@ fn state_page(conn: &dyn SqliteExecutor, after: Option<&str>) -> Result<(Option<
             vec![SqliteValueRef::Integer(PAGE_SIZE)],
         )
     };
-    // One read snapshot for the page, so each state's memberships are read as
-    // of the state itself. Main had that snapshot without asking for one: its
-    // page's statement was still stepping while each membership was read, and
-    // SQLite ends a read only when the connection's last statement finishes.
-    // The executor reads the whole page first, so a savepoint keeps it here: it
-    // begins a transaction on a connection outside one, and nests in one an
-    // embedder left open, which main's page read within too. A failed read's
-    // error wins over the savepoint's ROLLBACK TO and RELEASE (see `savepoint`).
+    // One read snapshot for the page, so that each state's memberships are
+    // read as of the state itself. The executor collects the page's rows
+    // before any membership is read, so without a transaction each
+    // membership read would take a snapshot of its own. A savepoint takes
+    // the snapshot: it begins a transaction on a connection outside one, and
+    // nests in one an embedder left open, where BEGIN would fail. A failed
+    // read's error wins over the savepoint's ROLLBACK TO and RELEASE (see
+    // `savepoint`).
     let snapshot = conn.savepoint("_ankurah_dump_page")?;
     let page = states_of_page(&snapshot, &query, &arguments)?;
     snapshot.release()?;
@@ -234,9 +234,9 @@ mod tests {
     }
 
     /// A dump on a connection an embedder left inside an open transaction
-    /// reads its states within that transaction, as main's dump did, and
-    /// leaves the transaction open for the embedder to end: each page's
-    /// snapshot is a savepoint, which nests in it.
+    /// reads its states within that transaction, and leaves the transaction
+    /// open for the embedder to end, since each page's snapshot is a
+    /// savepoint, which nests in it.
     #[engine_test]
     async fn dump_reads_within_a_transaction_left_open() -> anyhow::Result<()> {
         let storage = test_driver::open_in_memory().await?;

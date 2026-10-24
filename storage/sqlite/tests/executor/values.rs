@@ -194,15 +194,12 @@ async fn a_json_parameter_binds_as_its_text() -> Result<()> {
     Ok(())
 }
 
-/// A compound SELECT at the top level of a query, or in a scalar subquery
-/// there, is refused on Node.js before it runs, where rusqlite reads its values
-/// directly: Node.js's typed reader would read a later SELECT's INTEGER past
-/// 2^53 with the affinity of the first SELECT's REAL column, or of a scalar
-/// subquery's last SELECT's, as the nearest REAL. A compound in an EXISTS is
-/// refused on Node.js too, though it reads the same everywhere. Selected from a
-/// materialized CTE, or from a subquery or CTE that SQLite does not flatten,
-/// where SQLite applies the first SELECT's affinity on every driver, or in
-/// an IN, the compound reads the same everywhere.
+/// A compound SELECT of a REAL and an INTEGER past 2^53, at the top level of
+/// a query, in a scalar subquery there, or in an EXISTS, is refused on
+/// Node.js before it runs, where rusqlite reads its values exactly. Selected
+/// from a materialized CTE, from a subquery or CTE that SQLite does not
+/// flatten, or in an IN, it reads the same on every driver.
+/// `refuse_a_compound_select`, in the Node.js executor, says why.
 #[engine_test]
 async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
     fn values(rows: Vec<Row>) -> Vec<String> {

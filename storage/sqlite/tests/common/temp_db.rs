@@ -33,7 +33,7 @@ impl TempDb {
 
     pub fn path(&self) -> &std::path::Path { &self.0 }
 
-    /// The path as a string, for node:sqlite.
+    /// The path as a string, as a Node.js driver takes it.
     pub fn path_str(&self) -> &str { self.0.to_str().expect("a UTF-8 path") }
 
     /// A second connection on the file, for edits behind the engine's back.

@@ -9,8 +9,9 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-# On wasm32, run the engine on Node.js's built-in node:sqlite. A native build
-# ignores it and always runs on rusqlite.
+# On wasm32, run the engine inside Node.js, on its built-in node:sqlite or on
+# a better-sqlite3 database the host hands over. A native build ignores it
+# and always runs on rusqlite.
 nodejs = ["dep:wasm-bindgen", "dep:js-sys", "dep:send_wrapper"]
 
 [dependencies]
@@ -49,7 +50,7 @@ ankurah-core       = { path = "../../core", version = "=0.10.0", features = ["wa
 ankurah-core-types = { path = "../../core-types", version = "=0.10.0", features = ["wasm"] }
 ankurah-proto      = { path = "../../proto", version = "=0.10.0", features = ["wasm"] }
 
-# The nodejs feature's driver: node:sqlite reached through wasm-bindgen
+# The nodejs feature's bindings to JavaScript
 wasm-bindgen = { version = "0.2.84", optional = true }
 js-sys       = { version = "0.3.69", optional = true }
 send_wrapper = { version = "0.6.0", optional = true }

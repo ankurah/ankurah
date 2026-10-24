@@ -28,7 +28,10 @@ pub(crate) use native::connection::{file_pool, memory_pool, Pool, PooledConnecti
 #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
 pub(crate) use nodejs::{file_pool, memory_pool, Pool, PooledConnection};
 #[cfg(all(target_arch = "wasm32", not(feature = "nodejs")))]
-compile_error!("on wasm32, ankurah-storage-sqlite runs on a JavaScript SQLite: enable the `nodejs` feature for Node.js's node:sqlite");
+compile_error!(
+    "on wasm32, ankurah-storage-sqlite runs inside Node.js: enable the `nodejs` feature, for Node.js's node:sqlite or a \
+     better-sqlite3 database the host hands over"
+);
 
 use crate::{
     error::SqliteError,
@@ -36,8 +39,10 @@ use crate::{
 };
 
 /// The session pragmas every connection the engine opens runs, natively and
-/// on Node.js alike, so that a Node.js connection behaves like a native one.
-/// Each executor sets the busy timeout apart, before them.
+/// on Node.js alike, so that the engine runs with the same session settings
+/// on every driver. The busy timeout is not among them: it must come before
+/// any statement that reads the file, so each executor sets it first,
+/// rusqlite as it opens a connection.
 pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
      PRAGMA synchronous=NORMAL;
      PRAGMA foreign_keys=ON;
@@ -45,76 +50,118 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
      PRAGMA mmap_size=268435456;
      PRAGMA temp_store=MEMORY;";
 
-/// One SQLite connection, driven synchronously and in order.
+/// What the engine runs its SQL through, so that one engine serves every
+/// SQLite driver: one SQLite connection, driven synchronously and in order.
 ///
-/// Parameters are positional `?` placeholders, bound by reference, without
-/// first copying a caller's TEXT and BLOB into an owned value. A
+/// Parameters are positional `?` placeholders, bound by reference, so that a
+/// caller's TEXT and BLOB are not first copied into owned values. A
 /// [`SqliteValueRef::Jsonb`] parameter is bound as its JSON text, TEXT, on
 /// every driver, which SQL that stores it as JSONB wraps in `jsonb(?)`.
 ///
-/// Each call runs one statement: SQL that holds a second one is refused
+/// Each call runs one statement. SQL that holds a second one is refused
 /// before SQLite prepares either, since SQLite applies some PRAGMAs while it
 /// prepares them. Whitespace, semicolons and comments after the statement
-/// are no second statement, and a CREATE TRIGGER statement runs on to the
-/// END of its body. SQL that holds no statement, only those, is refused as
+/// are no second statement, but anything else is, even one byte SQLite
+/// cannot read. A CREATE TRIGGER statement runs on to the END of its body.
+/// SQL that holds only whitespace, semicolons and comments is refused as
 /// SQLite refuses to run it, with SQLITE_MISUSE.
 ///
 /// # Where the Node.js executor differs from the native one
 ///
-/// - On Node.js a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
-///   top level of a query, or in a scalar subquery there, is refused before
-///   it runs. Node.js reads a query's rows through a typed reader that nests the
-///   query in a WITH clause, which gives each column an affinity: a
-///   compound's first SELECT's, or a scalar subquery's last SELECT's,
-///   whichever SELECT the value came from. That can change a value: an
-///   INTEGER past 2^53 read through a REAL column would read as the nearest
-///   REAL. Selected as `WITH x AS MATERIALIZED (…) SELECT * FROM x`, a
-///   compound SELECT reads the same on every driver, as does one in a
-///   subquery or CTE that SQLite does not flatten into the query, or in an
-///   IN. SQLite's query plan decides where a compound stands, so one in a
-///   subquery that SQLite flattens into the query is refused too. The plan
-///   does not show whether a scalar subquery computes a column of the query,
-///   so a compound in an EXISTS or in a WHERE clause's scalar subquery is
-///   refused as well, though it reads the same everywhere. No statement of
-///   the engine's own holds a compound SELECT.
-/// - On Node.js a statement with a named parameter (`:a`, `@a`, `#a` or `$a`)
-///   is refused before it runs, where rusqlite binds a call's values to
-///   named parameters in turn too: node:sqlite would bind no positional value
-///   to one, leaving it NULL. Write a positional `?` for each parameter.
-/// - better-sqlite3 binds no positional value to a numbered parameter such as
-///   `?1`, and refuses the call; rusqlite and node:sqlite bind the value at
-///   that position.
-/// - On Node.js a query that SQLite cannot nest in a WITH clause is refused,
-///   before it runs, unless it is a PRAGMA or an EXPLAIN. A PRAGMA's or an
-///   EXPLAIN's TEXT is read as the driver's JavaScript string, and a string
-///   holding U+FFFD is refused, since both Node.js drivers put that character in
-///   place of each byte that is not UTF-8.
-/// - So on Node.js the engine refuses a model's table with a column whose
-///   name holds U+FFFD, since it reads the names through `PRAGMA table_info`.
-/// - On Node.js a query that yields more than half of SQLite's column limit,
-///   1000 of the default 2000 columns, is refused before it runs, since the
-///   typed reader reads each column as two; natively it reads up to the
-///   limit.
+/// Both Node.js drivers hand TEXT over only as a JavaScript string, which
+/// puts U+FFFD in place of each byte that is not UTF-8, and which
+/// node:sqlite cuts at the first NUL. So the Node.js executor reads a
+/// query's rows through a typed reader, which nests the query in a
+/// materialized WITH clause and reads each column as two: its storage class,
+/// and its value, TEXT as the bytes of a BLOB. Most of the differences come
+/// from that reader.
+///
+/// - A compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the top
+///   level of a query, or in a scalar subquery there, is refused before it
+///   runs ([`Refusal::CompoundSelect`]), since the typed reader could read
+///   one of its INTEGERs as a REAL. Selected as
+///   `WITH x AS MATERIALIZED (…) SELECT * FROM x`, a compound SELECT reads
+///   the same on every driver, and no statement of the engine's own holds
+///   one. The Node.js executor's `refuse_a_compound_select` says which
+///   other compounds it lets through, and which it refuses though they read
+///   the same everywhere.
+/// - A statement with a named parameter (`:a`, `@a`, `#a` or `$a`) is
+///   refused before it runs ([`Refusal::NamedParameter`]). rusqlite binds a
+///   call's values to named and positional parameters alike, in order, but
+///   node:sqlite would bind no positional value to a named one, leaving it
+///   NULL, and better-sqlite3 binds one only by name. Write a positional `?`
+///   for each parameter.
+/// - better-sqlite3 binds a numbered parameter such as `?1` only by name, as
+///   it binds a named one, so it refuses, in its own words, a call that
+///   gives one a positional value; rusqlite and node:sqlite bind the value
+///   at that position.
+/// - A statement that yields rows and that SQLite cannot nest in the typed
+///   reader, such as one with a RETURNING clause, is refused before it can
+///   write ([`Refusal::NotNestable`]), unless it is a PRAGMA or an EXPLAIN.
+///   Their TEXT is read as the driver's string, and a string holding U+FFFD
+///   is refused ([`Refusal::ReplacementCharacter`]).
+/// - So the engine refuses a model's table with a column whose name holds
+///   U+FFFD, since it reads the names through `PRAGMA table_info`, and it
+///   refuses a name that is not UTF-8 as one holding U+FFFD, where natively
+///   it refuses it as TEXT that is not UTF-8.
+/// - A query that yields more than half of SQLite's column limit, 1000 of
+///   the default 2000 columns, is refused before it runs
+///   ([`Refusal::TooManyColumns`]), since the typed reader reads each column
+///   as two; natively it reads up to the limit.
+/// - [`query_row`](SqliteExecutor::query_row) decodes only the first row,
+///   but SQLite computes every row of the typed reader's WITH clause before
+///   the first comes back. So an error SQLite raises while computing a later
+///   row, such as an integer overflow, fails the call, where natively SQLite
+///   computes only the first row.
+/// - A virtual table's column declared REAL that returns an INTEGER reads as
+///   the nearest REAL, since the typed reader's WITH clause gives the column
+///   REAL affinity, where natively it reads as the INTEGER. Only a loaded
+///   extension reaches this: better-sqlite3's JavaScript virtual tables give
+///   their columns no type, node:sqlite has no virtual-table API, and
+///   SQLite's own R*Tree returns REALs from its REAL columns.
 /// - better-sqlite3 refuses a query whose SQL holds more than whitespace
 ///   after the semicolon that ends its statement, as `SELECT 1; -- note`
-///   does: the typed reader nests the SQL better-sqlite3 prepared, and
-///   better-sqlite3 keeps what follows the semicolon in it.
-/// - better-sqlite3 refuses SQL in which a UTF-8 byte order mark follows a
-///   statement, which its own check of what follows a statement does not
-///   read as whitespace, as SQLite does.
+///   does: the typed reader nests the SQL better-sqlite3 prepared, which
+///   keeps what follows the semicolon.
+/// - better-sqlite3 refuses, in its own words, SQL in which a UTF-8 byte
+///   order mark follows a statement: its own check of what follows a
+///   statement does not read the mark as whitespace, as SQLite does.
+/// - Errors take each target's own variants of [`SqliteError`]. Natively
+///   every error SQLite raises, and every refusal of rusqlite's, is a
+///   `SqliteError::Rusqlite`. On Node.js an error SQLite raised is a
+///   `SqliteError::Sqlite`, a refusal of the executor's a
+///   `SqliteError::Refused`, and any other JavaScript exception, a driver's
+///   own refusal among them, a `SqliteError::JavaScript`.
+///   [`SqliteError::refusal`] and [`SqliteError::sqlite_code`] answer the
+///   same on every driver, except in the cases their docs list.
+///
+/// [`Refusal::CompoundSelect`]: crate::Refusal::CompoundSelect
+/// [`Refusal::NamedParameter`]: crate::Refusal::NamedParameter
+/// [`Refusal::NotNestable`]: crate::Refusal::NotNestable
+/// [`Refusal::ReplacementCharacter`]: crate::Refusal::ReplacementCharacter
+/// [`Refusal::TooManyColumns`]: crate::Refusal::TooManyColumns
 pub trait SqliteExecutor {
-    /// Run one statement that yields no rows; returns SQLite's changes(), as
+    /// Run one statement for its effect, and return SQLite's changes(), as
     /// rusqlite does: the number of rows the statement changed when it is an
     /// INSERT, UPDATE or DELETE, and after any other statement, such as DDL
-    /// or BEGIN, still the number the last of those changed.
+    /// or BEGIN, still the number the last of those changed. A statement
+    /// whose first step yields a row is refused
+    /// ([`Refusal::ExecuteReturnedRows`]), since its rows belong to
+    /// [`query`](SqliteExecutor::query).
+    ///
+    /// [`Refusal::ExecuteReturnedRows`]: crate::Refusal::ExecuteReturnedRows
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError>;
 
-    /// Run one statement and collect every row it yields, in order.
+    /// Run one statement and return every row it yields, in order. A
+    /// statement that yields no rows, such as an INSERT, runs for its effect
+    /// and returns none.
     fn query(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError>;
 
-    /// Run one statement and return its first row, if it yields one, reading
-    /// no row past it, as rusqlite's `query_row` does: a row after the first
-    /// that cannot be read does not fail the call.
+    /// Run one statement and return its first row, if it yields one. No row
+    /// past the first is decoded, as rusqlite's `query_row` decodes none, so
+    /// a later row that cannot be read does not fail the call; on Node.js
+    /// SQLite still computes every row first (see the Node.js differences
+    /// above).
     fn query_row(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError>;
 }
 
@@ -132,13 +179,16 @@ impl dyn SqliteExecutor + '_ {
         Ok(Transaction { executor: self, open: true })
     }
 
-    /// Open the savepoint `name`, an identifier, on this connection: a
-    /// transaction where none is open, and nested in the open one where one
-    /// is. Dropped without [`Savepoint::release`], it rolls back to the
-    /// savepoint and releases it, as rusqlite's `Savepoint` does, so an early
-    /// `?` leaves nothing behind and reports its own error: the errors of
-    /// that ROLLBACK TO and RELEASE are dropped, so the error of a statement
-    /// that failed inside the savepoint wins over theirs.
+    /// Open the savepoint `name` on this connection, so that the statements
+    /// run through it read one snapshot and keep or undo their work as one,
+    /// whether or not a transaction is open: it begins a transaction where
+    /// none is, and nests in the open one, where BEGIN would fail. `name`
+    /// goes into the SQL as it is, so it must be an identifier. Dropped
+    /// without [`Savepoint::release`], it rolls back to the savepoint and
+    /// releases it, as rusqlite's `Savepoint` does, so that an early `?`
+    /// leaves nothing behind; the errors of that ROLLBACK TO and RELEASE are
+    /// dropped, so that the `?` reports the error of the statement that
+    /// failed.
     pub(crate) fn savepoint(&self, name: &'static str) -> Result<Savepoint<'_>, SqliteError> {
         self.execute(&format!("SAVEPOINT {name}"), &[])?;
         Ok(Savepoint { executor: self, name, open: true })
@@ -150,13 +200,16 @@ impl dyn SqliteExecutor + '_ {
 pub enum TransactionBehavior {
     /// `BEGIN DEFERRED`: a read snapshot that upgrades to a write lock on the first write.
     Deferred,
-    /// `BEGIN IMMEDIATE`: the write lock is taken up front, so writers serialize
-    /// before any expectation is read.
+    /// `BEGIN IMMEDIATE`: the write lock is taken up front, so that writers
+    /// serialize before any of them reads the head its commit expects.
     Immediate,
 }
 
-/// An open transaction on an executor. Statements run through it execute
-/// inside the transaction; dropping it uncommitted rolls back.
+/// A SQL transaction on one connection, BEGIN to COMMIT, which rolls back
+/// when dropped uncommitted. Statements run through it execute inside it.
+/// [`SqliteTransaction`](crate::SqliteTransaction) is another thing: it
+/// buffers the storage writes of Ankurah's `StorageTransaction`, and commits
+/// them in one SQL transaction of this kind.
 pub struct Transaction<'e> {
     executor: &'e dyn SqliteExecutor,
     open: bool,
@@ -246,9 +299,8 @@ impl Drop for Savepoint<'_> {
 /// The getters are strict: each accepts only its own SQLite storage class and
 /// refuses any other, as rusqlite's `String` and `Vec<u8>` reads do, so a
 /// value of the wrong type is an error rather than a conversion. TEXT and
-/// BLOB are lent from the row, which holds the one copy the driver made of
-/// them (TEXT already checked to be UTF-8); a caller that keeps one takes
-/// its own.
+/// BLOB are lent from the row, which owns them (TEXT already checked to be
+/// UTF-8); a caller that keeps one takes its own copy.
 #[derive(Debug, Clone)]
 pub struct Row(Vec<SqliteValue>);
 
@@ -286,9 +338,9 @@ impl Row {
     }
 }
 
-/// The refusal of a value of another storage class, the same on both
-/// drivers. Changed from main, where rusqlite's typed getters refused it as
-/// `InvalidColumnType`, naming the column; this message names it by position.
+/// The refusal of a value of another storage class than a getter reads, the
+/// same on every driver. It names the column by its position, since a `Row`
+/// holds no column names.
 fn mismatch(index: usize, found: &SqliteValue, expected: &str) -> SqliteError {
     let found = if matches!(found, SqliteValue::Null) { "NULL" } else { found.sqlite_type() };
     SqliteError::Row(format!("column {index} holds {found} where {expected} was expected"))

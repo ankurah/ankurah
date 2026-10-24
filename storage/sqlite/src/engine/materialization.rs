@@ -369,17 +369,17 @@ impl Materialization {
         let table_name = self.table().to_owned();
         let new_columns = conn
             .with_executor(move |c| {
-                // The PRAGMA itself, which no table can shadow, where a table
+                // The PRAGMA statement, not its table-valued function: a table
                 // named `pragma_table_info`, a model's or a host's, takes the
-                // place of the table-valued function of that name. Its rows
-                // are cid, name, type, notnull, dflt_value and pk. The table's
-                // name comes from `naming::sanitize`, which keeps only
-                // `[a-z0-9_]`, so it can stand between double quotes as it is.
+                // function's place, and no table can take the statement's.
+                // Its rows are cid, name, type, notnull, dflt_value and pk.
+                // The table's name comes from `naming::sanitize`, which keeps
+                // only `[a-z0-9_]`, so it can stand between double quotes as
+                // it is.
                 let rows = c.query(&format!(r#"PRAGMA table_info("{table_name}")"#), &[])?;
-                // Changed from main, which skipped a column it could not read,
-                // and on a failed step ended the list there without an error,
-                // leaving materialized columns out of the cache. Every column
-                // is read now, or the rebuild fails.
+                // Every column is read, or the rebuild fails: a column left
+                // out of the cache would read as a missing one, NULL, in every
+                // query on it.
                 let columns: Vec<SqliteColumn> = rows
                     .iter()
                     .map(|row| Ok(SqliteColumn { name: row.text(1)?.to_owned(), data_type: row.text(2)?.to_owned() }))

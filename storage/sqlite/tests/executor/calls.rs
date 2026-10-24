@@ -5,9 +5,9 @@ use anyhow::Result;
 
 use crate::common::{self, engine_test, TempDb};
 
-/// `query_row` reads a statement's first row and no row past it, on every
-/// driver, as rusqlite's does: a later row that cannot be read fails `query`,
-/// and not `query_row`.
+/// `query_row` decodes a statement's first row and no row past it, on every
+/// driver, as rusqlite's does: a later row whose TEXT is not UTF-8 fails
+/// `query`, and not `query_row`.
 #[engine_test]
 async fn query_row_reads_no_row_past_the_first() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -107,9 +107,9 @@ async fn a_pragma_that_sets_a_value_reports_it() -> Result<()> {
 
 /// A statement read again after the schema changes reads as the schema now
 /// stands, though the Node.js executor keeps the reader it prepared for the
-/// statement: `SELECT *` gains the column its table gained, in main or in an
-/// attached database, and a TEMP table of the same name takes the table's
-/// place.
+/// statement: `SELECT *` gains the column its table gained, in the `main`
+/// database or in an attached one, and a TEMP table of the same name takes
+/// the table's place.
 #[engine_test]
 async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
     fn width_of_every_column(executor: &dyn SqliteExecutor, table: &str) -> Result<usize, SqliteError> {
@@ -126,8 +126,8 @@ async fn a_statement_read_again_follows_a_schema_change() -> Result<()> {
             executor.execute("CREATE TEMP TABLE things (a, b, c)", &[])?;
             executor.execute("INSERT INTO temp.things VALUES (1, 2, 3)", &[])?;
             let shadowed = width_of_every_column(executor, "things")?;
-            // The Node.js executor watches the schema versions of main and temp
-            // only, so its reader of the attached table fails, and is
+            // The Node.js executor watches the schema versions of `main` and
+            // `temp` only, so its reader of the attached table fails, and is
             // prepared afresh.
             executor.execute("ATTACH DATABASE ':memory:' AS aux", &[])?;
             executor.execute("CREATE TABLE aux.more (a)", &[])?;

@@ -80,7 +80,7 @@ async fn mismatched_version_refuses() -> anyhow::Result<()> {
 }
 
 /// A version record that is not TEXT fails the open with `SqliteError::Row`,
-/// on every driver, where main failed it with rusqlite's `InvalidColumnType`.
+/// on every driver.
 #[engine_test]
 async fn a_version_record_that_is_not_text_refuses() -> anyhow::Result<()> {
     let db = TempDb::new("not_text");
@@ -169,11 +169,11 @@ async fn a_table_name_the_check_cannot_read_fails_the_open() -> anyhow::Result<(
 }
 
 /// A protocol version record the engine wrote but cannot read back fails
-/// the open as `SqliteError::CorruptRecord`, where main failed it as
-/// rusqlite's QueryReturnedNoRows. The test makes the record vanish without
-/// a hook in the engine: a view takes the meta table's name, so the check's
-/// scan of tables does not list it, CREATE TABLE IF NOT EXISTS leaves it in
-/// place, and its INSTEAD OF trigger drops the record the engine inserts.
+/// the open as `SqliteError::CorruptRecord`. The test makes the record
+/// vanish without a hook in the engine: a view takes the meta table's name,
+/// so the check's scan of tables does not list it, CREATE TABLE IF NOT
+/// EXISTS leaves it in place, and its INSTEAD OF trigger drops the record
+/// the engine inserts.
 #[engine_test]
 async fn a_protocol_record_gone_after_its_write_fails_the_open() -> anyhow::Result<()> {
     let db = TempDb::new("vanished_record");

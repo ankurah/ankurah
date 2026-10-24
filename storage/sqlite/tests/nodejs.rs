@@ -1,5 +1,7 @@
-//! What only the Node.js executor offers: adopting a database the host built,
-//! and refusing an object of the wrong shape.
+//! What only the Node.js executor does: adopting a database the host built,
+//! refusing a database it cannot read exactly, and refusing the statements
+//! it cannot read as rusqlite does, such as a RETURNING statement, a named
+//! parameter, or a PRAGMA whose TEXT holds U+FFFD.
 #![cfg(target_arch = "wasm32")]
 
 mod common;
@@ -83,13 +85,14 @@ async fn refuses_a_driver_without_exact_integers() {
     assert_eq!(refusal_of(&error), refused_database(DatabaseRefusal::NoExactIntegers), "{error}");
 }
 
-// Hand over a copy of a statement of the run's driver that holds all but its
-// SQL (node:sqlite's `sourceSQL`, better-sqlite3's `source`), each method
-// bound to the actual statement, and reports `source` as its SQL unless that
-// is undefined: both drivers make the SQL a property that cannot be
-// redefined, nor hidden behind a Proxy for better-sqlite3, whose `source` is
-// a value that cannot change. `withoutStatementSource` copies every
-// statement, and `withStatementSource` the one prepared from `sql`.
+// Hand over, in place of a statement of the run's driver, a copy that holds
+// all but its SQL (node:sqlite's `sourceSQL`, better-sqlite3's `source`),
+// each method bound to the actual statement, and that reports `source` as
+// its SQL unless `source` is undefined. A copy stands in, since both drivers
+// make the SQL a property that cannot be redefined, nor, on better-sqlite3,
+// whose `source` is a value that cannot change, hidden behind a Proxy.
+// `withoutStatementSource` copies every statement, and `withStatementSource`
+// the one prepared from `sql`.
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
 function copyStatement(statement, source) {
     const copy = source === undefined ? {} : { sourceSQL: source };
@@ -146,9 +149,10 @@ fn refuses_sql_past_the_statement_the_database_reports() {
 }
 
 /// TEXT from a statement SQLite cannot nest in the typed reader, such as a
-/// PRAGMA, is read as the driver's string, and the PRAGMA's other storage
-/// classes as ever; a string holding U+FFFD, which a driver may have put in
-/// place of bytes that are not UTF-8, is refused, naming its column.
+/// PRAGMA, is read as the driver's string, and the statement's other values
+/// as their storage classes; a string holding U+FFFD, which a driver may
+/// have put in place of bytes that are not UTF-8, is refused, naming its
+/// column.
 #[wasm_bindgen_test]
 async fn text_from_a_statement_sqlite_cannot_nest_is_read_as_a_string() -> Result<()> {
     let storage = common::open_in_memory().await?;

@@ -140,13 +140,13 @@ async fn a_store_holding_a_table_named_pragma_table_info_loads_its_materializati
 }
 
 /// A materialized column whose name SQLite cannot hand over as UTF-8 TEXT
-/// fails the query that first uses its model after an open, where main left
-/// the column out of the engine's list of columns without an error, so that
-/// a query on it read as one on a missing column, NULL. SQLite never stores
-/// such a name itself; the test plants one, a lone 0xFF byte, through
-/// `writable_schema`. Natively the scan refuses the name as TEXT that is not
-/// UTF-8, as rusqlite refuses it; on Node.js the PRAGMA's TEXT arrives as the
-/// driver's string, U+FFFD in place of the byte, and is refused as such.
+/// fails the first query on its model after an open, rather than drop out
+/// of the engine's list of columns and read as a missing column, NULL.
+/// SQLite never stores such a name itself; the test plants one, a lone 0xFF
+/// byte, through `writable_schema`. Natively the scan refuses the name as
+/// TEXT that is not UTF-8, as rusqlite refuses it; on Node.js the PRAGMA's
+/// TEXT arrives as the driver's string, U+FFFD in place of the byte, and is
+/// refused as such.
 #[engine_test]
 #[cfg_attr(
     ankurah_sqlite_better_sqlite3,

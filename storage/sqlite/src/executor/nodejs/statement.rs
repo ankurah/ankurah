@@ -58,7 +58,8 @@ fn read_big_ints(statement: &JsValue) -> Result<(), SqliteError> {
 }
 
 /// Whether a statement can yield rows, as better-sqlite3 reports it in
-/// `reader`. node:sqlite's statements have no `reader`, and are taken to.
+/// `reader`. node:sqlite's statements have no `reader`, so each is taken to
+/// yield rows.
 fn yields_rows(statement: &JsValue) -> Result<bool, SqliteError> {
     Ok(Reflect::get(statement, &"reader".into()).map_err(js_error)?.as_bool() != Some(false))
 }
@@ -135,7 +136,9 @@ pub(super) enum RowSelection {
     First,
 }
 
-/// Run a statement and take the rows `selection` names.
+/// Run a statement and take its rows as arrays of `width` values: every row,
+/// or only the first, for which `get()` steps the statement once, so that
+/// `query_row` decodes no row past it.
 pub(super) fn read_rows(
     statement: &JsValue,
     params: &[SqliteValueRef<'_>],
@@ -225,7 +228,7 @@ pub(super) fn integer_from_js(value: &JsValue) -> Result<i64, SqliteError> {
         .map_err(|_| unreadable(format!("the INTEGER {value:?}, which does not fit in 64 bits")))
 }
 
-/// A method of the database object, which the refusal of one it lacks names.
+/// A method of the database object; a missing one is refused by name.
 pub(super) fn method(database: &JsValue, name: &'static str) -> Result<Function, SqliteError> {
     Reflect::get(database, &name.into())
         .map_err(js_error)?

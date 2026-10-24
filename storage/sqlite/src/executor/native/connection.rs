@@ -1,4 +1,5 @@
-//! Connection manager for bb8 pool with rusqlite
+//! Connection manager for bb8 pool with rusqlite, and the engine's pools of
+//! its connections
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -41,11 +42,11 @@ impl SqliteConnectionManager {
         // Performance optimizations
         conn.execute_batch(SESSION_PRAGMAS)?;
 
-        // A defect fix: main left double-quoted string literals on, so a
-        // double-quoted name that matched no column read as a string, in a
-        // query and in DDL alike, and a stale name read as data instead of
-        // failing. Off, such a name fails with "no such column", as it does
-        // on both Node.js drivers (see nodejs/adoption.rs).
+        // So that a stale or misspelt double-quoted column name fails with
+        // "no such column" instead of reading as the string of its name,
+        // double-quoted string literals are off, in queries and in DDL
+        // alike, as on every Node.js database the engine accepts (see
+        // nodejs/adoption.rs).
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
 

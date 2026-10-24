@@ -10,9 +10,10 @@ use crate::common::driver;
 use crate::common::{self, engine_test, TempDb};
 
 /// A connection the engine opens sets a busy timeout of five seconds, on
-/// every driver: rusqlite sets it on each connection it opens, and the Node.js
-/// executor before any other statement. That a writer then waits for
-/// another's lock is `a_writer_waits_for_a_lock_another_connection_holds`.
+/// every driver: rusqlite sets it on each connection it opens, and the
+/// Node.js executor before any other statement.
+/// `a_writer_waits_for_a_lock_another_connection_holds` tests that a writer
+/// then waits for another's lock.
 #[engine_test]
 #[cfg_attr(
     ankurah_sqlite_better_sqlite3,
@@ -25,8 +26,8 @@ async fn connections_set_a_busy_timeout_of_five_seconds() -> Result<()> {
     Ok(())
 }
 
-/// A connection the engine opens on a file takes the session settings
-/// connection.rs gives a native one, on every driver.
+/// A connection the engine opens on a file takes the session settings of a
+/// native one, on every driver.
 #[engine_test]
 #[cfg_attr(
     ankurah_sqlite_better_sqlite3,
@@ -87,7 +88,8 @@ async fn a_lock_held_past_the_busy_timeout_fails_with_sqlite_busy() -> Result<()
 )]
 async fn opening_a_store_waits_for_a_lock_on_its_file() -> Result<()> {
     let db = TempDb::new("open_waits");
-    // EXCLUSIVE in the file's first, rollback journal keeps out readers too.
+    // A new file starts in rollback-journal mode, where BEGIN EXCLUSIVE keeps
+    // out readers too.
     let holder = LockHolder::take(&db, "BEGIN EXCLUSIVE", HOLD_MS).await;
     let waited = Stopwatch::start();
     let storage = SqliteStorageEngine::open(db.path()).await?;
@@ -99,8 +101,8 @@ async fn opening_a_store_waits_for_a_lock_on_its_file() -> Result<()> {
 }
 
 /// The session settings a connection of `storage` runs with, in the order
-/// connection.rs sets them after rusqlite's busy timeout: busy timeout,
-/// journal mode, synchronous, foreign keys, cache size, mmap size, temp store.
+/// the executor sets them: busy timeout, journal mode, synchronous, foreign
+/// keys, cache size, mmap size, temp store.
 async fn session_settings(storage: &SqliteStorageEngine) -> anyhow::Result<(i64, String, i64, i64, i64, i64, i64)> {
     Ok(storage
         .with_executor(|executor| {

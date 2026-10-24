@@ -1,6 +1,6 @@
-//! What the Node.js executor needs of Node.js itself: the `process` global,
-//! and node:sqlite's `DatabaseSync`, opened with the busy timeout and the
-//! session settings of a native connection.
+//! Opening node:sqlite's `DatabaseSync` for `SqliteStorageEngine::open` and
+//! `open_in_memory`, through Node.js's `process` global, with the busy
+//! timeout and the session settings of a native connection.
 
 use js_sys::{Array, Function, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
@@ -20,11 +20,11 @@ fn nodejs_process() -> Result<JsValue, SqliteError> {
     Ok(process)
 }
 
-/// The 5000 ms busy timeout rusqlite sets on every connection as it opens
-/// it, before the connection runs any statement (node:sqlite's default is
-/// 0): a connection then waits for another's lock instead of failing at
-/// once, and on a file in a rollback journal even preparing `SELECT 1`
-/// takes a lock.
+/// So that a connection waits up to five seconds for another's lock instead
+/// of failing at once, the busy timeout rusqlite sets on every connection it
+/// opens (node:sqlite's default is 0). `open` sets it before any other
+/// statement, since on a file in a rollback journal even preparing
+/// `SELECT 1` takes a lock.
 const BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout=5000;";
 
 impl NodeJsConnection {

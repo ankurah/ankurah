@@ -276,10 +276,9 @@ impl SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         conn.with_executor(|c| {
             let rows = c.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &[])?;
-            // Changed from main, which skipped a name it could not read, and
-            // on a failed step ended the list there without an error: a list
-            // cut short could read an unversioned store as fresh and stamp it
-            // as current. Every name is read now, or the open fails.
+            // Every table name is read, or the open fails: a list cut short,
+            // or one missing a name it could not read, could take an
+            // unversioned store for a fresh one and stamp it as current.
             let tables = rows.iter().map(|row| row.text(0)).collect::<Result<Vec<_>, _>>()?;
             let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(table));
 
@@ -305,8 +304,6 @@ impl SqliteStorageEngine {
                     )?;
                     // Re-read: if another process recorded between our scan and
                     // our insert, the store must still match this binary.
-                    // Changed from main, which reported a record gone by now
-                    // as rusqlite's QueryReturnedNoRows.
                     let reread = c
                         .query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])?
                         .ok_or_else(|| SqliteError::CorruptRecord("the protocol version record vanished after it was written".into()))?;

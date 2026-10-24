@@ -1,5 +1,6 @@
-//! The checks a database a host hands over must pass before the engine runs
-//! on it.
+//! The checks a database must pass before the engine runs on it, so that a
+//! database the executor cannot read exactly is refused as the engine
+//! adopts it, rather than misread later.
 
 use std::rc::Rc;
 
@@ -17,12 +18,10 @@ use crate::{
 };
 
 impl NodeJsConnection {
-    /// Adopt a database object the host constructed: Node.js's `DatabaseSync` or
-    /// a compatible driver whose statements support positional arrays and BigInt
-    /// INTEGER results. The host owns session settings, including busy timeout.
-    /// A driver with a copy of SQLite of its own must not share a file with
-    /// another copy in the same process (see
-    /// [`SqliteStorageEngine::from_database`](crate::SqliteStorageEngine::from_database)).
+    /// Adopt a database object the host constructed, as
+    /// [`SqliteStorageEngine::from_database`](crate::SqliteStorageEngine::from_database)
+    /// does: its doc lists the databases refused, and says why the host must
+    /// not open the same file with another copy of SQLite in the process.
     pub fn from_database(database: JsValue) -> Result<Self, SqliteError> {
         if !database.is_object() {
             return Err(DatabaseRefusal::NotAnObject { found: format!("{database:?}") }.into());
@@ -63,10 +62,10 @@ impl NodeJsConnection {
             return Err(DatabaseRefusal::NotUtf8.into());
         }
         // A double-quoted name that matches no column fails with "no such
-        // column" on every connection the engine opens natively
-        // (connection.rs), so a database that reads such a name as a string
-        // literal is refused rather than let it read as data: the probe
-        // prepares only on such a database.
+        // column" on every connection the engine opens natively (see
+        // native/connection.rs), so a database that reads such a name as a
+        // string literal is refused rather than let it read as data: the
+        // probe prepares only on such a database.
         match connection.prepare(r#"SELECT "_ankurah_dqs_probe""#) {
             Ok(_) => return Err(DatabaseRefusal::DoubleQuotedStringLiterals.into()),
             Err(SqliteError::Sqlite(failure))

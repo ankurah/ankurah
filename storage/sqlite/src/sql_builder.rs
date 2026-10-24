@@ -159,10 +159,10 @@ impl SqlBuilder {
     }
 
     /// The SQL and its parameters, in the engine's own value type, which every
-    /// driver binds; `build_where_clause` returns them alike. Changed from
-    /// main, which returned rusqlite's `Value`s, a type a wasm32 build cannot
-    /// name. A native caller turns them into rusqlite's values with
-    /// `params.iter().map(SqliteValue::to_sql)`, as main's callers had them.
+    /// executor binds and a wasm32 build can name; `build_where_clause`
+    /// returns them alike. A caller that binds them through rusqlite directly
+    /// turns them into rusqlite's values with
+    /// `params.iter().map(SqliteValue::to_sql)`.
     pub fn build(self) -> Result<(String, Vec<SqliteValue>), SqlGenerationError> {
         if self.fields.is_empty() || self.table_name.is_none() {
             // Just return WHERE clause
@@ -399,9 +399,8 @@ mod tests {
         assert_eq!(params.len(), 2);
     }
 
-    /// A native caller of `build` binds its values to rusqlite after one
-    /// `.map(SqliteValue::to_sql)`, as it bound the rusqlite values main's
-    /// `build` returned.
+    /// A caller that binds `build`'s values through rusqlite directly
+    /// converts them with one `.map(SqliteValue::to_sql)`.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn built_values_bind_to_rusqlite_through_to_sql() {

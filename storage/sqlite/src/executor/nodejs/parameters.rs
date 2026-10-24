@@ -18,9 +18,10 @@ use crate::{
     value::SqliteValueRef,
 };
 
-/// On a database that binds NULL for a positional parameter a call does not
-/// pass, how many values each SQL text's statement was shown to take at
-/// most, by that text (see `refuse_too_few_values`).
+/// So that a statement run again skips the probe of its parameters, the
+/// count of values shown to be enough for each SQL text's statement, kept on
+/// a database that binds NULL for a parameter a call leaves out (see
+/// `refuse_too_few_values`).
 pub(super) type ParameterCounts = Rc<RefCell<HashMap<String, usize>>>;
 
 /// How many SQL texts' parameter counts a connection keeps; past that it
@@ -48,14 +49,15 @@ impl NodeJsConnection {
 
     /// Whether the database binds a call's values to a numbered parameter
     /// such as `?2` at its position, as rusqlite does: node:sqlite does from
-    /// Node.js 22.20.0 on 22 and 24.7.0 on 24, and on every later line. Before,
-    /// it skipped each numbered parameter as it bound a call's values in turn,
-    /// so that `?, ?3` given two values left `?3` NULL, and the check of a
-    /// call's values (`refuse_too_few_values`) misjudged it. Checking the
-    /// binding itself, rather than the version, holds for every release line
-    /// and build: given two values, `SELECT ?2` reads the second where the
-    /// binding is right, and where it skips `?2`, its second value lands past
-    /// the statement's last parameter, which SQLite refuses (SQLITE_RANGE).
+    /// Node.js 22.20.0 on 22 and 24.7.0 on 24, and on every later line.
+    /// Earlier releases skip each numbered parameter as they bind a call's
+    /// values in turn, so that `?, ?3` given two values leaves `?3` NULL, and
+    /// the check of a call's values (`refuse_too_few_values`) misjudges it.
+    /// The check reads the binding itself, so that it holds on every release
+    /// line and build, whatever the version: given two values, `SELECT ?2`
+    /// reads the second where the binding is right, and where it skips `?2`,
+    /// its second value lands past the statement's last parameter, which
+    /// SQLite refuses (SQLITE_RANGE).
     pub(super) fn binds_a_numbered_parameter_at_its_position(&self) -> Result<bool, SqliteError> {
         let statement = self.prepare("SELECT ?2")?;
         match read_rows(&statement, &[SqliteValueRef::Integer(1), SqliteValueRef::Integer(2)], 1, RowSelection::First) {

@@ -3,7 +3,9 @@
 //! (node:sqlite decodes them only up to the first NUL), where rusqlite hands
 //! over the bytes themselves. So a query reads its statement through a typed
 //! reader that takes TEXT as the bytes of a BLOB, and decodes them as
-//! strictly as rusqlite does (see `typed_reader`).
+//! strictly as rusqlite does (see `typed_reader`). The reader's nesting can
+//! change a compound SELECT's values, so the check that refuses such a
+//! SELECT lives here too.
 
 use js_sys::Array;
 
@@ -29,9 +31,9 @@ pub(super) struct TypedReader {
 /// statement nested in a WITH clause, and each of its columns read as two,
 /// the value's storage class from `typeof()` and the value itself, TEXT cast
 /// to the BLOB of its bytes. MATERIALIZED has SQLite compute each value once,
-/// so that the class and the value read are of the same one; SQLite keeps a
-/// nested ORDER BY when the query around it has none, and a materialized
-/// statement's rows are read in the order it yielded them.
+/// so that `typeof()` and the value read come from one evaluation; SQLite
+/// keeps a nested ORDER BY when the query around it has none, and a
+/// materialized statement's rows are read in the order it yielded them.
 pub(super) fn typed_reader(statement: &str, width: usize) -> TypedReader {
     // A statement's source keeps the semicolon that ended it, which a nested
     // statement cannot have.
@@ -103,21 +105,24 @@ pub(super) fn plain_row(row: Array) -> Result<Row, SqliteError> {
 impl NodeJsConnection {
     /// Refuse a compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the
     /// top level of a query, or as the SELECT of a scalar subquery there,
-    /// before it runs. Nested in the typed reader, each column of the query
-    /// takes an affinity, which can change a value: a compound's column takes
-    /// its first SELECT's, and a scalar subquery takes its last SELECT's,
-    /// whichever SELECT the value came from, so that an INTEGER past 2^53
-    /// read through a REAL one reads as the nearest REAL, and a small one as
-    /// a REAL. rusqlite reads each value as SQLite computed it. A compound in
-    /// a subquery or a CTE that SQLite does not flatten into the query, which
-    /// the plan shows under a CO-ROUTINE or a MATERIALIZE, takes its first
-    /// SELECT's affinity natively too, and a compound in an IN has its values
-    /// only compared, so both are let through. The plan does not show whether
-    /// a scalar subquery computes a column of the query, so one that computes
-    /// a value no row holds, in a WHERE clause or as an EXISTS, is refused
-    /// too. SQLite's plan shows a compound as a COMPOUND QUERY, or as a MERGE
-    /// when SQLite codes it as a merge of its SELECTs, as it does under an
-    /// ORDER BY and, in SQLite 3.53, for UNION, INTERSECT and EXCEPT.
+    /// before it runs, since the typed reader could change one of its values.
+    /// Nested in the typed reader, each column of the query takes an
+    /// affinity: a compound's column takes its first SELECT's, and a scalar
+    /// subquery takes its last SELECT's, whichever SELECT the value came
+    /// from. So an INTEGER past 2^53 read through a REAL one reads as the
+    /// nearest REAL, and a small one as a REAL, where rusqlite reads each
+    /// value as SQLite computed it. SQLite's query plan says where a compound
+    /// stands, so one in a subquery that SQLite flattens into the query is
+    /// refused as one at its top level. A compound in a subquery or a CTE
+    /// that SQLite does not flatten, which the plan shows under a CO-ROUTINE
+    /// or a MATERIALIZE, takes its first SELECT's affinity natively too, and
+    /// a compound in an IN has its values only compared, so both are let
+    /// through. The plan does not show whether a scalar subquery computes a
+    /// column of the query, so one that computes a value no row holds, in a
+    /// WHERE clause or as an EXISTS, is refused too. The plan shows a
+    /// compound as a COMPOUND QUERY, or as a MERGE when SQLite codes it as a
+    /// merge of its SELECTs, as it does under an ORDER BY and, in SQLite
+    /// 3.53, for UNION, INTERSECT and EXCEPT.
     pub(super) fn refuse_a_compound_select(&self, statement: &str, params: &[SqliteValueRef<'_>]) -> Result<(), SqliteError> {
         // Each step of the plan is id, parent, notused, detail. better-sqlite3
         // plans a statement only with its parameters bound.

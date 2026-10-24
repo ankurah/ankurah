@@ -5,7 +5,8 @@
 # If no package name is provided, runs tests for all discovered wasm packages
 # (in headless Chrome) and then ankurah-storage-sqlite's suite on node:sqlite (in Node.js)
 # browser runs only the discovered packages, in headless Chrome
-# storage_sqlite_better_sqlite3 runs that suite again on better-sqlite3, which
+# storage_sqlite_node_sqlite runs only ankurah-storage-sqlite's suite, on node:sqlite
+# storage_sqlite_better_sqlite3 runs that suite on better-sqlite3, which
 # `npm ci` in storage/sqlite/tests installs
 # Use --discover to only show discovered packages without running tests
 

@@ -7,11 +7,11 @@ use anyhow::Result;
 use crate::common::{self, engine_test};
 
 /// SQL that holds a second statement is refused before either runs, on
-/// every driver, where rusqlite and node:sqlite ran the first and ignored the
-/// rest. Whitespace, semicolons and comments after a statement are no second
-/// statement, except that better-sqlite3 refuses a query with a comment after
-/// its semicolon (see `SqliteExecutor`); a byte SQLite cannot read after it
-/// is.
+/// every driver, where rusqlite and node:sqlite on their own run the first
+/// and ignore the rest. Whitespace, semicolons and comments after a
+/// statement are no second statement, except that better-sqlite3 refuses a
+/// query with a comment after its semicolon (see `SqliteExecutor`); a byte
+/// SQLite cannot read after it is.
 #[engine_test]
 async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -88,11 +88,11 @@ async fn a_refused_string_of_two_statements_changes_no_setting() -> Result<()> {
     Ok(())
 }
 
-/// What SQLite skips around a statement includes a UTF-8 byte order mark,
-/// semicolons and comments, before a PRAGMA as before a query, which
-/// `query` and `query_row` alike read past it, on every driver: the Node.js
-/// executor nests the query past it in its typed reader. better-sqlite3
-/// alone refuses a byte order mark after a statement, in its own words.
+/// `query` and `query_row` read past what SQLite skips before a statement,
+/// a UTF-8 byte order mark, semicolons and comments among it, on every
+/// driver, before a PRAGMA just as before a query: the Node.js executor nests
+/// the query past it in its typed reader. better-sqlite3 alone refuses a
+/// byte order mark after a statement, in its own words.
 #[engine_test]
 async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Result<()> {
     let storage = common::open_in_memory().await?;
