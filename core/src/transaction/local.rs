@@ -239,8 +239,7 @@ impl Transaction {
             }
             source.publish(&changes, true);
             changes.retain(|change| !change.events().is_empty());
-            let failures = node.reactor.notify_change(changes).await;
-            node.live_queries.fail_notifications(&failures);
+            node.notify_reactor(changes).await;
             Ok(attested_events.into_iter().map(|event| event.payload).collect())
         })
     }

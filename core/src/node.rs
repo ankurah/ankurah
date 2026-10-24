@@ -915,6 +915,16 @@ where
 
         Ok(())
     }
+
+    /// Notify the reactor of applied changes and fail every live query whose notification could
+    /// not prove its events' history, so that no query believes it is current after a failed
+    /// proof. Returns the failures for a caller that reacts to them further.
+    pub(crate) async fn notify_reactor<C>(&self, changes: Vec<C>) -> Vec<crate::reactor::NotificationFailure>
+    where C: crate::reactor::ChangeNotification<Entity = crate::entity::Entity, Event = Attested<proto::Event>> {
+        let failures = self.reactor.notify_change(changes).await;
+        self.live_queries.fail_notifications(&failures);
+        failures
+    }
 }
 
 impl<SE, PA> Drop for NodeInner<SE, PA>
