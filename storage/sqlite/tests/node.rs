@@ -115,6 +115,25 @@ async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
     Ok(())
 }
 
+/// A database that reads a double-quoted name that matches no column as a
+/// string literal is refused, since the engine refuses such a name on every
+/// connection it opens natively; node:sqlite's DatabaseSync reads them so
+/// when constructed with `enableDoubleQuotedStringLiterals`.
+#[wasm_bindgen_test]
+fn refuses_a_database_that_reads_double_quoted_names_as_strings() {
+    // better-sqlite3 is built with double-quoted string literals off, and
+    // offers no way to turn them on.
+    if on_better_sqlite3() {
+        return;
+    }
+    let construct = Function::new_no_args(
+        "const { DatabaseSync } = process.getBuiltinModule('node:sqlite');
+         return new DatabaseSync(':memory:', { enableDoubleQuotedStringLiterals: true });",
+    );
+    let error = NodeConnection::from_database(construct.call0(&JsValue::NULL).unwrap()).err().expect("the database is refused");
+    assert!(error.to_string().contains("enableDoubleQuotedStringLiterals"), "{error}");
+}
+
 #[wasm_bindgen_test]
 fn refuses_a_utf16_database() {
     let database = host_database(":memory:");

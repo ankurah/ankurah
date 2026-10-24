@@ -145,6 +145,23 @@ impl NodeConnection {
                 "the database's text encoding is not UTF-8, and the node executor reads TEXT as UTF-8 bytes".into(),
             ));
         }
+        // A double-quoted name that matches no column fails with "no such
+        // column" on every connection the engine opens natively
+        // (connection.rs), so a database that reads such a name as a string
+        // literal is refused rather than let it read as data: the probe
+        // prepares only on such a database.
+        match connection.prepare(r#"SELECT "_ankurah_dqs_probe""#) {
+            Ok(_) => {
+                return Err(SqliteError::Node(
+                    "the database reads a double-quoted name that matches no column as a string literal, where the engine \
+                     refuses such a name: turn double-quoted string literals off (node:sqlite's DatabaseSync has them off \
+                     unless it is constructed with `enableDoubleQuotedStringLiterals: true`)"
+                        .into(),
+                ));
+            }
+            Err(refusal) if refusal.to_string().contains("no such column") && refusal.to_string().contains("_ankurah_dqs_probe") => {}
+            Err(error) => return Err(error),
+        }
         Ok(connection)
     }
 

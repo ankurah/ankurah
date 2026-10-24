@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rusqlite::Connection;
+use rusqlite::{config::DbConfig, Connection};
 use tokio::sync::Mutex;
 
 use crate::error::SqliteError;
@@ -47,6 +47,14 @@ impl SqliteConnectionManager {
              PRAGMA mmap_size=268435456;
              PRAGMA temp_store=MEMORY;",
         )?;
+
+        // A defect fix: main left double-quoted string literals on, so a
+        // double-quoted name that matched no column read as a string, in a
+        // query and in DDL alike, and a stale name read as data instead of
+        // failing. Off, such a name fails with "no such column", as it does
+        // on both Node drivers (see node.rs).
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
 
         Ok(conn)
     }

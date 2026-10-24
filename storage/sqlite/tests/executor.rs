@@ -271,6 +271,32 @@ async fn errors_carry_sqlite_s_extended_result_code() -> Result<()> {
     Ok(())
 }
 
+/// A double-quoted name that matches no column is refused, in a query and in
+/// DDL, on every driver, rather than read as the string literal SQLite makes
+/// of it where double-quoted string literals are on.
+#[engine_test]
+async fn a_double_quoted_name_that_matches_no_column_is_refused() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let refusals = storage
+        .with_executor(|executor| {
+            executor.execute(r#"CREATE TABLE things ("present" TEXT)"#, &[])?;
+            executor.execute("INSERT INTO things VALUES ('x')", &[])?;
+            Ok([
+                executor.query(r#"SELECT "missing" FROM things"#, &[]).map(|rows| rows.len()),
+                executor.execute(r#"CREATE INDEX things_missing ON things ("missing")"#, &[]),
+            ]
+            .map(|outcome| outcome.map_err(|error| (error.sqlite_code(), error.to_string()))))
+        })
+        .await?;
+    for refusal in refusals {
+        let (code, message) = refusal.expect_err("the name matches no column");
+        assert!(message.contains(r#"no such column: "missing""#), "{message}");
+        // SQLITE_ERROR, which better-sqlite3 names without its number.
+        assert_eq!(code, if common::on_better_sqlite3() { None } else { Some(1) });
+    }
+    Ok(())
+}
+
 /// A connection the engine opens on a file takes the session settings
 /// connection.rs gives a native one, on every driver.
 #[engine_test]
