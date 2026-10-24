@@ -24,23 +24,21 @@ impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
         query_id: proto::QueryId,
         rows: &mut ResultSetWrite<'_, E>,
         answer: Vec<E>,
-        membership: Option<&RemoteMembership>,
+        membership: &RemoteMembership,
         predicate: &Predicate<Resolved>,
         initial_baseline: bool,
         reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>,
     ) -> (Vec<E>, Vec<proto::EntityId>) {
-        let mut entered = Vec::new();
-        let mut left = Vec::new();
         let before: IndexMap<_, _> = rows.iter_entities().map(|(id, entity)| (id, entity.clone())).collect();
         // Start from the rows visible now, under the notification lock: they include every local
         // or other-query change notified since the requester took the snapshot it offered.
         let mut included: IndexMap<_, _> = before
             .iter()
-            .filter(|(id, _)| membership.is_some_and(|membership| !membership.offered.contains(id) && !membership.absent.contains(id)))
+            .filter(|(id, _)| !membership.offered.contains(id) && !membership.absent.contains(id))
             .map(|(id, entity)| (*id, entity.clone()))
             .collect();
         for entity in answer {
-            if membership.is_none_or(|membership| !membership.absent.contains(&entity.id())) && self.source.admits_query_entity(&entity) {
+            if !membership.absent.contains(&entity.id()) && self.source.admits_query_entity(&entity) {
                 included.insert(entity.id(), entity);
             }
         }
@@ -48,24 +46,22 @@ impl<E: AbstractEntity + Filterable + Send + 'static> QueryState<E> {
             .into_values()
             .filter(|entity| {
                 self.source.can_read(entity)
-                    && (membership.is_some_and(|membership| membership.held.contains(&entity.id()) && before.contains_key(&entity.id()))
+                    && ((membership.held.contains(&entity.id()) && before.contains_key(&entity.id()))
                         || evaluate_predicate(entity, predicate).unwrap_or(false))
             })
             .collect();
-        // Replace as a set before applying its order/limit. Adding to the
-        // old limited set first could evict an authoritative new member.
-        if let Some(membership) = membership {
-            rows.replace_all_preserving_keys(included, &membership.held);
-        } else {
-            rows.replace_all(included);
-        }
+        // Replace as a set before applying its order/limit. Adding to the old limited set first
+        // could evict a new member the answer admits.
+        rows.replace_all_preserving_keys(included, &membership.held);
+        let entered_as = if initial_baseline { MembershipChange::Initial } else { MembershipChange::Add };
+        let mut entered = Vec::new();
         for (id, entity) in rows.iter_entities() {
             if !before.contains_key(&id) {
-                let change = if membership.is_some() && !initial_baseline { MembershipChange::Add } else { MembershipChange::Initial };
-                reactor_updates.push(membership_item(entity, query_id, change));
+                reactor_updates.push(membership_item(entity, query_id, entered_as.clone()));
                 entered.push(entity.clone());
             }
         }
+        let mut left = Vec::new();
         for (id, entity) in before {
             if !rows.contains(&id) {
                 left.push(id);

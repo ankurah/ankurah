@@ -893,9 +893,12 @@ async fn completed_live_jobs_for_one_entity_keep_both_event_notifications() -> a
             Arc::new(QueryGapFetcher::new(context.clone())),
             1,
             (),
-            vec![entity.clone()],
-            crate::reactor::RemoteMembership::default(),
-            vec![],
+            crate::reactor::RemoteInstall {
+                entities: vec![entity.clone()],
+                membership: crate::reactor::RemoteMembership::default(),
+                changes: vec![],
+                complete: true,
+            },
         )
         .await?;
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1113,9 +1116,15 @@ async fn first_peer_install_uses_captured_head_for_event_baseline_not_newer_enti
             Arc::new(QueryGapFetcher::new(context)),
             1,
             (),
-            vec![entity.clone()],
-            crate::reactor::RemoteMembership { known_heads: [(entity.id(), baseline)].into_iter().collect(), ..Default::default() },
-            vec![],
+            crate::reactor::RemoteInstall {
+                entities: vec![entity.clone()],
+                membership: crate::reactor::RemoteMembership {
+                    known_heads: [(entity.id(), baseline)].into_iter().collect(),
+                    ..Default::default()
+                },
+                changes: vec![],
+                complete: true,
+            },
         )
         .await?;
     let received = Arc::new(std::sync::Mutex::new(Vec::new()));

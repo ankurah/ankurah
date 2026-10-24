@@ -70,9 +70,7 @@ async fn stream_admission_survives_late_data_and_readable_removals_still_notify(
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![entity.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![entity.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -91,14 +89,17 @@ async fn stream_admission_survives_late_data_and_readable_removals_still_notify(
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![],
-            RemoteMembership {
-                offered: [entity.id].into_iter().collect(),
-                absent: HashSet::new(),
-                held: HashSet::new(),
-                known_heads: HashMap::new(),
+            RemoteInstall {
+                entities: vec![],
+                membership: RemoteMembership {
+                    offered: [entity.id].into_iter().collect(),
+                    absent: HashSet::new(),
+                    held: HashSet::new(),
+                    known_heads: HashMap::new(),
+                },
+                changes: vec![],
+                complete: true,
             },
-            vec![],
         )
         .await
         .unwrap();
@@ -143,9 +144,7 @@ async fn changes_from_a_replaced_stream_cannot_change_the_query_membership() {
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -227,9 +226,12 @@ async fn a_complete_answer_removes_omitted_offered_rows_and_keeps_later_local_ad
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![arrival.clone()],
-            RemoteMembership { offered, ..Default::default() },
-            vec![],
+            RemoteInstall {
+                entities: vec![arrival.clone()],
+                membership: RemoteMembership { offered, ..Default::default() },
+                changes: vec![],
+                complete: true,
+            },
         )
         .await
         .unwrap();
@@ -264,9 +266,7 @@ async fn a_partial_answer_keeps_rows_other_operations_added() {
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![arrival.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![arrival.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
     };
     install().await.unwrap();
@@ -295,9 +295,12 @@ async fn an_absence_removes_a_local_addition_and_later_stream_data_cannot_restor
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![arrival.clone()],
-            RemoteMembership { absent, ..Default::default() },
-            vec![],
+            RemoteInstall {
+                entities: vec![arrival.clone()],
+                membership: RemoteMembership { absent, ..Default::default() },
+                changes: vec![],
+                complete: true,
+            },
         )
     };
     install(HashSet::new()).await.unwrap();
@@ -370,9 +373,7 @@ async fn finite_baseline_state_changes_preserve_sorted_initial_and_add_notificat
                     Arc::new(MockGapFetcher::new()),
                     1,
                     (),
-                    rows.to_vec(),
-                    RemoteMembership::default(),
-                    changes,
+                    RemoteInstall { entities: rows.to_vec(), membership: RemoteMembership::default(), changes: changes, complete: true },
                 )
                 .await
                 .unwrap();
@@ -396,11 +397,6 @@ async fn finite_baseline_state_changes_preserve_sorted_initial_and_add_notificat
 
 #[tokio::test]
 async fn explicit_live_publication_preserves_change_order_and_causing_events() {
-    struct Partial;
-    impl PreNotifyHook for Partial {
-        fn marks_loaded(&self) -> bool { false }
-        fn pre_notify(&self, _: u32) {}
-    }
     let reactor = Reactor::<TestEntity, TestEvent>::new_test();
     let subscription = reactor.subscribe();
     let query = QueryId::new();
@@ -420,13 +416,16 @@ async fn explicit_live_publication_preserves_change_order_and_causing_events() {
             resultset.clone(),
             Arc::new(MockGapFetcher::new()),
             1,
-            Partial,
-            vec![first.clone(), second.clone()],
-            RemoteMembership::default(),
-            vec![
-                ReactorUpdateItem { entity: second.clone(), events: vec![event.clone()], predicate_relevance: vec![] },
-                ReactorUpdateItem { entity: first.clone(), events: vec![], predicate_relevance: vec![] },
-            ],
+            (),
+            RemoteInstall {
+                entities: vec![first.clone(), second.clone()],
+                membership: RemoteMembership::default(),
+                changes: vec![
+                    ReactorUpdateItem { entity: second.clone(), events: vec![event.clone()], predicate_relevance: vec![] },
+                    ReactorUpdateItem { entity: first.clone(), events: vec![], predicate_relevance: vec![] },
+                ],
+                complete: false,
+            },
         )
         .await
         .unwrap();
@@ -461,9 +460,7 @@ async fn finite_remote_install_notifies_an_existing_state_advance_without_histor
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![entity.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![entity.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -480,9 +477,12 @@ async fn finite_remote_install_notifies_an_existing_state_advance_without_histor
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![entity.clone()],
-            RemoteMembership { offered: [entity.id].into_iter().collect(), ..Default::default() },
-            vec![ReactorUpdateItem { entity, events: vec![], predicate_relevance: vec![] }],
+            RemoteInstall {
+                entities: vec![entity.clone()],
+                membership: RemoteMembership { offered: [entity.id].into_iter().collect(), ..Default::default() },
+                changes: vec![ReactorUpdateItem { entity, events: vec![], predicate_relevance: vec![] }],
+                complete: true,
+            },
         )
         .await
         .unwrap();
@@ -527,9 +527,7 @@ async fn owner_publication_reports_callback_before_return_without_local_gap_work
             gap.clone(),
             1,
             (),
-            vec![first.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![first.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -562,9 +560,7 @@ async fn owner_publication_reports_callback_before_return_without_local_gap_work
             gap,
             1,
             (),
-            vec![replacement.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![replacement.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -588,11 +584,6 @@ async fn owner_publication_reports_callback_before_return_without_local_gap_work
 
 #[tokio::test]
 async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_are_add() {
-    struct Partial;
-    impl PreNotifyHook for Partial {
-        fn marks_loaded(&self) -> bool { false }
-        fn pre_notify(&self, _: u32) {}
-    }
     let reactor = Reactor::<TestEntity, TestEvent>::new_test();
     let subscription = reactor.subscribe();
     let query = QueryId::new();
@@ -629,9 +620,7 @@ async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![arrival.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![arrival.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -649,10 +638,8 @@ async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_
             resultset.clone(),
             Arc::new(MockGapFetcher::new()),
             2,
-            Partial,
-            vec![],
-            RemoteMembership::default(),
-            vec![],
+            (),
+            RemoteInstall { entities: vec![], membership: RemoteMembership::default(), changes: vec![], complete: false },
         )
         .await
         .unwrap();
@@ -667,10 +654,13 @@ async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_
             resultset.clone(),
             Arc::new(MockGapFetcher::new()),
             2,
-            Partial,
-            vec![live.clone()],
-            RemoteMembership::default(),
-            vec![ReactorUpdateItem { entity: live, events: vec![event.clone()], predicate_relevance: vec![] }],
+            (),
+            RemoteInstall {
+                entities: vec![live.clone()],
+                membership: RemoteMembership::default(),
+                changes: vec![ReactorUpdateItem { entity: live, events: vec![event.clone()], predicate_relevance: vec![] }],
+                complete: false,
+            },
         )
         .await
         .unwrap();
@@ -691,9 +681,7 @@ async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_
             Arc::new(MockGapFetcher::new()),
             2,
             (),
-            vec![baseline],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![baseline], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -711,10 +699,8 @@ async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_
             resultset.clone(),
             Arc::new(MockGapFetcher::new()),
             2,
-            Partial,
-            vec![],
-            RemoteMembership::default(),
-            vec![],
+            (),
+            RemoteInstall { entities: vec![], membership: RemoteMembership::default(), changes: vec![], complete: false },
         )
         .await
         .unwrap();
@@ -729,9 +715,7 @@ async fn replaced_selection_baseline_is_initial_but_live_and_reconnect_arrivals_
             Arc::new(MockGapFetcher::new()),
             2,
             (),
-            vec![reconnected],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![reconnected], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -757,9 +741,7 @@ async fn pending_publication_preserves_visible_predicate_and_sort_until_joint_co
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![exiting.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![exiting.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -779,14 +761,17 @@ async fn pending_publication_preserves_visible_predicate_and_sort_until_joint_co
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![exiting.clone(), entrant.clone()],
-            RemoteMembership {
-                offered: [exiting.id].into_iter().collect(),
-                absent: HashSet::new(),
-                held: [exiting.id].into_iter().collect(),
-                known_heads: HashMap::new(),
+            RemoteInstall {
+                entities: vec![exiting.clone(), entrant.clone()],
+                membership: RemoteMembership {
+                    offered: [exiting.id].into_iter().collect(),
+                    absent: HashSet::new(),
+                    held: [exiting.id].into_iter().collect(),
+                    known_heads: HashMap::new(),
+                },
+                changes: vec![],
+                complete: true,
             },
-            vec![],
         )
         .await
         .unwrap();
@@ -822,14 +807,17 @@ async fn pending_publication_preserves_visible_predicate_and_sort_until_joint_co
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![entrant.clone()],
-            RemoteMembership {
-                offered: HashSet::new(),
-                absent: [exiting.id].into_iter().collect(),
-                held: HashSet::new(),
-                known_heads: HashMap::new(),
+            RemoteInstall {
+                entities: vec![entrant.clone()],
+                membership: RemoteMembership {
+                    offered: HashSet::new(),
+                    absent: [exiting.id].into_iter().collect(),
+                    held: HashSet::new(),
+                    known_heads: HashMap::new(),
+                },
+                changes: vec![ReactorUpdateItem { entity: exiting.clone(), events: vec![event.clone()], predicate_relevance: vec![] }],
+                complete: true,
             },
-            vec![ReactorUpdateItem { entity: exiting.clone(), events: vec![event.clone()], predicate_relevance: vec![] }],
         )
         .await
         .unwrap();
@@ -862,9 +850,7 @@ async fn local_optimistic_member_can_enter_a_remote_sorted_limit() {
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![remote_row.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![remote_row.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();
@@ -886,9 +872,7 @@ async fn local_optimistic_member_can_enter_a_remote_sorted_limit() {
             Arc::new(MockGapFetcher::new()),
             1,
             (),
-            vec![remote_row.clone()],
-            RemoteMembership::default(),
-            vec![],
+            RemoteInstall { entities: vec![remote_row.clone()], membership: RemoteMembership::default(), changes: vec![], complete: true },
         )
         .await
         .unwrap();

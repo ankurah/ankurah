@@ -170,15 +170,18 @@ impl LiveQueryInner {
                 source,
                 version,
                 RemoteActivation { query: self, origin, canceled, complete },
-                entities,
-                membership,
-                changes
-                    .into_iter()
-                    .map(|change| {
-                        let (entity, events) = change.into_parts();
-                        crate::reactor::ReactorUpdateItem { entity, events, predicate_relevance: vec![] }
-                    })
-                    .collect(),
+                crate::reactor::RemoteInstall {
+                    entities,
+                    membership,
+                    changes: changes
+                        .into_iter()
+                        .map(|change| {
+                            let (entity, events) = change.into_parts();
+                            crate::reactor::ReactorUpdateItem { entity, events, predicate_relevance: vec![] }
+                        })
+                        .collect(),
+                    complete,
+                },
             )
             .await?;
         if canceled() || !self.remote_stream_current(version, origin) {
@@ -257,8 +260,6 @@ struct RemoteActivation<'a> {
 
 impl crate::reactor::PreNotifyHook for RemoteActivation<'_> {
     fn is_current(&self, version: u32) -> bool { !(self.canceled)() && self.query.remote_stream_current(version, self.origin) }
-
-    fn marks_loaded(&self) -> bool { self.complete }
 
     fn pre_notify(&self, version: u32) {
         let state = self.query.version_lock.lock().unwrap_or_else(|error| error.into_inner());

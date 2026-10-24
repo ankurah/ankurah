@@ -13,7 +13,7 @@ mod watcherset;
 pub use self::remote_query::QueryOrigin;
 pub(crate) use self::{
     candidate_changes::CandidateChanges,
-    remote_query::RemoteMembership,
+    remote_query::{RemoteInstall, RemoteMembership},
     subscription::{ReactorSubscription, ReactorSubscriptionId},
     update::{MembershipChange, ReactorUpdate, ReactorUpdateItem},
     watcherset::{WatcherChange, WatcherSet},
@@ -26,7 +26,7 @@ use crate::{
     entity::Entity,
     error::{RetrievalError, SubscriptionError},
     indexing::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder},
-    reactor::{subscription::ReactorSubInner, subscription_state::Subscription, watcherset::WatcherOp},
+    reactor::{delivery::DeliveredHeads, subscription::ReactorSubInner, subscription_state::Subscription, watcherset::WatcherOp},
     resultset::EntityResultSet,
     selection::filter::Filterable,
     value::{Value, ValueType},
@@ -97,8 +97,6 @@ pub trait ChangeNotification: std::fmt::Debug + std::fmt::Display {
 /// Hook trait for performing actions before notification is sent
 pub trait PreNotifyHook {
     fn is_current(&self, _version: u32) -> bool { true }
-    /// Partial peer updates may publish membership before initialization finishes.
-    fn marks_loaded(&self) -> bool { true }
     fn pre_notify(&self, version: u32);
 }
 
@@ -308,11 +306,14 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         version: u32,
         pre_notify_hook: H,
     ) -> anyhow::Result<()> {
-        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None, None, vec![])
+        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, None)
             .await
             .map(|_| ())
     }
 
+    /// Install or update a query, notifying its owner before listeners, and return the ids a
+    /// remote installation notified. A local installation reads its rows from local storage and
+    /// refills a LIMIT window from it; a remote one installs its stream's answer.
     async fn install_query<H: PreNotifyHook>(
         &self,
         subscription_id: ReactorSubscriptionId,
@@ -323,13 +324,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
         version: u32,
         pre_notify_hook: H,
-        entities: Option<Vec<E>>,
-        membership: Option<RemoteMembership>,
-        mut changes: Vec<ReactorUpdateItem<E, Ev>>,
+        remote: Option<RemoteInstall<E, Ev>>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
-        let authoritative = entities.is_some();
-        let included_entities = match entities {
-            Some(entities) => entities,
+        let local_entities = match remote {
+            Some(_) => Vec::new(),
             None => node.fetch_entities_from_local(&selection).await?,
         };
         if !pre_notify_hook.is_current(version) {
@@ -347,61 +345,36 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         }
 
         let is_new = subscription.ensure_query_registered(query_id, resultset.clone(), gap_fetcher, node.clone());
-
-        changes.retain(|change| node.can_read(&change.entity));
-        let carried_events: HashSet<_> =
-            changes.iter().filter(|change| !change.events.is_empty()).map(|change| change.entity.id()).collect();
-        let empty_baseline = HashMap::new();
-        let delivered = subscription
-            .filter_query_events(
-                query_id,
-                &mut changes,
-                membership.as_ref().map(|m| &m.known_heads).unwrap_or(&empty_baseline),
-                self.0.history.as_deref(),
-            )
-            .await?;
-        let mut reactor_update_items = Vec::new();
-        subscription.update_query(
-            query_id,
-            selection.clone(),
-            included_entities,
-            version,
-            &mut reactor_update_items,
-            authoritative,
-            membership.as_ref(),
-            pre_notify_hook.marks_loaded(),
-        )?;
-
-        let mut reactor_update_items = remote_query::merge_carried_changes(
-            reactor_update_items,
-            changes,
-            &carried_events,
-            node.as_ref(),
-            &resultset,
-            pre_notify_hook.marks_loaded(),
-        );
-
-        let _notify = if authoritative {
-            resultset.clear_gap_dirty();
-            notify
-        } else {
-            drop(notify);
-            subscription.fill_gaps_for_query(query_id, &mut reactor_update_items).await;
-            self.0.notify_lock.lock().await
+        let complete = remote.as_ref().is_none_or(|remote| remote.complete);
+        let remote_install = remote.is_some();
+        let (reactor_update_items, delivered, _notify) = match remote {
+            Some(remote) => {
+                let (items, delivered) = self
+                    .apply_remote_answer(&subscription, query_id, selection.clone(), node.as_ref(), &resultset, version, remote)
+                    .await?;
+                resultset.clear_gap_dirty();
+                (items, delivered, notify)
+            }
+            None => {
+                let mut items = Vec::new();
+                subscription.update_query(query_id, selection.clone(), local_entities, version, &mut items, None, true)?;
+                drop(notify);
+                subscription.fill_gaps_for_query(query_id, &mut items).await;
+                (items, DeliveredHeads::default(), self.0.notify_lock.lock().await)
+            }
         };
         if !pre_notify_hook.is_current(version) {
             return Ok(HashSet::new());
         }
 
-        if pre_notify_hook.marks_loaded() {
+        if complete {
             resultset.set_loaded(true);
         }
         subscription.commit_query_events(query_id, delivered);
         pre_notify_hook.pre_notify(version);
         #[cfg(test)]
         self.pause_publication_if_requested(&selection).await;
-        let notified =
-            if membership.is_some() { reactor_update_items.iter().map(|item| item.entity.id()).collect() } else { HashSet::new() };
+        let notified = if remote_install { reactor_update_items.iter().map(|item| item.entity.id()).collect() } else { HashSet::new() };
         if is_new || !reactor_update_items.is_empty() {
             subscription.send_update(reactor_update_items);
         }

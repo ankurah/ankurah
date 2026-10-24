@@ -3,11 +3,11 @@
 //! only the query that owns the stream.
 
 use super::{
-    AbstractEntity, CandidateChanges, ChangeNotification, GapFetcher, LocalEntitySource, PreNotifyHook, Reactor, ReactorEvent,
-    ReactorSubscriptionId, ReactorUpdateItem,
+    delivery::DeliveredHeads, subscription_state::Subscription, AbstractEntity, CandidateChanges, ChangeNotification, GapFetcher,
+    LocalEntitySource, PreNotifyHook, Reactor, ReactorEvent, ReactorSubscriptionId, ReactorUpdateItem,
 };
 use crate::{resultset::EntityResultSet, selection::filter::Filterable};
-use ankql::ast::Resolved;
+use ankql::ast::{Resolved, Selection};
 use ankurah_proto as proto;
 use std::{
     collections::{HashMap, HashSet},
@@ -43,6 +43,18 @@ pub(crate) struct RemoteMembership {
     pub known_heads: HashMap<proto::EntityId, proto::Clock>,
 }
 
+/// One answer from a remote stream, to install into its query.
+pub(crate) struct RemoteInstall<E, Ev> {
+    /// The local entities for the ids the stream admitted.
+    pub entities: Vec<E>,
+    pub membership: RemoteMembership,
+    /// The changes the answer applied, with their events, in the order the stream applied them.
+    pub changes: Vec<ReactorUpdateItem<E, Ev>>,
+    /// Whether this answer completes the query's initialization from the stream. A partial
+    /// answer publishes membership without marking the results loaded.
+    pub complete: bool,
+}
+
 impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<E, Ev> {
     /// Install a remote stream's answer into a query, notifying its owner before listeners, and
     /// return the ids whose notifications this installation published.
@@ -56,24 +68,35 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
         gap_fetcher: std::sync::Arc<dyn GapFetcher<E>>,
         version: u32,
         pre_notify_hook: H,
-        entities: Vec<E>,
-        membership: RemoteMembership,
-        changes: Vec<ReactorUpdateItem<E, Ev>>,
+        install: RemoteInstall<E, Ev>,
     ) -> anyhow::Result<HashSet<proto::EntityId>> {
-        self.install_query(
-            subscription_id,
-            query_id,
-            selection,
-            node,
-            resultset,
-            gap_fetcher,
-            version,
-            pre_notify_hook,
-            Some(entities),
-            Some(membership),
-            changes,
-        )
-        .await
+        self.install_query(subscription_id, query_id, selection, node, resultset, gap_fetcher, version, pre_notify_hook, Some(install))
+            .await
+    }
+
+    /// Apply a remote answer to its query under the notification lock: reduce the answer's
+    /// changes to the events the query has not delivered, reconcile the query's rows with the
+    /// answer, and merge the changes into the membership notifications. Returns the
+    /// notifications and the delivered heads to record once they are published.
+    pub(super) async fn apply_remote_answer(
+        &self,
+        subscription: &Subscription<E, Ev>,
+        query_id: proto::QueryId,
+        selection: Selection<Resolved>,
+        source: &dyn LocalEntitySource<E>,
+        resultset: &EntityResultSet<E>,
+        version: u32,
+        install: RemoteInstall<E, Ev>,
+    ) -> anyhow::Result<(Vec<ReactorUpdateItem<E, Ev>>, DeliveredHeads)> {
+        let RemoteInstall { entities, membership, mut changes, complete } = install;
+        changes.retain(|change| source.can_read(&change.entity));
+        let carried_events: HashSet<_> =
+            changes.iter().filter(|change| !change.events.is_empty()).map(|change| change.entity.id()).collect();
+        let delivered =
+            subscription.filter_query_events(query_id, &mut changes, &membership.known_heads, self.0.history.as_deref()).await?;
+        let mut items = Vec::new();
+        subscription.update_query(query_id, selection, entities, version, &mut items, Some(&membership), complete)?;
+        Ok((merge_carried_changes(items, changes, &carried_events, source, resultset, complete), delivered))
     }
 
     /// Publish a remote stream's committed publication, whose changes are already applied, to the
@@ -107,9 +130,11 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: ReactorEvent> Reactor<
     }
 }
 
-/// Merge source events with the same membership transition, rather than
-/// removing first and later misreporting its causing events as an Update.
-pub(super) fn merge_carried_changes<E: AbstractEntity + Filterable + Send + 'static, Ev>(
+/// Merge each carried change into its row's membership notification, so that the change's
+/// causing events travel with that transition rather than following a removal as an update. A
+/// change for a row without a transition is an update, unless delivery already published every
+/// event it carried.
+fn merge_carried_changes<E: AbstractEntity + Filterable + Send + 'static, Ev>(
     membership: Vec<ReactorUpdateItem<E, Ev>>,
     changes: Vec<ReactorUpdateItem<E, Ev>>,
     carried_events: &HashSet<proto::EntityId>,

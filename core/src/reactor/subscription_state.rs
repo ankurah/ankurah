@@ -212,8 +212,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         included_entities: Vec<E>,
         version: u32,
         reactor_updates: &mut Vec<ReactorUpdateItem<E, Ev>>,
-        authoritative: bool,
-        membership: Option<&crate::reactor::RemoteMembership>,
+        remote: Option<&crate::reactor::RemoteMembership>,
         complete: bool,
     ) -> anyhow::Result<()> {
         let mut state_guard = self.state.lock().unwrap();
@@ -243,7 +242,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
         let mut newly_added: Vec<E> = Vec::new();
 
         let mut removed_entities = Vec::new();
-        if authoritative {
+        if let Some(membership) = remote {
             (newly_added, removed_entities) = query_state.reconcile_remote_rows(
                 query_id,
                 &mut rw_resultset,
@@ -296,7 +295,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
 
         // Existing event frontiers survive silent state repairs and refreshes.
         for (id, entity) in rw_resultset.iter_entities() {
-            if let Some(head) = membership.and_then(|m| m.known_heads.get(&id)).cloned().or_else(|| entity.head()) {
+            if let Some(head) = remote.and_then(|m| m.known_heads.get(&id)).cloned().or_else(|| entity.head()) {
                 query_state.delivered.start(id, head);
             }
         }

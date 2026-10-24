@@ -9,7 +9,6 @@ async fn partial_install_blocks_stale_local_activation_without_marking_ready() {
     let canceled = || false;
     query.0.bind_remote_stream(1, origin.clone(), &canceled);
     let partial = RemoteActivation { query: &query.0, origin: &origin, canceled: &canceled, complete: false };
-    assert!(!partial.marks_loaded());
     partial.pre_notify(1);
     assert!(!LocalActivation(&query.0).is_current(1));
     assert!(query.0.remote_stream_pending(1));
