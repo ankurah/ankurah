@@ -84,30 +84,55 @@ async fn a_refused_string_of_two_statements_changes_no_setting() -> Result<()> {
     Ok(())
 }
 
-/// What SQLite skips around a statement includes a UTF-8 byte order mark
-/// and semicolons, before a PRAGMA as before any statement, on every driver;
-/// better-sqlite3 alone refuses a byte order mark after a statement, in its
-/// own words.
+/// What SQLite skips around a statement includes a UTF-8 byte order mark,
+/// semicolons and comments, before a PRAGMA as before a query, which
+/// `query` and `query_row` alike read past it, on every driver: the Node.js
+/// executor nests the query past it in its typed reader. better-sqlite3
+/// alone refuses a byte order mark after a statement, in its own words.
 #[engine_test]
 async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Result<()> {
     let storage = common::open_in_memory().await?;
-    let (timeouts, trailing) = storage
+    let (timeouts, ones, trailing) = storage
         .with_executor(|executor| {
             let timeouts = ["\u{FEFF}PRAGMA busy_timeout", "; PRAGMA busy_timeout"].map(|sql| {
                 executor.query_row(sql, &[]).and_then(|row| row.expect("one row").integer(0)).map_err(|error| error.to_string())
             });
-            Ok((timeouts, executor.execute("CREATE TABLE marked (x);\u{FEFF}", &[]).map_err(|error| error.to_string())))
+            let ones = ["; SELECT 1", ";; VALUES (1)", "/* c */ SELECT 1"].map(|sql| {
+                let every = executor.query(sql, &[]).and_then(|rows| rows.iter().map(|row| row.integer(0)).collect::<Result<Vec<_>, _>>());
+                let first = executor.query_row(sql, &[]).and_then(|row| row.expect("one row").integer(0));
+                (every.map_err(|error| error.to_string()), first.map_err(|error| error.to_string()))
+            });
+            Ok((timeouts, ones, executor.execute("CREATE TABLE marked (x);\u{FEFF}", &[]).map_err(|error| error.to_string())))
         })
         .await?;
     for timeout in timeouts {
         assert!(timeout.is_ok(), "{timeout:?}");
     }
+    assert_eq!(ones, [(Ok(vec![1]), Ok(1)), (Ok(vec![1]), Ok(1)), (Ok(vec![1]), Ok(1))]);
     if common::on_better_sqlite3() {
         let refusal = trailing.expect_err("better-sqlite3 reads the byte order mark as a second statement");
         assert!(refusal.ends_with("The supplied SQL string contains more than one statement"), "{refusal}");
     } else {
         assert!(trailing.is_ok(), "{trailing:?}");
     }
+    Ok(())
+}
+
+/// SQL that holds no statement, only what SQLite skips between statements,
+/// is refused by `execute`, `query` and `query_row` alike, on every driver,
+/// as SQLite refuses to run it: SQLITE_MISUSE, 21.
+#[engine_test]
+async fn sql_that_holds_no_statement_is_refused() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let codes = storage
+        .with_executor(|executor| {
+            Ok([";", "", "-- c"].map(|sql| {
+                [executor.execute(sql, &[]).map(drop), executor.query(sql, &[]).map(drop), executor.query_row(sql, &[]).map(drop)]
+                    .map(|outcome| outcome.map_err(|error| error.sqlite_code()))
+            }))
+        })
+        .await?;
+    assert_eq!(codes, [[Err(Some(21)); 3]; 3]);
     Ok(())
 }
 

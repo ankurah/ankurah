@@ -92,19 +92,34 @@ pub(super) fn source(statement: &JsValue) -> Result<String, SqliteError> {
     ))
 }
 
-/// Refuse SQL that holds a second statement, before SQLite prepares either,
-/// as the native executor refuses it: SQLite applies some PRAGMAs while it
-/// prepares them, and node:sqlite runs the first statement and ignores the
-/// rest without a word. Whitespace, semicolons and comments after the
-/// statement are no statement. Returns the statement's first named
-/// parameter, which the same pass over the SQL finds, for
-/// `refuse_a_named_parameter`.
-pub(super) fn refuse_a_second_statement(sql: &str) -> Result<Option<&str>, SqliteError> {
+/// SQLite's result code for a misuse of its API, which it returns natively
+/// for a step of SQL that holds no statement.
+const SQLITE_MISUSE: i32 = 21;
+
+/// Refuse SQL that holds no statement, or a second one, before SQLite
+/// prepares anything. Returns the statement's first named parameter, which
+/// the same pass over the SQL finds, for `refuse_a_named_parameter`.
+///
+/// - SQL that holds a second statement is refused as the native executor
+///   refuses it: SQLite applies some PRAGMAs while it prepares them, and
+///   node:sqlite runs the first statement and ignores the rest without a
+///   word. Whitespace, semicolons and comments after the statement are no
+///   statement.
+/// - SQL that holds no statement, only whitespace, semicolons and comments,
+///   is refused as SQLite refuses to run it natively, with SQLITE_MISUSE.
+///   It is refused before it is prepared, since node:sqlite can crash the
+///   process, in a later `sqlite3_step`, once it collects a statement
+///   prepared from such SQL while the database is open, as Node.js 24.13.0
+///   does.
+pub(super) fn refuse_all_but_one_statement(sql: &str) -> Result<Option<&str>, SqliteError> {
     match statement_scan::statements(sql) {
+        Statements::One { named_parameter } => Ok(named_parameter),
         // rusqlite's words for the same refusal.
         Statements::Several => Err(SqliteError::Node("Multiple statements provided".into())),
-        Statements::One { named_parameter } => Ok(named_parameter),
-        Statements::None => Ok(None),
+        Statements::None => Err(SqliteError::NodeSqlite {
+            code: SQLITE_MISUSE,
+            message: "the SQL holds no statement, which SQLite refuses to run, as a misuse of its API (SQLITE_MISUSE)".into(),
+        }),
     }
 }
 

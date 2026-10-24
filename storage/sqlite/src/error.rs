@@ -13,7 +13,9 @@ pub enum SqliteError {
     #[error("node executor error: {0}")]
     Node(String),
 
-    /// SQLite refused a statement run through node:sqlite. `code` is SQLite's
+    /// SQLite refused a statement run through node:sqlite, or the Node.js
+    /// executor refused SQL that holds no statement, on either driver, as
+    /// SQLite refuses it natively (SQLITE_MISUSE). `code` is SQLite's
     /// extended result code, which rusqlite's `SqliteFailure` carries
     /// natively; [`SqliteError::sqlite_code`] reads it from either.
     #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
@@ -59,7 +61,9 @@ impl SqliteError {
     /// such as 1555 for a duplicate primary key or 5 for a lock held past the
     /// busy timeout, read the same way whether rusqlite or node:sqlite ran the
     /// statement; `None` for every other error. better-sqlite3 hands the code
-    /// over only by name, which is not read, so its refusals have `None` too.
+    /// over only by name, which is not read, so its refusals have `None` too,
+    /// but for SQL that holds no statement, which the Node.js executor refuses
+    /// before the driver sees it, with SQLITE_MISUSE, 21, on every driver.
     ///
     /// A call that passes more values than its statement takes parameters
     /// differs between drivers: rusqlite and better-sqlite3 refuse it

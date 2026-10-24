@@ -40,7 +40,7 @@ use crate::{
 use kept_readers::KeptReaders;
 use parameters::{refuse_a_named_parameter, ParameterCounts};
 use statement::{
-    integer_from_js, js_error, js_params, method, read_rows, refuse_a_second_statement, refuse_sql_past_its_statement, source,
+    integer_from_js, js_error, js_params, method, read_rows, refuse_all_but_one_statement, refuse_sql_past_its_statement, source,
     statement_method, width, RowSelection,
 };
 use typed_reader::{plain_row, typed_reader, typed_row};
@@ -182,7 +182,7 @@ impl SqliteExecutor for NodeJsConnection {
     /// rows belongs to `query`. node:sqlite's `run` takes the step and
     /// discards the row.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
-        let named_parameter = refuse_a_second_statement(sql)?;
+        let named_parameter = refuse_all_but_one_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
         refuse_sql_past_its_statement(sql, &source)?;
@@ -237,7 +237,7 @@ impl NodeJsConnection {
                 Err(_) => self.drop_reader(sql),
             }
         }
-        let named_parameter = refuse_a_second_statement(sql)?;
+        let named_parameter = refuse_all_but_one_statement(sql)?;
         let statement = self.prepare(sql)?;
         let source = source(&statement)?;
         refuse_sql_past_its_statement(sql, &source)?;
@@ -251,10 +251,13 @@ impl NodeJsConnection {
             statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
             return Ok(Vec::new());
         }
-        match self.prepare(&typed_reader(&source, width)) {
+        // The statement past what SQLite skips before it, semicolons and
+        // comments among it, which the source keeps and SQLite cannot nest.
+        let nested = statement_scan::skip_to_statement(&source);
+        match self.prepare(&typed_reader(nested, width)) {
             Ok(reader) => {
                 // Checked once for each SQL text, since a kept reader skips it.
-                self.refuse_a_compound_select(&source, params)?;
+                self.refuse_a_compound_select(nested, params)?;
                 self.keep_reader(sql, &reader, width);
                 read_rows(&reader, params, 2 * width, selection)?.into_iter().map(typed_row).collect()
             }

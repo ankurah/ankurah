@@ -116,10 +116,10 @@ impl NodeJsConnection {
     /// too. SQLite's plan shows a compound as a COMPOUND QUERY, or as a MERGE
     /// when SQLite codes it as a merge of its SELECTs, as it does under an
     /// ORDER BY and, in SQLite 3.53, for UNION, INTERSECT and EXCEPT.
-    pub(super) fn refuse_a_compound_select(&self, source: &str, params: &[SqliteValueRef<'_>]) -> Result<(), SqliteError> {
+    pub(super) fn refuse_a_compound_select(&self, statement: &str, params: &[SqliteValueRef<'_>]) -> Result<(), SqliteError> {
         // Each step of the plan is id, parent, notused, detail. better-sqlite3
         // plans a statement only with its parameters bound.
-        let plan = self.prepare(&format!("EXPLAIN QUERY PLAN {source}"))?;
+        let plan = self.prepare(&format!("EXPLAIN QUERY PLAN {statement}"))?;
         let mut steps = Vec::new();
         for step in all(&plan, params, 4)? {
             let detail = step.get(3);
