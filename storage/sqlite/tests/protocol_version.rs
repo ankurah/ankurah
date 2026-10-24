@@ -122,3 +122,31 @@ async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
     let _engine = common::open(db.path()).await?;
     Ok(())
 }
+
+/// A table whose name the protocol check cannot read fails the open, rather
+/// than drop out of the check's list of tables. SQLite never stores such a
+/// name itself; the test plants one, the name's bytes as a BLOB, through
+/// `writable_schema`.
+#[engine_test]
+async fn a_table_name_the_check_cannot_read_fails_the_open() -> anyhow::Result<()> {
+    // better-sqlite3 opens its databases in SQLite's defensive mode, which
+    // refuses `writable_schema`.
+    if common::on_better_sqlite3() {
+        return Ok(());
+    }
+    let db = TempDb::new("unreadable_name");
+    {
+        let conn = db.raw();
+        conn.execute(r#"CREATE TABLE "application_data" ("value" TEXT)"#, &[])?;
+        conn.execute("PRAGMA writable_schema = ON", &[])?;
+        conn.execute("UPDATE sqlite_master SET name = CAST(name AS BLOB) WHERE name = 'application_data'", &[])?;
+        conn.execute("PRAGMA writable_schema = OFF", &[])?;
+    }
+
+    let err = match common::open(db.path()).await {
+        Ok(_) => panic!("expected a table name the check cannot read to refuse the open"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("column 0 holds BLOB where TEXT was expected"), "{err}");
+    Ok(())
+}

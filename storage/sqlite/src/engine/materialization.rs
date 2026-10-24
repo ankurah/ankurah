@@ -373,10 +373,14 @@ impl Materialization {
                 // PRAGMA table_info's rows, through its table-valued function:
                 // the node executor reads TEXT exactly only from a query.
                 let rows = c.query("SELECT * FROM pragma_table_info(?)", &[SqliteValueRef::Text(&table_name)])?;
+                // Changed from main, which skipped a column it could not read,
+                // and on a failed step ended the list there without an error,
+                // leaving materialized columns out of the cache. Every column
+                // is read now, or the rebuild fails.
                 let columns: Vec<SqliteColumn> = rows
                     .iter()
-                    .filter_map(|row| Some(SqliteColumn { name: row.text(1).ok()?.to_owned(), data_type: row.text(2).ok()?.to_owned() }))
-                    .collect();
+                    .map(|row| Ok(SqliteColumn { name: row.text(1)?.to_owned(), data_type: row.text(2)?.to_owned() }))
+                    .collect::<Result<_, SqliteError>>()?;
                 Ok(columns)
             })
             .await?;

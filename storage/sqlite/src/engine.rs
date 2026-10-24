@@ -265,7 +265,11 @@ impl SqliteStorageEngine {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         conn.with_executor(|c| {
             let rows = c.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", &[])?;
-            let tables: Vec<&str> = rows.iter().filter_map(|row| row.text(0).ok()).collect();
+            // Changed from main, which skipped a name it could not read, and
+            // on a failed step ended the list there without an error: a list
+            // cut short could read an unversioned store as fresh and stamp it
+            // as current. Every name is read now, or the open fails.
+            let tables = rows.iter().map(|row| row.text(0)).collect::<Result<Vec<_>, _>>()?;
             let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(table));
 
             let recorded: Option<String> = if tables.contains(&META_TABLE) {
