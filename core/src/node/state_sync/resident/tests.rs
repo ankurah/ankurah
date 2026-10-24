@@ -21,18 +21,21 @@ use crate::{entity::TemporaryEntity, node::state_sync::Snapshot, schema::catalog
 use ankql::ast::{OrderByItem, OrderDirection, Predicate};
 use ankurah_core_types::PropertyPath;
 use ankurah_proto::Attested;
+use std::sync::atomic::Ordering;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Weak,
 };
 
-mod bounded;
-mod capture_retry;
-mod captured;
+mod authorization;
+mod bootstrap;
+mod builds;
+mod burst;
 mod digests;
-mod resident;
+mod lru;
+mod retry;
 mod routes;
-mod view_isolation;
+mod sharing;
 
 /// The core test engine deliberately rejects ORDER BY/LIMIT. This fixture adds
 /// exactly the ordered bounded read exercised here, leaving its real commit and
@@ -276,129 +279,12 @@ fn hold_fetch(node: &TestNode) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     (observed, release)
 }
 
-#[tokio::test]
-async fn unlimited_capture_folds_an_entrant_and_movement_after_its_storage_read() -> anyhow::Result<()> {
-    let node = node().await?;
-    let a = genesis("01")?;
-    apply(&node, &a).await?;
-    let selection = selection(None);
-    let spec = proto::TreeSpec::new(
-        ankurah_core_types::KeySpec::new(vec![ankurah_core_types::IndexKeyPart::asc(property(), crate::value::ValueType::String)]),
-        selection.predicate.clone(),
-    );
-    let (entered, release) = hold_fetch(&node);
-    let capture = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
-    tokio::pin!(capture);
-    assert!(futures::poll!(&mut capture).is_pending());
-    entered.await?;
-    let moved = update(&a, "09")?;
-    let b = genesis("02")?;
-    apply(&node, &moved).await?;
-    apply(&node, &b).await?;
-    release.send(()).unwrap();
-    let actor = capture.await?;
-    let captured = view(&actor, &selection, &node.catalog)?;
-    assert_eq!(actor.tree.entries().len(), 2);
-    assert_eq!(captured.entries[&a.entity_id].head, proto::Clock::singleton(&moved));
-    assert!(captured.entries.contains_key(&b.entity_id));
-    assert!(captured.entries[&b.entity_id].key() < captured.entries[&a.entity_id].key());
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_complete_id_keyed_tree_cannot_select_an_unindexed_ordered_limit() -> anyhow::Result<()> {
-    let node = node().await?;
-    let a = genesis("01")?;
-    let b = genesis("02")?;
-    apply(&node, &a).await?;
-    apply(&node, &b).await?;
-    // Deliberately oppose ID order and requested ascending label order.
-    let (first, last) = if a.entity_id > b.entity_id { (&a, &b) } else { (&b, &a) };
-    apply(&node, &update(first, "01")?).await?;
-    apply(&node, &update(last, "02")?).await?;
-    let selection = selection(Some(1));
-    let by_id = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
-    let actor = complete_resident(&node, by_id, vec![DEFAULT_CONTEXT]).await?;
-    assert!(view(&actor, &selection, &node.catalog).is_err(), "a complete tree cannot rank properties absent from its keys");
-    assert_eq!(actor.tree.entries().len(), 2, "a failed scope never truncates the resident admission");
-    assert_eq!(
-        actor.tree.snapshot().member_map().values().copied().collect::<Vec<_>>(),
-        vec![last.entity_id, first.entity_id],
-        "physical digest address order remains by ID"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn full_capture_folds_changes_before_resolving_a_limit_with_unchanged_entrants() -> anyhow::Result<()> {
-    let node = node().await?;
-    let [a, b, c]: [proto::Event; 3] = ["01", "02", "03"].map(genesis).into_iter().collect::<anyhow::Result<Vec<_>>>()?.try_into().unwrap();
-    for event in [&a, &b, &c] {
-        apply(&node, event).await?;
-    }
-    let selection = selection(Some(2));
-    let spec = spec_for(&selection, &node.catalog);
-    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
-    let (entered, release) = hold_fetch(&node);
-    let capture = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
-    tokio::pin!(capture);
-    assert!(futures::poll!(&mut capture).is_pending());
-    entered.await?;
-    apply(&node, &update(&a, "09")?).await?;
-    release.send(()).unwrap();
-    let actor = capture.await?;
-    assert_eq!(actor.tree.entries().len(), 3, "the unchanged replacement is already resident");
-    let captured = view(&actor, &selection, &node.catalog)?;
-    assert_eq!(captured.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
-    assert_eq!(
-        node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed),
-        scans + 1,
-        "a concurrent update does not cause a refill read"
-    );
-    Ok(())
-}
-
 #[derive(Clone)]
 struct Sender(proto::EntityId);
 impl PeerSender for Sender {
     fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
     fn recipient_node_id(&self) -> proto::EntityId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
-}
-
-#[tokio::test]
-async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutating_old_snapshots() -> anyhow::Result<()> {
-    let node = node().await?;
-    let mut events = Vec::new();
-    for value in ["01", "02", "03"] {
-        let event = genesis(value)?;
-        apply(&node, &event).await?;
-        events.push(event);
-    }
-    let selection = selection(Some(2));
-    let spec = spec_for(&selection, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    let frozen = view(&actor, &selection, &node.catalog)?;
-    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
-    let moved_a = update(&events[0], "09")?;
-    apply(&node, &moved_a).await?;
-    let intermediate = actor.refresh(&node).await?.select(&selection, &node.catalog)?;
-    assert_eq!(intermediate.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
-    // C now moves past A. The next scope must re-admit unchanged A from the
-    // same resident tree, while both previous comparisons stay frozen.
-    apply(&node, &update(&events[2], "10")?).await?;
-    let current = actor.refresh(&node).await?.select(&selection, &node.catalog)?;
-    assert_eq!(current.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[0].entity_id, events[1].entity_id]));
-    assert_eq!(current.entries[&events[0].entity_id].head, proto::Clock::singleton(&moved_a));
-    assert_eq!(frozen.entries[&events[0].entity_id].head, proto::Clock::singleton(&events[0]));
-    assert_eq!(intermediate.entries[&events[2].entity_id].head, proto::Clock::singleton(&events[2]));
-    assert_eq!(actor.tree.entries().len(), 3);
-    assert_eq!(
-        node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed),
-        scans,
-        "supported limited scopes never refill from storage"
-    );
-    Ok(())
 }
 
 #[derive(Clone, Default)]
@@ -539,237 +425,24 @@ impl PolicyAgent for RestrictedDiscovery {
     }
 }
 
-#[tokio::test]
-async fn maintenance_respects_retrieval_permission_when_query_membership_is_unchanged() -> anyhow::Result<()> {
-    let retrieval = Predicate::Comparison {
-        left: Box::new(ankql::ast::Expr::Path(PropertyPath::from(property()))),
-        operator: ankql::ast::ComparisonOperator::LessThan,
-        right: Box::new(ankql::ast::Expr::Literal(Value::String("03".into()))),
-    };
-    let node =
-        Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery { retrieval: Some(retrieval), ..Default::default() });
-    node.system.create().await?;
-    node.wait_ready().await?;
-    let initial = genesis("01")?;
-    let initially_denied = genesis("04")?;
-    apply(&node, &initial).await?;
-    apply(&node, &initially_denied).await?;
-    let selected = selection(None);
-    let spec = spec_for(&selected, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    let captured = view(&actor, &selected, &node.catalog)?;
-    assert!(captured.entries.contains_key(&initial.entity_id));
-    assert!(!captured.entries.contains_key(&initially_denied.entity_id));
+async fn acquire<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
+    cache: &ResidentTrees<PA::ContextData>,
+    node: &Node<OrderedStorage, PA>,
+    selection: Selection<Resolved>,
+) -> anyhow::Result<crate::node::state_sync::resident::ResidentLease<PA::ContextData>> {
+    cache.acquire(node, selection, None, vec![DEFAULT_CONTEXT]).await
+}
 
-    let mut current = initial;
-    for (value, readable) in [("04", false), ("02", true), ("04", false)] {
-        current = update(&current, value)?;
-        apply(&node, &current).await?;
-        let batch = actor.cursor.next().await?;
-        let change = batch.changes.iter().find(|change| change.entity_id == current.entity_id).unwrap();
-        assert!(change.matches, "all values still satisfy the query/discovery predicate");
-        assert_eq!(change.entry.is_some(), readable, "maintenance must enforce the separate retrieval predicate");
-        actor.apply(batch.changes, false).await?;
-        let snapshot = actor.tree.snapshot();
-        assert_eq!(snapshot.entries.contains_key(&current.entity_id), readable);
-        if readable {
-            assert_eq!(snapshot.entries[&current.entity_id].head, proto::Clock::singleton(&current));
-        }
-        assert!(actor.candidates.contains(&current.entity_id), "denied query candidates remain watched for reentry");
-    }
-    let newly_readable = update(&initially_denied, "02")?;
-    apply(&node, &newly_readable).await?;
-    let batch = actor.cursor.next().await?;
-    actor.apply(batch.changes, false).await?;
-    assert_eq!(
-        actor.tree.entries()[&newly_readable.entity_id].head,
-        proto::Clock::singleton(&newly_readable),
-        "an initially denied candidate enters when it becomes readable"
+fn above(value: &str, limit: Option<u64>) -> Selection<Resolved> {
+    use ankql::ast::{ComparisonOperator, Expr};
+    let mut selected = selection(limit);
+    selected.predicate = Predicate::And(
+        Box::new(selected.predicate),
+        Box::new(Predicate::Comparison {
+            left: Box::new(Expr::Path(PropertyPath::from(property()))),
+            operator: ComparisonOperator::GreaterThan,
+            right: Box::new(Expr::Literal(Value::String(value.into()))),
+        }),
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_broader() -> anyhow::Result<()> {
-    let node = Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery::default());
-    node.system.create().await?;
-    node.wait_ready().await?;
-    let inside = genesis("01")?;
-    let outside = genesis("09")?;
-    apply(&node, &inside).await?;
-    apply(&node, &outside).await?;
-    let selection = selection(None);
-    let spec = spec_for(&selection, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    assert_eq!(actor.tree.entries().len(), 1);
-    assert!(actor.tree.entries().contains_key(&inside.entity_id));
-    let mut route = routes::route(&node, &actor, selection).await?;
-    apply(&node, &update(&outside, "08")?).await?;
-    if let Some(batch) = actor.cursor.fence().await?.batch {
-        assert!(actor.apply(batch.changes, true).await?.is_empty());
-    }
-    assert!(!actor.tree.entries().contains_key(&outside.entity_id));
-    apply(&node, &update(&inside, "09")?).await?;
-    let batch = actor.cursor.next().await?;
-    let changes = actor.apply(batch.changes, true).await?;
-    assert_eq!(changes.len(), 1);
-    let changes = delivered(&node, &actor, &mut route, &changes).await?;
-    assert_eq!(changes.len(), 1);
-    assert!(changes[0].member.is_none());
-    assert!(changes[0].delta.is_some(), "readable former matches still carry causal data");
-    assert!(actor.tree.entries().is_empty());
-    Ok(())
-}
-
-#[tokio::test]
-async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()> {
-    let node = node().await?;
-    let mut initial = Vec::new();
-    for value in ["01", "02", "03"] {
-        let event = genesis(value)?;
-        apply(&node, &event).await?;
-        initial.push(event);
-    }
-    let peer = proto::EntityId::from_bytes([26; 32]);
-    node.register_peer(
-        proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
-        Box::new(Sender(peer)),
-    )
-    .await?;
-    // Complete coverage can serve several limits without a bounded refill.
-    let full = node
-        .resident_trees
-        .acquire(&node, selection(None), Some(spec_for(&selection(Some(2)), &node.catalog)), vec![DEFAULT_CONTEXT])
-        .await?;
-    let handler = crate::peer_subscription::SubscriptionHandler::new(peer);
-    let query = proto::QueryId::new();
-    handler
-        .subscribe_query(
-            &node,
-            proto::RequestId::new(),
-            Vec::new(),
-            query,
-            selection(Some(2)),
-            Some(&DEFAULT_CONTEXT),
-            1,
-            proto::KnownState { spec: spec_for(&selection(Some(2)), &node.catalog), spans: vec![] },
-        )
-        .await?;
-    let (_, original) = handler.query_resident_for_test(query).await.unwrap();
-    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
-    apply(&node, &update(&initial[0], "09")?).await?;
-    handler
-        .subscribe_query(
-            &node,
-            proto::RequestId::new(),
-            Vec::new(),
-            query,
-            selection(Some(1)),
-            Some(&DEFAULT_CONTEXT),
-            2,
-            proto::KnownState { spec: spec_for(&selection(Some(1)), &node.catalog), spans: vec![] },
-        )
-        .await?;
-    let (version, reused) = handler.query_resident_for_test(query).await.unwrap();
-    assert_eq!(version, 2);
-    assert!(Weak::ptr_eq(&original, &reused), "compatible limits select scopes of the same resident tree");
-    assert!(Weak::ptr_eq(&full.identity(), &reused), "both limits reuse the complete resident");
-    let snapshot = full.snapshot().await?.snapshot;
-    assert_eq!(snapshot.entries.len(), 3, "the resident keeps the full admission");
-    let snapshot = snapshot.select(&selection(Some(1)), &node.catalog)?;
-    assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
-    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans);
-    handler.remove_predicate(&node, query).await?;
-    node.deregister_peer(peer);
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window_record() -> anyhow::Result<()> {
-    let node = node().await?;
-    let initial = genesis("01")?;
-    apply(&node, &initial).await?;
-    let selection = selection(None);
-    let spec = spec_for(&selection, &node.catalog);
-    let (entered, observed) = oneshot::channel();
-    let (read, resume) = oneshot::channel();
-    *node.storage.fetch_pause.lock().unwrap() = Some((entered, resume));
-    let capture = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
-    tokio::pin!(capture);
-    assert!(futures::poll!(&mut capture).is_pending());
-    observed.await?;
-    let first = update(&initial, "02")?;
-    apply(&node, &first).await?;
-    let second = update(&first, "03")?;
-    let (committed, stored) = oneshot::channel();
-    let (admit, admission) = oneshot::channel();
-    *node.storage.inner.hold_after_commit.lock().unwrap() = Some((committed, admission));
-    let publishing = apply(&node, &second);
-    tokio::pin!(publishing);
-    assert!(futures::poll!(&mut publishing).is_pending());
-    stored.await?;
-    read.send(()).unwrap();
-    // The raw storage read now sees "03" while the window still contains
-    // only "02". Its closing fence must wait for the second admission.
-    assert!(futures::poll!(&mut capture).is_pending());
-    admit.send(()).unwrap();
-    let (published, captured) = tokio::join!(publishing, capture);
-    published?;
-    let actor = captured?;
-    assert_eq!(actor.tree.entries()[&initial.entity_id].head, proto::Clock::singleton(&second));
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<()> {
-    let initial = genesis("01")?;
-    let denied = update(&initial, "02")?;
-    let policy = RestrictedDiscovery { denied_event: Some(denied.id()), ..Default::default() };
-    let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
-    node.system.create().await?;
-    node.wait_ready().await?;
-    apply(&node, &initial).await?;
-    let selection = selection(None);
-    let spec = spec_for(&selection, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
-    let mut route = routes::route(&node, &actor, selection).await?;
-    apply(&node, &denied).await?;
-    let batch = actor.cursor.next().await?;
-    let credentials = vec![DEFAULT_CONTEXT];
-    let read_policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    read_policy
-        .check_read(&initial.entity_id, &current_states(&node, [initial.entity_id]).await?.remove(&initial.entity_id).unwrap().state)?;
-    assert_eq!(batch.changes[0].events[0], denied.id());
-    let changes = actor.apply(batch.changes, true).await?;
-    let error =
-        delivered(&node, &actor, &mut route, &changes).await.expect_err("denied event must fail delivery without poisoning the tree");
-    assert!(matches!(error.downcast_ref::<crate::policy::AccessDenied>(), Some(crate::policy::AccessDenied::ByPolicy(_))));
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_complete_resident_applies_a_published_batch_while_another_commit_is_in_flight() -> anyhow::Result<()> {
-    let node = node().await?;
-    let initial = genesis("01")?;
-    apply(&node, &initial).await?;
-    let mut actor = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
-    let first = update(&initial, "02")?;
-    apply(&node, &first).await?;
-    let batch = actor.cursor.next().await?;
-    // Hold the next commit after its storage write, while it holds the commit gate.
-    let (committed, stored) = oneshot::channel();
-    let (admit, admission) = oneshot::channel();
-    *node.storage.inner.hold_after_commit.lock().unwrap() = Some((committed, admission));
-    let second = update(&first, "03")?;
-    let publishing = apply(&node, &second);
-    tokio::pin!(publishing);
-    assert!(futures::poll!(&mut publishing).is_pending());
-    stored.await?;
-    tokio::time::timeout(std::time::Duration::from_secs(2), actor.publish(&node, batch))
-        .await
-        .expect("a published batch does not wait for a commit in flight")?;
-    assert_eq!(actor.tree.entries()[&initial.entity_id].head, proto::Clock::singleton(&first));
-    admit.send(()).unwrap();
-    publishing.await?;
-    Ok(())
+    selected
 }

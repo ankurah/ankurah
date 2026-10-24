@@ -1,3 +1,4 @@
+//! Live routes: membership changes and their delivery.
 use super::*;
 
 pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
@@ -68,7 +69,7 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
         assert!(added.member.is_some());
         match added.delta.as_ref().unwrap() {
             proto::DeltaContent::StateAndEvents { events, .. } => assert!(events.is_empty()),
-            _ => panic!("unchanged entrant must carry its captured state"),
+            _ => panic!("unchanged entrant must carry its current state"),
         }
     }
     assert_eq!(frozen.entries[&events[0].entity_id].head, proto::Clock::singleton(&events[0]));
@@ -266,5 +267,64 @@ async fn one_publication_reads_its_changed_states_and_events_once_for_every_rout
     actor.publish(&node, batch).await?;
     assert_eq!(node.storage.state_batches.load(Ordering::Relaxed) - states, 1, "both routes deliver one state read");
     assert_eq!(node.storage.event_reads.load(Ordering::Relaxed) - events, 1, "both routes deliver one event read");
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_broader() -> anyhow::Result<()> {
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery::default());
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let inside = genesis("01")?;
+    let outside = genesis("09")?;
+    apply(&node, &inside).await?;
+    apply(&node, &outside).await?;
+    let selection = selection(None);
+    let spec = spec_for(&selection, &node.catalog);
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(actor.tree.entries().len(), 1);
+    assert!(actor.tree.entries().contains_key(&inside.entity_id));
+    let mut route = routes::route(&node, &actor, selection).await?;
+    apply(&node, &update(&outside, "08")?).await?;
+    if let Some(batch) = actor.cursor.fence().await?.batch {
+        assert!(actor.apply(batch.changes, true).await?.is_empty());
+    }
+    assert!(!actor.tree.entries().contains_key(&outside.entity_id));
+    apply(&node, &update(&inside, "09")?).await?;
+    let batch = actor.cursor.next().await?;
+    let changes = actor.apply(batch.changes, true).await?;
+    assert_eq!(changes.len(), 1);
+    let changes = delivered(&node, &actor, &mut route, &changes).await?;
+    assert_eq!(changes.len(), 1);
+    assert!(changes[0].member.is_none());
+    assert!(changes[0].delta.is_some(), "readable former matches still carry causal data");
+    assert!(actor.tree.entries().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<()> {
+    let initial = genesis("01")?;
+    let denied = update(&initial, "02")?;
+    let policy = RestrictedDiscovery { denied_event: Some(denied.id()), ..Default::default() };
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
+    node.system.create().await?;
+    node.wait_ready().await?;
+    apply(&node, &initial).await?;
+    let selection = selection(None);
+    let spec = spec_for(&selection, &node.catalog);
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut route = routes::route(&node, &actor, selection).await?;
+    apply(&node, &denied).await?;
+    let batch = actor.cursor.next().await?;
+    let credentials = vec![DEFAULT_CONTEXT];
+    let read_policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
+    read_policy
+        .check_read(&initial.entity_id, &current_states(&node, [initial.entity_id]).await?.remove(&initial.entity_id).unwrap().state)?;
+    assert_eq!(batch.changes[0].events[0], denied.id());
+    let changes = actor.apply(batch.changes, true).await?;
+    let error =
+        delivered(&node, &actor, &mut route, &changes).await.expect_err("denied event must fail delivery without poisoning the tree");
+    assert!(matches!(error.downcast_ref::<crate::policy::AccessDenied>(), Some(crate::policy::AccessDenied::ByPolicy(_))));
     Ok(())
 }

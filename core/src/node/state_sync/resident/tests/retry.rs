@@ -1,3 +1,4 @@
+//! Admission retries after catalog changes, races, lag and an unavailable source.
 use super::*;
 use crate::{
     error::RequestError,
@@ -80,95 +81,8 @@ fn query(client: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<En
 async fn add_catalog_model(node: &TestNode, label: &str) -> anyhow::Result<()> {
     let context = node.privileged_context();
     let transaction = context.begin();
-    transaction.create(&crate::schema::catalog::SysModelRow { label: label.into(), name: "Capture retry fixture".into() }).await?;
+    transaction.create(&crate::schema::catalog::SysModelRow { label: label.into(), name: "Admission retry fixture".into() }).await?;
     transaction.commit().await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn catalog_change_during_fetch_capture_reopens_the_source() -> anyhow::Result<()> {
-    let node = node().await?;
-    let initial = genesis("01")?;
-    apply(&node, &initial).await?;
-    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
-    let (entered, release) = hold_fetch(&node);
-    let capture = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
-    tokio::pin!(capture);
-    assert!(futures::poll!(&mut capture).is_pending());
-    entered.await?;
-    add_catalog_model(&node, "fetch_capture_fixture").await?;
-    release.send(()).unwrap();
-    let captured = capture.await?;
-    assert_eq!(captured.snapshot.entries.len(), 1);
-    assert_eq!(captured.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
-    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2, "the raced admission must be read again");
-    assert_eq!(node.resident_trees.len(), 1, "only the replacement admission may be reusable");
-    Ok(())
-}
-
-#[tokio::test]
-async fn catalog_change_during_subscription_capture_reopens_the_source() -> anyhow::Result<()> {
-    let (server, client, messages) = pair().await?;
-    let initial = genesis("01")?;
-    apply(&server, &initial).await?;
-    let (entered, release) = hold_fetch(&server);
-    let query = query(&client, selection(None))?;
-    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
-    add_catalog_model(&server, "subscribe_capture_fixture").await?;
-    release.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(3), query.wait_durable_answered()).await??;
-    let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].id(), initial.entity_id);
-    assert_eq!(rows[0].head(), proto::Clock::singleton(&initial));
-    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
-    drop(query);
-    client.deregister_peer(server.id);
-    server.deregister_peer(client.id);
-    Ok(())
-}
-
-#[tokio::test]
-async fn catalog_churn_bounds_capture_retries_and_later_capture_recovers() -> anyhow::Result<()> {
-    let node = node().await?;
-    let initial = genesis("01")?;
-    apply(&node, &initial).await?;
-    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
-    let (mut entered, mut release) = hold_fetch(&node);
-    let capture = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
-    tokio::pin!(capture);
-    for attempt in 0..2 {
-        assert!(futures::poll!(&mut capture).is_pending());
-        entered.await?;
-        add_catalog_model(&node, &format!("catalog_churn_{attempt}")).await?;
-        if attempt == 1 {
-            release.send(()).unwrap();
-            break;
-        }
-        let next = hold_fetch(&node);
-        release.send(()).unwrap();
-        (entered, release) = next;
-    }
-    let error = capture.await.err().expect("continued catalog churn must exhaust the bounded retry");
-    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
-    assert!(SourceError::is_retryable(&error));
-    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
-    assert_eq!(node.resident_trees.len(), 0);
-    let current = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
-    assert_eq!(current.snapshot.entries.len(), 1);
-    assert!(current.snapshot.entries.contains_key(&initial.entity_id));
-    Ok(())
-}
-
-#[tokio::test]
-async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() -> anyhow::Result<()> {
-    let node = node().await?;
-    let selected = selection(None);
-    let mut source = complete_resident(&node, spec_for(&selected, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
-    add_catalog_model(&node, "existing_capture_fixture").await?;
-    let error = source.refresh(&node).await.err().expect("an existing source cannot cross a catalog change");
-    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
-    assert!(SourceError::is_retryable(&error));
     Ok(())
 }
 
@@ -179,7 +93,7 @@ async fn assert_recovers(client: &TestNode, query: &EntityLiveQuery, messages: &
     })
     .await;
     assert_eq!(responses(messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 1);
-    assert!(query.error().value().is_none(), "a busy capture cannot permanently fail the query");
+    assert!(query.error().value().is_none(), "a busy admission cannot permanently fail the query");
     // Exercise the existing periodic retry task, not a manual new registration.
     // A due retry may already have completed before this observer resumes.
     tokio::time::timeout(std::time::Duration::from_secs(7), query.wait_durable_answered()).await??;
@@ -198,47 +112,6 @@ async fn assert_recovers(client: &TestNode, query: &EntityLiveQuery, messages: &
         })
         .count();
     assert_eq!(attempts, 2, "the same subscription retries once after its busy response");
-    Ok(())
-}
-
-#[tokio::test]
-async fn limited_query_retries_a_raced_bounded_capture() -> anyhow::Result<()> {
-    let (server, client, messages) = pair().await?;
-    let mut latest = genesis("01")?;
-    apply(&server, &latest).await?;
-    let (entered, release) = hold_fetch(&server);
-    let query = query(&client, selection(Some(1)))?;
-    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
-    for attempt in 0..8 {
-        latest = update(&latest, &format!("01-{attempt}"))?;
-        apply(&server, &latest).await?;
-    }
-    release.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), query.wait_durable_answered()).await??;
-    let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].head(), proto::Clock::singleton(&latest));
-    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
-    drop(query);
-    client.deregister_peer(server.id);
-    server.deregister_peer(client.id);
-    Ok(())
-}
-
-#[tokio::test]
-async fn lagged_initial_capture_retries_with_a_fresh_source_window() -> anyhow::Result<()> {
-    let (server, client, messages) = pair().await?;
-    let mut latest = genesis("01")?;
-    apply(&server, &latest).await?;
-    let (entered, release) = hold_fetch(&server);
-    let query = query(&client, keyed_selection(None))?;
-    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
-    overflow_maintenance_bytes(&server, &mut latest).await?;
-    release.send(()).unwrap();
-    assert_recovers(&client, &query, &messages, &latest).await?;
-    drop(query);
-    client.deregister_peer(server.id);
-    server.deregister_peer(client.id);
     Ok(())
 }
 
@@ -265,6 +138,134 @@ async fn overflow_maintenance_bytes(node: &TestNode, latest: &mut proto::Event) 
     }
     *latest = update(latest, "01")?;
     apply(node, latest).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_catalog_change_during_a_fetch_admission_reopens_the_source() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
+    let (entered, release) = hold_fetch(&node);
+    let admission = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
+    tokio::pin!(admission);
+    assert!(futures::poll!(&mut admission).is_pending());
+    entered.await?;
+    add_catalog_model(&node, "fetch_admission_fixture").await?;
+    release.send(()).unwrap();
+    let admitted = admission.await?;
+    assert_eq!(admitted.snapshot.entries.len(), 1);
+    assert_eq!(admitted.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&initial));
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2, "the raced admission must be read again");
+    assert_eq!(node.resident_trees.len(), 1, "only the replacement admission may be reusable");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_catalog_change_during_a_subscription_admission_reopens_the_source() -> anyhow::Result<()> {
+    let (server, client, messages) = pair().await?;
+    let initial = genesis("01")?;
+    apply(&server, &initial).await?;
+    let (entered, release) = hold_fetch(&server);
+    let query = query(&client, selection(None))?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
+    add_catalog_model(&server, "subscribe_admission_fixture").await?;
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), query.wait_durable_answered()).await??;
+    let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id(), initial.entity_id);
+    assert_eq!(rows[0].head(), proto::Clock::singleton(&initial));
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
+    drop(query);
+    client.deregister_peer(server.id);
+    server.deregister_peer(client.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_churn_bounds_admission_retries_and_a_later_admission_recovers() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
+    let (mut entered, mut release) = hold_fetch(&node);
+    let admission = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
+    tokio::pin!(admission);
+    for attempt in 0..2 {
+        assert!(futures::poll!(&mut admission).is_pending());
+        entered.await?;
+        add_catalog_model(&node, &format!("catalog_churn_{attempt}")).await?;
+        if attempt == 1 {
+            release.send(()).unwrap();
+            break;
+        }
+        let next = hold_fetch(&node);
+        release.send(()).unwrap();
+        (entered, release) = next;
+    }
+    let error = admission.await.err().expect("continued catalog churn must exhaust the bounded retry");
+    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
+    assert!(SourceError::is_retryable(&error));
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
+    assert_eq!(node.resident_trees.len(), 0);
+    let current = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(current.snapshot.entries.len(), 1);
+    assert!(current.snapshot.entries.contains_key(&initial.entity_id));
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() -> anyhow::Result<()> {
+    let node = node().await?;
+    let selected = selection(None);
+    let mut source = complete_resident(&node, spec_for(&selected, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    add_catalog_model(&node, "existing_admission_fixture").await?;
+    let error = source.refresh(&node).await.err().expect("an existing source cannot cross a catalog change");
+    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
+    assert!(SourceError::is_retryable(&error));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_limited_query_retries_a_raced_limited_admission() -> anyhow::Result<()> {
+    let (server, client, messages) = pair().await?;
+    let mut latest = genesis("01")?;
+    apply(&server, &latest).await?;
+    let (entered, release) = hold_fetch(&server);
+    let query = query(&client, selection(Some(1)))?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
+    for attempt in 0..8 {
+        latest = update(&latest, &format!("01-{attempt}"))?;
+        apply(&server, &latest).await?;
+    }
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), query.wait_durable_answered()).await??;
+    let rows = query.resultset().read().iter_entities().map(|(_, entity)| entity.clone()).collect::<Vec<_>>();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].head(), proto::Clock::singleton(&latest));
+    assert_eq!(responses(&messages, |body| matches!(body, proto::NodeResponseBody::StateSnapshotBusy)), 0);
+    drop(query);
+    client.deregister_peer(server.id);
+    server.deregister_peer(client.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_lagged_initial_admission_retries_with_a_fresh_source_window() -> anyhow::Result<()> {
+    let (server, client, messages) = pair().await?;
+    let mut latest = genesis("01")?;
+    apply(&server, &latest).await?;
+    let (entered, release) = hold_fetch(&server);
+    let query = query(&client, keyed_selection(None))?;
+    tokio::time::timeout(std::time::Duration::from_secs(3), entered).await??;
+    overflow_maintenance_bytes(&server, &mut latest).await?;
+    release.send(()).unwrap();
+    assert_recovers(&client, &query, &messages, &latest).await?;
+    drop(query);
+    client.deregister_peer(server.id);
+    server.deregister_peer(client.id);
     Ok(())
 }
 
@@ -301,7 +302,7 @@ async fn fetch_bounds_busy_retries_and_can_be_retried_after_quiescence() -> anyh
 #[tokio::test]
 async fn unavailable_source_is_terminal_for_initial_query_and_fetch() -> anyhow::Result<()> {
     let (server, client, messages) = pair().await?;
-    // An unknown commit outcome cannot be repaired by retrying a capture.
+    // An unknown commit outcome cannot be repaired by retrying a admission.
     drop(server.reactor.begin_commit().await);
     let query = query(&client, selection(None))?;
     let error = tokio::time::timeout(std::time::Duration::from_secs(2), query.wait_durable_answered()).await?.unwrap_err();
@@ -317,7 +318,7 @@ async fn unavailable_source_is_terminal_for_initial_query_and_fetch() -> anyhow:
 }
 
 #[tokio::test]
-async fn malformed_initial_offer_is_not_a_busy_capture() -> anyhow::Result<()> {
+async fn a_malformed_initial_offer_is_not_a_busy_snapshot() -> anyhow::Result<()> {
     let (server, client, messages) = pair().await?;
     let known_state =
         proto::KnownState { spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), Predicate::False), spans: vec![] };

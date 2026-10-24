@@ -1,3 +1,4 @@
+//! A large cold transfer and the idle maintenance after it.
 use super::*;
 
 async fn wait_for_original_tree(
@@ -26,7 +27,7 @@ async fn wait_for_original_tree(
 
 #[tokio::test]
 async fn original_resident_survives_a_4096_row_cold_transfer_and_an_idle_update() -> anyhow::Result<()> {
-    let (server, client, _messages) = super::super::capture_retry::pair().await?;
+    let (server, client, _messages) = super::retry::pair().await?;
     let mut events = Vec::with_capacity(4096);
     for row in 0..4096 {
         let event = genesis(&format!("row-{row:08}"))?;

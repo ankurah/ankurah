@@ -40,7 +40,7 @@ async fn node_with(values: &[&str]) -> anyhow::Result<(TestNode, Vec<proto::Even
 
 #[tokio::test]
 async fn an_inventory_sized_fetch_builds_no_digest_tree_on_either_node() -> anyhow::Result<()> {
-    let (server, client, _messages) = super::capture_retry::pair().await?;
+    let (server, client, _messages) = super::retry::pair().await?;
     for value in ["01", "02", "03"] {
         apply(&server, &genesis(value)?).await?;
     }

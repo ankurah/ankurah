@@ -1,5 +1,101 @@
+//! Read permission: admission, maintenance and every use of a resident check it.
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+async fn restricted_node(policy: RestrictedDiscovery) -> anyhow::Result<Node<OrderedStorage, RestrictedDiscovery>> {
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
+    node.system.create().await?;
+    node.wait_ready().await?;
+    for value in ["01", "02", "03"] {
+        apply(&node, &genesis(value)?).await?;
+    }
+    Ok(node)
+}
+
+#[tokio::test]
+async fn permissions_are_rechecked_and_new_grants_are_not_lost() -> anyhow::Result<()> {
+    let allowed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let discovery = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let policy = RestrictedDiscovery {
+        read_allowed: Some(allowed.clone()),
+        discover_all: Some(discovery.clone()),
+        deny_empty: true,
+        ..Default::default()
+    };
+    let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
+    node.system.create().await?;
+    node.wait_ready().await?;
+    for value in ["01", "09"] {
+        apply(&node, &genesis(value)?).await?;
+    }
+    let selection = selection(None);
+    let spec = spec_for(&selection, &node.catalog);
+    let taken = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
+    assert!(taken.snapshot.entries.is_empty());
+    allowed.store(true, Ordering::SeqCst);
+    let taken = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(taken.snapshot.entries.len(), 1, "a newly granted cached candidate is discovered");
+    discovery.store(true, Ordering::SeqCst);
+    let taken = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(taken.snapshot.entries.len(), 2, "a broader discovery scope requires a fresh admission");
+    let denied = node.resident_trees.snapshot(&node, selection.clone(), Some(spec.clone()), vec![]).await?;
+    assert!(denied.snapshot.entries.is_empty(), "empty credentials are not privileged and never borrow an authorized view");
+    allowed.store(false, Ordering::SeqCst);
+    let denied = node.resident_trees.snapshot(&node, selection, Some(spec), vec![DEFAULT_CONTEXT]).await?;
+    assert!(denied.snapshot.entries.is_empty(), "revoked rows cannot be disclosed by a cache hit");
+    assert_eq!(taken.snapshot.entries.len(), 2, "the old comparison snapshot is frozen independently");
+    Ok(())
+}
+
+#[tokio::test]
+async fn maintenance_respects_retrieval_permission_when_query_membership_is_unchanged() -> anyhow::Result<()> {
+    let retrieval = Predicate::Comparison {
+        left: Box::new(ankql::ast::Expr::Path(PropertyPath::from(property()))),
+        operator: ankql::ast::ComparisonOperator::LessThan,
+        right: Box::new(ankql::ast::Expr::Literal(Value::String("03".into()))),
+    };
+    let node =
+        Node::new_durable(Arc::new(OrderedStorage::default()), RestrictedDiscovery { retrieval: Some(retrieval), ..Default::default() });
+    node.system.create().await?;
+    node.wait_ready().await?;
+    let initial = genesis("01")?;
+    let initially_denied = genesis("04")?;
+    apply(&node, &initial).await?;
+    apply(&node, &initially_denied).await?;
+    let selected = selection(None);
+    let spec = spec_for(&selected, &node.catalog);
+    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let admitted = view(&actor, &selected, &node.catalog)?;
+    assert!(admitted.entries.contains_key(&initial.entity_id));
+    assert!(!admitted.entries.contains_key(&initially_denied.entity_id));
+
+    let mut current = initial;
+    for (value, readable) in [("04", false), ("02", true), ("04", false)] {
+        current = update(&current, value)?;
+        apply(&node, &current).await?;
+        let batch = actor.cursor.next().await?;
+        let change = batch.changes.iter().find(|change| change.entity_id == current.entity_id).unwrap();
+        assert!(change.matches, "all values still satisfy the query/discovery predicate");
+        assert_eq!(change.entry.is_some(), readable, "maintenance must enforce the separate retrieval predicate");
+        actor.apply(batch.changes, false).await?;
+        let snapshot = actor.tree.snapshot();
+        assert_eq!(snapshot.entries.contains_key(&current.entity_id), readable);
+        if readable {
+            assert_eq!(snapshot.entries[&current.entity_id].head, proto::Clock::singleton(&current));
+        }
+        assert!(actor.candidates.contains(&current.entity_id), "denied query candidates remain watched for reentry");
+    }
+    let newly_readable = update(&initially_denied, "02")?;
+    apply(&node, &newly_readable).await?;
+    let batch = actor.cursor.next().await?;
+    actor.apply(batch.changes, false).await?;
+    assert_eq!(
+        actor.tree.entries()[&newly_readable.entity_id].head,
+        proto::Clock::singleton(&newly_readable),
+        "an initially denied candidate enters when it becomes readable"
+    );
+    Ok(())
+}
 
 #[tokio::test]
 async fn a_restricted_residents_publications_evaluate_its_admitting_proof_afresh() -> anyhow::Result<()> {
@@ -248,16 +344,6 @@ async fn a_command_reads_its_candidates_states_in_one_storage_call() -> anyhow::
     assert_eq!(resident.snapshot().await?.snapshot.entries.len(), 3);
     assert_eq!(node.storage.state_batches.load(Ordering::Relaxed) - batches, 1, "the per-candidate read check reads every state at once");
     Ok(())
-}
-
-async fn restricted_node(policy: RestrictedDiscovery) -> anyhow::Result<Node<OrderedStorage, RestrictedDiscovery>> {
-    let node = Node::new_durable(Arc::new(OrderedStorage::default()), policy);
-    node.system.create().await?;
-    node.wait_ready().await?;
-    for value in ["01", "02", "03"] {
-        apply(&node, &genesis(value)?).await?;
-    }
-    Ok(node)
 }
 
 #[tokio::test]

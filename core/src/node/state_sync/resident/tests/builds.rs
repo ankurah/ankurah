@@ -1,3 +1,4 @@
+//! Resident builds: an unrelated build never blocks another, and a compatible one is shared.
 use super::*;
 
 #[tokio::test]
