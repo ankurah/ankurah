@@ -77,8 +77,9 @@ async fn a_concurrent_snapshot_with_its_events_merges_and_keeps_the_local_edit()
     Ok(())
 }
 
-/// Equal and older snapshots leave state unchanged and publish nothing;
-/// events carried beside them that the entity has applied are not applied again.
+/// Equal and older snapshots leave state unchanged, and events carried beside them that the entity
+/// has applied are not applied again. Initial transfer publishes nothing for them; live delivery
+/// still publishes the carried events, because a subscriber of that stream may not have them yet.
 #[tokio::test]
 async fn equal_and_older_snapshots_leave_the_entity_unchanged() -> anyhow::Result<()> {
     for delivery in [Delivery::Initial, Delivery::Live] {
@@ -92,15 +93,25 @@ async fn equal_and_older_snapshots_leave_the_entity_unchanged() -> anyhow::Resul
         let _listener = fixture.entity.broadcast().reference().listen(notifications);
 
         let shapes = [
-            proto::DeltaContent::StateSnapshot { state: fragment(current.clone()) },
-            proto::DeltaContent::StateSnapshot { state: fragment(older.clone()) },
-            proto::DeltaContent::StateAndEvents { state: fragment(current.clone()), events: fragments([next.clone()]) },
-            proto::DeltaContent::StateAndEvents { state: fragment(older.clone()), events: fragments([fixture.genesis.clone()]) },
+            (proto::DeltaContent::StateSnapshot { state: fragment(current.clone()) }, vec![]),
+            (proto::DeltaContent::StateSnapshot { state: fragment(older.clone()) }, vec![]),
+            (
+                proto::DeltaContent::StateAndEvents { state: fragment(current.clone()), events: fragments([next.clone()]) },
+                vec![next.clone()],
+            ),
+            (
+                proto::DeltaContent::StateAndEvents { state: fragment(older.clone()), events: fragments([fixture.genesis.clone()]) },
+                vec![fixture.genesis.clone()],
+            ),
         ];
-        for content in shapes {
+        for (content, carried) in shapes {
             let description = format!("{delivery:?}: {content:?}");
             let outcome = fixture.apply(content, delivery).await?;
-            assert!(outcome.change.is_none(), "{description}");
+            let published = match delivery {
+                Delivery::Initial => None,
+                Delivery::Live => (!carried.is_empty()).then(|| carried.into_iter().map(Attested::from).collect::<Vec<_>>()),
+            };
+            assert_eq!(outcome.change.map(|change| change.events().to_vec()), published, "{description}");
 
             assert_eq!(outcome.entity, Some(fixture.entity.clone()), "{description}");
             assert_eq!(fixture.entity.to_state()?, current, "{description}");

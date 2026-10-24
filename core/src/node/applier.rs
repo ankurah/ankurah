@@ -18,9 +18,9 @@ pub struct NodeApplier;
 ///
 /// Initial transfer publishes no events on its reactor changes: a repair for
 /// one subscribing query must not surface on another established query holding
-/// the same entity as an event update. Live delivery also returns validated events
-/// independently of state advancement; the reactor tracks each subscriber's
-/// event delivery so a prior initial snapshot cannot swallow a live update.
+/// the same entity as an event update. Live delivery publishes every event it
+/// validated, whether or not the entity advanced; the reactor tracks each
+/// subscriber's event delivery so a prior initial snapshot cannot swallow a live update.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Delivery {
     Initial,
@@ -28,20 +28,12 @@ pub(crate) enum Delivery {
 }
 
 /// What applying one delta did.
-///
-/// `change` is set only when the entity advanced and carries what this
-/// delivery publishes.
 #[derive(Debug)]
 pub(crate) struct DeltaOutcome {
+    /// The entity the delta applied to; an empty bridge reports it only if it is resident.
     pub entity: Option<Entity>,
+    /// The reactor change this delivery publishes, if any.
     pub change: Option<EntityChange>,
-    /// Validated live events remain delivery obligations even when an earlier
-    /// initial snapshot already advanced the entity through them.
-    pub live_events: Vec<Attested<proto::Event>>,
-}
-
-impl DeltaOutcome {
-    fn unchanged(entity: Option<Entity>) -> Self { Self { entity, change: None, live_events: Vec::new() } }
 }
 
 impl NodeApplier {
@@ -79,11 +71,19 @@ impl NodeApplier {
         crate::event_dag::ordering::topo_sort_events(attested_events)
     }
 
-    /// What a delivery publishes for an advanced entity.
-    fn change_for_delivery(entity: Entity, events: Vec<Attested<proto::Event>>, delivery: Delivery) -> EntityChange {
+    /// The reactor change a delivery publishes for one applied delta. Initial transfer publishes
+    /// an advanced entity without its events. Live delivery publishes every validated event, even
+    /// when an earlier initial snapshot already advanced the entity through them, and publishes an
+    /// advanced entity even when no events came with it.
+    fn change_for_delivery(
+        entity: &Entity,
+        advanced: bool,
+        events: Vec<Attested<proto::Event>>,
+        delivery: Delivery,
+    ) -> Option<EntityChange> {
         match delivery {
-            Delivery::Initial => EntityChange::new(entity, Vec::new()),
-            Delivery::Live => EntityChange::new(entity, events),
+            Delivery::Initial => advanced.then(|| EntityChange::new(entity.clone(), Vec::new())),
+            Delivery::Live => (advanced || !events.is_empty()).then(|| EntityChange::new(entity.clone(), events)),
         }
     }
 
@@ -111,13 +111,12 @@ impl NodeApplier {
         S: crate::retrieval::GetState + Send + Sync,
     {
         let events = Self::validate_and_stage(node, from_peer_id, entity_id, carried, event_getter)?;
-        let live_events = if delivery == Delivery::Live { events.clone() } else { Vec::new() };
         let state: Attested<proto::EntityState> = (entity_id, fragment).into();
         node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
         if let Some(entity) = Self::save_new_entity(node, &state.payload, &events, delivery, event_getter, state_getter).await? {
-            let change = Self::change_for_delivery(entity.clone(), events, delivery);
-            return Ok(DeltaOutcome { entity: Some(entity), change: Some(change), live_events });
+            let change = Self::change_for_delivery(&entity, true, events, delivery);
+            return Ok(DeltaOutcome { entity: Some(entity), change });
         }
         let entity = node
             .entities
@@ -125,12 +124,9 @@ impl NodeApplier {
             .await?
             .ok_or(RetrievalError::EntityNotFound(entity_id))?;
 
-        let change = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?;
-        let change = change.map(|change| {
-            let (entity, events) = change.into_parts();
-            Self::change_for_delivery(entity, events, delivery)
-        });
-        Ok(DeltaOutcome { entity: Some(entity), change, live_events })
+        let advanced = Self::apply_and_commit_state(node, &entity, &state.payload, &events, delivery, event_getter).await?.is_some();
+        let change = Self::change_for_delivery(&entity, advanced, events, delivery);
+        Ok(DeltaOutcome { entity: Some(entity), change })
     }
 
     /// Apply a bridge as one atomic batch for both initial and live delivery.
@@ -151,18 +147,20 @@ impl NodeApplier {
     {
         let events = Self::validate_and_stage(node, from_peer_id, entity_id, fragments, event_getter)?;
         if events.is_empty() {
-            return Ok(DeltaOutcome::unchanged(node.entities.get(&entity_id)));
+            return Ok(DeltaOutcome { entity: node.entities.get(&entity_id), change: None });
         }
-        let live_events = if delivery == Delivery::Live { events.clone() } else { Vec::new() };
-        let change = Self::apply_and_commit_events(node, &events, delivery, event_getter).await?.map(|change| {
-            let (entity, events) = change.into_parts();
-            Self::change_for_delivery(entity, events, delivery)
-        });
-        let entity = match &change {
-            Some(change) => Some(change.entity().clone()),
-            None => node.entities.get_or_retrieve(state_getter, event_getter, &entity_id).await?,
+        let advanced = Self::apply_and_commit_events(node, &events, delivery, event_getter).await?;
+        let entity = match &advanced {
+            Some(change) => change.entity().clone(),
+            // The bridge committed, so storage holds the entity even if no event was new.
+            None => node
+                .entities
+                .get_or_retrieve(state_getter, event_getter, &entity_id)
+                .await?
+                .ok_or(RetrievalError::EntityNotFound(entity_id))?,
         };
-        Ok(DeltaOutcome { entity, change, live_events })
+        let change = Self::change_for_delivery(&entity, advanced.is_some(), events, delivery);
+        Ok(DeltaOutcome { entity: Some(entity), change })
     }
 
     /// Before adopting a snapshot, check that its events lead to its head through the ordered batch,

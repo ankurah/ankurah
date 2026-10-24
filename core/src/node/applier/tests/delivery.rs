@@ -71,10 +71,11 @@ async fn state_and_relation_is_refused() -> anyhow::Result<()> {
 }
 
 /// Two query streams carrying the same live state can both judge it applicable before either
-/// persists it. The one that advances the resident publishes the events; the other, whose commit
-/// conflicts and retries against the installed state, has nothing to publish.
+/// persists it. Only the first advances the resident entity; the second's commit conflicts and
+/// retries against the installed state. Both publish the live events for their own subscribers,
+/// and the reactor delivers each event to a subscriber once.
 #[tokio::test]
-async fn concurrent_identical_live_states_publish_once() -> anyhow::Result<()> {
+async fn concurrent_identical_live_states_advance_the_resident_once() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let incoming =
         Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
@@ -97,9 +98,9 @@ async fn concurrent_identical_live_states_publish_once() -> anyhow::Result<()> {
     let first = first.await?;
     let second = second.await?;
 
-    let published: Vec<_> = [first, second].into_iter().filter_map(|outcome| outcome.change).collect();
-    assert_eq!(published.len(), 1, "the events are published exactly once");
-    assert_eq!(published[0].events(), &[Attested::from(incoming.clone())]);
+    for outcome in [first, second] {
+        assert_eq!(outcome.change.expect("live events are published").events(), &[Attested::from(incoming.clone())]);
+    }
     assert_eq!(fixture.entity.to_state()?, snapshot);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
     assert_eq!(fixture.storage.get_events(vec![incoming.id()]).await?.len(), 1);
@@ -271,6 +272,9 @@ async fn untrusted_attestations_are_refused_before_anything_is_stored() -> anyho
     Ok(())
 }
 
+/// An initial snapshot that adopts an entity's newest state does not consume the live delivery of
+/// the event behind it: the live delta still publishes that event, and a historical repair of the
+/// same event publishes nothing.
 #[tokio::test]
 async fn initial_snapshot_does_not_consume_later_live_event_delivery() -> anyhow::Result<()> {
     for ingress in [EventIngress::LiveBridge, EventIngress::LiveStateAndEvents] {
@@ -280,14 +284,14 @@ async fn initial_snapshot_does_not_consume_later_live_event_delivery() -> anyhow
         fixture.events.stage_event(event.clone());
         let newer = fixture.remote_snapshot(&event).await?;
         let initial = fixture.apply(proto::DeltaContent::StateSnapshot { state: fragment(newer.clone()) }, Delivery::Initial).await?;
-        assert!(initial.live_events.is_empty());
         assert!(initial.change.unwrap().events().is_empty());
         assert_eq!(fixture.entity.head(), newer.head);
         let live = fixture.deliver(ingress, vec![event.clone()]).await?;
-        assert!(live.change.is_none(), "the data was already adopted by the initial snapshot");
-        assert_eq!(live.live_events.iter().map(|event| event.payload.id()).collect::<Vec<_>>(), [event.id()]);
+        let published = live.change.expect("the live event is published although the entity already holds it");
+        assert_eq!(published.entity(), &fixture.entity);
+        assert_eq!(published.events().iter().map(|event| event.payload.id()).collect::<Vec<_>>(), [event.id()]);
         let history = fixture.deliver(EventIngress::InitialBridge, vec![event]).await?;
-        assert!(history.live_events.is_empty(), "historical repair is never a live event delivery");
+        assert!(history.change.is_none(), "a historical repair of an applied event publishes nothing");
     }
     Ok(())
 }

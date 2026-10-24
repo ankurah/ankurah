@@ -493,8 +493,11 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
     Ok(())
 }
 
+/// A live snapshot whose event a concurrent local commit applied first retries without applying it
+/// again, so the resident advances once. Live delivery still publishes the event; the reactor drops
+/// it for every query that already delivered it.
 #[tokio::test]
-async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_applied() -> anyhow::Result<()> {
+async fn snapshot_retry_does_not_reapply_events_a_concurrent_commit_already_applied() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let incoming =
         Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
@@ -528,9 +531,10 @@ async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_a
     let (notifications, observed) = mpsc::channel();
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
     release.send(()).unwrap();
-    assert!(applying.await?.change.is_none());
+    let change = applying.await?.change.expect("live delivery publishes its validated event");
+    assert_eq!(change.events(), &[Attested::from(incoming.clone())]);
 
-    assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "the resident does not advance again");
     assert_eq!(fixture.entity.to_state()?, snapshot);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
     assert_eq!(fixture.storage.get_events(vec![incoming.id()]).await?, vec![Attested::from(incoming)]);
