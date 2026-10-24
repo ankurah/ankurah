@@ -106,7 +106,7 @@ impl TreeSpan {
     /// The parts of this span outside `covered`, whose spans must be sorted
     /// by start and must not overlap. Keeping these gaps matters when the
     /// other peer has leaves absent locally.
-    pub(crate) fn gaps(&self, covered: &[TreeSpan]) -> Vec<TreeSpan> {
+    pub fn gaps(&self, covered: &[TreeSpan]) -> Vec<TreeSpan> {
         let mut start = self.start.clone();
         let mut gaps = Vec::new();
         for covered in covered {

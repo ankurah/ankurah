@@ -190,6 +190,7 @@ dependencies = [
  "uniffi",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-time",
  "yrs",
 ]
 

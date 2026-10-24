@@ -111,6 +111,9 @@ impl QueryTree {
     /// Each admitted entity's entry.
     pub(crate) fn entries(&self) -> &Entries { &self.entries }
 
+    /// How many times the entries have changed.
+    pub(crate) fn version(&self) -> u64 { self.version }
+
     /// The bytes the LRU charges this tree: its digest rows only once they are built.
     pub(crate) fn accounted_bytes(&self) -> usize { self.footprint.bytes(self.digests.is_some()) }
 

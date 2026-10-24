@@ -77,6 +77,10 @@ pub enum RetrievalError {
     DeserializationError(Arc<bincode::ErrorKind>),
     #[error("No durable peers available for fetch operation")]
     NoDurablePeers,
+    /// The local copy of a query's result stopped progressing toward the
+    /// peer's account of it, however often the requester compared again.
+    #[error("query sync with peer {peer} stalled: comparing again brought no progress")]
+    SyncStalled { peer: EntityId },
     #[error("Other error: {0}")]
     Other(String),
     #[error("bucket name must only contain valid characters")]

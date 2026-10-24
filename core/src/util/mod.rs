@@ -10,6 +10,13 @@ pub mod safeset;
 pub use iterable::Iterable;
 pub use ivec::IVec;
 
+#[cfg(not(target_family = "wasm"))]
+pub(crate) use std::time::Instant;
+/// A monotonic clock reading. `web-time` stands in for `std::time` on wasm
+/// targets, where `std::time::Instant::now` is unavailable.
+#[cfg(target_family = "wasm")]
+pub(crate) use web_time::Instant;
+
 /// Formats an action log with consistent styling.
 /// First argument is always a "thing" that performed the action (in bold blue)
 /// Second argument is the action name (in green)

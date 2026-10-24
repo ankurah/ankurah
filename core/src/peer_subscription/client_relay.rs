@@ -10,15 +10,20 @@ use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, warn};
 
 use crate::error::{NodeDropped, RequestError, RetrievalError};
+use crate::node::state_sync::{CheckOutcome, SyncedQuery};
 use crate::node::ContextData;
 use crate::session::SessionSet;
 use crate::util::cancel_flag::CancelFlag;
 use crate::util::safeset::SafeSet;
+use crate::util::Instant;
+
+mod periodic_check;
+use periodic_check::PeriodicCheck;
 
 /// Query lifecycle callbacks used by SubscriptionRelay.
 #[async_trait::async_trait]
 pub trait RemoteQuerySubscriber: Clone + Send + Sync + 'static {
-    /// Called after remote subscription deltas have been applied.
+    /// Called once the query's local copy matches or exceeds the remote's result.
     async fn subscription_established(&self, version: u32);
 
     /// Record a permanent failure for this subscription version.
@@ -49,6 +54,8 @@ pub struct RemoteQueryState<CD: ContextData, Q: RemoteQuerySubscriber> {
     pub status: Status,
     pub livequery: Q,
     cancel: CancelFlag,
+    /// The schedule of checks since the query was last established.
+    check: Option<PeriodicCheck>,
 }
 
 struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
@@ -162,6 +169,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     status: peer.map_or(Status::PendingRemote, |peer| Status::Requested(peer, version)),
                     livequery,
                     cancel: cancel.clone(),
+                    check: None,
                 },
             );
             peer
@@ -248,8 +256,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 // credentials current at send time.
                 match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version).await {
                     _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
-                    Ok(()) => {
-                        // Deltas applied successfully, now activate the livequery
+                    Ok(synced) => {
+                        // The local copy is ready, now activate the livequery
                         if let Some(lq) = livequery {
                             lq.subscription_established(version).await;
                         }
@@ -259,6 +267,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                         if !cancel.canceled() {
                             if let Some(info) = subscriptions.get_mut(&query_id) {
                                 info.status = Status::Established(peer_id, version);
+                                info.check = Some(PeriodicCheck::new(synced));
                             }
                         }
                         debug!("Successfully updated predicate {} on peer {} subscription", query_id, peer_id);
@@ -438,11 +447,11 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         let livequery =
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
-        // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
+        // Call remote_subscribe, which offers the local copy, subscribes, and returns once the copy is ready
         match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version).await {
             _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
-            Ok(()) => {
-                // Deltas applied successfully, now activate the livequery
+            Ok(synced) => {
+                // The local copy is ready, now activate the livequery
                 // The livequery handles its own errors internally
                 if let Some(lq) = livequery {
                     lq.subscription_established(version).await;
@@ -453,6 +462,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 if !cancel.canceled() {
                     if let Some(info) = subscriptions.get_mut(&query_id) {
                         info.status = Status::Established(target_peer, version);
+                        info.check = Some(PeriodicCheck::new(synced));
                     }
                 }
                 debug!("Successfully registered predicate {} on peer {} subscription", query_id, target_peer);
@@ -472,9 +482,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 let delay = futures_timer::Delay::new(std::time::Duration::from_secs(5));
                 tokio::select! {
                     _ = delay => {
-                        // Attempt to setup any pending subscriptions
+                        // Attempt to setup any pending subscriptions, and check the established ones that are due
                         let Some(relay) = me.upgrade() else { break };
                         relay.setup_remote_subscriptions();
+                        relay.run_due_checks();
                     }
                     _ = shutdown_rx.recv() => {
                         debug!("Subscription relay retry task stopped");
@@ -484,6 +495,54 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             }
         });
     }
+
+    /// Start the periodic check of each established query whose check is due.
+    fn run_due_checks(&self) {
+        let now = Instant::now();
+        let due: Vec<_> = {
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            subscriptions
+                .iter_mut()
+                .filter(|(_, state)| state.check.as_ref().is_some_and(|check| check.is_due(now)))
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for query_id in due {
+            let relay = self.clone();
+            crate::task::spawn(async move { relay.check(query_id).await });
+        }
+    }
+
+    /// Run established query `query_id`'s periodic check and schedule its
+    /// next one, or handle its error as a subscription's.
+    async fn check(&self, query_id: proto::QueryId) {
+        let Some(node) = self.inner.node.get() else { return };
+        let started = {
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            subscriptions.get_mut(&query_id).and_then(|state| {
+                let Status::Established(peer, _) = state.status else { return None };
+                let check = state.check.as_mut()?;
+                let confirm = check.start()?;
+                Some((peer, state.content.clone(), check.synced.clone(), confirm, state.cancel.clone()))
+            })
+        };
+        let Some((peer, content, synced, confirm, cancel)) = started else { return };
+        match node.check_query(peer, content.selection.clone(), content.sessions.current(), synced, confirm).await {
+            Ok(outcome) => {
+                let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+                if !cancel.canceled() {
+                    if let Some(check) = subscriptions.get_mut(&query_id).and_then(|state| state.check.as_mut()) {
+                        check.finish(outcome, Instant::now());
+                    }
+                }
+            }
+            Err(error) => self.handle_error(query_id, peer, error, &cancel),
+        }
+    }
+
+    /// Run established query `query_id`'s periodic check now, whatever its schedule.
+    #[cfg(feature = "test-helpers")]
+    pub(crate) async fn check_now(&self, query_id: proto::QueryId) { self.check(query_id).await }
 
     /// Handle errors with retry logic
     fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::EntityId, error: RetrievalError, cancel: &CancelFlag) {
@@ -503,6 +562,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 RequestError::AccessDenied(_) => false,
                 RequestError::NodeNotReady | RequestError::NodeHalted(_) => false,
             },
+            // A sync that stopped progressing starts over with a new subscription
+            RetrievalError::SyncStalled { .. } => true,
             // Other retrieval errors are not retryable
             _ => false,
         };
@@ -533,9 +594,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 /// Trait for communicating with remote peers (abstraction over WeakNode for testing)
 #[async_trait]
 pub trait TNode<CD: ContextData>: Send + Sync {
-    /// Send a predicate registration request to a remote peer, fetch known matches,
-    /// apply received deltas, and store used events.
-    /// Returns Ok(()) if subscription was established and deltas applied successfully.
+    /// Send a predicate registration request to a remote peer, offering the local copy of its result.
+    /// Returns once the local copy matches or exceeds the remote's result, with what the sync settled on.
     async fn remote_subscribe(
         &self,
         peer_id: proto::EntityId,
@@ -543,7 +603,18 @@ pub trait TNode<CD: ContextData>: Send + Sync {
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
         version: u32,
-    ) -> Result<(), RetrievalError>;
+    ) -> Result<SyncedQuery, RetrievalError>;
+
+    /// Check an established query's local copy against the remote's result, repairing it when
+    /// `confirm`ing a disagreement.
+    async fn check_query(
+        &self,
+        peer_id: proto::EntityId,
+        selection: ankql::ast::Selection<Resolved>,
+        context_data: Vec<CD>,
+        synced: SyncedQuery,
+        confirm: bool,
+    ) -> Result<CheckOutcome, RetrievalError>;
 
     /// Send a predicate unregistration message to a remote peer
     /// This is a one-way message, no response expected
@@ -564,39 +635,22 @@ where
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
         version: u32,
-    ) -> Result<(), RetrievalError> {
+    ) -> Result<SyncedQuery, RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
         node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
+        crate::node::state_sync::subscribe(&node, peer_id, query_id, selection, context_data, version).await
+    }
 
-        // 1. Pre-fetch known_matches from local storage
-        let known_matches: Vec<ankurah_proto::KnownEntity> = node
-            .fetch_entities_from_local(&selection)
-            .await?
-            .into_iter()
-            .map(|entity| ankurah_proto::KnownEntity { entity_id: entity.id(), head: entity.head() })
-            .collect();
-
-        // 2. Send subscribe request with known_matches
-        let response = node
-            .request(
-                peer_id,
-                &context_data,
-                ankurah_proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_matches },
-            )
-            .await?;
-        let deltas = match response {
-            ankurah_proto::NodeResponseBody::QuerySubscribed { query_id: _response_query_id, deltas } => deltas,
-            ankurah_proto::NodeResponseBody::Error(e) => return Err(RetrievalError::RequestError(RequestError::ServerError(e))),
-            other => return Err(RetrievalError::RequestError(RequestError::UnexpectedResponse(other))),
-        };
-
-        tracing::debug!("Node.remote_subscribe: query_id: {}, received deltas: {}", query_id, deltas.len());
-        // 3. Apply deltas to local node using NodeApplier
-        let event_getter = crate::retrieval::CachedEventGetter::new(&node, &context_data);
-        let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-        crate::node::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
-
-        Ok(())
+    async fn check_query(
+        &self,
+        peer_id: proto::EntityId,
+        selection: ankql::ast::Selection<Resolved>,
+        context_data: Vec<PA::ContextData>,
+        synced: SyncedQuery,
+        confirm: bool,
+    ) -> Result<CheckOutcome, RetrievalError> {
+        let node = self.upgrade().ok_or(NodeDropped)?;
+        crate::node::state_sync::check(&node, peer_id, selection, context_data, &synced, confirm).await
     }
 
     async fn peer_unsubscribe(&self, peer_id: proto::EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
@@ -673,20 +727,35 @@ mod tests {
             selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
             _version: u32,
-        ) -> Result<(), RetrievalError> {
+        ) -> Result<SyncedQuery, RetrievalError> {
             self.sent_requests.lock().unwrap().push((peer_id, query_id, Some(selection.clone())));
+            let synced = || SyncedQuery {
+                spec: proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone()),
+                round_trip: std::time::Duration::ZERO,
+            };
 
             let held = self.held_reply.lock().unwrap().take();
             if let Some(reply) = held {
-                return reply.await.expect("held reply dropped").map_err(RetrievalError::RequestError);
+                return reply.await.expect("held reply dropped").map(|()| synced()).map_err(RetrievalError::RequestError);
             }
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
                 Err(RetrievalError::RequestError(error))
             } else {
-                // Mock successful subscription (fetch, subscribe, apply, store all succeeded)
-                Ok(())
+                // Mock successful subscription (offer, subscribe, and readiness all succeeded)
+                Ok(synced())
             }
+        }
+
+        async fn check_query(
+            &self,
+            _peer_id: EntityId,
+            _selection: ankql::ast::Selection<Resolved>,
+            _context_data: Vec<CD>,
+            _synced: SyncedQuery,
+            _confirm: bool,
+        ) -> Result<CheckOutcome, RetrievalError> {
+            Ok(CheckOutcome::Agreed)
         }
 
         async fn peer_unsubscribe(&self, peer_id: EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {

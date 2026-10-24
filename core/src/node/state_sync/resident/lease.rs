@@ -6,7 +6,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, Weak,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// The handle every lease of one resident shares: the channel to its actor,
 /// the stop signal its drop sends, whether its actor still runs, and how many
@@ -65,10 +65,11 @@ impl<CD: ContextData> Drop for ResidentLease<CD> {
     }
 }
 
-/// A snapshot of a resident's view, and the source revision it reflects.
+/// A snapshot of a resident's view, and a signal that the resident's tree has
+/// changed since: it fires at the next change, and errs once the resident stops.
 pub(crate) struct ResidentSnapshot {
-    pub(crate) revision: u64,
     pub(crate) snapshot: Snapshot,
+    pub(crate) changes: watch::Receiver<u64>,
 }
 
 /// A lease's request for a snapshot of its view, answered on its own channel.

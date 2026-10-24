@@ -23,6 +23,7 @@ use crate::{
 };
 use ankurah_proto as proto;
 use std::collections::{BTreeMap, BTreeSet};
+use tokio::sync::watch;
 
 pub(super) const MAX_READ_ATTEMPTS: usize = 8;
 pub(super) type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
@@ -167,7 +168,8 @@ impl<CD: ContextData> ResidentActor<CD> {
             }
         };
         let tree = QueryTree::new(identity.spec.clone(), rows);
-        Ok(Self { identity, candidates, tree, cursor, revision: revision.0, digest_requests: None })
+        let changes = watch::Sender::new(tree.version());
+        Ok(Self { identity, candidates, tree, cursor, revision: revision.0, digest_requests: None, changes })
     }
 }
 

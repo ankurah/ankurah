@@ -26,7 +26,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{atomic::Ordering, Mutex, Weak},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 /// A resident's state, owned by its actor task: what it admits, every
 /// candidate its predicate matches, its tree and its maintenance subscription.
@@ -40,6 +40,9 @@ pub(super) struct ResidentActor<CD: ContextData> {
     /// How the snapshots this actor hands out ask it for the tree's digests,
     /// once the actor runs.
     pub(super) digest_requests: Option<DigestRequests>,
+    /// The tree's version, which a snapshot's holder watches for the tree's
+    /// next change.
+    pub(super) changes: watch::Sender<u64>,
 }
 
 impl<CD: ContextData> ResidentActor<CD> {
@@ -162,7 +165,15 @@ impl<CD: ContextData> ResidentActor<CD> {
     {
         let window = self.cursor.fence().await?;
         self.advance(node, window.batch, window.revision.0).await?;
+        self.signal_changes();
         Ok(self.snapshot())
+    }
+
+    /// Signal the holders of this resident's snapshots when the tree has
+    /// changed since they last heard.
+    fn signal_changes(&self) {
+        let version = self.tree.version();
+        self.changes.send_if_modified(|seen| std::mem::replace(seen, version) != version);
     }
 
     /// A snapshot of the tree whose first digest read asks this actor for the
@@ -209,6 +220,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                     let batch = batch?;
                     let revision = batch.revision.0;
                     self.advance(&node, Some(batch), revision).await?;
+                    self.signal_changes();
                 }
             }
             let lru = lru.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
@@ -265,7 +277,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         })();
         match selected {
             Ok(snapshot) => {
-                let _ = request.response.send(Ok(ResidentSnapshot { revision: self.revision, snapshot }));
+                let _ = request.response.send(Ok(ResidentSnapshot { snapshot, changes: self.changes.subscribe() }));
             }
             // An invalid view does not invalidate the source used by other
             // query owners.

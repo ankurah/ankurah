@@ -53,6 +53,7 @@ pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
+use peer_state::PendingRequest;
 use schema_registration::WireRegistrant;
 pub use state::NodeState;
 
@@ -353,11 +354,13 @@ where
             self.policy_agent.sign_request(self, cdata, &request)?
         };
 
-        {
+        let _pending = {
             let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
-            connection.pending_requests.insert(request_id, response_tx);
+            connection.pending_requests.insert(request_id.clone(), response_tx);
+            let pending = PendingRequest::new(&connection, request_id);
             connection.send_message(proto::NodeMessage::Request { auth, request })?;
-        }
+            pending
+        };
 
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
     }
@@ -766,8 +769,8 @@ where
         }
     }
 
-    /// Fetch matching entities from a durable peer using local heads as known matches.
-    /// Apply its deltas locally before returning.
+    /// Fetch matching entities from a durable peer: bring the local copy of the
+    /// selection's result to match or exceed the peer's, then read it locally.
     pub(crate) async fn fetch_from_peer(
         &self,
         selection: ankql::ast::Selection<Resolved>,
@@ -775,34 +778,9 @@ where
     ) -> Result<Vec<Entity>, RetrievalError> {
         self.system.require_system_ready().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
-
-        let known_matched_entities = self.fetch_entities_from_local(&selection).await?;
-
-        let known_matches = known_matched_entities
-            .iter()
-            .map(|entity| proto::KnownEntity { entity_id: entity.id(), head: entity.head().clone() })
-            .collect();
-
-        let selection_clone = selection.clone();
-        match self.request(peer_id, cdata, proto::NodeRequestBody::Fetch { selection, known_matches }).await? {
-            proto::NodeResponseBody::Fetch(deltas) => {
-                let event_getter = CachedEventGetter::new(self, cdata);
-                let state_getter = LocalStateGetter::new(self.storage.clone());
-
-                applier::NodeApplier::apply_deltas(self, &peer_id, deltas, &event_getter, &state_getter).await?;
-                // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
-
-                self.fetch_entities_from_local(&selection_clone).await
-            }
-            proto::NodeResponseBody::Error(e) => {
-                debug!("Error from peer fetch: {}", e);
-                Err(RetrievalError::Other(format!("{:?}", e)))
-            }
-            _ => {
-                debug!("Unexpected response type from peer fetch");
-                Err(RetrievalError::Other("Unexpected response type".to_string()))
-            }
-        }
+        state_sync::fetch(self, peer_id, selection.clone(), cdata.clone()).await?;
+        // ARCHITECTURAL QUESTION: Optimize in-place mutation vs re-fetching for remote-peer-assisted operations https://github.com/ankurah/ankurah/issues/145
+        self.fetch_entities_from_local(&selection).await
     }
 
     /// Get a random durable peer node ID.

@@ -8,7 +8,7 @@ use crate::{
 };
 use std::{
     collections::HashSet,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::oneshot;
 
@@ -34,6 +34,26 @@ impl<CD: ContextData> PeerState<CD> {
     }
 
     pub fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> { self.sender.send_message(message) }
+}
+
+/// A request's slot in its peer's pending requests, freed when the request
+/// stops waiting, so that a request whose waiter gave up, as a timed-out
+/// comparison does, leaves nothing behind for a peer that never answers.
+pub(super) struct PendingRequest<CD: ContextData> {
+    connection: Weak<PeerState<CD>>,
+    id: proto::RequestId,
+}
+
+impl<CD: ContextData> PendingRequest<CD> {
+    pub(super) fn new(connection: &Arc<PeerState<CD>>, id: proto::RequestId) -> Self { Self { connection: Arc::downgrade(connection), id } }
+}
+
+impl<CD: ContextData> Drop for PendingRequest<CD> {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.upgrade() {
+            connection.pending_requests.remove(&self.id);
+        }
+    }
 }
 
 /// The Fetches this node has in flight with one peer, each with the credentials
