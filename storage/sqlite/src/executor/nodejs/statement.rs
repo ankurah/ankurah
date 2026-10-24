@@ -184,7 +184,7 @@ fn js_param(value: &SqliteValueRef<'_>) -> JsValue {
         SqliteValueRef::Integer(integer) => BigInt::from(integer).into(),
         SqliteValueRef::Real(real) => JsValue::from_f64(real),
         SqliteValueRef::Blob(bytes) => Uint8Array::from(bytes).into(),
-        // The SQL wraps this placeholder in jsonb(?), so the text form binds.
+        // JSON binds as its JSON text, TEXT, as it does natively.
         SqliteValueRef::Jsonb(json) => JsValue::from_str(&json.to_string()),
         SqliteValueRef::Null => JsValue::NULL,
     }

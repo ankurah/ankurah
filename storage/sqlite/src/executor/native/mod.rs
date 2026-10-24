@@ -103,8 +103,7 @@ fn value_from_ref(index: usize, value: ValueRef<'_>) -> Result<SqliteValue, Sqli
 
 /// Binds a parameter by reference: TEXT and BLOB reach rusqlite borrowed,
 /// without first being copied into an owned value, though SQLite still
-/// copies them as rusqlite binds them; a JSONB value binds as its JSON text
-/// for the `jsonb(?)` that wraps it.
+/// copies them as rusqlite binds them; JSON binds as its JSON text, TEXT.
 impl ToSql for SqliteValueRef<'_> {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(match *self {

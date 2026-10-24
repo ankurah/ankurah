@@ -177,6 +177,23 @@ async fn empty_text_and_an_empty_blob_read_back_as_stored() -> Result<()> {
     Ok(())
 }
 
+/// A JSON parameter binds as its JSON text, TEXT, on every driver, which
+/// `jsonb(?)` turns into JSONB.
+#[engine_test]
+async fn a_json_parameter_binds_as_its_text() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let row = storage
+        .with_executor(|executor| {
+            let json = serde_json::json!({ "a": [1, "two"] });
+            let json = SqliteValueRef::Jsonb(&json);
+            Ok(executor.query_row("SELECT ?, typeof(?), typeof(jsonb(?)), json(jsonb(?))", &[json; 4])?.expect("one row"))
+        })
+        .await?;
+    let text = r#"{"a":[1,"two"]}"#;
+    assert_eq!([row.text(0)?, row.text(1)?, row.text(2)?, row.text(3)?], [text, "text", "blob", text]);
+    Ok(())
+}
+
 /// A compound SELECT at the top level of a query, or in a scalar subquery
 /// there, is refused on Node.js before it runs, where rusqlite reads its values
 /// directly: Node.js's typed reader would read a later SELECT's INTEGER past

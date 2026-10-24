@@ -49,8 +49,8 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///
 /// Parameters are positional `?` placeholders, bound by reference, without
 /// first copying a caller's TEXT and BLOB into an owned value. A
-/// [`SqliteValueRef::Jsonb`] parameter is bound as its JSON text, because the
-/// SQL that carries one always wraps its placeholder in `jsonb(?)`.
+/// [`SqliteValueRef::Jsonb`] parameter is bound as its JSON text, TEXT, on
+/// every driver, which SQL that stores it as JSONB wraps in `jsonb(?)`.
 ///
 /// Each call runs one statement: SQL that holds a second one is refused
 /// before SQLite prepares either, since SQLite applies some PRAGMAs while it

@@ -10,7 +10,7 @@ use ankurah_storage_sqlite::{
 };
 use anyhow::Result;
 use common::{host_database, on_better_sqlite3, Album, AlbumView};
-use js_sys::{Function, Reflect};
+use js_sys::{Function, Object, Reflect};
 use std::sync::Arc;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
@@ -21,9 +21,13 @@ fn refusal_of(error: &anyhow::Error) -> Option<Refusal> { error.downcast_ref::<S
 /// The refusal of a database, as a [`Refusal::Database`].
 fn refused_database(refusal: DatabaseRefusal) -> Option<Refusal> { Some(Refusal::Database(refusal)) }
 
+/// The engine adopts a database the host built, runs on it, and hands the
+/// same object back from `database()`.
 #[wasm_bindgen_test]
 async fn adopts_a_host_built_database() -> Result<()> {
-    let storage = SqliteStorageEngine::from_database(host_database(":memory:")).await?;
+    let database = host_database(":memory:");
+    let storage = SqliteStorageEngine::from_database(database.clone()).await?;
+    assert!(Object::is(storage.database(), &database), "`database()` returns the object the host adopted");
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
     node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
@@ -79,33 +83,40 @@ async fn refuses_a_driver_without_exact_integers() {
     assert_eq!(refusal_of(&error), refused_database(DatabaseRefusal::NoExactIntegers), "{error}");
 }
 
-// Hand over a copy of each statement of the run's driver that holds all but
-// its SQL (node:sqlite's `sourceSQL`, better-sqlite3's `source`), each method
-// bound to the actual statement: both drivers make the SQL a property that
-// cannot be redefined, nor hidden behind a Proxy for better-sqlite3, whose
-// `source` is a value that cannot change.
+// Hand over a copy of a statement of the run's driver that holds all but its
+// SQL (node:sqlite's `sourceSQL`, better-sqlite3's `source`), each method
+// bound to the actual statement, and reports `source` as its SQL unless that
+// is undefined: both drivers make the SQL a property that cannot be
+// redefined, nor hidden behind a Proxy for better-sqlite3, whose `source` is
+// a value that cannot change. `withoutStatementSource` copies every
+// statement, and `withStatementSource` the one prepared from `sql`.
 #[wasm_bindgen::prelude::wasm_bindgen(inline_js = "
+function copyStatement(statement, source) {
+    const copy = source === undefined ? {} : { sourceSQL: source };
+    for (let object = statement; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {
+        for (const name of Object.getOwnPropertyNames(object)) {
+            if (name === 'sourceSQL' || name === 'source' || name === 'constructor' || name in copy) continue;
+            const value = statement[name];
+            copy[name] = typeof value === 'function' ? value.bind(statement) : value;
+        }
+    }
+    return copy;
+}
 export function withoutStatementSource(database) {
+    return { prepare: (text) => copyStatement(database.prepare(text)), exec: (text) => database.exec(text) };
+}
+export function withStatementSource(database, sql, source) {
     return {
-        prepare(sql) {
-            const statement = database.prepare(sql);
-            const copy = {};
-            for (let object = statement; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {
-                for (const name of Object.getOwnPropertyNames(object)) {
-                    if (name === 'sourceSQL' || name === 'source' || name === 'constructor' || name in copy) continue;
-                    const value = statement[name];
-                    copy[name] = typeof value === 'function' ? value.bind(statement) : value;
-                }
-            }
-            return copy;
-        },
-        exec(sql) { return database.exec(sql); }
+        prepare: (text) => text === sql ? copyStatement(database.prepare(text), source) : database.prepare(text),
+        exec: (text) => database.exec(text),
     };
 }
 ")]
 extern "C" {
     #[wasm_bindgen::prelude::wasm_bindgen(js_name = withoutStatementSource)]
     fn without_statement_source(database: JsValue) -> JsValue;
+    #[wasm_bindgen::prelude::wasm_bindgen(js_name = withStatementSource)]
+    fn with_statement_source(database: JsValue, sql: &str, source: &str) -> JsValue;
 }
 
 #[wasm_bindgen_test]
@@ -113,6 +124,25 @@ async fn refuses_a_driver_whose_statements_report_no_sql() {
     let database = without_statement_source(host_database(":memory:"));
     let error = SqliteStorageEngine::from_database(database).await.err().expect("the executor reads each statement's SQL");
     assert_eq!(refusal_of(&error), refused_database(DatabaseRefusal::NoStatementSource), "{error}");
+}
+
+/// SQL that goes on past the statement the database reports it prepared is
+/// refused by `execute` and `query` alike, though the scan before preparing
+/// found nothing past that statement but what SQLite skips, since the
+/// driver would run that statement alone. SQL the reported statement's SQL
+/// does not begin is refused as unreadable.
+#[wasm_bindgen_test]
+fn refuses_sql_past_the_statement_the_database_reports() {
+    let sql = "SELECT 1 + 1";
+    let past = NodeJsConnection::from_database(with_statement_source(host_database(":memory:"), sql, "SELECT 1")).unwrap();
+    for refusal in
+        [past.execute(sql, &[]).map(drop), past.query(sql, &[]).map(drop)].map(|outcome| outcome.map_err(|error| error.refusal()))
+    {
+        assert_eq!(refusal, Err(Some(Refusal::SqlPastItsStatement)));
+    }
+    let other = NodeJsConnection::from_database(with_statement_source(host_database(":memory:"), sql, "SELECT 2")).unwrap();
+    let unreadable = r#""SELECT 2" as the SQL of a statement prepared from "SELECT 1 + 1""#.to_owned();
+    assert_eq!(other.query(sql, &[]).err().and_then(|error| error.refusal()), refused_database(DatabaseRefusal::Unreadable(unreadable)));
 }
 
 /// TEXT from a statement SQLite cannot nest in the typed reader, such as a

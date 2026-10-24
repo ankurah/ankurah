@@ -72,7 +72,7 @@ pub enum SqliteValueRef<'a> {
     Integer(i64),
     Real(f64),
     Blob(&'a [u8]),
-    /// JSON, bound as its text for the `jsonb(?)` that wraps its placeholder.
+    /// JSON, bound as its JSON text, TEXT, which `jsonb(?)` turns into JSONB.
     Jsonb(&'a serde_json::Value),
     Null,
 }
