@@ -29,13 +29,16 @@ pub struct MemoryMaps {
     shared: Arc<Mutex<Shared>>,
 }
 
+/// What every transaction over the maps shares, behind their lock.
 #[derive(Debug, Default)]
 struct Shared {
     /// The maps as the last commit left them.
     committed: Arc<Maps>,
     /// How many values have been appended: the next one's suffix.
     appended: u64,
+    /// How many commits have written anything.
     revision: u64,
+    /// How many commits have changed the topology.
     structure: u64,
 }
 
@@ -76,9 +79,15 @@ pub struct MemoryTransaction {
     /// The first failure the transaction met, a failed condition or a failed
     /// tree operation, which prevents its commit.
     failure: Option<Failure>,
+    /// The maps' revision when the transaction began.
     revision: u64,
+    /// The maps' topology revision when the transaction began.
     structure: u64,
+    /// Whether the transaction relies on the topology it read, so that a
+    /// commit that changed the topology since fails it.
     watches_structure: bool,
+    /// Whether the transaction changes the topology, so that any commit that
+    /// wrote since fails it.
     changes_structure: bool,
 }
 
