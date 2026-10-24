@@ -14,3 +14,6 @@ pub const MAX_OFFER_BYTES: usize = 256 * 1024;
 /// Heads across one KnownState's inventories. The codec caps every packed inventory
 /// at this count too.
 pub const MAX_OFFER_HEADS: usize = 2048;
+/// Heads questions in one CompareSpans, so that its answers stay within
+/// `MAX_OFFER_BYTES` of work: four pages of at most `MAX_PAGE_BYTES`.
+pub const MAX_HEAD_QUESTIONS: usize = 4;

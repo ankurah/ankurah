@@ -44,9 +44,10 @@ pub(crate) fn is_catalog_read<S: ankql::ast::Stage<ModelId = ModelId>>(predicate
 pub(crate) fn request_bypasses_policy(request: &ankurah_proto::NodeRequestBody) -> bool {
     use ankurah_proto::NodeRequestBody;
     match request {
-        NodeRequestBody::Fetch { selection, .. } | NodeRequestBody::SubscribeQuery { selection, .. } => {
-            is_catalog_read(&selection.predicate)
-        }
+        NodeRequestBody::Fetch { selection, .. }
+        | NodeRequestBody::SubscribeQuery { selection, .. }
+        | NodeRequestBody::CompareSpans { selection, .. }
+        | NodeRequestBody::SyncEntities { selection, .. } => is_catalog_read(&selection.predicate),
         NodeRequestBody::Get { .. }
         | NodeRequestBody::GetEvents { .. }
         | NodeRequestBody::CommitTransaction { .. }
@@ -101,7 +102,8 @@ mod model_mapping_tests {
 mod request_policy_tests {
     use super::*;
     use ankql::ast::Predicate;
-    use ankurah_proto::{NodeRequestBody, QueryId, RegisterModel, TransactionId};
+    use ankurah_core_types::KeySpec;
+    use ankurah_proto::{KnownState, NodeRequestBody, QueryId, RegisterModel, SpanQuestion, TransactionId, TreeSpan, TreeSpec};
 
     #[test]
     fn only_catalog_reads_bypass_policy() {
@@ -112,14 +114,22 @@ mod request_policy_tests {
             (ModelId::System(SystemModel::System), false),
             (ModelId::EntityId(ankurah_proto::EntityId::random()), false),
         ] {
+            let spec = TreeSpec::new(KeySpec::new(vec![]), Predicate::MemberOf(model));
+            let known_state = KnownState { spec: spec.clone(), spans: Vec::new() };
             let requests = [
-                NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_matches: Vec::new() },
+                NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_state: known_state.clone() },
                 NodeRequestBody::SubscribeQuery {
                     query_id: QueryId::new(),
                     selection: Predicate::MemberOf(model).into(),
                     version: 1,
-                    known_matches: Vec::new(),
+                    known_state,
                 },
+                NodeRequestBody::CompareSpans {
+                    selection: Predicate::MemberOf(model).into(),
+                    spec,
+                    questions: vec![SpanQuestion::Digest(TreeSpan::all())],
+                },
+                NodeRequestBody::SyncEntities { selection: Predicate::MemberOf(model).into(), entities: Vec::new() },
             ];
             for request in requests {
                 assert_eq!(request_bypasses_policy(&request), exempt, "{request:?}");

@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventFragment,
-    EventId, RegisterModel, RegisteredModel, StateFragment,
+    EventId, KnownState, RegisterModel, RegisteredModel, SpanAnswer, SpanQuestion, StateFragment, TreeSpec,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -30,7 +30,8 @@ pub struct NodeRequest {
     pub body: NodeRequestBody,
 }
 
-/// Entity with known head for lineage attestation
+/// An entity and the head its sender holds of it; an empty head means the sender
+/// holds none.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct KnownEntity {
     pub entity_id: EntityId,
@@ -99,15 +100,15 @@ pub struct CausalAssertionFragment {
 /// Content for entity initialization - either bridge, state, or attested state
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DeltaContent {
-    /// Entity not in known_matches; send full state snapshot
+    /// The full state snapshot, when no event bridge from the receiver's known head serves
     StateSnapshot { state: StateFragment },
-    /// Entity present in known matches with a small event gap
+    /// The events from the receiver's known head, across a small event gap
     EventBridge { events: Vec<EventFragment> },
-    /// Entity present in known matches with a large event gap; send state + causal assertion
+    /// Across a large event gap from the receiver's known head; send state + causal assertion
     StateAndRelation { state: StateFragment, relation: CausalAssertionFragment },
 }
 
-/// Entity initialization data returned in QuerySubscribed and Fetch
+/// Data that brings a receiver's copy of an entity to its sender's state
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntityDelta {
     pub entity_id: EntityId,
@@ -129,15 +130,43 @@ pub enum NodeRequestBody {
     GetEvents {
         event_ids: Vec<EventId>,
     },
+    /// Read a query's result once. `known_state` describes what the requester holds of
+    /// the result; the responder compares it with a snapshot of its own result, answers
+    /// with its account of that snapshot, and pushes on the update channel each entity
+    /// the requester lacks or holds at another head. Nothing stays registered on the
+    /// responder.
     Fetch {
         selection: ast::Selection<ast::Resolved>,
-        known_matches: Vec<KnownEntity>,
+        known_state: KnownState,
     },
+    /// Install a query in the responder's reactor subscription for this peer, then
+    /// compare `known_state` with a snapshot of its result taken after the install, and
+    /// push what the requester lacks as items tagged `(query_id, Initial)`. Changes after
+    /// the install arrive as the subscription's ordinary updates.
     SubscribeQuery {
         query_id: QueryId,
         selection: ast::Selection<ast::Resolved>,
         version: u32,
-        known_matches: Vec<KnownEntity>,
+        known_state: KnownState,
+    },
+    /// Ask for the responder's digests of spans of a query's result, or one page of its
+    /// heads within a span, as the result stands now. Self-contained: a responder that
+    /// kept nothing since the query opened can answer it.
+    CompareSpans {
+        selection: ast::Selection<ast::Resolved>,
+        /// The tree the spans address: the spec of the responder's account.
+        spec: TreeSpec,
+        /// At most `MAX_OFFER_SPANS` questions, of which at most `MAX_HEAD_QUESTIONS`
+        /// ask for heads.
+        questions: Vec<SpanQuestion>,
+    },
+    /// Ask the responder to push its current state of each entity on the update
+    /// channel, from the head the requester holds. The selection decides whether the
+    /// request is a credentialless catalog read.
+    SyncEntities {
+        selection: ast::Selection<ast::Resolved>,
+        /// At most `MAX_PAGE_HEADS` entities.
+        entities: Vec<KnownEntity>,
     },
     /// Register one model's schema: an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
@@ -168,13 +197,28 @@ pub enum NodeResponseBody {
     CommitComplete {
         id: TransactionId,
     },
-    Fetch(Vec<EntityDelta>),
+    /// The responder's account of its result when it compared, which the Fetch's
+    /// pushed data brings the requester to.
+    Fetch(KnownState),
     /// One outcome per requested identity, in request order.
     Get(Vec<GetResult>),
     GetEvents(Vec<Attested<Event>>),
+    /// The query is installed; `target` is the responder's account of its result when
+    /// it compared, which the initial data brings the requester to.
     QuerySubscribed {
         query_id: QueryId,
-        deltas: Vec<EntityDelta>,
+        target: KnownState,
+    },
+    /// One answer per question, in the questions' order.
+    SpansCompared {
+        answers: Vec<SpanAnswer>,
+    },
+    /// For each entity the responder may send, the head it holds, which it pushes
+    /// unless the requester's head already equals it; and the entities it holds no
+    /// readable state of.
+    EntitiesSynced {
+        held: Vec<KnownEntity>,
+        unavailable: Vec<EntityId>,
     },
     /// The resolved schema, with build ids echoed for descriptor binding.
     SchemaRegistered {
@@ -256,11 +300,17 @@ impl std::fmt::Display for NodeRequestBody {
             NodeRequestBody::GetEvents { event_ids } => {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
-            NodeRequestBody::Fetch { selection: query, known_matches } => {
-                write!(f, "Fetch {query} known:{}", known_matches.len())
+            NodeRequestBody::Fetch { selection: query, known_state } => {
+                write!(f, "Fetch {query} known spans:{}", known_state.spans.len())
             }
-            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_matches } => {
-                write!(f, "Subscribe {query_id} {query} v{version} known:{}", known_matches.len())
+            NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_state } => {
+                write!(f, "Subscribe {query_id} {query} v{version} known spans:{}", known_state.spans.len())
+            }
+            NodeRequestBody::CompareSpans { selection: query, questions, .. } => {
+                write!(f, "CompareSpans {query} questions:{}", questions.len())
+            }
+            NodeRequestBody::SyncEntities { selection: query, entities } => {
+                write!(f, "SyncEntities {query} {}", entities.iter().map(|e| e.entity_id.to_base64_short()).collect::<Vec<_>>().join(", "))
             }
             NodeRequestBody::RegisterSchema { model } => {
                 write!(f, "RegisterSchema {} properties:{}", model.label, model.properties.len())
@@ -272,16 +322,20 @@ impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
-            NodeResponseBody::Fetch(deltas) => {
-                write!(f, "Fetch [{}]", deltas.len()) // TODO display deltas
-            }
+            NodeResponseBody::Fetch(target) => write!(f, "Fetch target spans:{}", target.spans.len()),
             NodeResponseBody::Get(states) => {
                 write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::GetEvents(events) => {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
-            NodeResponseBody::QuerySubscribed { query_id, deltas: initial } => write!(f, "Subscribed {query_id} initial:{}", initial.len()),
+            NodeResponseBody::QuerySubscribed { query_id, target } => {
+                write!(f, "Subscribed {query_id} target spans:{}", target.spans.len())
+            }
+            NodeResponseBody::SpansCompared { answers } => write!(f, "SpansCompared answers:{}", answers.len()),
+            NodeResponseBody::EntitiesSynced { held, unavailable } => {
+                write!(f, "EntitiesSynced held:{} unavailable:{}", held.len(), unavailable.len())
+            }
             NodeResponseBody::SchemaRegistered { model } => {
                 write!(f, "SchemaRegistered {} properties:{}", model.label, model.properties.len())
             }

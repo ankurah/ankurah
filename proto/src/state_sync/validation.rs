@@ -3,12 +3,12 @@
 
 use std::{collections::HashSet, ops::Bound};
 
-use ankurah_digest_tree::NodePrefix;
-use anyhow::ensure;
+use ankurah_digest_tree::{leaf_address, NodePrefix};
+use anyhow::{bail, ensure};
 
 use super::{
-    limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS, MAX_OFFER_SPANS, MAX_PAGE_BYTES, MAX_PAGE_HEADS},
-    KnownState, SpanContent, TreeSpan, TreeSpanInventory, TreeSpec,
+    limits::{MAX_HEAD_QUESTIONS, MAX_OFFER_BYTES, MAX_OFFER_HEADS, MAX_OFFER_SPANS, MAX_PAGE_BYTES, MAX_PAGE_HEADS},
+    KnownState, SpanAnswer, SpanContent, SpanQuestion, TreeSpan, TreeSpanInventory, TreeSpec,
 };
 
 impl KnownState {
@@ -69,6 +69,60 @@ impl TreeSpanInventory {
         ensure!(self.heads.len() <= MAX_PAGE_HEADS, "inventory page has too many heads");
         ensure!(self.work_bytes()? <= MAX_PAGE_BYTES as u64, "inventory page exceeds its work limit");
         self.validate(spec)?;
+        Ok(())
+    }
+}
+
+impl SpanQuestion {
+    /// Checks one CompareSpans request's questions: at most `MAX_OFFER_SPANS`, of which
+    /// at most `MAX_HEAD_QUESTIONS` ask for heads, each about a nonempty span within the
+    /// tree.
+    pub fn validate_all(questions: &[SpanQuestion]) -> anyhow::Result<()> {
+        ensure!(questions.len() <= MAX_OFFER_SPANS, "too many span questions");
+        let heads = questions.iter().filter(|question| matches!(question, SpanQuestion::Heads(_))).count();
+        ensure!(heads <= MAX_HEAD_QUESTIONS, "too many heads questions");
+        for question in questions {
+            let span = question.span();
+            ensure!(!span.is_empty() && span.is_subset_of(&TreeSpan::all()), "span question outside the tree");
+        }
+        Ok(())
+    }
+}
+
+impl SpanAnswer {
+    /// Checks a SpansCompared response: one answer per question, in the questions'
+    /// order, each valid for its question under `spec`.
+    pub fn validate_all(answers: &[SpanAnswer], questions: &[SpanQuestion], spec: &TreeSpec) -> anyhow::Result<()> {
+        ensure!(answers.len() == questions.len(), "span answers do not match their questions");
+        answers.iter().zip(questions).try_for_each(|(answer, question)| answer.validate(question, spec))
+    }
+
+    /// Checks one answer: a valid digest of exactly the question's span, or a valid
+    /// inventory page under `spec` that starts where the question's span starts, lies
+    /// within it, and ends where the span ends or, stopping short, at its own last head.
+    pub fn validate(&self, question: &SpanQuestion, spec: &TreeSpec) -> anyhow::Result<()> {
+        match (question, self) {
+            (SpanQuestion::Digest(span), SpanAnswer::Digest(digest)) => {
+                digest.validate()?;
+                ensure!(&digest.bounds == span, "digest answer covers another span");
+            }
+            (SpanQuestion::Heads(span), SpanAnswer::Heads(page)) => {
+                page.validate_page(spec)?;
+                ensure!(page.bounds.start == span.start && page.bounds.is_subset_of(span), "heads answer lies outside its span");
+                if page.bounds.end != span.end {
+                    let mut last = None;
+                    let mut cursor = page.heads.cursor();
+                    while let Some(head) = cursor.next() {
+                        last = Some(leaf_address(head.key, head.entity.entity_id));
+                    }
+                    ensure!(
+                        last.is_some_and(|last| page.bounds.end == Bound::Included(last)),
+                        "a short heads answer must end at its last head"
+                    );
+                }
+            }
+            _ => bail!("span answer is not the kind its question asked for"),
+        }
         Ok(())
     }
 }

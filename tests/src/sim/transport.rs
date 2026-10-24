@@ -131,6 +131,12 @@ fn request_descriptor(body: &proto::NodeRequestBody) -> String {
         }
         proto::NodeRequestBody::Fetch { selection, .. } => format!("fetch {}", selection),
         proto::NodeRequestBody::SubscribeQuery { selection, .. } => format!("subscribe {}", selection),
+        proto::NodeRequestBody::CompareSpans { selection, questions, .. } => format!("comparespans {} {}q", selection, questions.len()),
+        proto::NodeRequestBody::SyncEntities { entities, .. } => {
+            let mut ss: Vec<String> = entities.iter().map(|e| e.entity_id.to_base64_short()).collect();
+            ss.sort();
+            format!("syncentities {}", ss.join("+"))
+        }
         proto::NodeRequestBody::RegisterSchema { model } => {
             format!("registerschema {} {}p", model.label, model.properties.len())
         }
@@ -143,7 +149,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         proto::NodeResponseBody::SchemaRegistered { model } => {
             format!("schemaregistered {} {}p", model.label, model.properties.len())
         }
-        proto::NodeResponseBody::Fetch(deltas) => format!("fetch {}", deltas.len()),
+        proto::NodeResponseBody::Fetch(target) => format!("fetch {}", target.spans.len()),
         proto::NodeResponseBody::Get(results) => {
             let mut ss: Vec<String> = results
                 .iter()
@@ -157,7 +163,14 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
             format!("get [{}]", ss.join("+"))
         }
         proto::NodeResponseBody::GetEvents(events) => format!("getevents {}", event_ids(events)),
-        proto::NodeResponseBody::QuerySubscribed { deltas, .. } => format!("subscribed {}", deltas.len()),
+        proto::NodeResponseBody::QuerySubscribed { target, .. } => format!("subscribed {}", target.spans.len()),
+        proto::NodeResponseBody::SpansCompared { answers } => format!("spanscompared {}", answers.len()),
+        proto::NodeResponseBody::EntitiesSynced { held, unavailable } => {
+            let mut ss: Vec<String> = held.iter().map(|e| e.entity_id.to_base64_short()).collect();
+            ss.extend(unavailable.iter().map(|id| format!("{}:unavailable", id.to_base64_short())));
+            ss.sort();
+            format!("entitiessynced [{}]", ss.join("+"))
+        }
         proto::NodeResponseBody::Success => "success".to_string(),
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).

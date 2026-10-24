@@ -4,7 +4,7 @@ use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
 use ankurah_digest_tree::{leaf_address, CanonicalCodec};
 
 use super::*;
-use crate::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, PackedHeads};
+use crate::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, PackedHeads, TreeSpanDigest};
 
 fn spec() -> TreeSpec { TreeSpec::new(KeySpec::new(vec![]), ankql::ast::Predicate::True) }
 fn id(n: u16) -> EntityId {
@@ -84,4 +84,60 @@ fn a_page_holds_at_most_a_page_of_ordered_heads() {
     assert!(page(vec![2, 1]).validate_page(&spec()).is_err(), "unordered heads");
     assert!(page((0..MAX_PAGE_HEADS as u16).collect()).validate_page(&spec()).is_ok());
     assert!(page((0..=MAX_PAGE_HEADS as u16).collect()).validate_page(&spec()).is_err(), "more heads than a page holds");
+}
+
+fn digest_of(bounds: TreeSpan) -> SpanAnswer {
+    SpanAnswer::Digest(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: ankurah_digest_tree::Digest::empty() })
+}
+
+#[test]
+fn span_questions_stay_within_their_counts_and_the_tree() {
+    let heads = |count: usize| vec![SpanQuestion::Heads(TreeSpan::all()); count];
+    assert!(SpanQuestion::validate_all(&heads(MAX_HEAD_QUESTIONS)).is_ok());
+    assert!(SpanQuestion::validate_all(&heads(MAX_HEAD_QUESTIONS + 1)).is_err(), "too many heads questions");
+    assert!(SpanQuestion::validate_all(&vec![SpanQuestion::Digest(TreeSpan::all()); MAX_OFFER_SPANS]).is_ok());
+    assert!(SpanQuestion::validate_all(&vec![SpanQuestion::Digest(TreeSpan::all()); MAX_OFFER_SPANS + 1]).is_err(), "too many questions");
+    let point = leaf_address(&[], id(3));
+    let empty = TreeSpan::new(Excluded(point.clone()), Included(point));
+    assert!(SpanQuestion::validate_all(&[SpanQuestion::Digest(empty)]).is_err(), "an empty span");
+    let before_the_tree = TreeSpan::new(Unbounded, Unbounded);
+    assert!(SpanQuestion::validate_all(&[SpanQuestion::Heads(before_the_tree)]).is_err(), "a span starting before the tree");
+}
+
+#[test]
+fn a_digest_answer_covers_exactly_its_question() {
+    let question = SpanQuestion::Digest(TreeSpan::all());
+    assert!(digest_of(TreeSpan::all()).validate(&question, &spec()).is_ok());
+    let below = TreeSpan::new(TreeSpan::all().start, Excluded(leaf_address(&[], id(9))));
+    assert!(digest_of(below).validate(&question, &spec()).is_err(), "a digest of another span");
+    let heads = SpanAnswer::Heads(inventory(TreeSpan::all(), 0..1));
+    assert!(heads.validate(&question, &spec()).is_err(), "heads answering a digest question");
+}
+
+#[test]
+fn a_heads_answer_starts_at_its_question_and_stops_short_only_at_its_last_head() {
+    let start = Included(leaf_address(&[], id(1)));
+    let question = SpanQuestion::Heads(TreeSpan::new(start.clone(), Unbounded));
+    let page = |start, end, ids| SpanAnswer::Heads(inventory(TreeSpan::new(start, end), ids));
+    assert!(page(start.clone(), Unbounded, 1..4).validate(&question, &spec()).is_ok(), "the whole span");
+    assert!(page(start.clone(), Included(leaf_address(&[], id(3))), 1..4).validate(&question, &spec()).is_ok(), "ends at its last head");
+    let short = page(start.clone(), Excluded(leaf_address(&[], id(5))), 1..4);
+    assert!(short.validate(&question, &spec()).is_err(), "stops short past its last head");
+    let empty = page(start.clone(), Included(leaf_address(&[], id(3))), 1..1);
+    assert!(empty.validate(&question, &spec()).is_err(), "stops short with no head");
+    let later = page(Included(leaf_address(&[], id(2))), Unbounded, 2..4);
+    assert!(later.validate(&question, &spec()).is_err(), "starts after its question");
+    let wider = SpanQuestion::Heads(TreeSpan::new(start.clone(), Excluded(leaf_address(&[], id(2)))));
+    assert!(page(start, Unbounded, 1..2).validate(&wider, &spec()).is_err(), "extends past its question");
+    assert!(digest_of(TreeSpan::all()).validate(&SpanQuestion::Heads(TreeSpan::all()), &spec()).is_err(), "a digest answering heads");
+}
+
+#[test]
+fn span_answers_pair_one_to_one_with_their_questions() {
+    let questions = [SpanQuestion::Digest(TreeSpan::all()), SpanQuestion::Heads(TreeSpan::all())];
+    let answers = [digest_of(TreeSpan::all()), SpanAnswer::Heads(inventory(TreeSpan::all(), 0..2))];
+    assert!(SpanAnswer::validate_all(&answers, &questions, &spec()).is_ok());
+    assert!(SpanAnswer::validate_all(&answers[..1], &questions, &spec()).is_err(), "an answer missing");
+    let swapped = [answers[1].clone(), answers[0].clone()];
+    assert!(SpanAnswer::validate_all(&swapped, &questions, &spec()).is_err(), "answers out of their questions' order");
 }
