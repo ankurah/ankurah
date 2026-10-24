@@ -361,7 +361,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                     let entity_id = change.entity().id();
                     let Some(effect) = query.effect_of(id, &selection.predicate, change, held) else { continue };
                     if effect.publishes(state.entity_subscriptions.contains(&entity_id)) {
-                        rows.push((offset, entity_id, change.events().to_vec()));
+                        rows.push((offset, entity_id, change.events()));
                     }
                 }
                 let delivered = query.delivered.of(rows.iter().map(|(_, id, _)| *id));
@@ -371,7 +371,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: crate::reactor::Reacto
                 .entity_iter()
                 .enumerate()
                 .filter(|(_, c)| state.entity_subscriptions.contains(&c.entity().id()))
-                .map(|(offset, c)| (offset, c.entity().id(), c.events().to_vec()))
+                .map(|(offset, c)| (offset, c.entity().id(), c.events()))
                 .collect();
             let delivered = state.entity_delivered.of(rows.iter().map(|(_, id, _)| *id));
             plans.push(DeliveryPlan { query: None, version: 0, delivered, rows });

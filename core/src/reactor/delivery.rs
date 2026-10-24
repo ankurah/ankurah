@@ -66,14 +66,15 @@ impl DeliveredHeads {
 }
 
 /// The changes one target will publish, planned under its subscription's lock: a query, or for
-/// `query: None` the subscription's explicit entity subscriptions.
-pub(super) struct DeliveryPlan<Ev> {
+/// `query: None` the subscription's explicit entity subscriptions. Rows borrow their events from
+/// the notified changes, so planning copies no events.
+pub(super) struct DeliveryPlan<'a, Ev> {
     pub(super) query: Option<proto::QueryId>,
     pub(super) version: u32,
     /// The target's delivered heads for the planned entities.
     pub(super) delivered: DeliveredHeads,
     /// Each planned change's offset among the target's candidates, its entity, and its events.
-    pub(super) rows: Vec<(usize, proto::EntityId, Vec<Ev>)>,
+    pub(super) rows: Vec<(usize, proto::EntityId, &'a [Ev])>,
 }
 
 /// Each planned change's undelivered events and the head past them, by target and offset.
@@ -92,7 +93,7 @@ impl<Ev> PreparedEvents<Ev> {
 /// proven prepares nothing and returns its failure instead.
 pub(super) async fn prepare<Ev: ReactorEvent>(
     history: Option<&(dyn GetEvents + Send + Sync)>,
-    plans: Vec<DeliveryPlan<Ev>>,
+    plans: Vec<DeliveryPlan<'_, Ev>>,
 ) -> (PreparedEvents<Ev>, Vec<NotificationFailure>) {
     let mut prepared = PreparedEvents { rows: HashMap::new() };
     let mut failures = Vec::new();
@@ -100,7 +101,7 @@ pub(super) async fn prepare<Ev: ReactorEvent>(
         let mut staged = Vec::new();
         let mut failure = None;
         for (offset, id, events) in rows {
-            match delivered.take_undelivered(history, id, &events).await {
+            match delivered.take_undelivered(history, id, events).await {
                 Ok(row) => staged.push(((query, offset), row)),
                 Err(error) => {
                     failure = Some(error);
