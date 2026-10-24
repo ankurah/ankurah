@@ -62,7 +62,7 @@ async fn assert_released_with_live_query(
             _ => None,
         })
         .unwrap();
-    super::super::super::queue_live(
+    super::super::super::server::queue_live(
         server,
         client.id,
         live,

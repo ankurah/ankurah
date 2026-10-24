@@ -9,6 +9,7 @@ pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::
     let snapshot = view(actor, &selection, &node.catalog).await?;
     let mut filtered = selection.clone();
     filtered.predicate = policy.filter_predicate(filtered.predicate)?;
+    let members = RouteMembers::of(&snapshot, &selection);
     Ok(Route {
         peer: proto::EntityId::from_bytes([97; 32]),
         stream: proto::StateStreamId::new(),
@@ -16,7 +17,7 @@ pub(super) async fn route<PA: PolicyAgent<ContextData = &'static crate::policy::
         selection,
         filtered,
         credentials: vec![DEFAULT_CONTEXT],
-        members: snapshot.query_members(),
+        members,
     })
 }
 
@@ -49,11 +50,10 @@ async fn shared_tree_routes_keep_independent_limits_and_supply_unchanged_entrant
     apply(&node, &moved).await?;
     let batch = actor.cursor.next().await?;
     let sources = actor.apply(batch.changes, true).await?;
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let changes_one = one.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
-    let changes_two = two.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
-    assert_eq!(one.members.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id]));
-    assert_eq!(two.members.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
+    let changes_one = delivered(&node, &actor, &mut one, &sources).await?;
+    let changes_two = delivered(&node, &actor, &mut two, &sources).await?;
+    assert_eq!(members_of(&one, &actor), BTreeSet::from([events[1].entity_id]));
+    assert_eq!(members_of(&two, &actor), BTreeSet::from([events[1].entity_id, events[2].entity_id]));
     for changes in [&changes_one, &changes_two] {
         let leaving = changes.iter().find(|change| change.entity_id == events[0].entity_id).unwrap();
         assert!(leaving.member.is_none());
@@ -87,16 +87,15 @@ async fn shared_tree_routes_apply_different_membership_predicates() -> anyhow::R
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let mut all = route(&node, &actor, admitted).await?;
     let mut narrow = route(&node, &actor, above("05")).await?;
-    assert!(narrow.members.is_empty());
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
+    assert!(members_of(&narrow, &actor).is_empty());
     let mut current = initial.clone();
     for (value, narrow_present) in [("02", false), ("09", true), ("03", false)] {
         let next = update(&current, value)?;
         apply(&node, &next).await?;
         let batch = actor.cursor.next().await?;
         let sources = actor.apply(batch.changes, true).await?;
-        let all_changes = all.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
-        let narrow_changes = narrow.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
+        let all_changes = delivered(&node, &actor, &mut all, &sources).await?;
+        let narrow_changes = delivered(&node, &actor, &mut narrow, &sources).await?;
         assert_eq!(all_changes.len(), 1);
         assert!(all_changes[0].member.is_some());
         if value == "02" {
@@ -106,7 +105,7 @@ async fn shared_tree_routes_apply_different_membership_predicates() -> anyhow::R
             assert_eq!(narrow_changes[0].member.is_some(), narrow_present);
             assert!(narrow_changes[0].delta.is_some());
         }
-        assert_eq!(narrow.members.contains_key(&initial.entity_id), narrow_present);
+        assert_eq!(members_of(&narrow, &actor).contains(&initial.entity_id), narrow_present);
         current = next;
     }
     Ok(())
@@ -128,14 +127,11 @@ async fn a_denied_event_only_fails_routes_that_would_deliver_it() -> anyhow::Res
     let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let mut includes = route(&node, &actor, admitted).await?;
     let mut excludes = route(&node, &actor, above("03")).await?;
-    let old = includes.members.clone();
     apply(&node, &denied).await?;
     let batch = actor.cursor.next().await?;
     let sources = actor.apply(batch.changes, true).await?;
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    assert!(includes.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await.is_err());
-    assert_eq!(includes.members, old, "a failed publication never partially advances route membership");
-    assert!(excludes.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?.is_empty());
+    assert!(delivered(&node, &actor, &mut includes, &sources).await.is_err());
+    assert!(delivered(&node, &actor, &mut excludes, &sources).await?.is_empty());
     assert_eq!(actor.tree.snapshot().entries[&initial.entity_id].head, proto::Clock::singleton(&denied));
     Ok(())
 }
@@ -181,8 +177,7 @@ async fn unchanged_replacements_follow_query_order_after_commit_changes() -> any
     let batch = actor.cursor.next().await?;
     assert_eq!(batch.changes.iter().map(|change| change.entity_id).collect::<Vec<_>>(), vec![events[2].entity_id, events[3].entity_id]);
     let sources = actor.apply(batch.changes, true).await?;
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let changes = route.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &sources).await?;
+    let changes = delivered(&node, &actor, &mut route, &sources).await?;
     assert_eq!(
         changes.iter().map(|change| (change.entity_id, change.member.is_some())).collect::<Vec<_>>(),
         vec![(events[2].entity_id, false), (events[3].entity_id, false), (events[1].entity_id, true), (events[0].entity_id, true)],
@@ -237,7 +232,7 @@ async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<(
         selection: selected.clone(),
         filtered: selected,
         credentials: vec![DEFAULT_CONTEXT],
-        members,
+        members: RouteMembers::Listed(Arc::new(members)),
     });
     let first = update(&initial[0], "09")?;
     let second = update(&initial[1], "08")?;
@@ -246,7 +241,30 @@ async fn active_bounded_route_refills_after_queued_commits() -> anyhow::Result<(
     let current = actor.refresh(&node).await?;
     assert_eq!(current.entries.keys().copied().collect::<Vec<_>>(), vec![initial[2].entity_id]);
     assert_eq!(actor.routes.len(), 1, "storage ahead of a queued intermediate revision must not expire the route");
-    assert_eq!(actor.routes[0].members.keys().copied().collect::<Vec<_>>(), vec![initial[2].entity_id]);
+    assert_eq!(members_of(&actor.routes[0], &actor).into_iter().collect::<Vec<_>>(), vec![initial[2].entity_id]);
     node.deregister_peer(peer);
+    Ok(())
+}
+
+#[tokio::test]
+async fn one_publication_reads_its_changed_states_and_events_once_for_every_route() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let mut actor = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    let owner = Arc::new(());
+    for selected in [selection(None), selection(None)] {
+        let mut route = route(&node, &actor, selected).await?;
+        route.owner = Arc::downgrade(&owner);
+        actor.routes.push(route);
+    }
+    let moved = update(&initial, "02")?;
+    apply(&node, &moved).await?;
+    assert!(node.entities.get(&initial.entity_id).is_none(), "the changed state is in storage alone");
+    let batch = actor.cursor.next().await?;
+    let (states, events) = (node.storage.state_batches.load(Ordering::Relaxed), node.storage.event_reads.load(Ordering::Relaxed));
+    actor.publish(&node, batch).await?;
+    assert_eq!(node.storage.state_batches.load(Ordering::Relaxed) - states, 1, "both routes deliver one state read");
+    assert_eq!(node.storage.event_reads.load(Ordering::Relaxed) - events, 1, "both routes deliver one event read");
     Ok(())
 }

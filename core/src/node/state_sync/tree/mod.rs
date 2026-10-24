@@ -8,7 +8,7 @@ mod spans;
 mod spec;
 
 pub(crate) use footprint::{CLOCK_ENTRY_BYTES, ID_ROW_BYTES};
-pub(crate) use snapshot::{DigestRequest, DigestRequests, Snapshot, UnsupportedTreeSelection};
+pub(crate) use snapshot::{DigestRequest, DigestRequests, Snapshot};
 pub(crate) use spec::{accept_peer_spec, key_paths, request_for, serves, spec_for, tree_keys_rank_like_storage};
 
 use self::footprint::Footprint;

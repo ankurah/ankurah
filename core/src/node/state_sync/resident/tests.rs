@@ -2,7 +2,7 @@ use super::*;
 use super::{
     actor::ResidentActor,
     identity::Identity,
-    route::{current_state, Route},
+    route::{current_states, Affected, LiveRead, Route, RouteMembers},
 };
 use crate::{
     connector::{PeerSender, SendError},
@@ -52,6 +52,8 @@ struct OrderedStorage {
     state_reads: std::sync::atomic::AtomicUsize,
     /// `get_states` calls.
     state_batches: std::sync::atomic::AtomicUsize,
+    /// `get_events` calls.
+    event_reads: std::sync::atomic::AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -119,6 +121,7 @@ impl StorageEngine for OrderedStorage {
         Ok(rows.into_iter().map(|(_, _, state)| state).collect())
     }
     async fn get_events(&self, ids: Vec<proto::EventId>) -> Result<Vec<Attested<proto::Event>>, RetrievalError> {
+        self.event_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pause = self.events_pause.lock().unwrap().take();
         if let Some((entered, resume)) = pause {
             let _ = entered.send(());
@@ -209,6 +212,33 @@ async fn resident<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultC
     spec: proto::TreeSpec,
 ) -> anyhow::Result<ResidentActor<PA::ContextData>> {
     ResidentActor::bootstrap(node, Identity::requested(node, selection, spec, vec![DEFAULT_CONTEXT])?.admission()).await
+}
+
+/// What `route` delivers for `affected`, as its stream would: its membership
+/// changes, each with the delta its stream builds from one shared read.
+async fn delivered<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
+    node: &Node<OrderedStorage, PA>,
+    actor: &ResidentActor<PA::ContextData>,
+    route: &mut Route<PA::ContextData>,
+    affected: &[Affected],
+) -> anyhow::Result<Vec<proto::QueryChange>> {
+    let changes = route.changes(&actor.identity.coverage, &actor.tree, &node.catalog, affected, None).await?;
+    let read = LiveRead::of(node, changes.iter().map(|change| change.entity_id).collect(), affected).await?;
+    crate::node::state_sync::server::live_items(node, &route.credentials, changes, &read)
+}
+
+/// The members `route` reads from `actor`'s tree now.
+fn members_of<CD: ContextData>(route: &Route<CD>, actor: &ResidentActor<CD>) -> BTreeSet<proto::EntityId> {
+    match &route.members {
+        RouteMembers::Listed(members) => members.keys().copied().collect(),
+        RouteMembers::Spans(spans) => actor
+            .tree
+            .entries()
+            .iter()
+            .filter(|(_, entry)| spans.iter().any(|span| span.contains(entry.address())))
+            .map(|(id, _)| *id)
+            .collect(),
+    }
 }
 
 /// The view `selection` selects from `actor`'s tree as it stands.
@@ -587,8 +617,7 @@ async fn discovery_filter_is_preserved_for_live_changes_when_known_id_reads_are_
     let batch = actor.cursor.next().await?;
     let changes = actor.apply(batch.changes, true).await?;
     assert_eq!(changes.len(), 1);
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &vec![DEFAULT_CONTEXT]);
-    let changes = route.changes(&node, &actor.identity.coverage, &actor.tree, &policy, &changes).await?;
+    let changes = delivered(&node, &actor, &mut route, &changes).await?;
     assert_eq!(changes.len(), 1);
     assert!(changes[0].member.is_none());
     assert!(changes[0].delta.is_some(), "readable former matches still carry causal data");
@@ -712,14 +741,12 @@ async fn a_readable_live_state_cannot_carry_a_denied_event() -> anyhow::Result<(
     let batch = actor.cursor.next().await?;
     let credentials = vec![DEFAULT_CONTEXT];
     let read_policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    read_policy.check_read(&initial.entity_id, &current_state(&node, initial.entity_id).await?.unwrap().state)?;
+    read_policy
+        .check_read(&initial.entity_id, &current_states(&node, [initial.entity_id]).await?.remove(&initial.entity_id).unwrap().state)?;
     assert_eq!(batch.changes[0].events[0], denied.id());
     let changes = actor.apply(batch.changes, true).await?;
-    let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    let error = route
-        .changes(&node, &actor.identity.coverage, &actor.tree, &policy, &changes)
-        .await
-        .expect_err("denied event must fail delivery without poisoning the tree");
+    let error =
+        delivered(&node, &actor, &mut route, &changes).await.expect_err("denied event must fail delivery without poisoning the tree");
     assert!(matches!(error.downcast_ref::<crate::policy::AccessDenied>(), Some(crate::policy::AccessDenied::ByPolicy(_))));
     Ok(())
 }

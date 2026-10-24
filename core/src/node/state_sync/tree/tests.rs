@@ -1,3 +1,4 @@
+use super::snapshot::UnsupportedTreeSelection;
 use super::spans::FRONTIER_BYTES;
 use super::*;
 use crate::schema::catalog::CatalogManager;

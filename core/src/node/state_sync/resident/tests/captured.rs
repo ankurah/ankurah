@@ -26,7 +26,7 @@ async fn maintenance_and_captures_retain_only_keys_and_cloned_heads() -> anyhow:
     assert!(node.entities.get(&id).is_none(), "maintenance must not retain an entity handle");
 
     // Payload retrieval goes back to the node even while an older metadata read view lives.
-    let now = current_state(&node, id).await?.unwrap();
+    let now = current_states(&node, [id]).await?.remove(&id).unwrap();
     assert_eq!(now.state.head, proto::Clock::singleton(&moved));
     assert_eq!(TemporaryEntity::new(id, &now.state)?.value(&property()), Some(Value::String("02".into())));
     Ok(())

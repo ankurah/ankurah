@@ -5,13 +5,13 @@ use super::{
     bootstrap::{ensure_catalog_unchanged, fold_candidate, StorageRead, TreeUpdate, MAX_READ_ATTEMPTS},
     identity::{ensure_filter_unchanged, Access, Coverage, Identity},
     lease::{Command, Resident, ResidentSnapshot},
-    route::{current_states, Route},
+    route::{current_states, Affected, LiveRead, Refill, Route, RouteMembers},
     Lru,
 };
 use crate::{
     node::{
         state_sync::{
-            tree::{DigestRequest, DigestRequests, ID_ROW_BYTES},
+            tree::{DigestRequest, DigestRequests, TreeEntry, ID_ROW_BYTES},
             QueryTree, Snapshot,
         },
         Node, WeakNode,
@@ -28,8 +28,6 @@ use std::{
     sync::{atomic::Ordering, Arc, Mutex, Weak},
 };
 use tokio::sync::{mpsc, oneshot, Notify};
-
-type RouteMembership = (BTreeMap<proto::EntityId, proto::QueryMember>, Vec<proto::EntityId>);
 
 /// A resident's state, owned by its actor task: what it admits, every
 /// candidate its predicate matches, its tree, its maintenance subscription and
@@ -77,70 +75,68 @@ impl<CD: ContextData> ResidentActor<CD> {
     pub(super) fn accounted_bytes(&self) -> usize { self.tree.accounted_bytes().saturating_add(self.candidates.len() * ID_ROW_BYTES) }
 
     /// Fold `changes` into the candidates and the tree. With `delivery`, return
-    /// the changes to entities that were or now are members, for live routes.
-    pub(super) async fn apply(&mut self, changes: Vec<TreeUpdate>, delivery: bool) -> anyhow::Result<Vec<TreeUpdate>> {
-        let mut affected = BTreeSet::new();
-        let mut latest = BTreeMap::new();
+    /// each entity the changes moved that was or is a member, for live routes.
+    pub(super) async fn apply(&mut self, changes: Vec<TreeUpdate>, delivery: bool) -> anyhow::Result<Vec<Affected>> {
         for change in &changes {
             fold_candidate(&mut self.candidates, change);
-            latest.insert(change.entity_id, change.entry.clone());
-            if delivery && (self.tree.entries().contains_key(&change.entity_id) || change.entry.is_some()) {
-                affected.insert(change.entity_id);
+        }
+        let (mut affected, latest) = group_affected(changes, |id| self.tree.entries().get(id).cloned());
+        if delivery {
+            for change in &mut affected {
+                change.after = latest[&change.entity_id].clone();
             }
+            affected.retain(|change| change.before.is_some() || change.after.is_some());
+        } else {
+            affected.clear();
         }
         self.tree.apply(latest).await?;
-        Ok(changes.into_iter().filter(|change| affected.contains(&change.entity_id)).collect())
+        Ok(affected)
     }
 
-    async fn deliver<SE, PA>(
-        &mut self,
-        node: &Node<SE, PA>,
-        revision: u64,
-        sources: Vec<TreeUpdate>,
-        prepared: Option<Vec<anyhow::Result<RouteMembership>>>,
-    ) where
+    /// Deliver `affected` to every live route: each route's membership changes
+    /// under its own principal's checks, one read of the states and events
+    /// they deliver, and each stream's items built from that read. `refill` is
+    /// a limited resident's new cut, when a storage read moved it.
+    async fn deliver<SE, PA>(&mut self, node: &Node<SE, PA>, revision: u64, affected: Vec<Affected>, refill: Option<Refill>)
+    where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let mut retained = Vec::with_capacity(self.routes.len());
-        let mut prepared = prepared.map(Vec::into_iter);
+        let mut publications = Vec::with_capacity(self.routes.len());
         for mut route in std::mem::take(&mut self.routes) {
-            let membership = prepared.as_mut().map(|prepared| prepared.next().expect("one prepared membership per route"));
             if route.owner.strong_count() == 0 {
                 continue;
             }
-            let result = async {
+            let changes = async {
                 // Each route reads for its own principal, checked afresh.
                 let policy = ContextPolicy::from_credentials(&node.policy_agent, &route.credentials);
                 ensure_filter_unchanged(&policy, &route.selection, &route.filtered)?;
                 self.identity.ensure_holder_admitted(&policy)?;
-                if let Some(membership) = membership {
-                    let (next, ordered) = membership?;
-                    route.changes_for_members(node, &policy, &sources, next, ordered).await
-                } else {
-                    route.changes(node, &self.identity.coverage, &self.tree, &policy, &sources).await
-                }
+                route.changes(&self.identity.coverage, &self.tree, &node.catalog, &affected, refill.as_ref()).await
             }
             .await;
-            match result {
-                Ok(changes) => {
-                    if changes.is_empty() || crate::node::state_sync::queue_live(node, route.peer, route.stream, revision, changes).is_ok()
-                    {
-                        retained.push(route);
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(%error, "resident tree live delivery failed");
-                    let weak = node.weak();
-                    crate::task::spawn(async move {
-                        if let Some(node) = weak.upgrade() {
-                            let _ = crate::node::state_sync::expire_state_stream(&node, route.peer, route.stream).await;
-                        }
-                    });
-                }
+            match changes {
+                Ok(changes) => publications.push((route, changes)),
+                Err(error) => fail_route(node, &route, &error),
             }
         }
-        self.routes = retained;
+        let entities = publications.iter().flat_map(|(_, changes)| changes.iter().map(|change| change.entity_id)).collect();
+        let read = match LiveRead::of(node, entities, &affected).await {
+            Ok(read) => read,
+            Err(error) => {
+                for (route, _) in &publications {
+                    fail_route(node, route, &error);
+                }
+                return;
+            }
+        };
+        for (route, changes) in publications {
+            if changes.is_empty()
+                || crate::node::state_sync::queue_live_changes(node, route.peer, route.stream, revision, changes, &read).is_ok()
+            {
+                self.routes.push(route);
+            }
+        }
     }
 
     /// Bring the resident up to `batch`, the next committed changes, and
@@ -188,9 +184,9 @@ impl<CD: ContextData> ResidentActor<CD> {
         }
         self.routes.retain(|route| route.owner.strong_count() != 0);
         if !changes.is_empty() {
-            let sources = self.apply(changes, !self.routes.is_empty()).await?;
-            if !sources.is_empty() {
-                self.deliver(node, revision, sources, None).await;
+            let affected = self.apply(changes, !self.routes.is_empty()).await?;
+            if !affected.is_empty() {
+                self.deliver(node, revision, affected, None).await;
             }
         }
         self.revision = revision;
@@ -243,11 +239,14 @@ impl<CD: ContextData> ResidentActor<CD> {
             }
         };
         self.candidates = read.candidates;
+        let (mut affected, _) =
+            group_affected(pending.into_iter().flat_map(|batch| batch.changes).collect(), |id| self.tree.entries().get(id).cloned());
         self.tree.replace(read.rows).await?;
-        let sources = pending.into_iter().flat_map(|batch| batch.changes).collect();
-        let members = self.tree.snapshot().query_members();
-        let prepared = self.routes.iter().map(|_| Ok((members.clone(), read.ordered.clone()))).collect();
-        self.deliver(node, revision, sources, Some(prepared)).await;
+        for change in &mut affected {
+            change.after = self.tree.entries().get(&change.entity_id).cloned();
+        }
+        let refill = Refill { members: Arc::new(self.tree.snapshot().query_members()), ordered: read.ordered };
+        self.deliver(node, revision, affected, Some(refill)).await;
         self.revision = revision;
         Ok(())
     }
@@ -392,7 +391,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 if response.is_closed() || owner.strong_count() == 0 {
                     return Ok(());
                 }
-                let members = snapshot.query_members();
+                let members = RouteMembers::of(&snapshot, &view.selection);
                 let result = crate::node::state_sync::prepare_state_stream(
                     node,
                     peer,
@@ -487,4 +486,42 @@ impl<CD: ContextData> ResidentActor<CD> {
             }
         });
     }
+}
+
+/// `changes` grouped by entity in commit order: each entity once, with the
+/// entry `before` gives for it and the events it committed, and the entry its
+/// last change leaves it, by entity.
+fn group_affected(
+    changes: Vec<TreeUpdate>,
+    before: impl Fn(&proto::EntityId) -> Option<TreeEntry>,
+) -> (Vec<Affected>, BTreeMap<proto::EntityId, Option<TreeEntry>>) {
+    let mut affected: Vec<Affected> = Vec::new();
+    let mut positions = BTreeMap::new();
+    let mut latest = BTreeMap::new();
+    for change in changes {
+        let position = *positions.entry(change.entity_id).or_insert_with(|| {
+            affected.push(Affected { entity_id: change.entity_id, before: before(&change.entity_id), after: None, events: Vec::new() });
+            affected.len() - 1
+        });
+        affected[position].events.extend(change.events);
+        latest.insert(change.entity_id, change.entry);
+    }
+    (affected, latest)
+}
+
+/// Make `route`'s peer restart its stream after a live delivery failed.
+fn fail_route<SE, PA, CD>(node: &Node<SE, PA>, route: &Route<CD>, error: &anyhow::Error)
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    tracing::debug!(%error, "resident tree live delivery failed");
+    let weak = node.weak();
+    let (peer, stream) = (route.peer, route.stream);
+    // A peer waiting on its own handler must not delay this resident.
+    crate::task::spawn(async move {
+        if let Some(node) = weak.upgrade() {
+            let _ = crate::node::state_sync::expire_state_stream(&node, peer, stream).await;
+        }
+    });
 }

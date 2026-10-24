@@ -234,6 +234,10 @@ impl Snapshot {
         Ok(rows.into_iter().map(|(id, _)| id).collect())
     }
 
+    /// The spans of addresses this view covers: the spans a selection
+    /// narrowed it to, or every address while it is the whole tree.
+    pub(crate) fn spans(&self) -> Vec<proto::TreeSpan> { self.ranges.clone().unwrap_or_else(|| vec![proto::TreeSpan::all()]) }
+
     /// Each member's address and entity id, in address order.
     pub fn members(&self) -> impl Iterator<Item = (&[u8], EntityId)> + '_ {
         self.members.iter().map(|(address, id)| (address.as_ref(), *id))

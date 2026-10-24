@@ -21,6 +21,7 @@ use crate::{
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto as proto;
 pub(crate) use lease::{ResidentLease, ResidentPin, ResidentSnapshot, ResidentSubscription};
+pub(crate) use route::{LiveChange, LiveRead};
 use std::{
     collections::VecDeque,
     sync::{

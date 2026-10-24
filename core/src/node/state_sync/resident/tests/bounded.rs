@@ -89,7 +89,7 @@ async fn bounded_refill_keeps_all_events_and_a_newer_revision_across_refresh_rac
         selection: selected.clone(),
         filtered: selected,
         credentials: vec![DEFAULT_CONTEXT],
-        members,
+        members: RouteMembers::Listed(Arc::new(members)),
     });
 
     let first = update(&initial[0], "09")?;
