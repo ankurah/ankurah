@@ -16,6 +16,5 @@ mod tree;
 mod fixtures;
 
 pub(crate) use requester::{check, fetch, subscribe, CheckOutcome, SyncedQuery};
-pub(crate) use resident::{ResidentPin, ResidentSnapshot, ResidentTrees};
+pub(crate) use resident::ResidentTrees;
 pub(crate) use responder::{answer_offer, compare_spans, sync_entities};
-pub(crate) use tree::{QueryTree, Snapshot};

@@ -177,8 +177,7 @@ async fn a_complete_resident_applies_a_published_batch_while_another_commit_is_i
     tokio::pin!(publishing);
     assert!(futures::poll!(&mut publishing).is_pending());
     stored.await?;
-    let revision = batch.revision.0;
-    tokio::time::timeout(std::time::Duration::from_secs(2), actor.advance(&node, Some(batch), revision))
+    tokio::time::timeout(std::time::Duration::from_secs(2), actor.advance(&node, Some(batch)))
         .await
         .expect("a published batch does not wait for a commit in flight")?;
     assert_eq!(actor.tree.entries()[&initial.entity_id].head, proto::Clock::singleton(&first));
@@ -242,7 +241,7 @@ async fn a_limited_admission_retries_to_find_an_unchanged_replacement() -> anyho
 }
 
 #[tokio::test]
-async fn a_limited_refill_keeps_a_newer_revision_across_refresh_races() -> anyhow::Result<()> {
+async fn a_limited_refill_raced_by_a_commit_takes_it_and_leaves_the_next_refresh_nothing_to_read() -> anyhow::Result<()> {
     let node = node().await?;
     let initial = [genesis("01")?, genesis("02")?, genesis("03")?];
     for event in &initial {
@@ -266,14 +265,12 @@ async fn a_limited_refill_keeps_a_newer_revision_across_refresh_races() -> anyho
         release.send(()).unwrap();
         refresh.await?
     };
-    let revision = actor.revision;
     assert_eq!(current.entries.keys().copied().collect::<BTreeSet<_>>(), [initial[1].entity_id, initial[2].entity_id].into());
     assert_eq!(frozen.entries[&initial[0].entity_id].head, proto::Clock::singleton(&initial[0]));
     assert_eq!(actor.tree.snapshot().entries.len(), 2);
     assert_eq!(actor.candidates.len(), 2);
     let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     actor.refresh(&node).await?;
-    assert_eq!(actor.revision, revision, "refresh must not roll back the refill's later fence");
     assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans, "consumed publications must not be replayed");
 
     Ok(())
@@ -285,9 +282,7 @@ async fn zero_limit_ignores_application_publications_without_reads_or_retention(
     let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let mut actor = limited(&node, selection(Some(0))).await?;
     apply(&node, &genesis("01")?).await?;
-    let before = actor.revision;
     let current = actor.refresh(&node).await?;
-    assert!(actor.revision > before);
     assert!(current.entries.is_empty());
     assert!(actor.tree.entries().is_empty());
     assert!(actor.candidates.is_empty());

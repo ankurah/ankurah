@@ -31,9 +31,11 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 const MAX_ENTRIES: usize = 32;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
-/// Snapshots a comparison takes before a retryable admission failure stands.
+/// Admissions a snapshot makes before a retryable failure stands. Each
+/// admission's own storage read retries up to `MAX_READ_ATTEMPTS` times
+/// while commits race it, which multiplies the reads a snapshot can make.
 const MAX_SNAPSHOT_ATTEMPTS: u32 = 8;
-/// The wait before a comparison's second snapshot attempt, doubled before each later one.
+/// The wait before a snapshot's second admission, doubled before each later one.
 const FIRST_SNAPSHOT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The node's one LRU of resident trees, shared by every requester and
@@ -84,9 +86,12 @@ impl<CD: ContextData> ResidentTrees<CD> {
         Self { lru: Arc::new(Mutex::new(Lru { slots: VecDeque::new(), building: Vec::new(), next_id: 0, max_entries, max_bytes })) }
     }
     /// A snapshot of the resident that serves `selection` for `credentials`,
-    /// in a tree under `spec` when the peer chose one. It admits the resident
-    /// again, once, after a catalog change crossed the admission's storage read
-    /// or the snapshot failed with a retryable source error.
+    /// in a tree under `spec` when the peer chose one. A comparison must not
+    /// fail while the node's data, catalog or policy changes: such a change
+    /// fails an admission retryably, and changes come in bursts, as while a
+    /// schema syncs. So after a retryable failure it admits the resident
+    /// again, waiting longer each time, up to `MAX_SNAPSHOT_ATTEMPTS`
+    /// admissions.
     pub(crate) async fn snapshot<SE, PA>(
         &self,
         node: &Node<SE, PA>,
@@ -98,46 +103,22 @@ impl<CD: ContextData> ResidentTrees<CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        for attempt in 0..2 {
-            let lease = match self.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await {
-                Err(error) if attempt == 0 && matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)) => continue,
-                result => result?,
-            };
-            match lease.snapshot().await {
-                Err(error) if attempt == 0 && SourceError::is_retryable(&error) => continue,
-                result => return result,
-            }
-        }
-        unreachable!("the second attempt returns")
-    }
-
-    /// A snapshot as [`Self::snapshot`] takes one, for a comparison that must
-    /// not fail while the node's data, catalog or policy changes: such a change
-    /// fails an admission retryably, and changes come in bursts, as while a
-    /// schema syncs. It takes another after a retryable failure, waiting longer
-    /// each time, up to `MAX_SNAPSHOT_ATTEMPTS` snapshots.
-    pub(crate) async fn snapshot_through_changes<SE, PA>(
-        &self,
-        node: &Node<SE, PA>,
-        selection: Selection<Resolved>,
-        spec: Option<proto::TreeSpec>,
-        credentials: Vec<CD>,
-    ) -> anyhow::Result<ResidentSnapshot>
-    where
-        SE: StorageEngine + Send + Sync + 'static,
-        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
-    {
         let mut wait = FIRST_SNAPSHOT_RETRY;
-        for _ in 1..MAX_SNAPSHOT_ATTEMPTS {
-            match self.snapshot(node, selection.clone(), spec.clone(), credentials.clone()).await {
-                Err(error) if SourceError::is_retryable(&error) => {
+        let mut admissions = 1;
+        loop {
+            let taken = match self.acquire(node, selection.clone(), spec.clone(), credentials.clone()).await {
+                Ok(lease) => lease.snapshot().await,
+                Err(error) => Err(error),
+            };
+            match taken {
+                Err(error) if admissions < MAX_SNAPSHOT_ATTEMPTS && SourceError::is_retryable(&error) => {
+                    admissions += 1;
                     futures_timer::Delay::new(wait).await;
                     wait *= 2;
                 }
-                result => return result,
+                taken => return taken,
             }
         }
-        self.snapshot(node, selection, spec, credentials).await
     }
 
     /// A lease of the resident that serves `selection` for `credentials`:

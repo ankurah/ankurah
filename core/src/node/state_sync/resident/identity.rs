@@ -3,10 +3,7 @@
 use super::bootstrap::ReadPolicy;
 use crate::{
     node::{
-        state_sync::{
-            tree::{request_for, serves, tree_keys_rank_like_storage},
-            Snapshot,
-        },
+        state_sync::tree::{request_for, serves, tree_keys_rank_like_storage, Snapshot},
         Node,
     },
     policy::{ContextPolicy, PolicyAgent},

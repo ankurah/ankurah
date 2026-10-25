@@ -122,7 +122,6 @@ async fn maintenance_queues_committed_metadata_for_each_reader_without_retaining
     let subsequent = first.next().await?;
     let current = &subsequent.changes[0];
     assert_eq!(current.key.clone().map(Value::String), Some(Value::String("after".into())));
-    assert!(subsequent.revision > first_window.revision);
     assert_eq!(subsequent.changes[0].head, proto::Clock::singleton(&b));
     let second_window = second.fence().await?;
     assert!(second_window.batch.is_some());
@@ -210,7 +209,6 @@ async fn one_commit_and_4096_separate_commits_preserve_the_same_bounded_metadata
     assert!(many_window.batch.is_some());
     let one_batch = one_window.batch.as_ref().unwrap();
     let many_batch = many_window.batch.as_ref().unwrap();
-    assert_eq!(many_batch.revision, many_window.revision, "the coalesced window ends at its newest publication");
     assert_eq!(many_batch.changes.len(), 4096);
     assert_eq!(one_batch.changes, many_batch.changes, "entity heads retain publication order");
     assert_eq!(one_batch.bytes, many_batch.bytes);
@@ -240,7 +238,6 @@ async fn next_detaches_a_window_before_later_publications() -> anyhow::Result<()
     assert!(next.batch.is_some());
     assert_eq!(next.batch.as_ref().unwrap().changes.len(), 1);
     assert_eq!(next.batch.as_ref().unwrap().changes[0].head, proto::Clock::singleton(&later));
-    assert!(next.revision > detached.revision);
     Ok(())
 }
 
@@ -260,7 +257,6 @@ async fn coalescing_preserves_catalog_invalidation_before_later_ordinary_changes
     assert!(window.batch.is_some());
     let batch = window.batch.as_ref().unwrap();
     assert!(batch.catalog_changed);
-    assert_eq!(batch.revision, window.revision);
     assert_eq!(batch.changes.iter().map(|head| head.id).collect::<Vec<_>>(), vec![first.entity_id, catalog.entity_id, later.entity_id]);
     Ok(())
 }

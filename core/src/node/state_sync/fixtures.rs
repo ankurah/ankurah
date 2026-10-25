@@ -1,6 +1,6 @@
 //! Nodes, entities, peers and snapshots that the state sync tests share.
 
-use super::{tree::fixtures::snapshot_of, Snapshot};
+use super::tree::{fixtures::snapshot_of, Snapshot};
 use crate::{
     connector::{PeerSender, SendError},
     entity::Entity,

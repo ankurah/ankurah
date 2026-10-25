@@ -16,7 +16,7 @@ pub(crate) struct Snapshot {
     /// compatible spec the peer chose.
     pub spec: TreeSpec,
     /// The resident this view came from, kept alive while the view is.
-    pub(crate) resident: Option<crate::node::state_sync::ResidentPin>,
+    pub(crate) resident: Option<crate::node::state_sync::resident::ResidentPin>,
     /// The spec the tree is built under, which addresses and digests follow.
     pub(super) physical_spec: Arc<TreeSpec>,
     /// Every entry the tree held, whatever spans the view is narrowed to.
@@ -176,8 +176,8 @@ impl Snapshot {
         self.ranges = Some(ranges);
     }
 
-    /// At most `limit` members within `bounds`, in address order.
-    pub fn entries_in(&self, bounds: &proto::TreeSpan, limit: usize) -> impl Iterator<Item = (EntityId, &TreeEntry)> {
-        self.members.range::<[u8], _>(bounds.bounds()).take(limit).map(|(_, id)| (*id, &self.entries[id]))
+    /// The members within `bounds`, in address order.
+    pub fn entries_in(&self, bounds: &proto::TreeSpan) -> impl Iterator<Item = (EntityId, &TreeEntry)> {
+        self.members.range::<[u8], _>(bounds.bounds()).map(|(_, id)| (*id, &self.entries[id]))
     }
 }

@@ -1,7 +1,7 @@
 //! A resident builds its digest tree the first time anything reads a digest,
 //! and maintains it on every commit after.
 use super::*;
-use crate::node::state_sync::QueryTree;
+use crate::node::state_sync::tree::QueryTree;
 
 /// The bytes the LRU charges each resident it holds, in LRU order.
 fn charges<CD: ContextData>(cache: &ResidentTrees<CD>) -> Vec<usize> {

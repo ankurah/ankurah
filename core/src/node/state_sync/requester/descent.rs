@@ -11,7 +11,7 @@ use super::{
 };
 use crate::{
     error::{RequestError, RetrievalError},
-    node::state_sync::Snapshot,
+    node::state_sync::tree::Snapshot,
     policy::PolicyAgent,
     storage::StorageEngine,
 };

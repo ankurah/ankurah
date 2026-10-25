@@ -9,10 +9,7 @@ use super::{
 use crate::{
     entity::{Entity, TemporaryEntity},
     node::{
-        state_sync::{
-            tree::{key_paths, TreeEntry, CLOCK_ENTRY_BYTES},
-            QueryTree,
-        },
+        state_sync::tree::{key_paths, QueryTree, TreeEntry, CLOCK_ENTRY_BYTES},
         Node,
     },
     policy::{ContextPolicy, PolicyAgent},
@@ -118,7 +115,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         let mut candidates = BTreeSet::new();
         let mut populated = false;
         let mut attempts = 0;
-        let revision = loop {
+        loop {
             attempts += 1;
             anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
             if !populated {
@@ -163,13 +160,13 @@ impl<CD: ContextData> ResidentActor<CD> {
                 }
                 result => {
                     result?;
-                    break window.revision;
+                    break;
                 }
             }
-        };
+        }
         let tree = QueryTree::new(identity.spec.clone(), rows);
         let changes = watch::Sender::new(tree.version());
-        Ok(Self { identity, candidates, tree, cursor, revision: revision.0, digest_requests: None, changes })
+        Ok(Self { identity, candidates, tree, cursor, digest_requests: None, changes })
     }
 }
 

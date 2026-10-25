@@ -9,10 +9,7 @@ use super::{
 };
 use crate::{
     node::{
-        state_sync::{
-            tree::{DigestRequest, DigestRequests, ID_ROW_BYTES},
-            QueryTree, Snapshot,
-        },
+        state_sync::tree::{DigestRequest, DigestRequests, QueryTree, Snapshot, ID_ROW_BYTES},
         Node, WeakNode,
     },
     policy::{ContextPolicy, PolicyAgent},
@@ -36,7 +33,6 @@ pub(super) struct ResidentActor<CD: ContextData> {
     pub(super) candidates: BTreeSet<proto::EntityId>,
     pub(super) tree: QueryTree,
     pub(super) cursor: MaintenanceSubscription<TreeUpdate>,
-    pub(super) revision: u64,
     /// How the snapshots this actor hands out ask it for the tree's digests,
     /// once the actor runs.
     pub(super) digest_requests: Option<DigestRequests>,
@@ -85,15 +81,10 @@ impl<CD: ContextData> ResidentActor<CD> {
         self.tree.apply(latest).await
     }
 
-    /// Bring the resident up to `revision` with `batch`, the committed changes
-    /// it has not applied, when there are any. A complete resident applies them
+    /// Bring the resident up to date with `batch`, the committed changes it
+    /// has not applied, when there are any. A complete resident applies them
     /// as they stand; a limited one reads its cut again when they touched it.
-    pub(super) async fn advance<SE, PA>(
-        &mut self,
-        node: &Node<SE, PA>,
-        batch: Option<SourceBatch<TreeUpdate>>,
-        revision: u64,
-    ) -> anyhow::Result<()>
+    pub(super) async fn advance<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Option<SourceBatch<TreeUpdate>>) -> anyhow::Result<()>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -106,7 +97,6 @@ impl<CD: ContextData> ResidentActor<CD> {
                 Coverage::Limited(_) => {}
             }
         }
-        self.revision = revision;
         Ok(())
     }
 
@@ -123,7 +113,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     {
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &self.identity.credentials);
         let mut attempts = 0;
-        let (read, revision) = loop {
+        let read = loop {
             attempts += 1;
             anyhow::ensure!(attempts <= MAX_READ_ATTEMPTS, SourceError::Changed);
             let window = self.cursor.fence().await?;
@@ -145,7 +135,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                         Err(SourceError::Changed) => continue,
                         result => {
                             result?;
-                            break (read, revision.0);
+                            break read;
                         }
                     }
                 }
@@ -153,7 +143,6 @@ impl<CD: ContextData> ResidentActor<CD> {
         };
         self.candidates = read.candidates;
         self.tree.replace(read.rows).await?;
-        self.revision = revision;
         Ok(())
     }
 
@@ -164,7 +153,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let window = self.cursor.fence().await?;
-        self.advance(node, window.batch, window.revision.0).await?;
+        self.advance(node, window.batch).await?;
         self.signal_changes();
         Ok(self.snapshot())
     }
@@ -217,9 +206,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                     let node = weak.upgrade().ok_or_else(|| anyhow::anyhow!("node dropped"))?;
                     node.system.check_not_halted()?;
                     self.identity.ensure_policy_unchanged(&node)?;
-                    let batch = batch?;
-                    let revision = batch.revision.0;
-                    self.advance(&node, Some(batch), revision).await?;
+                    self.advance(&node, Some(batch?)).await?;
                     self.signal_changes();
                 }
             }

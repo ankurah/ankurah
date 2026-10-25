@@ -1,7 +1,7 @@
 //! The handles that pin a resident and the snapshot requests they send its actor.
 
 use super::{identity::QueryView, Lru};
-use crate::{node::state_sync::Snapshot, reactor::maintenance::SourceError, session::ContextData};
+use crate::{node::state_sync::tree::Snapshot, reactor::maintenance::SourceError, session::ContextData};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex, Weak,

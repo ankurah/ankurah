@@ -48,7 +48,7 @@ async fn a_withheld_span_lacks_every_member_within_it() -> anyhow::Result<()> {
     let mut known = snapshot(source.clone()).await?.offer().await?;
     let SpanContent::Digest(withheld) = known.spans.remove(digest_span(&known, |count| count > 0)) else { unreachable!() };
     let responder = snapshot(source).await?;
-    let within: BTreeSet<_> = responder.entries_in(&withheld.bounds, usize::MAX).map(|(id, _)| id).collect();
+    let within: BTreeSet<_> = responder.entries_in(&withheld.bounds).map(|(id, _)| id).collect();
     let comparison = OfferComparison::new(&responder, known)?;
     assert_eq!(lacking_ids(&comparison), within);
     assert!(comparison.lacking.iter().all(|(_, head)| head.is_none()), "the offer listed none of them");

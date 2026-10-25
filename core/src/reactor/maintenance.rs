@@ -60,10 +60,9 @@ pub(crate) struct ProjectedChange<T> {
     pub(crate) bytes: usize,
 }
 
-/// One reader's projections of the commits it has not consumed, coalesced, through `revision`.
+/// One reader's projections of the commits it has not consumed, coalesced.
 #[derive(Debug)]
 pub(crate) struct SourceBatch<T> {
-    pub(crate) revision: SourceRevision,
     pub(crate) changes: Vec<T>,
     pub(crate) catalog_changed: bool,
     pub(crate) bytes: usize,
@@ -97,7 +96,7 @@ struct SourceState {
 }
 
 trait MaintenanceReader: Send + Sync {
-    fn project(&self, revision: SourceRevision, entities: &[&Entity], catalog_changed: bool) -> Vec<WatcherChange>;
+    fn project(&self, entities: &[&Entity], catalog_changed: bool) -> Vec<WatcherChange>;
     fn fail(&self, error: SourceError);
 }
 
@@ -219,7 +218,7 @@ impl Reactor<Entity, Attested<Event>> {
 }
 
 impl<T: Send + Sync> MaintenanceReader for Reader<T> {
-    fn project(&self, revision: SourceRevision, entities: &[&Entity], catalog_changed: bool) -> Vec<WatcherChange> {
+    fn project(&self, entities: &[&Entity], catalog_changed: bool) -> Vec<WatcherChange> {
         let mut state = self.state.lock().unwrap();
         if state.error.is_some() || (entities.is_empty() && !catalog_changed) {
             return Vec::new();
@@ -260,12 +259,11 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
             // Commit boundaries do not change index work. Coalesce only the
             // unconsumed window; next()/fence() detach it before later commits.
             if let Some(pending) = &mut state.pending {
-                pending.revision = revision;
                 pending.changes.extend(values);
                 pending.catalog_changed |= catalog_changed;
                 pending.bytes += bytes;
             } else {
-                state.pending = Some(SourceBatch { revision, changes: values, catalog_changed, bytes });
+                state.pending = Some(SourceBatch { changes: values, catalog_changed, bytes });
             }
         }
         self.notify.notify_one();
@@ -300,7 +298,6 @@ impl SourceCommit {
             return;
         }
         source.revision += 1;
-        let revision = source.revision;
         source.readers.retain(|_, reader| reader.strong_count() != 0);
         let catalog_changed = entities.iter().any(|entity| entity.memberships().iter().any(crate::schema::is_catalog_model));
         let mut candidates = BTreeMap::new();
@@ -319,7 +316,7 @@ impl SourceCommit {
                     interested.extend(query.iter().copied());
                 }
             }
-            watcher_changes.extend(reader.project(SourceRevision(revision), &interested, catalog_changed));
+            watcher_changes.extend(reader.project(&interested, catalog_changed));
         }
         let mut watchers = self.maintenance.0.watchers.lock().unwrap();
         for change in watcher_changes {

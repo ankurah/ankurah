@@ -4,7 +4,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::node::state_sync::Snapshot;
+use crate::node::state_sync::tree::Snapshot;
 use ankurah_digest_tree::{leaf_address, Digest};
 use ankurah_proto::{Clock, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanInventory};
 use anyhow::ensure;
@@ -71,7 +71,7 @@ impl OfferComparison {
         if bounds.is_empty() {
             return;
         }
-        for (entity_id, _) in snapshot.entries_in(bounds, usize::MAX) {
+        for (entity_id, _) in snapshot.entries_in(bounds) {
             self.lacking.push((entity_id, known_heads.get(&entity_id).cloned()));
         }
     }
@@ -84,7 +84,7 @@ impl OfferComparison {
         while let Some(head) = cursor.next() {
             listed.insert(leaf_address(head.key, head.entity.entity_id), (head.entity.entity_id, head.entity.head.to_owned()));
         }
-        for (entity_id, entry) in snapshot.entries_in(&inventory.bounds, usize::MAX) {
+        for (entity_id, entry) in snapshot.entries_in(&inventory.bounds) {
             match listed.remove(entry.address()) {
                 Some((_, head)) if head == entry.head => {}
                 _ => self.lacking.push((entity_id, known_heads.get(&entity_id).cloned())),

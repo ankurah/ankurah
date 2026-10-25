@@ -4,7 +4,7 @@
 
 use super::coverage::{covers, local_heads};
 use crate::{
-    node::{state_sync::Snapshot, Node},
+    node::{state_sync::tree::Snapshot, Node},
     policy::PolicyAgent,
     storage::StorageEngine,
     util::Instant,
@@ -254,7 +254,7 @@ impl Target {
                 // A member the account lists elsewhere, as one whose key
                 // changed, is listed: its head says what the copy lacks.
                 Region::Listed(bounds) => {
-                    for (id, entry) in snapshot.entries_in(bounds, usize::MAX) {
+                    for (id, entry) in snapshot.entries_in(bounds) {
                         if self.listed.contains(&id) || self.unavailable.contains(&id) || self.diverged.contains(&id) {
                             continue;
                         }

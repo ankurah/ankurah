@@ -59,7 +59,7 @@ async fn a_catalog_change_during_an_admission_reopens_the_source() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn catalog_churn_bounds_admission_retries_and_a_later_admission_recovers() -> anyhow::Result<()> {
+async fn catalog_churn_across_every_admission_fails_a_snapshot_retryably_and_a_later_snapshot_recovers() -> anyhow::Result<()> {
     let node = node().await?;
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
@@ -67,11 +67,14 @@ async fn catalog_churn_bounds_admission_retries_and_a_later_admission_recovers()
     let (mut entered, mut release) = hold_fetch(&node);
     let admission = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
     tokio::pin!(admission);
-    for attempt in 0..2 {
-        assert!(futures::poll!(&mut admission).is_pending());
-        entered.await?;
+    let admissions = super::super::MAX_SNAPSHOT_ATTEMPTS;
+    for attempt in 1..=admissions {
+        tokio::select! {
+            _ = &mut admission => anyhow::bail!("the snapshot ended while its admission's read was held"),
+            read = &mut entered => read?,
+        }
         add_catalog_model(&node, &format!("catalog_churn_{attempt}")).await?;
-        if attempt == 1 {
+        if attempt == admissions {
             release.send(()).unwrap();
             break;
         }
@@ -79,42 +82,14 @@ async fn catalog_churn_bounds_admission_retries_and_a_later_admission_recovers()
         release.send(()).unwrap();
         (entered, release) = next;
     }
-    let error = admission.await.err().expect("continued catalog churn must exhaust the bounded retry");
+    let error = admission.await.err().expect("catalog churn across every admission exhausts the snapshot's retries");
     assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));
     assert!(SourceError::is_retryable(&error));
-    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2);
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, admissions as usize, "one read per admission");
     assert_eq!(node.resident_trees.len(), 0);
     let current = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
     assert_eq!(current.snapshot.entries.len(), 1);
     assert!(current.snapshot.entries.contains_key(&initial.entity_id));
-    Ok(())
-}
-
-#[tokio::test]
-async fn a_comparisons_snapshot_outlasts_churn_that_exhausts_one_snapshots_retries() -> anyhow::Result<()> {
-    let node = node().await?;
-    let initial = genesis("01")?;
-    apply(&node, &initial).await?;
-    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
-    let (mut entered, mut release) = hold_fetch(&node);
-    let admission = node.resident_trees.snapshot_through_changes(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
-    tokio::pin!(admission);
-    // The same churn that exhausts a single snapshot's retry above.
-    for attempt in 0..2 {
-        assert!(futures::poll!(&mut admission).is_pending());
-        entered.await?;
-        add_catalog_model(&node, &format!("comparison_churn_{attempt}")).await?;
-        if attempt == 1 {
-            release.send(()).unwrap();
-            break;
-        }
-        let next = hold_fetch(&node);
-        release.send(()).unwrap();
-        (entered, release) = next;
-    }
-    let admitted = admission.await?;
-    assert!(admitted.snapshot.entries.contains_key(&initial.entity_id), "the snapshot after the churn admits the member");
-    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 3, "one more admission, once the churn stopped");
     Ok(())
 }
 
@@ -131,23 +106,24 @@ async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() 
 }
 
 #[tokio::test]
-async fn a_lagged_admission_fails_retryably_and_a_later_admission_reads_a_fresh_window() -> anyhow::Result<()> {
+async fn a_lagged_admission_is_admitted_again_from_a_fresh_window() -> anyhow::Result<()> {
     let node = node().await?;
     let mut latest = genesis("01")?;
     apply(&node, &latest).await?;
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
     let admission = node.resident_trees.snapshot(&node, keyed_selection(), None, vec![DEFAULT_CONTEXT]);
     tokio::pin!(admission);
-    assert!(futures::poll!(&mut admission).is_pending());
-    entered.await?;
+    tokio::select! {
+        _ = &mut admission => anyhow::bail!("the snapshot ended while its admission's read was held"),
+        read = entered => read?,
+    }
     overflow_maintenance_bytes(&node, &mut latest).await?;
     release.send(()).unwrap();
-    let error = admission.await.err().expect("an admission whose window overflowed cannot complete");
-    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Lagged)));
-    assert!(SourceError::is_retryable(&error));
-    assert_eq!(node.resident_trees.len(), 0);
-    let current = node.resident_trees.snapshot(&node, keyed_selection(), None, vec![DEFAULT_CONTEXT]).await?;
+    let current = admission.await?;
     assert_eq!(current.snapshot.entries[&latest.entity_id].head, proto::Clock::singleton(&latest));
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 2, "the lagged admission's window was read again");
+    assert_eq!(node.resident_trees.len(), 1);
     Ok(())
 }
 

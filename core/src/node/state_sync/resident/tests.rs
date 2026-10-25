@@ -1,6 +1,8 @@
 use super::*;
 use super::{actor::ResidentActor, identity::Identity};
-use crate::{entity::TemporaryEntity, node::state_sync::Snapshot, schema::catalog::CatalogManager, session::ContextData, value::Value};
+use crate::{
+    entity::TemporaryEntity, node::state_sync::tree::Snapshot, schema::catalog::CatalogManager, session::ContextData, value::Value,
+};
 use crate::{
     error::{MutationError, RetrievalError},
     node::applier::NodeApplier,
