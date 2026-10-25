@@ -1,12 +1,20 @@
-//! When an established live query checks its copy against its peer's result.
-//! A push lost after the query became ready is otherwise invisible until the
-//! entity's next change or a reconnect; the check itself is state_sync's.
+//! When the relay checks an established live query's copy against its peer's
+//! result, and what it does with each check's outcome. A push lost after the
+//! query became ready is otherwise invisible until the entity's next change or
+//! a reconnect; the comparison itself is state_sync's.
 
+use super::{until_canceled, RemoteQuerySubscriber, Status, SubscriptionRelay};
 use crate::{
-    node::state_sync::{CheckOutcome, SyncedQuery},
-    util::Instant,
+    error::RetrievalError,
+    node::{
+        state_sync::{CheckBasis, CheckOutcome},
+        ContextData,
+    },
+    util::{cancel_flag::CancelFlag, Instant},
 };
+use ankurah_proto as proto;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 /// The wait before a query's first check, and after a disagreement or a repair.
 const FIRST_CHECK: Duration = Duration::from_secs(30);
@@ -16,7 +24,7 @@ const MAX_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 /// One established live query's schedule of checks.
 pub(super) struct PeriodicCheck {
-    pub(super) synced: SyncedQuery,
+    pub(super) basis: CheckBasis,
     interval: Duration,
     due: Instant,
     /// Whether the last check disagreed, so that the next one to disagree
@@ -27,8 +35,8 @@ pub(super) struct PeriodicCheck {
 }
 
 impl PeriodicCheck {
-    pub(super) fn new(synced: SyncedQuery) -> Self {
-        Self { synced, interval: FIRST_CHECK, due: Instant::now() + FIRST_CHECK, disagreed: false, running: false }
+    pub(super) fn new(basis: CheckBasis) -> Self {
+        Self { basis, interval: FIRST_CHECK, due: Instant::now() + FIRST_CHECK, disagreed: false, running: false }
     }
 
     pub(super) fn is_due(&self, now: Instant) -> bool { !self.running && now >= self.due }
@@ -60,6 +68,87 @@ impl PeriodicCheck {
     }
 }
 
+impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
+    /// Start the periodic check of each established query whose check is due.
+    pub(super) fn run_due_checks(&self) {
+        let now = Instant::now();
+        let due: Vec<_> = {
+            let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            subscriptions
+                .iter()
+                .filter(|(_, state)| state.check.as_ref().is_some_and(|check| check.is_due(now)))
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        for query_id in due {
+            let relay = self.clone();
+            crate::task::spawn(async move { relay.run_check(query_id).await });
+        }
+    }
+
+    /// Run established query `query_id`'s periodic check and schedule its
+    /// next one. A repair that fails to apply is reported and leaves the query
+    /// established; a check that fails subscribes the query again.
+    pub(super) async fn run_check(&self, query_id: proto::QueryId) {
+        let Some(node) = self.inner.node.get() else { return };
+        let started = {
+            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            subscriptions.get_mut(&query_id).and_then(|state| {
+                let Status::Established(peer, _) = state.status else { return None };
+                let check = state.check.as_mut()?;
+                let confirm = check.start()?;
+                Some((peer, state.content.clone(), check.basis.clone(), confirm, state.cancel.clone()))
+            })
+        };
+        let Some((peer, content, basis, confirm, cancel)) = started else { return };
+        match until_canceled(&cancel, node.check_query(peer, content.selection.clone(), content.sessions.current(), basis, confirm)).await {
+            None => debug!("Stopped the superseded check of predicate {}", query_id),
+            Some(Ok(outcome)) => {
+                if let CheckOutcome::RepairFailed { entity_id, error } = &outcome {
+                    warn!("The check of predicate {} could not repair entity {} from peer {}: {}", query_id, entity_id, peer, error);
+                }
+                let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+                if !cancel.canceled() {
+                    if let Some(check) = subscriptions.get_mut(&query_id).and_then(|state| state.check.as_mut()) {
+                        check.finish(outcome, Instant::now());
+                    }
+                }
+            }
+            Some(Err(error)) => self.resubscribe_after_failed_check(query_id, peer, error, &cancel),
+        }
+    }
+
+    /// Subscribe established query `query_id` again after its check failed
+    /// with `error`, keeping its data, as after a sync that stalled. A check's
+    /// failure says nothing lasting about a query that was established: its
+    /// causes, such as a catalog change on either side, clear with a new
+    /// subscription, so it never marks the query failed.
+    fn resubscribe_after_failed_check(&self, query_id: proto::QueryId, peer: proto::EntityId, error: RetrievalError, cancel: &CancelFlag) {
+        let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        if cancel.canceled() {
+            return;
+        }
+        if let Some(info) = subscriptions.get_mut(&query_id) {
+            if let Status::Established(..) = info.status {
+                info.status = Status::PendingRemote;
+                warn!("The check of predicate {} with peer {} failed: {} - will subscribe again", query_id, peer, error);
+            }
+        }
+    }
+
+    /// Run every established query's periodic check now, whatever its schedule.
+    #[cfg(feature = "test-helpers")]
+    pub(crate) async fn check_all_now(&self) {
+        let established: Vec<_> = {
+            let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            subscriptions.iter().filter(|(_, state)| state.check.is_some()).map(|(id, _)| *id).collect()
+        };
+        for query_id in established {
+            self.run_check(query_id).await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,7 +158,7 @@ mod tests {
 
     fn check() -> PeriodicCheck {
         let spec = ankurah_proto::TreeSpec::new(KeySpec::new(vec![]), ankql::ast::Predicate::True);
-        PeriodicCheck::new(SyncedQuery { spec, round_trip: Duration::ZERO })
+        PeriodicCheck::new(CheckBasis { spec, round_trip: Duration::ZERO })
     }
 
     #[test]

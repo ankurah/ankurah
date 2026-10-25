@@ -9,18 +9,12 @@ use super::{
     target::{Outstanding, Region, Target},
     OpeningPush, QuerySync,
 };
-use crate::{
-    error::{RequestError, RetrievalError},
-    node::state_sync::tree::Snapshot,
-    policy::PolicyAgent,
-    storage::StorageEngine,
-};
+use crate::{error::RetrievalError, node::state_sync::tree::Snapshot, policy::PolicyAgent, storage::StorageEngine};
 use ankurah_proto::{
-    self as proto,
     state_sync::limits::{MAX_HEAD_QUESTIONS, MAX_OFFER_SPANS, MAX_PAGE_HEADS},
-    Clock, EntityId, SpanAnswer, SpanQuestion, TreeSpan, TreeSpanDigest, TreeSpec,
+    SpanAnswer, SpanQuestion, TreeSpan, TreeSpanDigest,
 };
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 
 /// One question of a descent, about a span of a region not matched yet.
 enum Step {
@@ -114,49 +108,6 @@ where
             }
         }
         Ok(true)
-    }
-
-    /// Ask `questions` about the query's result in a tree under `spec`, and
-    /// check the answers against them; none when no answer came in time.
-    pub(super) async fn compare(
-        &mut self,
-        spec: TreeSpec,
-        questions: Vec<SpanQuestion>,
-    ) -> Result<Option<Vec<SpanAnswer>>, RetrievalError> {
-        let request =
-            proto::NodeRequestBody::CompareSpans { selection: self.selection.clone(), spec: spec.clone(), questions: questions.clone() };
-        match self.ask(request).await? {
-            None => Ok(None),
-            Some(proto::NodeResponseBody::SpansCompared { answers }) => {
-                SpanAnswer::validate_all(&answers, &questions, &spec)?;
-                Ok(Some(answers))
-            }
-            Some(other) => Err(RequestError::UnexpectedResponse(other).into()),
-        }
-    }
-
-    /// Ask the responder to push each of `entities` from the copy's head of
-    /// it, a page of entities per request, and record what it holds. A request
-    /// that finds no answer in time ends the requests early.
-    pub(super) async fn sync_entities(
-        &mut self,
-        target: &mut Target,
-        entities: Vec<(EntityId, Option<Clock>)>,
-    ) -> Result<(), RetrievalError> {
-        // The responder refuses a request that names an entity twice.
-        let mut distinct = HashSet::with_capacity(entities.len());
-        let entities: Vec<_> = entities.into_iter().filter(|(id, _)| distinct.insert(*id)).collect();
-        for page in entities.chunks(MAX_PAGE_HEADS) {
-            self.named.extend(page.iter().map(|(id, _)| *id));
-            let entities =
-                page.iter().map(|(id, head)| proto::EntityHead { entity_id: *id, head: head.clone().unwrap_or_default() }).collect();
-            match self.ask(proto::NodeRequestBody::SyncEntities { selection: self.selection.clone(), entities }).await? {
-                None => return Ok(()),
-                Some(proto::NodeResponseBody::EntitiesSynced { held, unavailable }) => target.synced(page, held, unavailable)?,
-                Some(other) => return Err(RequestError::UnexpectedResponse(other).into()),
-            }
-        }
-        Ok(())
     }
 }
 

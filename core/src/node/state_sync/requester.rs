@@ -38,11 +38,12 @@ use ankurah_proto::{
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
 
-/// What a live query's sync settled on, which its periodic checks reuse: the
-/// tree its target's spans address, and the round trip last measured to its
-/// peer.
+/// What a live query's periodic checks start from, as its sync settled it:
+/// the spec of the tree its target's spans address, and the round trip
+/// measured when the query opened, which sets a check's idle interval until
+/// the check measures its own.
 #[derive(Clone, Debug)]
-pub struct SyncedQuery {
+pub struct CheckBasis {
     pub(crate) spec: TreeSpec,
     pub(crate) round_trip: Duration,
 }
@@ -102,7 +103,7 @@ pub(crate) async fn subscribe<SE, PA>(
     selection: Selection<Resolved>,
     credentials: Vec<PA::ContextData>,
     version: u32,
-) -> Result<SyncedQuery, RetrievalError>
+) -> Result<CheckBasis, RetrievalError>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
@@ -119,7 +120,7 @@ where
     let spec = target.spec.clone();
     let push = OpeningPush::of(&offer, &target);
     sync.until_ready(target, push).await??;
-    Ok(SyncedQuery { spec, round_trip: sync.round_trip })
+    Ok(CheckBasis { spec, round_trip: sync.round_trip })
 }
 
 /// Check a live query's copy against `peer`'s result with one question about
@@ -135,7 +136,7 @@ pub(crate) async fn check<SE, PA>(
     peer: EntityId,
     selection: Selection<Resolved>,
     credentials: Vec<PA::ContextData>,
-    synced: &SyncedQuery,
+    basis: &CheckBasis,
     confirm: bool,
 ) -> Result<CheckOutcome, RetrievalError>
 where
@@ -143,9 +144,9 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let mut sync = QuerySync::new(node, peer, selection, credentials);
-    sync.measured(synced.round_trip);
+    sync.restart_wait(basis.round_trip);
     let question = {
-        let snapshot = sync.snapshot(Some(synced.spec.clone())).await?.snapshot;
+        let snapshot = sync.snapshot(Some(basis.spec.clone())).await?.snapshot;
         let fits_a_page = snapshot.entries.len() <= MAX_PAGE_HEADS && snapshot.page(TreeSpan::all())?.bounds == TreeSpan::all();
         if fits_a_page {
             SpanQuestion::Heads(TreeSpan::all())
@@ -153,14 +154,14 @@ where
             SpanQuestion::Digest(TreeSpan::all())
         }
     };
-    let Some(answer) = sync.compare(synced.spec.clone(), vec![question]).await?.and_then(|mut answers| answers.pop()) else {
+    let Some(answer) = sync.compare(basis.spec.clone(), vec![question]).await?.and_then(|mut answers| answers.pop()) else {
         return Ok(CheckOutcome::Disagreed);
     };
     let account = match answer {
         SpanAnswer::Digest(digest) => SpanContent::Digest(digest),
         SpanAnswer::Heads(page) => SpanContent::Heads(page),
     };
-    let mut target = Target::new(KnownState { spec: synced.spec.clone(), spans: vec![account] })?;
+    let mut target = Target::new(KnownState { spec: basis.spec.clone(), spans: vec![account] })?;
     if sync.outstanding(&mut target).await?.0.is_empty() {
         return Ok(CheckOutcome::Agreed);
     }
@@ -218,7 +219,8 @@ where
     /// The copy's account of itself, which the opening request offers.
     async fn offer(&self) -> Result<KnownState, RetrievalError> { Ok(self.snapshot(None).await?.snapshot.offer().await?) }
 
-    fn measured(&mut self, round_trip: Duration) {
+    /// Take `round_trip` as the peer's, and wait the base interval again.
+    fn restart_wait(&mut self, round_trip: Duration) {
         self.round_trip = round_trip;
         self.deadline.measured(round_trip);
         self.deadline.progressed();
@@ -229,7 +231,7 @@ where
     async fn open(&mut self, request: proto::NodeRequestBody) -> Result<proto::NodeResponseBody, RetrievalError> {
         let started = Instant::now();
         let response = self.node.request(self.peer, &self.credentials, request).await?;
-        self.measured(started.elapsed());
+        self.restart_wait(started.elapsed());
         answered(response)
     }
 
@@ -245,6 +247,49 @@ where
         self.round_trip = started.elapsed();
         self.deadline.measured(self.round_trip);
         answered(response).map(Some)
+    }
+
+    /// Ask `questions` about the query's result in a tree under `spec`, and
+    /// check the answers against them; none when no answer came in time.
+    pub(super) async fn compare(
+        &mut self,
+        spec: TreeSpec,
+        questions: Vec<SpanQuestion>,
+    ) -> Result<Option<Vec<SpanAnswer>>, RetrievalError> {
+        let request =
+            proto::NodeRequestBody::CompareSpans { selection: self.selection.clone(), spec: spec.clone(), questions: questions.clone() };
+        match self.ask(request).await? {
+            None => Ok(None),
+            Some(proto::NodeResponseBody::SpansCompared { answers }) => {
+                SpanAnswer::validate_all(&answers, &questions, &spec)?;
+                Ok(Some(answers))
+            }
+            Some(other) => Err(RequestError::UnexpectedResponse(other).into()),
+        }
+    }
+
+    /// Ask the responder to push each of `entities` from the copy's head of
+    /// it, a page of entities per request, and record what it holds. A request
+    /// that finds no answer in time ends the requests early.
+    pub(super) async fn sync_entities(
+        &mut self,
+        target: &mut Target,
+        entities: Vec<(EntityId, Option<Clock>)>,
+    ) -> Result<(), RetrievalError> {
+        // The responder refuses a request that names an entity twice.
+        let mut distinct = HashSet::with_capacity(entities.len());
+        let entities: Vec<_> = entities.into_iter().filter(|(id, _)| distinct.insert(*id)).collect();
+        for page in entities.chunks(MAX_PAGE_HEADS) {
+            self.named.extend(page.iter().map(|(id, _)| *id));
+            let entities =
+                page.iter().map(|(id, head)| proto::EntityHead { entity_id: *id, head: head.clone().unwrap_or_default() }).collect();
+            match self.ask(proto::NodeRequestBody::SyncEntities { selection: self.selection.clone(), entities }).await? {
+                None => return Ok(()),
+                Some(proto::NodeResponseBody::EntitiesSynced { held, unavailable }) => target.synced(page, held, unavailable)?,
+                Some(other) => return Err(RequestError::UnexpectedResponse(other).into()),
+            }
+        }
+        Ok(())
     }
 
     /// What the copy does not yet match or exceed of `target`, and the signal
