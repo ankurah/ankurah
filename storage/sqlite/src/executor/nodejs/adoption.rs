@@ -8,7 +8,7 @@ use send_wrapper::SendWrapper;
 use wasm_bindgen::JsValue;
 
 use super::{
-    statement::{method, unreadable},
+    statement::{database_method, unreadable},
     NodeJsConnection,
 };
 use crate::{
@@ -26,8 +26,8 @@ impl NodeJsConnection {
         if !database.is_object() {
             return Err(DatabaseRefusal::NotAnObject { found: format!("{database:?}") }.into());
         }
-        method(&database, "prepare")?;
-        method(&database, "exec")?;
+        database_method(&database, "prepare")?;
+        database_method(&database, "exec")?;
         let mut connection = Self {
             database: SendWrapper::new(database),
             readers: SendWrapper::new(Rc::default()),

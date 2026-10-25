@@ -40,8 +40,8 @@ use exception::js_error;
 use kept_readers::KeptReaders;
 use parameters::{refuse_a_named_parameter, ParameterCounts};
 use statement::{
-    integer_from_js, js_params, method, read_rows, refuse_all_but_one_statement, refuse_sql_past_its_statement, source, statement_method,
-    unreadable, width, RowSelection,
+    database_method, integer_from_js, js_params, read_rows, refuse_all_but_one_statement, refuse_sql_past_its_statement, source,
+    statement_method, unreadable, width, RowSelection,
 };
 use typed_reader::{plain_row, typed_reader, typed_row};
 
@@ -119,7 +119,7 @@ impl NodeJsConnection {
     /// schema script, through the database's own `exec`: the one call that
     /// runs more than one statement, which [`SqliteExecutor`]'s calls refuse.
     pub fn exec(&self, sql: &str) -> Result<(), SqliteError> {
-        method(&self.database, "exec")?.call1(&self.database, &sql.into()).map_err(js_error)?;
+        database_method(&self.database, "exec")?.call1(&self.database, &sql.into()).map_err(js_error)?;
         Ok(())
     }
 

@@ -4,12 +4,12 @@
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-use js_sys::Array;
-use wasm_bindgen::JsValue;
+use js_sys::{Array, RangeError};
+use wasm_bindgen::{JsCast, JsValue};
 
 use super::{
     exception::js_error,
-    statement::{integer_from_js, method, read_rows, statement_method, RowSelection},
+    statement::{database_method, integer_from_js, read_rows, statement_method, RowSelection},
     NodeJsConnection,
 };
 use crate::{
@@ -34,17 +34,18 @@ const SQLITE_RANGE: i32 = 25;
 impl NodeJsConnection {
     /// Whether the database binds NULL for a positional parameter a call does
     /// not pass, as node:sqlite does, rather than refusing the call, as
-    /// rusqlite and better-sqlite3 do.
+    /// rusqlite and better-sqlite3 do. Only better-sqlite3's own refusal, a
+    /// RangeError, answers that the database refuses the call. Any other
+    /// exception the call throws, such as a host's, is reported as it came:
+    /// it tells nothing of how the database binds, and read as a refusal it
+    /// would switch off the executor's own check of a call's values.
     pub(super) fn binds_null_for_a_missing_parameter(&self) -> Result<bool, SqliteError> {
-        let statement = method(&self.database, "prepare")?.call1(&self.database, &"SELECT ?".into()).map_err(js_error)?;
-        let get = statement_method(&statement, "get")?;
-        if get.call0(&statement).is_ok() {
-            return Ok(true);
+        let statement = database_method(&self.database, "prepare")?.call1(&self.database, &"SELECT ?".into()).map_err(js_error)?;
+        match statement_method(&statement, "get")?.call0(&statement) {
+            Ok(_) => Ok(true),
+            Err(exception) if exception.is_instance_of::<RangeError>() => Ok(false),
+            Err(exception) => Err(js_error(exception)),
         }
-        // The call was refused for the value it did not pass only if the same
-        // call passing that value runs.
-        get.call1(&statement, &JsValue::NULL).map_err(js_error)?;
-        Ok(false)
     }
 
     /// Whether the database binds a call's values to a numbered parameter
@@ -91,7 +92,7 @@ impl NodeJsConnection {
         } else {
             format!("EXPLAIN {statement}")
         };
-        let probe = method(&self.database, "prepare")?.call1(&self.database, &explain.into()).map_err(js_error)?;
+        let probe = database_method(&self.database, "prepare")?.call1(&self.database, &explain.into()).map_err(js_error)?;
         let values: Array = (0..=passed).map(|_| JsValue::NULL).collect();
         match statement_method(&probe, "get")?.apply(&probe, &values).map_err(js_error) {
             Err(SqliteError::Sqlite(SqliteFailure { code: Some(SQLITE_RANGE), .. })) => {}

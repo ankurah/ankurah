@@ -16,7 +16,7 @@ use crate::{
 impl NodeJsConnection {
     /// Prepare a statement that hands rows over as the executor reads them.
     pub(super) fn prepare(&self, sql: &str) -> Result<JsValue, SqliteError> {
-        let statement = method(&self.database, "prepare")?.call1(&self.database, &sql.into()).map_err(js_error)?;
+        let statement = database_method(&self.database, "prepare")?.call1(&self.database, &sql.into()).map_err(js_error)?;
         return_arrays(&statement)?;
         // INTEGERs as BigInt, so that each storage class arrives as a
         // JavaScript type of its own and a value past 2^53 arrives exactly.
@@ -32,9 +32,9 @@ impl NodeJsConnection {
 /// columns of one name collapse into one. better-sqlite3 refuses `raw` on a
 /// statement that yields no rows, which has none to hand over.
 fn return_arrays(statement: &JsValue) -> Result<(), SqliteError> {
-    if let Ok(set_return_arrays) = method(statement, "setReturnArrays") {
+    if let Some(set_return_arrays) = optional_statement_method(statement, "setReturnArrays")? {
         set_return_arrays.call1(statement, &JsValue::TRUE).map_err(js_error)?;
-    } else if let Ok(raw) = method(statement, "raw") {
+    } else if let Some(raw) = optional_statement_method(statement, "raw")? {
         if yields_rows(statement)? {
             raw.call1(statement, &JsValue::TRUE).map_err(js_error)?;
         }
@@ -47,9 +47,9 @@ fn return_arrays(statement: &JsValue) -> Result<(), SqliteError> {
 /// Ask a statement for its INTEGERs as BigInt: node:sqlite's
 /// `setReadBigInts`, or better-sqlite3's `safeIntegers`.
 fn read_big_ints(statement: &JsValue) -> Result<(), SqliteError> {
-    if let Ok(set_read_big_ints) = method(statement, "setReadBigInts") {
+    if let Some(set_read_big_ints) = optional_statement_method(statement, "setReadBigInts")? {
         set_read_big_ints.call1(statement, &JsValue::TRUE).map_err(js_error)?;
-    } else if let Ok(safe_integers) = method(statement, "safeIntegers") {
+    } else if let Some(safe_integers) = optional_statement_method(statement, "safeIntegers")? {
         safe_integers.call1(statement, &JsValue::TRUE).map_err(js_error)?;
     } else {
         return Err(DatabaseRefusal::NoExactIntegers.into());
@@ -229,7 +229,7 @@ pub(super) fn integer_from_js(value: &JsValue) -> Result<i64, SqliteError> {
 }
 
 /// A method of the database object; a missing one is refused by name.
-pub(super) fn method(database: &JsValue, name: &'static str) -> Result<Function, SqliteError> {
+pub(super) fn database_method(database: &JsValue, name: &'static str) -> Result<Function, SqliteError> {
     Reflect::get(database, &name.into())
         .map_err(js_error)?
         .dyn_into::<Function>()
@@ -243,6 +243,20 @@ pub(super) fn statement_method(statement: &JsValue, name: &'static str) -> Resul
         .map_err(js_error)?
         .dyn_into::<Function>()
         .map_err(|_| DatabaseRefusal::NoStatementMethod { name }.into())
+}
+
+/// A method only one Node.js driver's statements have, such as node:sqlite's
+/// `setReturnArrays` beside better-sqlite3's `raw`, so that the executor
+/// calls whichever the statement has: `None` only when the statement has no
+/// member `name`. An exception thrown as the member is read is reported as it
+/// came, and a member that is not a method is refused, rather than either
+/// read as the method missing.
+fn optional_statement_method(statement: &JsValue, name: &'static str) -> Result<Option<Function>, SqliteError> {
+    let member = Reflect::get(statement, &name.into()).map_err(js_error)?;
+    if member.is_undefined() {
+        return Ok(None);
+    }
+    member.dyn_into::<Function>().map(Some).map_err(|_| DatabaseRefusal::NoStatementMethod { name }.into())
 }
 
 /// The refusal of `what`, something the database handed over that the

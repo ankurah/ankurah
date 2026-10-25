@@ -340,6 +340,49 @@ fn a_typed_reader_that_fails_to_prepare_otherwise_than_in_sqlite_reports_the_fai
     assert_eq!(common::javascript_message(&error), Some("the typed reader is not prepared"), "{error}");
 }
 
+/// An exception the probe of a parameter a call leaves out does not expect,
+/// here a host's one-off failure of the probe's first `get()`, fails
+/// adoption with that exception, rather than read as the database refusing
+/// such a call itself, which would switch off the executor's check of a
+/// call's values.
+#[wasm_bindgen_test]
+fn an_unexpected_exception_from_the_missing_parameter_probe_fails_adoption() {
+    let error = NodeJsConnection::from_database(tampered_database(
+        "if (sql !== 'SELECT ?') return statement;
+         let failed = false;
+         return new Proxy(statement, { get: (target, name) => name === 'get'
+             ? (...params) => {
+                   if (!failed) { failed = true; throw new Error('a one-off failure'); }
+                   return target.get(...params);
+               }
+             : forward(target, name) });",
+    ))
+    .err()
+    .expect("the database is refused");
+    assert_eq!(common::javascript_message(&error), Some("a one-off failure"), "{error}");
+}
+
+/// An exception thrown as the executor reads a method only one driver's
+/// statements have, here from a getter, fails adoption with that exception,
+/// rather than read as the method missing; a member of that name that is not
+/// a method is refused.
+#[wasm_bindgen_test]
+fn a_statement_method_that_cannot_be_read_fails_adoption() {
+    for name in ["setReturnArrays", "setReadBigInts"] {
+        let error = NodeJsConnection::from_database(tampered_database(&format!(
+            "return new Proxy(statement, {{ get: (target, key) => {{
+                 if (key === '{name}') throw new Error('{name} cannot be read');
+                 return forward(target, key);
+             }} }});"
+        )))
+        .err()
+        .expect("the database is refused");
+        assert_eq!(common::javascript_message(&error), Some(format!("{name} cannot be read").as_str()), "{error}");
+    }
+    let refusal = refusal("return new Proxy(statement, { get: (target, key) => key === 'setReturnArrays' ? 1 : forward(target, key) });");
+    assert_eq!(refusal, refused_database(DatabaseRefusal::NoStatementMethod { name: "setReturnArrays" }));
+}
+
 /// A database that skips a numbered parameter as it binds a call's values,
 /// as node:sqlite did before Node.js 22.20.0 on 22 and 24.7.0 on 24, is
 /// refused, naming the releases that bind one at its position. The fake's

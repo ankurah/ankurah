@@ -5,7 +5,7 @@
 use js_sys::{Array, Function, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
 
-use super::{exception::js_error, statement::method, NodeJsConnection};
+use super::{exception::js_error, statement::database_method, NodeJsConnection};
 use crate::{
     error::{DatabaseRefusal, SqliteError},
     executor::SESSION_PRAGMAS,
@@ -50,7 +50,7 @@ impl NodeJsConnection {
         let database = Reflect::construct(&constructor, &Array::of1(&path.into())).map_err(js_error)?;
         // The busy timeout comes before any other statement, as rusqlite sets
         // it at open, since from_database's checks already read the file.
-        method(&database, "exec")?.call1(&database, &BUSY_TIMEOUT_PRAGMA.into()).map_err(js_error)?;
+        database_method(&database, "exec")?.call1(&database, &BUSY_TIMEOUT_PRAGMA.into()).map_err(js_error)?;
         let connection = Self::from_database(database)?;
         // Only a database the executor accepts is switched to WAL.
         connection.exec(SESSION_PRAGMAS)?;
