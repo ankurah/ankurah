@@ -5,41 +5,6 @@
 
 use super::*;
 
-/// The offer each of a client's Fetches (no query id) and subscribes carried.
-type Offers = Arc<Mutex<Vec<(Option<proto::QueryId>, proto::KnownState)>>>;
-
-/// An ephemeral client connected to `server` through a gate that records its
-/// offers. Connected only once the server holds its data, so the client's
-/// catalog types each property before its first query: a query that cannot
-/// type its keys falls back to a tree keyed by entity id.
-async fn connect_recording_offers(server: &Sled) -> anyhow::Result<(Sled, GatedConnection, Offers)> {
-    let client = ephemeral_sled_setup().await?;
-    let offers = Offers::default();
-    let (connection, _gate) = {
-        let offers = offers.clone();
-        GatedConnection::new(&client, server, move |message| {
-            if let proto::NodeMessage::Request { request, .. } = message {
-                match &request.body {
-                    proto::NodeRequestBody::Fetch { known_state, .. } => offers.lock().unwrap().push((None, known_state.clone())),
-                    proto::NodeRequestBody::SubscribeQuery { query_id, known_state, .. } => {
-                        offers.lock().unwrap().push((Some(*query_id), known_state.clone()))
-                    }
-                    _ => {}
-                }
-            }
-            false
-        })
-        .await
-    };
-    client.wait_ready().await?;
-    Ok((client, connection, offers))
-}
-
-/// The tree of each offer `query` carried (none for a Fetch), in order.
-fn specs(offers: &Offers, query: Option<proto::QueryId>) -> Vec<proto::TreeSpec> {
-    offers.lock().unwrap().iter().filter(|(id, _)| *id == query).map(|(_, known)| known.spec.clone()).collect()
-}
-
 fn keys(spec: &proto::TreeSpec) -> Vec<proto::PropertyId> { spec.key_spec().keyparts.iter().map(|part| part.key).collect() }
 
 /// The trees a live query over three records offers before and after its
@@ -51,7 +16,8 @@ async fn trees_across_a_selection_change(initial: &str, updated: &str) -> anyhow
         trx.create(&Record { title: title.into(), artist: artist.into() }).await?;
     }
     trx.commit().await?;
-    let (client_node, _connection, offers) = connect_recording_offers(&server).await?;
+    let client_node = ephemeral_sled_setup().await?;
+    let (_connection, offers) = connect_recording_offers(&client_node, &server).await?;
     let client = client_node.context_async(DEFAULT_CONTEXT).await?;
 
     let query = client.query_wait::<RecordView>(nocache(initial)?).await?;
@@ -96,7 +62,8 @@ async fn a_broad_fetchs_tree_serves_a_narrower_fetch_and_live_queries_with_their
         pets.push(trx.create(&Pet { name: name.into(), age: age.into() }).await?.id());
     }
     trx.commit().await?;
-    let (client_node, _connection, offers) = connect_recording_offers(&server_node).await?;
+    let client_node = ephemeral_sled_setup().await?;
+    let (_connection, offers) = connect_recording_offers(&client_node, &server_node).await?;
     let client = client_node.context_async(DEFAULT_CONTEXT).await?;
     let ids = |pets: Vec<PetView>| pets.iter().map(|pet| pet.id()).collect::<Vec<_>>();
 

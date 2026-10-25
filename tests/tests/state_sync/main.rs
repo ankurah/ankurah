@@ -8,6 +8,7 @@ mod catchup;
 #[path = "../common.rs"]
 mod common;
 mod fetch;
+mod limits;
 mod live;
 mod loss;
 mod pushes;
@@ -55,6 +56,40 @@ async fn create_pets(context: &Context, age: &str, names: impl IntoIterator<Item
     }
     trx.commit().await?;
     Ok(ids)
+}
+
+/// The offer each of a client's Fetches (no query id) and subscribes carried.
+type Offers = Arc<Mutex<Vec<(Option<proto::QueryId>, proto::KnownState)>>>;
+
+/// Connect `client` to `server` through a gate that records the client's
+/// offers. Connected only once the server holds its data, a client's catalog
+/// types each property before its first query: a query that cannot type its
+/// keys falls back to a tree keyed by entity id.
+async fn connect_recording_offers(client: &Sled, server: &Sled) -> anyhow::Result<(GatedConnection, Offers)> {
+    let offers = Offers::default();
+    let (connection, _gate) = {
+        let offers = offers.clone();
+        GatedConnection::new(client, server, move |message| {
+            if let proto::NodeMessage::Request { request, .. } = message {
+                match &request.body {
+                    proto::NodeRequestBody::Fetch { known_state, .. } => offers.lock().unwrap().push((None, known_state.clone())),
+                    proto::NodeRequestBody::SubscribeQuery { query_id, known_state, .. } => {
+                        offers.lock().unwrap().push((Some(*query_id), known_state.clone()))
+                    }
+                    _ => {}
+                }
+            }
+            false
+        })
+        .await
+    };
+    client.wait_ready().await?;
+    Ok((connection, offers))
+}
+
+/// The tree of each offer `query` carried (none for a Fetch), in order.
+fn specs(offers: &Offers, query: Option<proto::QueryId>) -> Vec<proto::TreeSpec> {
+    offers.lock().unwrap().iter().filter(|(id, _)| *id == query).map(|(_, known)| known.spec.clone()).collect()
 }
 
 /// Whether `message` is an update that pushes `entity`.
