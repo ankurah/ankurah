@@ -278,8 +278,11 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
     *storage.hold_after_commit.lock().unwrap() = Some((entered, release_rx));
     let winner = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(other, None)]);
     tokio::pin!(winner);
-    assert!(futures::poll!(&mut winner).is_pending());
-    entered_rx.await?;
+    // Its gated commit runs in a task of its own, which the transaction releases once staged.
+    tokio::select! {
+        _ = &mut winner => anyhow::bail!("the winner finished while storage held its commit"),
+        entered = entered_rx => entered?,
+    }
 
     assert_eq!(storage.get_state(id).await?.payload.state.memberships, [a, b].into_iter().collect());
     assert_eq!(entity.memberships(), [a].into_iter().collect());

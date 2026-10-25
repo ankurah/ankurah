@@ -251,8 +251,11 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     *storage.hold_commit.lock().unwrap() = Some((entered, release_rx));
     let pending = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(edit.clone(), None)]);
     tokio::pin!(pending);
-    assert!(futures::poll!(&mut pending).is_pending());
-    entered_rx.await?;
+    // Its gated commit runs in a task of its own, which the transaction releases once staged.
+    tokio::select! {
+        _ = &mut pending => anyhow::bail!("the commit finished while storage held it"),
+        entered = entered_rx => entered?,
+    }
 
     // Ownership changes after Alice's check but before her storage commit.
     let transfer = Event::update(entity.id(), proto::Clock::singleton(&genesis), AuthorId::Unknown, OperationSet(vec![set(owner, "Bob")?]));

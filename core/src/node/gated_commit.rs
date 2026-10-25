@@ -1,9 +1,9 @@
-//! The storage commit that ends a local transaction or the application of a peer's update, run in
-//! a task of its own so that it finishes once it takes reactor maintenance's commit gate, even if
-//! its caller's future is dropped: a commit stopped between taking the gate and publishing would
-//! leave maintenance unavailable for the whole node. The task stages the entity writes, then,
-//! holding the gate, commits them, advances each resident entity and publishes the committed
-//! entities to maintenance.
+//! The storage commit that ends a local transaction, a peer's transaction or the application of a
+//! peer's update, run in a task of its own so that it finishes once it takes reactor maintenance's
+//! commit gate, even if its caller's future is dropped: a commit stopped between taking the gate
+//! and publishing would leave its outcome in doubt for every resident tree. The task stages the
+//! entity writes, then, holding the gate, commits them, advances each resident entity and publishes
+//! the committed entities to maintenance.
 use crate::{
     changes::EntityChange,
     entity::RemoteTrxEntity,

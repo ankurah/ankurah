@@ -83,8 +83,11 @@ async fn a_commit_batch_and_its_fence_cannot_be_half_published() -> anyhow::Resu
         events.iter().cloned().map(Attested::from).collect(),
     );
     tokio::pin!(transaction);
-    assert!(futures::poll!(&mut transaction).is_pending());
-    wait.await?;
+    // Its gated commit runs in a task of its own, which the transaction releases once staged.
+    tokio::select! {
+        _ = &mut transaction => anyhow::bail!("the transaction finished while storage held its commit"),
+        entered = wait => entered?,
+    }
     for event in &events {
         assert_eq!(node.storage.get_state(event.entity_id).await?.payload.state.head, proto::Clock::singleton(event));
     }

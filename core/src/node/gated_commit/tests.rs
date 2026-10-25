@@ -1,16 +1,19 @@
 //! Callers that drop a gated commit's future after the commit has taken the gate, as a user may drop
-//! a transaction's commit or a `Context::get` whose response is being applied.
+//! a transaction's commit or a `Context::get` whose response is being applied, and a connector a
+//! peer's transaction whose message it handles.
 use crate::{
     entity::{Entity, LocalTrxEntity},
     error::RetrievalError,
-    node::{applier::NodeApplier, Node},
+    node::{applier::NodeApplier, handler::commit_transaction, Node},
     policy::{PermissiveAgent, DEFAULT_CONTEXT},
     reactor::maintenance::ProjectedChange,
     retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
     storage::StorageEngine,
     test_utils::TestStorage,
 };
-use ankurah_proto::{self as proto, Attested, AuthorId, Clock, EntityId, Event, Membership, ModelId, Operation, OperationSet};
+use ankurah_proto::{
+    self as proto, Attested, AuthorId, Clock, EntityId, Event, Membership, ModelId, Operation, OperationSet, TransactionId,
+};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 
@@ -82,6 +85,33 @@ async fn a_local_commit_dropped_before_releasing_its_writes_commits_nothing() ->
     assert!(matches!(node.storage.get_state(abandoned).await, Err(RetrievalError::EntityNotFound(_))));
     let head = node.storage.get_state(later).await?.payload.state.head;
     assert_eq!(maintenance.next().await?.changes, [(later, head)], "maintenance heard only of the later commit");
+    Ok(())
+}
+
+/// A peer's transaction whose commit is dropped after storage committed it inside the gate, as a
+/// connector that bounds or cancels its handling of a message may drop it, still lands, advances
+/// the resident entity and publishes to maintenance, which then serves later commits.
+#[tokio::test]
+async fn a_remote_transaction_dropped_inside_the_gate_still_lands_and_publishes() -> anyhow::Result<()> {
+    let node = node().await?;
+    let genesis = Event::genesis(node.system.root_id(), AuthorId::Unknown, adding_model(1));
+    let id = genesis.entity_id;
+    commit_transaction(&node, &DEFAULT_CONTEXT, TransactionId::new(), vec![genesis.clone().into()]).await?;
+    let resident = load_resident(&node, id).await?;
+    let (_, mut maintenance) = node.reactor.subscribe_maintenance(heads).await?;
+
+    let update = Event::update(id, Clock::singleton(&genesis), AuthorId::Unknown, adding_model(2));
+    drop_inside_the_gate(&node, commit_transaction(&node, &DEFAULT_CONTEXT, TransactionId::new(), vec![update.clone().into()])).await?;
+
+    let head = Clock::singleton(&update);
+    assert_eq!(node.storage.get_state(id).await?.payload.state.head, head, "the dropped commit reached storage");
+    let published = tokio::time::timeout(Duration::from_secs(10), maintenance.next()).await??;
+    assert_eq!(published.changes, [(id, head.clone())]);
+    assert_eq!(resident.head(), head);
+
+    let later = Event::genesis(node.system.root_id(), AuthorId::Unknown, adding_model(3));
+    commit_transaction(&node, &DEFAULT_CONTEXT, TransactionId::new(), vec![later.clone().into()]).await?;
+    assert_eq!(maintenance.next().await?.changes, [(later.entity_id, Clock::singleton(&later))], "maintenance still serves later commits");
     Ok(())
 }
 
