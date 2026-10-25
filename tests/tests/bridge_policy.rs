@@ -487,6 +487,9 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 /// design question for the snapshot-authority design.)
 #[tokio::test]
 async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
+    use ankurah::core::error::{ApplyError, MutationError, RetrievalError};
+    use std::time::{Duration, Instant};
+
     let server_agent = BridgePolicyAgent::new();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), server_agent.clone());
     server.system.create().await?;
@@ -527,11 +530,19 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // Re-fetch: the bridge would need the denied event, so it must be
     // suppressed entirely. The snapshot fallback arrives but cannot be
     // lineage-verified without the hidden event, so the client refuses it
-    // rather than adopting unverifiable state; its copy never reaches the
-    // server's account, and the fetch fails once comparing again brings no
-    // progress.
-    let refetch = ctx_c.fetch::<PetView>(query.as_str()).await;
-    assert!(refetch.is_err(), "client must not silently adopt state whose lineage it cannot verify, got {refetch:?}");
+    // rather than adopting unverifiable state, and the fetch fails at once
+    // with the refusal.
+    let started = Instant::now();
+    let error =
+        ctx_c.fetch::<PetView>(query.as_str()).await.expect_err("client must not silently adopt state whose lineage it cannot verify");
+    assert!(started.elapsed() < Duration::from_secs(1), "the refusal fails the fetch before its first idle interval ends");
+    let RetrievalError::ApplyError(refusal) = &error else { panic!("the fetch fails with the client's refusal to apply, got {error}") };
+    let ApplyError::Items(items) = &**refusal else { panic!("the refusal names the item it refused, got {refusal}") };
+    assert!(
+        matches!(items.as_slice(), [item] if item.entity_id == pet_id
+            && matches!(&item.cause, MutationError::RetrievalError(RetrievalError::EventNotFound(hidden)) if *hidden == denied_id)),
+        "the pet's snapshot alone was refused, for want of the hidden event: {refusal}"
+    );
 
     // The security property: the hidden event never reached the client, and
     // neither did the rest of the redacted window (a partial chain would

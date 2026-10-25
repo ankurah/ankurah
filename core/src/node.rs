@@ -105,6 +105,9 @@ where PA: PolicyAgent
     /// The node's one LRU of resident digest trees, which every comparison of a
     /// query result with a peer reads.
     pub(crate) resident_trees: state_sync::ResidentTrees<PA::ContextData>,
+    /// Each item of a peer's update that fails to apply, for the syncs waiting
+    /// on its entity.
+    pub(crate) apply_failures: applier::ApplyFailures,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,
 
@@ -220,6 +223,7 @@ where
             storage: engine,
             entities: entityset,
             resident_trees: state_sync::ResidentTrees::default(),
+            apply_failures: applier::ApplyFailures::default(),
             peer_connections: SafeMap::new(),
             durable_peers: SafeSet::new(),
             rng: Mutex::new(rng),
@@ -550,8 +554,17 @@ where
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
                 self.system.require_system_ready()?;
-                crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
-                Ok(())
+                match crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await {
+                    Ok(()) => Ok(()),
+                    // The acknowledgment carries the failure to the peer as
+                    // text, so that each failed item's cause can go on to the
+                    // syncs waiting on its entity.
+                    Err(error) => {
+                        let report = anyhow!("{error}");
+                        self.apply_failures.publish(notification.from, error);
+                        Err(report)
+                    }
+                }
             }
         }
     }

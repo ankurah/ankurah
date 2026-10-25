@@ -1,3 +1,7 @@
+mod failures;
+
+pub(crate) use failures::{ApplyFailure, ApplyFailures};
+
 use super::gated_commit::{EntityWrite, ResidentAdvance};
 use crate::entity::RemoteTrxEntity;
 use crate::error::{ApplyError, ApplyErrorItem};

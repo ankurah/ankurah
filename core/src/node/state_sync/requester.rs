@@ -4,7 +4,8 @@
 //! exceeds the target as the responder's pushes apply. It repairs what does
 //! not arrive: at once where the responder pushed nothing, when its copy stops
 //! progressing for an idle interval, and, for a live query, when two periodic
-//! checks disagree.
+//! checks disagree. A push that fails to apply for what it waits on fails the
+//! sync at once.
 
 mod coverage;
 mod deadline;
@@ -20,8 +21,8 @@ use self::{
 };
 use super::ResidentSnapshot;
 use crate::{
-    error::{RequestError, RetrievalError},
-    node::Node,
+    error::{ApplyError, RequestError, RetrievalError},
+    node::{applier::ApplyFailure, Node},
     policy::PolicyAgent,
     storage::StorageEngine,
     util::Instant,
@@ -30,8 +31,8 @@ use ankql::ast::{Resolved, Selection};
 use ankurah_proto::{
     self as proto, state_sync::limits::MAX_PAGE_HEADS, EntityId, KnownState, SpanAnswer, SpanContent, SpanQuestion, TreeSpan, TreeSpec,
 };
-use futures::future::Either;
-use std::{collections::HashSet, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::sync::broadcast;
 
 /// What a live query's sync settled on, which its periodic checks reuse: the
 /// tree its target's spans address, and the round trip last measured to its
@@ -167,6 +168,9 @@ struct QuerySync<'a, SE, PA: PolicyAgent> {
     deadline: IdleDeadline,
     /// The round trip last measured to the peer.
     round_trip: Duration,
+    /// The node's failures to apply pushed items since the sync began, which
+    /// is before its first request: the peer may push before it answers.
+    failures: broadcast::Receiver<ApplyFailure>,
 }
 
 impl<'a, SE, PA> QuerySync<'a, SE, PA>
@@ -175,7 +179,8 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     fn new(node: &'a Node<SE, PA>, peer: EntityId, selection: Selection<Resolved>, credentials: Vec<PA::ContextData>) -> Self {
-        Self { node, peer, selection, credentials, deadline: IdleDeadline::new(), round_trip: Duration::ZERO }
+        let failures = node.apply_failures.listen();
+        Self { node, peer, selection, credentials, deadline: IdleDeadline::new(), round_trip: Duration::ZERO, failures }
     }
 
     /// A snapshot of the copy: this node's resident for the query, under the
@@ -223,9 +228,25 @@ where
         Ok((target.outstanding(self.node, &mut snapshot).await?, changes))
     }
 
+    /// The failure of the next item the peer pushed for an entity that
+    /// `outstanding` waits on. A failure the sync lagged behind is lost, which
+    /// leaves its entity to the idle deadline, as a lost push is.
+    async fn failure_concerning(&mut self, outstanding: &Outstanding) -> Arc<ApplyError> {
+        loop {
+            match self.failures.recv().await {
+                Ok(failure) if failure.peer == self.peer && outstanding.waits_on(&failure.entity_id) => return failure.error,
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                // The node, which publishes failures, outlives every sync it runs.
+                Err(broadcast::error::RecvError::Closed) => return futures::future::pending().await,
+            }
+        }
+    }
+
     /// Wait until the copy matches or exceeds `target`. What `push` does not
     /// bring is repaired at once; the rest is waited for, and compared again
-    /// whenever the copy has not progressed for the idle interval.
+    /// whenever the copy has not progressed for the idle interval. A pushed
+    /// item that fails to apply for an entity still waited on fails the sync
+    /// at once, with that failure.
     async fn until_ready(&mut self, mut target: Target, push: OpeningPush) -> Result<(), RetrievalError> {
         let mut last = usize::MAX;
         let mut unpushed_repaired = false;
@@ -252,11 +273,10 @@ where
             let woke = if remaining.is_zero() {
                 None
             } else {
-                let changed = changes.changed();
-                futures::pin_mut!(changed);
-                match futures::future::select(changed, futures_timer::Delay::new(remaining)).await {
-                    Either::Left((changed, _)) => Some(changed.is_ok()),
-                    Either::Right(_) => None,
+                tokio::select! {
+                    changed = changes.changed() => Some(changed.is_ok()),
+                    error = self.failure_concerning(&outstanding) => return Err(RetrievalError::ApplyError(error)),
+                    () = futures_timer::Delay::new(remaining) => None,
                 }
             };
             match woke {

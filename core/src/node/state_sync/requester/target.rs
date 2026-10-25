@@ -69,6 +69,13 @@ pub(super) struct Outstanding {
 impl Outstanding {
     pub(super) fn is_empty(&self) -> bool { self.len() == 0 }
     pub(super) fn len(&self) -> usize { self.heads.len() + self.spans.len() + self.extras.len() }
+
+    /// Whether the copy still waits for `entity`: a responder head of it that
+    /// the copy does not cover, or a local member the responder has not
+    /// settled.
+    pub(super) fn waits_on(&self, entity: &EntityId) -> bool {
+        self.heads.iter().any(|(id, ..)| id == entity) || self.extras.iter().any(|(id, _)| id == entity)
+    }
 }
 
 impl Target {

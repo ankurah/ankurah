@@ -1,8 +1,12 @@
-//! Readiness of a copy against a responder's account, and the requester's
-//! descent and repair against a real responder.
+//! Readiness of a copy against a responder's account, a sync's failure when a
+//! push it waits on fails to apply, and the requester's descent and repair
+//! against a real responder.
 
 use super::{target::Target, *};
-use crate::node::state_sync::{fixtures::*, tree::entity_id_spec};
+use crate::{
+    error::{ApplyErrorItem, MutationError},
+    node::state_sync::{fixtures::*, tree::entity_id_spec},
+};
 use ankurah_proto::{EntityHead, KeyedEntityHead, PackedHeads, SpanContent, TreeSpanInventory};
 use std::collections::BTreeSet;
 
@@ -72,6 +76,54 @@ async fn a_local_entity_the_account_does_not_list_holds_readiness_until_the_resp
 
     let stray = proto::KnownEntity { entity_id: EntityId::random(), head: proto::Clock::default() };
     assert!(target.synced(&named, vec![stray], vec![]).is_err(), "an answer may name only what its request named");
+    Ok(())
+}
+
+/// An update's failure to apply its item for `entity`.
+fn failed_item(entity: EntityId) -> ApplyError {
+    ApplyError::Items(vec![ApplyErrorItem { entity_id: entity, cause: MutationError::InvalidEvent }])
+}
+
+#[tokio::test]
+async fn a_push_that_fails_to_apply_for_an_entity_the_sync_waits_on_fails_it_at_once() -> anyhow::Result<()> {
+    let node = durable().await?;
+    let lacking = labeled(None, "lacking")?;
+    let unsettled = create(&[&node], "outside the responder's account").await?;
+    let peer = EntityId::random();
+    // The sync waits on the head it lacks and on the local member the account does not list.
+    for waited_on in [lacking.entity_id, unsettled.entity_id] {
+        let mut sync = QuerySync::new(&node, peer, members(), vec![]);
+        let push = OpeningPush::of(&sync.offer().await?);
+        let target = Target::new(account(&[(lacking.entity_id, head(&lacking))])?)?;
+        let started = Instant::now();
+        let (result, ()) = tokio::join!(sync.until_ready(target, push), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            node.apply_failures.publish(peer, failed_item(waited_on));
+        });
+        let failed = |error: &ApplyError| matches!(error, ApplyError::Items(items) if items.len() == 1 && items[0].entity_id == waited_on);
+        assert!(matches!(&result, Err(RetrievalError::ApplyError(error)) if failed(error)), "fails with the item's failure: {result:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "before the first idle interval ends");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn failures_for_other_entities_or_from_other_peers_change_nothing() -> anyhow::Result<()> {
+    let node = durable().await?;
+    let lacking = labeled(None, "lacking")?;
+    let peer = EntityId::random();
+    let mut sync = QuerySync::new(&node, peer, members(), vec![]);
+    let push = OpeningPush::of(&sync.offer().await?);
+    let target = Target::new(account(&[(lacking.entity_id, head(&lacking))])?)?;
+    let (ready, applied) = tokio::join!(sync.until_ready(target, push), async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        node.apply_failures.publish(peer, failed_item(EntityId::random()));
+        node.apply_failures.publish(EntityId::random(), failed_item(lacking.entity_id));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        apply(&node, &lacking).await
+    });
+    applied?;
+    ready?;
     Ok(())
 }
 
