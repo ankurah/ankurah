@@ -128,7 +128,8 @@ impl RemoteTrxEntity {
         Self(Arc::new(inner)).read()
     }
 
-    /// Publish admitted events after storage commits, then redirect any views to the resident entity.
+    /// After storage commits, carry what the fork changed, its admitted events or an adopted snapshot,
+    /// to the resident entity, then redirect any views to the resident entity.
     pub(crate) async fn commit<G>(self, entities: &WeakEntitySet, getter: &G) -> Result<EntityChange, MutationError>
     where G: GetEvents + Send + Sync {
         let data = self.0.data();
@@ -136,7 +137,7 @@ impl RemoteTrxEntity {
 
         let resident = match &*self.0 {
             RemoteTrxEntityInner::Mut { upstream, base_head, .. } => {
-                if !events.is_empty() && upstream.state.replace_if_head_matches(base_head, &data.state) {
+                if data.state.head() != *base_head && upstream.state.replace_if_head_matches(base_head, &data.state) {
                     data.committed(upstream.clone());
                     return Ok(EntityChange::new(Entity::from_resident(upstream.clone()), events));
                 }

@@ -37,6 +37,7 @@ use tracing::{debug, warn};
 pub mod applier;
 mod erased;
 pub(crate) mod event_admissibility;
+pub(crate) mod gated_commit;
 pub(crate) mod handler;
 pub mod handles;
 mod match_args;

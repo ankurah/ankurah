@@ -8,10 +8,10 @@ use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
 use crate::node::event_admissibility::check_genesis_membership;
+use crate::node::gated_commit::{EntityWrite, GatedCommit, ResidentAdvance};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
-use crate::storage::StorageTransaction;
 use crate::util::retry::retry_on;
 
 use append_only_vec::AppendOnlyVec;
@@ -201,9 +201,8 @@ impl Transaction {
         let state_getter = LocalStateGetter::new(node.storage.clone());
         let mut relayed = false;
         retry_on!(MutationError::WriteConflict, {
-            let mut storage_trx = node.storage.transaction();
+            let mut writes = Vec::new();
             let mut attested_events = Vec::new();
-            let mut forks = Vec::new();
             for (entity, events) in &entity_events {
                 // TODO(#509): Finalize the existing transaction fork; rebase it only on write conflicts.
                 // A subscription echo may already have committed this creation locally.
@@ -215,31 +214,30 @@ impl Transaction {
                 entity_after
                     .apply_events(&event_getter, &mut events, |event| policy.check_write_event(node, &entity_before, &after, event))
                     .await?;
-                storage_trx.add_events(&events).await?;
                 let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
                 let attestation = policy.attest_state(node, &state);
-                storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
-                attested_events.extend(events);
-                forks.push((entity, entity_after));
+                attested_events.extend(events.iter().cloned());
+                writes.push(EntityWrite {
+                    expected_head,
+                    state: Attested::opt(state, attestation),
+                    events,
+                    resident: ResidentAdvance::Apply(entity_after),
+                });
             }
 
+            let staged = GatedCommit::stage(node, writes).await?;
             if !relayed {
                 if let ContextAuth::Sessions(sessions) = auth {
                     node.relay_to_required_peers(&sessions.write_credential()?, self.id.clone(), &attested_events).await?;
                 }
                 relayed = true;
             }
-            let mut source = node.reactor.begin_commit().await;
-            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
-            let mut changes = Vec::new();
-            for (entity, fork) in forks {
-                let change = fork.commit(&node.entities, &event_getter).await?;
+            let mut changes = staged.commit().await?.ok_or(MutationError::WriteConflict)?;
+            for ((entity, _), change) in entity_events.iter().zip(&changes) {
                 entity.committed(change.entity())?;
-                changes.push(change);
             }
             // Maintenance follows every committed head, including one a reader loaded before this
             // commit published it; reactor subscribers hear only of new events.
-            source.publish(changes.iter().map(|change| change.entity()));
             changes.retain(|change| !change.events().is_empty());
             node.reactor.notify_change(changes).await;
             Ok(attested_events.into_iter().map(|event| event.payload).collect())
