@@ -23,7 +23,8 @@ pub struct SubscriptionHandler<CD: ContextData> {
     peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
-    /// Tracks each standing query's version and the credential source shared with its gap fetcher.
+    /// Tracks each standing query's version, the credential source shared with its gap fetcher,
+    /// and what stops its initial push.
     /// Held through async installation and failure cleanup so removal cannot race an
     /// installation that would leave a reactor query without its credential source; not
     /// through the answer's snapshot, which can wait out catalog churn.
@@ -35,7 +36,7 @@ struct StandingQuery<CD: ContextData> {
     sessions: SessionSet<CD>,
     version: u32,
     /// Stops the push of this version's initial data once a later version
-    /// replaces the query or the query goes.
+    /// replaces the query or the query is removed.
     push: CancelFlag,
 }
 
