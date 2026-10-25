@@ -13,6 +13,7 @@ mod loss;
 mod pushes;
 mod readiness;
 mod reconnect;
+mod sharing;
 
 use common::*;
 use std::{
