@@ -231,15 +231,10 @@ async fn apply_snapshot(node: &TestNode, source: &TestNode, event: &proto::Event
     let stored = source.storage.get_state(event.entity_id).await?;
     let events = LocalEventGetter::new(node.storage.clone(), true);
     events.stage_event(event.clone());
-    NodeApplier::apply_deltas(
+    NodeApplier::apply_states(
         node,
         &proto::EntityId::from_bytes([24; 32]),
-        vec![proto::EntityDelta {
-            entity_id: event.entity_id,
-            content: proto::DeltaContent::StateSnapshot {
-                state: proto::StateFragment { state: stored.payload.state, attestations: stored.attestations },
-            },
-        }],
+        vec![stored],
         &events,
         &LocalStateGetter::new(node.storage.clone()),
     )

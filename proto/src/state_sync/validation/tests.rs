@@ -1,7 +1,7 @@
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
-use ankurah_digest_tree::{leaf_address, CanonicalCodec};
+use ankurah_digest_tree::{leaf_address, CanonicalCodec, NodePrefix};
 
 use super::*;
 use crate::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, PackedHeads, TreeSpanDigest};
@@ -21,7 +21,7 @@ fn offer(spans: Vec<SpanContent>) -> KnownState { KnownState { spec: spec(), spa
 
 #[test]
 fn an_offer_holds_disjoint_spans_within_the_tree_and_each_entity_once() {
-    let tree = TreeSpan::under(&NodePrefix::root());
+    let tree = TreeSpan::all();
     let split = leaf_address(&[], id(100));
     let below = TreeSpan::new(tree.start.clone(), Excluded(split.clone()));
     let above = TreeSpan::new(Included(split), Unbounded);
@@ -51,7 +51,7 @@ fn an_offer_lists_each_entity_once_across_inventories() {
         let heads = vec![KeyedEntityHead { key, entity: EntityHead { entity_id: id(7), head: head(1) } }];
         SpanContent::Heads(TreeSpanInventory { bounds, heads: PackedHeads::try_from(heads).unwrap() })
     };
-    let tree = TreeSpan::under(&NodePrefix::root());
+    let tree = TreeSpan::all();
     let spans = vec![
         keyed(TreeSpan::new(tree.start.clone(), Excluded(split.clone())), key(1)),
         keyed(TreeSpan::new(Included(split), Unbounded), key(3)),
@@ -62,7 +62,7 @@ fn an_offer_lists_each_entity_once_across_inventories() {
 
 #[test]
 fn an_offer_counts_its_heads_across_inventories() {
-    let tree = TreeSpan::under(&NodePrefix::root());
+    let tree = TreeSpan::all();
     let split = leaf_address(&[], id(MAX_OFFER_HEADS as u16 / 2 + 1));
     let below = TreeSpan::new(tree.start.clone(), Excluded(split.clone()));
     let above = TreeSpan::new(Included(split), Unbounded);
@@ -75,6 +75,44 @@ fn an_offer_counts_its_heads_across_inventories() {
     };
     assert!(full(0).validate().is_ok());
     assert!(full(1).validate().is_err());
+}
+
+#[test]
+fn an_offer_refuses_inventories_whose_work_together_passes_its_limit() {
+    // Four tips make each head 166 bytes of work, so a thousand heads fit one inventory
+    // under the codec's cap, while two such inventories pass the offer's work limit
+    // with fewer heads in all than its head limit.
+    let clock = Clock::new((1..=4).map(|n| (1, EventId::from_bytes([n; 32]))).collect::<Vec<_>>()).unwrap();
+    let inventory = |bounds, ids: std::ops::Range<u16>| {
+        let heads =
+            ids.map(|n| KeyedEntityHead { key: vec![], entity: EntityHead { entity_id: id(n), head: clock.clone() } }).collect::<Vec<_>>();
+        SpanContent::Heads(TreeSpanInventory { bounds, heads: PackedHeads::try_from(heads).unwrap() })
+    };
+    let split = leaf_address(&[], id(1000));
+    let below = inventory(TreeSpan::new(TreeSpan::all().start, Excluded(split.clone())), 0..1000);
+    let above = inventory(TreeSpan::new(Included(split), Unbounded), 1000..2000);
+    assert!(offer(vec![below.clone()]).validate().is_ok());
+    let error = offer(vec![below, above]).validate().unwrap_err();
+    assert!(error.to_string().contains("work limit"), "{error}");
+}
+
+#[test]
+fn a_page_refuses_work_past_its_limit_that_prefix_sharing_kept_off_the_wire() {
+    // A page of heads under one long key: sharing it keeps the wire bytes small, while
+    // the work counts every key whole.
+    let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(PropertyId::Id, ValueType::String)]), ankql::ast::Predicate::True);
+    let page = |key_len: usize| {
+        let key = CanonicalCodec::encode_nullable(spec.key_spec(), &[Some(Value::String("k".repeat(key_len)))]).unwrap();
+        let heads = (0..MAX_PAGE_HEADS as u16)
+            .map(|n| KeyedEntityHead { key: key.clone(), entity: EntityHead { entity_id: id(n), head: head(1) } })
+            .collect::<Vec<_>>();
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: PackedHeads::try_from(heads).unwrap() }
+    };
+    assert!(page(256).validate_page(&spec).is_ok());
+    let long = page(1024);
+    assert!(bincode::serialized_size(&long).unwrap() < MAX_PAGE_BYTES as u64 / 4);
+    let error = long.validate_page(&spec).unwrap_err();
+    assert!(error.to_string().contains("work limit"), "{error}");
 }
 
 #[test]
@@ -140,4 +178,13 @@ fn span_answers_pair_one_to_one_with_their_questions() {
     assert!(SpanAnswer::validate_all(&answers[..1], &questions, &spec()).is_err(), "an answer missing");
     let swapped = [answers[1].clone(), answers[0].clone()];
     assert!(SpanAnswer::validate_all(&swapped, &questions, &spec()).is_err(), "answers out of their questions' order");
+}
+
+#[test]
+fn a_sync_request_names_at_most_a_page_of_entities_each_once() {
+    let entities = |ids: std::ops::Range<u16>| ids.map(|n| EntityHead { entity_id: id(n), head: head(1) }).collect::<Vec<_>>();
+    assert!(EntityHead::validate_sync_request(&entities(0..MAX_PAGE_HEADS as u16)).is_ok());
+    assert!(EntityHead::validate_sync_request(&entities(0..MAX_PAGE_HEADS as u16 + 1)).is_err(), "more than a page");
+    let twice = [entities(0..2), entities(1..2)].concat();
+    assert!(EntityHead::validate_sync_request(&twice).is_err(), "an entity named twice");
 }

@@ -29,8 +29,6 @@ impl HeadCursor {
         Self { bytes, offset, remaining, encoding, key: Vec::new() }
     }
 
-    pub fn len(&self) -> usize { self.remaining }
-    pub fn is_empty(&self) -> bool { self.remaining == 0 }
     #[allow(clippy::should_implement_trait)] // Lending result borrows the cursor's reusable key.
     pub fn next(&mut self) -> Option<KeyedEntityHeadRef<'_>> {
         if self.remaining == 0 {
@@ -80,10 +78,6 @@ pub struct ClockRef<'a> {
 impl ClockRef<'_> {
     pub fn entries(&self) -> impl Iterator<Item = (u32, EventId)> + '_ { codec::tips(self.bytes, self.count) }
     pub fn to_owned(&self) -> Clock { Clock::new(self.entries().collect::<Vec<_>>()).expect("validated clock") }
-    pub fn equals(&self, clock: &Clock) -> bool {
-        self.count == clock.len()
-            && self.entries().zip(clock.entries()).all(|((g, id), (other_g, other_id))| g == *other_g && id == *other_id)
-    }
 }
 
 impl Serialize for ClockRef<'_> {

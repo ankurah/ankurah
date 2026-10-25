@@ -59,17 +59,18 @@ async fn node() -> anyhow::Result<Node<TestStorage, PermissiveAgent>> {
     Ok(node)
 }
 
-/// Apply `event` as a peer's event bridge, committing it through the applier.
+/// Apply `event` as a peer's push, committing it through the applier.
 async fn apply(node: &Node<TestStorage, PermissiveAgent>, event: &Event) -> anyhow::Result<()> {
     let events = LocalEventGetter::new(node.storage.clone(), false);
     events.stage_event(event.clone());
-    NodeApplier::apply_deltas(
+    NodeApplier::apply_update(
         node,
         &EntityId::from_bytes([8; 32]),
-        vec![proto::EntityDelta {
+        proto::SubscriptionUpdateItem {
             entity_id: event.entity_id,
-            content: proto::DeltaContent::EventBridge { events: vec![Attested::from(event.clone()).into()] },
-        }],
+            content: proto::UpdateContent::EventOnly(vec![Attested::from(event.clone()).into()]),
+            predicate_relevance: vec![],
+        },
         &events,
         &LocalStateGetter::new(node.storage.clone()),
     )

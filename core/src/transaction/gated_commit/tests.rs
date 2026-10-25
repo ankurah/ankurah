@@ -115,7 +115,7 @@ async fn a_remote_transaction_dropped_inside_the_gate_still_lands_and_publishes(
     Ok(())
 }
 
-/// The applier's commit sites, each reached by one kind of delta in a peer's response.
+/// The applier's commit sites, each reached by one kind of update content from a peer.
 #[derive(Clone, Copy, Debug)]
 enum ApplierPath {
     /// A snapshot of an entity this node does not hold registers its resident entity.
@@ -126,8 +126,8 @@ enum ApplierPath {
     EventBridge,
 }
 
-/// A peer's response whose application is dropped after storage committed it inside the gate, as
-/// `get_from_peer` applies a response inside its caller's future, still advances the resident
+/// A peer's update whose application is dropped after storage committed it inside the gate, as a
+/// caller that applies a peer's data inside its own future may drop it, still advances the resident
 /// entity and publishes to maintenance, which then serves later commits.
 #[tokio::test]
 async fn an_application_dropped_inside_the_gate_still_lands_and_publishes() -> anyhow::Result<()> {
@@ -200,31 +200,32 @@ async fn load_resident(node: &TestNode, id: EntityId) -> anyhow::Result<Entity> 
     Ok(node.entities.get_or_retrieve(&states, &events, &id).await?.expect("the entity is stored"))
 }
 
-/// Apply `delta` from a peer, staging `history` in the caller's getter for the applier's causal checks.
-async fn apply(node: &TestNode, delta: proto::EntityDelta, history: Vec<Event>) -> anyhow::Result<()> {
+/// Apply `item` from a peer, staging `history` in the caller's getter for the applier's causal checks.
+async fn apply(node: &TestNode, item: proto::SubscriptionUpdateItem, history: Vec<Event>) -> anyhow::Result<()> {
     let events = LocalEventGetter::new(node.storage.clone(), true);
     for event in history {
         events.stage_event(event);
     }
     let states = LocalStateGetter::new(node.storage.clone());
-    NodeApplier::apply_deltas(node, &EntityId::from_bytes([9; 32]), vec![delta], &events, &states).await?;
+    NodeApplier::apply_update(node, &EntityId::from_bytes([9; 32]), item, &events, &states).await?;
     Ok(())
 }
 
-fn snapshot(head: &Event, models: impl IntoIterator<Item = u8>) -> proto::EntityDelta {
+fn snapshot(head: &Event, models: impl IntoIterator<Item = u8>) -> proto::SubscriptionUpdateItem {
     let state = proto::State { memberships: models.into_iter().map(model).collect(), head: Clock::singleton(head), ..Default::default() };
-    proto::EntityDelta {
+    let state = Attested::opt(proto::EntityState { entity_id: head.entity_id, state }, None).into();
+    proto::SubscriptionUpdateItem {
         entity_id: head.entity_id,
-        content: proto::DeltaContent::StateSnapshot {
-            state: Attested::opt(proto::EntityState { entity_id: head.entity_id, state }, None).into(),
-        },
+        content: proto::UpdateContent::StateAndEvent(state, vec![]),
+        predicate_relevance: vec![],
     }
 }
 
-fn bridge(event: &Event) -> proto::EntityDelta {
-    proto::EntityDelta {
+fn bridge(event: &Event) -> proto::SubscriptionUpdateItem {
+    proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        content: proto::DeltaContent::EventBridge { events: vec![Attested::from(event.clone()).into()] },
+        content: proto::UpdateContent::EventOnly(vec![Attested::from(event.clone()).into()]),
+        predicate_relevance: vec![],
     }
 }
 

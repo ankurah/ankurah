@@ -261,12 +261,7 @@ async fn catalog_arrival_preserves_an_accepted_entity_id_fallback() -> anyhow::R
     let fallback = spec_for(&selection, &CatalogManager::default());
     assert!(fallback.key_spec().keyparts.is_empty(), "missing catalog types require entity-ID keys");
     assert_eq!(spec_for(&selection, &node.catalog).key_spec().keyparts.len(), 1, "catalog types now permit a keyed layout");
-    let offer = proto::KnownState { spec: fallback.clone(), spans: vec![] };
-    assert_eq!(
-        accept_peer_spec(&selection, &node.catalog, &offer)?,
-        fallback,
-        "the accepted fallback remains a distinct tree specification"
-    );
+    assert!(serves(&fallback, &selection, &node.catalog), "the accepted fallback remains a distinct tree specification");
     Ok(())
 }
 
@@ -410,8 +405,7 @@ fn compatible_offered_spec_accepts_broader_admission_but_rejects_invalid_keys() 
         operator: ComparisonOperator::GreaterThan,
         right: Box::new(Expr::Literal(Value::EntityId(state(1, 1).payload.entity_id))),
     });
-    let offer = proto::KnownState { spec: spec(), spans: vec![] };
-    assert_eq!(accept_peer_spec(&selection, &catalog, &offer)?, spec());
+    assert!(serves(&spec(), &selection, &catalog));
     let mut differently_ordered = selection.clone();
     differently_ordered.order_by = Some(vec![OrderByItem {
         path: PropertyPath::from(proto::PropertyId::EntityId(EntityId::from_bytes([42; EntityId::BYTE_LEN]))),

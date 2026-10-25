@@ -171,14 +171,12 @@ protocol):
   resulting state before publication. A write conflict repeats the decision
   against a fresh fork, and an already-applied batch produces no change notification.
 
-**Delta application** (fetch/query responses) similarly comes as either a
-*StateSnapshot* (applied directly) or an *EventBridge* (events connecting the
-requester's known head to the responder's).
-Existing entities use the same snapshot coordinator with no accompanying
-events: a concurrent snapshot leaves the resident unchanged, including on retry.
+**State application** (Get responses) applies each state directly. Existing
+entities use the same snapshot coordinator with no accompanying events: a
+concurrent snapshot leaves the resident unchanged, including on retry.
 
-For every multi-event payload -- *EventOnly*, *StateAndEvent*, and
-*EventBridge* alike -- the receiver validates and stages the whole batch, then
+For every multi-event payload -- *EventOnly* and *StateAndEvent* alike -- the
+receiver validates and stages the whole batch, then
 topologically sorts it by in-batch parent edges (`event_dag/ordering.rs`) and
 applies parents before children. Sender order is not trusted: applying a child
 before its staged parent would fast-forward the head past the parent, whose

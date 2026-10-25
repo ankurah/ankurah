@@ -3,7 +3,9 @@
 //!
 //! A node files its result's entities in a tree under a [`TreeSpec`] and describes the
 //! tree as a [`KnownState`]: disjoint spans of addresses, each given as a digest of the
-//! heads within it or as an inventory of every head within it.
+//! heads within it or as an inventory of every head within it. Either peer's
+//! `KnownState` is an offer: the requester's offers its copy for comparison, and the
+//! responder's, the requester's target, offers the responder's snapshot.
 //!
 //! Both peers enforce the limits in [`limits`]. Byte limits on an offer or an inventory
 //! page count its work: its encoded bytes plus the bytes its inventories saved by
@@ -28,6 +30,20 @@ pub use inventory::{
 pub struct KnownState {
     pub spec: TreeSpec,
     pub spans: Vec<SpanContent>,
+}
+
+/// Counts the heads its inventories list and the digests it gives.
+impl std::fmt::Display for KnownState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (mut heads, mut digests) = (0, 0);
+        for span in &self.spans {
+            match span {
+                SpanContent::Digest(_) => digests += 1,
+                SpanContent::Heads(inventory) => heads += inventory.heads.len(),
+            }
+        }
+        write!(f, "heads:{heads} digests:{digests}")
+    }
 }
 
 /// What a node knows about one span of its result.
@@ -71,7 +87,7 @@ pub enum SpanQuestion {
 
 impl SpanQuestion {
     /// The span this question asks about.
-    pub fn span(&self) -> &TreeSpan {
+    pub fn bounds(&self) -> &TreeSpan {
         match self {
             SpanQuestion::Digest(span) | SpanQuestion::Heads(span) => span,
         }

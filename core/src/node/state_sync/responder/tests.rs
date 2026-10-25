@@ -4,7 +4,9 @@
 use super::*;
 use crate::node::state_sync::fixtures::*;
 use ankurah_core_types::{IndexKeyPart, KeySpec, ValueType};
-use ankurah_proto::{EntityHead, KeyedEntityHead, PackedHeads, SpanContent, TreeSpan, TreeSpanInventory};
+use ankurah_proto::{
+    state_sync::limits::MAX_PAGE_HEADS, EntityHead, KeyedEntityHead, PackedHeads, SpanContent, TreeSpan, TreeSpanInventory,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The entity-id offer of [`members`] that lists `heads`.
@@ -54,8 +56,9 @@ async fn an_offer_is_answered_with_the_snapshots_account_and_what_it_lacks_is_pu
         (&unknown, proto::Clock::singleton(&unknown)),
     ])?;
     let query = proto::QueryId::new();
-    let initial = vec![(query, proto::MembershipChange::Initial)];
-    let target = answer_offer(&node, peer, members(), known, vec![], initial.clone()).await?;
+    let target =
+        answer_offer(&node, peer, members(), known, vec![], OfferedIn::SubscribeQuery { query_id: query, cancel: CancelFlag::default() })
+            .await?;
 
     let members_now = BTreeMap::from([
         (current.entity_id, proto::Clock::singleton(&current)),
@@ -69,7 +72,8 @@ async fn an_offer_is_answered_with_the_snapshots_account_and_what_it_lacks_is_pu
         BTreeSet::from([behind.entity_id, unlisted.entity_id, outside.entity_id]),
         "what the offer holds older or lacks, and what left the result; nothing it holds current, nothing never committed"
     );
-    assert!(updates.iter().flatten().all(|item| item.predicate_relevance == initial), "every item carries the relevance asked for");
+    let initial = vec![(query, proto::MembershipChange::Initial)];
+    assert!(updates.iter().flatten().all(|item| item.predicate_relevance == initial), "every item is the subscription's initial data");
     Ok(())
 }
 
@@ -79,61 +83,35 @@ async fn an_offer_under_a_spec_no_tree_serves_is_answered_under_entity_id_keys_a
     let (peer, mut messages) = recording_peer(&node).await?;
     let first = create(&[&node], "first").await?;
     let second = create(&[&node], "second").await?;
-    // A key part the responder's catalog does not type.
+    // A key part the responder's catalog does not type, under which the offer
+    // lists the first member at its current head.
     let untyped = proto::PropertyId::EntityId(proto::EntityId::from_bytes([99; 32]));
     let spec = proto::TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(untyped, ValueType::I64)]), members().predicate);
-    let known = KnownState { spec, spans: Vec::new() };
+    let mut known = offer(&[(&first, proto::Clock::singleton(&first))])?;
+    known.spec = spec;
 
-    let target = answer_offer(&node, peer, members(), known, vec![], vec![]).await?;
+    let target = answer_offer(&node, peer, members(), known, vec![], OfferedIn::Fetch).await?;
 
     assert_eq!(target.spec, entity_id_spec(&members()));
     assert_eq!(listed(&target).len(), 2);
-    assert_eq!(ids(&pushed(&mut messages, 2).await), BTreeSet::from([first.entity_id, second.entity_id]));
+    assert_eq!(
+        ids(&pushed(&mut messages, 2).await),
+        BTreeSet::from([first.entity_id, second.entity_id]),
+        "every member, the listed one included: the offer's heads are not read"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn pushes_fill_updates_by_count_and_by_size() -> anyhow::Result<()> {
+async fn a_malformed_offer_is_refused_before_any_tree_is_admitted_for_it() -> anyhow::Result<()> {
     let node = durable().await?;
-    let (peer, mut messages) = recording_peer(&node).await?;
-    let delta = |state: proto::Attested<proto::EntityState>| proto::EntityDelta {
-        entity_id: state.payload.entity_id,
-        content: proto::DeltaContent::StateSnapshot { state: state.into() },
-    };
+    let (peer, _messages) = recording_peer(&node).await?;
+    let entity = create(&[&node], "listed").await?;
+    let mut overlapping = offer(&[(&entity, proto::Clock::singleton(&entity))])?;
+    overlapping.spans.push(overlapping.spans[0].clone());
 
-    let mut push = Push::new(peer, vec![]);
-    for state in states(MAX_PAGE_HEADS + 1, 10) {
-        push.add(&node, delta(state))?;
-    }
-    push.send(&node);
-    let counts: Vec<_> = pushed(&mut messages, MAX_PAGE_HEADS + 1).await.iter().map(Vec::len).collect();
-    assert_eq!(counts, [MAX_PAGE_HEADS, 1], "at most a page of items per update");
-
-    // Each item's data lies half in its buffers or diffs and half in its attestation.
-    let attested = || proto::AttestationSet(vec![proto::Attestation(vec![0; 200 * 1024])]);
-    let mut push = Push::new(peer, vec![]);
-    for mut state in states(3, 200 * 1024) {
-        state.attestations = attested();
-        push.add(&node, delta(state))?;
-    }
-    push.send(&node);
-    let counts: Vec<_> = pushed(&mut messages, 3).await.iter().map(Vec::len).collect();
-    assert_eq!(counts, [2, 1], "about a mebibyte of item data per update");
-
-    let mut push = Push::new(peer, vec![]);
-    for _ in 0..3 {
-        let event = labeled(None, &"x".repeat(200 * 1024))?;
-        let events = vec![proto::Attested { payload: event.clone(), attestations: attested() }.into()];
-        push.add(&node, proto::EntityDelta { entity_id: event.entity_id, content: proto::DeltaContent::EventBridge { events } })?;
-    }
-    push.send(&node);
-    let counts: Vec<_> = pushed(&mut messages, 3).await.iter().map(Vec::len).collect();
-    assert_eq!(counts, [2, 1], "a bridge counts its events' data the same way");
-
-    let mut push = Push::new(peer, vec![]);
-    push.add(&node, delta(states(1, 2 * 1024 * 1024).pop().unwrap()))?;
-    push.send(&node);
-    assert_eq!(pushed(&mut messages, 1).await.len(), 1, "an item larger than the bound still goes, alone");
+    assert!(answer_offer(&node, peer, members(), overlapping, vec![], OfferedIn::Fetch).await.is_err());
+    assert_eq!(node.resident_trees.len(), 0, "no tree was admitted to compare the offer with");
     Ok(())
 }
 

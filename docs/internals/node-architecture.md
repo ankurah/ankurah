@@ -90,13 +90,14 @@ readiness rules and limits.
 For each entity it pushes, the responder sends one of two forms, depending on
 what the requester holds:
 
-- **State** -- the requester holds no head of the entity, its head cannot be
-  bridged, or the bridge would be larger than the state. The current state is
-  sent.
+- **State** -- the requester holds no head of the entity, or its head cannot
+  be bridged. The current state is sent.
 - **Event bridge** -- the requester holds an older head, the responder can
-  trace a clean forward path through the DAG from it to the current head, the
-  requester's read policy admits every event on that path, and the events are
-  smaller than the state. Only the missing events are sent.
+  trace a clean forward path through the DAG from it to the current head, and
+  the requester's read policy admits every event on that path. Only the
+  missing events are sent, even when the state is smaller: a requester adopts
+  a state over an older copy only after proving its lineage, which fetches
+  those same events one request at a time.
 
 The event bridge is especially valuable after brief disconnections: a handful
 of events is far cheaper than retransmitting the full state. The bridge is

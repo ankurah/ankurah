@@ -13,6 +13,7 @@ use crate::{
     },
     session::{ContextData, SessionSet},
     storage::StorageEngine,
+    util::cancel_flag::CancelFlag,
 };
 use ankurah_signals::{Subscribe, SubscriptionGuard};
 use std::collections::HashMap;
@@ -22,9 +23,11 @@ pub struct SubscriptionHandler<CD: ContextData> {
     peer_id: proto::EntityId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
-    /// Tracks each standing query's version and the credential source shared with its gap fetcher.
+    /// Tracks each standing query's version, the credential source shared with its gap fetcher,
+    /// and what stops its initial push.
     /// Held through async installation and failure cleanup so removal cannot race an
-    /// installation that would leave a reactor query without its credential source.
+    /// installation that would leave a reactor query without its credential source; not
+    /// through the answer's snapshot, which can wait out catalog churn.
     queries: tokio::sync::Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
 }
 
@@ -32,6 +35,13 @@ struct StandingQuery<CD: ContextData> {
     /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
     sessions: SessionSet<CD>,
     version: u32,
+    /// Stops the push of this version's initial data once a later version
+    /// replaces the query or the query is removed.
+    push: CancelFlag,
+}
+
+impl<CD: ContextData> Drop for StandingQuery<CD> {
+    fn drop(&mut self) { self.push.cancel(); }
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
@@ -101,41 +111,59 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         selection.predicate = policy.filter_predicate(selection.predicate)?;
 
         use std::collections::hash_map::Entry;
-        let (sessions, query_created) = match queries.entry(query_id) {
+        let (sessions, push, query_created) = match queries.entry(query_id) {
             Entry::Occupied(mut o) => {
                 let standing = o.get_mut();
                 if version < standing.version {
                     anyhow::bail!("stale subscription version {version} for query {query_id}; current version is {}", standing.version);
                 }
                 standing.version = version;
-                (standing.sessions.clone(), false)
+                standing.push.cancel_and_swap();
+                (standing.sessions.clone(), standing.push.clone(), false)
             }
             Entry::Vacant(v) => {
                 let sessions = match cdata {
                     Some(cdata) => cdata.clone().into(),
                     None => SessionSet::new(),
                 };
-                v.insert(StandingQuery { sessions: sessions.clone(), version });
-                (sessions, true)
+                let push = CancelFlag::default();
+                v.insert(StandingQuery { sessions: sessions.clone(), version, push: push.clone() });
+                (sessions, push, true)
             }
         };
 
         // Install before the snapshot the answer reads: a commit after the
         // install reaches the peer live, one before the snapshot is in it, and
         // one between travels both ways, which applying twice tolerates.
-        let response = async {
-            self.install(node, query_id, selection, &sessions, version).await?;
-            let initial = vec![(query_id, proto::MembershipChange::Initial)];
-            let target = crate::node::state_sync::answer_offer(node, self.peer_id, requested, known_state, credentials, initial).await?;
-            Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target })
+        if let Err(error) = self.install(node, query_id, selection, &sessions, version).await {
+            if query_created {
+                queries.remove(&query_id);
+                let _ = self.subscription.remove_predicate(query_id);
+            }
+            return Err(error);
         }
-        .await;
+        drop(queries);
 
-        if response.is_err() && query_created {
+        let offered_in = crate::node::state_sync::OfferedIn::SubscribeQuery { query_id, cancel: push };
+        match crate::node::state_sync::answer_offer(node, self.peer_id, requested, known_state, credentials, offered_in).await {
+            Ok(target) => Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target }),
+            Err(error) => {
+                if query_created {
+                    self.remove_unless_replaced(query_id, version).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove a query this handler created at `version`, unless a later
+    /// subscription replaced it or the peer removed it meanwhile.
+    async fn remove_unless_replaced(&self, query_id: proto::QueryId, version: u32) {
+        let mut queries = self.queries.lock().await;
+        if queries.get(&query_id).is_some_and(|standing| standing.version == version) {
             queries.remove(&query_id);
             let _ = self.subscription.remove_predicate(query_id);
         }
-        response
     }
 
     /// Install the query in this peer's reactor subscription, seeded with its local matches.
@@ -205,3 +233,6 @@ where
     // Create subscription update item
     Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), content, predicate_relevance })
 }
+
+#[cfg(test)]
+mod tests;

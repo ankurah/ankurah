@@ -17,4 +17,4 @@ mod fixtures;
 
 pub(crate) use requester::{check, fetch, subscribe, CheckBasis, CheckOutcome};
 pub(crate) use resident_trees::ResidentTrees;
-pub(crate) use responder::{answer_offer, compare_spans, sync_entities};
+pub(crate) use responder::{answer_offer, compare_spans, sync_entities, OfferedIn};

@@ -39,20 +39,52 @@ impl<CD: ContextData> PeerState<CD> {
 /// A request's slot in its peer's pending requests, freed when the request
 /// stops waiting, so that a request whose waiter gave up, as a timed-out
 /// comparison does, leaves nothing behind for a peer that never answers.
-pub(super) struct PendingRequest<CD: ContextData> {
+pub(super) struct PendingRequestSlot<CD: ContextData> {
     connection: Weak<PeerState<CD>>,
     id: proto::RequestId,
 }
 
-impl<CD: ContextData> PendingRequest<CD> {
-    pub(super) fn new(connection: &Arc<PeerState<CD>>, id: proto::RequestId) -> Self { Self { connection: Arc::downgrade(connection), id } }
+impl<CD: ContextData> PendingRequestSlot<CD> {
+    /// Hold request `id`'s slot in `connection`'s pending requests, where
+    /// `response` awaits its answer.
+    pub(super) fn insert(
+        connection: &Arc<PeerState<CD>>,
+        id: proto::RequestId,
+        response: oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>,
+    ) -> Self {
+        connection.pending_requests.insert(id.clone(), response);
+        Self { connection: Arc::downgrade(connection), id }
+    }
 }
 
-impl<CD: ContextData> Drop for PendingRequest<CD> {
+impl<CD: ContextData> Drop for PendingRequestSlot<CD> {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.upgrade() {
             connection.pending_requests.remove(&self.id);
         }
+    }
+}
+
+impl<SE, PA> Node<SE, PA>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    /// The credentials under which this node applies `peer`'s pushes, or none
+    /// when it admits no push from the peer. A peer may push only what this node
+    /// asked it for: while this node holds a standing query with the peer or has
+    /// a Fetch in flight with it, under the credentials of both.
+    pub(crate) fn push_credentials(&self, peer: &proto::EntityId) -> Option<HashSet<PA::ContextData>> {
+        let fetching = self.peer_connections.get(peer).and_then(|connection| connection.fetches.credentials());
+        let subscribed = self.subscription_relay.as_ref().filter(|relay| relay.has_subscription_with_peer(peer));
+        if fetching.is_none() && subscribed.is_none() {
+            return None;
+        }
+        let mut credentials = fetching.unwrap_or_default();
+        if let Some(relay) = subscribed {
+            credentials.extend(relay.get_contexts_for_peer(peer));
+        }
+        Some(credentials)
     }
 }
 

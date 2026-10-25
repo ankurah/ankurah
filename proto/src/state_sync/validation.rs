@@ -1,14 +1,15 @@
-//! Structural checks a receiver applies to offers and inventory pages before acting on
-//! them. Whether a page answers what the receiver asked stays with the receiver.
+//! The checks a receiver applies before acting on what a peer sent: an offer, an
+//! inventory page, a request's span questions or entities, and a response's span
+//! answers against the questions they answer.
 
 use std::{collections::HashSet, ops::Bound};
 
-use ankurah_digest_tree::{leaf_address, NodePrefix};
+use ankurah_digest_tree::leaf_address;
 use anyhow::{bail, ensure};
 
 use super::{
     limits::{MAX_HEAD_QUESTIONS, MAX_OFFER_BYTES, MAX_OFFER_HEADS, MAX_OFFER_SPANS, MAX_PAGE_BYTES, MAX_PAGE_HEADS},
-    KnownState, SpanAnswer, SpanContent, SpanQuestion, TreeSpan, TreeSpanInventory, TreeSpec,
+    EntityHead, KnownState, SpanAnswer, SpanContent, SpanQuestion, TreeSpan, TreeSpanInventory, TreeSpec,
 };
 
 impl KnownState {
@@ -44,7 +45,7 @@ impl KnownState {
 
 /// Checks that spans, in any order, are disjoint and lie within the tree's addresses.
 fn check_disjoint_within_tree<'a>(spans: impl Iterator<Item = &'a TreeSpan>) -> anyhow::Result<()> {
-    let tree = TreeSpan::under(&NodePrefix::root());
+    let tree = TreeSpan::all();
     let mut spans: Vec<_> = spans.collect();
     spans.sort_by(|a, b| a.cmp_start(b));
     let mut start = tree.start.clone();
@@ -82,9 +83,20 @@ impl SpanQuestion {
         let heads = questions.iter().filter(|question| matches!(question, SpanQuestion::Heads(_))).count();
         ensure!(heads <= MAX_HEAD_QUESTIONS, "too many heads questions");
         for question in questions {
-            let span = question.span();
+            let span = question.bounds();
             ensure!(!span.is_empty() && span.is_subset_of(&TreeSpan::all()), "span question outside the tree");
         }
+        Ok(())
+    }
+}
+
+impl EntityHead {
+    /// Checks one SyncEntities request's entities: at most `MAX_PAGE_HEADS`, each
+    /// named once.
+    pub fn validate_sync_request(entities: &[EntityHead]) -> anyhow::Result<()> {
+        ensure!(entities.len() <= MAX_PAGE_HEADS, "too many entities to sync");
+        let mut named = HashSet::with_capacity(entities.len());
+        ensure!(entities.iter().all(|entity| named.insert(entity.entity_id)), "an entity to sync is named twice");
         Ok(())
     }
 }

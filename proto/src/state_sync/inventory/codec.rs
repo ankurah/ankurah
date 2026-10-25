@@ -160,7 +160,9 @@ impl<'a> Reader<'a> {
         self.offset = end;
         Ok(bytes)
     }
+    /// Reads an integer written in its shortest form, as the writer writes every one.
     pub fn uint(&mut self) -> Result<usize> {
+        let start = self.offset;
         let value = match self.take(1)?[0] {
             n @ 0..=250 => n as u64,
             251 => u16::from_le_bytes(self.take(2)?.try_into().unwrap()) as u64,
@@ -168,7 +170,11 @@ impl<'a> Reader<'a> {
             253 => u64::from_le_bytes(self.take(8)?.try_into().unwrap()),
             _ => return Err(InventoryError::Malformed("invalid inventory integer")),
         };
-        usize::try_from(value).map_err(|_| InventoryError::Malformed("inventory integer overflow"))
+        let value = usize::try_from(value).map_err(|_| InventoryError::Malformed("inventory integer overflow"))?;
+        if self.offset - start != uint_size(value) {
+            return Err(InventoryError::Malformed("inventory integer not in its shortest form"));
+        }
+        Ok(value)
     }
     pub fn generation(&mut self) -> Result<u32> {
         let value = u32::try_from(self.uint()?).map_err(|_| InventoryError::Malformed("invalid clock generation"))?;
@@ -195,7 +201,6 @@ impl<'a> Reader<'a> {
         }
         let length = self.uint()?;
         let suffix = self.take(length)?;
-        shared.checked_add(length).ok_or(InventoryError::Malformed("key length overflow"))?;
         let full_key = match encoding {
             KeyEncoding::Plain => suffix,
             KeyEncoding::Prefix => {
@@ -235,8 +240,10 @@ pub(super) struct Validated {
 }
 
 /// Check all fields before retaining or exposing a payload. Cap the unshared size
-/// as well as the wire bytes, so repeated prefixes cannot amplify work. Each clock
-/// must list its tips in ascending event order, as the writer does.
+/// as well as the wire bytes, so repeated prefixes cannot amplify work. Accept the
+/// writer's own choices only: integers in their shortest form, clocks listing their
+/// tips in ascending event order, and the prefix encoding only where it saves bytes.
+/// The payload's bytes then never exceed its unshared size.
 pub(super) fn validate(bytes: &[u8]) -> Result<Validated> {
     if bytes.len() > MAX_OFFER_BYTES {
         return Err(InventoryError::ExceedsLimit("byte limit"));
@@ -261,6 +268,9 @@ pub(super) fn validate(bytes: &[u8]) -> Result<Validated> {
     }
     if reader.offset != bytes.len() {
         return Err(InventoryError::Malformed("trailing inventory bytes"));
+    }
+    if encoding == KeyEncoding::Prefix && bytes.len() >= unshared_bytes {
+        return Err(InventoryError::Malformed("prefix encoding saves no bytes"));
     }
     Ok(Validated { heads, unshared_bytes })
 }

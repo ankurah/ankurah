@@ -1,3 +1,5 @@
+> **Historical.** Written for the `known_matches` protocol, which comparing query results by `KnownState` has replaced. The current protocol is described in [Comparing query results (`KnownState`)](../../docs/internals/node-architecture.md#comparing-query-results-knownstate).
+
 ## Tasks
 
 1. Proto changes

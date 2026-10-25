@@ -1,4 +1,4 @@
-use super::key_spec::KeySpec;
+use super::KeySpec;
 use crate::collation::Collatable;
 use crate::value::{Value, ValueType};
 use thiserror::Error;

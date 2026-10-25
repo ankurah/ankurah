@@ -1,3 +1,5 @@
+> **Partly historical.** Written for the `known_matches` protocol, whose responses carried each entity's data. Comparing query results by `KnownState`, with the data pushed on the update channel, has replaced it; see [Comparing query results (`KnownState`)](../../docs/internals/node-architecture.md#comparing-query-results-knownstate). One requirement here is still open: when the events connecting a requester's head to the current state exceed the policy's budget, the server sends the state with an attested lineage relation (the third case under "Requirement"), which would now arrive as an update item's content.
+
 ## Functional Requirement: Server-assisted lineage confirmation and stale-entity correction
 
 ### Motivation

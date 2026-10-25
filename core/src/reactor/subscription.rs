@@ -79,7 +79,8 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
 // Entity-specific methods for remote subscriptions
 impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_proto::Event>> {
-    /// Install or replace a remote subscriber's versioned query.
+    /// Install or replace a remote subscriber's versioned query, and fill its
+    /// result's gaps, watching the entities that fill them.
     pub async fn upsert_query(
         &self,
         query_id: proto::QueryId,
@@ -88,7 +89,7 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
         gap_fetcher: std::sync::Arc<dyn crate::reactor::fetch_gap::GapFetcher<crate::entity::Entity>>,
         source: Arc<dyn crate::reactor::LocalEntitySource>,
         version: u32,
-    ) -> anyhow::Result<Vec<crate::entity::Entity>> {
+    ) -> anyhow::Result<()> {
         let subscription = self
             .0
             .reactor
@@ -103,7 +104,7 @@ impl ReactorSubscription<crate::entity::Entity, ankurah_proto::Attested<ankurah_
 
         resultset.set_loaded(true);
 
-        Ok(all_entities)
+        Ok(())
     }
 }
 

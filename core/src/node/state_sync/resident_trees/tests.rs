@@ -170,13 +170,14 @@ async fn apply<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultCont
 ) -> anyhow::Result<()> {
     let events = LocalEventGetter::new(node.storage.clone(), true);
     events.stage_event(event.clone());
-    NodeApplier::apply_deltas(
+    NodeApplier::apply_update(
         node,
         &proto::EntityId::from_bytes([24; 32]),
-        vec![proto::EntityDelta {
+        proto::SubscriptionUpdateItem {
             entity_id: event.entity_id,
-            content: proto::DeltaContent::EventBridge { events: vec![Attested::from(event.clone()).into()] },
-        }],
+            content: proto::UpdateContent::EventOnly(vec![Attested::from(event.clone()).into()]),
+            predicate_relevance: vec![],
+        },
         &events,
         &LocalStateGetter::new(node.storage.clone()),
     )
