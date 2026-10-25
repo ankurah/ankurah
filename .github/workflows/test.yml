@@ -87,7 +87,7 @@ jobs:
       - name: Add wasm32 target
         run: rustup target add wasm32-unknown-unknown
 
-      # ankurah-storage-sqlite's suites on Node.js run in the sqlite-nodejs job.
+      # ankurah-storage-sqlite's suite on Node.js runs in the sqlite-nodejs job.
       - name: Run WASM tests
         run: ./scripts/run-wasm-tests.sh browser
         env:
@@ -99,13 +99,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # ankurah-storage-sqlite's nodejs feature runs on a node:sqlite that
-        # binds a numbered parameter at its position, which it checks as it
-        # adopts a database: Node.js 22.20.0 or later on 22, 24.7.0 or later
-        # on 24, and every later line. The matrix runs the oldest of those
-        # releases on each of the LTS lines 22 and 24, and the newest release
-        # of the newest line, 26.
-        node: ["22.20.0", "24.7.0", "26"]
+        # ankurah-storage-sqlite's nodejs feature runs on better-sqlite3,
+        # which brings its own SQLite, so the release of Node.js changes only
+        # what loads it: the matrix runs the oldest line the pinned release
+        # supports (its `engines` names Node.js 22 or later) and the newest.
+        node: ["22", "26"]
 
     steps:
       - uses: actions/checkout@v4
@@ -129,20 +127,15 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
 
-      - name: Run WASM tests on node:sqlite
-        run: ./scripts/run-wasm-tests.sh storage_sqlite_node_sqlite
-        env:
-          RUST_BACKTRACE: 1
-
-      # The same suite runs again on better-sqlite3, at the release
-      # storage/sqlite/tests/package.json pins, on every leg: that release
-      # ships prebuilt Node-API 10 binaries, which each leg's Node.js loads,
-      # so `npm ci` builds nothing.
+      # The release storage/sqlite/tests/package.json pins ships prebuilt
+      # Node-API binaries, which each leg's Node.js loads, so `npm ci`
+      # compiles nothing: npm's implicit `node-gyp rebuild` finds the
+      # prebuilt binary and builds no target.
       - name: Install better-sqlite3
         working-directory: storage/sqlite/tests
         run: npm ci
 
-      - name: Run WASM tests on better-sqlite3
-        run: ./scripts/run-wasm-tests.sh storage_sqlite_better_sqlite3
+      - name: Run WASM tests
+        run: ./scripts/run-wasm-tests.sh storage_sqlite_nodejs
         env:
           RUST_BACKTRACE: 1
