@@ -8,10 +8,10 @@ use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
 use crate::node::event_admissibility::check_genesis_membership;
-use crate::node::gated_commit::{EntityWrite, GatedCommit, ResidentAdvance};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
+use crate::transaction::gated_commit::{EntityWrite, GatedCommit, ResidentAdvance};
 use crate::util::retry::retry_on;
 
 use append_only_vec::AppendOnlyVec;

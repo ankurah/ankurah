@@ -127,8 +127,8 @@ enum Route {
 }
 
 /// A peer's response whose application is dropped after storage committed it inside the gate, as
-/// `get_from_peer` and `fetch_from_peer` apply responses inside their caller's future, still
-/// advances the resident entity and publishes to maintenance, which then serves later commits.
+/// `get_from_peer` applies a response inside its caller's future, still advances the resident
+/// entity and publishes to maintenance, which then serves later commits.
 #[tokio::test]
 async fn an_application_dropped_inside_the_gate_still_lands_and_publishes() -> anyhow::Result<()> {
     for route in [Route::NewEntitySnapshot, Route::ExtendingSnapshot, Route::EventBridge] {

@@ -2,12 +2,12 @@ mod failures;
 
 pub(crate) use failures::{ApplyFailure, ApplyFailures};
 
-use super::gated_commit::{EntityWrite, ResidentAdvance};
 use crate::entity::RemoteTrxEntity;
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
+use crate::transaction::gated_commit::{EntityWrite, ResidentAdvance};
 use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};

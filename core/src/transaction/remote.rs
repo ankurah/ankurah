@@ -1,10 +1,10 @@
 use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
 use crate::node::event_admissibility::check_genesis_membership;
-use crate::node::gated_commit::{EntityWrite, GatedCommit, ResidentAdvance};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
+use crate::transaction::gated_commit::{EntityWrite, GatedCommit, ResidentAdvance};
 use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event};
 use ankurah_signals::{Peek, Signal};
 use indexmap::{map::Entry, IndexMap};
