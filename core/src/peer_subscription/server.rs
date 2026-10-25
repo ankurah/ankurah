@@ -24,7 +24,8 @@ pub struct SubscriptionHandler<CD: ContextData> {
     _guard: SubscriptionGuard,
     /// Tracks each standing query's version and the credential source shared with its gap fetcher.
     /// Held through async installation and failure cleanup so removal cannot race an
-    /// installation that would leave a reactor query without its credential source.
+    /// installation that would leave a reactor query without its credential source; not
+    /// through the answer's snapshot, which can wait out catalog churn.
     queries: tokio::sync::Mutex<HashMap<proto::QueryId, StandingQuery<CD>>>,
 }
 
@@ -123,19 +124,35 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // Install before the snapshot the answer reads: a commit after the
         // install reaches the peer live, one before the snapshot is in it, and
         // one between travels both ways, which applying twice tolerates.
-        let response = async {
-            self.install(node, query_id, selection, &sessions, version).await?;
-            let initial = vec![(query_id, proto::MembershipChange::Initial)];
-            let target = crate::node::state_sync::answer_offer(node, self.peer_id, requested, known_state, credentials, initial).await?;
-            Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target })
+        if let Err(error) = self.install(node, query_id, selection, &sessions, version).await {
+            if query_created {
+                queries.remove(&query_id);
+                let _ = self.subscription.remove_predicate(query_id);
+            }
+            return Err(error);
         }
-        .await;
+        drop(queries);
 
-        if response.is_err() && query_created {
+        let initial = vec![(query_id, proto::MembershipChange::Initial)];
+        match crate::node::state_sync::answer_offer(node, self.peer_id, requested, known_state, credentials, initial).await {
+            Ok(target) => Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target }),
+            Err(error) => {
+                if query_created {
+                    self.remove_unless_replaced(query_id, version).await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Remove a query this handler created at `version`, unless a later
+    /// subscription replaced it or the peer removed it meanwhile.
+    async fn remove_unless_replaced(&self, query_id: proto::QueryId, version: u32) {
+        let mut queries = self.queries.lock().await;
+        if queries.get(&query_id).is_some_and(|standing| standing.version == version) {
             queries.remove(&query_id);
             let _ = self.subscription.remove_predicate(query_id);
         }
-        response
     }
 
     /// Install the query in this peer's reactor subscription, seeded with its local matches.
@@ -205,3 +222,6 @@ where
     // Create subscription update item
     Some(proto::SubscriptionUpdateItem { entity_id: item.entity.id(), content, predicate_relevance })
 }
+
+#[cfg(test)]
+mod tests;
