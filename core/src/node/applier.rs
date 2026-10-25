@@ -1,9 +1,9 @@
+use super::gated_commit::{EntityWrite, ResidentAdvance};
 use crate::entity::RemoteTrxEntity;
 use crate::error::{ApplyError, ApplyErrorItem};
 use crate::internal::prelude::*;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{CachedEventGetter, LocalStateGetter, SuspenseEvents};
-use crate::storage::StorageTransaction;
 use crate::util::ready_chunks::ReadyChunks;
 use futures::stream::StreamExt;
 use proto::{Attested, EventStructureError};
@@ -213,17 +213,14 @@ impl NodeApplier {
         crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
         Self::check_snapshot_events(node, state, &proto::Clock::default(), events, event_getter).await?;
         let attestation = node.policy_agent.attest_state(node, state);
-        let mut storage_trx = node.storage.transaction();
-        storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
-        storage_trx.add_events(events).await?;
-        let mut source = node.reactor.begin_commit().await;
-        match source.record_storage_outcome(storage_trx.commit().await)? {
-            crate::storage::StorageCommitOutcome::Conflict { .. } => return Ok(None),
-            crate::storage::StorageCommitOutcome::Committed(_) => {}
-        }
-        let (_, entity) = node.entities.with_state(state_getter, event_getter, state.entity_id, state.state.clone()).await?;
-        source.publish([&entity]);
-        Ok(Some(entity))
+        let write = EntityWrite {
+            expected_head: proto::Clock::default(),
+            state: Attested::opt(state.clone(), attestation),
+            events: events.to_vec(),
+            resident: ResidentAdvance::Create,
+        };
+        // A refused write means another delivery stored the entity first.
+        Ok(write.commit(node).await?.map(|change| change.into_parts().0))
     }
 
     /// Adopt an extending snapshot, or merge its accompanying events. Persist both before publishing.
@@ -256,24 +253,10 @@ impl NodeApplier {
             }
             let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
-            let state = Attested::opt(state, attestation);
-            let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &state).await?;
-            storage_trx.add_events(&events).await?;
-            let mut source = node.reactor.begin_commit().await;
-            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
-            if adopted {
-                let (_, entity) = node
-                    .entities
-                    .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
-                    .await?;
-                source.publish([&entity]);
-                Ok(Some(EntityChange::new(entity, events)))
-            } else {
-                let change = candidate.commit(&node.entities, event_getter).await?;
-                source.publish([change.entity()]);
-                Ok((!change.events().is_empty()).then_some(change))
-            }
+            let resident = if adopted { ResidentAdvance::Adopt(candidate) } else { ResidentAdvance::Apply(candidate) };
+            let write = EntityWrite { expected_head, state: Attested::opt(state, attestation), events, resident };
+            let change = write.commit(node).await?.ok_or(MutationError::WriteConflict)?;
+            Ok((adopted || !change.events().is_empty()).then_some(change))
         })
     }
 
@@ -299,13 +282,13 @@ impl NodeApplier {
             candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
             let attestation = node.policy_agent.attest_state(node, &state);
-            let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
-            storage_trx.add_events(&events).await?;
-            let mut source = node.reactor.begin_commit().await;
-            source.record_storage_outcome(storage_trx.commit().await)?.committed()?;
-            let change = candidate.commit(&node.entities, event_getter).await?;
-            source.publish([change.entity()]);
+            let write = EntityWrite {
+                expected_head,
+                state: Attested::opt(state, attestation),
+                events,
+                resident: ResidentAdvance::Apply(candidate),
+            };
+            let change = write.commit(node).await?.ok_or(MutationError::WriteConflict)?;
             Ok((!change.events().is_empty()).then_some(change))
         })
     }
