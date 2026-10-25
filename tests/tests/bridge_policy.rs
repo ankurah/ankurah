@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{empty_offer, Album, GatedConnection, Model, Pet, PetView};
+use common::{empty_offer, nocache, Album, GatedConnection, Model, Peek, Pet, PetView};
 
 #[tokio::test]
 async fn peer_get_preserves_denial_and_absence_even_with_a_cached_entity() -> Result<()> {
@@ -556,6 +556,68 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     let _ = open_id;
     assert_eq!(initial[0].age().unwrap(), "1", "the resident view remains at its last verified state");
 
+    Ok(())
+}
+
+/// A live query's check meets the refusal the fetch above meets: repairing a
+/// lost edit would need its read-denied event, so the client is pushed the
+/// state and refuses it. The query stays established with the pet stale, and
+/// once the event is readable the next check that disagrees repairs the pet.
+#[tokio::test]
+async fn a_refused_repair_leaves_a_live_query_established_and_the_next_disagreeing_check_repairs() -> Result<()> {
+    let server_agent = BridgePolicyAgent::new();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), server_agent.clone());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    // While set, every update to the client is lost.
+    let lose = Arc::new(AtomicBool::new(false));
+    let (_conn, _gate) = {
+        let lose = lose.clone();
+        GatedConnection::new(&server, &client, move |message| {
+            lose.load(Ordering::SeqCst) && matches!(message, proto::NodeMessage::Update(_))
+        })
+        .await
+    };
+    client.wait_ready().await?;
+    let (ctx_s, ctx_c) = (server.context_async(DEFAULT_CONTEXT).await?, client.context_async(DEFAULT_CONTEXT).await?);
+
+    let pet_id = {
+        let trx = ctx_s.begin();
+        // A state larger than the edit's event, so that only the denial keeps a bridge from serving the repair.
+        let pet = trx.create(&Pet { name: "bridge-repair".repeat(256), age: "1".to_string() }).await?;
+        let id = pet.id();
+        trx.commit().await?;
+        id
+    };
+    let query = ctx_c.query_wait::<PetView>(nocache(format!("id = '{}'", pet_id).as_str())?).await?;
+    let age = || query.peek().first().map(|pet| pet.age().unwrap());
+
+    // The edit's live push is lost, and its event is read-denied before any repair.
+    lose.store(true, Ordering::SeqCst);
+    let denied_id = {
+        let trx = ctx_s.begin();
+        ctx_s.get::<PetView>(pet_id).await?.edit(&trx)?.age()?.replace("2")?;
+        trx.commit_and_return_events().await?[0].id()
+    };
+    server_agent.deny_read_events.lock().unwrap().insert(denied_id);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    lose.store(false, Ordering::SeqCst);
+
+    // The first check disagrees; the second confirms it and repairs, and the client refuses the state.
+    client.check_remote_queries_now().await;
+    client.check_remote_queries_now().await;
+    assert!(query.error().peek().is_none(), "the refused repair leaves the query established");
+    assert_eq!(age().as_deref(), Some("1"), "with the pet stale");
+
+    server_agent.deny_read_events.lock().unwrap().clear();
+    client.check_remote_queries_now().await;
+    let repaired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while age().as_deref() != Some("2") {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(repaired.is_ok(), "the first check to disagree once the event is readable repairs the pet");
     Ok(())
 }
 

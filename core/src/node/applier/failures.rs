@@ -3,19 +3,25 @@
 //! task, not by the sync that asked for it, so the failure reaches the sync
 //! only this way.
 
-use crate::error::ApplyError;
+use crate::error::{ApplyError, RetrievalError};
 use ankurah_proto::{state_sync::limits::MAX_PAGE_HEADS, EntityId};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// One item of a peer's update that failed to apply.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct ApplyFailure {
     /// The peer whose update carried the item.
     pub(crate) peer: EntityId,
     pub(crate) entity_id: EntityId,
     /// The failure, as the error of an application that failed for this item.
     pub(crate) error: Arc<ApplyError>,
+}
+
+impl From<ApplyFailure> for RetrievalError {
+    /// A sync that fails for a pushed item fails with the item's own failure,
+    /// which names its entity.
+    fn from(failure: ApplyFailure) -> Self { RetrievalError::ApplyError(failure.error) }
 }
 
 /// The node's signal of pushed items that failed to apply. It keeps, for each

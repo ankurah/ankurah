@@ -1,6 +1,6 @@
-//! Readiness of a copy against a responder's account, a sync's failure when a
-//! push it waits on fails to apply, and the requester's descent and repair
-//! against a real responder.
+//! Readiness of a copy against a responder's account, the end of a sync's
+//! wait when a push it waits on fails to apply, and the requester's descent
+//! and repair against a real responder.
 
 use super::{target::Target, *};
 use crate::{
@@ -85,7 +85,7 @@ fn failed_item(entity: EntityId) -> ApplyError {
 }
 
 #[tokio::test]
-async fn a_push_that_fails_to_apply_for_an_entity_the_sync_waits_on_fails_it_at_once() -> anyhow::Result<()> {
+async fn a_push_that_fails_to_apply_for_an_entity_the_sync_waits_on_ends_its_wait_at_once() -> anyhow::Result<()> {
     let node = durable().await?;
     let lacking = labeled(None, "lacking")?;
     let unsettled = create(&[&node], "outside the responder's account").await?;
@@ -101,7 +101,10 @@ async fn a_push_that_fails_to_apply_for_an_entity_the_sync_waits_on_fails_it_at_
             node.apply_failures.publish(peer, failed_item(waited_on));
         });
         let failed = |error: &ApplyError| matches!(error, ApplyError::Items(items) if items.len() == 1 && items[0].entity_id == waited_on);
-        assert!(matches!(&result, Err(RetrievalError::ApplyError(error)) if failed(error)), "fails with the item's failure: {result:?}");
+        assert!(
+            matches!(&result, Ok(Err(failure)) if failure.entity_id == waited_on && failed(&failure.error)),
+            "ends with the item's failure: {result:?}"
+        );
         assert!(started.elapsed() < Duration::from_secs(1), "before the first idle interval ends");
     }
     Ok(())
@@ -123,7 +126,7 @@ async fn failures_for_other_entities_or_from_other_peers_change_nothing() -> any
         apply(&node, &lacking).await
     });
     applied?;
-    ready?;
+    ready?.map_err(RetrievalError::from)?;
     Ok(())
 }
 

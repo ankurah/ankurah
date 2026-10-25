@@ -518,7 +518,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     }
 
     /// Run established query `query_id`'s periodic check and schedule its
-    /// next one, or handle its error as a subscription's.
+    /// next one, or handle its error as a subscription's. A repair that fails
+    /// to apply is reported and leaves the query established.
     async fn check(&self, query_id: proto::QueryId) {
         let Some(node) = self.inner.node.get() else { return };
         let started = {
@@ -535,6 +536,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         {
             None => debug!("Stopped the superseded check of predicate {}", query_id),
             Some(Ok(outcome)) => {
+                if let CheckOutcome::RepairFailed { entity_id, error } = &outcome {
+                    warn!("The check of predicate {} could not repair entity {} from peer {}: {}", query_id, entity_id, peer, error);
+                }
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                 if !cancel.canceled() {
                     if let Some(check) = subscriptions.get_mut(&query_id).and_then(|state| state.check.as_mut()) {

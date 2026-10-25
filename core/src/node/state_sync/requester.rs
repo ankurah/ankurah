@@ -4,8 +4,10 @@
 //! exceeds the target as the responder's pushes apply. It repairs what does
 //! not arrive: at once where the responder pushed nothing, when its copy stops
 //! progressing for an idle interval, and, for a live query, when two periodic
-//! checks disagree. A push that fails to apply for what it waits on fails the
-//! sync at once.
+//! checks disagree. A push that fails to apply for what it waits on ends the
+//! wait at once: it fails a Fetch or a subscribe, while a periodic check
+//! reports it and leaves its entity stale, as a live update that fails to
+//! apply leaves it.
 
 mod coverage;
 mod deadline;
@@ -44,7 +46,7 @@ pub struct SyncedQuery {
 }
 
 /// What one periodic check of a live query found.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum CheckOutcome {
     /// The copy matches or exceeds the peer's result.
     Agreed,
@@ -53,6 +55,9 @@ pub enum CheckOutcome {
     /// The copy differed on a second check in a row, and a repair brought it
     /// level.
     Repaired,
+    /// The copy differed on a second check in a row, and an item the peer
+    /// pushed to repair `entity_id` failed to apply, with `error`.
+    RepairFailed { entity_id: EntityId, error: Arc<ApplyError> },
 }
 
 /// Read `selection`'s result from `peer` into this node: offer the local copy,
@@ -79,7 +84,7 @@ where
         proto::NodeResponseBody::Fetch(target) => target,
         other => return Err(RequestError::UnexpectedResponse(other).into()),
     };
-    sync.until_ready(Target::new(target)?, OpeningPush::of(&offer)).await
+    Ok(sync.until_ready(Target::new(target)?, OpeningPush::of(&offer)).await??)
 }
 
 /// Subscribe `selection` as `query_id` at `peer`: offer the local copy, and
@@ -108,7 +113,7 @@ where
     };
     let target = Target::new(target)?;
     let spec = target.spec.clone();
-    sync.until_ready(target, OpeningPush::of(&offer)).await?;
+    sync.until_ready(target, OpeningPush::of(&offer)).await??;
     Ok(SyncedQuery { spec, round_trip: sync.round_trip })
 }
 
@@ -116,7 +121,10 @@ where
 /// the whole tree: its heads when the copy fits one page of them, so that a
 /// small live query never builds a digest tree, and its digest otherwise. A
 /// check that disagrees right after another, `confirm`, repairs the copy,
-/// since pushes still in flight explain one disagreement but not two.
+/// since pushes still in flight explain one disagreement but not two. A pushed
+/// item that fails to apply ends the repair as the check's outcome, not as an
+/// error, so that the query stays established, as it does when a live update
+/// fails to apply.
 pub(crate) async fn check<SE, PA>(
     node: &Node<SE, PA>,
     peer: EntityId,
@@ -154,8 +162,10 @@ where
     if !confirm {
         return Ok(CheckOutcome::Disagreed);
     }
-    sync.until_ready(target, OpeningPush::nothing()).await?;
-    Ok(CheckOutcome::Repaired)
+    Ok(match sync.until_ready(target, OpeningPush::nothing()).await? {
+        Ok(()) => CheckOutcome::Repaired,
+        Err(ApplyFailure { entity_id, error, .. }) => CheckOutcome::RepairFailed { entity_id, error },
+    })
 }
 
 /// One query's sync with one peer, from the requester's side: what it asks,
@@ -231,10 +241,10 @@ where
     /// The failure of the next item the peer pushed for an entity that
     /// `outstanding` waits on. A failure the sync lagged behind is lost, which
     /// leaves its entity to the idle deadline, as a lost push is.
-    async fn failure_concerning(&mut self, outstanding: &Outstanding) -> Arc<ApplyError> {
+    async fn failure_concerning(&mut self, outstanding: &Outstanding) -> ApplyFailure {
         loop {
             match self.failures.recv().await {
-                Ok(failure) if failure.peer == self.peer && outstanding.waits_on(&failure.entity_id) => return failure.error,
+                Ok(failure) if failure.peer == self.peer && outstanding.waits_on(&failure.entity_id) => return failure,
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 // The node, which publishes failures, outlives every sync it runs.
                 Err(broadcast::error::RecvError::Closed) => return futures::future::pending().await,
@@ -245,16 +255,16 @@ where
     /// Wait until the copy matches or exceeds `target`. What `push` does not
     /// bring is repaired at once; the rest is waited for, and compared again
     /// whenever the copy has not progressed for the idle interval. A pushed
-    /// item that fails to apply for an entity still waited on fails the sync
-    /// at once, with that failure.
-    async fn until_ready(&mut self, mut target: Target, push: OpeningPush) -> Result<(), RetrievalError> {
+    /// item that fails to apply for an entity still waited on ends the wait at
+    /// once, with that failure, which the caller judges.
+    async fn until_ready(&mut self, mut target: Target, push: OpeningPush) -> Result<Result<(), ApplyFailure>, RetrievalError> {
         let mut last = usize::MAX;
         let mut unpushed_repaired = false;
         let mut idle_since = Instant::now();
         loop {
             let (outstanding, mut changes) = self.outstanding(&mut target).await?;
             if outstanding.is_empty() {
-                return Ok(());
+                return Ok(Ok(()));
             }
             if outstanding.len() < last {
                 self.deadline.progressed();
@@ -275,7 +285,7 @@ where
             } else {
                 tokio::select! {
                     changed = changes.changed() => Some(changed.is_ok()),
-                    error = self.failure_concerning(&outstanding) => return Err(RetrievalError::ApplyError(error)),
+                    failure = self.failure_concerning(&outstanding) => return Ok(Err(failure)),
                     () = futures_timer::Delay::new(remaining) => None,
                 }
             };
