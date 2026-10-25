@@ -21,8 +21,10 @@ pub(crate) struct SourceRevision(pub(crate) u64);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SourceError {
-    #[error("reactor maintenance is unavailable after an incomplete commit; reconstruct the node")]
-    Unavailable,
+    #[error("reactor maintenance stopped with its node")]
+    Closed,
+    #[error("a commit failed inside the commit gate, so the index may have missed its outcome; admit it again")]
+    CommitInDoubt,
     #[error("index maintenance fell behind its bounded change window")]
     Lagged,
     #[error("source changed while the index was being read")]
@@ -35,11 +37,17 @@ pub(crate) enum SourceError {
 
 impl SourceError {
     /// Whether `error` is a source error that admitting the index again can
-    /// recover from, unlike a source that is no longer available.
+    /// recover from, unlike maintenance that stopped with its node.
     pub(crate) fn is_retryable(error: &anyhow::Error) -> bool {
         matches!(
             error.downcast_ref::<SourceError>(),
-            Some(SourceError::Changed | SourceError::Lagged | SourceError::CatalogChanged | SourceError::PolicyChanged)
+            Some(
+                SourceError::CommitInDoubt
+                    | SourceError::Changed
+                    | SourceError::Lagged
+                    | SourceError::CatalogChanged
+                    | SourceError::PolicyChanged
+            )
         )
     }
 }
@@ -81,7 +89,8 @@ struct MaintenanceInner {
 #[derive(Default)]
 struct SourceState {
     revision: u64,
-    unavailable: bool,
+    /// Whether the reactor closed, after which maintenance admits no reader.
+    closed: bool,
     readers: BTreeMap<ReactorSubscriptionId, Weak<dyn MaintenanceReader>>,
 }
 
@@ -121,8 +130,9 @@ pub(crate) struct MaintenanceSubscription<T> {
 /// Serializes persistence, resident publication and index projection. A commit
 /// holds it from its storage commit until it has registered or updated the
 /// resident entity and published the entities it changed; otherwise a competing
-/// writer could retry from stale in-memory state after storage advances. An
-/// uncertain or interrupted commit must not leave a successful read barrier.
+/// writer could retry from stale in-memory state after storage advances. A
+/// commit that fails or stops after taking it fails every reader that exists
+/// then, any of which may have missed its outcome.
 pub(crate) struct SourceCommit {
     maintenance: Maintenance,
     _gate: OwnedMutexGuard<()>,
@@ -144,8 +154,8 @@ impl Maintenance {
     ) -> Result<(SourceRevision, MaintenanceSubscription<T>), SourceError> {
         let _gate = self.0.gate.lock().await;
         let mut source = self.0.state.lock().unwrap();
-        if source.unavailable {
-            return Err(SourceError::Unavailable);
+        if source.closed {
+            return Err(SourceError::Closed);
         }
         let reader = Arc::new(Reader {
             id: ReactorSubscriptionId::new(),
@@ -162,11 +172,27 @@ impl Maintenance {
         Ok((SourceRevision(source.revision), MaintenanceSubscription { maintenance: self.clone(), reader }))
     }
 
-    pub(super) fn invalidate(&self) {
+    /// Fail every reader and admit none again: the reactor closed with its node.
+    pub(super) fn close(&self) {
         let mut source = self.0.state.lock().unwrap();
-        source.unavailable = true;
+        source.closed = true;
         for reader in source.readers.values().filter_map(Weak::upgrade) {
-            reader.fail(SourceError::Unavailable);
+            reader.fail(SourceError::Closed);
+        }
+    }
+
+    /// A commit failed after taking the gate, for `cause`, and published
+    /// nothing, so storage may hold its outcome or not. Fail every reader that
+    /// exists now, any of which may have missed the outcome, and log it once.
+    /// A reader admitted later reads the outcome from storage, which holds it
+    /// once the gate is released. One risk remains: a write that storage
+    /// reported failed but that lands later leaves such a reader stale for its
+    /// entity until that entity's next change.
+    fn commit_in_doubt(&self, cause: &dyn std::fmt::Display) {
+        tracing::error!(%cause, "a commit failed inside the commit gate; the resident trees that existed are admitted again from storage");
+        let source = self.0.state.lock().unwrap();
+        for reader in source.readers.values().filter_map(Weak::upgrade) {
+            reader.fail(SourceError::CommitInDoubt);
         }
     }
 }
@@ -263,7 +289,7 @@ impl SourceCommit {
     pub(crate) fn publish<'a>(mut self, entities: impl IntoIterator<Item = &'a Entity>) {
         let mut source = self.maintenance.0.state.lock().unwrap();
         let entities = Arc::new(entities.into_iter().collect::<Vec<_>>());
-        if source.unavailable || entities.is_empty() {
+        if source.closed || entities.is_empty() {
             self.finished = true;
             return;
         }
@@ -295,12 +321,20 @@ impl SourceCommit {
         }
         self.finished = true;
     }
+
+    /// End this commit after `error`, publishing nothing. Unless storage
+    /// refused the commit, which changed nothing, its outcome is in doubt.
+    pub(crate) fn fail(mut self, error: &crate::error::MutationError) {
+        if !std::mem::replace(&mut self.finished, true) {
+            self.maintenance.commit_in_doubt(error);
+        }
+    }
 }
 
 impl Drop for SourceCommit {
     fn drop(&mut self) {
         if !self.finished {
-            self.maintenance.invalidate();
+            self.maintenance.commit_in_doubt(&"the commit stopped before it published");
         }
     }
 }
@@ -315,9 +349,6 @@ impl<T> MaintenanceSubscription<T> {
     async fn fence_inner(&mut self, started: Option<SourceRevision>) -> Result<SourceWindow<T>, SourceError> {
         let _gate = self.maintenance.0.gate.lock().await;
         let source = self.maintenance.0.state.lock().unwrap();
-        if source.unavailable {
-            return Err(SourceError::Unavailable);
-        }
         let mut reader = self.reader.state.lock().unwrap();
         if let Some(error) = &reader.error {
             return Err(error.clone());
@@ -339,9 +370,6 @@ impl<T> MaintenanceSubscription<T> {
     ) -> Result<(), SourceError> {
         let _gate = self.maintenance.0.gate.lock().await;
         let source = self.maintenance.0.state.lock().unwrap();
-        if source.unavailable {
-            return Err(SourceError::Unavailable);
-        }
         if let Some(error) = &self.reader.state.lock().unwrap().error {
             return Err(error.clone());
         }

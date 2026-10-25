@@ -1,5 +1,5 @@
-//! Commit outcomes: which commits publish to maintenance, and which leave it
-//! unavailable until the node is rebuilt.
+//! Commit outcomes: which commits publish to maintenance, and which fail the
+//! readers that exist when the commit's outcome is in doubt.
 
 use super::*;
 
@@ -27,18 +27,22 @@ async fn dropping_a_caller_while_its_write_stages_leaves_the_source_available() 
 }
 
 #[tokio::test]
-async fn cancellation_after_storage_commit_invalidates_existing_and_new_subscriptions() -> anyhow::Result<()> {
+async fn a_commit_stopped_after_storage_committed_fails_existing_readers_and_admits_new_ones() -> anyhow::Result<()> {
     let node = node().await?;
     let (_, mut cursor) = subscribe(&node).await?;
     apply(&node, &genesis(13)).await?;
     // A commit dropped after storage committed it and before its publication must leave no
-    // successful read barrier.
+    // successful read barrier for a reader that missed it.
     let mut commit = node.reactor.begin_commit().await;
     commit.record_storage_outcome(Ok(crate::storage::StorageCommitOutcome::Committed(Default::default())))?;
     drop(commit);
-    assert!(matches!(cursor.next().await, Err(SourceError::Unavailable)));
-    assert!(matches!(cursor.fence().await, Err(SourceError::Unavailable)));
-    assert!(matches!(subscribe(&node).await, Err(SourceError::Unavailable)));
+    assert!(matches!(cursor.next().await, Err(SourceError::CommitInDoubt)));
+    assert!(matches!(cursor.fence().await, Err(SourceError::CommitInDoubt)));
+    // A reader admitted after the gate is released reads the outcome from storage.
+    let (_, mut admitted) = subscribe(&node).await?;
+    let later = genesis(14);
+    apply(&node, &later).await?;
+    assert_eq!(admitted.next().await?.changes.iter().map(|change| change.id).collect::<Vec<_>>(), [later.entity_id]);
     Ok(())
 }
 
@@ -107,15 +111,18 @@ async fn a_commit_batch_and_its_fence_cannot_be_half_published() -> anyhow::Resu
 }
 
 #[tokio::test]
-async fn an_unclassified_storage_error_requires_source_reconstruction() -> anyhow::Result<()> {
+async fn an_unclassified_storage_error_fails_existing_readers_and_admits_new_ones() -> anyhow::Result<()> {
     let node = node().await?;
     let (_, mut cursor) = subscribe(&node).await?;
     node.storage.fail_next_commit();
     assert!(apply(&node, &genesis(6)).await.is_err());
     // This fixture rejected before commit, but the generic storage error does
     // not prove that outcome to its caller. It must not authorize a clean fence.
-    assert!(matches!(cursor.fence().await, Err(SourceError::Unavailable)));
-    assert!(matches!(subscribe(&node).await, Err(SourceError::Unavailable)));
+    assert!(matches!(cursor.fence().await, Err(SourceError::CommitInDoubt)));
+    let (_, mut admitted) = subscribe(&node).await?;
+    let later = genesis(7);
+    apply(&node, &later).await?;
+    assert_eq!(admitted.next().await?.changes.iter().map(|change| change.id).collect::<Vec<_>>(), [later.entity_id]);
     Ok(())
 }
 
@@ -143,7 +150,7 @@ async fn closing_the_reactor_fails_every_maintenance_reader() -> anyhow::Result<
     // Closing clears the watchers that route changes to readers, so a reader
     // that kept its window open would miss every later commit.
     source.close().await;
-    assert!(matches!(cursor.next().await, Err(SourceError::Unavailable)));
-    assert!(matches!(source.subscribe_maintenance(project).await, Err(SourceError::Unavailable)));
+    assert!(matches!(cursor.next().await, Err(SourceError::Closed)));
+    assert!(matches!(source.subscribe_maintenance(project).await, Err(SourceError::Closed)));
     Ok(())
 }

@@ -360,7 +360,7 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
     /// Clear current subscription results and watchers when the owner stops running.
     pub(crate) async fn close(&self) {
         let _notify = self.0.notify_lock.lock().await;
-        self.0.maintenance.invalidate();
+        self.0.maintenance.close();
         {
             let mut watcher_set = self.0.watcher_set.lock().unwrap();
             watcher_set.clear();

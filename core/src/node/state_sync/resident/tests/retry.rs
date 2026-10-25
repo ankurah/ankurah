@@ -1,4 +1,4 @@
-//! Admission retries after catalog changes, races and lag, and an unavailable source.
+//! Admission retries after catalog changes, races and lag, and a commit whose outcome is in doubt.
 use super::*;
 use crate::reactor::maintenance::MAX_PENDING_BYTES;
 
@@ -152,12 +152,16 @@ async fn a_lagged_admission_fails_retryably_and_a_later_admission_reads_a_fresh_
 }
 
 #[tokio::test]
-async fn an_unavailable_source_fails_admission_without_a_retry() -> anyhow::Result<()> {
+async fn a_commit_in_doubt_stops_the_trees_that_exist_and_a_new_admission_reads_storage() -> anyhow::Result<()> {
     let node = node().await?;
-    // An unknown commit outcome cannot be repaired by admitting again.
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let mut existing = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    // A commit that took the gate and stopped before publishing.
     drop(node.reactor.begin_commit().await);
-    let error = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await.err().expect("no admission");
-    assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::Unavailable)));
-    assert!(!SourceError::is_retryable(&error));
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(5), existing.changes.changed()).await?;
+    assert!(stopped.is_err(), "the tree that existed stops");
+    let admitted = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(admitted.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&initial), "a new admission reads storage");
     Ok(())
 }

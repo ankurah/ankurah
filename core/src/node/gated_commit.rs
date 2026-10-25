@@ -10,7 +10,7 @@ use crate::{
     error::MutationError,
     node::Node,
     policy::PolicyAgent,
-    reactor::ChangeNotification,
+    reactor::{maintenance::SourceCommit, ChangeNotification},
     retrieval::{LocalEventGetter, LocalStateGetter},
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
 };
@@ -128,6 +128,31 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let mut source = node.reactor.begin_commit().await;
+    match commit_and_advance(node, &mut source, storage_trx, writes).await {
+        Ok(Some(changes)) => {
+            source.publish(changes.iter().map(|change| change.entity()));
+            Ok(Some(changes))
+        }
+        Ok(None) => Ok(None),
+        Err(error) => {
+            source.fail(&error);
+            Err(error)
+        }
+    }
+}
+
+/// Commit the staged writes, holding the commit gate as `source`, then advance each resident
+/// entity: one change per write, in order, or `None` when storage refused the writes.
+async fn commit_and_advance<SE, PA>(
+    node: &Node<SE, PA>,
+    source: &mut SourceCommit,
+    storage_trx: SE::Transaction<'_>,
+    writes: Vec<EntityWrite>,
+) -> CommitOutcome
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
     if let StorageCommitOutcome::Conflict { .. } = source.record_storage_outcome(storage_trx.commit().await)? {
         return Ok(None);
     }
@@ -150,7 +175,6 @@ where
             ResidentAdvance::Apply(fork) => fork.commit(&node.entities, &history).await?,
         });
     }
-    source.publish(changes.iter().map(|change| change.entity()));
     Ok(Some(changes))
 }
 
