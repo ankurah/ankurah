@@ -5,17 +5,6 @@
 
 use super::*;
 
-/// Each entity `account` lists with its head, or none when it describes a
-/// span by a digest.
-fn listed(account: &proto::KnownState) -> Option<BTreeMap<EntityId, proto::Clock>> {
-    let mut listed = BTreeMap::new();
-    for span in &account.spans {
-        let proto::SpanContent::Heads(inventory) = span else { return None };
-        listed.extend(inventory.heads.to_vec().into_iter().map(|head| (head.entity.entity_id, head.entity.head)));
-    }
-    Some(listed)
-}
-
 fn is_state(item: &proto::SubscriptionUpdateItem) -> bool { matches!(item.content, proto::UpdateContent::StateAndEvent(..)) }
 
 #[tokio::test]

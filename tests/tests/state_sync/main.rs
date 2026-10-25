@@ -12,6 +12,7 @@ mod live;
 mod loss;
 mod pushes;
 mod readiness;
+mod reconnect;
 
 use common::*;
 use std::{
@@ -110,6 +111,17 @@ impl Received {
         self.updates.lock().unwrap().clear();
         self.responses.lock().unwrap().clear();
     }
+}
+
+/// Each entity `account` lists with its head, or none when it describes a
+/// span by a digest.
+fn listed(account: &proto::KnownState) -> Option<BTreeMap<EntityId, proto::Clock>> {
+    let mut listed = BTreeMap::new();
+    for span in &account.spans {
+        let proto::SpanContent::Heads(inventory) = span else { return None };
+        listed.extend(inventory.heads.to_vec().into_iter().map(|head| (head.entity.entity_id, head.entity.head)));
+    }
+    Some(listed)
 }
 
 /// The head `node` holds of each of `ids`.
