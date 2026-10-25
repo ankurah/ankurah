@@ -83,7 +83,9 @@ pub(super) struct Maintenance(Arc<MaintenanceInner>);
 struct MaintenanceInner {
     gate: Arc<AsyncMutex<()>>,
     state: Mutex<SourceState>,
-    watchers: Arc<Mutex<WatcherSet>>,
+    /// The watchers that route each committed entity to the readers it may
+    /// concern, apart from the reactor's own.
+    watchers: Mutex<WatcherSet>,
 }
 
 #[derive(Default)]
@@ -140,8 +142,12 @@ pub(crate) struct SourceCommit {
 }
 
 impl Maintenance {
-    pub(super) fn new(watchers: Arc<Mutex<WatcherSet>>) -> Self {
-        Self(Arc::new(MaintenanceInner { gate: Arc::new(AsyncMutex::new(())), state: Mutex::default(), watchers }))
+    pub(super) fn new() -> Self {
+        Self(Arc::new(MaintenanceInner {
+            gate: Arc::new(AsyncMutex::new(())),
+            state: Mutex::default(),
+            watchers: Mutex::new(WatcherSet::new()),
+        }))
     }
 
     pub(super) async fn begin_commit(&self) -> SourceCommit {

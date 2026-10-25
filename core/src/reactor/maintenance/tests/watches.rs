@@ -134,3 +134,16 @@ async fn catalog_changes_reach_maintenance_without_any_predicate_candidate() -> 
     assert!(window.batch.as_ref().unwrap().changes.is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn maintenance_routes_commits_through_watchers_of_its_own() -> anyhow::Result<()> {
+    let node = node().await?;
+    let (_, mut cursor) = subscribe(&node).await?;
+    // The reactor's watchers route only its own subscriptions' changes.
+    node.reactor.0.watcher_set.lock().unwrap().clear();
+    let event = genesis(52);
+    apply(&node, &event).await?;
+    let batch = tokio::time::timeout(std::time::Duration::from_secs(5), cursor.next()).await??;
+    assert_eq!(batch.changes[0].head, proto::Clock::singleton(&event));
+    Ok(())
+}

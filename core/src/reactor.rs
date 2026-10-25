@@ -103,11 +103,10 @@ impl<E: AbstractEntity + Filterable + Send + 'static, Ev: Clone + Send + 'static
 
     /// Clear subscriptions when the owner stops running, without retaining the reactor while waiting.
     pub(crate) fn new(run: impl Wait<bool> + Send + Sync + 'static) -> Self {
-        let watcher_set = Arc::new(Mutex::new(WatcherSet::new()));
         let reactor = Self(Arc::new(ReactorInner {
-            maintenance: maintenance::Maintenance::new(watcher_set.clone()),
+            maintenance: maintenance::Maintenance::new(),
             subscriptions: Mutex::new(HashMap::new()),
-            watcher_set,
+            watcher_set: Arc::new(Mutex::new(WatcherSet::new())),
             notify_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             publication_pause: Mutex::new(None),

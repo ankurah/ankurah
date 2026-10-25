@@ -147,8 +147,8 @@ async fn a_local_transaction_publishes_its_entities_to_maintenance() -> anyhow::
 async fn closing_the_reactor_fails_every_maintenance_reader() -> anyhow::Result<()> {
     let source: crate::reactor::Reactor = crate::reactor::Reactor::new(ankurah_signals::Mut::new(true));
     let (_, mut cursor) = source.subscribe_maintenance(project).await?;
-    // Closing clears the watchers that route changes to readers, so a reader
-    // that kept its window open would miss every later commit.
+    // The node stopped: a reader that kept its window open would wait for
+    // commits that never come.
     source.close().await;
     assert!(matches!(cursor.next().await, Err(SourceError::Closed)));
     assert!(matches!(source.subscribe_maintenance(project).await, Err(SourceError::Closed)));
