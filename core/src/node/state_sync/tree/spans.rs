@@ -26,6 +26,17 @@ impl Snapshot {
         Ok(TreeSpanDigest { prefix: NodePrefix::root(), bounds, digest: tree.digest(&scope).await? })
     }
 
+    /// Whether this snapshot's digest over `digest`'s bounds equals `digest`.
+    /// A digest counts the leaves it sums, so a snapshot holding another
+    /// number of members within the bounds cannot match, and is judged so
+    /// without computing a digest.
+    pub async fn matches(&mut self, digest: &TreeSpanDigest) -> anyhow::Result<bool> {
+        if self.members.range::<[u8], _>(digest.bounds.bounds()).count() as i64 != digest.digest.count() {
+            return Ok(false);
+        }
+        Ok(self.span_digest(digest.bounds.clone()).await?.digest == digest.digest)
+    }
+
     pub async fn offer(&mut self) -> anyhow::Result<proto::KnownState> {
         if let Some(inventory) = self.initial_inventory() {
             return Ok(inventory);

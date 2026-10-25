@@ -275,7 +275,7 @@ impl Target {
         for region in &mut self.regions {
             match region {
                 Region::Digest(digest) => {
-                    if snapshot.span_digest(digest.bounds.clone()).await?.digest == digest.digest {
+                    if snapshot.matches(digest).await? {
                         let bounds = digest.bounds.clone();
                         *region = Region::Matched(bounds);
                     } else {

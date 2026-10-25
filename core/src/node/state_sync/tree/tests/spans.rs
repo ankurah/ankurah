@@ -1,4 +1,5 @@
-//! A snapshot read as protocol spans: offers, initial inventories and pages.
+//! A snapshot read as protocol spans: offers, initial inventories, pages, and
+//! whether a span digest matches it.
 use super::*;
 
 #[tokio::test]
@@ -309,5 +310,30 @@ async fn limited_peers_answer_bounds_using_their_own_cut() -> anyhow::Result<()>
     assert_eq!(right.span_digest(point).await?.digest.count(), 1);
     assert_eq!(left.span_digest(proto::TreeSpan::all()).await?.digest.count(), 2);
     assert_eq!(right.span_digest(proto::TreeSpan::all()).await?.digest.count(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_snapshot_matches_a_span_digest_only_with_as_many_members_within_its_bounds_and_an_equal_digest() -> anyhow::Result<()> {
+    let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+    let mut copy = QueryTree::new(spec(), Entries::new())
+        .refresh_states((0..3).map(|id| state(id, 1)).collect())
+        .await?
+        .asking(&DigestRequests::new(&sender));
+    let more = digest_of((0..4).map(|id| state(id, 1)).collect(), proto::TreeSpan::all()).await?;
+    let matched = tokio::select! {
+        matched = copy.matches(&more) => matched?,
+        _ = requests.recv() => anyhow::bail!("the copy read a digest to judge a span it holds fewer members in"),
+    };
+    assert!(!matched, "a span holding more members than the copy does not match");
+
+    // Without its tree, the copy builds the digests it reads.
+    drop(sender);
+    // Below entity 2, since an address under this spec is the entity id.
+    let below = proto::TreeSpan::new(Bound::Unbounded, Bound::Excluded(vec![2; EntityId::BYTE_LEN]));
+    let same = digest_of(vec![state(0, 1), state(1, 1), state(9, 1)], below.clone()).await?;
+    assert!(copy.matches(&same).await?, "as many members within the bounds, at the same heads");
+    let other_head = digest_of(vec![state(0, 1), state(1, 2)], below).await?;
+    assert!(!copy.matches(&other_head).await?, "as many members within the bounds, one at another head");
     Ok(())
 }

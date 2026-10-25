@@ -134,11 +134,12 @@ async fn failures_for_other_entities_or_from_other_peers_change_nothing() -> any
 }
 
 #[tokio::test]
-async fn a_digest_settles_its_span_when_the_copys_digest_over_the_same_bounds_equals_it() -> anyhow::Result<()> {
+async fn a_digest_settles_its_span_only_when_the_copy_holds_as_many_entities_there_and_its_digest_equals_it() -> anyhow::Result<()> {
     let node = durable().await?;
     let elsewhere = durable().await?;
+    let mut created = Vec::new();
     for label in ["a", "b", "c"] {
-        create(&[&node, &elsewhere], label).await?;
+        created.push(create(&[&node, &elsewhere], label).await?);
     }
     let digest_of = |node: TestNode| async move {
         let mut snapshot = node.resident_trees.snapshot(&node, members(), None, vec![]).await?.snapshot;
@@ -147,9 +148,17 @@ async fn a_digest_settles_its_span_when_the_copys_digest_over_the_same_bounds_eq
     let mut equal = Target::new(KnownState { spec: entity_id_spec(&members()), spans: vec![digest_of(elsewhere.clone()).await?] })?;
     assert!(outstanding(&node, &mut equal).await?.is_empty());
 
+    apply(&elsewhere, &labeled(Some(&created[0]), "edited elsewhere")?).await?;
+    let mut edited = Target::new(KnownState { spec: entity_id_spec(&members()), spans: vec![digest_of(elsewhere.clone()).await?] })?;
+    assert_eq!(
+        outstanding(&node, &mut edited).await?.spans.len(),
+        1,
+        "as many entities, one at another head, leave the span to descend into"
+    );
+
     create(&[&elsewhere], "d").await?;
-    let mut differing = Target::new(KnownState { spec: entity_id_spec(&members()), spans: vec![digest_of(elsewhere).await?] })?;
-    assert_eq!(outstanding(&node, &mut differing).await?.spans.len(), 1, "a differing digest leaves its span to descend into");
+    let mut more = Target::new(KnownState { spec: entity_id_spec(&members()), spans: vec![digest_of(elsewhere).await?] })?;
+    assert_eq!(outstanding(&node, &mut more).await?.spans.len(), 1, "and so does an entity the copy lacks");
     Ok(())
 }
 
