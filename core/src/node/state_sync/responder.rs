@@ -9,6 +9,9 @@ mod comparison;
 mod push;
 mod repair;
 
+#[cfg(test)]
+mod tests;
+
 use self::{
     comparison::OfferComparison,
     push::{spawn_push, Push},

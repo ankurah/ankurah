@@ -11,6 +11,9 @@ mod deadline;
 mod descent;
 mod target;
 
+#[cfg(test)]
+mod tests;
+
 use self::{
     deadline::{within, IdleDeadline},
     target::{Outstanding, Target},

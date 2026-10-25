@@ -13,6 +13,8 @@ use proto::{
 };
 use std::sync::{mpsc, Arc};
 
+mod admission;
+
 fn model_a() -> ModelId { ModelId::EntityId(EntityId::from_bytes([1; 32])) }
 fn model_b() -> ModelId { ModelId::EntityId(EntityId::from_bytes([2; 32])) }
 fn property() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([3; 32])) }

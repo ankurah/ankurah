@@ -1,34 +1,7 @@
 //! Repair building: the current state it reads, and what it sends toward it.
 
 use super::*;
-use crate::{
-    node::{applier::NodeApplier, state_sync::fixtures::*},
-    property::backend::{LWWBackend, PropertyBackend},
-    retrieval::{LocalEventGetter, LocalStateGetter, SuspenseEvents},
-    value::Value,
-};
-use ankurah_proto::Attested;
-
-/// An event that sets the label to `label`: a genesis joining a model, or an
-/// update of `parent`.
-fn labeled(parent: Option<&proto::Event>, label: &str) -> anyhow::Result<proto::Event> {
-    let backend = LWWBackend::new();
-    backend.set(proto::PropertyId::System(proto::SystemProperty::Label), Some(Value::String(label.into())));
-    let set = proto::Operation::Backend { backend: "lww".into(), operations: backend.to_operations()?.unwrap() };
-    Ok(match parent {
-        Some(parent) => proto::Event::update(
-            parent.entity_id,
-            proto::Clock::singleton(parent),
-            proto::AuthorId::Unknown,
-            proto::OperationSet(vec![set]),
-        ),
-        None => {
-            let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]));
-            let join = proto::Operation::Membership(proto::Membership::Add(model));
-            proto::Event::genesis(None, proto::AuthorId::Unknown, proto::OperationSet(vec![join, set]))
-        }
-    })
-}
+use crate::node::state_sync::fixtures::*;
 
 /// The repair toward entity `id` for a requester holding `known`.
 async fn repair(node: &TestNode, id: proto::EntityId, known: Option<proto::Clock>, catalog: bool) -> anyhow::Result<CurrentStateRepair> {
@@ -43,24 +16,6 @@ async fn read(node: &TestNode, id: proto::EntityId) -> anyhow::Result<Option<pro
     let credentials = vec![];
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     Ok(node_states(node, std::iter::once(id), &policy).await?.remove(&id))
-}
-
-/// Commit `event` on `node` as a peer's event bridge.
-async fn apply(node: &TestNode, event: &proto::Event) -> anyhow::Result<()> {
-    let events = LocalEventGetter::new(node.storage.clone(), false);
-    events.stage_event(event.clone());
-    NodeApplier::apply_deltas(
-        node,
-        &proto::EntityId::from_bytes([8; 32]),
-        vec![proto::EntityDelta {
-            entity_id: event.entity_id,
-            content: proto::DeltaContent::EventBridge { events: vec![Attested::from(event.clone()).into()] },
-        }],
-        &events,
-        &LocalStateGetter::new(node.storage.clone()),
-    )
-    .await?;
-    Ok(())
 }
 
 #[tokio::test]
