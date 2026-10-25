@@ -83,9 +83,9 @@ async fn a_resubscribe_brings_a_held_member_only_the_events_it_missed() -> anyho
 }
 
 /// A live query for the first ten pets in `direction` order, whose sixth
-/// member's sort key grows longer while the client is away, staying between
-/// its neighbors: the first result installed once the query is ready again
-/// keeps that member's rank.
+/// member's sort key grows, while the client is away, past the length a
+/// result set stores a key inline, staying between its neighbors: the first
+/// result installed once the query is ready again keeps that member's rank.
 async fn a_reconnect_keeps_the_rank_of_a_sort_key_that_grew(direction: &str) -> anyhow::Result<()> {
     let (server_node, client_node, connection) = connected().await?;
     let (server, client) = (server_node.context_async(DEFAULT_CONTEXT).await?, client_node.context_async(DEFAULT_CONTEXT).await?);
