@@ -114,7 +114,9 @@ where
 /// Plan the questions that learn `region`: a page of heads when its digest
 /// counts at most a page of the responder's entries, or when the copy's tree
 /// cannot split it; otherwise the responder's digests of the children the
-/// copy's tree splits it into.
+/// copy's tree splits it into. A region not learned yet is judged by the copy:
+/// where the copy holds more than a page, the children's digests settle most
+/// of it in one round trip, where pages of heads would take one each.
 async fn plan(snapshot: &mut Snapshot, region: Region, steps: &mut VecDeque<Step>) -> anyhow::Result<()> {
     match region {
         Region::Digest(digest) if digest.digest.count() <= MAX_PAGE_HEADS as i64 => steps.push_back(Step::Heads(digest.bounds)),
@@ -122,8 +124,38 @@ async fn plan(snapshot: &mut Snapshot, region: Region, steps: &mut VecDeque<Step
             children if children.len() > 1 => steps.extend(children.into_iter().map(Step::Digest)),
             _ => steps.push_back(Step::Heads(digest.bounds)),
         },
+        Region::Unknown(bounds) if snapshot.entries_in(&bounds).nth(MAX_PAGE_HEADS).is_some() => {
+            let local = snapshot.span_digest(bounds.clone()).await?;
+            match snapshot.refine(&local).await? {
+                children if children.len() > 1 => steps.extend(children.into_iter().map(Step::Digest)),
+                _ => steps.push_back(Step::Heads(bounds)),
+            }
+        }
         Region::Unknown(bounds) => steps.push_back(Step::Heads(bounds)),
         Region::Listed(_) | Region::Matched(_) => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::state_sync::fixtures::{snapshot, states};
+
+    /// The questions `plan` asks to learn the whole tree, of a copy holding `members` entities.
+    async fn questions_learning_everything(members: usize) -> anyhow::Result<Vec<Step>> {
+        let mut copy = snapshot(states(members, 8)).await?;
+        let mut steps = VecDeque::new();
+        plan(&mut copy, Region::Unknown(TreeSpan::all()), &mut steps).await?;
+        Ok(steps.into())
+    }
+
+    #[tokio::test]
+    async fn a_region_not_learned_yet_is_asked_by_digests_where_the_copy_holds_more_than_a_page() -> anyhow::Result<()> {
+        let small = questions_learning_everything(MAX_PAGE_HEADS).await?;
+        assert!(matches!(small.as_slice(), [Step::Heads(bounds)] if *bounds == TreeSpan::all()), "a page of heads learns at most a page");
+        let large = questions_learning_everything(MAX_PAGE_HEADS + 64).await?;
+        assert!(large.len() > 1 && large.iter().all(|step| matches!(step, Step::Digest(_))), "the copy's children, asked by digest");
+        Ok(())
+    }
 }
