@@ -94,6 +94,11 @@ async fn values_snapshot(spec: TreeSpec, rows: Vec<(Attested<EntityState>, Vec<O
     Ok(QueryTree::of_values(spec, rows).await?.snapshot())
 }
 
+/// The digest over `bounds` of a tree under [`spec`] built from `states` alone.
+async fn digest_of(states: Vec<Attested<EntityState>>, bounds: proto::TreeSpan) -> anyhow::Result<proto::TreeSpanDigest> {
+    QueryTree::new(spec(), Entries::new()).refresh_states(states).await?.span_digest(bounds).await
+}
+
 #[tokio::test]
 async fn digest_and_cloned_heads_advance_together_without_retaining_payloads() -> anyhow::Result<()> {
     let mut tree = QueryTree::new(keyed_spec(), Entries::new());
@@ -431,5 +436,35 @@ async fn accounted_bytes_follow_each_change_as_a_fresh_build_counts_them() -> an
     tree.replace_values(rows(&[1, 3, 4, 5])?).await?;
     assert_eq!(tree.accounted_bytes(), QueryTree::of_values(keyed_spec(), rows(&[1, 3, 4, 5])?).await?.accounted_bytes());
     assert!(tree.accounted_bytes() > QueryTree::of_values(keyed_spec(), rows(&[1, 3, 4])?).await?.accounted_bytes());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_request_from_a_snapshot_the_tree_moved_past_builds_the_digests_later_snapshots_read() -> anyhow::Result<()> {
+    let at = |head: u8| (0..3).map(|id| state(id, head)).collect::<Vec<_>>();
+    let (sender, mut requests) = tokio::sync::mpsc::channel(1);
+    let asking = DigestRequests::new(&sender);
+    let mut tree = QueryTree::new(spec(), Entries::new());
+    let mut older = tree.refresh_states(at(1)).await?.asking(&asking);
+    tree.refresh_states(at(2)).await?;
+
+    // The tree answers the older snapshot's request as its actor does.
+    let answering = async {
+        let request = requests.recv().await.ok_or_else(|| anyhow::anyhow!("the older snapshot asks its tree"))?;
+        tree.answer(request).await
+    };
+    let (older_digest, answered) = tokio::join!(older.span_digest(proto::TreeSpan::all()), answering);
+    answered?;
+    assert_eq!(older_digest?, digest_of(at(1), proto::TreeSpan::all()).await?, "the older snapshot's digests agree with its own entries");
+    assert!(tree.digests.is_some(), "the tree keeps the digests the request built");
+
+    let mut next = tree.snapshot().asking(&asking);
+    // A commit after the next snapshot leaves its view at its own entries.
+    tree.refresh_states(at(3)).await?;
+    let next_digest = tokio::select! {
+        digest = next.span_digest(proto::TreeSpan::all()) => digest?,
+        _ = requests.recv() => anyhow::bail!("the next snapshot asked its tree instead of reading the tree's digests"),
+    };
+    assert_eq!(next_digest, digest_of(at(2), proto::TreeSpan::all()).await?);
     Ok(())
 }

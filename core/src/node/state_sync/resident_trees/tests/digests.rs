@@ -96,6 +96,23 @@ async fn a_snapshot_taken_before_the_tree_advances_answers_digests_of_its_own_en
 }
 
 #[tokio::test]
+async fn a_digest_read_from_a_snapshot_the_tree_moved_past_builds_the_trees_digests_which_the_lru_charges() -> anyhow::Result<()> {
+    let (node, events) = node_with(&["01", "02", "03"]).await?;
+    let lease = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    let mut older = lease.snapshot().await?.snapshot;
+    apply(&node, &update(&events[0], "09")?).await?;
+    // Answering a snapshot request brings the tree past the older snapshot's entries.
+    lease.snapshot().await?;
+    let moved = charges(&node.resident_trees);
+    assert_eq!(older.span_digest(proto::TreeSpan::all()).await?, fresh_digest(&older).await?);
+    // Answering a request follows charging for what the read before it built.
+    let mut next = lease.snapshot().await?.snapshot;
+    assert!(charges(&node.resident_trees)[0] > moved[0], "the older snapshot's read built the tree's digests");
+    assert_eq!(next.span_digest(proto::TreeSpan::all()).await?, fresh_digest(&next).await?);
+    Ok(())
+}
+
+#[tokio::test]
 async fn the_lru_charges_a_tree_for_its_digest_tree_only_once_it_is_built() -> anyhow::Result<()> {
     let (node, _) = node_with(&["01", "02", "03"]).await?;
     let lease = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;

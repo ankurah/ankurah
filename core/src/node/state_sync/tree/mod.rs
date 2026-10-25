@@ -128,12 +128,20 @@ impl QueryTree {
         )
     }
 
-    /// Answer a snapshot's request for this tree's digests: build them if
-    /// nothing has read a digest yet, and hand back a read view of them,
-    /// unless the entries have changed since the snapshot.
+    /// Answer a snapshot's request for this tree's digests. A request builds
+    /// them when the tree holds none, whatever version its snapshot was taken
+    /// at, and the tree keeps them, so that every later snapshot reads a view
+    /// of them. A snapshot taken before the entries last changed is answered
+    /// with none, since its digests must agree with its own entries, and
+    /// before any build, since it builds its own from those entries.
     pub(crate) async fn answer(&mut self, request: DigestRequest) -> anyhow::Result<()> {
-        let digests = if request.version == self.version { Some(self.digests().await?.begin()) } else { None };
-        request.answer(digests);
+        if request.version != self.version {
+            request.answer(None);
+            self.digests().await?;
+            return Ok(());
+        }
+        let digests = self.digests().await?.begin();
+        request.answer(Some(digests));
         Ok(())
     }
 
