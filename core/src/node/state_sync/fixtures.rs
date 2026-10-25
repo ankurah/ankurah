@@ -111,10 +111,19 @@ impl PeerSender for Recorder {
 /// A peer of `node` that records every message `node` sends it.
 pub(super) async fn recording_peer(node: &TestNode) -> anyhow::Result<(proto::EntityId, mpsc::UnboundedReceiver<proto::NodeMessage>)> {
     let peer = proto::EntityId::random();
+    Ok((peer, recording_connection(node, peer).await?))
+}
+
+/// A new connection from `peer` to `node`, replacing any it had, that records
+/// every message `node` sends on it.
+pub(super) async fn recording_connection(
+    node: &TestNode,
+    peer: proto::EntityId,
+) -> anyhow::Result<mpsc::UnboundedReceiver<proto::NodeMessage>> {
     let (sender, messages) = mpsc::unbounded_channel();
     let presence = proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION };
     node.register_peer(presence, Box::new(Recorder(peer, sender))).await?;
-    Ok((peer, messages))
+    Ok(messages)
 }
 
 /// The items of the updates in `messages`, until `count` have arrived; then

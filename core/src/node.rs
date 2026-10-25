@@ -369,6 +369,22 @@ where
 
     // TODO LATER: rework this to be retried in the background some number of times
     pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
+        // Get the peer connection
+        let Some(connection) = self.peer_connections.get(&node_id) else {
+            warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
+            return;
+        };
+        self.send_update_on(&connection, node_id, notification);
+    }
+
+    /// Send an update to peer `node_id` on `connection`, which a caller holds so
+    /// that its updates end with that connection rather than reach a later one.
+    pub(crate) fn send_update_on(
+        &self,
+        connection: &PeerState<PA::ContextData>,
+        node_id: proto::EntityId,
+        notification: proto::NodeUpdateBody,
+    ) {
         if self.system.check_not_halted().is_err() {
             return;
         }
@@ -376,12 +392,6 @@ where
         debug!("{self}.send_update({node_id:#}, {notification})");
         let (response_tx, _response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let id = proto::UpdateId::new();
-
-        // Get the peer connection
-        let Some(connection) = self.peer_connections.get(&node_id) else {
-            warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
-            return;
-        };
 
         // Store the response channel
         connection.pending_updates.insert(id.clone(), response_tx);

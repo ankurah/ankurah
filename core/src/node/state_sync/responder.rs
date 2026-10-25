@@ -63,7 +63,7 @@ where
     // The push reads current states, never the snapshot: holding it would copy
     // the resident's entries at its next commit.
     drop(snapshot);
-    spawn_push(node, comparison.lacking, credentials, catalog, Push::new(peer, relevance));
+    spawn_push(node, comparison.lacking, credentials, catalog, Push::new(node, peer, relevance));
     Ok(target)
 }
 
@@ -114,7 +114,7 @@ where
         entities.into_iter().map(|entity| (entity.entity_id, (!entity.head.is_empty()).then_some(entity.head))).collect();
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     let repairs = current_state_repairs(node, &policy, &entities, is_catalog_read(&selection.predicate)).await?;
-    let mut push = Push::new(peer, Vec::new());
+    let mut push = Push::new(node, peer, Vec::new());
     let (mut held, mut unavailable) = (Vec::new(), Vec::new());
     for ((entity_id, _), repair) in entities.into_iter().zip(repairs) {
         match repair {
