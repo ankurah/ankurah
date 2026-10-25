@@ -404,14 +404,13 @@ impl OpeningPush {
         }
         let mut push = Self { digests: Vec::new(), listed: HashSet::new() };
         for span in &offer.spans {
-            match span {
-                SpanContent::Digest(digest) if digest.digest.count() > 0 => push.digests.push(digest.bounds.clone()),
-                SpanContent::Digest(_) => {}
-                SpanContent::Heads(inventory) => {
-                    let mut cursor = inventory.heads.cursor();
-                    while let Some(head) = cursor.next() {
-                        push.listed.insert(head.entity.entity_id);
-                    }
+            if span.withholds_push() {
+                push.digests.push(span.bounds().clone());
+            }
+            if let SpanContent::Heads(inventory) = span {
+                let mut cursor = inventory.heads.cursor();
+                while let Some(head) = cursor.next() {
+                    push.listed.insert(head.entity.entity_id);
                 }
             }
         }

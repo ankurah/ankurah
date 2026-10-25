@@ -53,10 +53,8 @@ impl OfferComparison {
             }
             start = opposite(&bounds.end);
             match span {
-                SpanContent::Digest(digest) if digest.digest == Digest::empty() => {
-                    comparison.lack_all(snapshot, &digest.bounds, &known_heads)
-                }
-                SpanContent::Digest(_) => {}
+                span if span.withholds_push() => {}
+                SpanContent::Digest(digest) => comparison.lack_all(snapshot, &digest.bounds, &known_heads),
                 SpanContent::Heads(inventory) => comparison.diff(snapshot, &inventory, &known_heads),
             }
         }

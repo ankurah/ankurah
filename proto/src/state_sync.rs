@@ -48,6 +48,15 @@ impl SpanContent {
             SpanContent::Heads(inventory) => &inventory.bounds,
         }
     }
+
+    /// Whether a responder comparing an offer that holds this span pushes
+    /// nothing within its bounds: a nonempty digest does not say which entities
+    /// differ, so the requester compares the responder's account over the span
+    /// itself. Within an empty digest, as within a range an offer leaves out,
+    /// the responder pushes every member it holds.
+    pub fn withholds_push(&self) -> bool {
+        matches!(self, SpanContent::Digest(digest) if digest.digest != ankurah_digest_tree::Digest::empty())
+    }
 }
 
 /// One question of a CompareSpans request.
@@ -74,4 +83,23 @@ impl SpanQuestion {
 pub enum SpanAnswer {
     Digest(TreeSpanDigest),
     Heads(TreeSpanInventory),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ankurah_digest_tree::{Digest, HeadHash, Leaf, NodePrefix, Ristretto255};
+
+    fn digest_span(digest: Digest) -> SpanContent {
+        SpanContent::Digest(TreeSpanDigest { prefix: NodePrefix::root(), bounds: TreeSpan::all(), digest })
+    }
+
+    #[test]
+    fn a_responder_withholds_its_push_only_within_a_nonempty_digest() {
+        let leaf = Leaf::new(&[], crate::EntityId::from_bytes([1; 32]), HeadHash::of([[2; 32]]));
+        assert!(digest_span(Digest::from(leaf.element::<Ristretto255>())).withholds_push());
+        assert!(!digest_span(Digest::empty()).withholds_push(), "an empty digest is pushed into like a range left out");
+        let empty_inventory = TreeSpanInventory { bounds: TreeSpan::all(), heads: PackedHeads::try_from(Vec::new()).unwrap() };
+        assert!(!SpanContent::Heads(empty_inventory).withholds_push(), "an inventory says what it lacks");
+    }
 }
