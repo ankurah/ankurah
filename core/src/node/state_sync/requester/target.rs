@@ -56,25 +56,34 @@ impl Region {
 /// What the copy does not yet match or exceed of a target, as of one snapshot.
 #[derive(Debug, Default)]
 pub(super) struct Outstanding {
-    /// Responder heads the copy does not cover: each entity, its address, and
-    /// the copy's head of it when the copy holds one.
-    pub(super) heads: Vec<(EntityId, Vec<u8>, Option<Clock>)>,
+    /// Responder heads the copy does not cover.
+    pub(super) heads: Vec<UncoveredHead>,
     /// Digest regions the copy has not matched, and spans not learned yet.
     pub(super) spans: Vec<Region>,
     /// Local members the account does not list and the responder has not
     /// settled, each with the copy's head.
-    pub(super) extras: Vec<(EntityId, Clock)>,
+    pub(super) unlisted: Vec<(EntityId, Clock)>,
+}
+
+/// A responder head the copy does not cover.
+#[derive(Clone, Debug)]
+pub(super) struct UncoveredHead {
+    pub(super) entity_id: EntityId,
+    /// The entity's address in the responder's tree.
+    pub(super) address: Vec<u8>,
+    /// The copy's head of the entity, when the copy holds one.
+    pub(super) local: Option<Clock>,
 }
 
 impl Outstanding {
     pub(super) fn is_empty(&self) -> bool { self.len() == 0 }
-    pub(super) fn len(&self) -> usize { self.heads.len() + self.spans.len() + self.extras.len() }
+    pub(super) fn len(&self) -> usize { self.heads.len() + self.spans.len() + self.unlisted.len() }
 
     /// Whether the copy still waits for `entity`: a responder head of it that
     /// the copy does not cover, or a local member the responder has not
     /// settled.
     pub(super) fn waits_on(&self, entity: &EntityId) -> bool {
-        self.heads.iter().any(|(id, ..)| id == entity) || self.extras.iter().any(|(id, _)| id == entity)
+        self.heads.iter().any(|head| head.entity_id == *entity) || self.unlisted.iter().any(|(id, _)| id == entity)
     }
 }
 
@@ -181,7 +190,7 @@ impl Target {
         for (id, (address, head)) in &self.uncovered {
             match heads.remove(id) {
                 Some(local) if covers(node, &local, head).await? => covered.push(*id),
-                local => outstanding.heads.push((*id, address.clone(), local)),
+                local => outstanding.heads.push(UncoveredHead { entity_id: *id, address: address.clone(), local }),
             }
         }
         for id in covered {
@@ -208,7 +217,7 @@ impl Target {
                             None => false,
                         };
                         if !settled {
-                            outstanding.extras.push((id, entry.head.clone()));
+                            outstanding.unlisted.push((id, entry.head.clone()));
                         }
                     }
                 }

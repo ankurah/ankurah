@@ -350,14 +350,9 @@ impl OpeningPush {
     fn unpushed(&self, outstanding: &Outstanding) -> Outstanding {
         let digest_described = |bounds: &TreeSpan| self.digests.iter().any(|span| span.intersect(bounds).is_some());
         Outstanding {
-            heads: outstanding
-                .heads
-                .iter()
-                .filter(|(_, address, _)| self.digests.iter().any(|span| span.contains(address)))
-                .cloned()
-                .collect(),
+            heads: outstanding.heads.iter().filter(|head| self.digests.iter().any(|span| span.contains(&head.address))).cloned().collect(),
             spans: outstanding.spans.iter().filter(|region| digest_described(region.bounds())).cloned().collect(),
-            extras: outstanding.extras.iter().filter(|(id, _)| !self.listed.contains(id)).cloned().collect(),
+            unlisted: outstanding.unlisted.iter().filter(|(id, _)| !self.listed.contains(id)).cloned().collect(),
         }
     }
 }

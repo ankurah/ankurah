@@ -35,7 +35,7 @@ async fn a_target_is_outstanding_until_the_copy_covers_every_head() -> anyhow::R
     let mut target = Target::new(account(&[(held.entity_id, head(&held)), (lacking.entity_id, head(&lacking))])?)?;
 
     let found = outstanding(&node, &mut target).await?;
-    assert_eq!(found.heads.iter().map(|(id, _, local)| (*id, local.clone())).collect::<Vec<_>>(), vec![(lacking.entity_id, None)]);
+    assert_eq!(found.heads.iter().map(|head| (head.entity_id, head.local.clone())).collect::<Vec<_>>(), vec![(lacking.entity_id, None)]);
     apply(&node, &lacking).await?;
     assert!(outstanding(&node, &mut target).await?.is_empty(), "the copy covers every head once the lacking entity applies");
     Ok(())
@@ -55,7 +55,7 @@ async fn a_copy_at_a_newer_head_covers_the_responders_older_one_and_never_the_re
     let mut ahead = Target::new(account(&[(entity.entity_id, head(&newer))])?)?;
     let found = outstanding(&node, &mut ahead).await?;
     assert_eq!(found.heads.len(), 1, "a head beyond the copy's is not covered");
-    assert_eq!(found.heads[0].2, Some(head(&edit)), "and the copy's own head goes with it, for the repair to bridge from");
+    assert_eq!(found.heads[0].local, Some(head(&edit)), "and the copy's own head goes with it, for the repair to bridge from");
     Ok(())
 }
 
@@ -67,8 +67,8 @@ async fn a_local_entity_the_account_does_not_list_holds_readiness_until_the_resp
     let gone = create(&[&node], "unreadable on the responder").await?;
     let mut target = Target::new(account(&[(listed.entity_id, head(&listed))])?)?;
 
-    let extras: BTreeSet<_> = outstanding(&node, &mut target).await?.extras.into_iter().map(|(id, _)| id).collect();
-    assert_eq!(extras, BTreeSet::from([held.entity_id, gone.entity_id]));
+    let unlisted: BTreeSet<_> = outstanding(&node, &mut target).await?.unlisted.into_iter().map(|(id, _)| id).collect();
+    assert_eq!(unlisted, BTreeSet::from([held.entity_id, gone.entity_id]));
     let named = HashSet::from([held.entity_id, gone.entity_id]);
     let held_head = EntityHead { entity_id: held.entity_id, head: head(&held) };
     target.synced(&named, vec![held_head], vec![gone.entity_id])?;

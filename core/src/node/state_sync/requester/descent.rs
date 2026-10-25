@@ -60,8 +60,8 @@ where
         let entities = outstanding
             .heads
             .into_iter()
-            .map(|(id, _, local)| (id, local))
-            .chain(outstanding.extras.into_iter().map(|(id, local)| (id, Some(local))))
+            .map(|head| (head.entity_id, head.local))
+            .chain(outstanding.unlisted.into_iter().map(|(id, local)| (id, Some(local))))
             .collect();
         self.sync_entities(target, entities).await
     }
