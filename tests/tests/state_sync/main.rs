@@ -7,6 +7,7 @@ mod busy;
 mod catchup;
 #[path = "../common.rs"]
 mod common;
+mod credentials;
 mod fetch;
 mod large;
 mod limits;
