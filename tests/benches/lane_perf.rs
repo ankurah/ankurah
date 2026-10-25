@@ -39,8 +39,9 @@
 //!   reconnects and re-fetches. The re-fetch's offer lists the stale head, the
 //!   server builds the bridge from stale head to current
 //!   (generate_entity_delta Case 2), and the client applies GAP events through
-//!   the bridge arm. A lane guard asserts the client committed the gap events
-//!   locally (the bridge arm commits them; the snapshot arm does not).
+//!   the bridge arm. The server repairs with the smaller of the bridge and the
+//!   state, so the entity's state is made larger than its gap's events. A
+//!   guard asserts the client committed the gap events locally.
 //! - `subscription_establishment`: wall time to establish and initialize a live
 //!   query at N resident entities on the server.
 //!
@@ -318,11 +319,17 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
 /// (two peer registrations and two task spawns) is negligible against the
 /// bridge at any gap.
 ///
-/// Guards: the client must reach the final state, and a lane guard asserts the
-/// client committed at least `gap` events locally, which only the bridge arm
-/// does (verified against the snapshot arm by construction; a one-off
-/// instrumented run confirmed stored == gap exactly on this shape).
+/// The server repairs with the smaller of the bridge and the entity's state, so
+/// the entity's title makes its state outweigh its gap's events.
+///
+/// Guards: the client must reach the final state and hold at least `gap`
+/// events locally. A snapshot over the stale head would commit them too,
+/// through the lineage check that adopts it, so the title is what keeps this
+/// lane on the bridge.
 fn bench_bridge_catchup(c: &mut Criterion) {
+    /// Title bytes per gap edit: more than the edit's event encodes to.
+    const TITLE_BYTES_PER_EDIT: usize = 512;
+
     let rt = multi_thread_runtime();
     let mut group = c.benchmark_group("bridge_catchup");
     group.sample_size(10); // Deep-gap setup per iteration is expensive; keep samples modest.
@@ -341,12 +348,14 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         let server_ctx = server.context_async(CTX).await.unwrap();
                         let doc = {
                             let trx = server_ctx.begin();
-                            let doc = trx.create(&Doc { title: "chain".into(), body: "0".into() }).await.unwrap();
+                            let title = "x".repeat(gap * TITLE_BYTES_PER_EDIT);
+                            let doc = trx.create(&Doc { title, body: "0".into() }).await.unwrap();
                             let read = doc.read().unwrap();
                             trx.commit().await.unwrap();
                             read
                         };
                         let doc_id = doc.id();
+                        let query = format!("id = '{doc_id}'");
 
                         let client = ephemeral();
                         let conn = LocalProcessConnection::new(&client, &server).await.unwrap();
@@ -356,7 +365,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         // First fetch: persists the entity locally at the current
                         // head (snapshot-served; the fetch returns once its
                         // pushes have applied, so the head is durable on the client here).
-                        let first = client_ctx.fetch::<DocView>("title = 'chain'").await.unwrap();
+                        let first = client_ctx.fetch::<DocView>(query.as_str()).await.unwrap();
                         assert_eq!(first.len(), 1, "client must hold the entity before going stale");
 
                         // Disconnect, then advance the server by `gap` edits.
@@ -370,21 +379,18 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         // --- Measured: reconnect + re-fetch (EventBridge served). ---
                         let start = Instant::now();
                         let _conn2 = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        let results = client_ctx.fetch::<DocView>("title = 'chain'").await.unwrap();
+                        let results = client_ctx.fetch::<DocView>(query.as_str()).await.unwrap();
                         total += start.elapsed();
 
                         // Correctness guard: the client must reach the final state.
                         assert_eq!(results.len(), 1, "client must materialize the entity");
                         assert_eq!(results[0].body().unwrap(), gap.to_string(), "client must reach the final state after catch-up");
-                        // Lane guard: bridge-served means the gap events were
-                        // committed on the client (the bridge arm commits each
-                        // event; the snapshot arm commits none). If the server
-                        // fell back to a snapshot, this count stays 0 and the
-                        // bench is measuring the wrong lane.
+                        // Guard: the gap events were committed on the client,
+                        // as the bridge arm commits each one.
                         let stored = client.storage.dump_entity_events(doc_id).await.unwrap();
                         assert!(
                             stored.len() >= gap,
-                            "stale re-fetch must be bridge-served: expected >= {gap} locally committed events, found {}",
+                            "the stale re-fetch must commit the gap events: expected >= {gap} locally committed events, found {}",
                             stored.len()
                         );
                     }
