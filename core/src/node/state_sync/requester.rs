@@ -317,9 +317,10 @@ where
     /// bring is repaired at once, and so is each local member the account
     /// does not list that the copy's result gains later, since no push brings
     /// those either; the rest is waited for, and compared again whenever the
-    /// outstanding set has not shrunk for the idle interval. A pushed item
-    /// that fails to apply for an entity still waited on ends the wait at
-    /// once, with that failure, which the caller judges.
+    /// outstanding set has not shrunk for the idle interval, when a member
+    /// whose copy the responder's pushes keep leaving unchanged is settled
+    /// instead. A pushed item that fails to apply for an entity still waited
+    /// on ends the wait at once, with that failure, which the caller judges.
     async fn until_ready(&mut self, mut target: Target, push: OpeningPush) -> Result<Result<(), ApplyFailure>, RetrievalError> {
         let mut first_pass = true;
         // The fewest items outstanding since the last repair. Only fewer is
