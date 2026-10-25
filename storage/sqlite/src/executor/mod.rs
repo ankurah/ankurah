@@ -185,10 +185,11 @@ impl dyn SqliteExecutor + '_ {
     /// none is, and nests in the open one, where BEGIN would fail. `name`
     /// goes into the SQL as it is, so it must be an identifier. Dropped
     /// without [`Savepoint::release`], it rolls back to the savepoint and
-    /// releases it, as rusqlite's `Savepoint` does, so that an early `?`
-    /// leaves nothing behind; the errors of that ROLLBACK TO and RELEASE are
-    /// dropped, so that the `?` reports the error of the statement that
-    /// failed.
+    /// then releases it, as rusqlite's `Savepoint` does, so that an early `?`
+    /// leaves nothing behind; a savepoint whose ROLLBACK TO fails is not
+    /// released, which would keep the work it was to undo. The errors of
+    /// that ROLLBACK TO and RELEASE are dropped, so that the `?` reports the
+    /// error of the statement that failed.
     pub(crate) fn savepoint(&self, name: &'static str) -> Result<Savepoint<'_>, SqliteError> {
         self.execute(&format!("SAVEPOINT {name}"), &[])?;
         Ok(Savepoint { executor: self, name, open: true })
@@ -287,9 +288,12 @@ impl Drop for Savepoint<'_> {
             // that would have ended it, already reported its error, which is
             // the one to report: these fail, typically, only because SQLite
             // rolled the whole transaction back for that error, so that the
-            // savepoint is gone.
-            let _ = self.executor.execute(&format!("ROLLBACK TO {}", self.name), &[]);
-            let _ = self.executor.execute(&format!("RELEASE {}", self.name), &[]);
+            // savepoint is gone. RELEASE runs only once ROLLBACK TO has
+            // undone the savepoint's work, since releasing a savepoint keeps
+            // its work.
+            if self.executor.execute(&format!("ROLLBACK TO {}", self.name), &[]).is_ok() {
+                let _ = self.executor.execute(&format!("RELEASE {}", self.name), &[]);
+            }
         }
     }
 }
@@ -344,4 +348,52 @@ impl Row {
 fn mismatch(index: usize, found: &SqliteValue, expected: &str) -> SqliteError {
     let found = if matches!(found, SqliteValue::Null) { "NULL" } else { found.sqlite_type() };
     SqliteError::Row(format!("column {index} holds {found} where {expected} was expected"))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use std::cell::RefCell;
+
+    use rusqlite::ffi;
+
+    use super::*;
+
+    /// A savepoint dropped unreleased rolls back to itself and then releases
+    /// itself, and stays unreleased when SQLite fails its ROLLBACK TO, here
+    /// with an I/O error, rather than keep the work it was to undo.
+    #[test]
+    fn a_savepoint_dropped_unreleased_releases_itself_only_once_rolled_back() {
+        /// An executor that records each statement it runs, and fails each
+        /// ROLLBACK TO when `fails` is set.
+        struct Recording {
+            statements: RefCell<Vec<String>>,
+            fails: bool,
+        }
+
+        impl SqliteExecutor for Recording {
+            fn execute(&self, sql: &str, _: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
+                self.statements.borrow_mut().push(sql.to_owned());
+                if self.fails && sql.starts_with("ROLLBACK TO") {
+                    return Err(rusqlite::Error::SqliteFailure(ffi::Error::new(ffi::SQLITE_IOERR), None).into());
+                }
+                Ok(0)
+            }
+
+            fn query(&self, _: &str, _: &[SqliteValueRef<'_>]) -> Result<Vec<Row>, SqliteError> {
+                unreachable!("a savepoint only executes")
+            }
+
+            fn query_row(&self, _: &str, _: &[SqliteValueRef<'_>]) -> Result<Option<Row>, SqliteError> {
+                unreachable!("a savepoint only executes")
+            }
+        }
+
+        for (fails, statements) in
+            [(false, &["SAVEPOINT s", "ROLLBACK TO s", "RELEASE s"][..]), (true, &["SAVEPOINT s", "ROLLBACK TO s"][..])]
+        {
+            let executor = Recording { statements: RefCell::default(), fails };
+            drop((&executor as &dyn SqliteExecutor).savepoint("s").unwrap());
+            assert_eq!(*executor.statements.borrow(), statements, "when ROLLBACK TO fails: {fails}");
+        }
+    }
 }

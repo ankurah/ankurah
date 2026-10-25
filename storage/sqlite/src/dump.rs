@@ -186,7 +186,10 @@ mod tests {
     use futures_util::{pin_mut, StreamExt};
 
     use super::*;
-    use crate::test_driver::{self, engine_test};
+    use crate::{
+        executor::TransactionBehavior,
+        test_driver::{self, engine_test},
+    };
 
     #[engine_test]
     async fn dump_crosses_cursor_pages_without_skipping_records() -> anyhow::Result<()> {
@@ -263,6 +266,39 @@ mod tests {
         }
         assert_eq!(states, [entity_id]);
         storage.with_executor(|executor| executor.execute("COMMIT", &[]).map(drop)).await?;
+        Ok(())
+    }
+
+    /// A page whose read fails part-way, here on a state's head that is not
+    /// a clock, leaves its connection outside any transaction, so that the
+    /// next caller's BEGIN on it runs: the page's savepoint, dropped
+    /// unreleased, rolls back to itself and releases itself. The pool of an
+    /// in-memory engine holds one connection, which the BEGIN reaches.
+    #[engine_test]
+    async fn a_page_that_fails_leaves_its_connection_outside_a_transaction() -> anyhow::Result<()> {
+        let storage = test_driver::open_in_memory().await?;
+        let event = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+        let entity_id = event.entity_id;
+        let head = Clock::singleton(&event);
+        let state = Attested::opt(
+            EntityState { entity_id, state: State { state_buffers: StateBuffers::default(), memberships: BTreeSet::new(), head } },
+            None,
+        );
+        let mut transaction = storage.transaction();
+        transaction.add_events(&[Attested::opt(event, None)]).await?;
+        transaction.set_state(&Clock::default(), &state).await?;
+        assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
+        let unreadable_head = format!(r#"UPDATE "{ENTITY_TABLE}" SET "head" = 'not a clock'"#);
+        storage.with_executor(move |executor| executor.execute(&unreadable_head, &[]).map(drop)).await?;
+
+        let items = storage.dump().await?;
+        pin_mut!(items);
+        let mut failed = false;
+        while let Some(item) = items.next().await {
+            failed |= item.is_err();
+        }
+        assert!(failed, "the page fails on the head it cannot read");
+        storage.with_executor(|executor| executor.begin(TransactionBehavior::Deferred)?.commit()).await?;
         Ok(())
     }
 
