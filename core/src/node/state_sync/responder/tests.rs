@@ -109,13 +109,26 @@ async fn pushes_fill_updates_by_count_and_by_size() -> anyhow::Result<()> {
     let counts: Vec<_> = pushed(&mut messages, MAX_PAGE_HEADS + 1).await.iter().map(Vec::len).collect();
     assert_eq!(counts, [MAX_PAGE_HEADS, 1], "at most a page of items per update");
 
+    // Each item's data lies half in its buffers or diffs and half in its attestation.
+    let attested = || proto::AttestationSet(vec![proto::Attestation(vec![0; 200 * 1024])]);
     let mut push = Push::new(peer, vec![]);
-    for state in states(3, 400 * 1024) {
+    for mut state in states(3, 200 * 1024) {
+        state.attestations = attested();
         push.add(&node, delta(state))?;
     }
     push.send(&node);
     let counts: Vec<_> = pushed(&mut messages, 3).await.iter().map(Vec::len).collect();
     assert_eq!(counts, [2, 1], "about a mebibyte of item data per update");
+
+    let mut push = Push::new(peer, vec![]);
+    for _ in 0..3 {
+        let event = labeled(None, &"x".repeat(200 * 1024))?;
+        let events = vec![proto::Attested { payload: event.clone(), attestations: attested() }.into()];
+        push.add(&node, proto::EntityDelta { entity_id: event.entity_id, content: proto::DeltaContent::EventBridge { events } })?;
+    }
+    push.send(&node);
+    let counts: Vec<_> = pushed(&mut messages, 3).await.iter().map(Vec::len).collect();
+    assert_eq!(counts, [2, 1], "a bridge counts its events' data the same way");
 
     let mut push = Push::new(peer, vec![]);
     push.add(&node, delta(states(1, 2 * 1024 * 1024).pop().unwrap()))?;
