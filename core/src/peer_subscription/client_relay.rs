@@ -564,6 +564,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             },
             // A sync that stopped progressing starts over with a new subscription
             RetrievalError::SyncStalled { .. } => true,
+            // So does one whose local source kept changing while it was admitted
+            RetrievalError::Anyhow(error) => crate::reactor::maintenance::SourceError::is_retryable(error),
             // Other retrieval errors are not retryable
             _ => false,
         };

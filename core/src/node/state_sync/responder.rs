@@ -53,7 +53,7 @@ where
             (spec.clone(), KnownState { spec, spans: Vec::new() })
         }
     };
-    let mut snapshot = node.resident_trees.snapshot(node, selection, Some(spec), credentials.clone()).await?.snapshot;
+    let mut snapshot = node.resident_trees.snapshot_through_changes(node, selection, Some(spec), credentials.clone()).await?.snapshot;
     let comparison = OfferComparison::new(&mut snapshot, known).await?;
     let target = snapshot.offer().await?;
     // The push reads current states, never the snapshot: holding it would copy
@@ -77,7 +77,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     SpanQuestion::validate_all(&questions)?;
-    let mut snapshot = node.resident_trees.snapshot(node, selection, Some(spec), credentials).await?.snapshot;
+    let mut snapshot = node.resident_trees.snapshot_through_changes(node, selection, Some(spec), credentials).await?.snapshot;
     let mut answers = Vec::with_capacity(questions.len());
     for question in questions {
         answers.push(match question {

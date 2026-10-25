@@ -31,6 +31,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 const MAX_ENTRIES: usize = 32;
 const MAX_BYTES: usize = 128 * 1024 * 1024;
+/// Snapshots a comparison takes before a retryable admission failure stands.
+const MAX_SNAPSHOT_ATTEMPTS: u32 = 8;
+/// The wait before a comparison's second snapshot attempt, doubled before each later one.
+const FIRST_SNAPSHOT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The node's one LRU of resident trees, shared by every requester and
 /// responder. A lease pins its resident; idle residents stay maintained until
@@ -105,6 +109,35 @@ impl<CD: ContextData> ResidentTrees<CD> {
             }
         }
         unreachable!("the second attempt returns")
+    }
+
+    /// A snapshot as [`Self::snapshot`] takes one, for a comparison that must
+    /// not fail while the node's data, catalog or policy changes: such a change
+    /// fails an admission retryably, and changes come in bursts, as while a
+    /// schema syncs. It takes another after a retryable failure, waiting longer
+    /// each time, up to `MAX_SNAPSHOT_ATTEMPTS` snapshots.
+    pub(crate) async fn snapshot_through_changes<SE, PA>(
+        &self,
+        node: &Node<SE, PA>,
+        selection: Selection<Resolved>,
+        spec: Option<proto::TreeSpec>,
+        credentials: Vec<CD>,
+    ) -> anyhow::Result<ResidentSnapshot>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
+    {
+        let mut wait = FIRST_SNAPSHOT_RETRY;
+        for _ in 1..MAX_SNAPSHOT_ATTEMPTS {
+            match self.snapshot(node, selection.clone(), spec.clone(), credentials.clone()).await {
+                Err(error) if SourceError::is_retryable(&error) => {
+                    futures_timer::Delay::new(wait).await;
+                    wait *= 2;
+                }
+                result => return result,
+            }
+        }
+        self.snapshot(node, selection, spec, credentials).await
     }
 
     /// A lease of the resident that serves `selection` for `credentials`:

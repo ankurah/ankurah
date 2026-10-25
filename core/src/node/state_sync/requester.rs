@@ -178,7 +178,7 @@ where
     /// A snapshot of the copy: this node's resident for the query, under the
     /// target's `spec` once there is one.
     async fn snapshot(&self, spec: Option<TreeSpec>) -> Result<ResidentSnapshot, RetrievalError> {
-        Ok(self.node.resident_trees.snapshot(self.node, self.selection.clone(), spec, self.credentials.clone()).await?)
+        Ok(self.node.resident_trees.snapshot_through_changes(self.node, self.selection.clone(), spec, self.credentials.clone()).await?)
     }
 
     /// The copy's account of itself, which the opening request offers.
