@@ -39,17 +39,6 @@ pub(crate) fn entity_id_spec(selection: &Selection<Resolved>) -> TreeSpec {
     TreeSpec::new(KeySpec::new(vec![]), selection.predicate.clone())
 }
 
-/// The spec a peer built its known state under, accepted when a tree under it
-/// can serve `selection`.
-pub(crate) fn accept_peer_spec(
-    selection: &Selection<Resolved>,
-    catalog: &CatalogManager,
-    known: &proto::KnownState,
-) -> anyhow::Result<TreeSpec> {
-    anyhow::ensure!(serves(&known.spec, selection, catalog), "unsupported comparison tree spec");
-    Ok(known.spec.clone())
-}
-
 /// The digest-tree request that selects `selection`'s members, typed by the
 /// catalog.
 pub(crate) fn request_for(selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<TreeRequest> {
