@@ -1,17 +1,15 @@
-//! A delta's size, by which a repair chooses between a bridge and a state and
-//! a push bounds its updates: the bytes of the delta's own buffers, which are
-//! its state's buffers, its events' operation diffs, and every attestation it
-//! carries. These grow with an entity while the rest of a delta stays small,
-//! so they measure it without encoding it.
+//! An update item's size, by which a push bounds its updates: the bytes of the
+//! item's own buffers, which are its state's buffers, its events' operation
+//! diffs, and every attestation it carries. These grow with an entity while the
+//! rest of an item stays small, so they measure it without encoding it.
 
 use ankurah_proto as proto;
 
 /// The bytes of `content`'s own buffers.
-pub(super) fn data_bytes(content: &proto::DeltaContent) -> usize {
+pub(super) fn data_bytes(content: &proto::UpdateContent) -> usize {
     match content {
-        proto::DeltaContent::StateSnapshot { state } => state_bytes(state),
-        proto::DeltaContent::EventBridge { events } => events.iter().map(event_bytes).sum(),
-        proto::DeltaContent::StateAndRelation { state, relation } => state_bytes(state) + attestation_bytes(&relation.attestations),
+        proto::UpdateContent::EventOnly(events) => events.iter().map(event_bytes).sum(),
+        proto::UpdateContent::StateAndEvent(state, events) => state_bytes(state) + events.iter().map(event_bytes).sum::<usize>(),
     }
 }
 

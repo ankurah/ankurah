@@ -35,26 +35,19 @@ impl Push {
         Self { peer, relevance, items: Vec::new(), bytes: 0 }
     }
 
-    /// Add the item that carries `delta`, first sending the gathered items when
-    /// it would overfill their update.
-    pub(super) fn add<SE, PA>(&mut self, node: &Node<SE, PA>, delta: proto::EntityDelta) -> anyhow::Result<()>
+    /// Add the item that carries `content` for `entity_id`, first sending the
+    /// gathered items when it would overfill their update.
+    pub(super) fn add<SE, PA>(&mut self, node: &Node<SE, PA>, entity_id: proto::EntityId, content: proto::UpdateContent)
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let bytes = data_bytes(&delta.content);
-        let content = match delta.content {
-            proto::DeltaContent::StateSnapshot { state } => proto::UpdateContent::StateAndEvent(state, vec![]),
-            proto::DeltaContent::EventBridge { events } => proto::UpdateContent::EventOnly(events),
-            proto::DeltaContent::StateAndRelation { .. } => anyhow::bail!("a state-and-relation delta has no update content"),
-        };
-        let item = proto::SubscriptionUpdateItem { entity_id: delta.entity_id, content, predicate_relevance: self.relevance.clone() };
+        let bytes = data_bytes(&content);
         if !self.items.is_empty() && (self.items.len() == MAX_PAGE_HEADS || self.bytes + bytes > MAX_UPDATE_BYTES) {
             self.send(node);
         }
-        self.items.push(item);
+        self.items.push(proto::SubscriptionUpdateItem { entity_id, content, predicate_relevance: self.relevance.clone() });
         self.bytes += bytes;
-        Ok(())
     }
 
     /// Send the gathered items, if any.
@@ -73,8 +66,8 @@ impl Push {
 
 /// Push `peer` each entity in `lacking` from the head listed beside it, from a
 /// task of its own that reads a page of states at a time as it sends. The
-/// requester learns of entities the read policy denies, which this skips,
-/// through its own repair.
+/// requester learns of entities this node holds no readable state of, which
+/// this skips, through its own repair.
 pub(super) fn spawn_push<SE, PA>(
     node: &Node<SE, PA>,
     lacking: Vec<(proto::EntityId, Option<proto::Clock>)>,
@@ -109,9 +102,9 @@ where
         // A dropped node stops the push between pages.
         let Some(node) = node.upgrade() else { return Ok(()) };
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-        for repair in current_state_repairs(&node, &policy, page, &credentials, catalog).await? {
-            if let CurrentStateRepair::Delta { delta, .. } = repair {
-                push.add(&node, delta)?;
+        for ((entity_id, _), repair) in page.iter().zip(current_state_repairs(&node, &policy, page, catalog).await?) {
+            if let CurrentStateRepair::Lacking { content, .. } = repair {
+                push.add(&node, *entity_id, content);
             }
         }
         push.send(&node);

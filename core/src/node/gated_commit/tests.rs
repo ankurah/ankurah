@@ -170,31 +170,32 @@ async fn load_resident(node: &TestNode, id: EntityId) -> anyhow::Result<Entity> 
     Ok(node.entities.get_or_retrieve(&states, &events, &id).await?.expect("the entity is stored"))
 }
 
-/// Apply `delta` from a peer, staging `history` in the caller's getter for the applier's causal checks.
-async fn apply(node: &TestNode, delta: proto::EntityDelta, history: Vec<Event>) -> anyhow::Result<()> {
+/// Apply `item` from a peer, staging `history` in the caller's getter for the applier's causal checks.
+async fn apply(node: &TestNode, item: proto::SubscriptionUpdateItem, history: Vec<Event>) -> anyhow::Result<()> {
     let events = LocalEventGetter::new(node.storage.clone(), true);
     for event in history {
         events.stage_event(event);
     }
     let states = LocalStateGetter::new(node.storage.clone());
-    NodeApplier::apply_deltas(node, &EntityId::from_bytes([9; 32]), vec![delta], &events, &states).await?;
+    NodeApplier::apply_update(node, &EntityId::from_bytes([9; 32]), item, &events, &states).await?;
     Ok(())
 }
 
-fn snapshot(head: &Event, models: impl IntoIterator<Item = u8>) -> proto::EntityDelta {
+fn snapshot(head: &Event, models: impl IntoIterator<Item = u8>) -> proto::SubscriptionUpdateItem {
     let state = proto::State { memberships: models.into_iter().map(model).collect(), head: Clock::singleton(head), ..Default::default() };
-    proto::EntityDelta {
+    let state = Attested::opt(proto::EntityState { entity_id: head.entity_id, state }, None).into();
+    proto::SubscriptionUpdateItem {
         entity_id: head.entity_id,
-        content: proto::DeltaContent::StateSnapshot {
-            state: Attested::opt(proto::EntityState { entity_id: head.entity_id, state }, None).into(),
-        },
+        content: proto::UpdateContent::StateAndEvent(state, vec![]),
+        predicate_relevance: vec![],
     }
 }
 
-fn bridge(event: &Event) -> proto::EntityDelta {
-    proto::EntityDelta {
+fn bridge(event: &Event) -> proto::SubscriptionUpdateItem {
+    proto::SubscriptionUpdateItem {
         entity_id: event.entity_id,
-        content: proto::DeltaContent::EventBridge { events: vec![Attested::from(event.clone()).into()] },
+        content: proto::UpdateContent::EventOnly(vec![Attested::from(event.clone()).into()]),
+        predicate_relevance: vec![],
     }
 }
 

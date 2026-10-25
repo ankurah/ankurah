@@ -69,17 +69,18 @@ fn set_label(label: &str) -> anyhow::Result<proto::Operation> {
     Ok(proto::Operation::Backend { backend: "lww".into(), operations: backend.to_operations()?.unwrap() })
 }
 
-/// Commit `event` on `node` as a peer's event bridge.
+/// Commit `event` on `node` as a peer's push.
 pub(super) async fn apply(node: &TestNode, event: &proto::Event) -> anyhow::Result<()> {
     let events = LocalEventGetter::new(node.storage.clone(), node.durable);
     events.stage_event(event.clone());
-    NodeApplier::apply_deltas(
+    NodeApplier::apply_update(
         node,
         &proto::EntityId::from_bytes([8; 32]),
-        vec![proto::EntityDelta {
+        proto::SubscriptionUpdateItem {
             entity_id: event.entity_id,
-            content: proto::DeltaContent::EventBridge { events: vec![Attested::from(event.clone()).into()] },
-        }],
+            content: proto::UpdateContent::EventOnly(vec![Attested::from(event.clone()).into()]),
+            predicate_relevance: vec![],
+        },
         &events,
         &LocalStateGetter::new(node.storage.clone()),
     )

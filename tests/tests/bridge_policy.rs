@@ -447,8 +447,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 
     let pet_id = {
         let trx = ctx_s.begin();
-        // A state larger than the edits' events, so the re-fetch is served by a bridge.
-        let pet = trx.create(&Pet { name: "bridge-validate".repeat(256), age: "1".to_string() }).await?;
+        let pet = trx.create(&Pet { name: "bridge-validate".to_string(), age: "1".to_string() }).await?;
         let id = pet.id();
         trx.commit().await?;
         id
@@ -503,8 +502,7 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
 
     let pet_id = {
         let trx = ctx_s.begin();
-        // A state larger than the edits' events, so that only suppression keeps a bridge from serving the re-fetch.
-        let pet = trx.create(&Pet { name: "bridge-redact".repeat(256), age: "1".to_string() }).await?;
+        let pet = trx.create(&Pet { name: "bridge-redact".to_string(), age: "1".to_string() }).await?;
         let id = pet.id();
         trx.commit().await?;
         id
@@ -583,8 +581,7 @@ async fn a_refused_repair_leaves_a_live_query_established_and_the_next_disagreei
 
     let pet_id = {
         let trx = ctx_s.begin();
-        // A state larger than the edit's event, so that only the denial keeps a bridge from serving the repair.
-        let pet = trx.create(&Pet { name: "bridge-repair".repeat(256), age: "1".to_string() }).await?;
+        let pet = trx.create(&Pet { name: "bridge-repair".to_string(), age: "1".to_string() }).await?;
         let id = pet.id();
         trx.commit().await?;
         id

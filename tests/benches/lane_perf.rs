@@ -29,19 +29,17 @@
 //! - `fresh_fetch_snapshot`: wall time for a FRESH client's first fetch of an
 //!   entity whose server-side history is 100 / 1000 / 5000 events deep. A fresh
 //!   fetch offers an empty account, so the server pushes the full state, with
-//!   no head to bridge from (generate_entity_delta Case 3): depth
-//!   affects only the excluded setup, and the measured region is snapshot
-//!   adoption. A lane guard asserts no events were committed locally.
-//! - `bridge_catchup`: the TRUE EventBridge lane, via the stale-client shape
-//!   (the only shape that produces DeltaContent::EventBridge): the client
-//!   fetches once so it holds the entity at a stale head, disconnects, the
-//!   server advances by GAP edits (100 / 1000 / 5000), then the client
-//!   reconnects and re-fetches. The re-fetch's offer lists the stale head, the
-//!   server builds the bridge from stale head to current
-//!   (generate_entity_delta Case 2), and the client applies GAP events through
-//!   the bridge arm. The server repairs with the smaller of the bridge and the
-//!   state, so the entity's state is made larger than its gap's events. A
-//!   guard asserts the client committed the gap events locally.
+//!   no head to bridge from: depth affects only the excluded setup, and the
+//!   measured region is snapshot adoption. A lane guard asserts no events were
+//!   committed locally.
+//! - `bridge_catchup`: the TRUE event-bridge lane, via the stale-client shape
+//!   (the only shape that produces an event bridge): the client fetches once
+//!   so it holds the entity at a stale head, disconnects, the server advances
+//!   by GAP edits (100 / 1000 / 5000), then the client reconnects and
+//!   re-fetches. The re-fetch's offer lists the stale head, the server builds
+//!   the bridge from stale head to current, and the client applies the GAP
+//!   events it carries. A guard asserts the client committed the gap events
+//!   locally.
 //! - `subscription_establishment`: wall time to establish and initialize a live
 //!   query at N resident entities on the server.
 //!
@@ -235,7 +233,7 @@ fn futures_noop_poll<F: std::future::Future>(fut: &mut std::pin::Pin<&mut F>) ->
 /// region; the measured region is the client's fetch.
 ///
 /// LANE: a fresh client offers an EMPTY account, so the server pushes the full
-/// state, with no head to bridge from (generate_entity_delta Case 3). The
+/// state, with no head to bridge from. The
 /// history depth therefore affects only the excluded setup; the measured region
 /// is one final-state snapshot adoption and is expected to be roughly FLAT in
 /// depth. This is still a useful number (fresh-client first-fetch latency), but
@@ -306,10 +304,9 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
 
 /// Time a STALE client catching up an entity the server advanced by `gap`
 /// events while the client was disconnected. This is the only shape that
-/// produces `DeltaContent::EventBridge`: the re-fetch's offer lists the
-/// client's stale head, the server builds the bridge from stale head to
-/// current head (generate_entity_delta Case 2), and the client applies the gap
-/// events through the bridge arm.
+/// produces an event bridge: the re-fetch's offer lists the client's stale
+/// head, the server builds the bridge from stale head to current head, and the
+/// client applies the gap events the bridge carries.
 ///
 /// Per iteration: (setup, excluded) server creates the entity; the client
 /// connects and fetches once so it persists the entity at that head, then
@@ -319,17 +316,11 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
 /// (two peer registrations and two task spawns) is negligible against the
 /// bridge at any gap.
 ///
-/// The server repairs with the smaller of the bridge and the entity's state, so
-/// the entity's title makes its state outweigh its gap's events.
-///
 /// Guards: the client must reach the final state and hold at least `gap`
-/// events locally. A snapshot over the stale head would commit them too,
-/// through the lineage check that adopts it, so the title is what keeps this
-/// lane on the bridge.
+/// events locally. A state over the stale head would commit them too, through
+/// the lineage check that adopts it; the server sends the bridge because it
+/// sends one whenever it can build one from the requester's head.
 fn bench_bridge_catchup(c: &mut Criterion) {
-    /// Title bytes per gap edit: more data than the edit's event carries.
-    const TITLE_BYTES_PER_EDIT: usize = 512;
-
     let rt = multi_thread_runtime();
     let mut group = c.benchmark_group("bridge_catchup");
     group.sample_size(10); // Deep-gap setup per iteration is expensive; keep samples modest.
@@ -348,14 +339,12 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         let server_ctx = server.context_async(CTX).await.unwrap();
                         let doc = {
                             let trx = server_ctx.begin();
-                            let title = "x".repeat(gap * TITLE_BYTES_PER_EDIT);
-                            let doc = trx.create(&Doc { title, body: "0".into() }).await.unwrap();
+                            let doc = trx.create(&Doc { title: "chain".into(), body: "0".into() }).await.unwrap();
                             let read = doc.read().unwrap();
                             trx.commit().await.unwrap();
                             read
                         };
                         let doc_id = doc.id();
-                        let query = format!("id = '{doc_id}'");
 
                         let client = ephemeral();
                         let conn = LocalProcessConnection::new(&client, &server).await.unwrap();
@@ -365,7 +354,7 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         // First fetch: persists the entity locally at the current
                         // head (snapshot-served; the fetch returns once its
                         // pushes have applied, so the head is durable on the client here).
-                        let first = client_ctx.fetch::<DocView>(query.as_str()).await.unwrap();
+                        let first = client_ctx.fetch::<DocView>("title = 'chain'").await.unwrap();
                         assert_eq!(first.len(), 1, "client must hold the entity before going stale");
 
                         // Disconnect, then advance the server by `gap` edits.
@@ -376,17 +365,17 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                             trx.commit().await.unwrap();
                         }
 
-                        // --- Measured: reconnect + re-fetch (EventBridge served). ---
+                        // --- Measured: reconnect + re-fetch (bridge served). ---
                         let start = Instant::now();
                         let _conn2 = LocalProcessConnection::new(&client, &server).await.unwrap();
-                        let results = client_ctx.fetch::<DocView>(query.as_str()).await.unwrap();
+                        let results = client_ctx.fetch::<DocView>("title = 'chain'").await.unwrap();
                         total += start.elapsed();
 
                         // Correctness guard: the client must reach the final state.
                         assert_eq!(results.len(), 1, "client must materialize the entity");
                         assert_eq!(results[0].body().unwrap(), gap.to_string(), "client must reach the final state after catch-up");
                         // Guard: the gap events were committed on the client,
-                        // as the bridge arm commits each one.
+                        // as the bridge commits each one.
                         let stored = client.storage.dump_entity_events(doc_id).await.unwrap();
                         assert!(
                             stored.len() >= gap,

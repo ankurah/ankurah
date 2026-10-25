@@ -4,7 +4,7 @@ use ulid::Ulid;
 
 use crate::{
     auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityHead, EntityState,
-    EventFragment, EventId, KnownState, RegisterModel, RegisteredModel, SpanAnswer, SpanQuestion, StateFragment, TreeSpec,
+    EventId, KnownState, RegisterModel, RegisteredModel, SpanAnswer, SpanQuestion, TreeSpec,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -80,31 +80,6 @@ pub struct CausalAssertion {
     pub other: Clock,
     // Directionality: subject CausalRelations other
     pub relation: CausalRelation,
-}
-
-/// Wire-minimal lineage attestation (omits heads that are reconstructible)
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct CausalAssertionFragment {
-    pub relation: CausalRelation,
-    pub attestations: crate::auth::AttestationSet,
-}
-
-/// Content for entity initialization - either bridge, state, or attested state
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum DeltaContent {
-    /// The full state snapshot, when no event bridge from the receiver's known head serves
-    StateSnapshot { state: StateFragment },
-    /// The events from the receiver's known head, across a small event gap
-    EventBridge { events: Vec<EventFragment> },
-    /// Across a large event gap from the receiver's known head; send state + causal assertion
-    StateAndRelation { state: StateFragment, relation: CausalAssertionFragment },
-}
-
-/// Data that brings a receiver's copy of an entity to its sender's state
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct EntityDelta {
-    pub entity_id: EntityId,
-    pub content: DeltaContent,
 }
 
 /// The body of a request from one node to another
@@ -260,15 +235,6 @@ impl TryFrom<GetResult> for Attested<EntityState> {
     }
 }
 
-impl TryFrom<GetResult> for EntityDelta {
-    type Error = GetFailure;
-
-    fn try_from(result: GetResult) -> Result<Self, Self::Error> {
-        let state = Attested::<EntityState>::try_from(result)?;
-        Ok(Self { entity_id: state.payload.entity_id, content: DeltaContent::StateSnapshot { state: state.into() } })
-    }
-}
-
 impl std::fmt::Display for NodeRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Request {} from {}->{}: {}", self.id, self.from, self.to, self.body)
@@ -334,25 +300,6 @@ impl std::fmt::Display for NodeResponseBody {
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
-        }
-    }
-}
-
-impl std::fmt::Display for EntityDelta {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.content {
-            DeltaContent::StateSnapshot { state } => write!(f, "EntityDelta {}: StateSnapshot({})", self.entity_id, state),
-            DeltaContent::EventBridge { events } => {
-                let mut event_strs = Vec::new();
-                for event in events {
-                    let event = Attested::<Event>::from_parts(self.entity_id, event.clone());
-                    event_strs.push(event.payload.to_string());
-                }
-                write!(f, "EntityDelta {}: EventBridge({})", self.entity_id, event_strs.join(", "))
-            }
-            DeltaContent::StateAndRelation { state, relation: _ } => {
-                write!(f, "EntityDelta {}: StateAndRelation({})", self.entity_id, state)
-            }
         }
     }
 }

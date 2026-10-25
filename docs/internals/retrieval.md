@@ -116,7 +116,7 @@ repeats the decision from a fresh fork. A bare snapshot that is not adopted
 requires no write.
 
 The same parent-first rule applies to every multi-event wire shape --
-`EventOnly`, `StateAndEvent`, and `EventBridge` (in `apply_delta`) alike: the
+`EventOnly` and `StateAndEvent` alike: the
 receiver stages the whole batch upfront, topologically sorts it by in-batch
 parent edges (`event_dag/ordering.rs`), and only then applies and submits
 canonical state. The producer also sorts what it sends, but wire

@@ -63,8 +63,7 @@ impl Fixture {
         let peer = EntityId::from_bytes([5; 32]);
         match ingress {
             SnapshotIngress::Snapshot => {
-                let delta = proto::EntityDelta { entity_id: self.entity.id(), content: proto::DeltaContent::StateSnapshot { state } };
-                NodeApplier::apply_delta(&self.node, &peer, delta, &self.events, &states).await?;
+                NodeApplier::apply_state(&self.node, &peer, (self.entity.id(), state).into(), Vec::new(), &self.events, &states).await?;
             }
             SnapshotIngress::StateAndEvent | SnapshotIngress::DivergedStateAndEvent => {
                 let update = proto::SubscriptionUpdateItem {
@@ -86,12 +85,11 @@ enum SnapshotIngress {
     DivergedStateAndEvent,
 }
 
-/// The ingresses that carry events from a peer.
+/// The ingresses that carry events from a peer. An event bridge travels as `EventOnly`.
 #[derive(Clone, Copy, Debug)]
 enum EventIngress {
     EventOnly,
     StateAndEvent,
-    EventBridge,
 }
 
 impl Fixture {
@@ -106,11 +104,6 @@ impl Fixture {
                 proto::StateFragment { state: self.entity.to_state()?, attestations: Default::default() },
                 fragments,
             ),
-            EventIngress::EventBridge => {
-                let delta =
-                    proto::EntityDelta { entity_id: self.entity.id(), content: proto::DeltaContent::EventBridge { events: fragments } };
-                return NodeApplier::apply_delta(&self.node, &peer, delta, &self.events, &states).await.map(|_| ());
-            }
         };
         let update = proto::SubscriptionUpdateItem { entity_id: self.entity.id(), content, predicate_relevance: vec![] };
         NodeApplier::apply_update(&self.node, &peer, update, &self.events, &states).await.map(|_| ())
@@ -125,17 +118,14 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
     node.system.wait_loaded().await?;
     let state = source.storage.get_state(source.entity.id()).await?.payload.state;
     assert!(!state.head.is_empty());
-    let delta = proto::EntityDelta {
-        entity_id: source.entity.id(),
-        content: proto::DeltaContent::StateSnapshot {
-            state: proto::StateFragment { state: state.clone(), attestations: Default::default() },
-        },
-    };
+    let snapshot: Attested<proto::EntityState> =
+        (source.entity.id(), proto::StateFragment { state: state.clone(), attestations: Default::default() }).into();
     storage.fail_next_commit();
-    let failed = NodeApplier::apply_delta(
+    let failed = NodeApplier::apply_state(
         &node,
         &EntityId::from_bytes([5; 32]),
-        delta.clone(),
+        snapshot.clone(),
+        Vec::new(),
         &LocalEventGetter::new(storage.clone(), false),
         &LocalStateGetter::new(storage.clone()),
     )
@@ -144,10 +134,11 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
     assert!(node.entities.get(&source.entity.id()).is_none());
     assert!(matches!(storage.get_state(source.entity.id()).await, Err(RetrievalError::EntityNotFound(_))));
 
-    let change = NodeApplier::apply_delta(
+    let change = NodeApplier::apply_state(
         &node,
         &EntityId::from_bytes([5; 32]),
-        delta,
+        snapshot,
+        Vec::new(),
         &LocalEventGetter::new(storage.clone(), false),
         &LocalStateGetter::new(storage.clone()),
     )
@@ -531,20 +522,17 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
-    let delta = proto::EntityDelta {
-        entity_id: fixture.entity.id(),
-        content: proto::DeltaContent::StateSnapshot {
-            state: proto::StateFragment { state: candidate.to_state()?, attestations: Default::default() },
-        },
-    };
+    let snapshot: Attested<proto::EntityState> =
+        (fixture.entity.id(), proto::StateFragment { state: candidate.to_state()?, attestations: Default::default() }).into();
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
     *fixture.storage.hold_set_state.lock().unwrap() = Some((entered, release_rx));
     let mut applying = Box::pin(async {
-        NodeApplier::apply_delta(
+        NodeApplier::apply_state(
             &fixture.node,
             &EntityId::from_bytes([5; 32]),
-            delta,
+            snapshot,
+            Vec::new(),
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
         )
@@ -585,16 +573,12 @@ async fn unchanged_bare_snapshots_do_not_write_storage() -> anyhow::Result<()> {
     // Any attempted commit would fail, even if it only rewrote the same state.
     fixture.storage.fail_next_commit();
     for snapshot in [current.clone(), older, concurrent] {
-        let delta = proto::EntityDelta {
-            entity_id: fixture.entity.id(),
-            content: proto::DeltaContent::StateSnapshot {
-                state: proto::StateFragment { state: snapshot, attestations: Default::default() },
-            },
-        };
-        assert!(NodeApplier::apply_delta(
+        let snapshot = (fixture.entity.id(), proto::StateFragment { state: snapshot, attestations: Default::default() }).into();
+        assert!(NodeApplier::apply_state(
             &fixture.node,
             &EntityId::from_bytes([5; 32]),
-            delta,
+            snapshot,
+            Vec::new(),
             &fixture.events,
             &LocalStateGetter::new(fixture.storage.clone()),
         )
@@ -630,7 +614,7 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
 
 #[tokio::test]
 async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent] {
         let fixture = Fixture::new().await?;
         let foreign = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
         cache(&fixture.storage, &[&foreign]).await?;
@@ -723,30 +707,24 @@ async fn event_only_discards_the_batch_without_partial_failed_operations() -> an
 }
 
 #[tokio::test]
-async fn state_and_event_bridges_discard_the_batch_on_operation_failure() -> anyhow::Result<()> {
-    for ingress in [EventIngress::StateAndEvent, EventIngress::EventBridge] {
-        let fixture = Fixture::new().await?;
-        let before = fixture.entity.to_state()?;
-        let first =
-            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("first")?]));
-        let failed = Event::update(
-            fixture.entity.id(),
-            Clock::singleton(&first),
-            AuthorId::Unknown,
-            OperationSet(vec![Operation::Backend {
-                backend: "yrs".into(),
-                operations: vec![proto::BackendOperation { diff: vec![0xff] }],
-            }]),
-        );
-        let (notifications, observed) = mpsc::channel();
-        let _listener = fixture.entity.broadcast().reference().listen(notifications);
-        let error = fixture.deliver(ingress, vec![first.clone(), failed.clone()]).await.unwrap_err();
-        assert!(matches!(error, MutationError::StateError(_)), "{ingress:?}: {error}");
-        assert_eq!(fixture.entity.to_state()?, before, "{ingress:?}");
-        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before, "{ingress:?}");
-        assert!(fixture.storage.get_events(vec![first.id(), failed.id()]).await?.is_empty(), "{ingress:?}");
-        assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{ingress:?}");
-    }
+async fn state_and_event_discards_the_batch_on_operation_failure() -> anyhow::Result<()> {
+    let fixture = Fixture::new().await?;
+    let before = fixture.entity.to_state()?;
+    let first = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("first")?]));
+    let failed = Event::update(
+        fixture.entity.id(),
+        Clock::singleton(&first),
+        AuthorId::Unknown,
+        OperationSet(vec![Operation::Backend { backend: "yrs".into(), operations: vec![proto::BackendOperation { diff: vec![0xff] }] }]),
+    );
+    let (notifications, observed) = mpsc::channel();
+    let _listener = fixture.entity.broadcast().reference().listen(notifications);
+    let error = fixture.deliver(EventIngress::StateAndEvent, vec![first.clone(), failed.clone()]).await.unwrap_err();
+    assert!(matches!(error, MutationError::StateError(_)), "{error}");
+    assert_eq!(fixture.entity.to_state()?, before);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
+    assert!(fixture.storage.get_events(vec![first.id(), failed.id()]).await?.is_empty());
+    assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
     Ok(())
 }
 
@@ -754,7 +732,7 @@ async fn state_and_event_bridges_discard_the_batch_on_operation_failure() -> any
 /// bound before any read. Preparation failure rejects the entire batch on every ingress.
 #[tokio::test]
 async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent] {
         for parent_in_batch in [false, true] {
             let fixture = Fixture::new().await?;
             let genesis = fixture.entity.head();
@@ -784,7 +762,7 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
 /// No event in the batch is applied when history preparation fails.
 #[tokio::test]
 async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_is_judged() -> anyhow::Result<()> {
-    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent] {
         let fixture = Fixture::new().await?;
         let genesis = fixture.entity.head();
         let honest = Event::update(fixture.entity.id(), genesis.clone(), AuthorId::Unknown, OperationSet::default());
@@ -835,8 +813,9 @@ async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_
     let states = LocalStateGetter::new(storage.clone());
     let snapshot = State { memberships: [model_a()].into(), head: head.clone(), ..State::default() };
     let state = proto::StateFragment { state: snapshot, attestations: Default::default() };
-    let delta = proto::EntityDelta { entity_id: genesis.entity_id, content: proto::DeltaContent::StateSnapshot { state } };
-    let change = NodeApplier::apply_delta(&node, &peer, delta, &events, &states).await?.expect("the snapshot creates the entity");
+    let state = (genesis.entity_id, state).into();
+    let change =
+        NodeApplier::apply_state(&node, &peer, state, Vec::new(), &events, &states).await?.expect("the snapshot creates the entity");
     let (entity, _) = change.into_parts();
     assert!(storage.get_events(vec![newer.id(), older.id()]).await?.is_empty(), "a snapshot brings no events");
 
@@ -989,8 +968,9 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     let states = LocalStateGetter::new(storage.clone());
     let snapshot = State { memberships: [model_a()].into(), head: Clock::singleton(&tip), ..State::default() };
     let state = proto::StateFragment { state: snapshot, attestations: Default::default() };
-    let delta = proto::EntityDelta { entity_id: genesis.entity_id, content: proto::DeltaContent::StateSnapshot { state } };
-    let change = NodeApplier::apply_delta(&node, &peer, delta, &events, &states).await?.expect("the snapshot creates the entity");
+    let state = (genesis.entity_id, state).into();
+    let change =
+        NodeApplier::apply_state(&node, &peer, state, Vec::new(), &events, &states).await?.expect("the snapshot creates the entity");
     let (entity, _) = change.into_parts();
     cache(&storage, &[&genesis, &tip]).await?;
     let admitted_head = Clock::from_events([&tip, &update]);
@@ -1045,8 +1025,9 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
         let states = LocalStateGetter::new(storage.clone());
         let snapshot = State { memberships: [model_a()].into(), head: Clock::singleton(&tip), ..State::default() };
         let state = proto::StateFragment { state: snapshot, attestations: Default::default() };
-        let delta = proto::EntityDelta { entity_id: genesis.entity_id, content: proto::DeltaContent::StateSnapshot { state } };
-        let change = NodeApplier::apply_delta(&node, &peer, delta, &events, &states).await?.expect("the snapshot creates the entity");
+        let state = (genesis.entity_id, state).into();
+        let change =
+            NodeApplier::apply_state(&node, &peer, state, Vec::new(), &events, &states).await?.expect("the snapshot creates the entity");
         let (entity, _) = change.into_parts();
         cache(&storage, &[&genesis, &tip]).await?;
         let admitted_head = Clock::from_events([&tip, &update]);

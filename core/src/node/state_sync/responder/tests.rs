@@ -96,14 +96,13 @@ async fn an_offer_under_a_spec_no_tree_serves_is_answered_under_entity_id_keys_a
 async fn pushes_fill_updates_by_count_and_by_size() -> anyhow::Result<()> {
     let node = durable().await?;
     let (peer, mut messages) = recording_peer(&node).await?;
-    let delta = |state: proto::Attested<proto::EntityState>| proto::EntityDelta {
-        entity_id: state.payload.entity_id,
-        content: proto::DeltaContent::StateSnapshot { state: state.into() },
+    let add_state = |push: &mut Push, state: proto::Attested<proto::EntityState>| {
+        push.add(&node, state.payload.entity_id, proto::UpdateContent::StateAndEvent(state.into(), vec![]))
     };
 
     let mut push = Push::new(peer, vec![]);
     for state in states(MAX_PAGE_HEADS + 1, 10) {
-        push.add(&node, delta(state))?;
+        add_state(&mut push, state);
     }
     push.send(&node);
     let counts: Vec<_> = pushed(&mut messages, MAX_PAGE_HEADS + 1).await.iter().map(Vec::len).collect();
@@ -114,7 +113,7 @@ async fn pushes_fill_updates_by_count_and_by_size() -> anyhow::Result<()> {
     let mut push = Push::new(peer, vec![]);
     for mut state in states(3, 200 * 1024) {
         state.attestations = attested();
-        push.add(&node, delta(state))?;
+        add_state(&mut push, state);
     }
     push.send(&node);
     let counts: Vec<_> = pushed(&mut messages, 3).await.iter().map(Vec::len).collect();
@@ -124,14 +123,14 @@ async fn pushes_fill_updates_by_count_and_by_size() -> anyhow::Result<()> {
     for _ in 0..3 {
         let event = labeled(None, &"x".repeat(200 * 1024))?;
         let events = vec![proto::Attested { payload: event.clone(), attestations: attested() }.into()];
-        push.add(&node, proto::EntityDelta { entity_id: event.entity_id, content: proto::DeltaContent::EventBridge { events } })?;
+        push.add(&node, event.entity_id, proto::UpdateContent::EventOnly(events));
     }
     push.send(&node);
     let counts: Vec<_> = pushed(&mut messages, 3).await.iter().map(Vec::len).collect();
     assert_eq!(counts, [2, 1], "a bridge counts its events' data the same way");
 
     let mut push = Push::new(peer, vec![]);
-    push.add(&node, delta(states(1, 2 * 1024 * 1024).pop().unwrap()))?;
+    add_state(&mut push, states(1, 2 * 1024 * 1024).pop().unwrap());
     push.send(&node);
     assert_eq!(pushed(&mut messages, 1).await.len(), 1, "an item larger than the bound still goes, alone");
     Ok(())

@@ -113,16 +113,16 @@ where
     let entities: Vec<_> =
         entities.into_iter().map(|entity| (entity.entity_id, (!entity.head.is_empty()).then_some(entity.head))).collect();
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
-    let repairs = current_state_repairs(node, &policy, &entities, &credentials, is_catalog_read(&selection.predicate)).await?;
+    let repairs = current_state_repairs(node, &policy, &entities, is_catalog_read(&selection.predicate)).await?;
     let mut push = Push::new(peer, Vec::new());
     let (mut held, mut unavailable) = (Vec::new(), Vec::new());
-    for ((entity_id, known), repair) in entities.into_iter().zip(repairs) {
+    for ((entity_id, _), repair) in entities.into_iter().zip(repairs) {
         match repair {
-            CurrentStateRepair::Denied => unavailable.push(entity_id),
-            CurrentStateRepair::Current => held.push(proto::EntityHead { entity_id, head: known.unwrap_or_default() }),
-            CurrentStateRepair::Delta { head, delta } => {
+            CurrentStateRepair::Unavailable => unavailable.push(entity_id),
+            CurrentStateRepair::Current { head } => held.push(proto::EntityHead { entity_id, head }),
+            CurrentStateRepair::Lacking { head, content } => {
                 held.push(proto::EntityHead { entity_id, head });
-                push.add(node, delta)?;
+                push.add(node, entity_id, content);
             }
         }
     }
