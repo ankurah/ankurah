@@ -229,6 +229,7 @@ where
     async fn until_ready(&mut self, mut target: Target, push: OpeningPush) -> Result<(), RetrievalError> {
         let mut last = usize::MAX;
         let mut unpushed_repaired = false;
+        let mut idle_since = Instant::now();
         loop {
             let (outstanding, mut changes) = self.outstanding(&mut target).await?;
             if outstanding.is_empty() {
@@ -236,6 +237,7 @@ where
             }
             if outstanding.len() < last {
                 self.deadline.progressed();
+                idle_since = Instant::now();
             }
             last = outstanding.len();
             if !unpushed_repaired {
@@ -246,20 +248,32 @@ where
                     continue;
                 }
             }
-            let changed = {
+            let remaining = self.deadline.interval().saturating_sub(idle_since.elapsed());
+            let woke = if remaining.is_zero() {
+                None
+            } else {
                 let changed = changes.changed();
                 futures::pin_mut!(changed);
-                let idle = futures_timer::Delay::new(self.deadline.interval());
-                matches!(futures::future::select(changed, idle).await, Either::Left(_))
+                match futures::future::select(changed, futures_timer::Delay::new(remaining)).await {
+                    Either::Left((changed, _)) => Some(changed.is_ok()),
+                    Either::Right(_) => None,
+                }
             };
-            if changed {
-                self.deadline.progressed();
-                continue;
+            match woke {
+                Some(true) => {
+                    self.deadline.progressed();
+                    idle_since = Instant::now();
+                }
+                // The resident stopped, as a catalog change stops it: look at a new one.
+                Some(false) => {}
+                None => {
+                    if !self.deadline.compare_again() {
+                        return Err(RetrievalError::SyncStalled { peer: self.peer });
+                    }
+                    self.repair(&mut target, outstanding, &OpeningPush::nothing()).await?;
+                    idle_since = Instant::now();
+                }
             }
-            if !self.deadline.compare_again() {
-                return Err(RetrievalError::SyncStalled { peer: self.peer });
-            }
-            self.repair(&mut target, outstanding, &OpeningPush::nothing()).await?;
         }
     }
 }
