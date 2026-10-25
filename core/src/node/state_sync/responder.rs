@@ -14,10 +14,11 @@ mod size;
 mod tests;
 
 use self::{
+    comparison::ComparedDigests,
     push::{spawn_push, Push},
     repair::{current_state_repairs, CurrentStateRepair},
 };
-use super::tree::{entity_id_spec, serves};
+use super::tree::{entity_id_spec, serves, Snapshot};
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
@@ -43,10 +44,10 @@ pub(crate) enum OfferedIn {
 /// Answer a requester's offer of `selection`'s result, which a Fetch or a
 /// SubscribeQuery carries: compare it with a snapshot of the resident tree that
 /// serves `selection` for `credentials`, push `peer` every entity the
-/// comparison finds it lacks, and return the snapshot's own account. An offer
-/// under a spec no tree here serves, as when two catalogs type a key part
-/// differently, is answered under the entity-id spec and treated as unknown,
-/// so the requester still gets every member.
+/// comparison finds it lacks, and return the snapshot's account as the target.
+/// An offer under a spec no tree here serves, as when two catalogs type a key
+/// part differently, is answered under the entity-id spec and treated as
+/// unknown, so the requester still gets every member.
 pub(crate) async fn answer_offer<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
@@ -69,8 +70,8 @@ where
     };
     let spec = known.spec.clone();
     let mut snapshot = node.resident_trees.snapshot(node, selection, Some(spec), credentials.clone()).await?.snapshot;
+    let target = target(&mut snapshot, &known).await?;
     let lacking = comparison::lacking(&snapshot, known);
-    let target = snapshot.offer().await?;
     // The push reads current states, never the snapshot: holding it would copy
     // the tree's entries at its next commit.
     drop(snapshot);
@@ -80,6 +81,22 @@ where
     };
     spawn_push(node, lacking, credentials, catalog, Push::new(node, peer, relevance, cancel));
     Ok(target)
+}
+
+/// The target answering `known`, a valid offer under `snapshot`'s spec. An
+/// offer of span digests is answered over its own spans, listing the
+/// snapshot's heads where they fit within each span whose digest differs: the
+/// push brings nothing within a nonempty offered digest, so a digest there
+/// would cost the requester a descent, while heads let it cover its own newer
+/// heads at once and name what it lacks. Any other offer, or one whose spans
+/// would break an offer's limits, is answered with the snapshot's own account.
+async fn target(snapshot: &mut Snapshot, known: &KnownState) -> anyhow::Result<KnownState> {
+    if let Some(ComparedDigests { matching, differing }) = comparison::compare_digests(snapshot, known).await? {
+        if let Some(account) = snapshot.account_over(matching, differing).await? {
+            return Ok(account);
+        }
+    }
+    snapshot.offer().await
 }
 
 /// Answer each of `questions` about `selection`'s result in a tree under `spec`,

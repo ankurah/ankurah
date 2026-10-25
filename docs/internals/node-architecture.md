@@ -76,7 +76,10 @@ its local copy of the query's result: every entity head when the result is
 small, otherwise digests of spans of it. The responder compares the account
 with a snapshot of its own result, answers with its own `KnownState`, the
 target, and pushes as an update each entity the account shows the requester
-lacks or holds at another head, tagged `Initial` for a subscription. The
+lacks or holds at another head, tagged `Initial` for a subscription. Where the
+account gave digests, the target follows its spans: a span whose digest
+matches keeps it, and a span that differs lists the responder's heads where
+they fit, so the requester learns at once which of its entities differ. The
 requester's copy is ready when it matches or exceeds the target. The requester
 repairs what the pushes do not bring: at once where its account gave only
 digests, and whenever its copy stops progressing short of the target.
