@@ -190,10 +190,10 @@ impl SqliteExecutor for NodeJsConnection {
     /// would take it and discard a row it yields, so a statement that has
     /// columns steps through `get`, which hands the row over to be refused.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
-        let named_parameter = refuse_all_but_one_statement(sql)?;
-        let statement = self.prepare(sql)?;
+        let (statement_sql, named_parameter) = refuse_all_but_one_statement(sql)?;
+        let statement = self.prepare(statement_sql)?;
         let source = source(&statement)?;
-        refuse_sql_past_its_statement(sql, &source)?;
+        refuse_sql_past_its_statement(statement_sql, &source)?;
         refuse_a_named_parameter(named_parameter)?;
         let width = width(&statement)?;
         self.refuse_too_few_values(sql, params.len())?;
@@ -249,10 +249,10 @@ impl NodeJsConnection {
                 Err(error) => return Err(error),
             }
         }
-        let named_parameter = refuse_all_but_one_statement(sql)?;
-        let statement = self.prepare(sql)?;
+        let (statement_sql, named_parameter) = refuse_all_but_one_statement(sql)?;
+        let statement = self.prepare(statement_sql)?;
         let source = source(&statement)?;
-        refuse_sql_past_its_statement(sql, &source)?;
+        refuse_sql_past_its_statement(statement_sql, &source)?;
         refuse_a_named_parameter(named_parameter)?;
         let width = width(&statement)?;
         self.refuse_too_few_values(sql, params.len())?;

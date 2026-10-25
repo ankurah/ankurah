@@ -92,8 +92,11 @@ pub(super) fn source(statement: &JsValue) -> Result<String, SqliteError> {
 }
 
 /// Refuse SQL that holds no statement, or a second one, before SQLite
-/// prepares anything. Returns the statement's first named parameter, which
-/// the same pass over the SQL finds, for `refuse_a_named_parameter`.
+/// prepares anything. Returns the SQL up to the end of its one statement,
+/// which is what the executor prepares, so that neither driver reads the
+/// whitespace and comments after it, and the statement's first named
+/// parameter, for `refuse_a_named_parameter`, both found in the same pass
+/// over the SQL.
 ///
 /// - SQL that holds a second statement is refused as the native executor
 ///   refuses it: SQLite applies some PRAGMAs while it prepares them, and
@@ -106,19 +109,21 @@ pub(super) fn source(statement: &JsValue) -> Result<String, SqliteError> {
 ///   it is prepared, since node:sqlite can crash the process, in a later
 ///   `sqlite3_step`, once it collects a statement prepared from such SQL
 ///   while the database is open, as Node.js 24.13.0 does.
-pub(super) fn refuse_all_but_one_statement(sql: &str) -> Result<Option<&str>, SqliteError> {
+pub(super) fn refuse_all_but_one_statement(sql: &str) -> Result<(&str, Option<&str>), SqliteError> {
     match statement_scan::statements(sql) {
-        Statements::One { named_parameter } => Ok(named_parameter),
+        Statements::One { end, named_parameter } => Ok((&sql[..end], named_parameter)),
         Statements::Several => Err(Refusal::MultipleStatements.into()),
         Statements::None => Err(Refusal::NoStatement.into()),
     }
 }
 
-/// Check where SQLite ended the statement it prepared from `sql`, which the
-/// scan before preparing found to be followed only by what SQLite skips:
-/// node:sqlite's `source` is the SQL up to the end of its first statement,
-/// and better-sqlite3's is the whole SQL. Should SQLite have found more, the
-/// SQL is refused.
+/// Check that SQLite ended the statement it prepared from `sql`, the SQL up
+/// to the end of the statement the scan before preparing found, where the
+/// scan ended it: node:sqlite's `source` is the SQL up to the end of the
+/// first statement SQLite found, and better-sqlite3's is the whole SQL, which
+/// it refuses to prepare when SQLite finds more. Should SQLite have ended
+/// the statement sooner, the SQL is refused, since the driver would run that
+/// statement alone.
 pub(super) fn refuse_sql_past_its_statement(sql: &str, source: &str) -> Result<(), SqliteError> {
     let rest = sql.strip_prefix(source).ok_or_else(|| unreadable(format!("{source:?} as the SQL of a statement prepared from {sql:?}")))?;
     if !statement_scan::holds_no_statement(rest) {

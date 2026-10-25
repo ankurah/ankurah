@@ -131,12 +131,13 @@ pub(crate) enum Statements<'s> {
     /// No statement: only what SQLite skips between statements, up to the
     /// end or a NUL (see `holds_no_statement`).
     None,
-    /// One statement, followed by no more than what SQLite skips, with the
-    /// first named parameter it has, if any: `:name`, `@name`, `#name` or
-    /// `$name`, with the `::` and `(…)` suffixes of SQLite's Tcl form, as
-    /// SQLite names it. better-sqlite3's SQLite is built without that form,
-    /// and fails to prepare SQL that uses it.
-    One { named_parameter: Option<&'s str> },
+    /// One statement, which ends at `end` (see `FirstStatement::end`) and is
+    /// followed by no more than what SQLite skips, with the first named
+    /// parameter it has, if any: `:name`, `@name`, `#name` or `$name`, with
+    /// the `::` and `(…)` suffixes of SQLite's Tcl form, as SQLite names it.
+    /// better-sqlite3's SQLite is built without that form, and fails to
+    /// prepare SQL that uses it.
+    One { end: usize, named_parameter: Option<&'s str> },
     /// A second statement after the first.
     Several,
 }
@@ -147,7 +148,7 @@ pub(crate) fn statements(sql: &str) -> Statements<'_> {
     if !first.found {
         Statements::None
     } else if holds_no_statement(&sql[first.end..]) {
-        Statements::One { named_parameter: first.named_parameter }
+        Statements::One { end: first.end, named_parameter: first.named_parameter }
     } else {
         Statements::Several
     }
@@ -155,11 +156,13 @@ pub(crate) fn statements(sql: &str) -> Statements<'_> {
 
 /// The first statement of some SQL, as one pass over its tokens finds it.
 struct FirstStatement<'s> {
-    /// Where it ends: just past the semicolon that ends it, or where the SQL
-    /// ends (at its end or a NUL) when none does. The whitespace, comments
-    /// and semicolons SQLite skips before a statement are no part of it, and
-    /// a CREATE TRIGGER statement goes on through the semicolons of its body
-    /// to the one after the body's END.
+    /// Where it ends: just past the semicolon that ends it, or, when none
+    /// does, just past its last token, so that whitespace and comments after
+    /// it, a comment that runs to the end of the SQL among them, are no part
+    /// of it. The whitespace, comments and semicolons SQLite skips before a
+    /// statement are no part of it either, and a CREATE TRIGGER statement
+    /// goes on through the semicolons of its body to the one after the
+    /// body's END.
     end: usize,
     /// Whether there is a statement at all, rather than only what SQLite skips.
     found: bool,
@@ -172,18 +175,18 @@ struct FirstStatement<'s> {
 fn first_statement(sql: &str) -> FirstStatement<'_> {
     let mut state = State::Start;
     let mut first = FirstStatement { end: 0, found: false, named_parameter: None };
-    for (kind, token) in tokens(sql) {
-        first.end = offset(sql, token) + token.len();
+    for (kind, text) in tokens(sql) {
         let token = match kind {
             TokenKind::Space => continue,
             TokenKind::Semicolon => CompletionToken::Semicolon,
-            TokenKind::Word => CompletionToken::of_word(token),
+            TokenKind::Word => CompletionToken::of_word(text),
             TokenKind::Parameter => {
-                first.named_parameter.get_or_insert(token);
+                first.named_parameter.get_or_insert(text);
                 CompletionToken::Other
             }
             TokenKind::Other => CompletionToken::Other,
         };
+        first.end = offset(sql, text) + text.len();
         state = NEXT[state as usize][token as usize];
         if token == CompletionToken::Semicolon && state == State::Start && first.found {
             return first;
@@ -357,15 +360,19 @@ mod tests {
     ];
 
     /// `first_statement` ends each statement where `sqlite3_complete` first
-    /// calls the SQL complete, past what SQLite skips before it.
+    /// calls the SQL complete, past what SQLite skips before it, and one that
+    /// no semicolon ends where SQLite's parser finds no statement in the rest.
     #[test]
     fn statements_end_where_sqlite3_complete_ends_them() {
+        let connection = Connection::open_in_memory().unwrap();
         let complete = |sql: &str| unsafe { ffi::sqlite3_complete(CString::new(sql).unwrap().as_ptr()) == 1 };
+        let no_statement = |sql: &str| matches!(Batch::new(&connection, sql).next(), Ok(None));
         for sql in STATEMENTS {
             let start = sql.len() - skip_to_statement(sql).len();
-            let expected =
-                (start + 1..=sql.len()).find(|&end| sql.as_bytes()[end - 1] == b';' && complete(&sql[..end])).unwrap_or(sql.len());
-            assert_eq!(first_statement(sql).end, expected, "{sql:?}");
+            let expected = (start + 1..=sql.len())
+                .find(|&end| sql.as_bytes()[end - 1] == b';' && complete(&sql[..end]))
+                .or_else(|| (start..=sql.len()).find(|&end| sql.is_char_boundary(end) && no_statement(&sql[end..])));
+            assert_eq!(Some(first_statement(sql).end), expected, "{sql:?}");
         }
     }
 
@@ -487,7 +494,10 @@ mod tests {
                 tokens(sql).filter(|(kind, _)| *kind == TokenKind::Parameter).map(|(_, parameter)| parameter).collect();
             scanned.retain(|name| seen.insert(*name));
             assert_eq!(scanned, named, "{sql:?}");
-            assert_eq!(statements(sql), Statements::One { named_parameter: named.first().copied() }, "{sql:?}");
+            assert!(
+                matches!(statements(sql), Statements::One { named_parameter, .. } if named_parameter == named.first().copied()),
+                "{sql:?}"
+            );
         }
     }
 }

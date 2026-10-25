@@ -9,13 +9,12 @@ use crate::common::{self, engine_test};
 /// SQL that holds a second statement is refused before either runs, on
 /// every driver, where rusqlite and node:sqlite on their own run the first
 /// and ignore the rest. Whitespace, semicolons and comments after a
-/// statement are no second statement, except that better-sqlite3 refuses a
-/// query with a comment after its semicolon (see `SqliteExecutor`); a byte
-/// SQLite cannot read after it is.
+/// statement are no second statement; a byte SQLite cannot read after it
+/// is.
 #[engine_test]
 async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
     let storage = common::open_in_memory().await?;
-    let (refused, created, accepted, commented) = storage
+    let (refused, created, accepted) = storage
         .with_executor(|executor| {
             let refused = [
                 executor.execute("CREATE TABLE a (x); CREATE TABLE b (x)", &[]),
@@ -36,8 +35,7 @@ async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
                 executor.query("SELECT 1; \n", &[]).map(|rows| rows.len()),
             ]
             .map(|outcome| outcome.map_err(|error| error.to_string()));
-            let commented = executor.query("SELECT 1; -- a note", &[]).map(|rows| rows.len()).map_err(|error| error.refusal());
-            Ok((refused, created, accepted, commented))
+            Ok((refused, created, accepted))
         })
         .await?;
     for outcome in refused {
@@ -45,12 +43,6 @@ async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
     }
     assert_eq!(created, 0, "no statement of a refused string ran");
     assert_eq!(accepted, [Ok(1), Ok(1)]);
-    if common::on_better_sqlite3() {
-        // The typed reader cannot nest the comment better-sqlite3 keeps after the semicolon.
-        assert!(matches!(commented, Err(Some(Refusal::NotNestable(_)))), "{commented:?}");
-    } else {
-        assert_eq!(commented, Ok(1));
-    }
     Ok(())
 }
 
@@ -91,8 +83,10 @@ async fn a_refused_string_of_two_statements_changes_no_setting() -> Result<()> {
 /// `query` and `query_row` read past what SQLite skips before a statement,
 /// a UTF-8 byte order mark, semicolons and comments among it, on every
 /// driver, before a PRAGMA just as before a query: the Node.js executor nests
-/// the query past it in its typed reader. better-sqlite3 alone refuses a
-/// byte order mark after a statement, in its own words.
+/// the query past it in its typed reader. They read a statement followed by
+/// what SQLite skips after it, a comment that is never closed and a byte
+/// order mark among it, as `execute` runs one, since the Node.js executor
+/// prepares the statement alone.
 #[engine_test]
 async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -101,10 +95,20 @@ async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Re
             let timeouts = ["\u{FEFF}PRAGMA busy_timeout", "; PRAGMA busy_timeout"].map(|sql| {
                 executor.query_row(sql, &[]).and_then(|row| row.expect("one row").integer(0)).map_err(|error| error.to_string())
             });
-            let ones = ["; SELECT 1", ";; VALUES (1)", "/* c */ SELECT 1"].map(|sql| {
+            let ones = [
+                "; SELECT 1",
+                ";; VALUES (1)",
+                "/* c */ SELECT 1",
+                "SELECT 1; -- a note",
+                "SELECT 1;;",
+                "SELECT 1; /* c */",
+                "SELECT 1;\u{FEFF}",
+                "SELECT 1 /* unterminated",
+            ]
+            .map(|sql| {
                 let every = executor.query(sql, &[]).and_then(|rows| rows.iter().map(|row| row.integer(0)).collect::<Result<Vec<_>, _>>());
                 let first = executor.query_row(sql, &[]).and_then(|row| row.expect("one row").integer(0));
-                (every.map_err(|error| error.to_string()), first.map_err(|error| error.to_string()))
+                (sql, (every.map_err(|error| error.to_string()), first.map_err(|error| error.to_string())))
             });
             Ok((timeouts, ones, executor.execute("CREATE TABLE marked (x);\u{FEFF}", &[])))
         })
@@ -112,13 +116,10 @@ async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Re
     for timeout in timeouts {
         assert!(timeout.is_ok(), "{timeout:?}");
     }
-    assert_eq!(ones, [(Ok(vec![1]), Ok(1)), (Ok(vec![1]), Ok(1)), (Ok(vec![1]), Ok(1))]);
-    if common::on_better_sqlite3() {
-        let refusal = trailing.expect_err("better-sqlite3 reads the byte order mark as a second statement");
-        assert_eq!(common::javascript_message(&refusal), Some("The supplied SQL string contains more than one statement"), "{refusal}");
-    } else {
-        assert!(trailing.is_ok(), "{trailing:?}");
+    for (sql, read) in ones {
+        assert_eq!(read, (Ok(vec![1]), Ok(1)), "{sql:?}");
     }
+    assert!(trailing.is_ok(), "{trailing:?}");
     Ok(())
 }
 

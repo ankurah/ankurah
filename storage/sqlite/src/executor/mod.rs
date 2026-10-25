@@ -119,13 +119,6 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///   extension reaches this: better-sqlite3's JavaScript virtual tables give
 ///   their columns no type, node:sqlite has no virtual-table API, and
 ///   SQLite's own R*Tree returns REALs from its REAL columns.
-/// - better-sqlite3 refuses a query whose SQL holds more than whitespace
-///   after the semicolon that ends its statement, as `SELECT 1; -- note`
-///   does: the typed reader nests the SQL better-sqlite3 prepared, which
-///   keeps what follows the semicolon.
-/// - better-sqlite3 refuses, in its own words, SQL in which a UTF-8 byte
-///   order mark follows a statement: its own check of what follows a
-///   statement does not read the mark as whitespace, as SQLite does.
 /// - Errors take each target's own variants of [`SqliteError`]. Natively
 ///   every error SQLite raises, and every refusal of rusqlite's, is a
 ///   `SqliteError::Rusqlite`. On Node.js an error SQLite raised is a
