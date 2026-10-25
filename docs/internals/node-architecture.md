@@ -27,7 +27,7 @@ caches it locally.
 This distinction surfaces in one critical API:
 `storage_is_definitive()`. On a durable node this returns `true` -- a
 negative lookup is conclusive. On an ephemeral node it returns `false`,
-which forces the system to do a deeper [DAG traversal](event-dag.md#generation-guided-traversal)
+which forces the system to do a deeper [DAG traversal](event-dag.md#bfs-traversal)
 instead of taking the shortcut. See the
 [creation-event guard](entity-lifecycle.md#guard-ordering) for the main place
 this matters.
@@ -38,41 +38,71 @@ the [Event Retrieval and Staging](retrieval.md) document.
 
 ## The Replication Protocol
 
-Data moves between nodes through two mechanisms: **streaming updates** (pushed)
-and **request/response deltas** (pulled). Both carry entity state and/or events,
-but they serve different moments in the lifecycle.
+Data moves between nodes through two mechanisms: **streaming updates**, which
+a node pushes to a peer on the update channel their connection carries, and
+**requests**, each of which gets exactly one response. Entity data travels in
+updates: a query's initial data, the data its repairs ask for, and a
+subscription's live changes all arrive the same way. The requests that open and
+repair a query, and their responses, exchange accounts of the query's result
+rather than entity data. `Get` and `GetEvents`, which read entities and events
+by ID, still answer with them directly.
 
 ### Streaming updates (`UpdateContent`)
 
-Once an ephemeral node has an active subscription with a durable peer, the
-durable node pushes changes as they happen. An update item carries either the
-events alone (`EventOnly`, when the sender expects the receiver to already
-have the state) or the new entity state plus the events that produced it
-(`StateAndEvent`). `EventOnly` is a valid wire format handled by the
-receiver, though current senders always include state. On the receiving side
-the node validates the state, integrates the events via
-[`apply_events`](entity-lifecycle.md#how-events-are-applied), and persists the
+Each update carries `SubscriptionUpdateItem`s, one per entity. An item carries
+either the events alone (`EventOnly`) or an entity state plus events
+(`StateAndEvent`). A subscription's live change carries the new state with the
+events that produced it. Data that a comparison or a repair pushes carries
+either the events from the head the receiver holds, as `EventOnly`, or the
+current state alone, as `StateAndEvent` with no events
+([below](#comparing-query-results-knownstate)). On the receiving side the node
+validates what it receives, integrates the events via
+[`apply_event`](entity-lifecycle.md#how-events-are-applied), and persists the
 result. If the incoming state diverges from what the receiver already has,
-the receiver falls back to batch `apply_events` with
+the receiver falls back to event-by-event `apply_event` with
 [BFS comparison](event-dag.md#comparing-two-clocks).
 
-### Request/response deltas (`DeltaContent`)
+A node admits a peer's updates only while it holds a subscription with that
+peer or has a Fetch in flight with it, and applies them under those queries'
+credentials. An item can also name the queries it concerns on the sender and
+how the entity's membership changed in each (`Initial`, `Add` or `Remove`),
+but the receiver does not act on these tags: its own reactor decides what each
+applied change means for its queries.
 
-When a subscription is first established -- or when an ephemeral node runs a
-fetch -- the durable node assembles a delta for each entity. The choice of
-delta depends on what the requester already knows:
+### Comparing query results (`KnownState`)
 
-- **State snapshot** -- the requester has never seen the entity, or the gap is
-  too complex to bridge. The full state is sent.
-- **Event bridge** -- the requester has a known (older) head and the durable
-  node can trace a clean forward path through the DAG. Only the missing events
-  are sent, avoiding a full state transfer.
+`Fetch` and `SubscribeQuery` carry the requester's `KnownState`, an account of
+its local copy of the query's result: every entity head when the result is
+small, otherwise digests of spans of it. The responder compares the account
+with a snapshot of its own result, answers with its own `KnownState`, the
+target, and pushes as an update each entity the account shows the requester
+lacks or holds at another head, tagged `Initial` for a subscription. The
+requester's copy is ready when it matches or exceeds the target. The requester
+repairs what the pushes do not bring: at once where its account gave only
+digests, and whenever its copy stops progressing short of the target.
+`CompareSpans` asks for the responder's digests of spans of its result or a
+page of its heads, and `SyncEntities` names the entities to push, whose data
+again arrives as updates. The
+[synchronization guide](../learn/synchronization.md) walks through each step, and its
+[reference](../learn/synchronization/reference.html) lists the messages,
+readiness rules and limits.
+
+For each entity it pushes, the responder sends one of two forms, depending on
+what the requester holds:
+
+- **State** -- the requester holds no head of the entity, its head cannot be
+  bridged, or the bridge would be larger than the state. The current state is
+  sent.
+- **Event bridge** -- the requester holds an older head, the responder can
+  trace a clean forward path through the DAG from it to the current head, the
+  requester's read policy admits every event on that path, and the events are
+  smaller than the state. Only the missing events are sent.
 
 The event bridge is especially valuable after brief disconnections: a handful
 of events is far cheaper than retransmitting the full state. The bridge is
 built by walking backward from the current head through parent pointers until
-every frontier member is in the requester's known head, then reversing the
-collected events into causal (oldest-first) order.
+every frontier member is in the requester's known head, then sorting the
+collected events parents-first.
 
 > **Known limitation:** The backward walk currently has no traversal budget. A
 > stale or malicious `known_head` could trigger unbounded event collection.
@@ -87,10 +117,15 @@ The flow has three phases: establishment, streaming, and recovery.
 
 **Establishment.** When application code creates a live query on an ephemeral
 node, the node registers it as a pending subscription. When a durable peer is
-(or becomes) available, the node sends a subscribe request that includes a map
-of entities it already knows and their head clocks. The durable peer responds
-with deltas -- state snapshots for unknown entities, event bridges for known
-ones -- and begins monitoring its local reactor for future changes.
+(or becomes) available, the node sends `SubscribeQuery` with a `KnownState` of
+its local copy of the query's result. The durable peer installs the query in
+its reactor subscription for that peer before it takes the snapshot it
+compares, so every change reaches the copy either through the comparison or as
+a live update. It then answers with its target and pushes what the copy lacks,
+tagged `Initial`. The query is established once its copy matches or exceeds
+the target, not when the response arrives; the
+[live query walkthrough](../learn/synchronization/livequery.html) follows each
+step.
 
 **Streaming.** After establishment, the durable node pushes updates whenever
 entities matching the subscribed query change. The ephemeral node applies these
@@ -99,8 +134,17 @@ incrementally, as described [above](#streaming-updates-updatecontent).
 **Recovery.** If the durable peer disconnects, all subscriptions associated with
 it revert to pending and are automatically re-established when a new durable
 peer connects. A background retry loop (every 5 seconds) also picks up any
-subscriptions that failed with transient errors. Permanent failures (access
-denied, server error) are marked as failed and not retried.
+subscriptions that failed with transient errors, including a sync whose copy
+stopped progressing. Permanent failures (access denied, server error) are
+marked as failed and not retried.
+
+An update lost while the peer stays connected would otherwise go unnoticed
+until the entity changes again, so each established query also checks its copy
+against the durable peer's result periodically: first 30 seconds after it is
+established, then twice as long after each check that agrees, up to every 5
+minutes. Because updates still in flight can explain one disagreement, the
+query repairs its copy only when two checks in a row disagree, and checks again
+30 seconds after a disagreement or a repair.
 
 Each subscription carries context data used for policy validation of incoming
 events and state.
