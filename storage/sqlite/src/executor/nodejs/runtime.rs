@@ -63,12 +63,22 @@ impl NodeJsConnection {
         let options = Object::new();
         Reflect::set(&options, &"defensive".into(), &JsValue::FALSE).map_err(js_error)?;
         let database = Reflect::construct(&constructor, &Array::of2(&path.into(), &options)).map_err(js_error)?;
-        // The busy timeout comes before any other statement, as rusqlite sets
-        // it at open, since from_database's checks already read the file.
-        database_method(&database, "exec")?.call1(&database, &BUSY_TIMEOUT_PRAGMA.into()).map_err(js_error)?;
-        let connection = Self::from_database(database)?;
-        // Only a database the executor accepts is switched to WAL.
-        connection.exec(SESSION_PRAGMAS)?;
-        Ok(connection)
+        let set_up = || -> Result<Self, SqliteError> {
+            // The busy timeout comes before any other statement, as rusqlite
+            // sets it at open, since from_database's checks already read the
+            // file.
+            database_method(&database, "exec")?.call1(&database, &BUSY_TIMEOUT_PRAGMA.into()).map_err(js_error)?;
+            let connection = Self::from_database(database.clone())?;
+            // Only a database the executor accepts is switched to WAL.
+            connection.exec(SESSION_PRAGMAS)?;
+            Ok(connection)
+        };
+        // A database that fails its setup, such as one `from_database`
+        // refuses, is closed before the error returns, rather than left open
+        // on its file until it is collected. The setup's error is the one to
+        // report, so an error of the close is dropped.
+        set_up().inspect_err(|_| {
+            let _ = database_method(&database, "close").and_then(|close| close.call0(&database).map_err(js_error));
+        })
     }
 }

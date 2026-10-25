@@ -265,6 +265,33 @@ fn refuses_a_utf16_database_that_holds_a_table_named_pragma_encoding() {
     assert_eq!(error.refusal(), refused_database(DatabaseRefusal::NotUtf8), "{error}");
 }
 
+/// A database `open` builds and then refuses, here on a UTF-16 file, is
+/// closed before the refusal returns. The file is in WAL mode, whose WAL a
+/// database left open would hold, so that no other connection could take
+/// the file out of WAL mode.
+#[wasm_bindgen_test]
+fn open_closes_a_database_it_refuses() {
+    let file = common::TempDb::new("refused_by_open");
+    // node:sqlite's database on the file runs `sql`, through `exec` or as a
+    // query whose first value it returns, and closes.
+    let run = |sql: &str, query: bool| {
+        Function::new_with_args(
+            "path, sql, query",
+            "const database = new (process.getBuiltinModule('node:sqlite').DatabaseSync)(path);
+             try { return query ? Object.values(database.prepare(sql).get())[0] : database.exec(sql); }
+             finally { database.close(); }",
+        )
+        .call3(&JsValue::NULL, &file.path_str().into(), &sql.into(), &query.into())
+    };
+    run("PRAGMA encoding = 'UTF-16le'; PRAGMA journal_mode = WAL; CREATE TABLE t (v TEXT);", false).unwrap();
+    let error = NodeJsConnection::open(file.path_str()).err().expect("a UTF-16 file is refused");
+    assert_eq!(error.refusal(), refused_database(DatabaseRefusal::NotUtf8), "{error}");
+    let journal_mode = run("PRAGMA journal_mode = DELETE", true)
+        .map(|mode| mode.as_string())
+        .map_err(|error| String::from(error.unchecked_into::<js_sys::Error>().message()));
+    assert_eq!(journal_mode, Ok(Some("delete".to_owned())), "no other connection holds the file's WAL");
+}
+
 /// A host database whose statements pass through `tamper`: the body of a
 /// JavaScript function of `statement` and the `sql` it was prepared from,
 /// returning what the executor gets in its place, where `forward(target,
