@@ -83,10 +83,11 @@ where
     drop(connection);
     let request = proto::NodeRequestBody::Fetch { selection: sync.selection.clone(), known_state: offer.clone() };
     let target = match sync.open(request).await? {
-        proto::NodeResponseBody::Fetch(target) => target,
+        proto::NodeResponseBody::Fetch(target) => Target::new(target)?,
         other => return Err(RequestError::UnexpectedResponse(other).into()),
     };
-    Ok(sync.until_ready(Target::new(target)?, OpeningPush::of(&offer)).await??)
+    let push = OpeningPush::of(&offer, &target);
+    Ok(sync.until_ready(target, push).await??)
 }
 
 /// Subscribe `selection` as `query_id` at `peer`: offer the local copy, and
@@ -115,7 +116,8 @@ where
     };
     let target = Target::new(target)?;
     let spec = target.spec.clone();
-    sync.until_ready(target, OpeningPush::of(&offer)).await??;
+    let push = OpeningPush::of(&offer, &target);
+    sync.until_ready(target, push).await??;
     Ok(SyncedQuery { spec, round_trip: sync.round_trip })
 }
 
@@ -343,7 +345,14 @@ struct OpeningPush {
 }
 
 impl OpeningPush {
-    fn of(offer: &KnownState) -> Self {
+    /// The push that answered `offer` with `target`. A target under another
+    /// spec than the offer's is the entity-id fallback of a responder that no
+    /// tree under the offer's spec serves: it compared an empty offer instead,
+    /// so it pushes every member and no leaver.
+    fn of(offer: &KnownState, target: &Target) -> Self {
+        if target.spec != offer.spec {
+            return Self { digests: Vec::new(), listed: HashSet::new() };
+        }
         let mut push = Self { digests: Vec::new(), listed: HashSet::new() };
         for span in &offer.spans {
             match span {

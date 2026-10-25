@@ -96,8 +96,8 @@ async fn a_push_that_fails_to_apply_for_an_entity_the_sync_waits_on_ends_its_wai
     // The sync waits on the head it lacks and on the local member the account does not list.
     for waited_on in [lacking.entity_id, unsettled.entity_id] {
         let mut sync = QuerySync::new(&node, peer, members(), vec![]);
-        let push = OpeningPush::of(&sync.offer().await?);
         let target = Target::new(account(&[(lacking.entity_id, head(&lacking))])?)?;
+        let push = OpeningPush::of(&sync.offer().await?, &target);
         let started = Instant::now();
         let (result, ()) = tokio::join!(sync.until_ready(target, push), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -119,8 +119,8 @@ async fn failures_for_other_entities_or_from_other_peers_change_nothing() -> any
     let lacking = labeled(None, "lacking")?;
     let peer = EntityId::random();
     let mut sync = QuerySync::new(&node, peer, members(), vec![]);
-    let push = OpeningPush::of(&sync.offer().await?);
     let target = Target::new(account(&[(lacking.entity_id, head(&lacking))])?)?;
+    let push = OpeningPush::of(&sync.offer().await?, &target);
     let (ready, applied) = tokio::join!(sync.until_ready(target, push), async {
         tokio::time::sleep(Duration::from_millis(50)).await;
         node.apply_failures.publish(peer, failed_item(EntityId::random()));
@@ -236,8 +236,8 @@ async fn a_member_the_account_does_not_list_that_the_copy_gains_while_waiting_is
     connect(&responder, &requester).await?;
     let pushed = labeled(None, "pushed")?;
     let mut sync = QuerySync::new(&requester, responder.id, members(), vec![]);
-    let push = OpeningPush::of(&sync.offer().await?);
     let target = Target::new(account(&[(pushed.entity_id, head(&pushed))])?)?;
+    let push = OpeningPush::of(&sync.offer().await?, &target);
     let started = Instant::now();
     let (ready, landed) = tokio::join!(sync.until_ready(target, push), async {
         // The copy gains a member the responder never held, then the push the
@@ -322,5 +322,61 @@ async fn a_sync_entities_names_each_entity_once() -> anyhow::Result<()> {
     let mut target = Target::new(account(&[(held.entity_id, head(&held))])?)?;
     // The responder refuses a request that names an entity twice.
     sync.sync_entities(&mut target, vec![(held.entity_id, None), (held.entity_id, None)]).await?;
+    Ok(())
+}
+
+/// What of `outstanding` the push that answered `offer` with `target` leaves
+/// to repair: the heads, the bounds of the spans, and the unlisted members.
+fn unpushed(offer: &KnownState, target: &Target, outstanding: &Outstanding) -> (Vec<EntityId>, Vec<TreeSpan>, Vec<EntityId>) {
+    let unpushed = OpeningPush::of(offer, target).unpushed(outstanding);
+    (
+        unpushed.heads.iter().map(|head| head.entity_id).collect(),
+        unpushed.spans.iter().map(|region| region.bounds().clone()).collect(),
+        unpushed.unlisted.iter().map(|(id, _)| *id).collect(),
+    )
+}
+
+/// Outstanding: a head the copy lacks and a span not learned yet, both inside
+/// the whole tree, and unlisted members `listed_leaver` and `other`.
+fn outstanding_of(lacking: EntityId, listed_leaver: EntityId, other: EntityId) -> Outstanding {
+    Outstanding {
+        heads: vec![target::UncoveredHead { entity_id: lacking, address: vec![0; 40], local: None }],
+        spans: vec![target::Region::Unknown(TreeSpan::all())],
+        unlisted: vec![(listed_leaver, proto::Clock::default()), (other, proto::Clock::default())],
+    }
+}
+
+#[tokio::test]
+async fn an_opening_push_brings_what_the_offer_leaves_out_and_the_leavers_it_lists() -> anyhow::Result<()> {
+    let held = states(2, 8);
+    let (lacking, leaver, other) = (EntityId::random(), held[0].payload.entity_id, EntityId::random());
+    let mut copy = snapshot(held).await?;
+    let target = Target::new(KnownState { spec: spec(), spans: vec![] })?;
+
+    let listing = KnownState { spec: spec(), spans: vec![SpanContent::Heads(copy.page(TreeSpan::all())?)] };
+    let pushed = unpushed(&listing, &target, &outstanding_of(lacking, leaver, other));
+    assert_eq!(pushed, (vec![], vec![], vec![other]), "outside any digest everything is pushed, and so is each listed leaver");
+
+    let describing = KnownState { spec: spec(), spans: vec![SpanContent::Digest(copy.span_digest(TreeSpan::all()).await?)] };
+    let pushed = unpushed(&describing, &target, &outstanding_of(lacking, leaver, other));
+    assert_eq!(pushed, (vec![lacking], vec![TreeSpan::all()], vec![leaver, other]), "within a nonempty digest nothing is pushed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn under_the_entity_id_fallback_an_opening_push_brings_every_member_and_no_leaver() -> anyhow::Result<()> {
+    let held = states(2, 8);
+    let (lacking, leaver, other) = (EntityId::random(), held[0].payload.entity_id, EntityId::random());
+    let mut copy = snapshot(held).await?;
+    // The responder serves no tree under the offer's spec, so it answers under the entity-id spec.
+    let fallback = Target::new(KnownState { spec: entity_id_spec(&members()), spans: vec![] })?;
+
+    for offer in [
+        KnownState { spec: spec(), spans: vec![SpanContent::Heads(copy.page(TreeSpan::all())?)] },
+        KnownState { spec: spec(), spans: vec![SpanContent::Digest(copy.span_digest(TreeSpan::all()).await?)] },
+    ] {
+        let pushed = unpushed(&offer, &fallback, &outstanding_of(lacking, leaver, other));
+        assert_eq!(pushed, (vec![], vec![], vec![leaver, other]), "every member is pushed and no leaver is");
+    }
     Ok(())
 }
