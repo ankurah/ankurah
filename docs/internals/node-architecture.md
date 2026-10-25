@@ -27,7 +27,7 @@ caches it locally.
 This distinction surfaces in one critical API:
 `storage_is_definitive()`. On a durable node this returns `true` -- a
 negative lookup is conclusive. On an ephemeral node it returns `false`,
-which forces the system to do a deeper [DAG traversal](event-dag.md#bfs-traversal)
+which forces the system to do a deeper [DAG traversal](event-dag.md#generation-guided-traversal)
 instead of taking the shortcut. See the
 [creation-event guard](entity-lifecycle.md#guard-ordering) for the main place
 this matters.
@@ -57,9 +57,9 @@ either the events from the head the receiver holds, as `EventOnly`, or the
 current state alone, as `StateAndEvent` with no events
 ([below](#comparing-query-results-knownstate)). On the receiving side the node
 validates what it receives, integrates the events via
-[`apply_event`](entity-lifecycle.md#how-events-are-applied), and persists the
+[`apply_events`](entity-lifecycle.md#how-events-are-applied), and persists the
 result. If the incoming state diverges from what the receiver already has,
-the receiver falls back to event-by-event `apply_event` with
+the receiver falls back to batch `apply_events` with
 [BFS comparison](event-dag.md#comparing-two-clocks).
 
 A node admits a peer's updates only while it holds a subscription with that
@@ -144,7 +144,10 @@ against the durable peer's result periodically: first 30 seconds after it is
 established, then twice as long after each check that agrees, up to every 5
 minutes. Because updates still in flight can explain one disagreement, the
 query repairs its copy only when two checks in a row disagree, and checks again
-30 seconds after a disagreement or a repair.
+30 seconds after a disagreement or a repair. A repair whose data fails to apply
+leaves the query established with that entity stale, as a live update that
+fails to apply does; its checks back off as if they agreed, and the next one
+that disagrees repairs without waiting for a second.
 
 Each subscription carries context data used for policy validation of incoming
 events and state.

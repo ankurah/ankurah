@@ -95,11 +95,12 @@ full round trip.
   to client reactor notification).
 - **fresh_fetch_snapshot**: durable server carrying an entity with a
   `param`-deep chain of edits; a FRESH ephemeral client connects and fetches
-  for the first time. LANE: a fresh fetch sends empty known_matches, so the
-  server answers with a full StateSnapshot (`generate_entity_delta` Case 3),
-  never an EventBridge. Depth therefore affects only the excluded setup; the
-  measured region is one final-state snapshot adoption, and the numbers are
-  expected to be roughly flat in depth. A lane guard asserts the client
+  for the first time. LANE: a fresh client's Fetch offers no heads, so the
+  server pushes the entity's full state, having no head to bridge from, never
+  an EventBridge. (The numbers above were measured on main, where that
+  snapshot arrived in the Fetch's response.) Depth therefore affects only the
+  excluded setup; the measured region is one final-state snapshot adoption, and
+  the numbers are expected to be roughly flat in depth. A lane guard asserts the client
   committed NO events locally (the snapshot arm commits none), so the lane
   cannot silently change without failing the bench. This is a useful number
   (fresh-client first-fetch latency at depth-N server history) but it is NOT

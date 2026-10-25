@@ -327,7 +327,7 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
 /// through the lineage check that adopts it, so the title is what keeps this
 /// lane on the bridge.
 fn bench_bridge_catchup(c: &mut Criterion) {
-    /// Title bytes per gap edit: more than the edit's event encodes to.
+    /// Title bytes per gap edit: more data than the edit's event carries.
     const TITLE_BYTES_PER_EDIT: usize = 512;
 
     let rt = multi_thread_runtime();

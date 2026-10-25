@@ -208,8 +208,8 @@ where
         self.deadline.progressed();
     }
 
-    /// Send the request that opens the query and wait for its response, as
-    /// long as it takes, as main's requests do.
+    /// Send the request that opens the query and wait for its response as long
+    /// as it takes: the request has no timeout, and a lost connection ends it.
     async fn open(&mut self, request: proto::NodeRequestBody) -> Result<proto::NodeResponseBody, RetrievalError> {
         let started = Instant::now();
         let response = self.node.request(self.peer, &self.credentials, request).await?;
