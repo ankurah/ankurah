@@ -518,8 +518,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     }
 
     /// Run established query `query_id`'s periodic check and schedule its
-    /// next one, or handle its error as a subscription's. A repair that fails
-    /// to apply is reported and leaves the query established.
+    /// next one. A repair that fails to apply is reported and leaves the query
+    /// established; a check that fails subscribes the query again.
     async fn check(&self, query_id: proto::QueryId) {
         let Some(node) = self.inner.node.get() else { return };
         let started = {
@@ -546,7 +546,25 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     }
                 }
             }
-            Some(Err(error)) => self.handle_error(query_id, peer, error, &cancel),
+            Some(Err(error)) => self.resubscribe_after_failed_check(query_id, peer, error, &cancel),
+        }
+    }
+
+    /// Subscribe established query `query_id` again after its check failed
+    /// with `error`, keeping its data, as after a sync that stalled. A check's
+    /// failure says nothing lasting about a query that was established: its
+    /// causes, such as a catalog change on either side, clear with a new
+    /// subscription, so it never marks the query failed.
+    fn resubscribe_after_failed_check(&self, query_id: proto::QueryId, peer: proto::EntityId, error: RetrievalError, cancel: &CancelFlag) {
+        let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+        if cancel.canceled() {
+            return;
+        }
+        if let Some(info) = subscriptions.get_mut(&query_id) {
+            if let Status::Established(..) = info.status {
+                info.status = Status::PendingRemote;
+                warn!("The check of predicate {} with peer {} failed: {} - will subscribe again", query_id, peer, error);
+            }
         }
     }
 
@@ -678,6 +696,7 @@ where
         confirm: bool,
     ) -> Result<CheckOutcome, RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
+        node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
         crate::node::state_sync::check(&node, peer_id, selection, context_data, &synced, confirm).await
     }
 
@@ -715,6 +734,7 @@ mod tests {
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
         held_reply: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), RequestError>>>>,
+        check_error: Mutex<Option<RetrievalError>>,
         _phantom: std::marker::PhantomData<CD>,
     }
 
@@ -726,6 +746,7 @@ mod tests {
                 should_fail: Arc::new(Mutex::new(false)),
                 failure_message: Arc::new(Mutex::new(String::new())),
                 held_reply: Mutex::new(None),
+                check_error: Mutex::new(None),
                 _phantom: std::marker::PhantomData,
             }
         }
@@ -737,6 +758,9 @@ mod tests {
         }
 
         fn clear_sent_requests(&self) { self.sent_requests.lock().unwrap().clear(); }
+
+        /// Fails the next check_query with `error`.
+        fn fail_next_check(&self, error: RetrievalError) { *self.check_error.lock().unwrap() = Some(error); }
 
         /// Parks the next remote_subscribe until the returned sender delivers its reply.
         fn hold_next_reply(&self) -> tokio::sync::oneshot::Sender<Result<(), RequestError>> {
@@ -783,7 +807,10 @@ mod tests {
             _synced: SyncedQuery,
             _confirm: bool,
         ) -> Result<CheckOutcome, RetrievalError> {
-            Ok(CheckOutcome::Agreed)
+            match self.check_error.lock().unwrap().take() {
+                Some(error) => Err(error),
+                None => Ok(CheckOutcome::Agreed),
+            }
         }
 
         async fn peer_unsubscribe(&self, peer_id: EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
@@ -858,6 +885,34 @@ mod tests {
         for _ in 0..4 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_subscribes_its_query_again_and_never_fails_it() {
+        let (relay, mock_sender, peer_id) = connected_relay();
+        let query_id = proto::QueryId::new();
+        subscribe(&relay, query_id);
+        settle().await;
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(peer, _)) if peer == peer_id));
+
+        // An error a subscribe treats as permanent, as when the peer's catalog
+        // no longer serves the synced spec.
+        mock_sender.fail_next_check(RetrievalError::RequestError(RequestError::ServerError("tree cannot serve selection".into())));
+        relay.check(query_id).await;
+        assert!(matches!(relay.get_status(query_id), Some(Status::PendingRemote)), "the query subscribes again rather than failing");
+
+        relay.setup_remote_subscriptions();
+        settle().await;
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(peer, _)) if peer == peer_id), "and is established again");
+    }
+
+    #[tokio::test]
+    async fn a_check_before_the_system_is_ready_fails_as_not_ready() {
+        let node = crate::Node::new(Arc::new(crate::test_utils::TestStorage::default()), crate::policy::PermissiveAgent::new());
+        let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), ankql::ast::Predicate::True);
+        let synced = SyncedQuery { spec, round_trip: std::time::Duration::ZERO };
+        let checked = node.weak().check_query(EntityId::random(), create_test_selection(), vec![], synced, false).await;
+        assert!(matches!(checked, Err(RetrievalError::RequestError(RequestError::SystemNotReady))), "{checked:?}");
     }
 
     #[tokio::test]
