@@ -1,19 +1,8 @@
-//! The SQLite driver a run of the suite builds its databases with, so that
-//! the engine's support for better-sqlite3, a driver its own constructors
-//! never build, runs under the same tests as node:sqlite. Natively the driver
-//! is rusqlite. On wasm32 it is Node.js's node:sqlite, or better-sqlite3 when
-//! the suite is built with `--cfg ankurah_sqlite_better_sqlite3` and run
-//! with `ANKURAH_SQLITE_TEST_DRIVER` set to `better-sqlite3`, as
-//! scripts/run-wasm-tests.sh builds and runs it for the suite's second run in
-//! Node.js. On that run a test's engine adopts a better-sqlite3 database through
-//! `SqliteStorageEngine::from_database`, because `open` and `open_in_memory`
-//! always build node:sqlite's. The driver is chosen when the suite is built,
-//! so that a test that cannot run on better-sqlite3 reports as ignored on
-//! that run, through `#[cfg_attr(ankurah_sqlite_better_sqlite3, ignore =
-//! "…")]`, rather than pass without testing anything; the variable is
-//! checked against the build, so that a build whose cfg went missing, as it
-//! does when `RUSTFLAGS` replaces the target's rustflags, fails rather than
-//! test node:sqlite again.
+//! What the tests open their engines with. Natively that is rusqlite,
+//! through `SqliteStorageEngine::open` and `open_in_memory`. On wasm32 it is
+//! better-sqlite3, whose `Database` class the tests pass to those
+//! constructors, as a host does: the release tests/package.json pins, which
+//! `npm ci` in storage/sqlite/tests installs.
 //!
 //! The unit tests in src/ include this file as well (see src/lib.rs), so it
 //! names this crate as the integration tests do and uses nothing else of
@@ -22,7 +11,7 @@
 
 use ankurah_storage_sqlite::{SqliteError, SqliteStorageEngine};
 #[cfg(target_arch = "wasm32")]
-use js_sys::{Array, Function, Reflect};
+use js_sys::{Function, Reflect};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::{JsCast, JsValue};
 
@@ -33,36 +22,10 @@ pub use tokio::test as engine_test;
 #[cfg(target_arch = "wasm32")]
 pub use wasm_bindgen_test::wasm_bindgen_test as engine_test;
 
-/// Whether this run builds its databases with better-sqlite3: never
-/// natively, where rusqlite builds them.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn on_better_sqlite3() -> bool { false }
-
-/// Whether this run builds its databases with better-sqlite3 rather than
-/// node:sqlite, as the suite was built to and `ANKURAH_SQLITE_TEST_DRIVER`
-/// names the driver; a run whose variable names another driver than the
-/// build's fails.
-#[cfg(target_arch = "wasm32")]
-pub fn on_better_sqlite3() -> bool {
-    let env = Reflect::get(&process(), &"env".into()).unwrap();
-    let named = match Reflect::get(&env, &"ANKURAH_SQLITE_TEST_DRIVER".into()).unwrap().as_string().as_deref() {
-        None | Some("node:sqlite") => false,
-        Some("better-sqlite3") => true,
-        Some(other) => panic!("ANKURAH_SQLITE_TEST_DRIVER names node:sqlite or better-sqlite3, not {other:?}"),
-    };
-    let built = cfg!(ankurah_sqlite_better_sqlite3);
-    assert_eq!(
-        named, built,
-        "ANKURAH_SQLITE_TEST_DRIVER names better-sqlite3 exactly when the suite is built with \
-         `--cfg ankurah_sqlite_better_sqlite3`, as scripts/run-wasm-tests.sh does both"
-    );
-    built
-}
-
-/// The message of `error` when it is a JavaScript exception, as a Node.js
-/// driver throws for its own refusal of a call, such as better-sqlite3's of a
-/// call that passes too few values: never natively, where rusqlite's
-/// refusals are errors of its own.
+/// The message of `error` when it is a JavaScript exception, as
+/// better-sqlite3 throws for its own refusal of a call, such as of a call
+/// that passes too few values: never natively, where rusqlite's refusals are
+/// errors of its own.
 #[cfg(target_arch = "wasm32")]
 pub fn javascript_message(error: &SqliteError) -> Option<&str> {
     match error {
@@ -75,41 +38,30 @@ pub fn javascript_message(error: &SqliteError) -> Option<&str> {
 #[cfg(not(target_arch = "wasm32"))]
 pub fn javascript_message(_: &SqliteError) -> Option<&str> { None }
 
-/// The engine a test runs on in memory: the one `open_in_memory` opens, or on
-/// the better-sqlite3 run the engine adopting a better-sqlite3 database.
-pub async fn open_in_memory() -> anyhow::Result<SqliteStorageEngine> {
-    #[cfg(target_arch = "wasm32")]
-    if on_better_sqlite3() {
-        return SqliteStorageEngine::from_database(host_database(":memory:")).await;
-    }
-    SqliteStorageEngine::open_in_memory().await
-}
+/// The engine a test runs on in memory.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn open_in_memory() -> anyhow::Result<SqliteStorageEngine> { SqliteStorageEngine::open_in_memory().await }
 
-/// The engine a test runs on over the file at `path`: the one `open` opens,
-/// or on the better-sqlite3 run the engine adopting a better-sqlite3 database
-/// on the file.
-pub async fn open(path: &std::path::Path) -> anyhow::Result<SqliteStorageEngine> {
-    #[cfg(target_arch = "wasm32")]
-    if on_better_sqlite3() {
-        return SqliteStorageEngine::from_database(host_database(path.to_str().expect("a UTF-8 path"))).await;
-    }
-    SqliteStorageEngine::open(path).await
-}
-
-/// A database the host constructed on `path` (`:memory:` for one in memory),
-/// the way an extension host or a server builds one before handing it to the
-/// engine: node:sqlite's `DatabaseSync`, or on the better-sqlite3 run
-/// better-sqlite3's `Database`, each with its driver's defaults.
+/// The engine a test runs on in memory, built with better-sqlite3.
 #[cfg(target_arch = "wasm32")]
-pub fn host_database(path: &str) -> JsValue {
-    let constructor = if on_better_sqlite3() {
-        tests_require()
-            .call1(&JsValue::NULL, &"better-sqlite3".into())
-            .expect("better-sqlite3 is installed: run `npm ci` in storage/sqlite/tests")
-    } else {
-        Reflect::get(&builtin("node:sqlite"), &"DatabaseSync".into()).unwrap()
-    };
-    Reflect::construct(&constructor.dyn_into().unwrap(), &Array::of1(&path.into())).unwrap()
+pub async fn open_in_memory() -> anyhow::Result<SqliteStorageEngine> { SqliteStorageEngine::open_in_memory(&better_sqlite3()).await }
+
+/// The engine a test runs on over the file at `path`.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn open(path: &std::path::Path) -> anyhow::Result<SqliteStorageEngine> { SqliteStorageEngine::open(path).await }
+
+/// The engine a test runs on over the file at `path`, built with better-sqlite3.
+#[cfg(target_arch = "wasm32")]
+pub async fn open(path: &std::path::Path) -> anyhow::Result<SqliteStorageEngine> {
+    SqliteStorageEngine::open(path, &better_sqlite3()).await
+}
+
+/// better-sqlite3's `Database` class, as a host passes it to the engine.
+#[cfg(target_arch = "wasm32")]
+pub fn better_sqlite3() -> JsValue {
+    tests_require()
+        .call1(&JsValue::NULL, &"better-sqlite3".into())
+        .expect("better-sqlite3 is installed: run `npm ci` in storage/sqlite/tests")
 }
 
 /// The path of better-sqlite3's entry point, for a worker thread to load it from.

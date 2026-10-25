@@ -1,11 +1,10 @@
-//! Both Node.js drivers hand TEXT over only as a JavaScript string, made by
-//! decoding the bytes and replacing each byte that is not UTF-8 with U+FFFD
-//! (node:sqlite decodes them only up to the first NUL), where rusqlite hands
-//! over the bytes themselves. So a query reads its statement through a typed
-//! reader that takes TEXT as the bytes of a BLOB, and decodes them as
-//! strictly as rusqlite does (see `typed_reader`). The reader's nesting can
-//! change a compound SELECT's values, so the check that refuses such a
-//! SELECT lives here too.
+//! better-sqlite3 hands TEXT over only as a JavaScript string, made by
+//! decoding the bytes and replacing each byte that is not UTF-8 with U+FFFD,
+//! where rusqlite hands over the bytes themselves. So a query reads its
+//! statement through a typed reader that takes TEXT as the bytes of a BLOB,
+//! and decodes them as strictly as rusqlite does (see `typed_reader`). The
+//! reader's nesting can change a compound SELECT's values, so the check that
+//! refuses such a SELECT lives here too.
 
 use js_sys::Array;
 
@@ -86,10 +85,9 @@ pub(super) fn typed_row(row: Array) -> Result<Row, SqliteError> {
 
 /// A row of a PRAGMA or an EXPLAIN, which SQLite would not nest in a typed
 /// reader, read as the database hands it over. Its TEXT arrives as a
-/// JavaScript string, read as the TEXT: SQLite makes a PRAGMA's or an
-/// EXPLAIN's TEXT of C strings, so it holds no NUL for node:sqlite to cut it
-/// at, but a string holding U+FFFD is refused, since both Node.js drivers put
-/// that character in place of each byte that is not UTF-8.
+/// JavaScript string, read as the TEXT, but a string holding U+FFFD is
+/// refused, since better-sqlite3 puts that character in place of each byte
+/// that is not UTF-8.
 pub(super) fn plain_row(row: Array) -> Result<Row, SqliteError> {
     row.iter()
         .enumerate()

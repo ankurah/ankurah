@@ -7,10 +7,9 @@ use anyhow::Result;
 use crate::common::{self, engine_test};
 
 /// SQL that holds a second statement is refused before either runs, on
-/// every driver, where rusqlite and node:sqlite on their own run the first
-/// and ignore the rest. Whitespace, semicolons and comments after a
-/// statement are no second statement; a byte SQLite cannot read after it
-/// is.
+/// every driver, where rusqlite on its own runs the first and ignores the
+/// rest. Whitespace, semicolons and comments after a statement are no second
+/// statement; a byte SQLite cannot read after it is.
 #[engine_test]
 async fn sql_holding_a_second_statement_is_refused() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -146,12 +145,10 @@ async fn sql_that_holds_no_statement_is_refused() -> Result<()> {
 }
 
 /// A call passes a value for every parameter of its statement, and no more,
-/// on every driver: one passing too few is refused before it runs, where
-/// node:sqlite would bind NULL for each value missing, and so is one passing
-/// too many. A numbered parameter counts as its number. rusqlite refuses the
-/// count of values itself, as the Node.js executor refuses too few on
-/// node:sqlite, whose SQLite refuses a value no parameter takes;
-/// better-sqlite3 refuses both itself, in its own words.
+/// on every driver: one passing too few is refused before it runs, and so is
+/// one passing too many. A numbered parameter counts as its number. rusqlite
+/// and better-sqlite3 refuse the count of values themselves, better-sqlite3
+/// in its own words.
 #[engine_test]
 async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -160,7 +157,8 @@ async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
             executor.execute("CREATE TABLE pairs (a, b)", &[])?;
             let seven = SqliteValueRef::Integer(7);
             // Each statement runs first with every value it takes, so that a
-            // count kept from that run cannot let a shorter call through.
+            // typed reader kept from that run cannot let a shorter call
+            // through.
             let passed = [
                 executor.query("SELECT ?, ?", &[seven, seven]).map(|rows| rows.len()),
                 executor.execute("INSERT INTO pairs VALUES (?, ?)", &[seven, seven]),
@@ -179,32 +177,31 @@ async fn a_call_passes_a_value_for_every_parameter() -> Result<()> {
         .await?;
     assert_eq!(passed, [Ok(1), Ok(1)]);
     let refused = refused.map(|outcome| outcome.expect_err("the call is refused"));
-    if common::on_better_sqlite3() {
+    #[cfg(target_arch = "wasm32")]
+    {
         // better-sqlite3 binds `?3` only by name, as it binds a named
         // parameter, once the call's two values fill the positions before it.
         let (few, many) = (Some("Too few parameter values were provided"), Some("Too many parameter values were provided"));
         let by_name = Some("Missing named parameters");
         assert_eq!(refused.each_ref().map(common::javascript_message), [few, few, few, by_name, many, many]);
-    } else {
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
         for (error, passed) in refused[..4].iter().zip([1, 0, 1, 2]) {
             assert_eq!(error.refusal(), Some(Refusal::TooFewValues { passed }), "{error}");
         }
         for error in &refused[4..] {
-            #[cfg(not(target_arch = "wasm32"))]
             assert!(matches!(error, SqliteError::Rusqlite(rusqlite::Error::InvalidParameterCount(3, 2))), "{error:?}");
-            // SQLITE_RANGE, for the value no parameter takes.
-            #[cfg(target_arch = "wasm32")]
-            assert_eq!(error.sqlite_code(), Some(25), "{error:?}");
         }
     }
     assert_eq!(stored, (1, 1), "only the insert given both values wrote a row");
     Ok(())
 }
 
-/// A numbered parameter takes the value at its position on rusqlite and
-/// node:sqlite, given a value for every position up to its number, one that
-/// no parameter takes included; better-sqlite3 binds no positional value to
-/// one, and refuses the call (see `SqliteExecutor`).
+/// A numbered parameter takes the value at its position on rusqlite, given a
+/// value for every position up to its number, one that no parameter takes
+/// included; better-sqlite3 binds no positional value to one, and refuses the
+/// call (see `SqliteExecutor`).
 #[engine_test]
 async fn a_numbered_parameter_takes_the_value_at_its_position() -> Result<()> {
     let storage = common::open_in_memory().await?;
@@ -219,7 +216,7 @@ async fn a_numbered_parameter_takes_the_value_at_its_position() -> Result<()> {
             Ok((selected, inserted, stored))
         })
         .await?;
-    if common::on_better_sqlite3() {
+    if cfg!(target_arch = "wasm32") {
         for refusal in [selected.expect_err("better-sqlite3 refuses ?2"), inserted.expect_err("better-sqlite3 refuses ?3")] {
             assert_eq!(common::javascript_message(&refusal), Some("Too many parameter values were provided"), "{refusal}");
         }

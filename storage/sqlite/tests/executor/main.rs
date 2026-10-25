@@ -1,5 +1,5 @@
 //! What every executor must agree on, checked natively on rusqlite and on
-//! wasm32 on node:sqlite and better-sqlite3.
+//! wasm32 on better-sqlite3.
 
 #[path = "../common/mod.rs"]
 mod common;

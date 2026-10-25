@@ -30,9 +30,9 @@ pub mod driver;
 pub mod temp_db;
 #[cfg(target_arch = "wasm32")]
 #[allow(unused)]
-pub use driver::host_database;
+pub use driver::better_sqlite3;
 #[allow(unused)]
-pub use driver::{engine_test, javascript_message, on_better_sqlite3, open, open_in_memory};
+pub use driver::{engine_test, javascript_message, open, open_in_memory};
 #[allow(unused)]
 pub use temp_db::TempDb;
 

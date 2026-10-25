@@ -163,11 +163,10 @@ async fn errors_carry_the_extended_result_code() -> Result<()> {
         })
         .await?;
     // SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
-    // SQLITE_CONSTRAINT_CHECK, SQLITE_ERROR, no code for an error SQLite did
-    // not raise, and for a call passing too many values SQLITE_RANGE on
-    // node:sqlite alone, which lets SQLite refuse it.
-    let too_many = if cfg!(target_arch = "wasm32") && !common::on_better_sqlite3() { Some(25) } else { None };
-    assert_eq!(codes, [Some(1555), Some(2067), Some(275), Some(1), None, too_many, None]);
+    // SQLITE_CONSTRAINT_CHECK, SQLITE_ERROR, and no code for an error SQLite
+    // did not raise, such as a call passing too many or too few values, which
+    // rusqlite and better-sqlite3 refuse themselves.
+    assert_eq!(codes, [Some(1555), Some(2067), Some(275), Some(1), None, None, None]);
     Ok(())
 }
 

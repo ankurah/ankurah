@@ -47,11 +47,7 @@ impl TempDb {
     /// tests/executor/connections.rs for why).
     #[cfg(target_arch = "wasm32")]
     pub fn raw(&self) -> Box<dyn ankurah_storage_sqlite::executor::SqliteExecutor> {
-        Box::new(if driver::on_better_sqlite3() {
-            ankurah_storage_sqlite::NodeJsConnection::from_database(driver::host_database(self.path_str())).unwrap()
-        } else {
-            ankurah_storage_sqlite::NodeJsConnection::open(self.path_str()).unwrap()
-        })
+        Box::new(ankurah_storage_sqlite::NodeJsConnection::open(self.path_str(), &driver::better_sqlite3()).unwrap())
     }
 }
 

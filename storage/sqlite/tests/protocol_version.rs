@@ -146,10 +146,6 @@ async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
 /// name itself; the test plants one, the name's bytes as a BLOB, through
 /// `writable_schema`.
 #[engine_test]
-#[cfg_attr(
-    ankurah_sqlite_better_sqlite3,
-    ignore = "better-sqlite3 opens its databases in SQLite's defensive mode, which refuses `writable_schema`"
-)]
 async fn a_table_name_the_check_cannot_read_fails_the_open() -> anyhow::Result<()> {
     let db = TempDb::new("unreadable_name");
     {

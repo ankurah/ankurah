@@ -6,6 +6,7 @@ use ankql::ast::Resolved;
 use ankurah_storage_common::naming;
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use std::sync::Arc;
 
@@ -17,7 +18,9 @@ use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
 
 use crate::error::SqliteError;
-use crate::executor::{self, Pool, PooledConnection, Row, SqliteExecutor, TransactionBehavior};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::executor::{file_pool, memory_pool};
+use crate::executor::{Pool, PooledConnection, Row, SqliteExecutor, TransactionBehavior};
 use crate::value::{SqliteValue, SqliteValueRef};
 
 mod materialization;
@@ -179,10 +182,12 @@ impl SqliteStorageEngine {
     }
 
     /// Open a file-based SQLite database
-    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> { Self::new(executor::file_pool(path.as_ref()).await?).await }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> { Self::new(file_pool(path.as_ref()).await?).await }
 
     /// Open an in-memory SQLite database (for testing)
-    pub async fn open_in_memory() -> anyhow::Result<Self> { Self::new(executor::memory_pool().await?).await }
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn open_in_memory() -> anyhow::Result<Self> { Self::new(memory_pool().await?).await }
 
     /// Check whether a physical SQLite name uses only the supported characters.
     pub fn sane_name(name: &str) -> bool {

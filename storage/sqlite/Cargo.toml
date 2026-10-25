@@ -9,9 +9,9 @@ homepage      = "https://github.com/ankurah/ankurah"
 repository    = "https://github.com/ankurah/ankurah"
 
 [features]
-# On wasm32, run the engine inside Node.js, on its built-in node:sqlite or on
-# a better-sqlite3 database the host hands over. A native build ignores it
-# and always runs on rusqlite.
+# On wasm32, run the engine inside Node.js, on better-sqlite3, whose
+# `Database` class the host passes to `open` and `open_in_memory`. A native
+# build ignores it and always runs on rusqlite.
 nodejs = ["dep:wasm-bindgen", "dep:js-sys", "dep:send_wrapper"]
 
 [dependencies]
@@ -66,9 +66,3 @@ ctor               = "0.2"
 wasm-bindgen-test    = "0.3"
 wasm-bindgen-futures = "0.4"
 ankurah              = { path = "../../ankurah", version = "=0.10.0", features = ["derive", "wasm", "test-helpers"] }
-
-[lints.rust]
-# scripts/run-wasm-tests.sh builds the suite's better-sqlite3 run with this
-# cfg (see tests/common/driver.rs), so that a test that cannot run on
-# better-sqlite3 reports as ignored there.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ankurah_sqlite_better_sqlite3)"] }

@@ -5,8 +5,8 @@
 //! tables, the per-model materializations and their column maps, the pushdown
 //! predicate, the exact-head commit. Everything below it runs that SQL on one
 //! SQLite connection: `native` over rusqlite, and on wasm32 `nodejs` over
-//! Node.js's built-in `node:sqlite` module, or over a better-sqlite3 database
-//! that a host hands the engine through `SqliteStorageEngine::from_database`.
+//! better-sqlite3, whose `Database` class the host passes to
+//! `SqliteStorageEngine::open` and `open_in_memory`.
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod native;
@@ -15,23 +15,21 @@ pub(crate) mod nodejs;
 mod statement_scan;
 
 // The executor this target compiles: `native` over rusqlite, or on wasm32
-// `nodejs`, over Node.js's node:sqlite or a better-sqlite3 database the host
-// hands over. The engine reaches it only through four items, which each
-// executor provides:
+// `nodejs`, over better-sqlite3. The engine reaches it only through two
+// items, which each executor provides:
 // - `Pool`, the engine's pool, whose `get()` hands out a pooled connection;
 // - `PooledConnection`, the connection it hands out, whose `with_executor`
-//   runs a closure on it through `SqliteExecutor`;
-// - `file_pool(path)`, the pool `SqliteStorageEngine::open` opens;
-// - `memory_pool()`, the pool `SqliteStorageEngine::open_in_memory` opens.
+//   runs a closure on it through `SqliteExecutor`.
+// Natively it also opens its pools through `file_pool(path)` and
+// `memory_pool()`, for `SqliteStorageEngine::open` and `open_in_memory`. On
+// Node.js those two constructors also take the class the host passes in, so
+// the Node.js executor defines them.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use native::connection::{file_pool, memory_pool, Pool, PooledConnection};
 #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
-pub(crate) use nodejs::{file_pool, memory_pool, Pool, PooledConnection};
+pub(crate) use nodejs::{Pool, PooledConnection};
 #[cfg(all(target_arch = "wasm32", not(feature = "nodejs")))]
-compile_error!(
-    "on wasm32, ankurah-storage-sqlite runs inside Node.js: enable the `nodejs` feature, for Node.js's node:sqlite or a \
-     better-sqlite3 database the host hands over"
-);
+compile_error!("on wasm32, ankurah-storage-sqlite runs inside Node.js, on better-sqlite3: enable the `nodejs` feature");
 
 use crate::{
     error::SqliteError,
@@ -41,8 +39,8 @@ use crate::{
 /// The session pragmas every connection the engine opens runs, natively and
 /// on Node.js alike, so that the engine runs with the same session settings
 /// on every driver. The busy timeout is not among them: it must come before
-/// any statement that reads the file, so each executor sets it first,
-/// rusqlite as it opens a connection.
+/// any statement that reads the file, so each executor has its driver set
+/// it as it opens a connection.
 pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
      PRAGMA synchronous=NORMAL;
      PRAGMA foreign_keys=ON;
@@ -68,10 +66,9 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///
 /// # Where the Node.js executor differs from the native one
 ///
-/// Both Node.js drivers hand TEXT over only as a JavaScript string, which
-/// puts U+FFFD in place of each byte that is not UTF-8, and which
-/// node:sqlite cuts at the first NUL. So the Node.js executor reads a
-/// query's rows through a typed reader, which nests the query in a
+/// better-sqlite3 hands TEXT over only as a JavaScript string, which puts
+/// U+FFFD in place of each byte that is not UTF-8. So the Node.js executor
+/// reads a query's rows through a typed reader, which nests the query in a
 /// materialized WITH clause and reads each column as two: its storage class,
 /// and its value, TEXT as the bytes of a BLOB. Most of the differences come
 /// from that reader.
@@ -90,13 +87,12 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 /// - A statement with a named parameter (`:a`, `@a`, `#a` or `$a`) is
 ///   refused before it runs ([`Refusal::NamedParameter`]). rusqlite binds a
 ///   call's values to named and positional parameters alike, in order, but
-///   node:sqlite would bind no positional value to a named one, leaving it
-///   NULL, and better-sqlite3 binds one only by name. Write a positional `?`
+///   better-sqlite3 binds a named one only by name. Write a positional `?`
 ///   for each parameter.
 /// - better-sqlite3 binds a numbered parameter such as `?1` only by name, as
 ///   it binds a named one, so it refuses, in its own words, a call that
-///   gives one a positional value; rusqlite and node:sqlite bind the value
-///   at that position.
+///   gives one a positional value; rusqlite binds the value at that
+///   position.
 /// - A statement that yields rows and that SQLite cannot nest in the typed
 ///   reader, such as one with a RETURNING clause, is refused before it can
 ///   write ([`Refusal::NotNestable`]), unless it is a PRAGMA or an EXPLAIN.
@@ -119,14 +115,14 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///   the nearest REAL, since the typed reader's WITH clause gives the column
 ///   REAL affinity, where natively it reads as the INTEGER. Only a loaded
 ///   extension reaches this: better-sqlite3's JavaScript virtual tables give
-///   their columns no type, node:sqlite has no virtual-table API, and
-///   SQLite's own R*Tree returns REALs from its REAL columns.
+///   their columns no type, and SQLite's own R*Tree returns REALs from its
+///   REAL columns.
 /// - Errors take each target's own variants of [`SqliteError`]. Natively
 ///   every error SQLite raises, and every refusal of rusqlite's, is a
 ///   `SqliteError::Rusqlite`. On Node.js an error SQLite raised is a
 ///   `SqliteError::Sqlite`, a refusal of the executor's a
-///   `SqliteError::Refused`, and any other JavaScript exception, a driver's
-///   own refusal among them, a `SqliteError::JavaScript`.
+///   `SqliteError::Refused`, and any other JavaScript exception,
+///   better-sqlite3's own refusal among them, a `SqliteError::JavaScript`.
 ///   [`SqliteError::refusal`] and [`SqliteError::sqlite_code`] answer the
 ///   same on every driver, except in the cases their docs list.
 ///

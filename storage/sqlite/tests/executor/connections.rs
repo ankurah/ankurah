@@ -10,17 +10,12 @@ use crate::common::driver;
 use crate::common::{self, engine_test, TempDb};
 
 /// A connection the engine opens sets a busy timeout of five seconds, on
-/// every driver: rusqlite sets it on each connection it opens, and the
-/// Node.js executor before any other statement.
-/// `a_writer_waits_for_a_lock_another_connection_holds` tests that a writer
-/// then waits for another's lock.
+/// every driver: rusqlite and better-sqlite3 set it as they open a
+/// connection. `a_writer_waits_for_a_lock_another_connection_holds` tests
+/// that a writer then waits for another's lock.
 #[engine_test]
-#[cfg_attr(
-    ankurah_sqlite_better_sqlite3,
-    ignore = "the engine opens no better-sqlite3 database, and one it adopts keeps the busy timeout its host set"
-)]
 async fn connections_set_a_busy_timeout_of_five_seconds() -> Result<()> {
-    let storage = SqliteStorageEngine::open_in_memory().await?;
+    let storage = common::open_in_memory().await?;
     let timeout = storage.with_executor(|executor| executor.query_row("PRAGMA busy_timeout", &[])?.expect("one row").integer(0)).await?;
     assert_eq!(timeout, 5000);
     Ok(())
@@ -29,13 +24,9 @@ async fn connections_set_a_busy_timeout_of_five_seconds() -> Result<()> {
 /// A connection the engine opens on a file takes the session settings of a
 /// native one, on every driver.
 #[engine_test]
-#[cfg_attr(
-    ankurah_sqlite_better_sqlite3,
-    ignore = "the engine opens no better-sqlite3 database, and one it adopts keeps the session settings its host chose"
-)]
 async fn a_connection_on_a_file_takes_the_session_settings() -> Result<()> {
     let db = TempDb::new("settings");
-    let storage = SqliteStorageEngine::open(db.path()).await?;
+    let storage = common::open(db.path()).await?;
     assert_eq!(session_settings(&storage).await?, (5000, "wal".to_owned(), 1, 1, -64000, 268_435_456, 2));
     Ok(())
 }
@@ -82,17 +73,13 @@ async fn a_lock_held_past_the_busy_timeout_fails_with_sqlite_busy() -> Result<()
 /// rather than failing at once: the busy timeout is set before any statement
 /// that needs the file.
 #[engine_test]
-#[cfg_attr(
-    ankurah_sqlite_better_sqlite3,
-    ignore = "the engine opens no better-sqlite3 database, and one it adopts keeps the busy timeout its host set"
-)]
 async fn opening_a_store_waits_for_a_lock_on_its_file() -> Result<()> {
     let db = TempDb::new("open_waits");
     // A new file starts in rollback-journal mode, where BEGIN EXCLUSIVE keeps
     // out readers too.
     let holder = LockHolder::take(&db, "BEGIN EXCLUSIVE", HOLD_MS).await;
     let waited = Stopwatch::start();
-    let storage = SqliteStorageEngine::open(db.path()).await?;
+    let storage = common::open(db.path()).await?;
     let waited = waited.elapsed_ms();
     holder.released().await;
     assert!(waited >= HOLD_MS as f64 / 2.0, "the store opened after {waited} ms, before the lock was released");
@@ -141,14 +128,14 @@ struct LockHolder {
     exit: js_sys::Promise,
 }
 
-/// The worker's side of a [`LockHolder`] on Node.js. Its connection is on the
-/// driver the engine's is on, because two copies of SQLite in one process do
-/// not see each other's locks: the file locks they take belong to the
-/// process, so neither copy's locks keep out the other's connections.
+/// The worker's side of a [`LockHolder`] on Node.js. Its connection is on
+/// better-sqlite3, as the engine's is, because two copies of SQLite in one
+/// process do not see each other's locks: the file locks they take belong to
+/// the process, so neither copy's locks keep out the other's connections.
 #[cfg(target_arch = "wasm32")]
 const LOCK_HOLDER_WORKER: &str = r#"
 const { parentPort, workerData } = require('node:worker_threads');
-const Database = workerData.betterSqlite3 ? require(workerData.betterSqlite3) : require('node:sqlite').DatabaseSync;
+const Database = require(workerData.betterSqlite3);
 const database = new Database(workerData.path);
 database.exec(workerData.lock);
 parentPort.postMessage('locked');
@@ -188,7 +175,7 @@ impl LockHolder {
              exit.catch(() => {});
              return once(worker, 'message').then(() => ({ exit }));",
         );
-        let better_sqlite3 = if driver::on_better_sqlite3() { driver::better_sqlite3_entry().into() } else { wasm_bindgen::JsValue::NULL };
+        let better_sqlite3 = wasm_bindgen::JsValue::from(driver::better_sqlite3_entry());
         let arguments =
             js_sys::Array::of5(&LOCK_HOLDER_WORKER.into(), &db.path_str().into(), &lock.into(), &(hold_ms as f64).into(), &better_sqlite3);
         let started: js_sys::Promise = start.apply(&wasm_bindgen::JsValue::NULL, &arguments).unwrap().dyn_into().unwrap();

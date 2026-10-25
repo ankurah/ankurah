@@ -122,8 +122,8 @@ async fn a_query_of_more_than_a_thousand_columns_is_refused_on_nodejs() -> Resul
 
 /// TEXT crosses the boundary as its bytes: a NUL inside it is kept, and TEXT
 /// whose bytes are not UTF-8 is refused, as rusqlite refuses it, on every
-/// driver. (node:sqlite's own strings would cut the first value at its NUL
-/// and turn the second into U+FFFD.)
+/// driver. (better-sqlite3's own strings would turn the second into
+/// U+FFFD.)
 #[engine_test]
 async fn text_keeps_an_embedded_nul_and_refuses_bytes_that_are_not_utf8() -> Result<()> {
     let storage = common::open_in_memory().await?;

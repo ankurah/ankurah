@@ -1,27 +1,25 @@
-//! The Node.js executor, which runs the engine's SQL from WASM on a
-//! JavaScript SQLite: Node.js's built-in `node:sqlite`, or a better-sqlite3
-//! database a host hands over.
+//! The Node.js executor, which runs the engine's SQL from WASM on
+//! better-sqlite3, a SQLite driver for Node.js whose `Database` class the
+//! host passes in.
 //!
 //! An Ankurah node built for wasm32 and run inside Node.js (a VS Code
 //! extension host, an Electron main process, a JavaScript CLI) has no
 //! IndexedDB, and its WASM cannot link SQLite as rusqlite does, but it can
-//! call a SQLite driver the host provides: Node.js ships SQLite as
-//! `node:sqlite`. The executor drives a `DatabaseSync`-shaped JavaScript
-//! object: `exec(sql)`, and `prepare(sql)`, giving statements with
-//! `run(...params)`, `get(...params)`, `all(...params)`, `columns()`,
-//! `setReturnArrays`, `setReadBigInts` and `sourceSQL`. It accepts
-//! better-sqlite3's `raw`, `safeIntegers` and `source` in place of the last
-//! three. [`NodeJsConnection::open`] constructs node:sqlite's `DatabaseSync`
-//! through `process.getBuiltinModule`, and a host adopts a database it built
-//! with [`SqliteStorageEngine::from_database`], whose checks refuse one the
-//! executor cannot read exactly. Every call is synchronous, which suits the
-//! single-threaded WASM host: the engine's closures run in place.
+//! call a SQLite driver the host loads. better-sqlite3 brings its own SQLite,
+//! the same on every Node.js release, and keeps its databases on files that
+//! several processes can share. The WASM does not import it: the host
+//! passes its `Database` class to [`SqliteStorageEngine::open`] and
+//! [`open_in_memory`](SqliteStorageEngine::open_in_memory), and the executor
+//! builds each database with it (see [`NodeJsConnection::open`]). The
+//! executor drives the database's `exec(sql)` and `prepare(sql)`, and its
+//! statements' `run`, `get`, `all`, `columns`, `raw`, `safeIntegers` and
+//! `reader`. Every call is synchronous, which suits the single-threaded WASM
+//! host: the engine's closures run in place.
 
-mod adoption;
 mod exception;
 mod kept_readers;
+mod open;
 mod parameters;
-mod runtime;
 mod statement;
 mod typed_reader;
 
@@ -39,7 +37,7 @@ use crate::{
 };
 use exception::js_error;
 use kept_readers::KeptReaders;
-use parameters::{refuse_a_named_parameter, ParameterCounts};
+use parameters::refuse_a_named_parameter;
 use statement::{
     database_method, integer_from_js, js_params, read_rows, refuse_all_but_one_statement, refuse_sql_past_its_statement, source,
     statement_method, unreadable, width, RowSelection,
@@ -52,54 +50,36 @@ pub(crate) use NodeJsConnection as PooledConnection;
 /// The engine's pool on Node.js.
 pub(crate) type Pool = NodeJsPool;
 
-/// The pool behind `SqliteStorageEngine::open`.
-pub(crate) async fn file_pool(path: &Path) -> anyhow::Result<Pool> {
-    let path = path.to_str().ok_or_else(|| anyhow::anyhow!("the database path is not valid UTF-8"))?;
-    Ok(NodeJsPool::new(NodeJsConnection::open(path)?))
-}
-
-/// The pool behind `SqliteStorageEngine::open_in_memory`.
-pub(crate) async fn memory_pool() -> anyhow::Result<Pool> { Ok(NodeJsPool::new(NodeJsConnection::open(":memory:")?)) }
-
 impl SqliteStorageEngine {
-    /// Adopt a database object the host constructed, for a host that runs
-    /// SQLite itself: on better-sqlite3, or on a node:sqlite `DatabaseSync`
-    /// with settings of its own. The engine keeps the host's session
-    /// settings, its busy timeout and SQLite's defensive flag among them,
-    /// where `open` sets native's. It refuses a database it cannot read
-    /// exactly, as a [`Refusal::Database`]: one whose statements cannot
-    /// hand rows over as arrays or INTEGERs as BigInts, or report their SQL;
-    /// one whose node:sqlite skips a numbered parameter as it binds a call's
-    /// values; one whose text encoding is not UTF-8; and one that reads a
-    /// double-quoted name that matches no column as a string.
-    ///
-    /// A driver such as better-sqlite3 brings a copy of SQLite of its own, and
-    /// two copies in one process cannot coordinate the file locks SQLite
-    /// takes, which belong to the process: one copy closing the file can drop
-    /// the locks the other holds, which SQLite's notes on corruption list as a
-    /// way to corrupt it. So a host that adopts such a database on a file must
-    /// not open the same file with another copy in the same process, as
-    /// [`SqliteStorageEngine::open`] would with node:sqlite's.
-    pub async fn from_database(database: JsValue) -> anyhow::Result<Self> {
-        Self::new(NodeJsPool::new(NodeJsConnection::from_database(database)?)).await
+    /// Open a file-based SQLite database, built with `driver`:
+    /// better-sqlite3's `Database` class, the export of
+    /// `require('better-sqlite3')`, which the host passes in, since the WASM
+    /// cannot import it. A `driver` that is not that class is refused, as a
+    /// [`Refusal::Database`] (see [`NodeJsConnection::open`]). better-sqlite3
+    /// reads a `path` that begins `file:` as the name of a file, where
+    /// natively SQLite reads it as a URI.
+    pub async fn open(path: impl AsRef<Path>, driver: &JsValue) -> anyhow::Result<Self> {
+        let path = path.as_ref().to_str().ok_or_else(|| anyhow::anyhow!("the database path is not valid UTF-8"))?;
+        Self::new(NodeJsPool::new(NodeJsConnection::open(path, driver)?)).await
     }
 
-    /// The JavaScript database object this engine runs on, for a host that
-    /// wants to share it or reopen the engine over it.
-    pub fn database(&self) -> &JsValue { self.pool().connection().database() }
+    /// Open an in-memory SQLite database (for testing), built with `driver`,
+    /// better-sqlite3's `Database` class, as [`SqliteStorageEngine::open`]
+    /// builds one on a file.
+    pub async fn open_in_memory(driver: &JsValue) -> anyhow::Result<Self> {
+        Self::new(NodeJsPool::new(NodeJsConnection::open(":memory:", driver)?)).await
+    }
 }
 
-/// The Node.js executor's connection: one `DatabaseSync`-shaped database
-/// object. Clones share the object and what the executor keeps for it: its
-/// typed readers, its parameter counts and its own statements.
+/// The Node.js executor's connection: one better-sqlite3 database. Clones
+/// share the database and what the executor keeps for it: its typed readers
+/// and its own statements.
 #[derive(Clone)]
 pub struct NodeJsConnection {
     // The JavaScript handles are bound to the thread that made them; WASM has one.
     database: SendWrapper<JsValue>,
     readers: SendWrapper<Rc<RefCell<KeptReaders>>>,
     statements: SendWrapper<Rc<RefCell<OwnStatements>>>,
-    /// `None` on a database that refuses a call passing too few values itself.
-    parameters: Option<SendWrapper<ParameterCounts>>,
 }
 
 /// The statements the executor runs on a connection for itself, to read its
@@ -114,7 +94,8 @@ struct OwnStatements {
 }
 
 impl NodeJsConnection {
-    /// The JavaScript database object.
+    /// The better-sqlite3 database, for a host that registers a function on
+    /// it or runs its own statements beside the engine's.
     pub fn database(&self) -> &JsValue { &self.database }
 
     /// Run SQL of one or more statements that yield no rows, such as a
@@ -136,19 +117,16 @@ impl NodeJsConnection {
     }
 
     /// The count of rows `run()` reports it changed, which must fit a usize:
-    /// SQLite's changes(), as rusqlite reports it. node:sqlite's `run()`
-    /// reports changes() itself, as a BigInt, since its statements here read
-    /// BigInts. better-sqlite3's reports it as a number whatever its
-    /// statements read, and as 0 after a statement that changed no rows
-    /// itself, where changes() is still the count of the last INSERT, UPDATE
-    /// or DELETE; for that 0, changes() is read.
+    /// SQLite's changes(), as rusqlite reports it. better-sqlite3's `run()`
+    /// reports it as a number, and as 0 after a statement that changed no
+    /// rows itself, where changes() is still the count of the last INSERT,
+    /// UPDATE or DELETE; for that 0, changes() is read.
     fn changed_rows(&self, result: &JsValue) -> Result<usize, SqliteError> {
         let changes = Reflect::get(result, &"changes".into()).map_err(js_error)?;
         let count = match changes.as_f64() {
             Some(0.0) => return self.changes(),
             Some(count) if count.fract() == 0.0 => count as i64,
-            Some(_) => return Err(unreadable(format!("{changes:?} as the count of rows `run()` changed"))),
-            None => integer_from_js(&changes)?,
+            _ => return Err(unreadable(format!("{changes:?} as the count of rows `run()` changed"))),
         };
         usize::try_from(count).map_err(|_| unreadable(format!("{count} as the count of rows `run()` changed")))
     }
@@ -188,7 +166,7 @@ impl NodeJsPool {
 }
 
 impl SqliteExecutor for NodeJsConnection {
-    /// Takes one step, as rusqlite's `execute` does. node:sqlite's `run`
+    /// Takes one step, as rusqlite's `execute` does. better-sqlite3's `run`
     /// would take it and discard a row it yields, so a statement that has
     /// columns steps through `get`, which hands the row over to be refused.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
@@ -197,9 +175,7 @@ impl SqliteExecutor for NodeJsConnection {
         let source = source(&statement)?;
         refuse_sql_past_its_statement(statement_sql, &source)?;
         refuse_a_named_parameter(named_parameter)?;
-        let width = width(&statement)?;
-        self.refuse_too_few_values(sql, params.len())?;
-        if width == 0 {
+        if width(&statement)? == 0 {
             // A statement without columns yields no row.
             let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
             return self.changed_rows(&result);
@@ -232,7 +208,6 @@ impl NodeJsConnection {
     /// or for a PRAGMA or an EXPLAIN as the database hands its rows over.
     fn read(&self, sql: &str, params: &[SqliteValueRef<'_>], selection: RowSelection) -> Result<Vec<Row>, SqliteError> {
         if let Some((reader, width)) = self.kept_reader(sql)? {
-            self.refuse_too_few_values(sql, params.len())?;
             match read_rows(&reader, params, 2 * width, selection) {
                 Ok(taken) => return taken.into_iter().map(typed_row).collect(),
                 // The executor watches the schema versions of `main` and
@@ -257,7 +232,6 @@ impl NodeJsConnection {
         refuse_sql_past_its_statement(statement_sql, &source)?;
         refuse_a_named_parameter(named_parameter)?;
         let width = width(&statement)?;
-        self.refuse_too_few_values(sql, params.len())?;
         if width == 0 {
             // A statement without columns yields no rows; it runs for its
             // effect, through `run`, since better-sqlite3 refuses `all` on a

@@ -140,11 +140,14 @@ mod tests {
 
     use super::*;
 
+    /// A connection in memory, built with better-sqlite3's class.
+    fn connection() -> NodeJsConnection { NodeJsConnection::open(":memory:", &test_driver::better_sqlite3()).unwrap() }
+
     /// A connection on a database that has a host function `tick()`, which
     /// returns NULL and throws on its fourth call, over a table `f` of three
     /// rows; and a count of the function's calls so far.
     fn ticking_connection() -> (NodeJsConnection, impl Fn() -> f64) {
-        let database = test_driver::host_database(":memory:");
+        let connection = connection();
         let register = Function::new_with_args(
             "database",
             "let calls = 0;
@@ -155,8 +158,7 @@ mod tests {
              });
              return () => calls;",
         );
-        let calls: Function = register.call1(&JsValue::NULL, &database).unwrap().dyn_into().unwrap();
-        let connection = NodeJsConnection::from_database(database).unwrap();
+        let calls: Function = register.call1(&JsValue::NULL, connection.database()).unwrap().dyn_into().unwrap();
         connection.execute("CREATE TABLE f (a)", &[]).unwrap();
         connection.execute("INSERT INTO f VALUES (1), (2), (3)", &[]).unwrap();
         (connection, move || calls.call0(&JsValue::NULL).unwrap().as_f64().unwrap())
@@ -183,9 +185,8 @@ mod tests {
 
     /// A kept reader that fails inside an open transaction reports the
     /// failure without running its statement again, and leaves the
-    /// transaction as SQLite left it, open after a host function's failure:
-    /// node:sqlite reports that as `isTransaction`, better-sqlite3 as
-    /// `inTransaction`.
+    /// transaction as SQLite left it, open after a host function's failure,
+    /// as better-sqlite3 reports in `inTransaction`.
     #[wasm_bindgen_test]
     fn a_kept_reader_that_fails_in_a_transaction_leaves_it_as_sqlite_left_it() {
         let (connection, calls) = ticking_connection();
@@ -194,8 +195,8 @@ mod tests {
         connection.execute("INSERT INTO f VALUES (4)", &[]).unwrap();
         connection.query(TICKING_QUERY, &[]).expect_err("the kept reader's run calls tick() a fourth time");
         assert_eq!(calls(), 4.0, "the failed run called tick() once, and nothing ran it again");
-        let open = if test_driver::on_better_sqlite3() { "inTransaction" } else { "isTransaction" };
-        assert_eq!(Reflect::get(connection.database(), &open.into()).unwrap().as_bool(), Some(true), "the transaction is open");
+        let open = Reflect::get(connection.database(), &"inTransaction".into()).unwrap().as_bool();
+        assert_eq!(open, Some(true), "the transaction is open");
         connection.execute("ROLLBACK", &[]).unwrap();
         assert_eq!(connection.query_row("SELECT count(*) FROM f", &[]).unwrap().unwrap().integer(0).unwrap(), 3);
     }
@@ -207,15 +208,14 @@ mod tests {
     /// `tally()` counts the rows the statement reached.
     #[wasm_bindgen_test]
     fn a_kept_reader_that_fails_with_another_sqlite_error_reports_it() {
-        let database = test_driver::host_database(":memory:");
+        let connection = connection();
         let register = Function::new_with_args(
             "database",
             "let calls = 0;
              database.function('tally', () => { calls += 1; return null; });
              return () => calls;",
         );
-        let calls: Function = register.call1(&JsValue::NULL, &database).unwrap().dyn_into().unwrap();
-        let connection = NodeJsConnection::from_database(database).unwrap();
+        let calls: Function = register.call1(&JsValue::NULL, connection.database()).unwrap().dyn_into().unwrap();
         connection.execute("CREATE TABLE j (a)", &[]).unwrap();
         connection.execute("INSERT INTO j VALUES ('{}'), ('[]')", &[]).unwrap();
         let sql = "SELECT tally(), json(a) FROM j ORDER BY rowid";
@@ -233,9 +233,7 @@ mod tests {
     /// prepared and kept again.
     #[wasm_bindgen_test]
     fn keeps_the_typed_readers_of_the_most_recently_used_queries() {
-        let connection = NodeJsConnection::from_database(crate::test_driver::host_database(":memory:")).unwrap();
-        // SQL texts of the test's own, so that the readers of the queries
-        // `from_database` ran leave first.
+        let connection = connection();
         let sql = |index: usize| format!("SELECT {index} AS kept");
         let read = |index: usize| connection.query(&sql(index), &[]).unwrap()[0].integer(0).unwrap();
         let kept = |index: usize| connection.readers.borrow().kept.contains_key(&sql(index));

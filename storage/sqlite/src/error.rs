@@ -11,21 +11,22 @@ pub enum SqliteError {
     Rusqlite(#[from] rusqlite::Error),
 
     /// An error SQLite itself raised, such as a constraint's failure or a
-    /// syntax error, through either Node.js driver: what rusqlite reports
-    /// natively as its `SqliteFailure`.
+    /// syntax error, through better-sqlite3: what rusqlite reports natively
+    /// as its `SqliteFailure`.
     #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
     #[error("SQLite error: {0}")]
     Sqlite(SqliteFailure),
 
-    /// A call, or a database, that the Node.js executor refuses (see [`Refusal`]).
+    /// A call, a driver or a database that the Node.js executor refuses (see
+    /// [`Refusal`]).
     #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
     #[error(transparent)]
     Refused(#[from] Refusal),
 
     /// A JavaScript exception that is no error SQLite raised, with its
-    /// message: a driver's own refusal, such as better-sqlite3's of a call
-    /// that passes too few values, a host function's exception, or a
-    /// TypeError a driver throws.
+    /// message: better-sqlite3's own refusal, such as of a call that passes
+    /// too few values, a host function's exception, or a TypeError
+    /// better-sqlite3 throws.
     #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
     #[error("JavaScript exception: {0}")]
     JavaScript(String),
@@ -76,22 +77,16 @@ impl SqliteError {
     /// SQLite's extended result code when SQLite itself refused a statement,
     /// such as 1555 for a duplicate primary key or 5 for a lock held past the
     /// busy timeout, the same whichever driver ran the statement: rusqlite
-    /// and node:sqlite hand the code over as its number, and better-sqlite3
-    /// by its name, which is read as the number sqlite3.h gives it. On
-    /// better-sqlite3 a name that no SQLite release up to the crate's table
-    /// of names defines, as a later release could add, has `None`. On Node.js
-    /// the executor's refusal of SQL that holds no statement answers 21,
-    /// SQLITE_MISUSE, the code SQLite refuses it with natively, and its
-    /// refusal of a statement SQLite cannot nest answers the code of SQLite's
-    /// error. `None` for every other error.
-    ///
-    /// A call that passes more values than its statement takes parameters
-    /// differs between drivers: rusqlite and better-sqlite3 refuse it
-    /// themselves, before SQLite binds anything, so their code is `None`,
-    /// where node:sqlite's refusal is SQLite's SQLITE_RANGE, `Some(25)`. A
-    /// call that passes too few has `None` on every driver, refused before
-    /// SQLite runs by rusqlite, by the Node.js executor on node:sqlite, and by
-    /// better-sqlite3.
+    /// hands the code over as its number, and better-sqlite3 by its name,
+    /// which is read as the number sqlite3.h gives it. On better-sqlite3 a
+    /// name that no SQLite release up to the crate's table of names defines,
+    /// as a later release could add, has `None`. On Node.js the executor's
+    /// refusal of SQL that holds no statement answers 21, SQLITE_MISUSE, the
+    /// code SQLite refuses it with natively, and its refusal of a statement
+    /// SQLite cannot nest answers the code of SQLite's error. `None` for
+    /// every other error, a call that passes more or fewer values than its
+    /// statement takes parameters among them: rusqlite and better-sqlite3
+    /// refuse such a call themselves, before SQLite binds anything.
     pub fn sqlite_code(&self) -> Option<i32> {
         match self {
             // rusqlite reports a statement SQLite could not parse as an
@@ -109,10 +104,10 @@ impl SqliteError {
     }
 
     /// The refusal this error is, when the executor refused a call, or on
-    /// Node.js a database, rather than run or read it otherwise than rusqlite
-    /// does: one question for every driver, as [`SqliteError::sqlite_code`]
-    /// is for SQLite's result codes. Natively it answers rusqlite's own
-    /// refusals of the kinds the Node.js executor makes as rusqlite does:
+    /// Node.js a driver or a database, rather than run or read it otherwise
+    /// than rusqlite does: one question for every driver, as
+    /// [`SqliteError::sqlite_code`] is for SQLite's result codes. Natively it
+    /// answers rusqlite's own refusals as the refusals of their kinds:
     /// `MultipleStatement`, `ExecuteReturnedResults`, `InvalidParameterCount`
     /// for a call that passes fewer values than its statement takes, and
     /// `FromSqlConversionFailure` for TEXT that is not UTF-8. On Node.js it
@@ -129,8 +124,9 @@ impl SqliteError {
     ///   `sqlite_code`);
     /// - TEXT that is not UTF-8 in a row of a PRAGMA or an EXPLAIN:
     ///   [`Refusal::TextNotUtf8`] natively, and
-    ///   [`Refusal::ReplacementCharacter`] on Node.js, whose drivers hand such
-    ///   TEXT over with U+FFFD in place of each byte that is not UTF-8.
+    ///   [`Refusal::ReplacementCharacter`] on Node.js, where better-sqlite3
+    ///   hands such TEXT over with U+FFFD in place of each byte that is not
+    ///   UTF-8.
     pub fn refusal(&self) -> Option<Refusal> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
@@ -152,32 +148,29 @@ impl SqliteError {
     }
 }
 
-/// An error SQLite raised, as a Node.js driver hands it over.
+/// An error SQLite raised, as better-sqlite3 hands it over.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
 pub struct SqliteFailure {
     /// SQLite's extended result code, such as 1555 for
-    /// SQLITE_CONSTRAINT_PRIMARYKEY: node:sqlite hands it over as its number,
-    /// and better-sqlite3 by its name, which is read as the number sqlite3.h
-    /// gives it. `None` for a name better-sqlite3 gives that no SQLite release
-    /// up to the crate's table of names defines.
+    /// SQLITE_CONSTRAINT_PRIMARYKEY: better-sqlite3 hands it over by its
+    /// name, which is read as the number sqlite3.h gives it. `None` for a
+    /// name better-sqlite3 gives that no SQLite release up to the crate's
+    /// table of names defines.
     pub code: Option<i32>,
     /// SQLite's message, such as "UNIQUE constraint failed: things.k".
     pub message: String,
 }
 
-/// The Node.js releases whose node:sqlite the Node.js executor runs on.
-const NODE_JS_RELEASES: &str = "Node.js 22.20.0 or later on 22, 24.7.0 or later on 24, or a later release line";
-
-/// A call, or on Node.js a database, that the engine's executor refuses
-/// rather than run or read it otherwise than rusqlite does: what
+/// A call, or on Node.js a driver or a database, that the engine's executor
+/// refuses rather than run or read it otherwise than rusqlite does: what
 /// [`SqliteError::refusal`] answers, on every driver.
 ///
-/// The first four are rusqlite's own refusals, which the Node.js executor
-/// makes as rusqlite does and in rusqlite's words, but for `TooFewValues`,
-/// which cannot name the count of parameters its statement takes; natively,
-/// `SqliteError::Rusqlite` displays each after "SQLite error: ". Only the
-/// Node.js executor makes the others.
+/// The first four are rusqlite's own refusals, which `refusal` answers
+/// natively; natively, `SqliteError::Rusqlite` displays each after "SQLite
+/// error: ". The Node.js executor makes three of them as rusqlite does, in
+/// rusqlite's words; the third, `TooFewValues`, better-sqlite3 makes itself,
+/// in its own words. Only the Node.js executor makes the others.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Refusal {
     /// SQL that holds a second statement, refused before SQLite prepares
@@ -194,8 +187,8 @@ pub enum Refusal {
     /// A call that passes `passed` values, fewer than its statement takes
     /// parameters, refused before it runs: natively rusqlite's
     /// `InvalidParameterCount`, which also counts the parameters the
-    /// statement takes, where the Node.js executor finds only that it takes
-    /// more.
+    /// statement takes. On Node.js better-sqlite3 refuses such a call itself,
+    /// as a [`SqliteError::JavaScript`].
     #[error("Wrong number of parameters passed to query. Got {passed}, needed more")]
     TooFewValues { passed: usize },
 
@@ -212,9 +205,7 @@ pub enum Refusal {
     /// SQL that holds no statement, only whitespace, semicolons and
     /// comments, refused before a driver prepares it: SQLite refuses to run
     /// such SQL, natively with SQLITE_MISUSE, which
-    /// [`SqliteError::sqlite_code`] answers for this refusal too, and
-    /// node:sqlite can crash the process once it collects a statement
-    /// prepared from such SQL while its database is open.
+    /// [`SqliteError::sqlite_code`] answers for this refusal too.
     #[error(
         "SQL that holds no statement, only whitespace, semicolons and comments, is refused on Node.js, as SQLite refuses to \
          run it natively (SQLITE_MISUSE)"
@@ -235,12 +226,11 @@ pub enum Refusal {
     CompoundSelect,
 
     /// A statement with a named parameter (`:a`, `@a`, `#a` or `$a`), the
-    /// first of which is `name`, refused before it runs: node:sqlite binds
-    /// no positional value to one, leaving it NULL, and better-sqlite3 binds
+    /// first of which is `name`, refused before it runs: better-sqlite3 binds
     /// one only by name, where rusqlite binds a call's values to every
     /// parameter in turn.
     #[error(
-        "a statement with the named parameter {name} is refused on Node.js, since neither Node.js driver binds a call's \
+        "a statement with the named parameter {name} is refused on Node.js, since better-sqlite3 does not bind a call's \
          values to it in turn, as rusqlite does; write a positional `?` for each parameter"
     )]
     NamedParameter { name: String },
@@ -280,14 +270,14 @@ pub enum Refusal {
     /// hands its TEXT over as a string, in which U+FFFD may stand for a byte
     /// that is not UTF-8.
     #[error(
-        "TEXT holding U+FFFD in column {column} of a PRAGMA or an EXPLAIN is refused on Node.js, since both Node.js drivers \
-         hand such TEXT over as a string, in which U+FFFD may stand for a byte that is not UTF-8; select it through a \
-         query, such as one of a table-valued pragma function like pragma_table_info, which reads TEXT as its bytes"
+        "TEXT holding U+FFFD in column {column} of a PRAGMA or an EXPLAIN is refused on Node.js, since better-sqlite3 hands \
+         such TEXT over as a string, in which U+FFFD may stand for a byte that is not UTF-8; select it through a query, \
+         such as one of a table-valued pragma function like pragma_table_info, which reads TEXT as its bytes"
     )]
     ReplacementCharacter { column: usize },
 
-    /// A database the Node.js executor cannot run on, or a runtime it cannot
-    /// open one in.
+    /// A driver or a database the Node.js executor cannot run on (see
+    /// [`DatabaseRefusal`]).
     #[error(transparent)]
     Database(#[from] DatabaseRefusal),
 }
@@ -298,52 +288,41 @@ impl From<DatabaseRefusal> for SqliteError {
     fn from(refusal: DatabaseRefusal) -> Self { SqliteError::Refused(Refusal::Database(refusal)) }
 }
 
-/// A database the Node.js executor cannot run on, refused as the engine
-/// adopts it or opens it, or a runtime it cannot open one in. A value the
-/// database hands over later that the executor cannot read is refused the
-/// same way, as it is read.
+/// A driver or a database the Node.js executor cannot run on, refused as the
+/// engine opens the database: a driver that is not better-sqlite3's
+/// `Database` class, or a database the executor cannot read exactly. A value
+/// the database hands over later that the executor cannot read is refused
+/// the same way, as it is read.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DatabaseRefusal {
-    /// A runtime without what opening a node:sqlite database takes, `missing`
-    /// naming what it lacks: the `process` global,
-    /// `process.getBuiltinModule`, the `node:sqlite` module, or its database
-    /// class, `Database` or `DatabaseSync`.
-    #[error("a runtime without {missing} is refused, since it offers no node:sqlite database to open; run inside {}", NODE_JS_RELEASES)]
-    NoNodeSqlite { missing: &'static str },
-
-    /// A value handed over as a database that is not an object; `found` is
-    /// how the value reads.
+    /// A value passed as the driver that is not a class, a constructor with
+    /// a prototype; `found` is how the value reads.
     #[error(
-        "{found} is refused as a database, since it is not an object, such as node:sqlite's DatabaseSync, with `prepare` and \
-         `exec` methods"
+        "{found} is refused as the driver, since it is not a class; pass better-sqlite3's `Database` class, the export of \
+         `require('better-sqlite3')`"
     )]
-    NotAnObject { found: String },
+    NotADatabaseClass { found: String },
 
-    /// A database object without the method `name`.
-    #[error("a database without a `{name}` method is refused, since the Node.js executor calls it")]
+    /// A driver whose databases lack the method `name`.
+    #[error(
+        "a driver whose databases have no `{name}` method is refused, since the Node.js executor calls it; better-sqlite3's \
+         `Database` has every method it calls"
+    )]
     NoDatabaseMethod { name: &'static str },
 
     /// A database whose statements lack the method `name`.
     #[error(
-        "a database whose statements have no `{name}` method is refused, since the Node.js executor calls it; node:sqlite's \
-         and better-sqlite3's statements have every method it calls"
+        "a database whose statements have no `{name}` method is refused, since the Node.js executor calls it; \
+         better-sqlite3's statements have every method it calls"
     )]
     NoStatementMethod { name: &'static str },
 
-    /// A database whose statements cannot hand rows over as arrays, which
-    /// keep every column at its position in the statement.
-    #[error(
-        "a database whose statements cannot hand rows over as arrays is refused, since rows keyed by column name do not \
-         keep every column at its position; its statements need setReturnArrays (node:sqlite's) or raw (better-sqlite3's)"
-    )]
-    NoPositionalRows,
-
-    /// A database whose statements cannot hand INTEGERs over as BigInts, or
-    /// hand one over as a number though asked for BigInts.
+    /// A database whose statements hand an INTEGER over as a number though
+    /// asked for BigInts.
     #[error(
         "a database whose statements hand INTEGERs over as JavaScript numbers is refused, since a number cannot hold every \
-         INTEGER exactly, nor be told from a REAL; its statements need setReadBigInts (node:sqlite's) or safeIntegers \
-         (better-sqlite3's)"
+         INTEGER exactly, nor be told from a REAL; the Node.js executor asks for BigInts through better-sqlite3's \
+         safeIntegers"
     )]
     NoExactIntegers,
 
@@ -351,32 +330,21 @@ pub enum DatabaseRefusal {
     /// to check where SQLite ended each statement.
     #[error(
         "a database whose statements report no SQL is refused, since the Node.js executor checks where SQLite ended each \
-         statement; its statements need sourceSQL (node:sqlite's) or source (better-sqlite3's)"
+         statement through better-sqlite3's `source`"
     )]
     NoStatementSource,
-
-    /// A database that skips a numbered parameter such as `?2` as it binds a
-    /// call's values, as node:sqlite did before Node.js 22.20.0 on 22 and
-    /// 24.7.0 on 24.
-    #[error(
-        "a database that skips a numbered parameter such as `?2` as it binds a call's values is refused, since that leaves \
-         the parameter NULL where rusqlite binds the value at its position, as node:sqlite did before Node.js 22.20.0 on 22 \
-         and 24.7.0 on 24; run inside {}",
-        NODE_JS_RELEASES
-    )]
-    SkipsNumberedParameters,
 
     /// A database whose text encoding is not UTF-8.
     #[error("a database whose text encoding is not UTF-8 is refused, since the Node.js executor reads TEXT as UTF-8 bytes")]
     NotUtf8,
 
-    /// A database that reads a double-quoted name that matches no column as
-    /// a string literal, where every connection the engine opens natively
-    /// refuses such a name.
+    /// A database whose SQLite reads a double-quoted name that matches no
+    /// column as a string literal, where every connection the engine opens
+    /// natively refuses such a name.
     #[error(
-        "a database that reads a double-quoted name that matches no column as a string literal is refused, since the engine \
-         refuses such a name natively; turn double-quoted string literals off, as node:sqlite's DatabaseSync has them \
-         unless it is constructed with `enableDoubleQuotedStringLiterals: true`"
+        "a database whose SQLite reads a double-quoted name that matches no column as a string literal is refused, since the \
+         engine refuses such a name natively; use a better-sqlite3 whose SQLite has double-quoted string literals off, as \
+         its own build does"
     )]
     DoubleQuotedStringLiterals,
 

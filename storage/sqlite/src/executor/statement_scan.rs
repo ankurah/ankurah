@@ -275,45 +275,13 @@ const NEXT: [[State; 7]; 7] = {
     ]
 };
 
-/// SQL on either side of holding no statement, on which `holds_no_statement`
-/// is checked against SQLite's own reading, natively and on node:sqlite:
-/// whitespace, semicolons and comments, ended or not, byte order marks and
-/// SQL past a NUL, beside characters and statements SQLite does not skip.
-#[cfg(test)]
-const NO_STATEMENT_CANDIDATES: &[&str] = &[
-    "",
-    " \t\n\x0c\r",
-    " \x0b",
-    "\x0b",
-    ";",
-    " ; ;",
-    " ; ;; ",
-    "-- c",
-    "-- c\n;",
-    "-",
-    "/* c */",
-    "/**/",
-    "/*/",
-    "/* unended",
-    "/*",
-    "/",
-    "\u{FEFF}",
-    " \u{FEFF};\u{FEFF} ",
-    "\0 SELECT 1",
-    " SELECT 1",
-    "x",
-];
-
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use std::{collections::HashSet, ffi::CString};
 
     use rusqlite::{ffi, Batch, Connection};
 
-    use super::{
-        first_keyword, first_statement, holds_no_statement, skip_to_statement, statements, tokens, Statements, TokenKind,
-        NO_STATEMENT_CANDIDATES,
-    };
+    use super::{first_keyword, first_statement, holds_no_statement, skip_to_statement, statements, tokens, Statements, TokenKind};
 
     /// The tables the statements below read.
     const SCHEMA: &str = r#"CREATE TABLE t (a, "b:c", [d@e], `f$g`, "h""i", a$b, "x--y", "p/*q", `j``k`); CREATE TABLE x (a)"#;
@@ -414,6 +382,34 @@ mod tests {
         assert_eq!(first_keyword(";;"), "");
     }
 
+    /// SQL on either side of holding no statement, on which `holds_no_statement`
+    /// is checked against SQLite's own reading: whitespace, semicolons and
+    /// comments, ended or not, byte order marks and SQL past a NUL, beside
+    /// characters and statements SQLite does not skip.
+    const NO_STATEMENT_CANDIDATES: &[&str] = &[
+        "",
+        " \t\n\x0c\r",
+        " \x0b",
+        "\x0b",
+        ";",
+        " ; ;",
+        " ; ;; ",
+        "-- c",
+        "-- c\n;",
+        "-",
+        "/* c */",
+        "/**/",
+        "/*/",
+        "/* unended",
+        "/*",
+        "/",
+        "\u{FEFF}",
+        " \u{FEFF};\u{FEFF} ",
+        "\0 SELECT 1",
+        " SELECT 1",
+        "x",
+    ];
+
     /// `holds_no_statement` holds of exactly the SQL in which SQLite's parser
     /// finds no statement, and `statements` finds none in exactly that SQL.
     #[test]
@@ -499,51 +495,5 @@ mod tests {
                 "{sql:?}"
             );
         }
-    }
-}
-
-#[cfg(all(test, target_arch = "wasm32", feature = "nodejs"))]
-mod node_sqlite_tests {
-    use js_sys::{Function, Reflect};
-    use wasm_bindgen::{JsCast, JsValue};
-    use wasm_bindgen_test::wasm_bindgen_test;
-
-    use super::{holds_no_statement, NO_STATEMENT_CANDIDATES};
-
-    /// `holds_no_statement` holds of exactly what SQLite skips between
-    /// statements on node:sqlite's SQLite too: SQL it holds of prepares there
-    /// to no statement, which node:sqlite refuses to prepare from Node.js
-    /// 26.8.0, and any other SQL to a statement or an error of another kind.
-    #[wasm_bindgen_test]
-    fn sql_holds_no_statement_where_node_sqlite_finds_none() {
-        let construct = Function::new_no_args("return new (process.getBuiltinModule('node:sqlite').DatabaseSync)(':memory:');");
-        let sqlite = construct.call0(&JsValue::NULL).unwrap();
-        let prepare: Function = Reflect::get(&sqlite, &"prepare".into()).unwrap().dyn_into().unwrap();
-        // node:sqlite can crash the process, in a later sqlite3_step, when a
-        // statement prepared from SQL that holds no statement is collected
-        // while its database is open, as Node.js 24.13.0 does. So the test
-        // holds every statement it prepares until it has closed the database.
-        let mut statements = Vec::new();
-        let mut prepares_to_no_statement = |sql: &str| match prepare.call1(&sqlite, &sql.into()) {
-            // Before Node.js 26.8.0, node:sqlite hands SQL that holds no
-            // statement back as a statement already finalized, whose source
-            // cannot be read.
-            Ok(statement) => {
-                let finalized = Reflect::get(&statement, &"sourceSQL".into()).is_err();
-                statements.push(statement);
-                finalized
-            }
-            // From 26.8.0 it refuses such SQL with ERR_INVALID_ARG_VALUE: "The
-            // SQL query contains no statements."
-            Err(error) => {
-                Reflect::get(&error, &"code".into()).ok().and_then(|code| code.as_string()).as_deref() == Some("ERR_INVALID_ARG_VALUE")
-            }
-        };
-        for sql in NO_STATEMENT_CANDIDATES {
-            assert_eq!(holds_no_statement(sql), prepares_to_no_statement(sql), "{sql:?}");
-        }
-        let close: Function = Reflect::get(&sqlite, &"close".into()).unwrap().dyn_into().unwrap();
-        close.call0(&sqlite).unwrap();
-        drop(statements);
     }
 }

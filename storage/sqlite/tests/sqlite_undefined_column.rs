@@ -148,10 +148,6 @@ async fn a_store_holding_a_table_named_pragma_table_info_loads_its_materializati
 /// TEXT arrives as the driver's string, U+FFFD in place of the byte, and is
 /// refused as such.
 #[engine_test]
-#[cfg_attr(
-    ankurah_sqlite_better_sqlite3,
-    ignore = "better-sqlite3 opens its databases in SQLite's defensive mode, which refuses `writable_schema`"
-)]
 async fn a_column_name_the_scan_cannot_read_fails_the_query() -> Result<()> {
     let db = common::TempDb::new("unreadable_column");
     {
