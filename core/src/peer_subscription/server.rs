@@ -13,6 +13,7 @@ use crate::{
     },
     session::{ContextData, SessionSet},
     storage::StorageEngine,
+    util::cancel_flag::CancelFlag,
 };
 use ankurah_signals::{Subscribe, SubscriptionGuard};
 use std::collections::HashMap;
@@ -33,6 +34,13 @@ struct StandingQuery<CD: ContextData> {
     /// Initial credential snapshot; peer session updates are not synchronized yet (#484).
     sessions: SessionSet<CD>,
     version: u32,
+    /// Stops the push of this version's initial data once a later version
+    /// replaces the query or the query goes.
+    push: CancelFlag,
+}
+
+impl<CD: ContextData> Drop for StandingQuery<CD> {
+    fn drop(&mut self) { self.push.cancel(); }
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
@@ -102,22 +110,24 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         selection.predicate = policy.filter_predicate(selection.predicate)?;
 
         use std::collections::hash_map::Entry;
-        let (sessions, query_created) = match queries.entry(query_id) {
+        let (sessions, push, query_created) = match queries.entry(query_id) {
             Entry::Occupied(mut o) => {
                 let standing = o.get_mut();
                 if version < standing.version {
                     anyhow::bail!("stale subscription version {version} for query {query_id}; current version is {}", standing.version);
                 }
                 standing.version = version;
-                (standing.sessions.clone(), false)
+                standing.push.cancel_and_swap();
+                (standing.sessions.clone(), standing.push.clone(), false)
             }
             Entry::Vacant(v) => {
                 let sessions = match cdata {
                     Some(cdata) => cdata.clone().into(),
                     None => SessionSet::new(),
                 };
-                v.insert(StandingQuery { sessions: sessions.clone(), version });
-                (sessions, true)
+                let push = CancelFlag::default();
+                v.insert(StandingQuery { sessions: sessions.clone(), version, push: push.clone() });
+                (sessions, push, true)
             }
         };
 
@@ -133,8 +143,8 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         }
         drop(queries);
 
-        let initial = vec![(query_id, proto::MembershipChange::Initial)];
-        match crate::node::state_sync::answer_offer(node, self.peer_id, requested, known_state, credentials, initial).await {
+        let offered_in = crate::node::state_sync::OfferedIn::SubscribeQuery { query_id, cancel: push };
+        match crate::node::state_sync::answer_offer(node, self.peer_id, requested, known_state, credentials, offered_in).await {
             Ok(target) => Ok(proto::NodeResponseBody::QuerySubscribed { query_id, target }),
             Err(error) => {
                 if query_created {

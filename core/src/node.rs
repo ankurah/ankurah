@@ -522,7 +522,8 @@ where
             }
             proto::NodeRequestBody::Fetch { selection, known_state } => {
                 let credentials = cdata.iterable().cloned().collect();
-                let target = state_sync::answer_offer(self, request.from, selection, known_state, credentials, Vec::new()).await?;
+                let target =
+                    state_sync::answer_offer(self, request.from, selection, known_state, credentials, state_sync::OfferedIn::Fetch).await?;
                 Ok(proto::NodeResponseBody::Fetch(target))
             }
             proto::NodeRequestBody::CompareSpans { selection, spec, questions } => {

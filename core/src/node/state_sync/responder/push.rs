@@ -11,6 +11,7 @@ use crate::{
     policy::{ContextPolicy, PolicyAgent},
     session::ContextData,
     storage::StorageEngine,
+    util::cancel_flag::CancelFlag,
 };
 use ankurah_proto::{self as proto, state_sync::limits::MAX_PAGE_HEADS};
 use std::sync::{Arc, Weak};
@@ -18,7 +19,7 @@ use std::sync::{Arc, Weak};
 #[cfg(test)]
 mod tests;
 
-/// The item data one update carries, about: a count alone would let large
+/// About how much item data one update carries: a count alone would let large
 /// entities build messages past a websocket's message limit. A responder's own
 /// bound, not a protocol limit.
 const MAX_UPDATE_BYTES: usize = 1024 * 1024;
@@ -27,10 +28,11 @@ const MAX_UPDATE_BYTES: usize = 1024 * 1024;
 /// updates of at most `MAX_PAGE_HEADS` items and about `MAX_UPDATE_BYTES` of item
 /// data, at least one item each. The push ends with that connection: a peer that
 /// reconnects compares afresh, and the old push's remaining items would reach it
-/// beside the new push's.
+/// beside the new push's. It also ends once `cancel` is raised.
 pub(super) struct Push<CD: ContextData> {
     peer: proto::EntityId,
     connection: Weak<PeerState<CD>>,
+    cancel: CancelFlag,
     relevance: Vec<(proto::QueryId, proto::MembershipChange)>,
     items: Vec<proto::SubscriptionUpdateItem>,
     bytes: usize,
@@ -44,16 +46,17 @@ impl<CD: ContextData> Push<CD> {
         node: &Node<SE, PA>,
         peer: proto::EntityId,
         relevance: Vec<(proto::QueryId, proto::MembershipChange)>,
+        cancel: CancelFlag,
     ) -> Self
     where
         PA: PolicyAgent<ContextData = CD>,
     {
         let connection = node.peer_connections.get(&peer).map(|connection| Arc::downgrade(&connection)).unwrap_or_default();
-        Self { peer, connection, relevance, items: Vec::new(), bytes: 0 }
+        Self { peer, connection, cancel, relevance, items: Vec::new(), bytes: 0 }
     }
 
-    /// Whether the connection the push began on is still open.
-    fn connected(&self) -> bool { self.connection.strong_count() > 0 }
+    /// Whether the push has ended: its connection closed, or `cancel` was raised.
+    fn stopped(&self) -> bool { self.cancel.canceled() || self.connection.strong_count() == 0 }
 
     /// Add the item that carries `content` for `entity_id`, first sending the
     /// gathered items when it would overfill their update.
@@ -70,7 +73,7 @@ impl<CD: ContextData> Push<CD> {
         self.bytes += bytes;
     }
 
-    /// Send the gathered items, if any, while the push's connection is open.
+    /// Send the gathered items, if any, unless the push has ended.
     pub(super) fn send<SE, PA>(&mut self, node: &Node<SE, PA>)
     where
         SE: StorageEngine + Send + Sync + 'static,
@@ -81,6 +84,9 @@ impl<CD: ContextData> Push<CD> {
         }
         self.bytes = 0;
         let items = std::mem::take(&mut self.items);
+        if self.cancel.canceled() {
+            return;
+        }
         if let Some(connection) = self.connection.upgrade() {
             node.send_update_on(&connection, self.peer, proto::NodeUpdateBody::SubscriptionUpdate { items });
         }
@@ -122,9 +128,9 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     for page in lacking.chunks(MAX_PAGE_HEADS) {
-        // A dropped node or a closed connection stops the push between pages.
+        // A dropped node, a closed connection or a cancel stops the push between pages.
         let Some(node) = node.upgrade() else { return Ok(()) };
-        if !push.connected() {
+        if push.stopped() {
             return Ok(());
         }
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);

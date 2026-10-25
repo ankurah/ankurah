@@ -34,7 +34,9 @@ async fn a_subscription_waiting_on_its_snapshot_holds_up_no_other_query_of_its_p
     node.storage.hold_fetch.lock().unwrap().insert(model(), (entered, release_rx));
     let fetch = tokio::spawn({
         let (node, peer, selection, offer) = (node.clone(), handler.peer_id, selection.clone(), offer.clone());
-        async move { crate::node::state_sync::answer_offer(&node, peer, selection, offer, vec![], vec![]).await }
+        async move {
+            crate::node::state_sync::answer_offer(&node, peer, selection, offer, vec![], crate::node::state_sync::OfferedIn::Fetch).await
+        }
     });
     entered_rx.await?;
 
@@ -62,5 +64,20 @@ async fn a_failed_answer_removes_its_query_only_while_no_later_version_replaced_
     assert!(handler.queries.lock().await.contains_key(&query), "version 2 replaced the query version 1 created");
     handler.remove_unless_replaced(query, 2).await;
     assert!(!handler.queries.lock().await.contains_key(&query));
+    Ok(())
+}
+
+#[tokio::test]
+async fn replacing_or_removing_a_query_cancels_its_push() -> anyhow::Result<()> {
+    let (node, handler, selection, offer) = serving().await?;
+    let query = proto::QueryId::new();
+    handler.subscribe_query(&node, query, selection.clone(), None, 1, offer.clone()).await?;
+    let first = handler.queries.lock().await[&query].push.clone();
+    handler.subscribe_query(&node, query, selection, None, 2, offer).await?;
+    let second = handler.queries.lock().await[&query].push.clone();
+    assert!(first.canceled() && !second.canceled(), "version 2's push replaces version 1's");
+
+    handler.remove_predicate(query).await?;
+    assert!(second.canceled(), "removing the query cancels its push");
     Ok(())
 }

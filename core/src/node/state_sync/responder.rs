@@ -14,54 +14,71 @@ mod size;
 mod tests;
 
 use self::{
-    comparison::OfferComparison,
     push::{spawn_push, Push},
     repair::{current_state_repairs, CurrentStateRepair},
 };
-use super::tree::{accept_peer_spec, entity_id_spec};
+use super::tree::{entity_id_spec, serves};
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
     schema::is_catalog_read,
     storage::StorageEngine,
+    util::cancel_flag::CancelFlag,
 };
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto::{self as proto, KnownState, SpanAnswer, SpanQuestion};
 
+/// The request an offer arrived in, which decides the tag on the items its
+/// push carries and what may stop that push before it finishes.
+pub(crate) enum OfferedIn {
+    /// A Fetch: its pushed items belong to no standing query, and its push ends
+    /// only with its connection.
+    Fetch,
+    /// A SubscribeQuery for `query_id`: its pushed items are that query's
+    /// initial data, and `cancel` stops its push when a later version replaces
+    /// the query or the peer removes it.
+    SubscribeQuery { query_id: proto::QueryId, cancel: CancelFlag },
+}
+
 /// Answer a requester's offer of `selection`'s result, which a Fetch or a
 /// SubscribeQuery carries: compare it with a snapshot of the resident that
 /// serves `selection` for `credentials`, push `peer` every entity the
-/// comparison finds it lacks, as items carrying `relevance`, and return the
-/// snapshot's own account. An offer under a spec no tree here serves, as when
-/// two catalogs type a key part differently, is answered under the entity-id
-/// spec and treated as unknown, so the requester still gets every member.
+/// comparison finds it lacks, and return the snapshot's own account. An offer
+/// under a spec no tree here serves, as when two catalogs type a key part
+/// differently, is answered under the entity-id spec and treated as unknown,
+/// so the requester still gets every member.
 pub(crate) async fn answer_offer<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     selection: Selection<Resolved>,
     known: KnownState,
     credentials: Vec<PA::ContextData>,
-    relevance: Vec<(proto::QueryId, proto::MembershipChange)>,
+    offered_in: OfferedIn,
 ) -> anyhow::Result<KnownState>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
     let catalog = is_catalog_read(&selection.predicate);
-    let (spec, known) = match accept_peer_spec(&selection, &node.catalog, &known) {
-        Ok(spec) => (spec, known),
-        Err(_) => {
-            let spec = entity_id_spec(&selection);
-            (spec.clone(), KnownState { spec, spans: Vec::new() })
-        }
+    let known = if serves(&known.spec, &selection, &node.catalog) {
+        // A malformed offer is refused before any snapshot is taken for it.
+        known.validate()?;
+        known
+    } else {
+        KnownState { spec: entity_id_spec(&selection), spans: Vec::new() }
     };
+    let spec = known.spec.clone();
     let mut snapshot = node.resident_trees.snapshot_through_changes(node, selection, Some(spec), credentials.clone()).await?.snapshot;
-    let comparison = OfferComparison::new(&snapshot, known)?;
+    let lacking = comparison::lacking(&snapshot, known);
     let target = snapshot.offer().await?;
     // The push reads current states, never the snapshot: holding it would copy
     // the resident's entries at its next commit.
     drop(snapshot);
-    spawn_push(node, comparison.lacking, credentials, catalog, Push::new(node, peer, relevance));
+    let (relevance, cancel) = match offered_in {
+        OfferedIn::Fetch => (Vec::new(), CancelFlag::default()),
+        OfferedIn::SubscribeQuery { query_id, cancel } => (vec![(query_id, proto::MembershipChange::Initial)], cancel),
+    };
+    spawn_push(node, lacking, credentials, catalog, Push::new(node, peer, relevance, cancel));
     Ok(target)
 }
 
@@ -110,7 +127,7 @@ where
         entities.into_iter().map(|entity| (entity.entity_id, (!entity.head.is_empty()).then_some(entity.head))).collect();
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);
     let repairs = current_state_repairs(node, &policy, &entities, is_catalog_read(&selection.predicate)).await?;
-    let mut push = Push::new(node, peer, Vec::new());
+    let mut push = Push::new(node, peer, Vec::new(), CancelFlag::default());
     let (mut held, mut unavailable) = (Vec::new(), Vec::new());
     for ((entity_id, _), repair) in entities.into_iter().zip(repairs) {
         match repair {
