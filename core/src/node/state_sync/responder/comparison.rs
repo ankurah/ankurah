@@ -1,13 +1,44 @@
 //! Comparing a requester's account of its query result with a snapshot of the
-//! responder's: which entities the requester lacks or holds at another head.
+//! responder's: which entities the requester lacks or holds at another head,
+//! and which of its span digests differ.
 
 #[cfg(test)]
 mod tests;
 
 use crate::node::state_sync::tree::Snapshot;
 use ankurah_digest_tree::leaf_address;
-use ankurah_proto::{Clock, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanInventory};
+use ankurah_proto::{Clock, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory};
 use std::collections::{BTreeMap, HashMap};
+
+/// An offer's span digests, compared with a snapshot's digests over the same bounds.
+pub(super) struct ComparedDigests {
+    /// The offered digests equal to the snapshot's.
+    pub(super) matching: Vec<TreeSpanDigest>,
+    /// The offered digests that differ from the snapshot's.
+    pub(super) differing: Vec<TreeSpanDigest>,
+}
+
+/// `known`'s span digests compared with `snapshot`'s over the same bounds;
+/// none when `known` describes a span by heads, or describes none. `known` is
+/// a valid offer under the snapshot's spec.
+pub(super) async fn compare_digests(snapshot: &mut Snapshot, known: &KnownState) -> anyhow::Result<Option<ComparedDigests>> {
+    let mut digests = Vec::with_capacity(known.spans.len());
+    for span in &known.spans {
+        match span {
+            SpanContent::Digest(digest) => digests.push(digest),
+            SpanContent::Heads(_) => return Ok(None),
+        }
+    }
+    if digests.is_empty() {
+        return Ok(None);
+    }
+    let mut compared = ComparedDigests { matching: Vec::new(), differing: Vec::new() };
+    for digest in digests {
+        let side = if snapshot.matches(digest).await? { &mut compared.matching } else { &mut compared.differing };
+        side.push(digest.clone());
+    }
+    Ok(Some(compared))
+}
 
 /// The entities the responder sends the requester's copy toward, each with the
 /// head `known` listed for it: every snapshot member in a range the offer left

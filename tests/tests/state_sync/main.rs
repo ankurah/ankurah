@@ -9,6 +9,7 @@ mod common;
 mod fetch;
 mod live;
 mod loss;
+mod offline_edits;
 
 use common::*;
 

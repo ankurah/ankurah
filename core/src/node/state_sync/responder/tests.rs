@@ -5,9 +5,13 @@ use super::*;
 use crate::node::state_sync::fixtures::*;
 use ankurah_core_types::{IndexKeyPart, KeySpec, ValueType};
 use ankurah_proto::{
-    state_sync::limits::MAX_PAGE_HEADS, EntityHead, KeyedEntityHead, PackedHeads, SpanContent, TreeSpan, TreeSpanInventory,
+    state_sync::limits::{MAX_OFFER_HEADS, MAX_PAGE_HEADS},
+    Attested, EntityHead, EntityState, KeyedEntityHead, PackedHeads, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Bound,
+};
 
 /// The entity-id offer of [`members`] that lists `heads`.
 fn offer(heads: &[(&proto::Event, proto::Clock)]) -> anyhow::Result<KnownState> {
@@ -112,6 +116,166 @@ async fn a_malformed_offer_is_refused_before_any_tree_is_admitted_for_it() -> an
 
     assert!(answer_offer(&node, peer, members(), overlapping, vec![], OfferedIn::Fetch).await.is_err());
     assert_eq!(node.resident_trees.len(), 0, "no tree was admitted to compare the offer with");
+    Ok(())
+}
+
+/// The offer of a copy holding `source`: a frontier of span digests, several
+/// of them nonempty.
+async fn frontier(source: &[Attested<EntityState>]) -> anyhow::Result<KnownState> {
+    let known = snapshot(source.to_vec()).await?.offer().await?;
+    assert!(known.spans.iter().all(|span| matches!(span, SpanContent::Digest(_))), "a frontier of digests");
+    assert!(known.spans.iter().filter(|span| span.withholds_push()).count() > 2, "several of them nonempty");
+    Ok(known)
+}
+
+/// The digests `known` gives, in address order.
+fn offered_digests(known: &KnownState) -> Vec<TreeSpanDigest> {
+    let mut digests: Vec<_> = known
+        .spans
+        .iter()
+        .map(|span| match span {
+            SpanContent::Digest(digest) => digest.clone(),
+            SpanContent::Heads(_) => panic!("a frontier gives digests"),
+        })
+        .collect();
+    digests.sort_by(|a, b| a.bounds.cmp_start(&b.bounds));
+    digests
+}
+
+/// `account`'s spans, in address order.
+fn in_address_order(account: &KnownState) -> Vec<SpanContent> {
+    let mut spans = account.spans.clone();
+    spans.sort_by(|a, b| a.bounds().cmp_start(b.bounds()));
+    spans
+}
+
+/// `source` with every member at `head`.
+fn at_head(mut source: Vec<Attested<EntityState>>, head: &proto::Clock) -> Vec<Attested<EntityState>> {
+    for state in &mut source {
+        state.payload.state.head = head.clone();
+    }
+    source
+}
+
+/// A head no member of [`states`] holds.
+fn another_head() -> proto::Clock { proto::Clock::genesis(proto::EventId::from_bytes([9; 32])) }
+
+#[tokio::test]
+async fn an_offered_span_whose_digest_differs_is_answered_with_its_heads_and_matching_spans_keep_their_digests() -> anyhow::Result<()> {
+    let source = states(4096, 8);
+    let known = frontier(&source).await?;
+    // The responder holds one member at another head.
+    let mut current = source;
+    current[7].payload.state.head = another_head();
+    let changed = current[7].payload.entity_id;
+    let mut responder = snapshot(current).await?;
+
+    let answered = target_for(&mut responder, &known).await?;
+
+    answered.validate()?;
+    let address = responder.entries[&changed].address().to_vec();
+    let offered = offered_digests(&known);
+    let spans = in_address_order(&answered);
+    assert_eq!(spans.len(), offered.len(), "the target follows the offer's spans");
+    for (offered, answered) in offered.iter().zip(spans) {
+        match answered {
+            SpanContent::Heads(inventory) => {
+                assert!(offered.bounds.contains(&address), "only the span whose digest differs lists heads");
+                assert_eq!(inventory.bounds, offered.bounds, "over exactly the offered span");
+                let held: Vec<_> = responder.entries_in(&offered.bounds).map(|(id, entry)| (id, entry.head.clone())).collect();
+                let listed: Vec<_> = inventory.heads.to_vec().into_iter().map(|head| (head.entity.entity_id, head.entity.head)).collect();
+                assert_eq!(listed, held, "every head the responder holds within it");
+            }
+            SpanContent::Digest(digest) => {
+                assert!(!offered.bounds.contains(&address), "the span whose digest differs lists its heads");
+                assert_eq!(&digest, offered, "a matching digest is kept as offered");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn differing_spans_are_listed_fewest_members_first_until_the_head_limit_and_the_rest_get_the_responders_digests() -> anyhow::Result<()>
+{
+    let source = states(4096, 8);
+    let known = frontier(&source).await?;
+    // Every member is at another head, so every nonempty offered span
+    // differs, and together they hold more heads than one offer may.
+    let mut responder = snapshot(at_head(source, &another_head())).await?;
+
+    let answered = target_for(&mut responder, &known).await?;
+
+    answered.validate()?;
+    let (mut listed, mut digests) = (Vec::new(), Vec::new());
+    for (offered, answered) in offered_digests(&known).into_iter().zip(in_address_order(&answered)) {
+        match answered {
+            // An empty span matches: the responder holds no member there either.
+            SpanContent::Digest(digest) if offered.digest.count() == 0 => assert_eq!(digest, offered),
+            SpanContent::Heads(inventory) => listed.push(inventory.heads.len()),
+            SpanContent::Digest(digest) => {
+                let own = responder.span_digest(offered.bounds.clone()).await?;
+                assert_eq!(digest, TreeSpanDigest { digest: own.digest, ..offered }, "the responder's digest under the offered prefix");
+                digests.push(own.digest.count() as usize);
+            }
+        }
+    }
+    let (most_listed, fewest_digested) = (*listed.iter().max().unwrap(), *digests.iter().min().unwrap());
+    assert!(most_listed <= fewest_digested, "no digest span holds fewer members than a listed one");
+    let heads: usize = listed.iter().sum();
+    assert!(heads <= MAX_OFFER_HEADS && heads + fewest_digested > MAX_OFFER_HEADS, "listing stopped at the head limit: {heads}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn differing_spans_are_listed_only_while_their_heads_fit_an_offers_work() -> anyhow::Result<()> {
+    let source = states(4096, 8);
+    let known = frontier(&source).await?;
+    // Every member is at another head of forty events, so that the heads of
+    // the differing spans outweigh an offer's work long before they outnumber
+    // its heads.
+    let wide = proto::Clock::new(
+        (0..40u32)
+            .map(|n| {
+                let mut bytes = [9; 32];
+                bytes[..4].copy_from_slice(&n.to_be_bytes());
+                (1, proto::EventId::from_bytes(bytes))
+            })
+            .collect::<Vec<_>>(),
+    )?;
+    let mut responder = snapshot(at_head(source, &wide)).await?;
+
+    let answered = target_for(&mut responder, &known).await?;
+
+    answered.validate()?;
+    let listed = |span: &SpanContent| match span {
+        SpanContent::Heads(inventory) => inventory.heads.len(),
+        SpanContent::Digest(_) => 0,
+    };
+    let heads: usize = answered.spans.iter().map(listed).sum();
+    assert!(heads > 0 && heads < MAX_OFFER_HEADS, "listing stopped at the work limit, short of the head limit: {heads}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_offer_whose_spans_and_the_ranges_it_leaves_out_pass_the_span_limit_gets_the_snapshots_own_account() -> anyhow::Result<()> {
+    let source = states(4096, 8);
+    let mut requester = snapshot(source.clone()).await?;
+    // A digest of each of the first hundred members alone, leaving out the
+    // ranges around each: more spans than one offer may carry in all.
+    let addresses: Vec<_> = requester.entries_in(&TreeSpan::all()).take(100).map(|(_, entry)| entry.address().to_vec()).collect();
+    let mut spans = Vec::new();
+    for address in addresses {
+        let alone = TreeSpan::new(Bound::Included(address.clone()), Bound::Included(address));
+        spans.push(SpanContent::Digest(requester.span_digest(alone).await?));
+    }
+    let known = KnownState { spec: spec(), spans };
+    known.validate()?;
+    let mut responder = snapshot(source).await?;
+
+    let answered = target_for(&mut responder, &known).await?;
+
+    assert_eq!(bincode::serialize(&answered)?, bincode::serialize(&responder.offer().await?)?, "the snapshot's own account");
     Ok(())
 }
 
