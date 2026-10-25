@@ -25,7 +25,7 @@ fn account(heads: &[(EntityId, proto::Clock)]) -> anyhow::Result<KnownState> {
 /// What `node`'s copy of [`members`] does not yet match or exceed of `target`.
 async fn outstanding(node: &TestNode, target: &mut Target) -> anyhow::Result<target::Outstanding> {
     let mut snapshot = node.resident_trees.snapshot(node, members(), Some(target.spec.clone()), vec![]).await?.snapshot;
-    target.outstanding(node, &mut snapshot).await
+    target.outstanding(node, &mut snapshot, Duration::MAX).await
 }
 
 fn head(event: &proto::Event) -> proto::Clock { proto::Clock::singleton(event) }
@@ -72,7 +72,7 @@ async fn a_local_entity_the_account_does_not_list_holds_readiness_until_the_resp
 
     let unlisted: BTreeSet<_> = outstanding(&node, &mut target).await?.unlisted.into_iter().map(|(id, _)| id).collect();
     assert_eq!(unlisted, BTreeSet::from([held.entity_id, gone.entity_id]));
-    let named = HashSet::from([held.entity_id, gone.entity_id]);
+    let named = [(held.entity_id, None), (gone.entity_id, None)];
     let held_head = EntityHead { entity_id: held.entity_id, head: head(&held) };
     target.synced(&named, vec![held_head], vec![gone.entity_id])?;
     assert!(outstanding(&node, &mut target).await?.is_empty(), "covering the held head and an unavailable entity both settle");
@@ -306,7 +306,7 @@ async fn a_member_the_account_lists_at_another_address_is_an_uncovered_head_and_
     let pages = vec![SpanContent::Heads(responder_view.page(below)?), SpanContent::Heads(responder_view.page(from)?)];
     let mut target = Target::new(KnownState { spec: position_spec(), spans: pages })?;
 
-    let found = target.outstanding(&node, &mut copy).await?;
+    let found = target.outstanding(&node, &mut copy, Duration::MAX).await?;
     assert_eq!(found.heads.iter().map(|head| head.entity_id).collect::<Vec<_>>(), [id], "the copy lacks the listed head");
     assert!(found.unlisted.is_empty(), "the account lists the member, if elsewhere: {:?}", found.unlisted);
     Ok(())
@@ -378,5 +378,49 @@ async fn under_the_entity_id_fallback_an_opening_push_brings_every_member_and_no
         let pushed = unpushed(&offer, &fallback, &outstanding_of(lacking, leaver, other));
         assert_eq!(pushed, (vec![], vec![], vec![leaver, other]), "every member is pushed and no leaver is");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_member_whose_copy_diverged_settles_at_the_copys_own_head() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    connect(&responder, &requester).await?;
+    let genesis = create(&[&responder, &requester], "shared").await?;
+    // Each side edits the member without the other, so the responder's state
+    // is concurrent with the copy's, which the applier does not adopt: no
+    // push brings the copy level.
+    let here = labeled(Some(&genesis), "edited here")?;
+    apply(&requester, &here).await?;
+    apply(&responder, &labeled(Some(&genesis), "edited there")?).await?;
+
+    // Without settling it, the sync would compare three times and stall.
+    tokio::time::timeout(Duration::from_secs(10), fetch(&requester, responder.id, members(), vec![])).await??;
+    assert_eq!(requester.storage.get_state(genesis.entity_id).await?.payload.state.head, head(&here), "the copy keeps its own head");
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unlisted_member_settles_once_its_copy_stays_at_the_head_the_request_named() -> anyhow::Result<()> {
+    let node = durable().await?;
+    let member = create(&[&node], "left the responder's result").await?;
+    let mut target = Target::new(account(&[])?)?;
+    // The responder holds a head the copy does not cover, as a concurrent one.
+    let theirs = labeled(Some(&member), "edited there")?;
+    let named = [(member.entity_id, Some(head(&member)))];
+    target.synced(&named, vec![EntityHead { entity_id: member.entity_id, head: head(&theirs) }], vec![])?;
+
+    let mut snapshot = node.resident_trees.snapshot(&node, members(), Some(target.spec.clone()), vec![]).await?.snapshot;
+    let found = target.outstanding(&node, &mut snapshot, Duration::MAX).await?;
+    assert_eq!(found.unlisted.len(), 1, "the push that followed may still be landing");
+    let found = target.outstanding(&node, &mut snapshot, Duration::ZERO).await?;
+    assert!(found.is_empty(), "once it has had time to land, the unchanged copy is settled");
+
+    // A copy that moved since its request named it is not settled.
+    let mut target = Target::new(account(&[])?)?;
+    target.synced(&named, vec![EntityHead { entity_id: member.entity_id, head: head(&theirs) }], vec![])?;
+    apply(&node, &labeled(Some(&member), "edited here")?).await?;
+    let mut snapshot = node.resident_trees.snapshot(&node, members(), Some(target.spec.clone()), vec![]).await?.snapshot;
+    assert_eq!(target.outstanding(&node, &mut snapshot, Duration::ZERO).await?.unlisted.len(), 1);
     Ok(())
 }

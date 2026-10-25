@@ -147,13 +147,12 @@ where
         let mut distinct = HashSet::with_capacity(entities.len());
         let entities: Vec<_> = entities.into_iter().filter(|(id, _)| distinct.insert(*id)).collect();
         for page in entities.chunks(MAX_PAGE_HEADS) {
-            let named: HashSet<_> = page.iter().map(|(id, _)| *id).collect();
-            self.named.extend(&named);
+            self.named.extend(page.iter().map(|(id, _)| *id));
             let entities =
                 page.iter().map(|(id, head)| proto::EntityHead { entity_id: *id, head: head.clone().unwrap_or_default() }).collect();
             match self.ask(proto::NodeRequestBody::SyncEntities { selection: self.selection.clone(), entities }).await? {
                 None => return Ok(()),
-                Some(proto::NodeResponseBody::EntitiesSynced { held, unavailable }) => target.synced(&named, held, unavailable)?,
+                Some(proto::NodeResponseBody::EntitiesSynced { held, unavailable }) => target.synced(page, held, unavailable)?,
                 Some(other) => return Err(RequestError::UnexpectedResponse(other).into()),
             }
         }

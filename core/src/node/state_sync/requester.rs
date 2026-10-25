@@ -250,7 +250,7 @@ where
     /// of the copy's next change.
     async fn outstanding(&self, target: &mut Target) -> Result<(Outstanding, tokio::sync::watch::Receiver<u64>), RetrievalError> {
         let ResidentSnapshot { mut snapshot, changes } = self.snapshot(Some(target.spec.clone())).await?;
-        Ok((target.outstanding(self.node, &mut snapshot).await?, changes))
+        Ok((target.outstanding(self.node, &mut snapshot, self.deadline.interval()).await?, changes))
     }
 
     /// The failure of the next item the peer pushed for an entity that

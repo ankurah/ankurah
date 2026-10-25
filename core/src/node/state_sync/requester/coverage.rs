@@ -13,8 +13,9 @@ use ankurah_proto::{Clock, EntityId};
 use std::collections::HashMap;
 
 /// Events the check may walk to decide whether a local head covers a
-/// responder's. A copy further ahead counts as uncovered until a repair
-/// reports the responder's newer head.
+/// responder's. A copy further ahead counts as uncovered until the
+/// responder's push in answer to a SyncEntities leaves it unchanged, when
+/// readiness settles it as diverged.
 const COVERAGE_BUDGET: usize = 256;
 
 /// Whether `local` covers `target`: it is that head or descends from it.
