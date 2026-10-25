@@ -115,10 +115,10 @@ impl Snapshot {
     /// digests, which a comparison split into the digests `matching` this
     /// snapshot's over the same bounds and those `differing` from it. A
     /// matching digest stays as offered. A differing span lists this
-    /// snapshot's heads within it while they fit an offer's limits, spans with
-    /// the fewest members first; each span past those gives this snapshot's
-    /// digest under the offered prefix, from which the peer's own tree refines
-    /// it. Each range the offer left out gets this snapshot's digest. None
+    /// snapshot's heads within it where they fit what an offer's limits leave,
+    /// spans with the fewest members first; a span whose heads do not fit gives
+    /// this snapshot's digest under the offered prefix, from which the peer's
+    /// own tree refines it. Each range the offer left out gets this snapshot's digest. None
     /// when the account would break an offer's limits even with every span
     /// given by a digest.
     pub async fn account_over(
@@ -150,16 +150,10 @@ impl Snapshot {
         };
         let mut room = OfferRoom { heads: MAX_OFFER_HEADS, work };
         placed.sort_by_cached_key(|(_, digest)| self.members.range::<[u8], _>(digest.bounds.bounds()).count());
-        let mut listing = true;
         for (index, offered) in placed {
-            if listing {
-                if let Some(heads) = self.heads_fitting(&account.spans[index], &mut room)? {
-                    account.spans[index] = heads;
-                    continue;
-                }
-                // No span after this one is listed either: each holds at least
-                // as many members.
-                listing = false;
+            if let Some(heads) = self.heads_fitting(&account.spans[index], &mut room)? {
+                account.spans[index] = heads;
+                continue;
             }
             let digest = self.span_digest(offered.bounds.clone()).await?.digest;
             account.spans[index] = SpanContent::Digest(TreeSpanDigest { digest, ..offered });

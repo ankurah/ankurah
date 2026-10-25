@@ -5,7 +5,7 @@ use super::*;
 use crate::node::state_sync::fixtures::*;
 use ankurah_core_types::{IndexKeyPart, KeySpec, ValueType};
 use ankurah_proto::{
-    state_sync::limits::{MAX_OFFER_HEADS, MAX_PAGE_HEADS},
+    state_sync::limits::{MAX_OFFER_BYTES, MAX_OFFER_HEADS, MAX_PAGE_HEADS},
     Attested, EntityHead, EntityState, KeyedEntityHead, PackedHeads, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory,
 };
 use std::{
@@ -160,6 +160,16 @@ fn at_head(mut source: Vec<Attested<EntityState>>, head: &proto::Clock) -> Vec<A
 /// A head no member of [`states`] holds.
 fn another_head() -> proto::Clock { proto::Clock::genesis(proto::EventId::from_bytes([9; 32])) }
 
+/// A head of `events` concurrent events, which no member of [`states`] holds.
+fn head_of(events: u32) -> anyhow::Result<proto::Clock> {
+    let tips = (0..events).map(|n| {
+        let mut bytes = [9; 32];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        (1, proto::EventId::from_bytes(bytes))
+    });
+    Ok(proto::Clock::new(tips.collect::<Vec<_>>())?)
+}
+
 #[tokio::test]
 async fn an_offered_span_whose_digest_differs_is_answered_with_its_heads_and_matching_spans_keep_their_digests() -> anyhow::Result<()> {
     let source = states(4096, 8);
@@ -228,22 +238,13 @@ async fn differing_spans_are_listed_fewest_members_first_until_the_head_limit_an
 }
 
 #[tokio::test]
-async fn differing_spans_are_listed_only_while_their_heads_fit_an_offers_work() -> anyhow::Result<()> {
+async fn differing_spans_are_listed_only_where_their_heads_fit_an_offers_work() -> anyhow::Result<()> {
     let source = states(4096, 8);
     let known = frontier(&source).await?;
     // Every member is at another head of forty events, so that the heads of
     // the differing spans outweigh an offer's work long before they outnumber
     // its heads.
-    let wide = proto::Clock::new(
-        (0..40u32)
-            .map(|n| {
-                let mut bytes = [9; 32];
-                bytes[..4].copy_from_slice(&n.to_be_bytes());
-                (1, proto::EventId::from_bytes(bytes))
-            })
-            .collect::<Vec<_>>(),
-    )?;
-    let mut responder = snapshot(at_head(source, &wide)).await?;
+    let mut responder = snapshot(at_head(source, &head_of(40)?)).await?;
 
     let answered = target_for(&mut responder, &known).await?;
 
@@ -253,7 +254,40 @@ async fn differing_spans_are_listed_only_while_their_heads_fit_an_offers_work() 
         SpanContent::Digest(_) => 0,
     };
     let heads: usize = answered.spans.iter().map(listed).sum();
-    assert!(heads > 0 && heads < MAX_OFFER_HEADS, "listing stopped at the work limit, short of the head limit: {heads}");
+    assert!(heads > 0 && heads < MAX_OFFER_HEADS, "the work limit, short of the head limit, bounds the listing: {heads}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_differing_span_whose_heads_fit_is_listed_even_after_a_smaller_one_whose_heads_do_not() -> anyhow::Result<()> {
+    let source = states(4096, 8);
+    let known = frontier(&source).await?;
+    // The responder holds every member at another head, and the members of the
+    // offered span with the fewest of them at heads too heavy for that span to
+    // fit an offer. Listing reaches that span first; larger spans of light
+    // heads still fit after it.
+    let smallest =
+        offered_digests(&known).into_iter().filter(|digest| digest.digest.count() > 0).min_by_key(|digest| digest.digest.count());
+    let smallest = smallest.expect("a nonempty offered span");
+    let members = smallest.digest.count() as usize;
+    let heavy = head_of((MAX_OFFER_BYTES / (33 * members) + 1) as u32)?;
+    let within: std::collections::HashSet<_> = snapshot(source.clone()).await?.entries_in(&smallest.bounds).map(|(id, _)| id).collect();
+    let mut current = at_head(source, &another_head());
+    for state in &mut current {
+        if within.contains(&state.payload.entity_id) {
+            state.payload.state.head = heavy.clone();
+        }
+    }
+    let mut responder = snapshot(current).await?;
+
+    let answered = target_for(&mut responder, &known).await?;
+
+    answered.validate()?;
+    let spans = in_address_order(&answered);
+    let heavy_span = spans.iter().find(|span| *span.bounds() == smallest.bounds).expect("the offered span is answered");
+    assert!(matches!(heavy_span, SpanContent::Digest(_)), "the span whose heads do not fit gives a digest");
+    let listed_larger = spans.iter().any(|span| matches!(span, SpanContent::Heads(inventory) if inventory.heads.len() > members));
+    assert!(listed_larger, "larger spans whose heads fit are still listed after it");
     Ok(())
 }
 
