@@ -8,6 +8,7 @@ mod catchup;
 #[path = "../common.rs"]
 mod common;
 mod fetch;
+mod large;
 mod limits;
 mod live;
 mod loss;
