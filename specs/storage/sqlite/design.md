@@ -96,50 +96,49 @@ driver. Each target compiles one executor:
   engine's standard performance pragmas; the in-memory engine uses a
   one-connection pool so all operations observe the same database.
 - `executor/nodejs`: on wasm32, behind the `nodejs` feature, the engine runs
-  inside Node.js on one database object, synchronously on the calling
-  thread. `open` and `open_in_memory` construct node:sqlite's database
-  (`Database` from Node.js 26.11.0, `DatabaseSync` before) with SQLite's
-  defensive flag off, as a native connection has it, and give it the native
-  connections' session settings. A host that built a database itself, a
-  node:sqlite database or a better-sqlite3 `Database`, hands it to
-  `SqliteStorageEngine::from_database`, which keeps the host's session
-  settings, its defensive flag among them, and refuses a database the
-  executor cannot read exactly. Among those is a database whose node:sqlite
-  skips a numbered parameter as it binds a call's values, as node:sqlite
-  does before Node.js 22.20.0 on 22 and 24.7.0 on 24: the executor binds
-  one and reads it back, whatever the release. The executor reads each
-  query's rows through a typed reader, a WITH clause that nests the query
-  and reads each value with its storage class; a query that the reader
-  would read otherwise than rusqlite does is refused before it runs, except
-  in the cases `SqliteExecutor`'s documentation lists, such as a virtual
-  table's REAL column that returns an INTEGER. A PRAGMA or an EXPLAIN, which
-  SQLite does not nest, is the exception: its TEXT is read as the driver's
-  string, and refused after it runs if it holds U+FFFD, which both drivers
-  put in place of a byte that is not UTF-8. `SqliteExecutor`'s
+  inside Node.js on one better-sqlite3 database, synchronously on the
+  calling thread. better-sqlite3 brings its own SQLite, the same on every
+  Node.js release, on files that several processes can share. The WASM does
+  not import it: the host passes better-sqlite3's `Database` class to `open`
+  and `open_in_memory`, which refuse any other value before building
+  anything, build the database with the class, and give it a native
+  connection's busy timeout and session settings, with SQLite's defensive
+  flag off. They refuse a database the executor cannot read exactly: one
+  whose text encoding is UTF-16, and one whose SQLite reads a double-quoted
+  name that matches no column as a string. The executor reads each query's
+  rows through a typed reader, a WITH clause that nests the query and reads
+  each value with its storage class; a query that the reader would read
+  otherwise than rusqlite does is refused before it runs, except in the
+  cases `SqliteExecutor`'s documentation lists, such as a virtual table's
+  REAL column that returns an INTEGER. A PRAGMA or an EXPLAIN, which SQLite
+  does not nest, is the exception: its TEXT is read as better-sqlite3's
+  string, and refused after it runs if it holds U+FFFD, which better-sqlite3
+  puts in place of a byte that is not UTF-8. `SqliteExecutor`'s
   documentation lists each way the drivers differ.
 
 Every driver's errors are typed. Natively they are rusqlite's, as
 `SqliteError::Rusqlite`. On Node.js an error SQLite raised is a
 `SqliteError::Sqlite`, with SQLite's extended result code; a refusal of the
-executor's, of a call or a database it cannot run or read as rusqlite does,
-is a `SqliteError::Refused`; and any other JavaScript exception is a
+executor's, of a call, a driver or a database it cannot run or read as
+rusqlite does, is a `SqliteError::Refused`; and any other JavaScript
+exception, better-sqlite3's own refusal of a call among them, is a
 `SqliteError::JavaScript`. `SqliteError::sqlite_code` gives SQLite's
 extended result code, reading better-sqlite3's name for a code as its
 number, and `SqliteError::refusal` gives a refused call's `Refusal`,
-natively by mapping each of rusqlite's own refusals to the one the Node.js
-executor raises for the same call. Both answer the same on every driver,
-except where their documentation says.
+natively by mapping each of rusqlite's own refusals to the refusal of its
+kind. Both answer the same on every driver, except where their
+documentation says.
 
 Every connection the engine opens has double-quoted string literals off, for
 DML and DDL, so that a double-quoted name that matches no column fails with
 "no such column" instead of reading as the string of its name: a native
-connection switches them off, and node:sqlite's `DatabaseSync` has them off
-unless constructed with them on. `from_database` refuses a database that reads
-such a name as a string. A schema stored with the literals on still opens, but
-a view or trigger whose body relies on one fails when used, and SQLite then
-refuses to rename any table on that file, or to rename or drop any column,
-since each of those reads every view and trigger again. ADD COLUMN, the only
-change the engine makes to a table, still runs.
+connection switches them off, and better-sqlite3 builds its SQLite with them
+off. On Node.js, `open` refuses a database whose SQLite reads such a name as
+a string. A schema stored with the literals on still opens, but a view or
+trigger whose body relies on one fails when used, and SQLite then refuses to
+rename any table on that file, or to rename or drop any column, since each
+of those reads every view and trigger again. ADD COLUMN, the only change the
+engine makes to a table, still runs.
 
 ## Dump
 

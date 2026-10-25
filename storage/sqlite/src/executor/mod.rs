@@ -115,6 +115,13 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///   extension reaches this: better-sqlite3's JavaScript virtual tables give
 ///   their columns no type, and SQLite's own R*Tree returns REALs from its
 ///   REAL columns.
+/// - better-sqlite3 builds its own SQLite with other options than rusqlite
+///   builds its, and sets other limits on it. LIKE and GLOB never match a
+///   BLOB, where natively they match its bytes as text; the engine's own SQL
+///   uses neither. A TEXT or BLOB longer than 2^29 - 24 bytes is refused,
+///   with SQLITE_TOOBIG, where natively the limit is 1,000,000,000 bytes. And
+///   some SQL that rusqlite's SQLite refuses runs, such as a math function
+///   like `sqrt()`, or a DELETE with a LIMIT.
 /// - Errors take each target's own variants of [`SqliteError`]. Natively
 ///   every error SQLite raises, and every refusal of rusqlite's, is a
 ///   `SqliteError::Rusqlite`. On Node.js an error SQLite raised is a

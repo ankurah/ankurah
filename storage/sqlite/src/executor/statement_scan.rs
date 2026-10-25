@@ -121,7 +121,7 @@ fn offset(sql: &str, token: &str) -> usize { token.as_ptr() as usize - sql.as_pt
 
 /// Whether `sql` holds only what SQLite skips between statements:
 /// whitespace, comments and semicolons, up to the end or a NUL.
-pub(crate) fn holds_no_statement(sql: &str) -> bool { tokens(sql).all(|(kind, _)| matches!(kind, TokenKind::Space | TokenKind::Semicolon)) }
+fn holds_no_statement(sql: &str) -> bool { tokens(sql).all(|(kind, _)| matches!(kind, TokenKind::Space | TokenKind::Semicolon)) }
 
 /// The statements some SQL holds, as the executors need to know them before
 /// SQLite prepares it.

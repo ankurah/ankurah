@@ -84,7 +84,7 @@ impl SqliteError {
     ///
     /// SQL that holds no statement differs between drivers: natively SQLite
     /// refuses to run it, with SQLITE_MISUSE, `Some(21)`, where better-sqlite3
-    /// refuses to prepare it itself, as a [`SqliteError::JavaScript`], with
+    /// refuses to prepare it itself, as a `SqliteError::JavaScript`, with
     /// `None`.
     pub fn sqlite_code(&self) -> Option<i32> {
         match self {
@@ -162,9 +162,11 @@ pub struct SqliteFailure {
 ///
 /// The first four are rusqlite's own refusals, which `refusal` answers
 /// natively; natively, `SqliteError::Rusqlite` displays each after "SQLite
-/// error: ". The Node.js executor makes three of them as rusqlite does, in
-/// rusqlite's words; the third, `TooFewValues`, better-sqlite3 makes itself,
-/// in its own words. Only the Node.js executor makes the others.
+/// error: ". The Node.js executor makes `MultipleStatements`,
+/// `ExecuteReturnedRows` and `TextNotUtf8` as rusqlite does, in rusqlite's
+/// words; a call that passes too few values, natively `TooFewValues`,
+/// better-sqlite3 refuses itself, in its own words. Only the Node.js
+/// executor makes the others.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Refusal {
     /// SQL that holds a second statement, refused before SQLite prepares
@@ -182,7 +184,7 @@ pub enum Refusal {
     /// parameters, refused before it runs: natively rusqlite's
     /// `InvalidParameterCount`, which also counts the parameters the
     /// statement takes. On Node.js better-sqlite3 refuses such a call itself,
-    /// as a [`SqliteError::JavaScript`].
+    /// as a `SqliteError::JavaScript`.
     #[error("Wrong number of parameters passed to query. Got {passed}, needed more")]
     TooFewValues { passed: usize },
 

@@ -46,7 +46,7 @@ impl SqliteConnectionManager {
         // "no such column" instead of reading as the string of its name,
         // double-quoted string literals are off, in queries and in DDL
         // alike, as on every Node.js database the engine accepts (see
-        // nodejs/adoption.rs).
+        // nodejs/open.rs).
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false)?;
 

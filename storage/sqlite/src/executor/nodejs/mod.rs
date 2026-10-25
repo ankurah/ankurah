@@ -11,10 +11,11 @@
 //! passes its `Database` class to [`SqliteStorageEngine::open`] and
 //! [`open_in_memory`](SqliteStorageEngine::open_in_memory), and the executor
 //! builds each database with it (see [`NodeJsConnection::open`]). The
-//! executor drives the database's `exec(sql)` and `prepare(sql)`, and its
-//! statements' `run`, `get`, `all`, `columns`, `raw`, `safeIntegers` and
-//! `reader`. Every call is synchronous, which suits the single-threaded WASM
-//! host: the engine's closures run in place.
+//! executor drives the database's `prepare(sql)` and `exec(sql)`, its
+//! `unsafeMode()` as it opens the database and its `close()` when it refuses
+//! one, and its statements' `run`, `get`, `all`, `columns`, `raw`,
+//! `safeIntegers` and `reader`. Every call is synchronous, which suits the
+//! single-threaded WASM host: the engine's closures run in place.
 
 mod exception;
 mod kept_readers;

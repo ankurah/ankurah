@@ -89,6 +89,16 @@ fn refuses_a_database_whose_statements_lack_a_method_the_executor_calls() {
     }
 }
 
+/// `open` gives a database the busy timeout of a native connection itself,
+/// rather than rely on the driver's default, which is the same five seconds
+/// in better-sqlite3: the class here waits for no lock unless told to.
+#[wasm_bindgen_test]
+fn open_sets_the_busy_timeout_whatever_the_drivers_default() {
+    let impatient = class("return class extends Database { constructor(path, options) { super(path, { timeout: 0, ...options }); } };");
+    let connection = NodeJsConnection::open(":memory:", &impatient).unwrap();
+    assert_eq!(connection.query_row("PRAGMA busy_timeout", &[]).unwrap().expect("one row").integer(0).unwrap(), 5000);
+}
+
 /// TEXT from a statement SQLite cannot nest in the typed reader, such as a
 /// PRAGMA, is read as the driver's string, and the statement's other values
 /// as their storage classes; a string holding U+FFFD, which better-sqlite3
