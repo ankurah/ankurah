@@ -31,10 +31,9 @@ fn push(event: &Event) -> Vec<proto::SubscriptionUpdateItem> {
 
 #[tokio::test]
 async fn a_fetch_in_flight_admits_its_peers_pushes_until_it_finishes() -> anyhow::Result<()> {
-    // A durable node holds no standing queries, so only a Fetch admits pushes.
-    let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await?;
-    node.wait_ready().await?;
+    // An ephemeral node holding no standing query with the peer: only a Fetch admits its pushes.
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    node.system.wait_loaded().await?;
     let peer = EntityId::random();
     let presence = proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION };
     node.register_peer(presence, Box::new(Silent(peer))).await?;

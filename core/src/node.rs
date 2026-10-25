@@ -52,7 +52,7 @@ pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
-use peer_state::PendingRequest;
+use peer_state::PendingRequestSlot;
 use schema_registration::WireRegistrant;
 pub use state::NodeState;
 
@@ -356,12 +356,11 @@ where
             self.policy_agent.sign_request(self, cdata, &request)?
         };
 
-        let _pending = {
+        let _slot = {
             let connection = self.peer_connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
-            connection.pending_requests.insert(request_id.clone(), response_tx);
-            let pending = PendingRequest::new(&connection, request_id);
+            let slot = PendingRequestSlot::insert(&connection, request_id, response_tx);
             connection.send_message(proto::NodeMessage::Request { auth, request })?;
-            pending
+            slot
         };
 
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
@@ -568,8 +567,8 @@ where
                 match crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await {
                     Ok(()) => Ok(()),
                     // The acknowledgment carries the failure to the peer as
-                    // text, so that each failed item's cause can go on to the
-                    // syncs waiting on its entity.
+                    // text; the error itself goes to the syncs waiting on each
+                    // failed item's entity.
                     Err(error) => {
                         let report = anyhow!("{error}");
                         self.apply_failures.publish(notification.from, error);

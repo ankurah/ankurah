@@ -32,20 +32,11 @@ impl NodeApplier {
 
         // In theory, if initialized_predicate is specified, we could potentially narrow it down to just the context for that predicate
         // but this feels brittle, because failure to apply this event would affect the other contexts on this node.
-        // A peer may push only what we asked it for, so a push is admissible
-        // only against a standing query of ours with that peer or a Fetch we
-        // have in flight with it.
-        let fetching = node.peer_connections.get(from_peer_id).and_then(|peer| peer.fetches.credentials());
-        let subscribed = node.subscription_relay.as_ref().filter(|relay| relay.has_subscription_with_peer(from_peer_id));
-        if fetching.is_none() && subscribed.is_none() {
+        let Some(cdata) = node.push_credentials(from_peer_id) else {
             return Err(
                 MutationError::InvalidUpdate("Should not be receiving updates from a peer we hold no subscription or Fetch with").into()
             );
-        }
-        let mut cdata = fetching.unwrap_or_default();
-        if let Some(relay) = subscribed {
-            cdata.extend(relay.get_contexts_for_peer(from_peer_id));
-        }
+        };
 
         // Apply all updates. One bad item must not poison the batch: failures
         // are collected per item, the remaining items still apply, and the
