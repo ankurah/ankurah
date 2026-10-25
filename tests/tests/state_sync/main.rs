@@ -4,6 +4,7 @@
 //! and the client repairs what is lost.
 
 mod busy;
+mod catchup;
 #[path = "../common.rs"]
 mod common;
 mod fetch;
@@ -65,6 +66,11 @@ fn pushes(message: &proto::NodeMessage, entity: EntityId) -> bool {
     }
 }
 
+/// Whether `message` answers a subscribe.
+fn answers_subscribe(message: &proto::NodeMessage) -> bool {
+    matches!(message, proto::NodeMessage::Response(response) if matches!(response.body, proto::NodeResponseBody::QuerySubscribed { .. }))
+}
+
 fn sorted(mut ids: Vec<EntityId>) -> Vec<EntityId> {
     ids.sort();
     ids
@@ -113,6 +119,18 @@ async fn heads(node: &Sled, ids: &[EntityId]) -> anyhow::Result<BTreeMap<EntityI
         heads.insert(*id, node.storage.get_state(*id).await?.payload.state.head);
     }
     Ok(heads)
+}
+
+/// Wait until `node` stores each entity in `heads` at the head beside it.
+async fn wait_for_heads(node: &Sled, heads: &BTreeMap<EntityId, proto::Clock>) -> anyhow::Result<()> {
+    let ids: Vec<_> = heads.keys().copied().collect();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while self::heads(node, &ids).await.ok().as_ref() != Some(heads) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("the node stores {heads:?}"))
 }
 
 /// Wait until `condition` holds, failing with `what` after ten seconds.

@@ -6,10 +6,6 @@ use super::*;
 use futures_util::FutureExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-fn subscribed(message: &proto::NodeMessage) -> bool {
-    matches!(message, proto::NodeMessage::Response(response) if matches!(response.body, proto::NodeResponseBody::QuerySubscribed { .. }))
-}
-
 #[tokio::test]
 async fn pushes_that_arrive_before_the_account_in_any_order_do_not_make_the_query_ready() -> anyhow::Result<()> {
     // Once armed, the gate holds the subscribe's answer and every push of a pet.
@@ -19,7 +15,8 @@ async fn pushes_that_arrive_before_the_account_in_any_order_do_not_make_the_quer
     let (server, client_node, _connection, gate) = {
         let (pets, armed, received) = (pets.clone(), armed.clone(), received.clone());
         gated(move |message| {
-            let hold = armed.load(Ordering::SeqCst) && (subscribed(message) || pets.lock().unwrap().iter().any(|id| pushes(message, *id)));
+            let hold =
+                armed.load(Ordering::SeqCst) && (answers_subscribe(message) || pets.lock().unwrap().iter().any(|id| pushes(message, *id)));
             if hold {
                 received.record(message);
             }
@@ -36,7 +33,7 @@ async fn pushes_that_arrive_before_the_account_in_any_order_do_not_make_the_quer
     let query = client.query::<PetView>(nocache("age = '1'")?)?;
     wait_until("the answer and every push are held", || received.responses().len() == 1 && received.items_for(&ids).len() == ids.len())
         .await;
-    let (answer, pushed): (Vec<_>, Vec<_>) = gate.take_held().into_iter().partition(subscribed);
+    let (answer, pushed): (Vec<_>, Vec<_>) = gate.take_held().into_iter().partition(answers_subscribe);
     assert!(pushed.len() > 1, "the push spans several updates");
 
     for update in pushed.into_iter().rev() {
@@ -61,7 +58,7 @@ async fn an_older_versions_answer_neither_makes_the_newer_version_ready_nor_dist
     let armed = Arc::new(AtomicBool::new(false));
     let (server, client_node, _connection, gate) = {
         let armed = armed.clone();
-        gated(move |message| armed.load(Ordering::SeqCst) && subscribed(message)).await?
+        gated(move |message| armed.load(Ordering::SeqCst) && answers_subscribe(message)).await?
     };
     let (server, client) = (server.context_async(DEFAULT_CONTEXT).await?, client_node.context_async(DEFAULT_CONTEXT).await?);
     let ids = create_pets(&server, "1", ["old".to_string(), "new".to_string()]).await?;
