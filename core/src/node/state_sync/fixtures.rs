@@ -140,19 +140,27 @@ pub(super) async fn pushed(
     updates
 }
 
+/// Whether a connection loses a message it carries.
+type Loses = Arc<dyn Fn(&proto::NodeMessage) -> bool + Send + Sync>;
+
 /// Hands each message to `to`'s `handle_message` in a task of its own, as an
-/// in-process connector does, and records the requests it carries.
+/// in-process connector does, unless it loses the message, and records the
+/// requests it carries.
 #[derive(Clone)]
 struct Forward {
     to: WeakNode<TestStorage, PermissiveAgent>,
     to_id: proto::EntityId,
     requests: Arc<Mutex<Vec<String>>>,
+    loses: Loses,
 }
 
 impl PeerSender for Forward {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         if let proto::NodeMessage::Request { request, .. } = &message {
             self.requests.lock().unwrap().push(request.body.to_string());
+        }
+        if (self.loses)(&message) {
+            return Ok(());
         }
         let node = self.to.upgrade().ok_or(SendError::ConnectionClosed)?;
         tokio::spawn(async move {
@@ -167,9 +175,19 @@ impl PeerSender for Forward {
 /// Connect ephemeral `requester` to durable `responder` in this process, and
 /// return the log of every request the requester sends.
 pub(super) async fn connect(responder: &TestNode, requester: &TestNode) -> anyhow::Result<Arc<Mutex<Vec<String>>>> {
+    connect_losing(responder, requester, |_| false).await
+}
+
+/// Connect as [`connect`] does, over a connection that loses each message to
+/// the requester that `loses` matches.
+pub(super) async fn connect_losing(
+    responder: &TestNode,
+    requester: &TestNode,
+    loses: impl Fn(&proto::NodeMessage) -> bool + Send + Sync + 'static,
+) -> anyhow::Result<Arc<Mutex<Vec<String>>>> {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let to_responder = Forward { to: responder.weak(), to_id: responder.id, requests: requests.clone() };
-    let to_requester = Forward { to: requester.weak(), to_id: requester.id, requests: Arc::default() };
+    let to_responder = Forward { to: responder.weak(), to_id: responder.id, requests: requests.clone(), loses: Arc::new(|_| false) };
+    let to_requester = Forward { to: requester.weak(), to_id: requester.id, requests: Arc::default(), loses: Arc::new(loses) };
     // The ephemeral node adopts the durable's system before the durable learns of it.
     requester.register_peer(responder.presence().await?, Box::new(to_responder)).await?;
     responder.register_peer(requester.presence().await?, Box::new(to_requester)).await?;

@@ -2,8 +2,9 @@
 //! queries. It offers its copy of a query's result, takes the responder's
 //! account of its result as the target, and waits until its copy matches or
 //! exceeds the target as the responder's pushes apply. It repairs what does
-//! not arrive: at once where the responder pushed nothing, when its copy stops
-//! progressing for an idle interval, and, for a live query, when two periodic
+//! not arrive: at once where the responder pushed nothing and for local
+//! members the account does not list, when what remains outstanding stops
+//! shrinking for an idle interval, and, for a live query, when two periodic
 //! checks disagree. A push that fails to apply for what it waits on ends the
 //! wait at once: it fails a Fetch or a subscribe, while a periodic check
 //! reports it and leaves its entity stale, as a live update that fails to
@@ -31,7 +32,8 @@ use crate::{
 };
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto::{
-    self as proto, state_sync::limits::MAX_PAGE_HEADS, EntityId, KnownState, SpanAnswer, SpanContent, SpanQuestion, TreeSpan, TreeSpec,
+    self as proto, state_sync::limits::MAX_PAGE_HEADS, Clock, EntityId, KnownState, SpanAnswer, SpanContent, SpanQuestion, TreeSpan,
+    TreeSpec,
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::sync::broadcast;
@@ -181,6 +183,8 @@ struct QuerySync<'a, SE, PA: PolicyAgent> {
     /// The node's failures to apply pushed items since the sync began, which
     /// is before its first request: the peer may push before it answers.
     failures: broadcast::Receiver<ApplyFailure>,
+    /// Every entity this sync has named in a SyncEntities.
+    named: HashSet<EntityId>,
 }
 
 impl<'a, SE, PA> QuerySync<'a, SE, PA>
@@ -190,7 +194,16 @@ where
 {
     fn new(node: &'a Node<SE, PA>, peer: EntityId, selection: Selection<Resolved>, credentials: Vec<PA::ContextData>) -> Self {
         let failures = node.apply_failures.listen();
-        Self { node, peer, selection, credentials, deadline: IdleDeadline::new(), round_trip: Duration::ZERO, failures }
+        Self {
+            node,
+            peer,
+            selection,
+            credentials,
+            deadline: IdleDeadline::new(),
+            round_trip: Duration::ZERO,
+            failures,
+            named: HashSet::new(),
+        }
     }
 
     /// A snapshot of the copy: this node's resident for the query, under the
@@ -253,56 +266,60 @@ where
     }
 
     /// Wait until the copy matches or exceeds `target`. What `push` does not
-    /// bring is repaired at once; the rest is waited for, and compared again
-    /// whenever the copy has not progressed for the idle interval. A pushed
-    /// item that fails to apply for an entity still waited on ends the wait at
+    /// bring is repaired at once, and so is each local member the account
+    /// does not list that the copy's result gains later, since no push brings
+    /// those either; the rest is waited for, and compared again whenever the
+    /// outstanding set has not shrunk for the idle interval. A pushed item
+    /// that fails to apply for an entity still waited on ends the wait at
     /// once, with that failure, which the caller judges.
     async fn until_ready(&mut self, mut target: Target, push: OpeningPush) -> Result<Result<(), ApplyFailure>, RetrievalError> {
-        let mut last = usize::MAX;
-        let mut unpushed_repaired = false;
+        let mut first_pass = true;
+        // The fewest items outstanding since the last repair. Only fewer is
+        // progress: a copy that changes, or gains members the account does
+        // not list, has come no closer to the target.
+        let mut fewest = None;
         let mut idle_since = Instant::now();
         loop {
             let (outstanding, mut changes) = self.outstanding(&mut target).await?;
             if outstanding.is_empty() {
                 return Ok(Ok(()));
             }
-            if outstanding.len() < last {
+            if fewest.is_some_and(|fewest| outstanding.len() < fewest) {
                 self.deadline.progressed();
                 idle_since = Instant::now();
             }
-            last = outstanding.len();
-            if !unpushed_repaired {
-                unpushed_repaired = true;
+            fewest = Some(fewest.map_or(outstanding.len(), |fewest: usize| fewest.min(outstanding.len())));
+            if std::mem::take(&mut first_pass) {
                 let unpushed = push.unpushed(&outstanding);
                 if !unpushed.is_empty() {
                     self.repair(&mut target, unpushed, &push).await?;
+                    // A descent's pages add heads: progress counts from what the repair left.
+                    fewest = None;
                     continue;
                 }
             }
+            let unnamed = push.unnamed_unlisted(&outstanding, &self.named);
+            if !unnamed.is_empty() {
+                self.sync_entities(&mut target, unnamed).await?;
+                continue;
+            }
             let remaining = self.deadline.interval().saturating_sub(idle_since.elapsed());
-            let woke = if remaining.is_zero() {
-                None
-            } else {
-                tokio::select! {
-                    changed = changes.changed() => Some(changed.is_ok()),
-                    failure = self.failure_concerning(&outstanding) => return Ok(Err(failure)),
-                    () = futures_timer::Delay::new(remaining) => None,
+            if remaining.is_zero() {
+                if !self.deadline.compare_again() {
+                    return Err(RetrievalError::SyncStalled { peer: self.peer });
                 }
-            };
-            match woke {
-                Some(true) => {
-                    self.deadline.progressed();
-                    idle_since = Instant::now();
-                }
-                // The resident stopped, as a catalog change stops it: look at a new one.
-                Some(false) => {}
-                None => {
-                    if !self.deadline.compare_again() {
-                        return Err(RetrievalError::SyncStalled { peer: self.peer });
-                    }
-                    self.repair(&mut target, outstanding, &OpeningPush::nothing()).await?;
-                    idle_since = Instant::now();
-                }
+                self.repair(&mut target, outstanding, &OpeningPush::nothing()).await?;
+                fewest = None;
+                idle_since = Instant::now();
+                continue;
+            }
+            // A change, or a resident tree that stopped as a catalog change
+            // stops it, calls for a fresh look; the next pass judges whether
+            // the copy came closer.
+            tokio::select! {
+                _ = changes.changed() => {}
+                failure = self.failure_concerning(&outstanding) => return Ok(Err(failure)),
+                () = futures_timer::Delay::new(remaining) => {}
             }
         }
     }
@@ -354,5 +371,13 @@ impl OpeningPush {
             spans: outstanding.spans.iter().filter(|region| digest_described(region.bounds())).cloned().collect(),
             unlisted: outstanding.unlisted.iter().filter(|(id, _)| !self.listed.contains(id)).cloned().collect(),
         }
+    }
+
+    /// The local members in `outstanding` that the account does not list,
+    /// that this push does not bring as leavers, and that are not in `named`,
+    /// each with the copy's head, as SyncEntities names them.
+    fn unnamed_unlisted(&self, outstanding: &Outstanding, named: &HashSet<EntityId>) -> Vec<(EntityId, Option<Clock>)> {
+        let unnamed = outstanding.unlisted.iter().filter(|(id, _)| !self.listed.contains(id) && !named.contains(id));
+        unnamed.map(|(id, local)| (*id, Some(local.clone()))).collect()
     }
 }

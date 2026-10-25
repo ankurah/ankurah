@@ -138,9 +138,14 @@ where
     /// Ask the responder to push each of `entities` from the copy's head of
     /// it, a page of entities per request, and record what it holds. A request
     /// that finds no answer in time ends the requests early.
-    async fn sync_entities(&mut self, target: &mut Target, entities: Vec<(EntityId, Option<Clock>)>) -> Result<(), RetrievalError> {
+    pub(super) async fn sync_entities(
+        &mut self,
+        target: &mut Target,
+        entities: Vec<(EntityId, Option<Clock>)>,
+    ) -> Result<(), RetrievalError> {
         for page in entities.chunks(MAX_PAGE_HEADS) {
             let named: HashSet<_> = page.iter().map(|(id, _)| *id).collect();
+            self.named.extend(&named);
             let entities =
                 page.iter().map(|(id, head)| proto::EntityHead { entity_id: *id, head: head.clone().unwrap_or_default() }).collect();
             match self.ask(proto::NodeRequestBody::SyncEntities { selection: self.selection.clone(), entities }).await? {

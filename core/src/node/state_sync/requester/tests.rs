@@ -180,3 +180,111 @@ async fn a_large_copy_descends_into_differing_spans_and_names_what_it_lacks() ->
     assert!(asked("SyncEntities") > 0, "and named what it lacked: {requests:?}");
     Ok(())
 }
+
+/// Whether `message` is an update that pushes `entity`.
+fn pushes(message: &proto::NodeMessage, entity: EntityId) -> bool {
+    match message {
+        proto::NodeMessage::Update(update) => {
+            let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
+            items.iter().any(|item| item.entity_id == entity)
+        }
+        _ => false,
+    }
+}
+
+#[tokio::test]
+async fn a_copy_that_keeps_changing_without_coming_closer_is_repaired_at_the_idle_deadline() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    let pushed = create(&[&responder], "pushed").await?;
+    let lost = create(&[&responder], "lost").await?;
+    let losing = std::sync::atomic::AtomicBool::new(true);
+    connect_losing(&responder, &requester, move |message| {
+        pushes(message, lost.entity_id) && losing.swap(false, std::sync::atomic::Ordering::SeqCst)
+    })
+    .await?;
+    // While the sync waits for the lost push, the copy's result gains a member
+    // the responder never held every 300 ms. Each changes the copy and none
+    // brings it closer to the target, so the repair still runs once the
+    // outstanding set has not shrunk for an idle second.
+    let local_writes = async {
+        for n in 0.. {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            create(&[&requester], &format!("local {n}")).await?;
+        }
+        anyhow::Ok(())
+    };
+    tokio::select! {
+        fetched = tokio::time::timeout(Duration::from_secs(5), fetch(&requester, responder.id, members(), vec![])) => {
+            fetched.map_err(|_| anyhow::anyhow!("the fetch is ready while its copy keeps changing"))??;
+        }
+        written = local_writes => written?,
+    }
+    for event in [&pushed, &lost] {
+        assert_eq!(requester.storage.get_state(event.entity_id).await?.payload.state.head, head(event), "the copy holds every member");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_member_the_account_does_not_list_that_the_copy_gains_while_waiting_is_named_at_once() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    connect(&responder, &requester).await?;
+    let pushed = labeled(None, "pushed")?;
+    let mut sync = QuerySync::new(&requester, responder.id, members(), vec![]);
+    let push = OpeningPush::of(&sync.offer().await?);
+    let target = Target::new(account(&[(pushed.entity_id, head(&pushed))])?)?;
+    let started = Instant::now();
+    let (ready, landed) = tokio::join!(sync.until_ready(target, push), async {
+        // The copy gains a member the responder never held, then the push the
+        // sync waits for lands, both within the first idle second.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        create(&[&requester], "gained").await?;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        apply(&requester, &pushed).await
+    });
+    landed?;
+    ready?.map_err(RetrievalError::from)?;
+    assert!(started.elapsed() < Duration::from_secs(1), "ready once the push landed, without waiting out an idle second");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_large_result_whose_members_keep_changing_still_becomes_ready() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    // More members than one offer's heads, so the responder's account is a
+    // digest frontier, which the empty copy matches span by span as the
+    // opening push lands.
+    for mut state in states(proto::state_sync::limits::MAX_OFFER_HEADS, 8) {
+        state.payload.state.memberships = BTreeSet::from([model()]);
+        responder.storage.set_state(state);
+    }
+    let mut edited = Vec::new();
+    for n in 0..8 {
+        edited.push(create(&[&responder], &format!("edited {n}")).await?);
+    }
+    connect(&responder, &requester).await?;
+    // Throughout the sync the responder edits a member every 100 ms, and the
+    // copy takes each edit. The copy's digest over an edited member's span
+    // then never equals the account's, so only a descent settles the span.
+    let edits = async {
+        for n in 0.. {
+            let at = n % edited.len();
+            let edit = labeled(Some(&edited[at]), &format!("edit {n}"))?;
+            apply(&responder, &edit).await?;
+            edited[at] = edit;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        anyhow::Ok(())
+    };
+    let subscribing = subscribe(&requester, responder.id, proto::QueryId::new(), members(), vec![], 1);
+    tokio::select! {
+        synced = tokio::time::timeout(Duration::from_secs(20), subscribing) => {
+            synced.map_err(|_| anyhow::anyhow!("the subscribe is ready while its members keep changing"))??;
+        }
+        written = edits => written?,
+    }
+    Ok(())
+}

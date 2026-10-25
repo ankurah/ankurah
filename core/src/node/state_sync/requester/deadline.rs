@@ -1,8 +1,10 @@
-//! The requester's idle deadline: how long it waits for its copy of a query's
-//! result to progress before comparing again, and how many comparisons
-//! without progress it makes before the sync fails. It measures progress by
-//! the copy alone, never by what a peer says it sent, so a peer that answers
-//! but sends nothing cannot keep a query waiting.
+//! The requester's idle deadline: how long it waits for progress toward a
+//! query's target before comparing again, and how many comparisons without
+//! progress it makes before the sync fails. Progress is fewer items
+//! outstanding than any look since the last comparison found, judged from the
+//! copy alone and never from what a peer says it sent, so that neither a peer
+//! that answers but sends nothing nor changes that leave the target unmet
+//! keep a query waiting.
 
 use futures::future::Either;
 use std::time::Duration;
@@ -28,8 +30,8 @@ impl IdleDeadline {
     /// Measure a round trip to the peer, which sets the wait after progress.
     pub(super) fn measured(&mut self, round_trip: Duration) { self.base = MIN_IDLE.max(round_trip * ROUND_TRIPS_IDLE); }
 
-    /// The copy progressed: wait the base interval again, with no comparison
-    /// counted against it.
+    /// The copy came closer to the target: wait the base interval again, with
+    /// no comparison counted against it.
     pub(super) fn progressed(&mut self) {
         self.interval = self.base;
         self.comparisons = 0;

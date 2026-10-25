@@ -3,6 +3,7 @@
 //! ready once the copy matches or exceeds the server's account of its result,
 //! and the client repairs what is lost.
 
+mod busy;
 #[path = "../common.rs"]
 mod common;
 mod fetch;
