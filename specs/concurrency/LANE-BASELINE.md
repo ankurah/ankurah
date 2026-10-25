@@ -106,22 +106,30 @@ full round trip.
   catch-up replay.
 - **bridge_catchup**: the TRUE EventBridge lane, via the stale-client shape,
   which is the only shape that produces `DeltaContent::EventBridge`. Setup
-  (excluded): the server creates the entity; the client connects, fetches once
-  so it persists the entity at that head, then disconnects (dropping the
+  (excluded): the server creates the entity with a title of 512 bytes per gap
+  edit, so that its state outweighs its gap's events: the server sends the
+  smaller of the bridge and the state. The client connects, fetches once so
+  it persists the entity at that head, then disconnects (dropping the
   `LocalProcessConnection`); the server advances by `param` edits. Measured:
-  the client reconnects and re-fetches; known_matches now carries the stale
-  head, the server builds the bridge from stale head to current head
+  the client reconnects and re-fetches. The Fetch's `KnownState` lists the
+  stale head; the server answers with its own account of the result and
+  pushes the bridge from stale head to current head on the update channel
   (`generate_entity_delta` Case 2, including the server-side causal comparison
-  and backward event walk), and the client applies the `param` gap events
-  through the bridge arm (validate, stage, topo-sort, apply, commit each).
+  and backward event walk). The client applies the `param` gap events through
+  the bridge arm (validate, stage, topo-sort, apply, commit each), and the
+  fetch returns once its copy matches or exceeds the server's account.
   Reconnect (two peer registrations, two task spawns) is inside the measured
   region and negligible against the bridge at any gap. Guards: the client must
-  reach the final state, AND a lane guard asserts the client committed at
-  least `param` events locally, which only the bridge arm does; if the server
-  fell back to a StateSnapshot the count stays 0 and the bench fails rather
-  than recording the wrong lane. A one-off instrumented run confirmed the lane
-  switch on this exact shape (stored events: 0 after the fresh fetch, exactly
-  `gap` after the stale re-fetch).
+  reach the final state and hold at least `param` events locally. The second
+  guard does not prove that the bridge served the catch-up: a StateSnapshot
+  over the stale head commits the gap events too, through the lineage check
+  that adopts it, so the title is what keeps the lane on the bridge. The
+  `bridge_catchup` numbers above were measured on main, before the catch-up
+  arrived as pushes on the update channel and before the entity gained its
+  title: on main's lane the re-fetch carried the stale head in known_matches,
+  and the entity's state was smaller than its gap's events. There a one-off
+  instrumented run confirmed the lane switch (stored events: 0 after the fresh
+  fetch, exactly `gap` after the stale re-fetch).
 - **subscription_establishment**: durable server holding `param` resident
   matching entities; a fresh ephemeral client establishes and initializes a
   broad live query (via `nocache`, so it waits on the server round trip rather
