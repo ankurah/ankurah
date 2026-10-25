@@ -143,6 +143,9 @@ where
         target: &mut Target,
         entities: Vec<(EntityId, Option<Clock>)>,
     ) -> Result<(), RetrievalError> {
+        // The responder refuses a request that names an entity twice.
+        let mut distinct = HashSet::with_capacity(entities.len());
+        let entities: Vec<_> = entities.into_iter().filter(|(id, _)| distinct.insert(*id)).collect();
         for page in entities.chunks(MAX_PAGE_HEADS) {
             let named: HashSet<_> = page.iter().map(|(id, _)| *id).collect();
             self.named.extend(&named);
@@ -170,7 +173,7 @@ async fn plan(snapshot: &mut Snapshot, region: Region, steps: &mut VecDeque<Step
             _ => steps.push_back(Step::Heads(digest.bounds)),
         },
         Region::Unknown(bounds) => steps.push_back(Step::Heads(bounds)),
-        Region::Listed { .. } | Region::Matched(_) => {}
+        Region::Listed(_) | Region::Matched(_) => {}
     }
     Ok(())
 }

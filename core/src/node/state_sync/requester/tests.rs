@@ -5,7 +5,10 @@
 use super::{target::Target, *};
 use crate::{
     error::{ApplyErrorItem, MutationError},
-    node::state_sync::{fixtures::*, tree::entity_id_spec},
+    node::state_sync::{
+        fixtures::*,
+        tree::{entity_id_spec, fixtures::snapshot_of},
+    },
 };
 use ankurah_proto::{EntityHead, KeyedEntityHead, PackedHeads, SpanContent, TreeSpanInventory};
 use std::collections::BTreeSet;
@@ -286,5 +289,38 @@ async fn a_large_result_whose_members_keep_changing_still_becomes_ready() -> any
         }
         written = edits => written?,
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_member_the_account_lists_at_another_address_is_an_uncovered_head_and_not_unlisted() -> anyhow::Result<()> {
+    let node = durable().await?;
+    // The member's key moved: the responder holds it at position 2, at a head
+    // the copy lacks, and the copy holds it at position 1.
+    let responder_view = snapshot_of(position_spec(), vec![positioned_state(1, 2, 2)?]).await?;
+    let mut copy = snapshot_of(position_spec(), vec![positioned_state(1, 1, 1)?]).await?;
+    let (id, moved_to) = responder_view.entries.iter().map(|(id, entry)| (*id, entry.address().to_vec())).next().unwrap();
+    // The page below the new address lists nothing, though it holds the copy's entry.
+    let below = TreeSpan::new(TreeSpan::all().start, std::ops::Bound::Excluded(moved_to.clone()));
+    let from = TreeSpan::new(std::ops::Bound::Included(moved_to), TreeSpan::all().end);
+    let pages = vec![SpanContent::Heads(responder_view.page(below)?), SpanContent::Heads(responder_view.page(from)?)];
+    let mut target = Target::new(KnownState { spec: position_spec(), spans: pages })?;
+
+    let found = target.outstanding(&node, &mut copy).await?;
+    assert_eq!(found.heads.iter().map(|head| head.entity_id).collect::<Vec<_>>(), [id], "the copy lacks the listed head");
+    assert!(found.unlisted.is_empty(), "the account lists the member, if elsewhere: {:?}", found.unlisted);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_sync_entities_names_each_entity_once() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    connect(&responder, &requester).await?;
+    let held = create(&[&responder], "held").await?;
+    let mut sync = QuerySync::new(&requester, responder.id, members(), vec![]);
+    let mut target = Target::new(account(&[(held.entity_id, head(&held))])?)?;
+    // The responder refuses a request that names an entity twice.
+    sync.sync_entities(&mut target, vec![(held.entity_id, None), (held.entity_id, None)]).await?;
     Ok(())
 }

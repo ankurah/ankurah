@@ -1,5 +1,6 @@
 //! Fetches: what a client's copy holds once a Fetch returns, cold or warm, for
-//! small and large results, entities that left the result, and limits.
+//! small and large results, members whose key moved, entities that left the
+//! result, and limits.
 
 use super::*;
 use std::sync::{Arc, Mutex};
@@ -71,6 +72,34 @@ async fn a_warm_fetch_of_a_large_result_descends_to_what_changed() -> anyhow::Re
     let requests = requests.lock().unwrap().clone();
     assert!(requests.iter().any(|request| request.starts_with("CompareSpans")), "the copy descended below the frontier: {requests:?}");
     assert!(requests.iter().any(|request| request.starts_with("SyncEntities")), "and named what changed: {requests:?}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_warm_fetch_of_a_large_result_brings_a_member_whose_key_moved() -> anyhow::Result<()> {
+    let (server, client, _connection) = connected().await?;
+    let (server, client) = (server.context_async(DEFAULT_CONTEXT).await?, client.context_async(DEFAULT_CONTEXT).await?);
+    // More members than one account's heads, under a range its tree keys by
+    // age, so both accounts are digest frontiers addressed by age. The copy
+    // holds members at both ages, so the offer describes each age by a
+    // nonempty digest, within which the server pushes nothing.
+    let mut ids = Vec::new();
+    for batch in 0..5 {
+        let age = if batch == 4 { "2" } else { "1" };
+        ids.extend(create_pets(&server, age, (0..420).map(|n| format!("pet {batch}-{n}"))).await?);
+    }
+    assert_eq!(client.fetch::<PetView>("age >= '1'").await?.len(), ids.len());
+
+    // The client holds no live query, so only its next Fetch learns of this.
+    // Its descent pages both the member's old address, where only the copy
+    // holds it, and its new one, where the server lists it.
+    let trx = server.begin();
+    trx.get::<Pet>(&ids[7]).await?.age()?.replace("2")?;
+    trx.commit().await?;
+
+    let fetched = client.fetch::<PetView>("age >= '1'").await?;
+    assert_eq!(fetched.len(), ids.len());
+    assert_eq!(fetched.iter().find(|pet| pet.id() == ids[7]).unwrap().age()?, "2", "the member arrives at its new key");
     Ok(())
 }
 

@@ -20,6 +20,9 @@ pub(super) struct Target {
     /// What the responder described of each span: disjoint, in address order,
     /// tiling the tree.
     regions: Vec<Region>,
+    /// Every entity the account lists, in its inventories and in the pages
+    /// answered since, wherever its address lies.
+    listed: HashSet<EntityId>,
     /// The responder heads seen in the account's inventories and pages that
     /// the copy does not cover yet, each with the entity's address.
     uncovered: BTreeMap<EntityId, (Vec<u8>, Clock)>,
@@ -34,8 +37,8 @@ pub(super) struct Target {
 /// What the responder described of one span.
 #[derive(Clone, Debug)]
 pub(super) enum Region {
-    /// Every entity it holds within the bounds.
-    Listed { bounds: TreeSpan, entities: HashSet<EntityId> },
+    /// Bounds within which it listed every entity it holds.
+    Listed(TreeSpan),
     /// A digest of its entities within the bounds, not matched by the copy yet.
     Digest(TreeSpanDigest),
     /// Bounds over which the copy matched the responder's digest.
@@ -47,7 +50,7 @@ pub(super) enum Region {
 impl Region {
     pub(super) fn bounds(&self) -> &TreeSpan {
         match self {
-            Region::Listed { bounds, .. } | Region::Matched(bounds) | Region::Unknown(bounds) => bounds,
+            Region::Listed(bounds) | Region::Matched(bounds) | Region::Unknown(bounds) => bounds,
             Region::Digest(digest) => &digest.bounds,
         }
     }
@@ -92,8 +95,14 @@ impl Target {
     /// treated as an account; a range it leaves out is not learned yet.
     pub(super) fn new(account: KnownState) -> anyhow::Result<Self> {
         account.validate()?;
-        let mut target =
-            Self { spec: account.spec, regions: Vec::new(), uncovered: BTreeMap::new(), unavailable: HashSet::new(), held: HashMap::new() };
+        let mut target = Self {
+            spec: account.spec,
+            regions: Vec::new(),
+            listed: HashSet::new(),
+            uncovered: BTreeMap::new(),
+            unavailable: HashSet::new(),
+            held: HashMap::new(),
+        };
         let mut spans = account.spans;
         spans.sort_by(|a, b| a.bounds().cmp_start(b.bounds()));
         let covered: Vec<_> = spans.iter().map(|span| span.bounds().clone()).collect();
@@ -113,13 +122,12 @@ impl Target {
 
     /// The region an inventory or a page lists, recording its heads.
     fn list(&mut self, inventory: TreeSpanInventory) -> Region {
-        let mut entities = HashSet::with_capacity(inventory.heads.len());
         let mut cursor = inventory.heads.cursor();
         while let Some(head) = cursor.next() {
-            entities.insert(head.entity.entity_id);
+            self.listed.insert(head.entity.entity_id);
             self.uncovered.insert(head.entity.entity_id, (leaf_address(head.key, head.entity.entity_id), head.entity.head.to_owned()));
         }
-        Region::Listed { bounds: inventory.bounds, entities }
+        Region::Listed(inventory.bounds)
     }
 
     /// Settle `region`'s bounds, a span within regions not learned yet, as
@@ -207,9 +215,11 @@ impl Target {
                     }
                 }
                 Region::Unknown(bounds) => outstanding.spans.push(Region::Unknown(bounds.clone())),
-                Region::Listed { bounds, entities } => {
+                // A member the account lists elsewhere, as one whose key
+                // changed, is listed: its head says what the copy lacks.
+                Region::Listed(bounds) => {
                     for (id, entry) in snapshot.entries_in(bounds, usize::MAX) {
-                        if entities.contains(&id) || self.unavailable.contains(&id) {
+                        if self.listed.contains(&id) || self.unavailable.contains(&id) {
                             continue;
                         }
                         let settled = match self.held.get(&id) {
