@@ -8,6 +8,7 @@
 mod comparison;
 mod push;
 mod repair;
+mod size;
 
 #[cfg(test)]
 mod tests;

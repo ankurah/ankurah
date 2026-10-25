@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod tests;
 
+use super::size::data_bytes;
 use crate::{
     node::Node,
     policy::{ContextPolicy, PolicyAgent},
@@ -53,8 +54,8 @@ where
 }
 
 /// The repair that brings a requester holding `known`, or nothing, to entity
-/// `id`'s current `state`: connecting events when they are smaller than a
-/// snapshot, else the snapshot.
+/// `id`'s current `state`: connecting events when their data is smaller than
+/// a snapshot's, else the snapshot.
 async fn current_state_repair<SE, PA, C>(
     node: &Node<SE, PA>,
     policy: &ContextPolicy<'_, PA, C>,
@@ -81,7 +82,7 @@ where
     let Some(mut delta) = node.generate_entity_delta(&known, state, credentials).await? else { return Ok(CurrentStateRepair::Current) };
     if matches!(delta.content, proto::DeltaContent::EventBridge { .. }) {
         if let Some(snapshot) = snapshot {
-            if bincode::serialized_size(&snapshot)? < bincode::serialized_size(&delta.content)? {
+            if data_bytes(&snapshot) < data_bytes(&delta.content) {
                 delta.content = snapshot;
             }
         }

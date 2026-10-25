@@ -2,7 +2,10 @@
 //! `SubscriptionUpdateItem`, sent through `Node::send_update` in updates
 //! bounded by count and size.
 
-use super::repair::{current_state_repairs, CurrentStateRepair};
+use super::{
+    repair::{current_state_repairs, CurrentStateRepair},
+    size::data_bytes,
+};
 use crate::{
     node::{Node, WeakNode},
     policy::{ContextPolicy, PolicyAgent},
@@ -39,12 +42,12 @@ impl Push {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
+        let bytes = data_bytes(&delta.content);
         let content = match delta.content {
             proto::DeltaContent::StateSnapshot { state } => proto::UpdateContent::StateAndEvent(state, vec![]),
             proto::DeltaContent::EventBridge { events } => proto::UpdateContent::EventOnly(events),
             proto::DeltaContent::StateAndRelation { .. } => anyhow::bail!("a state-and-relation delta has no update content"),
         };
-        let bytes = data_bytes(&content);
         let item = proto::SubscriptionUpdateItem { entity_id: delta.entity_id, content, predicate_relevance: self.relevance.clone() };
         if !self.items.is_empty() && (self.items.len() == MAX_PAGE_HEADS || self.bytes + bytes > MAX_UPDATE_BYTES) {
             self.send(node);
@@ -65,29 +68,6 @@ impl Push {
         }
         self.bytes = 0;
         node.send_update(self.peer, proto::NodeUpdateBody::SubscriptionUpdate { items: std::mem::take(&mut self.items) });
-    }
-}
-
-/// The bytes of `content`'s own buffers: its state's buffers, its events'
-/// operation diffs, and the attestations of both. These grow with an entity
-/// while the rest of an item stays small, so they bound an update's size
-/// without an encoding beyond the one the connector makes to send it.
-fn data_bytes(content: &proto::UpdateContent) -> usize {
-    let attestations = |set: &proto::AttestationSet| set.iter().map(|attestation| attestation.0.len()).sum::<usize>();
-    let event = |event: &proto::EventFragment| {
-        let (proto::EventBody::Genesis { operations, .. } | proto::EventBody::Update { operations, .. }) = &event.body;
-        let diffs = operations.0.iter().map(|operation| match operation {
-            proto::Operation::Backend { operations: diffs, .. } => diffs.iter().map(|diff| diff.diff.len()).sum(),
-            proto::Operation::Membership(_) => 0,
-        });
-        diffs.sum::<usize>() + attestations(&event.attestations)
-    };
-    match content {
-        proto::UpdateContent::EventOnly(events) => events.iter().map(event).sum(),
-        proto::UpdateContent::StateAndEvent(state, events) => {
-            let buffers = state.state.state_buffers.values().map(Vec::len).sum::<usize>();
-            buffers + attestations(&state.attestations) + events.iter().map(event).sum::<usize>()
-        }
     }
 }
 
