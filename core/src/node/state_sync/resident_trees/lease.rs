@@ -1,4 +1,4 @@
-//! The handles that pin a resident and the snapshot requests they send its actor.
+//! The handles that pin a resident tree, and the snapshot requests they send its actor.
 
 use super::{identity::QueryView, Lru};
 use crate::{node::state_sync::tree::Snapshot, reactor::maintenance::SourceError, session::ContextData};
@@ -8,10 +8,10 @@ use std::sync::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-/// The handle every lease of one resident shares: the channel to its actor,
+/// The handle every lease of one resident tree shares: the channel to its actor,
 /// the stop signal its drop sends, whether its actor still runs, and how many
 /// leases pin it.
-pub(super) struct Resident<CD: ContextData> {
+pub(super) struct ResidentTree<CD: ContextData> {
     pub(super) requests: mpsc::Sender<SnapshotRequest<CD>>,
     /// Dropped with the last handle, which stops the actor.
     pub(super) _stop: oneshot::Sender<()>,
@@ -20,54 +20,54 @@ pub(super) struct Resident<CD: ContextData> {
     pub(super) lru: Weak<Mutex<Lru<CD>>>,
 }
 
-/// Type-erased ownership lets a snapshot keep its resident without depending on
+/// Type-erased ownership lets a snapshot keep its tree without depending on
 /// the node's credential type.
 #[derive(Clone)]
-pub(crate) struct ResidentPin {
+pub(crate) struct TreePin {
     _lease: Arc<dyn Send + Sync>,
 }
 
-/// A pin on one resident, with the view its holder reads: while any lease
-/// lives, the LRU keeps the resident.
-pub(crate) struct ResidentLease<CD: ContextData> {
-    pub(super) resident: Arc<Resident<CD>>,
+/// A pin on one resident tree, with the view its holder reads: while any
+/// lease lives, the LRU keeps the tree.
+pub(crate) struct TreeLease<CD: ContextData> {
+    pub(super) tree: Arc<ResidentTree<CD>>,
     pub(super) view: Arc<QueryView<CD>>,
 }
-impl<CD: ContextData> ResidentLease<CD> {
-    pub(super) fn new(resident: Arc<Resident<CD>>, view: Arc<QueryView<CD>>) -> Self {
-        resident.pins.fetch_add(1, Ordering::AcqRel);
-        Self { resident, view }
+impl<CD: ContextData> TreeLease<CD> {
+    pub(super) fn new(tree: Arc<ResidentTree<CD>>, view: Arc<QueryView<CD>>) -> Self {
+        tree.pins.fetch_add(1, Ordering::AcqRel);
+        Self { tree, view }
     }
     /// A snapshot of this lease's view after every commit published so far.
-    /// The snapshot and its change signal each pin the resident while they live.
-    pub(crate) async fn snapshot(&self) -> anyhow::Result<ResidentSnapshot> {
+    /// The snapshot and its change signal each pin the tree while they live.
+    pub(crate) async fn snapshot(&self) -> anyhow::Result<LeasedSnapshot> {
         let (response, result) = oneshot::channel();
-        self.resident
+        self.tree
             .requests
             .send(SnapshotRequest { view: self.view.clone(), response })
             .await
             .map_err(|_| anyhow::anyhow!(SourceError::Changed))?;
         let (mut snapshot, receiver) = result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))??;
-        let pin = ResidentPin { _lease: Arc::new(self.clone()) };
-        snapshot.resident = Some(pin.clone());
-        Ok(ResidentSnapshot { snapshot, changes: TreeChanges { receiver, _pin: pin } })
+        let pin = TreePin { _lease: Arc::new(self.clone()) };
+        snapshot.pin = Some(pin.clone());
+        Ok(LeasedSnapshot { snapshot, changes: TreeChanges { receiver, _pin: pin } })
     }
 }
-impl<CD: ContextData> Clone for ResidentLease<CD> {
-    fn clone(&self) -> Self { Self::new(self.resident.clone(), self.view.clone()) }
+impl<CD: ContextData> Clone for TreeLease<CD> {
+    fn clone(&self) -> Self { Self::new(self.tree.clone(), self.view.clone()) }
 }
-impl<CD: ContextData> Drop for ResidentLease<CD> {
+impl<CD: ContextData> Drop for TreeLease<CD> {
     fn drop(&mut self) {
-        if self.resident.pins.fetch_sub(1, Ordering::AcqRel) == 1 {
-            if let Some(lru) = self.resident.lru.upgrade() {
+        if self.tree.pins.fetch_sub(1, Ordering::AcqRel) == 1 {
+            if let Some(lru) = self.tree.lru.upgrade() {
                 lru.lock().unwrap().trim_idle();
             }
         }
     }
 }
 
-/// A snapshot of a resident's view, and the signal of its tree's next change.
-pub(crate) struct ResidentSnapshot {
+/// A snapshot of a resident tree's view, and the signal of the tree's next change.
+pub(crate) struct LeasedSnapshot {
     pub(crate) snapshot: Snapshot,
     pub(crate) changes: TreeChanges,
 }
@@ -77,7 +77,7 @@ pub(crate) struct ResidentSnapshot {
 /// many others the LRU holds and however large the tree.
 pub(crate) struct TreeChanges {
     receiver: watch::Receiver<u64>,
-    _pin: ResidentPin,
+    _pin: TreePin,
 }
 
 impl TreeChanges {

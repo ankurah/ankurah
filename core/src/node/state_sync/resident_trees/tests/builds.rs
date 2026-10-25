@@ -1,4 +1,4 @@
-//! Resident builds: an unrelated build never blocks another, and a compatible one is shared.
+//! Resident tree builds: an unrelated build never blocks another, and a compatible one is shared.
 use super::*;
 
 #[tokio::test]
@@ -14,7 +14,7 @@ async fn an_unindexed_limit_builds_independently_without_blocking_the_shared_tre
     assert!(by_id.key_spec().keyparts.is_empty());
 
     // ORDER BY is not represented in this tree's entity-ID keys, so the
-    // limited selection needs its own bounded resident and storage read.
+    // limited selection needs its own bounded tree and storage read.
     let (entered, release) = hold_fetch(&node);
     let pending = node.resident_trees.acquire(&node, selection(Some(1)), Some(by_id), vec![DEFAULT_CONTEXT]);
     tokio::pin!(pending);
@@ -33,7 +33,7 @@ async fn an_unindexed_limit_builds_independently_without_blocking_the_shared_tre
     .await??;
     release.send(()).unwrap();
     let limited = pending.await?;
-    assert!(!Weak::ptr_eq(&tree, &limited.identity()), "unindexed ordering cannot borrow the broad resident");
+    assert!(!Weak::ptr_eq(&tree, &limited.identity()), "unindexed ordering cannot borrow the broad tree");
     let after = limited.snapshot().await?;
     assert_eq!(after.snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![second.entity_id]);
 

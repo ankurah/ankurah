@@ -1,12 +1,12 @@
 //! Trees and snapshots built from entity states, for tests that need a tree
-//! without a resident.
+//! without a resident tree.
 use super::{key_paths, QueryTree, Snapshot, TreeEntry};
 use crate::{entity::TemporaryEntity, selection::filter::ValueLookup};
 use ankurah_proto::{Attested, EntityState, TreeSpec};
 use std::collections::BTreeMap;
 
 impl QueryTree {
-    /// A tree under `spec` holding `states`, keyed as a resident's storage read
+    /// A tree under `spec` holding `states`, keyed as a resident tree's storage read
     /// keys them.
     pub(crate) async fn of_states(spec: TreeSpec, states: Vec<Attested<EntityState>>) -> anyhow::Result<Self> {
         let entries = states.iter().map(|state| Ok((state.payload.entity_id, entry_of(&spec, state)?))).collect::<anyhow::Result<_>>()?;

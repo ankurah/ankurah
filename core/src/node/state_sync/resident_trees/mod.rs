@@ -5,9 +5,9 @@ mod identity;
 mod lease;
 
 use self::{
-    actor::ResidentActor,
+    actor::TreeActor,
     identity::{compatible_access, compatible_selection, Coverage, Identity, QueryView},
-    lease::{Resident, ResidentLease},
+    lease::{ResidentTree, TreeLease},
 };
 use super::tree::{serves, spec_for};
 use crate::{
@@ -19,7 +19,7 @@ use crate::{
 };
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto as proto;
-pub(crate) use lease::{ResidentPin, ResidentSnapshot, TreeChanges};
+pub(crate) use lease::{LeasedSnapshot, TreeChanges, TreePin};
 use std::{
     collections::VecDeque,
     sync::{
@@ -39,7 +39,7 @@ const MAX_SNAPSHOT_ATTEMPTS: u32 = 8;
 const FIRST_SNAPSHOT_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The node's one LRU of resident trees, shared by every requester and
-/// responder. A lease pins its resident; idle residents stay maintained until
+/// responder. A lease pins its tree; idle trees stay maintained until
 /// the LRU's count or byte allowance evicts them.
 pub(crate) struct ResidentTrees<CD: ContextData> {
     lru: Arc<Mutex<Lru<CD>>>,
@@ -73,7 +73,7 @@ impl<CD: ContextData> Drop for BuildRegistration<CD> {
 struct Slot<CD: ContextData> {
     id: u64,
     identity: Identity<CD>,
-    resident: Arc<Resident<CD>>,
+    tree: Arc<ResidentTree<CD>>,
     bytes: usize,
 }
 
@@ -85,11 +85,11 @@ impl<CD: ContextData> ResidentTrees<CD> {
     pub(super) fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
         Self { lru: Arc::new(Mutex::new(Lru { slots: VecDeque::new(), building: Vec::new(), next_id: 0, max_entries, max_bytes })) }
     }
-    /// A snapshot of the resident that serves `selection` for `credentials`,
+    /// A snapshot of the resident tree that serves `selection` for `credentials`,
     /// in a tree under `spec` when the peer chose one. A comparison must not
     /// fail while the node's data, catalog or policy changes: such a change
     /// fails an admission retryably, and changes come in bursts, as while a
-    /// schema syncs. So after a retryable failure it admits the resident
+    /// schema syncs. So after a retryable failure it admits the tree
     /// again, waiting longer each time, up to `MAX_SNAPSHOT_ATTEMPTS`
     /// admissions.
     pub(crate) async fn snapshot<SE, PA>(
@@ -98,7 +98,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         selection: Selection<Resolved>,
         spec: Option<proto::TreeSpec>,
         credentials: Vec<CD>,
-    ) -> anyhow::Result<ResidentSnapshot>
+    ) -> anyhow::Result<LeasedSnapshot>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -121,7 +121,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         }
     }
 
-    /// A lease of the resident that serves `selection` for `credentials`:
+    /// A lease of the resident tree that serves `selection` for `credentials`:
     /// one already admitted or being admitted when it is compatible, otherwise
     /// a new one admitted from storage.
     async fn acquire<SE, PA>(
@@ -130,7 +130,7 @@ impl<CD: ContextData> ResidentTrees<CD> {
         selection: Selection<Resolved>,
         spec: Option<proto::TreeSpec>,
         credentials: Vec<CD>,
-    ) -> anyhow::Result<ResidentLease<CD>>
+    ) -> anyhow::Result<TreeLease<CD>>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -166,33 +166,33 @@ impl<CD: ContextData> ResidentTrees<CD> {
             // The sender only ever drops: `changed` returns once the build ends.
             let _ = ended.changed().await;
         };
-        let actor = ResidentActor::bootstrap(node, identity.clone()).await?;
+        let actor = TreeActor::bootstrap(node, identity.clone()).await?;
         node.system.check_not_halted()?;
         let bytes = actor.accounted_bytes();
         let (requests, receiver) = mpsc::channel(8);
         let (stop, canceled) = oneshot::channel();
-        let resident = Arc::new(Resident {
+        let tree = Arc::new(ResidentTree {
             requests,
             _stop: stop,
             alive: AtomicBool::new(true),
             pins: AtomicUsize::new(0),
             lru: Arc::downgrade(&self.lru),
         });
-        let lease = ResidentLease::new(resident.clone(), Arc::new(requested.view()));
+        let lease = TreeLease::new(tree.clone(), Arc::new(requested.view()));
         let id = {
             let mut lru = self.lru.lock().unwrap();
             let id = lru.next_id;
             lru.next_id = id.checked_add(1).ok_or_else(|| anyhow::anyhow!("resident tree identity exhausted"))?;
-            lru.slots.push_back(Slot { id, identity, resident: resident.clone(), bytes });
+            lru.slots.push_back(Slot { id, identity, tree: tree.clone(), bytes });
             id
         };
-        actor.spawn(node, receiver, canceled, Arc::downgrade(&self.lru), Arc::downgrade(&resident), id);
+        actor.spawn(node, receiver, canceled, Arc::downgrade(&self.lru), Arc::downgrade(&tree), id);
         Ok(lease)
     }
 }
 
 impl<CD: ContextData> Lru<CD> {
-    /// A lease of the resident that best serves `requested`: a complete one
+    /// A lease of the resident tree that best serves `requested`: a complete one
     /// first, then one keyed as requested, then any compatible one. `proof`
     /// tells whether credentials hold a fresh proof of unrestricted state reads.
     fn get(
@@ -201,8 +201,8 @@ impl<CD: ContextData> Lru<CD> {
         catalog: &crate::schema::catalog::CatalogManager,
         peer_spec: bool,
         proof: impl Fn(&[CD]) -> bool,
-    ) -> Option<ResidentLease<CD>> {
-        self.slots.retain(|slot| slot.resident.alive.load(Ordering::Acquire));
+    ) -> Option<TreeLease<CD>> {
+        self.slots.retain(|slot| slot.tree.alive.load(Ordering::Acquire));
         let serves = |slot: &Slot<CD>| compatible(&slot.identity, requested, catalog, peer_spec, &proof);
         let position = self
             .slots
@@ -217,20 +217,20 @@ impl<CD: ContextData> Lru<CD> {
             spec: if peer_spec { requested.spec.clone() } else { slot.identity.spec.clone() },
             credentials: requested.credentials.clone(),
         });
-        let lease = ResidentLease::new(slot.resident.clone(), view);
+        let lease = TreeLease::new(slot.tree.clone(), view);
         self.slots.push_back(slot);
         Some(lease)
     }
     fn trim_idle(&mut self) {
         // A result too large for idle retention must not evict useful small trees.
-        self.slots.retain(|slot| slot.resident.pins.load(Ordering::Acquire) != 0 || slot.bytes <= self.max_bytes);
+        self.slots.retain(|slot| slot.tree.pins.load(Ordering::Acquire) != 0 || slot.bytes <= self.max_bytes);
         loop {
-            let idle = self.slots.iter().filter(|slot| slot.resident.pins.load(Ordering::Acquire) == 0);
+            let idle = self.slots.iter().filter(|slot| slot.tree.pins.load(Ordering::Acquire) == 0);
             let (count, bytes) = idle.fold((0, 0usize), |(count, bytes), slot| (count + 1, bytes.saturating_add(slot.bytes)));
             if count <= self.max_entries && bytes <= self.max_bytes {
                 break;
             }
-            let Some(victim) = self.slots.iter().position(|slot| slot.resident.pins.load(Ordering::Acquire) == 0) else {
+            let Some(victim) = self.slots.iter().position(|slot| slot.tree.pins.load(Ordering::Acquire) == 0) else {
                 break;
             };
             self.slots.remove(victim);
@@ -244,7 +244,7 @@ impl<CD: ContextData> Lru<CD> {
     }
 }
 
-/// Whether a resident admitted under `existing` can serve `requested`.
+/// Whether a resident tree admitted under `existing` can serve `requested`.
 fn compatible<CD: ContextData>(
     existing: &Identity<CD>,
     requested: &Identity<CD>,

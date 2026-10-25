@@ -216,7 +216,7 @@ impl Target {
         Ok(())
     }
 
-    /// What the copy in `snapshot`, a view of the requester's resident for the
+    /// What the copy in `snapshot`, a view of the requester's resident tree for the
     /// query under this target's spec, does not yet match or exceed. A head the
     /// copy covers, or a digest it matches, stays settled: the copy only moves
     /// forward.

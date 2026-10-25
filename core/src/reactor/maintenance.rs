@@ -122,13 +122,13 @@ impl<T> Default for ReaderState<T> {
     fn default() -> Self { Self { pending: None, error: None } }
 }
 
-/// RAII registration; its lifetime is the lifetime of the resident index.
+/// A reader's RAII registration, which lives as long as the index it feeds, such as a resident tree.
 pub(crate) struct MaintenanceSubscription<T> {
     maintenance: Maintenance,
     reader: Arc<Reader<T>>,
 }
 
-/// Serializes persistence, resident publication and index projection. A commit
+/// Serializes persistence, the resident entities' advance and index projection. A commit
 /// holds it from its storage commit until it has registered or updated the
 /// resident entity and published the entities it changed; otherwise a competing
 /// writer could retry from stale in-memory state after storage advances. A

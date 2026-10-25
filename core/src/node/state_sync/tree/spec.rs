@@ -1,4 +1,4 @@
-//! The TreeSpec a selection's resident uses and the selections a TreeSpec serves.
+//! The TreeSpec a selection's resident tree uses and the selections a TreeSpec serves.
 
 use crate::schema::catalog::CatalogManager;
 use ankql::ast::{OrderDirection, Predicate, Resolved, Selection};
@@ -22,7 +22,7 @@ impl PropertyTypes for CatalogTypes<'_> {
     }
 }
 
-/// The TreeSpec a resident for `selection` uses: keyed by the selection's
+/// The TreeSpec a resident tree for `selection` uses: keyed by the selection's
 /// ordering where the catalog types every key part, otherwise by entity id
 /// alone, which also serves exact selections over expressions or JSON paths
 /// that the range planner cannot address.
@@ -76,7 +76,7 @@ pub(crate) fn serves(spec: &TreeSpec, selection: &Selection<Resolved>, catalog: 
     }
     // A tree admitting exactly the selection's predicate holds every member.
     // Under a limit, entity-id keys cannot rank the members, so a limited
-    // resident takes its cut from storage and holds only that cut.
+    // tree takes its cut from storage and holds only that cut.
     if spec.predicate() == &selection.predicate && (selection.limit.is_none() || spec.key_spec().keyparts.is_empty()) {
         return true;
     }

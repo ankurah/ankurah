@@ -1,14 +1,14 @@
-//! A resident builds its digest tree the first time anything reads a digest,
-//! and maintains it on every commit after.
+//! A resident tree builds its digests the first time anything reads a digest,
+//! and maintains them on every commit after.
 use super::*;
 use crate::node::state_sync::tree::QueryTree;
 
-/// The bytes the LRU charges each resident it holds, in LRU order.
+/// The bytes the LRU charges each tree it holds, in LRU order.
 fn charges<CD: ContextData>(cache: &ResidentTrees<CD>) -> Vec<usize> {
     cache.lru.lock().unwrap().slots.iter().map(|slot| slot.bytes).collect()
 }
 
-/// The bytes the LRU charges the residents admitting `selection`'s predicate.
+/// The bytes the LRU charges the trees admitting `selection`'s predicate.
 fn charges_for<CD: ContextData>(cache: &ResidentTrees<CD>, selection: &Selection<Resolved>) -> Vec<usize> {
     cache
         .lru
@@ -57,7 +57,7 @@ async fn an_inventory_sized_offer_builds_no_digest_tree() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn the_first_digest_read_builds_the_resident_tree_once_and_it_matches_a_fresh_build() -> anyhow::Result<()> {
+async fn the_first_digest_read_builds_the_digest_tree_once_and_it_matches_a_fresh_build() -> anyhow::Result<()> {
     let (node, events) = node_with(&["01", "02", "03"]).await?;
     let lease = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
     let admitted = charges(&node.resident_trees);
@@ -79,14 +79,14 @@ async fn the_first_digest_read_builds_the_resident_tree_once_and_it_matches_a_fr
 }
 
 #[tokio::test]
-async fn a_snapshot_taken_before_the_resident_advances_answers_digests_of_its_own_entries() -> anyhow::Result<()> {
+async fn a_snapshot_taken_before_the_tree_advances_answers_digests_of_its_own_entries() -> anyhow::Result<()> {
     let (node, events) = node_with(&["01", "02", "03"]).await?;
     let lease = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
     let mut before = lease.snapshot().await?.snapshot;
     apply(&node, &update(&events[0], "09")?).await?;
     let mut after = lease.snapshot().await?.snapshot;
-    // The resident builds its tree at the newer entries first; the older
-    // snapshot must not read that tree.
+    // The tree builds its digests at the newer entries first; the older
+    // snapshot must not read those digests.
     let current = after.span_digest(proto::TreeSpan::all()).await?;
     let frozen = before.span_digest(proto::TreeSpan::all()).await?;
     assert_eq!(frozen, fresh_digest(&before).await?);
@@ -96,7 +96,7 @@ async fn a_snapshot_taken_before_the_resident_advances_answers_digests_of_its_ow
 }
 
 #[tokio::test]
-async fn the_lru_charges_a_resident_for_its_digest_tree_only_once_it_is_built() -> anyhow::Result<()> {
+async fn the_lru_charges_a_tree_for_its_digest_tree_only_once_it_is_built() -> anyhow::Result<()> {
     let (node, _) = node_with(&["01", "02", "03"]).await?;
     let lease = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
     let admitted = charges(&node.resident_trees);

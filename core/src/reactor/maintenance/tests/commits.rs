@@ -97,7 +97,7 @@ async fn a_commit_batch_and_its_fence_cannot_be_half_published() -> anyhow::Resu
     }
     let fence = cursor.fence();
     tokio::pin!(fence);
-    assert!(futures::poll!(&mut fence).is_pending(), "a source fence must wait for resident publication and index projection");
+    assert!(futures::poll!(&mut fence).is_pending(), "a source fence must wait for the resident entities' advance and index projection");
     release.send(()).unwrap();
     let (transaction, window) = tokio::join!(transaction, fence);
     transaction?;

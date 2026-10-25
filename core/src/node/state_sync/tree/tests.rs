@@ -297,7 +297,7 @@ async fn scoped_snapshots_keep_one_full_tree_and_hide_unselected_rows() -> anyho
         assert_eq!(
             child.digest,
             selected.span_digest(child.bounds.clone()).await?.digest,
-            "refinement must never expose the full resident digest"
+            "refinement must never expose the full tree's digest"
         );
     }
     let mut full = cache.snapshot();
@@ -341,7 +341,7 @@ async fn limits_take_independent_cuts_and_preserve_old_snapshots() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn peer_spec_changes_only_the_view_description_not_resident_identity() -> anyhow::Result<()> {
+async fn peer_spec_changes_only_the_view_description_not_the_trees_identity() -> anyhow::Result<()> {
     use ankql::ast::{ComparisonOperator, Expr, Predicate};
     let predicate = Predicate::Comparison {
         left: Box::new(Expr::Path(PropertyPath::id())),

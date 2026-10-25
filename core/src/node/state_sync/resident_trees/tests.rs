@@ -1,5 +1,5 @@
 use super::*;
-use super::{actor::ResidentActor, identity::Identity};
+use super::{actor::TreeActor, identity::Identity};
 use crate::{
     entity::TemporaryEntity, node::state_sync::tree::Snapshot, schema::catalog::CatalogManager, session::ContextData, value::Value,
 };
@@ -183,49 +183,49 @@ async fn apply<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultCont
     .await?;
     Ok(())
 }
-/// A complete resident admitting `spec`'s whole predicate under `credentials`,
+/// A complete resident tree admitting `spec`'s whole predicate under `credentials`,
 /// bootstrapped as the LRU builds one for an unlimited selection.
-async fn complete_resident<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
+async fn complete_tree<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
     node: &Node<OrderedStorage, PA>,
     spec: proto::TreeSpec,
     credentials: Vec<PA::ContextData>,
-) -> anyhow::Result<ResidentActor<PA::ContextData>> {
+) -> anyhow::Result<TreeActor<PA::ContextData>> {
     node.system.require_system_ready()?;
     let selection = Selection::from(spec.predicate().clone());
-    ResidentActor::bootstrap(node, Identity::requested(node, selection, spec, credentials)?.admission()).await
+    TreeActor::bootstrap(node, Identity::requested(node, selection, spec, credentials)?.admission()).await
 }
 
-/// A resident bootstrapped as the LRU builds one for `selection` under the
+/// A resident tree bootstrapped as the LRU builds one for `selection` under the
 /// default credentials: limited when `selection` has a limit.
-async fn resident<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
+async fn bootstrap_tree<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultContext>>(
     node: &Node<OrderedStorage, PA>,
     selection: Selection<Resolved>,
     spec: proto::TreeSpec,
-) -> anyhow::Result<ResidentActor<PA::ContextData>> {
-    ResidentActor::bootstrap(node, Identity::requested(node, selection, spec, vec![DEFAULT_CONTEXT])?.admission()).await
+) -> anyhow::Result<TreeActor<PA::ContextData>> {
+    TreeActor::bootstrap(node, Identity::requested(node, selection, spec, vec![DEFAULT_CONTEXT])?.admission()).await
 }
 
 /// The view `selection` selects from `actor`'s tree as it stands.
-fn view<CD: ContextData>(actor: &ResidentActor<CD>, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Snapshot> {
+fn view<CD: ContextData>(actor: &TreeActor<CD>, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Snapshot> {
     actor.identity.coverage.select(actor.tree.snapshot(), selection, catalog)
 }
 
-impl<CD: ContextData> ResidentLease<CD> {
-    /// Which resident this lease holds, for [`Weak::ptr_eq`]. The weak
-    /// reference keeps the resident's allocation, so no later resident
+impl<CD: ContextData> TreeLease<CD> {
+    /// Which resident tree this lease holds, for [`Weak::ptr_eq`]. The weak
+    /// reference keeps the tree's allocation, so no later tree
     /// compares equal to it.
     pub(crate) fn identity(&self) -> Weak<dyn std::any::Any + Send + Sync> {
-        let resident: Weak<dyn std::any::Any + Send + Sync> = Arc::downgrade(&self.resident) as _;
-        resident
+        let tree: Weak<dyn std::any::Any + Send + Sync> = Arc::downgrade(&self.tree) as _;
+        tree
     }
 }
 
 impl<CD: ContextData> ResidentTrees<CD> {
-    /// How many residents the LRU holds, pinned or idle.
+    /// How many resident trees the LRU holds, pinned or idle.
     pub(crate) fn len(&self) -> usize { self.lru.lock().unwrap().slots.len() }
 
-    /// Evict every idle resident at once.
-    pub(crate) fn evict_idle(&self) { self.lru.lock().unwrap().slots.retain(|slot| slot.resident.pins.load(Ordering::Acquire) != 0); }
+    /// Evict every idle tree at once.
+    pub(crate) fn evict_idle(&self) { self.lru.lock().unwrap().slots.retain(|slot| slot.tree.pins.load(Ordering::Acquire) != 0); }
 }
 
 fn hold_fetch(node: &TestNode) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
@@ -377,7 +377,7 @@ async fn acquire<PA: PolicyAgent<ContextData = &'static crate::policy::DefaultCo
     cache: &ResidentTrees<PA::ContextData>,
     node: &Node<OrderedStorage, PA>,
     selection: Selection<Resolved>,
-) -> anyhow::Result<crate::node::state_sync::resident::ResidentLease<PA::ContextData>> {
+) -> anyhow::Result<crate::node::state_sync::resident_trees::TreeLease<PA::ContextData>> {
     cache.acquire(node, selection, None, vec![DEFAULT_CONTEXT]).await
 }
 

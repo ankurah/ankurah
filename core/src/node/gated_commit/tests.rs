@@ -118,11 +118,11 @@ async fn a_remote_transaction_dropped_inside_the_gate_still_lands_and_publishes(
 /// The applier's commit sites, each reached by one kind of delta in a peer's response.
 #[derive(Clone, Copy, Debug)]
 enum Route {
-    /// A snapshot of an entity this node does not hold registers its resident.
+    /// A snapshot of an entity this node does not hold registers its resident entity.
     NewEntitySnapshot,
-    /// The resident adopts a snapshot that extends it.
+    /// The resident entity adopts a snapshot that extends it.
     ExtendingSnapshot,
-    /// The resident applies events that extend it.
+    /// The resident entity applies events that extend it.
     EventBridge,
 }
 

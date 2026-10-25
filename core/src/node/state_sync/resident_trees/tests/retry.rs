@@ -97,7 +97,7 @@ async fn catalog_churn_across_every_admission_fails_a_snapshot_retryably_and_a_l
 async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() -> anyhow::Result<()> {
     let node = node().await?;
     let selected = selection(None);
-    let mut source = complete_resident(&node, spec_for(&selected, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    let mut source = complete_tree(&node, spec_for(&selected, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
     add_catalog_model(&node, "existing_admission_fixture").await?;
     let error = source.refresh(&node).await.err().expect("an existing source cannot cross a catalog change");
     assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::CatalogChanged)));

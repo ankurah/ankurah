@@ -22,7 +22,7 @@ use self::{
     deadline::{within, IdleDeadline},
     target::{Outstanding, Target},
 };
-use super::resident::{ResidentSnapshot, TreeChanges};
+use super::resident_trees::{LeasedSnapshot, TreeChanges};
 use crate::{
     error::{ApplyError, RequestError, RetrievalError},
     node::{applier::ApplyFailure, Node},
@@ -209,9 +209,9 @@ where
         }
     }
 
-    /// A snapshot of the copy: this node's resident for the query, under the
+    /// A snapshot of the copy: this node's resident tree for the query, under the
     /// target's `spec` once there is one.
-    async fn snapshot(&self, spec: Option<TreeSpec>) -> Result<ResidentSnapshot, RetrievalError> {
+    async fn snapshot(&self, spec: Option<TreeSpec>) -> Result<LeasedSnapshot, RetrievalError> {
         Ok(self.node.resident_trees.snapshot(self.node, self.selection.clone(), spec, self.credentials.clone()).await?)
     }
 
@@ -250,7 +250,7 @@ where
     /// What the copy does not yet match or exceed of `target`, and the signal
     /// of the copy's next change.
     async fn outstanding(&self, target: &mut Target) -> Result<(Outstanding, TreeChanges), RetrievalError> {
-        let ResidentSnapshot { mut snapshot, changes } = self.snapshot(Some(target.spec.clone())).await?;
+        let LeasedSnapshot { mut snapshot, changes } = self.snapshot(Some(target.spec.clone())).await?;
         Ok((target.outstanding(self.node, &mut snapshot).await?, changes))
     }
 

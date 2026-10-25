@@ -157,7 +157,7 @@ where
         return Ok(None);
     }
     // Local storage holds all the history the advance reads, so it needs none of the caller's
-    // getter. Holding the gate, no other commit moves a resident entity: each resident is still at
+    // getter. Holding the gate, no other commit moves a resident entity: each resident entity is still at
     // its write's expected head and takes the committed state without reading history, or already
     // holds that state because a reader loaded it from storage. Then a fork re-applies its events
     // to find them applied, reading only this write's events, now stored, and history that its own

@@ -1,9 +1,9 @@
-//! How a resident is admitted: the projector its maintenance subscription runs
+//! How a resident tree is admitted: the projector its maintenance subscription runs
 //! on each commit, and the storage read, fenced against the commits that
 //! crossed it, that its tree is built from.
 
 use super::{
-    actor::ResidentActor,
+    actor::TreeActor,
     identity::{Access, Coverage, Identity},
 };
 use crate::{
@@ -26,7 +26,7 @@ pub(super) const MAX_READ_ATTEMPTS: usize = 8;
 pub(super) type ReadPolicy<'a, PA> = ContextPolicy<'a, PA, ankurah_signals::Mut<Vec<<PA as PolicyAgent>::ContextData>>>;
 
 /// What the maintenance queue carries for one committed entity: its tree entry
-/// when the resident admits it, and whether it matches the resident's predicate.
+/// when the tree admits it, and whether it matches the tree's predicate.
 #[derive(Clone, Debug)]
 pub(crate) struct TreeUpdate {
     pub entity_id: proto::EntityId,
@@ -42,7 +42,7 @@ impl TreeUpdate {
     }
 }
 
-/// One storage read of what a resident admits: the readable members' entries,
+/// One storage read of what a resident tree admits: the readable members' entries,
 /// and every candidate its predicate matches.
 pub(super) struct StorageRead {
     pub(super) rows: BTreeMap<proto::EntityId, TreeEntry>,
@@ -85,13 +85,13 @@ impl StorageRead {
 }
 
 /// Fail with `CatalogChanged` when `batch` changed the catalog and the
-/// resident's selection is not itself a catalog read.
+/// tree's selection is not itself a catalog read.
 pub(super) fn ensure_catalog_unchanged<CD>(identity: &Identity<CD>, batch: &SourceBatch<TreeUpdate>) -> anyhow::Result<()> {
     anyhow::ensure!(crate::schema::is_catalog_read(&identity.filtered.predicate) || !batch.catalog_changed, SourceError::CatalogChanged);
     Ok(())
 }
 
-impl<CD: ContextData> ResidentActor<CD> {
+impl<CD: ContextData> TreeActor<CD> {
     /// Admit what `identity` selects: subscribe to maintenance, read storage,
     /// fold in the commits that crossed the read, narrow the subscription's
     /// watch to the result at the same fence, and build the tree.
@@ -107,7 +107,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 Coverage::Limited(original) =>
                     original.limit.is_some() && selection.limit == original.limit && selection.order_by == original.order_by,
             },
-            "resident admission does not match its declared coverage"
+            "resident tree admission does not match its declared coverage"
         );
         let policy = ContextPolicy::from_credentials(&node.policy_agent, &identity.credentials);
         let (mut start, mut cursor) = node.reactor.subscribe_maintenance(projector(node, &identity)).await?;
@@ -170,7 +170,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     }
 }
 
-/// Track whether `change`'s entity still matches the resident's predicate.
+/// Track whether `change`'s entity still matches the tree's predicate.
 pub(super) fn fold_candidate(candidates: &mut BTreeSet<proto::EntityId>, change: &TreeUpdate) {
     if change.matches {
         candidates.insert(change.entity_id);
@@ -179,11 +179,11 @@ pub(super) fn fold_candidate(candidates: &mut BTreeSet<proto::EntityId>, change:
     }
 }
 
-/// The projection the reactor runs on each publication for the resident
+/// The projection the reactor runs on each publication for the resident tree
 /// `identity` admits: for each committed entity, whether it matches the
-/// resident's predicate, and its tree entry when `identity`'s credentials may
+/// tree's predicate, and its tree entry when `identity`'s credentials may
 /// read it. One policy, and at most one evaluation of its unrestricted-read
-/// proof, serves the whole publication; an unrestricted resident checks no
+/// proof, serves the whole publication; an unrestricted tree checks no
 /// principal's reads, since each principal it serves holds its own proof.
 fn projector<SE, PA>(
     node: &Node<SE, PA>,
@@ -209,7 +209,7 @@ where
                 let entity_id = committed.id();
                 committed.with_read(|entity| {
                     let matches = evaluate_predicate(entity, &predicate)?;
-                    // An unrestricted resident admits every match; a restricted
+                    // An unrestricted tree admits every match; a restricted
                     // one asks its admitting credentials' policy afresh.
                     let readable = matches
                         && (access == Access::Unrestricted

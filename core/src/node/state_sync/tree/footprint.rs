@@ -1,4 +1,4 @@
-//! What the LRU charges a resident's tree for its memory: a fixed base, each
+//! What the LRU charges a resident tree for its memory: a fixed base, each
 //! member's index rows, and the digest tree's rows over the members.
 
 use super::TreeEntry;

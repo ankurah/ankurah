@@ -1,8 +1,8 @@
-//! Which requests share a resident, and which need their own.
+//! Which requests share a resident tree, and which need their own.
 use super::*;
 
 #[tokio::test]
-async fn compatible_selections_share_full_resident_with_independent_scopes() -> anyhow::Result<()> {
+async fn compatible_selections_share_a_complete_tree_with_independent_scopes() -> anyhow::Result<()> {
     let node = node().await?;
     let mut events = Vec::new();
     for value in ["01", "08", "10", "12", "20"] {
@@ -35,7 +35,7 @@ async fn compatible_selections_share_full_resident_with_independent_scopes() -> 
     }
     assert_eq!(node.resident_trees.len(), 1);
     assert_eq!(node.storage.fetches.load(Ordering::Relaxed), scans, "scopes do not scan storage again");
-    assert_eq!(broad.snapshot().await?.snapshot.entries.len(), 4, "query limits never truncate the resident");
+    assert_eq!(broad.snapshot().await?.snapshot.entries.len(), 4, "query limits never truncate the tree");
     let before = acquire(&node.resident_trees, &node, above("10", None)).await?.snapshot().await?.snapshot;
     let changed = update(&events[1], "15")?;
     apply(&node, &changed).await?;
@@ -64,13 +64,13 @@ async fn limited_coverage_is_explicit_and_complete_coverage_is_preferred() -> an
     let all = node.resident_trees.acquire(&node, selection(None), Some(frozen.spec.clone()), vec![DEFAULT_CONTEXT]).await?;
     assert!(!Weak::ptr_eq(&tree, &all.identity()), "bounded coverage cannot satisfy the unlimited request");
     let preferred = acquire(&node.resident_trees, &node, selection(Some(1))).await?;
-    assert!(Weak::ptr_eq(&all.identity(), &preferred.identity()), "prefer a compatible complete resident");
+    assert!(Weak::ptr_eq(&all.identity(), &preferred.identity()), "prefer a compatible complete tree");
     assert_eq!(all.snapshot().await?.snapshot.entries.len(), 3);
     apply(&node, &update(&events[0], "09")?).await?;
     let after = first.snapshot().await?.snapshot;
     assert_eq!(after.entries.keys().copied().collect::<Vec<_>>(), vec![events[1].entity_id]);
     assert_eq!(frozen.entries.keys().copied().collect::<Vec<_>>(), vec![events[0].entity_id]);
-    assert_eq!(after.entries.len(), 1, "a refill keeps the bounded resident at its cut");
+    assert_eq!(after.entries.len(), 1, "a refill keeps the bounded tree at its cut");
     assert_eq!(node.resident_trees.len(), 2);
     Ok(())
 }
@@ -104,7 +104,7 @@ async fn limited_coverage_rejects_other_selections_and_shares_exact_responder_re
     let tree = limited.identity();
     let spec = limited.snapshot().await?.snapshot.spec;
     let serving = node.resident_trees.acquire(&node, selected, Some(spec), vec![DEFAULT_CONTEXT]).await?;
-    assert!(Weak::ptr_eq(&tree, &serving.identity()), "requesting and serving use the same bounded resident");
+    assert!(Weak::ptr_eq(&tree, &serving.identity()), "requesting and serving use the same bounded tree");
     let mut opposite = selection(Some(1));
     opposite.order_by.as_mut().unwrap()[0].direction = OrderDirection::Desc;
     let mut narrower = above("01", None);
@@ -136,9 +136,9 @@ async fn replacing_a_limit_reuses_the_full_resident_tree() -> anyhow::Result<()>
     let (one, spec) = limited(1);
     let reused = node.resident_trees.acquire(&node, one, spec, vec![DEFAULT_CONTEXT]).await?;
     assert!(Weak::ptr_eq(&original.identity(), &reused.identity()), "compatible limits select scopes of the same resident tree");
-    assert!(Weak::ptr_eq(&full.identity(), &reused.identity()), "both limits reuse the complete resident");
+    assert!(Weak::ptr_eq(&full.identity(), &reused.identity()), "both limits reuse the complete tree");
     let snapshot = full.snapshot().await?.snapshot;
-    assert_eq!(snapshot.entries.len(), 3, "the resident keeps the full admission");
+    assert_eq!(snapshot.entries.len(), 3, "the tree keeps the full admission");
     let snapshot = snapshot.select(&selection(Some(1)), &node.catalog)?;
     assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), vec![initial[1].entity_id]);
     assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed), scans);

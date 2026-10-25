@@ -1,10 +1,10 @@
-//! The task that owns a resident: it applies the resident's maintenance and
+//! The task that owns a resident tree: it applies the tree's maintenance and
 //! answers its leases' snapshot requests and its snapshots' digest requests.
 
 use super::{
     bootstrap::{ensure_catalog_unchanged, fold_candidate, StorageRead, TreeUpdate, MAX_READ_ATTEMPTS},
     identity::{ensure_filter_unchanged, Access, Coverage, Identity},
-    lease::{Resident, SnapshotRequest},
+    lease::{ResidentTree, SnapshotRequest},
     Lru,
 };
 use crate::{
@@ -25,9 +25,9 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot, watch};
 
-/// A resident's state, owned by its actor task: what it admits, every
+/// A resident tree's state, owned by its actor task: what it admits, every
 /// candidate its predicate matches, its tree and its maintenance subscription.
-pub(super) struct ResidentActor<CD: ContextData> {
+pub(super) struct TreeActor<CD: ContextData> {
     pub(super) identity: Identity<CD>,
     // IDs only: denied candidates must also be rechecked when opaque policy changes.
     pub(super) candidates: BTreeSet<proto::EntityId>,
@@ -41,10 +41,10 @@ pub(super) struct ResidentActor<CD: ContextData> {
     pub(super) changes: watch::Sender<u64>,
 }
 
-impl<CD: ContextData> ResidentActor<CD> {
+impl<CD: ContextData> TreeActor<CD> {
     /// Fail with `PolicyChanged` unless the tree holds exactly the candidates
-    /// the resident's access admits now: every candidate for an unrestricted
-    /// resident, and for a restricted one those its admitting credentials may
+    /// the tree's access admits now: every candidate for an unrestricted
+    /// tree, and for a restricted one those its admitting credentials may
     /// read.
     pub(super) async fn check_authorization<SE, PA>(&self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
@@ -67,7 +67,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         Ok(())
     }
 
-    /// The bytes this resident is charged against the LRU's idle allowance.
+    /// The bytes this tree is charged against the LRU's idle allowance.
     pub(super) fn accounted_bytes(&self) -> usize { self.tree.accounted_bytes().saturating_add(self.candidates.len() * ID_ROW_BYTES) }
 
     /// Fold `changes` into the candidates and the tree, each entity taking the
@@ -81,8 +81,8 @@ impl<CD: ContextData> ResidentActor<CD> {
         self.tree.apply(latest).await
     }
 
-    /// Bring the resident up to date with `batch`, the committed changes it
-    /// has not applied, when there are any. A complete resident applies them
+    /// Bring the tree up to date with `batch`, the committed changes it
+    /// has not applied, when there are any. A complete tree applies them
     /// as they stand; a limited one reads its cut again when they touched it.
     pub(super) async fn advance<SE, PA>(&mut self, node: &Node<SE, PA>, batch: Option<SourceBatch<TreeUpdate>>) -> anyhow::Result<()>
     where
@@ -104,7 +104,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         batch.changes.iter().any(|change| change.matches || self.candidates.contains(&change.entity_id))
     }
 
-    /// Read a limited resident's cut again after a commit touched it, fence the
+    /// Read a limited tree's cut again after a commit touched it, fence the
     /// read, and replace the tree's entries.
     async fn refill<SE, PA>(&mut self, node: &Node<SE, PA>) -> anyhow::Result<()>
     where
@@ -125,7 +125,7 @@ impl<CD: ContextData> ResidentActor<CD> {
                 Err(SourceError::Changed) => continue,
                 result => {
                     let revision = result?.revision;
-                    // Keep bounded residents' explicit entity watches bounded
+                    // Keep bounded trees' explicit entity watches bounded
                     // too; predicate routing still observes future entrants.
                     match self
                         .cursor
@@ -158,7 +158,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         Ok(self.snapshot())
     }
 
-    /// Signal the holders of this resident's snapshots when the tree has
+    /// Signal the holders of this tree's snapshots when the tree has
     /// changed since they last heard.
     fn signal_changes(&self) {
         let version = self.tree.version();
@@ -176,7 +176,7 @@ impl<CD: ContextData> ResidentActor<CD> {
     }
 
     /// Answer snapshot and digest requests and apply published batches until
-    /// the resident's last handle drops, charging the LRU for the resident
+    /// the tree's last handle drops, charging the LRU for the tree
     /// after each.
     async fn run<SE, PA>(
         &mut self,
@@ -215,8 +215,8 @@ impl<CD: ContextData> ResidentActor<CD> {
         }
     }
 
-    /// Answer one lease's snapshot request from the resident brought up to
-    /// date. A failure to bring the resident up to date stops it; a failure of
+    /// Answer one lease's snapshot request from the tree brought up to
+    /// date. A failure to bring the tree up to date stops it; a failure of
     /// the request's own view fails only that request.
     async fn answer<SE, PA>(
         &mut self,
@@ -273,7 +273,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         Ok(())
     }
 
-    /// Run this actor until its resident is dropped or the node stops, then
+    /// Run this actor until its tree is dropped or the node stops, then
     /// remove its slot.
     pub(super) fn spawn<SE, PA>(
         mut self,
@@ -281,7 +281,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         receiver: mpsc::Receiver<SnapshotRequest<CD>>,
         canceled: oneshot::Receiver<()>,
         lru: Weak<Mutex<Lru<CD>>>,
-        resident: Weak<Resident<CD>>,
+        handle: Weak<ResidentTree<CD>>,
         id: u64,
     ) where
         SE: StorageEngine + Send + Sync + 'static,
@@ -301,8 +301,8 @@ impl<CD: ContextData> ResidentActor<CD> {
                 _ = run.wait_value(false) => Ok(()),
                 result = actor.run(weak, receiver, digest_requests, &lru, id) => result,
             };
-            if let Some(resident) = resident.upgrade() {
-                resident.alive.store(false, Ordering::Release);
+            if let Some(handle) = handle.upgrade() {
+                handle.alive.store(false, Ordering::Release);
             }
             if let Some(lru) = lru.upgrade() {
                 lru.lock().unwrap().slots.retain(|slot| slot.id != id);

@@ -1,9 +1,9 @@
 //! Admission: the storage read, the commits that cross it, limited refills and maintenance.
 use super::*;
 
-async fn limited(node: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<ResidentActor<&'static crate::policy::DefaultContext>> {
+async fn limited(node: &TestNode, selection: Selection<Resolved>) -> anyhow::Result<TreeActor<&'static crate::policy::DefaultContext>> {
     let spec = spec_for(&selection, &node.catalog);
-    resident(node, selection, spec).await
+    bootstrap_tree(node, selection, spec).await
 }
 
 #[tokio::test]
@@ -17,7 +17,7 @@ async fn an_unlimited_admission_folds_an_entrant_and_a_move_after_its_storage_re
         selection.predicate.clone(),
     );
     let (entered, release) = hold_fetch(&node);
-    let admission = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
+    let admission = complete_tree(&node, spec, vec![DEFAULT_CONTEXT]);
     tokio::pin!(admission);
     assert!(futures::poll!(&mut admission).is_pending());
     entered.await?;
@@ -48,9 +48,9 @@ async fn a_complete_id_keyed_tree_cannot_select_an_unindexed_ordered_limit() -> 
     apply(&node, &update(last, "02")?).await?;
     let selection = selection(Some(1));
     let by_id = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
-    let actor = complete_resident(&node, by_id, vec![DEFAULT_CONTEXT]).await?;
+    let actor = complete_tree(&node, by_id, vec![DEFAULT_CONTEXT]).await?;
     assert!(view(&actor, &selection, &node.catalog).is_err(), "a complete tree cannot rank properties absent from its keys");
-    assert_eq!(actor.tree.entries().len(), 2, "a failed scope never truncates the resident admission");
+    assert_eq!(actor.tree.entries().len(), 2, "a failed scope never truncates the tree's admission");
     assert_eq!(
         actor.tree.snapshot().member_map().values().copied().collect::<Vec<_>>(),
         vec![last.entity_id, first.entity_id],
@@ -70,14 +70,14 @@ async fn a_complete_admission_folds_changes_before_resolving_a_limit_with_unchan
     let spec = spec_for(&selection, &node.catalog);
     let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let (entered, release) = hold_fetch(&node);
-    let admission = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
+    let admission = complete_tree(&node, spec, vec![DEFAULT_CONTEXT]);
     tokio::pin!(admission);
     assert!(futures::poll!(&mut admission).is_pending());
     entered.await?;
     apply(&node, &update(&a, "09")?).await?;
     release.send(()).unwrap();
     let actor = admission.await?;
-    assert_eq!(actor.tree.entries().len(), 3, "the unchanged replacement is already resident");
+    assert_eq!(actor.tree.entries().len(), 3, "the unchanged replacement is already in the tree");
     let admitted = view(&actor, &selection, &node.catalog)?;
     assert_eq!(admitted.entries.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([b.entity_id, c.entity_id]));
     assert_eq!(
@@ -99,7 +99,7 @@ async fn limited_scopes_follow_concurrent_movements_without_refetching_or_mutati
     }
     let selection = selection(Some(2));
     let spec = spec_for(&selection, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut actor = complete_tree(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let frozen = view(&actor, &selection, &node.catalog)?;
     let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
     let moved_a = update(&events[0], "09")?;
@@ -133,7 +133,7 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
     let (entered, observed) = oneshot::channel();
     let (read, resume) = oneshot::channel();
     *node.storage.fetch_pause.lock().unwrap() = Some((entered, resume));
-    let admitting = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]);
+    let admitting = complete_tree(&node, spec, vec![DEFAULT_CONTEXT]);
     tokio::pin!(admitting);
     assert!(futures::poll!(&mut admitting).is_pending());
     observed.await?;
@@ -160,11 +160,11 @@ async fn a_storage_read_ahead_of_admission_cannot_be_replaced_by_an_older_window
 }
 
 #[tokio::test]
-async fn a_complete_resident_applies_a_published_batch_while_another_commit_is_in_flight() -> anyhow::Result<()> {
+async fn a_complete_tree_applies_a_published_batch_while_another_commit_is_in_flight() -> anyhow::Result<()> {
     let node = node().await?;
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
-    let mut actor = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    let mut actor = complete_tree(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
     let first = update(&initial, "02")?;
     apply(&node, &first).await?;
     let batch = actor.cursor.next().await?;
@@ -193,7 +193,7 @@ async fn maintenance_and_snapshots_retain_only_keys_and_cloned_heads() -> anyhow
     apply(&node, &original).await?;
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut actor = complete_tree(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let id = original.entity_id;
     let frozen = view(&actor, &selected, &node.catalog)?;
     assert_eq!(frozen.entries[&id].head, proto::Clock::singleton(&original));

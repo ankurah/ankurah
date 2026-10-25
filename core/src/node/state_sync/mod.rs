@@ -8,7 +8,7 @@
 //! trees and their snapshots are derived data.
 
 mod requester;
-mod resident;
+mod resident_trees;
 mod responder;
 mod tree;
 
@@ -16,5 +16,5 @@ mod tree;
 mod fixtures;
 
 pub(crate) use requester::{check, fetch, subscribe, CheckOutcome, SyncedQuery};
-pub(crate) use resident::ResidentTrees;
+pub(crate) use resident_trees::ResidentTrees;
 pub(crate) use responder::{answer_offer, compare_spans, sync_entities};

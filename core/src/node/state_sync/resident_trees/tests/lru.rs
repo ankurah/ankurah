@@ -2,15 +2,15 @@
 use super::*;
 
 #[tokio::test]
-async fn idle_resident_updates_then_exact_reuse_avoids_another_scan() -> anyhow::Result<()> {
+async fn idle_tree_updates_then_exact_reuse_avoids_another_scan() -> anyhow::Result<()> {
     let node = node().await?;
     let initial = genesis("01")?;
     apply(&node, &initial).await?;
-    let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
-    let tree = resident.identity();
-    let frozen = resident.snapshot().await?.snapshot;
+    let lease = acquire(&node.resident_trees, &node, selection(None)).await?;
+    let tree = lease.identity();
+    let frozen = lease.snapshot().await?.snapshot;
     let scans = node.storage.fetches.load(Ordering::Relaxed);
-    drop(resident);
+    drop(lease);
     let next = update(&initial, "02")?;
     apply(&node, &next).await?;
     let reused = acquire(&node.resident_trees, &node, selection(None)).await?;
@@ -52,19 +52,19 @@ async fn oversized_miss_does_not_evict_a_useful_small_entry() -> anyhow::Result<
         apply(&node, &genesis(value)?).await?;
     }
     let small = above("03", None);
-    let small_resident = complete_resident(&node, spec_for(&small, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
-    assert_eq!(small_resident.tree.entries().len(), 1);
-    let small_bytes = small_resident.accounted_bytes();
+    let small_tree = complete_tree(&node, spec_for(&small, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(small_tree.tree.entries().len(), 1);
+    let small_bytes = small_tree.accounted_bytes();
     let budget = small_bytes + 1;
     assert!(small_bytes <= budget);
     let all = selection(None);
-    let full_resident = complete_resident(&node, spec_for(&all, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
-    assert_eq!(full_resident.tree.entries().len(), 4);
-    assert!(full_resident.accounted_bytes() > budget);
+    let full_tree = complete_tree(&node, spec_for(&all, &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    assert_eq!(full_tree.tree.entries().len(), 4);
+    assert!(full_tree.accounted_bytes() > budget);
     let cache = ResidentTrees::with_limits(2, budget);
-    let resident = acquire(&cache, &node, above("03", None)).await?;
-    let tree = resident.identity();
-    drop(resident);
+    let lease = acquire(&cache, &node, above("03", None)).await?;
+    let tree = lease.identity();
+    drop(lease);
     let oversized = acquire(&cache, &node, selection(None)).await?;
     assert_eq!(oversized.snapshot().await?.snapshot.entries.len(), 4);
     drop(oversized);
@@ -103,13 +103,13 @@ async fn an_idle_entry_that_grows_beyond_retention_is_evicted() -> anyhow::Resul
     let node = node().await?;
     apply(&node, &genesis("01")?).await?;
     // Retain exactly what one member costs, so that more members cannot fit.
-    let budget = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?.accounted_bytes();
+    let budget = complete_tree(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?.accounted_bytes();
     let cache = ResidentTrees::with_limits(8, budget);
-    let resident = acquire(&cache, &node, selection(None)).await?;
-    let frozen = resident.snapshot().await?.snapshot;
+    let lease = acquire(&cache, &node, selection(None)).await?;
+    let frozen = lease.snapshot().await?.snapshot;
     assert_eq!(frozen.entries.len(), 1);
     drop(frozen);
-    drop(resident);
+    drop(lease);
     for value in ["02", "03", "04"] {
         apply(&node, &genesis(value)?).await?;
     }
@@ -132,7 +132,7 @@ async fn a_change_signal_pins_its_tree_past_the_count_and_byte_allowances() -> a
     apply(&node, &genesis("01")?).await?;
     // Every tree is past both allowances, so the LRU keeps only pinned ones.
     let cache = ResidentTrees::with_limits(0, 0);
-    let ResidentSnapshot { snapshot, changes } = acquire(&cache, &node, selection(None)).await?.snapshot().await?;
+    let LeasedSnapshot { snapshot, changes } = acquire(&cache, &node, selection(None)).await?.snapshot().await?;
     drop(snapshot);
     cache.evict_idle();
     assert_eq!(cache.len(), 1, "a sync waiting on the signal keeps its tree");
@@ -145,7 +145,7 @@ async fn a_change_signal_pins_its_tree_past_the_count_and_byte_allowances() -> a
 async fn a_change_signal_fires_for_the_trees_own_changes_and_errs_once_the_tree_stops() -> anyhow::Result<()> {
     let node = node().await?;
     apply(&node, &genesis("03")?).await?;
-    let ResidentSnapshot { snapshot, mut changes } =
+    let LeasedSnapshot { snapshot, mut changes } =
         node.resident_trees.snapshot(&node, above("02", None), None, vec![DEFAULT_CONTEXT]).await?;
     drop(snapshot);
     apply(&node, &genesis("01")?).await?;
@@ -179,7 +179,7 @@ async fn active_snapshot_lease_pins_tree_until_last_raii_owner_drops() -> anyhow
 }
 
 #[tokio::test]
-async fn a_new_limited_resident_retains_only_its_cut_and_a_zero_limit_reads_nothing() -> anyhow::Result<()> {
+async fn a_new_limited_tree_retains_only_its_cut_and_a_zero_limit_reads_nothing() -> anyhow::Result<()> {
     let node = node().await?;
     for value in 0..128 {
         apply(&node, &genesis(&format!("{value:03}"))?).await?;
@@ -190,7 +190,7 @@ async fn a_new_limited_resident_retains_only_its_cut_and_a_zero_limit_reads_noth
     assert_eq!(
         node.storage.returned_rows.load(Ordering::Relaxed) - rows_read,
         3,
-        "a cold limited resident reads, and so holds, only the selected rows"
+        "a cold limited tree reads, and so holds, only the selected rows"
     );
 
     let scans = node.storage.fetches.load(Ordering::Relaxed);
@@ -250,15 +250,15 @@ async fn apply_snapshot(node: &TestNode, source: &TestNode, event: &proto::Event
 #[tokio::test]
 async fn state_snapshots_update_a_resident_tree_for_new_and_existing_entities() -> anyhow::Result<()> {
     let (node, source) = (node().await?, node().await?);
-    let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
+    let lease = acquire(&node.resident_trees, &node, selection(None)).await?;
     let created = genesis("01")?;
     apply(&source, &created).await?;
     apply_snapshot(&node, &source, &created).await?;
-    assert_eq!(resident.snapshot().await?.snapshot.entries[&created.entity_id].head, proto::Clock::singleton(&created));
+    assert_eq!(lease.snapshot().await?.snapshot.entries[&created.entity_id].head, proto::Clock::singleton(&created));
     let changed = update(&created, "02")?;
     apply(&source, &changed).await?;
     apply_snapshot(&node, &source, &changed).await?;
-    assert_eq!(resident.snapshot().await?.snapshot.entries[&created.entity_id].head, proto::Clock::singleton(&changed));
+    assert_eq!(lease.snapshot().await?.snapshot.entries[&created.entity_id].head, proto::Clock::singleton(&changed));
     Ok(())
 }
 
@@ -273,9 +273,9 @@ async fn an_idle_tree_does_not_require_event_delivery_permission() -> anyhow::Re
     node.system.create().await?;
     node.wait_ready().await?;
     apply(&node, &initial).await?;
-    let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
-    let tree = resident.identity();
-    drop(resident);
+    let lease = acquire(&node.resident_trees, &node, selection(None)).await?;
+    let tree = lease.identity();
+    drop(lease);
     apply(&node, &denied).await?;
     let reused = acquire(&node.resident_trees, &node, selection(None)).await?;
     assert!(Weak::ptr_eq(&tree, &reused.identity()));

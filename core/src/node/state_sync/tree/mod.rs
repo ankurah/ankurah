@@ -1,4 +1,4 @@
-//! A resident's tree: each member's address and Clock, kept current on every
+//! A resident tree: each member's address and Clock, kept current on every
 //! commit; the digest tree over them, built the first time anything reads a
 //! digest and maintained on every commit after; and the frozen snapshots read
 //! from both.
@@ -31,7 +31,7 @@ const BULK_REFRESH_CHANGES: usize = 128;
 #[cfg(not(target_arch = "wasm32"))]
 const BLOCKING_BUILD_LEAVES: usize = 1024;
 
-/// What a resident keeps of one member: its leaf address, the key its values
+/// What a resident tree keeps of one member: its leaf address, the key its values
 /// encode followed by its entity id, and its Clock. Payloads stay in storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeEntry {
@@ -58,7 +58,7 @@ impl TreeEntry {
     }
 }
 
-/// A resident's index under one fixed TreeSpec: each admitted entity's
+/// A resident tree's index under one fixed TreeSpec: each admitted entity's
 /// address and Clock, kept current by every commit its maintenance
 /// subscription applies, and the digest tree over them once anything has read
 /// a digest. After its first build the digest tree changes with every commit,

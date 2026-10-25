@@ -1,4 +1,4 @@
-//! A frozen view of a resident's tree, selected for one query.
+//! A frozen view of a resident tree, selected for one query.
 
 use super::{build_tree_over, request_for, serves, tree_keys_rank_like_storage, Entries, Members, TreeEntry};
 use crate::schema::catalog::CatalogManager;
@@ -8,15 +8,16 @@ use ankurah_proto::{self as proto, EntityId, TreeSpec};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
-/// A frozen view of a resident's tree: the entries and members it held when
+/// A frozen view of a resident tree: the entries and members it held when
 /// the view was taken, narrowed to one query's spans once selected, and
 /// digests consistent with them.
 pub(crate) struct Snapshot {
     /// The spec a comparison describes this view under: the tree's own, or a
     /// compatible spec the peer chose.
     pub spec: TreeSpec,
-    /// The resident this view came from, kept alive while the view is.
-    pub(crate) resident: Option<crate::node::state_sync::resident::ResidentPin>,
+    /// The pin on the resident tree this view came from, which keeps the tree
+    /// alive while the view is.
+    pub(crate) pin: Option<crate::node::state_sync::resident_trees::TreePin>,
     /// The spec the tree is built under, which addresses and digests follow.
     pub(super) physical_spec: Arc<TreeSpec>,
     /// Every entry the tree held, whatever spans the view is narrowed to.
@@ -32,16 +33,16 @@ pub(crate) struct Snapshot {
 enum SnapshotDigests {
     /// A read view of digests over exactly the snapshot's entries.
     Read(TreeTransaction),
-    /// Not read yet: the first digest read asks `resident` for its digest tree
+    /// Not read yet: the first digest read asks its tree, through `requests`, for its digests
     /// at `version`, and otherwise builds one from the snapshot's entries.
-    Deferred { version: u64, resident: Option<DigestRequests> },
+    Deferred { version: u64, requests: Option<DigestRequests> },
 }
 
-/// How a snapshot asks the resident it came from for the resident's digests.
+/// How a snapshot asks the resident tree it came from for the tree's digests.
 #[derive(Clone)]
 pub(crate) struct DigestRequests(mpsc::WeakSender<DigestRequest>);
 
-/// One snapshot's request for its resident's digests, as of the tree version
+/// One snapshot's request for its tree's digests, as of the tree version
 /// the snapshot was taken at.
 pub(crate) struct DigestRequest {
     pub(super) version: u64,
@@ -49,7 +50,7 @@ pub(crate) struct DigestRequest {
 }
 
 impl DigestRequests {
-    /// Requests sent on `sender`, held only weakly: once the resident stops,
+    /// Requests sent on `sender`, held only weakly: once the tree stops,
     /// its snapshots build their own digests.
     pub(crate) fn new(sender: &mpsc::Sender<DigestRequest>) -> Self { Self(sender.downgrade()) }
 
@@ -80,11 +81,11 @@ impl Snapshot {
     ) -> Self {
         let digests = match digests {
             Some(tree) => SnapshotDigests::Read(tree),
-            None => SnapshotDigests::Deferred { version, resident: None },
+            None => SnapshotDigests::Deferred { version, requests: None },
         };
         Self {
             spec: (*spec).clone(),
-            resident: None,
+            pin: None,
             physical_spec: spec,
             physical_entries: entries.clone(),
             entries,
@@ -94,20 +95,20 @@ impl Snapshot {
         }
     }
 
-    /// Let this snapshot's first digest read ask its resident through `requests`.
+    /// Let this snapshot's first digest read ask its tree through `requests`.
     pub(crate) fn asking(mut self, requests: &DigestRequests) -> Self {
-        if let SnapshotDigests::Deferred { resident, .. } = &mut self.digests {
-            *resident = Some(requests.clone());
+        if let SnapshotDigests::Deferred { requests: asked, .. } = &mut self.digests {
+            *asked = Some(requests.clone());
         }
         self
     }
 
-    /// The digests this snapshot reads: its resident's, when the resident still
+    /// The digests this snapshot reads: its tree's, when the tree still
     /// holds this snapshot's entries, and otherwise digests built from them.
     pub(super) async fn digests(&mut self) -> anyhow::Result<&mut TreeTransaction> {
-        if let SnapshotDigests::Deferred { version, resident } = &self.digests {
-            let shared = match resident {
-                Some(resident) => resident.at(*version).await,
+        if let SnapshotDigests::Deferred { version, requests } = &self.digests {
+            let shared = match requests {
+                Some(requests) => requests.at(*version).await,
                 None => None,
             };
             let tree = match shared {
@@ -135,7 +136,7 @@ impl Snapshot {
     }
 
     /// Select a query view without changing the maintained tree. Scope gaps are
-    /// empty query addresses even when the resident contains other leaves there.
+    /// empty query addresses even when the tree contains other leaves there.
     pub fn select(mut self, selection: &Selection<Resolved>, catalog: &CatalogManager) -> anyhow::Result<Self> {
         anyhow::ensure!(self.ranges.is_none(), "a query view cannot be selected again");
         if self.physical_spec.predicate() == &selection.predicate && selection.limit.is_none() {

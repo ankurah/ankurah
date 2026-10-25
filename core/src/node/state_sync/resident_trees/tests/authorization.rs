@@ -1,4 +1,4 @@
-//! Read permission: admission, maintenance and every use of a resident check it.
+//! Read permission: admission, maintenance and every use of a resident tree check it.
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
@@ -64,7 +64,7 @@ async fn maintenance_respects_retrieval_permission_when_query_membership_is_unch
     apply(&node, &initially_denied).await?;
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut actor = complete_tree(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     let admitted = view(&actor, &selected, &node.catalog)?;
     assert!(admitted.entries.contains_key(&initial.entity_id));
     assert!(!admitted.entries.contains_key(&initially_denied.entity_id));
@@ -98,8 +98,8 @@ async fn maintenance_respects_retrieval_permission_when_query_membership_is_unch
 }
 
 #[tokio::test]
-async fn a_restricted_residents_publications_evaluate_its_admitting_proof_afresh() -> anyhow::Result<()> {
-    // Admitted without the proof, the resident keeps asking its admitting
+async fn a_restricted_trees_publications_evaluate_its_admitting_proof_afresh() -> anyhow::Result<()> {
+    // Admitted without the proof, the tree keeps asking its admitting
     // credentials' policy, which may grant the proof later.
     let allowed = Arc::new(AtomicBool::new(false));
     let checks = Arc::new(AtomicUsize::new(0));
@@ -120,7 +120,7 @@ async fn a_restricted_residents_publications_evaluate_its_admitting_proof_afresh
     apply(&node, &current).await?;
     let selected = selection(None);
     let spec = spec_for(&selected, &node.catalog);
-    let mut actor = complete_resident(&node, spec, vec![DEFAULT_CONTEXT]).await?;
+    let mut actor = complete_tree(&node, spec, vec![DEFAULT_CONTEXT]).await?;
     assert!(!view(&actor, &selected, &node.catalog)?.entries.contains_key(&current.entity_id));
 
     for (readable, value) in [(true, "02"), (false, "03"), (true, "04")] {
@@ -154,7 +154,7 @@ async fn unrestricted_reads_reuse_a_complete_tree_for_a_limit_without_reading_st
     }
     let full = acquire(&node.resident_trees, &node, above("", None)).await?;
     let original = full.identity();
-    assert!(node.entities.get(&events[0].entity_id).is_none(), "the proof must not depend on resident payloads");
+    assert!(node.entities.get(&events[0].entity_id).is_none(), "the proof must not depend on resident entities' payloads");
     let reads = node.storage.state_reads.load(Ordering::Relaxed);
     let scans = node.storage.fetches.load(Ordering::Relaxed);
     let limited = acquire(&node.resident_trees, &node, above("row-00000031", Some(10))).await?;
@@ -212,7 +212,7 @@ async fn state_free_read_proofs_are_fresh_and_do_not_hide_new_grants_or_revocati
     allowed.store(false, Ordering::SeqCst);
     assert!(granted.snapshot().await.is_err(), "the proof is not retained after revocation");
     let revoked = acquire(&node.resident_trees, &node, selection(None)).await?;
-    assert!(!Weak::ptr_eq(&granted.identity(), &revoked.identity()), "a revoked proof cannot reuse the unrestricted resident");
+    assert!(!Weak::ptr_eq(&granted.identity(), &revoked.identity()), "a revoked proof cannot reuse the unrestricted tree");
     let reads = node.storage.state_reads.load(Ordering::Relaxed);
     assert!(revoked.snapshot().await?.snapshot.entries.is_empty());
     assert!(node.storage.state_reads.load(Ordering::Relaxed) > reads, "without the proof, reads fall back to actual state checks");
@@ -243,10 +243,10 @@ async fn restricted_or_failed_retrieval_never_uses_a_state_free_read_proof() -> 
         for event in [&readable, &genesis("04")?] {
             apply(&node, event).await?;
         }
-        let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
+        let lease = acquire(&node.resident_trees, &node, selection(None)).await?;
         let reads = node.storage.state_reads.load(Ordering::Relaxed);
         let proof_calls = proofs.load(Ordering::Relaxed);
-        let snapshot = resident.snapshot().await?.snapshot;
+        let snapshot = lease.snapshot().await?.snapshot;
         assert_eq!(snapshot.entries.keys().copied().collect::<Vec<_>>(), if retrieval_error { vec![] } else { vec![readable.entity_id] });
         assert_eq!(
             node.storage.state_reads.load(Ordering::Relaxed) - reads,
@@ -267,9 +267,9 @@ async fn policies_without_a_state_free_proof_keep_their_state_checks() -> anyhow
     node.system.create().await?;
     node.wait_ready().await?;
     apply(&node, &genesis("01")?).await?;
-    let resident = acquire(&node.resident_trees, &node, selection(None)).await?;
+    let lease = acquire(&node.resident_trees, &node, selection(None)).await?;
     let reads = node.storage.state_reads.load(Ordering::Relaxed);
-    assert!(resident.snapshot().await?.snapshot.entries.is_empty());
+    assert!(lease.snapshot().await?.snapshot.entries.is_empty());
     assert_eq!(node.storage.state_reads.load(Ordering::Relaxed) - reads, 1);
     Ok(())
 }
@@ -290,7 +290,7 @@ async fn one_publication_evaluates_the_state_free_read_proof_once_for_all_its_ch
     node.system.create().await?;
     node.wait_ready().await?;
     // Admitted without the proof, so that its projector asks for it.
-    let mut actor = complete_resident(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
+    let mut actor = complete_tree(&node, spec_for(&selection(None), &node.catalog), vec![DEFAULT_CONTEXT]).await?;
     allowed.store(true, Ordering::SeqCst);
     let mut entities = Vec::new();
     for value in ["01", "02", "03"] {
@@ -338,16 +338,16 @@ async fn a_snapshot_request_reads_its_candidates_states_in_one_storage_call() ->
         apply(&node, &event).await?;
         events.push(event);
     }
-    let resident = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
+    let lease = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
     assert!(events.iter().all(|event| node.entities.get(&event.entity_id).is_none()), "every candidate's state is in storage alone");
     let batches = node.storage.state_batches.load(Ordering::Relaxed);
-    assert_eq!(resident.snapshot().await?.snapshot.entries.len(), 3);
+    assert_eq!(lease.snapshot().await?.snapshot.entries.len(), 3);
     assert_eq!(node.storage.state_batches.load(Ordering::Relaxed) - batches, 1, "the per-candidate read check reads every state at once");
     Ok(())
 }
 
 #[tokio::test]
-async fn principals_with_equal_effective_access_share_one_resident() -> anyhow::Result<()> {
+async fn principals_with_equal_effective_access_share_one_tree() -> anyhow::Result<()> {
     let node = restricted_node(RestrictedDiscovery { state_free_reads: true, ..Default::default() }).await?;
     let one = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT]).await?;
     let fetches = node.storage.fetches.load(Ordering::Relaxed);
@@ -381,10 +381,10 @@ async fn revoking_one_holders_proof_ends_only_that_holders_sharing() -> anyhow::
     let two = node.resident_trees.acquire(&node, selection(None), None, vec![DEFAULT_CONTEXT, DEFAULT_CONTEXT]).await?;
     assert!(Weak::ptr_eq(&one.identity(), &two.identity()));
     proof_up_to.store(1, Ordering::SeqCst);
-    let Err(error) = two.snapshot().await else { panic!("a holder whose proof is revoked cannot read the shared resident") };
+    let Err(error) = two.snapshot().await else { panic!("a holder whose proof is revoked cannot read the shared tree") };
     assert!(matches!(error.downcast_ref::<SourceError>(), Some(SourceError::PolicyChanged)));
-    assert_eq!(one.snapshot().await?.snapshot.entries.len(), 3, "a holder whose proof holds keeps the resident");
-    // Asking the LRU again admits the revoked principal a resident of its own.
+    assert_eq!(one.snapshot().await?.snapshot.entries.len(), 3, "a holder whose proof holds keeps the tree");
+    // Asking the LRU again admits the revoked principal a tree of its own.
     let own = node.resident_trees.snapshot(&node, selection(None), None, vec![DEFAULT_CONTEXT, DEFAULT_CONTEXT]).await?;
     assert_eq!(own.snapshot.entries.len(), 3, "its own read checks still allow every candidate");
     assert_eq!(node.resident_trees.len(), 2);
