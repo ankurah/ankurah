@@ -147,7 +147,9 @@ query repairs its copy only when two checks in a row disagree, and checks again
 30 seconds after a disagreement or a repair. A repair whose data fails to apply
 leaves the query established with that entity stale, as a live update that
 fails to apply does; its checks back off as if they agreed, and the next one
-that disagrees repairs without waiting for a second.
+that disagrees repairs without waiting for a second. A check that fails, as
+when the peer's catalog no longer serves the tree the query synced under,
+subscribes the query again and keeps its data, rather than marking it failed.
 
 Each subscription carries context data used for policy validation of incoming
 events and state.
