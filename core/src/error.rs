@@ -78,7 +78,8 @@ pub enum RetrievalError {
     #[error("No durable peers available for fetch operation")]
     NoDurablePeers,
     /// The local copy of a query's result stopped progressing toward the
-    /// peer's account of it, however often the requester compared again.
+    /// peer's account of it, through the three comparisons the requester
+    /// makes without progress.
     #[error("query sync with peer {peer} stalled: comparing again brought no progress")]
     SyncStalled { peer: EntityId },
     #[error("Other error: {0}")]

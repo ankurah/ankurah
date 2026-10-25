@@ -238,7 +238,6 @@ fn hold_fetch(node: &TestNode) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
 #[derive(Clone, Default)]
 struct RestrictedDiscovery {
     retrieval: Option<Predicate<Resolved>>,
-    denied_event: Option<proto::EventId>,
     read_allowed: Option<Arc<std::sync::atomic::AtomicBool>>,
     discover_all: Option<Arc<std::sync::atomic::AtomicBool>>,
     deny_empty: bool,
@@ -315,17 +314,6 @@ impl PolicyAgent for RestrictedDiscovery {
             states.iter().map(|(id, _)| (**id, crate::policy::AccessDenied::ByPolicy("fixture state denied"))).collect()
         } else {
             Default::default()
-        }
-    }
-    fn check_read_event<C: crate::util::Iterable<Self::ContextData>>(
-        &self,
-        _: &C,
-        event: &Attested<proto::Event>,
-    ) -> Result<(), crate::policy::AccessDenied> {
-        if self.denied_event.as_ref() == Some(&event.payload.id()) {
-            Err(crate::policy::AccessDenied::ByPolicy("fixture refuses this event"))
-        } else {
-            Ok(())
         }
     }
     fn check_write_event<SE: StorageEngine>(

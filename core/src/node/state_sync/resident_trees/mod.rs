@@ -1,4 +1,5 @@
-//! One node-local LRU for every caller and responder using a digest tree.
+//! The node's one LRU of resident trees, which every requester and responder
+//! shares.
 mod actor;
 mod bootstrap;
 mod identity;

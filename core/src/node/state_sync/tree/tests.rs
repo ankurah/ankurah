@@ -1,6 +1,5 @@
 use super::snapshot::UnsupportedTreeSelection;
 use super::spans::FRONTIER_BYTES;
-use super::spec::accept_peer_spec;
 use super::*;
 use crate::schema::catalog::CatalogManager;
 use crate::value::Value;

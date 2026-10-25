@@ -10,7 +10,7 @@ use crate::{
     error::MutationError,
     node::Node,
     policy::PolicyAgent,
-    reactor::{maintenance::SourceCommit, ChangeNotification},
+    reactor::{maintenance::CommitGateGuard, ChangeNotification},
     retrieval::{LocalEventGetter, LocalStateGetter},
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
 };
@@ -127,25 +127,25 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let mut source = node.reactor.begin_commit().await;
-    match commit_and_advance(node, &mut source, storage_trx, writes).await {
+    let mut gate = node.reactor.begin_commit().await;
+    match commit_and_advance(node, &mut gate, storage_trx, writes).await {
         Ok(Some(changes)) => {
-            source.publish(changes.iter().map(|change| change.entity()));
+            gate.publish(changes.iter().map(|change| change.entity()));
             Ok(Some(changes))
         }
         Ok(None) => Ok(None),
         Err(error) => {
-            source.fail(&error);
+            gate.fail(&error);
             Err(error)
         }
     }
 }
 
-/// Commit the staged writes, holding the commit gate as `source`, then advance each resident
+/// Commit the staged writes, holding the commit gate as `gate`, then advance each resident
 /// entity: one change per write, in order, or `None` when storage refused the writes.
 async fn commit_and_advance<SE, PA>(
     node: &Node<SE, PA>,
-    source: &mut SourceCommit,
+    gate: &mut CommitGateGuard,
     storage_trx: SE::Transaction<'_>,
     writes: Vec<EntityWrite>,
 ) -> CommitOutcome
@@ -153,7 +153,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    if let StorageCommitOutcome::Conflict { .. } = source.record_storage_outcome(storage_trx.commit().await)? {
+    if let StorageCommitOutcome::Conflict { .. } = gate.record_storage_outcome(storage_trx.commit().await)? {
         return Ok(None);
     }
     // Local storage holds all the history the advance reads, so it needs none of the caller's

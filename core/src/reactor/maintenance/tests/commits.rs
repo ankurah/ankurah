@@ -6,23 +6,31 @@ use super::*;
 /// A caller dropped while its applier write stages leaves the write running in
 /// its own task, here paused in storage: it has published nothing and holds no
 /// commit gate yet, so a fence passes with no batch and a new subscription
-/// opens.
+/// opens. The write was released to commit at once, so once storage resumes it
+/// lands and publishes without its caller.
 #[tokio::test]
-async fn dropping_a_caller_while_its_write_stages_leaves_the_source_available() -> anyhow::Result<()> {
+async fn a_write_whose_caller_drops_while_it_stages_holds_no_gate_and_still_lands() -> anyhow::Result<()> {
     let node = node().await?;
     let (_, mut cursor) = subscribe(&node).await?;
     let (entered, wait) = tokio::sync::oneshot::channel();
-    let (_release, resume) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
     *node.storage.hold_set_state.lock().unwrap() = Some((entered, resume));
+    let event = genesis(3);
     {
-        let event = genesis(3);
         let applying = apply(&node, &event);
         tokio::pin!(applying);
-        assert!(futures::poll!(&mut applying).is_pending());
-        wait.await?;
+        tokio::select! {
+            _ = &mut applying => anyhow::bail!("the write finished while storage held its staging"),
+            staging = wait => staging?,
+        }
     }
     assert!(cursor.fence().await?.batch.is_none());
     subscribe(&node).await?;
+
+    release.send(()).map_err(|()| anyhow::anyhow!("dropping the caller dropped the write"))?;
+    let published = tokio::time::timeout(std::time::Duration::from_secs(5), cursor.next()).await??;
+    assert_eq!(published.changes.iter().map(|change| change.id).collect::<Vec<_>>(), [event.entity_id]);
+    assert_eq!(node.storage.get_state(event.entity_id).await?.payload.state.head, proto::Clock::singleton(&event));
     Ok(())
 }
 

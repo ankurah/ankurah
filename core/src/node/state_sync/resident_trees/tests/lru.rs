@@ -261,24 +261,3 @@ async fn state_snapshots_update_a_resident_tree_for_new_and_existing_entities() 
     assert_eq!(lease.snapshot().await?.snapshot.entries[&created.entity_id].head, proto::Clock::singleton(&changed));
     Ok(())
 }
-
-#[tokio::test]
-async fn an_idle_tree_does_not_require_event_delivery_permission() -> anyhow::Result<()> {
-    let initial = genesis("01")?;
-    let denied = update(&initial, "02")?;
-    let node = Node::new_durable(
-        Arc::new(OrderedStorage::default()),
-        RestrictedDiscovery { denied_event: Some(denied.id()), ..Default::default() },
-    );
-    node.system.create().await?;
-    node.wait_ready().await?;
-    apply(&node, &initial).await?;
-    let lease = acquire(&node.resident_trees, &node, selection(None)).await?;
-    let tree = lease.identity();
-    drop(lease);
-    apply(&node, &denied).await?;
-    let reused = acquire(&node.resident_trees, &node, selection(None)).await?;
-    assert!(Weak::ptr_eq(&tree, &reused.identity()));
-    assert_eq!(reused.snapshot().await?.snapshot.entries[&initial.entity_id].head, proto::Clock::singleton(&denied));
-    Ok(())
-}

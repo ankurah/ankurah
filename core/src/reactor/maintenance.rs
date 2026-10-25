@@ -1,7 +1,12 @@
-//! Reactor subscriptions for indexes that retain metadata rather than entities.
+//! Reactor maintenance: the commit gate that every storage commit on the node
+//! takes, and the indexes, such as resident trees, that retain metadata of the
+//! entities each commit changes rather than the entities. The source is the
+//! sequence of committed entities that the commits publish under the gate, one
+//! revision per commit: an index subscribes to it before reading storage, and
+//! fences on it to take the commits its read may have missed.
 //!
 //! Projection happens while the committed entity is available. Only the projected
-//! values enter each subscription's bounded queue; no entity handles are retained.
+//! values enter each reader's bounded queue; no entity handles are retained.
 use super::{watcherset::WatcherOp, Reactor, ReactorSubscriptionId, WatcherChange, WatcherSet};
 use crate::entity::Entity;
 use ankql::ast::{Predicate, Resolved};
@@ -128,13 +133,14 @@ pub(crate) struct MaintenanceSubscription<T> {
     reader: Arc<Reader<T>>,
 }
 
-/// Serializes persistence, the resident entities' advance and index projection. A commit
+/// The commit gate, held for one storage commit. The gate serializes
+/// persistence, the resident entities' advance and index projection: a commit
 /// holds it from its storage commit until it has registered or updated the
 /// resident entity and published the entities it changed; otherwise a competing
 /// writer could retry from stale in-memory state after storage advances. A
-/// commit that fails or stops after taking it fails every reader that exists
+/// commit that fails or stops while holding it fails every reader that exists
 /// then, any of which may have missed its outcome.
-pub(crate) struct SourceCommit {
+pub(crate) struct CommitGateGuard {
     maintenance: Maintenance,
     _gate: OwnedMutexGuard<()>,
     finished: bool,
@@ -149,8 +155,8 @@ impl Maintenance {
         }))
     }
 
-    pub(super) async fn begin_commit(&self) -> SourceCommit {
-        SourceCommit { maintenance: self.clone(), _gate: self.0.gate.clone().lock_owned().await, finished: false }
+    pub(super) async fn begin_commit(&self) -> CommitGateGuard {
+        CommitGateGuard { maintenance: self.clone(), _gate: self.0.gate.clone().lock_owned().await, finished: false }
     }
 
     pub(super) async fn subscribe<T: Send + Sync + 'static>(
@@ -203,9 +209,9 @@ impl Maintenance {
 }
 
 impl Reactor<Entity, Attested<Event>> {
-    /// Take the commit gate for one storage commit; the returned [`SourceCommit`] publishes the
+    /// Take the commit gate for one storage commit; the returned [`CommitGateGuard`] publishes the
     /// entities the commit changed to maintenance.
-    pub(crate) async fn begin_commit(&self) -> SourceCommit { self.0.maintenance.begin_commit().await }
+    pub(crate) async fn begin_commit(&self) -> CommitGateGuard { self.0.maintenance.begin_commit().await }
 
     /// Subscribe an index before reading its initial contents. Projection runs
     /// before public event filtering and may retain only the index's metadata.
@@ -278,7 +284,7 @@ impl<T: Send + Sync> MaintenanceReader for Reader<T> {
     }
 }
 
-impl SourceCommit {
+impl CommitGateGuard {
     pub(crate) fn record_storage_outcome(
         &mut self,
         result: Result<crate::storage::StorageCommitOutcome, crate::error::MutationError>,
@@ -334,7 +340,7 @@ impl SourceCommit {
     }
 }
 
-impl Drop for SourceCommit {
+impl Drop for CommitGateGuard {
     fn drop(&mut self) {
         if !self.finished {
             self.maintenance.commit_in_doubt(&"the commit stopped before it published");

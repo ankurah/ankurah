@@ -117,7 +117,7 @@ async fn a_remote_transaction_dropped_inside_the_gate_still_lands_and_publishes(
 
 /// The applier's commit sites, each reached by one kind of delta in a peer's response.
 #[derive(Clone, Copy, Debug)]
-enum Route {
+enum ApplierPath {
     /// A snapshot of an entity this node does not hold registers its resident entity.
     NewEntitySnapshot,
     /// The resident entity adopts a snapshot that extends it.
@@ -131,32 +131,32 @@ enum Route {
 /// entity and publishes to maintenance, which then serves later commits.
 #[tokio::test]
 async fn an_application_dropped_inside_the_gate_still_lands_and_publishes() -> anyhow::Result<()> {
-    for route in [Route::NewEntitySnapshot, Route::ExtendingSnapshot, Route::EventBridge] {
+    for path in [ApplierPath::NewEntitySnapshot, ApplierPath::ExtendingSnapshot, ApplierPath::EventBridge] {
         let node = node().await?;
         let genesis = Event::genesis(node.system.root_id(), AuthorId::Unknown, adding_model(1));
         let id = genesis.entity_id;
         let update = Event::update(id, Clock::singleton(&genesis), AuthorId::Unknown, adding_model(2));
         let mut resident = None;
-        if !matches!(route, Route::NewEntitySnapshot) {
+        if !matches!(path, ApplierPath::NewEntitySnapshot) {
             apply(&node, bridge(&genesis), Vec::new()).await?;
             resident = Some(load_resident(&node, id).await?);
         }
         let (_, mut maintenance) = node.reactor.subscribe_maintenance(heads).await?;
 
-        let (head, applying) = match route {
-            Route::NewEntitySnapshot => (Clock::singleton(&genesis), apply(&node, snapshot(&genesis, [1]), Vec::new())),
+        let (head, applying) = match path {
+            ApplierPath::NewEntitySnapshot => (Clock::singleton(&genesis), apply(&node, snapshot(&genesis, [1]), Vec::new())),
             // Only the caller's getter holds the update, which the snapshot's causal check reads;
             // storage never stores it, so committing the adoption must not read history again.
-            Route::ExtendingSnapshot => (Clock::singleton(&update), apply(&node, snapshot(&update, [1, 2]), vec![update.clone()])),
-            Route::EventBridge => (Clock::singleton(&update), apply(&node, bridge(&update), Vec::new())),
+            ApplierPath::ExtendingSnapshot => (Clock::singleton(&update), apply(&node, snapshot(&update, [1, 2]), vec![update.clone()])),
+            ApplierPath::EventBridge => (Clock::singleton(&update), apply(&node, bridge(&update), Vec::new())),
         };
         drop_inside_the_gate(&node, applying).await?;
 
-        assert_eq!(node.storage.get_state(id).await?.payload.state.head, head, "{route:?}: the dropped commit reached storage");
+        assert_eq!(node.storage.get_state(id).await?.payload.state.head, head, "{path:?}: the dropped commit reached storage");
         let published = tokio::time::timeout(Duration::from_secs(10), maintenance.next()).await??;
-        assert_eq!(published.changes, [(id, head.clone())], "{route:?}");
+        assert_eq!(published.changes, [(id, head.clone())], "{path:?}");
         if let Some(resident) = &resident {
-            assert_eq!(resident.head(), head, "{route:?}");
+            assert_eq!(resident.head(), head, "{path:?}");
         }
 
         let later = Event::genesis(node.system.root_id(), AuthorId::Unknown, adding_model(3));
@@ -164,7 +164,7 @@ async fn an_application_dropped_inside_the_gate_still_lands_and_publishes() -> a
         assert_eq!(
             maintenance.next().await?.changes,
             [(later.entity_id, Clock::singleton(&later))],
-            "{route:?}: maintenance still serves later commits"
+            "{path:?}: maintenance still serves later commits"
         );
     }
     Ok(())
