@@ -3,8 +3,12 @@
 
 use super::*;
 
+/// A caller dropped while its applier write stages leaves the write running in
+/// its own task, here paused in storage: it has published nothing and holds no
+/// commit gate yet, so a fence passes with no batch and a new subscription
+/// opens.
 #[tokio::test]
-async fn cancellation_before_commit_does_not_invalidate_source() -> anyhow::Result<()> {
+async fn dropping_a_caller_while_its_write_stages_leaves_the_source_available() -> anyhow::Result<()> {
     let node = node().await?;
     let (_, mut cursor) = subscribe(&node).await?;
     let (entered, wait) = tokio::sync::oneshot::channel();
