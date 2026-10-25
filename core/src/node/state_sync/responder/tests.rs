@@ -170,7 +170,7 @@ async fn an_offered_span_whose_digest_differs_is_answered_with_its_heads_and_mat
     let changed = current[7].payload.entity_id;
     let mut responder = snapshot(current).await?;
 
-    let answered = target(&mut responder, &known).await?;
+    let answered = target_for(&mut responder, &known).await?;
 
     answered.validate()?;
     let address = responder.entries[&changed].address().to_vec();
@@ -204,7 +204,7 @@ async fn differing_spans_are_listed_fewest_members_first_until_the_head_limit_an
     // differs, and together they hold more heads than one offer may.
     let mut responder = snapshot(at_head(source, &another_head())).await?;
 
-    let answered = target(&mut responder, &known).await?;
+    let answered = target_for(&mut responder, &known).await?;
 
     answered.validate()?;
     let (mut listed, mut digests) = (Vec::new(), Vec::new());
@@ -245,7 +245,7 @@ async fn differing_spans_are_listed_only_while_their_heads_fit_an_offers_work() 
     )?;
     let mut responder = snapshot(at_head(source, &wide)).await?;
 
-    let answered = target(&mut responder, &known).await?;
+    let answered = target_for(&mut responder, &known).await?;
 
     answered.validate()?;
     let listed = |span: &SpanContent| match span {
@@ -273,7 +273,7 @@ async fn an_offer_whose_spans_and_the_ranges_it_leaves_out_pass_the_span_limit_g
     known.validate()?;
     let mut responder = snapshot(source).await?;
 
-    let answered = target(&mut responder, &known).await?;
+    let answered = target_for(&mut responder, &known).await?;
 
     assert_eq!(bincode::serialize(&answered)?, bincode::serialize(&responder.offer().await?)?, "the snapshot's own account");
     Ok(())

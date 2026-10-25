@@ -70,7 +70,7 @@ where
     };
     let spec = known.spec.clone();
     let mut snapshot = node.resident_trees.snapshot(node, selection, Some(spec), credentials.clone()).await?.snapshot;
-    let target = target(&mut snapshot, &known).await?;
+    let target = target_for(&mut snapshot, &known).await?;
     let lacking = comparison::lacking(&snapshot, known);
     // The push reads current states, never the snapshot: holding it would copy
     // the tree's entries at its next commit.
@@ -90,7 +90,7 @@ where
 /// would cost the requester a descent, while heads let it cover its own newer
 /// heads at once and name what it lacks. Any other offer, or one whose spans
 /// would break an offer's limits, is answered with the snapshot's own account.
-async fn target(snapshot: &mut Snapshot, known: &KnownState) -> anyhow::Result<KnownState> {
+async fn target_for(snapshot: &mut Snapshot, known: &KnownState) -> anyhow::Result<KnownState> {
     if let Some(ComparedDigests { matching, differing }) = comparison::compare_digests(snapshot, known).await? {
         if let Some(account) = snapshot.account_over(matching, differing).await? {
             return Ok(account);
