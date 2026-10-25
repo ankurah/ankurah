@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::node::state_sync::{fixtures::*, tree::fixtures::snapshot_of};
-use ankurah_digest_tree::NodePrefix;
+use ankurah_digest_tree::{Digest, NodePrefix};
 use ankurah_proto::{self as proto, state_sync::limits::MAX_PAGE_HEADS, Attested, EntityState, TreeSpanDigest};
 use std::collections::BTreeSet;
 

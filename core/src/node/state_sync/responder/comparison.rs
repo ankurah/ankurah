@@ -5,7 +5,7 @@
 mod tests;
 
 use crate::node::state_sync::tree::Snapshot;
-use ankurah_digest_tree::{leaf_address, Digest};
+use ankurah_digest_tree::leaf_address;
 use ankurah_proto::{Clock, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanInventory};
 use anyhow::ensure;
 use std::{
