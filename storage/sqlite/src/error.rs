@@ -294,14 +294,11 @@ impl From<DatabaseRefusal> for SqliteError {
 /// same way, as it is read.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum DatabaseRefusal {
-    /// A runtime without what opening node:sqlite's `DatabaseSync` takes,
-    /// `missing` naming what it lacks: the `process` global,
-    /// `process.getBuiltinModule`, the `node:sqlite` module, or its
-    /// `DatabaseSync` constructor.
-    #[error(
-        "a runtime without {missing} is refused, since it offers no node:sqlite DatabaseSync to open; run inside {}",
-        NODE_JS_RELEASES
-    )]
+    /// A runtime without what opening a node:sqlite database takes, `missing`
+    /// naming what it lacks: the `process` global,
+    /// `process.getBuiltinModule`, the `node:sqlite` module, or its database
+    /// class, `Database` or `DatabaseSync`.
+    #[error("a runtime without {missing} is refused, since it offers no node:sqlite database to open; run inside {}", NODE_JS_RELEASES)]
     NoNodeSqlite { missing: &'static str },
 
     /// A value handed over as a database that is not an object; `found` is

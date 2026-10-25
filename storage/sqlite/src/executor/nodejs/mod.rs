@@ -64,8 +64,9 @@ impl SqliteStorageEngine {
     /// Adopt a database object the host constructed, for a host that runs
     /// SQLite itself: on better-sqlite3, or on a node:sqlite `DatabaseSync`
     /// with settings of its own. The engine keeps the host's session
-    /// settings, its busy timeout among them. It refuses a database it cannot
-    /// read exactly, as a [`Refusal::Database`]: one whose statements cannot
+    /// settings, its busy timeout and SQLite's defensive flag among them,
+    /// where `open` sets native's. It refuses a database it cannot read
+    /// exactly, as a [`Refusal::Database`]: one whose statements cannot
     /// hand rows over as arrays or INTEGERs as BigInts, or report their SQL;
     /// one whose node:sqlite skips a numbered parameter as it binds a call's
     /// values; one whose text encoding is not UTF-8; and one that reads a

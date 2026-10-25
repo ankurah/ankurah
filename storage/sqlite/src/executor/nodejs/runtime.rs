@@ -1,8 +1,8 @@
-//! Opening node:sqlite's `DatabaseSync` for `SqliteStorageEngine::open` and
+//! Opening node:sqlite's database for `SqliteStorageEngine::open` and
 //! `open_in_memory`, through Node.js's `process` global, with the busy
 //! timeout and the session settings of a native connection.
 
-use js_sys::{Array, Function, Reflect};
+use js_sys::{Array, Function, Object, Reflect};
 use wasm_bindgen::{JsCast, JsValue};
 
 use super::{exception::js_error, statement::database_method, NodeJsConnection};
@@ -29,7 +29,8 @@ const BUSY_TIMEOUT_PRAGMA: &str = "PRAGMA busy_timeout=5000;";
 
 impl NodeJsConnection {
     /// Open a database through Node.js's built-in module; `":memory:"` for an
-    /// in-memory one. Applies the session settings a native connection has.
+    /// in-memory one. Applies the session settings a native connection has,
+    /// with SQLite's defensive flag off, as it is natively.
     pub fn open(path: &str) -> Result<Self, SqliteError> {
         let process = nodejs_process()?;
         // Node.js has had `process.getBuiltinModule` since 22.3, before any
@@ -43,11 +44,25 @@ impl NodeJsConnection {
         if module.is_undefined() || module.is_null() {
             return Err(DatabaseRefusal::NoNodeSqlite { missing: "the `node:sqlite` module" }.into());
         }
-        let constructor: Function = Reflect::get(&module, &"DatabaseSync".into())
-            .map_err(js_error)?
+        // node:sqlite names its database class `Database` from Node.js
+        // 26.11.0, which keeps `DatabaseSync` as a deprecated alias of it
+        // (DEP0210), and `DatabaseSync` alone before.
+        let class = match Reflect::get(&module, &"Database".into()).map_err(js_error)? {
+            class if class.is_undefined() => Reflect::get(&module, &"DatabaseSync".into()).map_err(js_error)?,
+            class => class,
+        };
+        let constructor: Function = class
             .dyn_into()
-            .map_err(|_| DatabaseRefusal::NoNodeSqlite { missing: "`node:sqlite`'s `DatabaseSync` constructor" })?;
-        let database = Reflect::construct(&constructor, &Array::of1(&path.into())).map_err(js_error)?;
+            .map_err(|_| DatabaseRefusal::NoNodeSqlite { missing: "`node:sqlite`'s `Database` or `DatabaseSync` constructor" })?;
+        // SQLite's defensive flag, which node:sqlite turns on by default from
+        // Node.js 24.14.0 and 25.5.0, makes statements such as `PRAGMA
+        // writable_schema = ON` and `PRAGMA journal_mode = OFF` do nothing,
+        // where a native connection has it off. A release before the option,
+        // which came in 24.12.0 and 25.1.0, reads only the options it knows,
+        // as 22.20.0 and 24.7.0 do, and so ignores it.
+        let options = Object::new();
+        Reflect::set(&options, &"defensive".into(), &JsValue::FALSE).map_err(js_error)?;
+        let database = Reflect::construct(&constructor, &Array::of2(&path.into(), &options)).map_err(js_error)?;
         // The busy timeout comes before any other statement, as rusqlite sets
         // it at open, since from_database's checks already read the file.
         database_method(&database, "exec")?.call1(&database, &BUSY_TIMEOUT_PRAGMA.into()).map_err(js_error)?;

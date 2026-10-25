@@ -512,7 +512,8 @@ mod node_sqlite_tests {
 
     /// `holds_no_statement` holds of exactly what SQLite skips between
     /// statements on node:sqlite's SQLite too: SQL it holds of prepares there
-    /// to no statement, and any other SQL to a statement or an error.
+    /// to no statement, which node:sqlite refuses to prepare from Node.js
+    /// 26.8.0, and any other SQL to a statement or an error of another kind.
     #[wasm_bindgen_test]
     fn sql_holds_no_statement_where_node_sqlite_finds_none() {
         let construct = Function::new_no_args("return new (process.getBuiltinModule('node:sqlite').DatabaseSync)(':memory:');");
@@ -524,14 +525,19 @@ mod node_sqlite_tests {
         // holds every statement it prepares until it has closed the database.
         let mut statements = Vec::new();
         let mut prepares_to_no_statement = |sql: &str| match prepare.call1(&sqlite, &sql.into()) {
-            // node:sqlite hands SQL that holds no statement back as a statement
-            // already finalized, whose source cannot be read.
+            // Before Node.js 26.8.0, node:sqlite hands SQL that holds no
+            // statement back as a statement already finalized, whose source
+            // cannot be read.
             Ok(statement) => {
                 let finalized = Reflect::get(&statement, &"sourceSQL".into()).is_err();
                 statements.push(statement);
                 finalized
             }
-            Err(_) => false,
+            // From 26.8.0 it refuses such SQL with ERR_INVALID_ARG_VALUE: "The
+            // SQL query contains no statements."
+            Err(error) => {
+                Reflect::get(&error, &"code".into()).ok().and_then(|code| code.as_string()).as_deref() == Some("ERR_INVALID_ARG_VALUE")
+            }
         };
         for sql in NO_STATEMENT_CANDIDATES {
             assert_eq!(holds_no_statement(sql), prepares_to_no_statement(sql), "{sql:?}");
