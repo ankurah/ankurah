@@ -26,9 +26,7 @@ use crate::{
     storage::StorageEngine,
 };
 use ankql::ast::{Resolved, Selection};
-use ankurah_proto::{self as proto, state_sync::limits::MAX_PAGE_HEADS, KnownState, SpanAnswer, SpanQuestion};
-use anyhow::ensure;
-use std::collections::HashSet;
+use ankurah_proto::{self as proto, KnownState, SpanAnswer, SpanQuestion};
 
 /// Answer a requester's offer of `selection`'s result, which a Fetch or a
 /// SubscribeQuery carries: compare it with a snapshot of the resident that
@@ -107,9 +105,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    ensure!(entities.len() <= MAX_PAGE_HEADS, "too many entities to sync");
-    let mut named = HashSet::with_capacity(entities.len());
-    ensure!(entities.iter().all(|entity| named.insert(entity.entity_id)), "an entity to sync is named twice");
+    proto::EntityHead::validate_sync_request(&entities)?;
     let entities: Vec<_> =
         entities.into_iter().map(|entity| (entity.entity_id, (!entity.head.is_empty()).then_some(entity.head))).collect();
     let policy = ContextPolicy::from_credentials(&node.policy_agent, &credentials);

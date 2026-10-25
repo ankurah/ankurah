@@ -1,7 +1,7 @@
 use std::ops::Bound::{Excluded, Included, Unbounded};
 
 use ankurah_core_types::{IndexKeyPart, KeySpec, PropertyId, Value, ValueType};
-use ankurah_digest_tree::{leaf_address, CanonicalCodec};
+use ankurah_digest_tree::{leaf_address, CanonicalCodec, NodePrefix};
 
 use super::*;
 use crate::{Clock, EntityHead, EntityId, EventId, KeyedEntityHead, PackedHeads, TreeSpanDigest};
@@ -21,7 +21,7 @@ fn offer(spans: Vec<SpanContent>) -> KnownState { KnownState { spec: spec(), spa
 
 #[test]
 fn an_offer_holds_disjoint_spans_within_the_tree_and_each_entity_once() {
-    let tree = TreeSpan::under(&NodePrefix::root());
+    let tree = TreeSpan::all();
     let split = leaf_address(&[], id(100));
     let below = TreeSpan::new(tree.start.clone(), Excluded(split.clone()));
     let above = TreeSpan::new(Included(split), Unbounded);
@@ -51,7 +51,7 @@ fn an_offer_lists_each_entity_once_across_inventories() {
         let heads = vec![KeyedEntityHead { key, entity: EntityHead { entity_id: id(7), head: head(1) } }];
         SpanContent::Heads(TreeSpanInventory { bounds, heads: PackedHeads::try_from(heads).unwrap() })
     };
-    let tree = TreeSpan::under(&NodePrefix::root());
+    let tree = TreeSpan::all();
     let spans = vec![
         keyed(TreeSpan::new(tree.start.clone(), Excluded(split.clone())), key(1)),
         keyed(TreeSpan::new(Included(split), Unbounded), key(3)),
@@ -62,7 +62,7 @@ fn an_offer_lists_each_entity_once_across_inventories() {
 
 #[test]
 fn an_offer_counts_its_heads_across_inventories() {
-    let tree = TreeSpan::under(&NodePrefix::root());
+    let tree = TreeSpan::all();
     let split = leaf_address(&[], id(MAX_OFFER_HEADS as u16 / 2 + 1));
     let below = TreeSpan::new(tree.start.clone(), Excluded(split.clone()));
     let above = TreeSpan::new(Included(split), Unbounded);
@@ -178,4 +178,13 @@ fn span_answers_pair_one_to_one_with_their_questions() {
     assert!(SpanAnswer::validate_all(&answers[..1], &questions, &spec()).is_err(), "an answer missing");
     let swapped = [answers[1].clone(), answers[0].clone()];
     assert!(SpanAnswer::validate_all(&swapped, &questions, &spec()).is_err(), "answers out of their questions' order");
+}
+
+#[test]
+fn a_sync_request_names_at_most_a_page_of_entities_each_once() {
+    let entities = |ids: std::ops::Range<u16>| ids.map(|n| EntityHead { entity_id: id(n), head: head(1) }).collect::<Vec<_>>();
+    assert!(EntityHead::validate_sync_request(&entities(0..MAX_PAGE_HEADS as u16)).is_ok());
+    assert!(EntityHead::validate_sync_request(&entities(0..MAX_PAGE_HEADS as u16 + 1)).is_err(), "more than a page");
+    let twice = [entities(0..2), entities(1..2)].concat();
+    assert!(EntityHead::validate_sync_request(&twice).is_err(), "an entity named twice");
 }

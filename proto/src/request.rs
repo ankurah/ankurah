@@ -260,10 +260,10 @@ impl std::fmt::Display for NodeRequestBody {
                 write!(f, "GetEvents {}", event_ids.iter().map(|id| id.to_base64_short()).collect::<Vec<_>>().join(", "),)
             }
             NodeRequestBody::Fetch { selection: query, known_state } => {
-                write!(f, "Fetch {query} known spans:{}", known_state.spans.len())
+                write!(f, "Fetch {query} known {known_state}")
             }
             NodeRequestBody::SubscribeQuery { query_id, selection: query, version, known_state } => {
-                write!(f, "Subscribe {query_id} {query} v{version} known spans:{}", known_state.spans.len())
+                write!(f, "Subscribe {query_id} {query} v{version} known {known_state}")
             }
             NodeRequestBody::CompareSpans { selection: query, questions, .. } => {
                 write!(f, "CompareSpans {query} questions:{}", questions.len())
@@ -281,7 +281,7 @@ impl std::fmt::Display for NodeResponseBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NodeResponseBody::CommitComplete { id } => write!(f, "CommitComplete {id}"),
-            NodeResponseBody::Fetch(target) => write!(f, "Fetch target spans:{}", target.spans.len()),
+            NodeResponseBody::Fetch(target) => write!(f, "Fetch target {target}"),
             NodeResponseBody::Get(states) => {
                 write!(f, "Get [{}]", states.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", "))
             }
@@ -289,7 +289,7 @@ impl std::fmt::Display for NodeResponseBody {
                 write!(f, "GetEvents [{}]", events.iter().map(|e| e.payload.to_string()).collect::<Vec<_>>().join(", "))
             }
             NodeResponseBody::QuerySubscribed { query_id, target } => {
-                write!(f, "Subscribed {query_id} target spans:{}", target.spans.len())
+                write!(f, "Subscribed {query_id} target {target}")
             }
             NodeResponseBody::SpansCompared { answers } => write!(f, "SpansCompared answers:{}", answers.len()),
             NodeResponseBody::EntitiesSynced { held, unavailable } => {

@@ -4,7 +4,9 @@
 use super::*;
 use crate::node::state_sync::fixtures::*;
 use ankurah_core_types::{IndexKeyPart, KeySpec, ValueType};
-use ankurah_proto::{EntityHead, KeyedEntityHead, PackedHeads, SpanContent, TreeSpan, TreeSpanInventory};
+use ankurah_proto::{
+    state_sync::limits::MAX_PAGE_HEADS, EntityHead, KeyedEntityHead, PackedHeads, SpanContent, TreeSpan, TreeSpanInventory,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The entity-id offer of [`members`] that lists `heads`.
