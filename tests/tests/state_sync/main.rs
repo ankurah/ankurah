@@ -4,14 +4,29 @@
 //! and the client repairs what is lost.
 
 mod busy;
+mod catchup;
 #[path = "../common.rs"]
 mod common;
+mod credentials;
 mod fetch;
+mod large;
+mod limits;
 mod live;
 mod loss;
 mod offline_edits;
+mod pushes;
+mod readiness;
+mod reconnect;
+mod sharing;
+mod wire;
 
 use common::*;
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+use wire::*;
 
 type Sled = Node<SledStorageEngine, PermissiveAgent>;
 
@@ -48,18 +63,39 @@ async fn create_pets(context: &Context, age: &str, names: impl IntoIterator<Item
     Ok(ids)
 }
 
-/// Whether `message` is an update that pushes `entity`.
-fn pushes(message: &proto::NodeMessage, entity: EntityId) -> bool {
-    match message {
-        proto::NodeMessage::Update(update) => {
-            let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
-            items.iter().any(|item| item.entity_id == entity)
-        }
-        _ => false,
-    }
-}
-
 fn sorted(mut ids: Vec<EntityId>) -> Vec<EntityId> {
     ids.sort();
     ids
+}
+
+/// The head `node` holds of each of `ids`.
+async fn heads(node: &Sled, ids: &[EntityId]) -> anyhow::Result<BTreeMap<EntityId, proto::Clock>> {
+    let mut heads = BTreeMap::new();
+    for id in ids {
+        heads.insert(*id, node.storage.get_state(*id).await?.payload.state.head);
+    }
+    Ok(heads)
+}
+
+/// Wait until `node` stores each entity in `heads` at the head beside it.
+async fn wait_for_heads(node: &Sled, heads: &BTreeMap<EntityId, proto::Clock>) -> anyhow::Result<()> {
+    let ids: Vec<_> = heads.keys().copied().collect();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while self::heads(node, &ids).await.ok().as_ref() != Some(heads) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("the node stores {heads:?}"))
+}
+
+/// Wait until `condition` holds, failing with `what` after ten seconds.
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let held = tokio::time::timeout(Duration::from_secs(10), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(held.is_ok(), "{what}");
 }
