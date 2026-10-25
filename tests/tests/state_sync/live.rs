@@ -1,8 +1,15 @@
-//! Live queries: readiness before the first result, and the subscription's
-//! own updates once ready.
+//! Live queries: readiness before the first result, the subscription's own
+//! updates once ready, and a sync that stops once its query is dropped.
 
 use super::*;
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
 
 /// Wait until `query`'s members are `expected`.
 async fn members(query: &LiveQuery<PetView>, expected: &[EntityId]) {
@@ -52,5 +59,49 @@ async fn a_limited_live_query_fills_the_gap_a_departure_leaves() -> anyhow::Resu
     })
     .await;
     assert!(filled.is_ok(), "the gap filled with the next album: {:?}", years(&query));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dropped_live_query_stops_syncing_at_its_next_wake() -> anyhow::Result<()> {
+    // Once the pet exists the server's pushes never arrive, so a subscribe's
+    // sync waits for the pet, and on waking idle it would ask for it again.
+    let pet: Arc<Mutex<Option<EntityId>>> = Arc::default();
+    let subscribed: Arc<Mutex<HashSet<proto::QueryId>>> = Arc::default();
+    let asked_again = Arc::new(AtomicBool::new(false));
+    let (server, client, _connection, _gate) = {
+        let (pet, subscribed, asked_again) = (pet.clone(), subscribed.clone(), asked_again.clone());
+        gated(move |message| {
+            let Some(pet) = *pet.lock().unwrap() else { return false };
+            if let proto::NodeMessage::Response(response) = message {
+                match &response.body {
+                    proto::NodeResponseBody::QuerySubscribed { query_id, .. } => {
+                        subscribed.lock().unwrap().insert(*query_id);
+                    }
+                    proto::NodeResponseBody::EntitiesSynced { held, .. } if held.iter().any(|entity| entity.entity_id == pet) => {
+                        asked_again.store(true, Ordering::SeqCst)
+                    }
+                    _ => {}
+                }
+            }
+            matches!(message, proto::NodeMessage::Update(_))
+        })
+        .await?
+    };
+    let (server, client) = (server.context_async(DEFAULT_CONTEXT).await?, client.context_async(DEFAULT_CONTEXT).await?);
+    *pet.lock().unwrap() = Some(create_pets(&server, "1", ["withheld".to_string()]).await?[0]);
+
+    let query = client.query::<PetView>(nocache("age = '1'")?)?;
+    let answered = tokio::time::timeout(Duration::from_secs(5), async {
+        while !subscribed.lock().unwrap().contains(&query.query_id()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(answered.is_ok(), "the server answered the subscribe");
+    drop(query);
+    // Past the first idle second, when a sync still running asks for the pet again.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert!(!asked_again.load(Ordering::SeqCst), "the dropped query's sync stops at its next wake, without asking for the pet again");
     Ok(())
 }

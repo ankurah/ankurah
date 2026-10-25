@@ -6,7 +6,9 @@ use anyhow::anyhow;
 use async_trait::async_trait;
 use proto::EntityId;
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, OnceLock, Weak};
+use std::task::Poll;
 use tracing::{debug, warn};
 
 use crate::error::{NodeDropped, RequestError, RetrievalError};
@@ -254,9 +256,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                 // Send the updated predicate to the peer, under the
                 // credentials current at send time.
-                match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version).await {
-                    _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
-                    Ok(synced) => {
+                match until_canceled(&cancel, node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version)).await {
+                    None => debug!("Stopped the superseded sync of predicate {}", query_id),
+                    Some(_) if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
+                    Some(Ok(synced)) => {
                         // The local copy is ready, now activate the livequery
                         if let Some(lq) = livequery {
                             lq.subscription_established(version).await;
@@ -272,7 +275,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                         }
                         debug!("Successfully updated predicate {} on peer {} subscription", query_id, peer_id);
                     }
-                    Err(e) => {
+                    Some(Err(e)) => {
                         // Handle error with retry logic
                         me.handle_error(query_id, peer_id, e, &cancel);
                     }
@@ -448,9 +451,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
         // Call remote_subscribe, which offers the local copy, subscribes, and returns once the copy is ready
-        match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version).await {
-            _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
-            Ok(synced) => {
+        match until_canceled(&cancel, node.remote_subscribe(target_peer, query_id, predicate, cdatas, version)).await {
+            None => debug!("Stopped the superseded sync of predicate {}", query_id),
+            Some(_) if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
+            Some(Ok(synced)) => {
                 // The local copy is ready, now activate the livequery
                 // The livequery handles its own errors internally
                 if let Some(lq) = livequery {
@@ -467,7 +471,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 }
                 debug!("Successfully registered predicate {} on peer {} subscription", query_id, target_peer);
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 // Handle error with retry logic
                 self.handle_error(query_id, target_peer, e, &cancel);
             }
@@ -527,8 +531,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             })
         };
         let Some((peer, content, synced, confirm, cancel)) = started else { return };
-        match node.check_query(peer, content.selection.clone(), content.sessions.current(), synced, confirm).await {
-            Ok(outcome) => {
+        match until_canceled(&cancel, node.check_query(peer, content.selection.clone(), content.sessions.current(), synced, confirm)).await
+        {
+            None => debug!("Stopped the superseded check of predicate {}", query_id),
+            Some(Ok(outcome)) => {
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                 if !cancel.canceled() {
                     if let Some(check) = subscriptions.get_mut(&query_id).and_then(|state| state.check.as_mut()) {
@@ -536,7 +542,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     }
                 }
             }
-            Err(error) => self.handle_error(query_id, peer, error, &cancel),
+            Some(Err(error)) => self.handle_error(query_id, peer, error, &cancel),
         }
     }
 
@@ -599,6 +605,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             }
         }
     }
+}
+
+/// Run `sync` to its end, unless it wakes to find `cancel` canceled, when it
+/// stops there: a superseded attempt's sync would otherwise run on until ready
+/// or stalled, only for its result to be ignored.
+async fn until_canceled<T>(cancel: &CancelFlag, sync: impl Future<Output = T>) -> Option<T> {
+    let mut sync = std::pin::pin!(sync);
+    std::future::poll_fn(|cx| if cancel.canceled() { Poll::Ready(None) } else { sync.as_mut().poll(cx).map(Some) }).await
 }
 
 /// Trait for communicating with remote peers (abstraction over WeakNode for testing)
