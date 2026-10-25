@@ -91,6 +91,34 @@ async fn catalog_churn_bounds_admission_retries_and_a_later_admission_recovers()
 }
 
 #[tokio::test]
+async fn a_comparisons_snapshot_outlasts_churn_that_exhausts_one_snapshots_retries() -> anyhow::Result<()> {
+    let node = node().await?;
+    let initial = genesis("01")?;
+    apply(&node, &initial).await?;
+    let scans = node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed);
+    let (mut entered, mut release) = hold_fetch(&node);
+    let admission = node.resident_trees.snapshot_through_changes(&node, selection(None), None, vec![DEFAULT_CONTEXT]);
+    tokio::pin!(admission);
+    // The same churn that exhausts a single snapshot's retry above.
+    for attempt in 0..2 {
+        assert!(futures::poll!(&mut admission).is_pending());
+        entered.await?;
+        add_catalog_model(&node, &format!("comparison_churn_{attempt}")).await?;
+        if attempt == 1 {
+            release.send(()).unwrap();
+            break;
+        }
+        let next = hold_fetch(&node);
+        release.send(()).unwrap();
+        (entered, release) = next;
+    }
+    let admitted = admission.await?;
+    assert!(admitted.snapshot.entries.contains_key(&initial.entity_id), "the snapshot after the churn admits the member");
+    assert_eq!(node.storage.fetches.load(std::sync::atomic::Ordering::Relaxed) - scans, 3, "one more admission, once the churn stopped");
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_change_invalidates_an_existing_source_with_a_retryable_error() -> anyhow::Result<()> {
     let node = node().await?;
     let selected = selection(None);

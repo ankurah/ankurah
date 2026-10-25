@@ -153,6 +153,22 @@ async fn disconnect_releases_pending_requests() {
 }
 
 #[tokio::test]
+async fn a_request_whose_waiter_gives_up_frees_its_response_slot() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let peer = proto::EntityId::random();
+    let (sent, _messages) = std::sync::mpsc::channel();
+    node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await.unwrap();
+    let mut request = Box::pin(node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] }));
+    assert!(futures::poll!(&mut request).is_pending());
+    let connection = node.peer_connections.get(&peer).unwrap();
+    assert_eq!(connection.pending_requests.len(), 1);
+
+    // As a comparison request does when its timeout passes.
+    drop(request);
+    assert_eq!(connection.pending_requests.len(), 0, "a peer that never answers keeps nothing waiting");
+}
+
+#[tokio::test]
 async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());

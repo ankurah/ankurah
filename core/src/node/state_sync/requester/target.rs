@@ -106,8 +106,9 @@ impl Target {
         Region::Listed { bounds: inventory.bounds, entities }
     }
 
-    /// Settle `bounds`, a span within a region not learned yet, as `region`.
-    /// What the old region held beyond `bounds` is not learned yet either.
+    /// Settle `region`'s bounds, a span within regions not learned yet, as
+    /// `region`. What those regions covered beyond its bounds is not learned
+    /// yet either.
     pub(super) fn settle(&mut self, region: Region) {
         let bounds = region.bounds().clone();
         let mut regions = Vec::with_capacity(self.regions.len() + 2);

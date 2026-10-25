@@ -500,9 +500,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     fn run_due_checks(&self) {
         let now = Instant::now();
         let due: Vec<_> = {
-            let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             subscriptions
-                .iter_mut()
+                .iter()
                 .filter(|(_, state)| state.check.as_ref().is_some_and(|check| check.is_due(now)))
                 .map(|(id, _)| *id)
                 .collect()
