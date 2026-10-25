@@ -1,36 +1,34 @@
 //! Comparing a requester's account of its query result with a snapshot of the
-//! responder's: which entities the requester lacks or holds at another head,
-//! and which of its digest spans differ.
+//! responder's: which entities the requester lacks or holds at another head.
 
 #[cfg(test)]
 mod tests;
 
 use crate::node::state_sync::Snapshot;
 use ankurah_digest_tree::{leaf_address, Digest};
-use ankurah_proto::{Clock, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory};
+use ankurah_proto::{Clock, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanInventory};
 use anyhow::ensure;
 use std::{
     collections::{BTreeMap, HashMap},
     ops::Bound,
 };
 
-/// How a requester's offer differs from a snapshot of the responder's result.
+/// How a requester's offer differs from a snapshot of the responder's result,
+/// where the offer says which entities it holds.
 #[derive(Debug, Default)]
 pub(crate) struct OfferComparison {
     /// The entities the responder sends the requester's copy toward, each with
     /// the head the offer listed for it: every snapshot member in a range the
     /// offer left unknown or described as empty, every member an inventory
     /// lists at another head or not at all, and every entity an inventory lists
-    /// that the snapshot no longer holds.
+    /// that the snapshot no longer holds. A nonempty digest names no entities,
+    /// so the requester compares the responder's account over it itself.
     pub(crate) lacking: Vec<(EntityId, Option<Clock>)>,
-    /// The offer's digest spans whose digest differs from the snapshot's, as
-    /// the snapshot digests them. A descent over them finds the rest.
-    pub(crate) differing: Vec<TreeSpanDigest>,
 }
 
 impl OfferComparison {
     /// Compare `known`, an offer under the snapshot's spec, with `snapshot`.
-    pub(crate) async fn new(snapshot: &mut Snapshot, known: KnownState) -> anyhow::Result<Self> {
+    pub(crate) fn new(snapshot: &Snapshot, known: KnownState) -> anyhow::Result<Self> {
         ensure!(known.spec == snapshot.spec, "unsupported comparison tree spec");
         known.validate()?;
         let mut spans = known.spans;
@@ -47,46 +45,23 @@ impl OfferComparison {
             }
         }
         let mut comparison = Self::default();
-        let mut digests = Vec::new();
-        // Whether the offer's digests alone cover every address so far.
-        let mut tiled = true;
         let mut start = TreeSpan::all().start;
         for span in spans {
             let bounds = span.bounds();
             if start != bounds.start {
-                tiled = false;
                 comparison.lack_all(snapshot, &TreeSpan::new(start, opposite(&bounds.start)), &known_heads);
             }
             start = opposite(&bounds.end);
             match span {
-                SpanContent::Digest(digest) => digests.push(digest),
-                SpanContent::Heads(inventory) => {
-                    tiled = false;
-                    comparison.diff(snapshot, &inventory, &known_heads);
+                SpanContent::Digest(digest) if digest.digest == Digest::empty() => {
+                    comparison.lack_all(snapshot, &digest.bounds, &known_heads)
                 }
+                SpanContent::Digest(_) => {}
+                SpanContent::Heads(inventory) => comparison.diff(snapshot, &inventory, &known_heads),
             }
         }
         if !matches!(start, Bound::Unbounded) {
-            tiled = false;
             comparison.lack_all(snapshot, &TreeSpan::new(start, TreeSpan::all().end), &known_heads);
-        }
-        // Digests that cover the tree and sum to its root settle the whole offer
-        // with one digest read.
-        if tiled
-            && digests.len() > 1
-            && Digest::checked_sum(digests.iter().map(|known| known.digest))? == snapshot.span_digest(TreeSpan::all()).await?.digest
-        {
-            return Ok(comparison);
-        }
-        for known in digests {
-            if known.digest == Digest::empty() {
-                comparison.lack_all(snapshot, &known.bounds, &known_heads);
-                continue;
-            }
-            let local = snapshot.span_digest(known.bounds).await?;
-            if local.digest != known.digest {
-                comparison.differing.push(local);
-            }
         }
         Ok(comparison)
     }

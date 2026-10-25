@@ -28,15 +28,15 @@
 //!   client LiveQuery change notification firing, over a LocalProcessConnection.
 //! - `fresh_fetch_snapshot`: wall time for a FRESH client's first fetch of an
 //!   entity whose server-side history is 100 / 1000 / 5000 events deep. A fresh
-//!   fetch sends empty known_matches, so the server answers with a full
-//!   StateSnapshot (generate_entity_delta Case 3), never an EventBridge: depth
+//!   fetch offers an empty account, so the server pushes the full state, with
+//!   no head to bridge from (generate_entity_delta Case 3): depth
 //!   affects only the excluded setup, and the measured region is snapshot
 //!   adoption. A lane guard asserts no events were committed locally.
 //! - `bridge_catchup`: the TRUE EventBridge lane, via the stale-client shape
 //!   (the only shape that produces DeltaContent::EventBridge): the client
 //!   fetches once so it holds the entity at a stale head, disconnects, the
 //!   server advances by GAP edits (100 / 1000 / 5000), then the client
-//!   reconnects and re-fetches. known_matches carries the stale head, the
+//!   reconnects and re-fetches. The re-fetch's offer lists the stale head, the
 //!   server builds the bridge from stale head to current
 //!   (generate_entity_delta Case 2), and the client applies GAP events through
 //!   the bridge arm. A lane guard asserts the client committed the gap events
@@ -233,8 +233,8 @@ fn futures_noop_poll<F: std::future::Future>(fut: &mut std::pin::Pin<&mut F>) ->
 /// `depth` events deep. The server and all history are built OUTSIDE the timed
 /// region; the measured region is the client's fetch.
 ///
-/// LANE: a fresh client sends EMPTY known_matches, so the server answers with a
-/// full StateSnapshot (generate_entity_delta Case 3), never an EventBridge. The
+/// LANE: a fresh client offers an EMPTY account, so the server pushes the full
+/// state, with no head to bridge from (generate_entity_delta Case 3). The
 /// history depth therefore affects only the excluded setup; the measured region
 /// is one final-state snapshot adoption and is expected to be roughly FLAT in
 /// depth. This is still a useful number (fresh-client first-fetch latency), but
@@ -305,8 +305,8 @@ fn bench_fresh_fetch_snapshot(c: &mut Criterion) {
 
 /// Time a STALE client catching up an entity the server advanced by `gap`
 /// events while the client was disconnected. This is the only shape that
-/// produces `DeltaContent::EventBridge`: the re-fetch's known_matches carries
-/// the client's stale head, the server builds the bridge from stale head to
+/// produces `DeltaContent::EventBridge`: the re-fetch's offer lists the
+/// client's stale head, the server builds the bridge from stale head to
 /// current head (generate_entity_delta Case 2), and the client applies the gap
 /// events through the bridge arm.
 ///
@@ -354,8 +354,8 @@ fn bench_bridge_catchup(c: &mut Criterion) {
                         let client_ctx = client.context_async(CTX).await.unwrap();
 
                         // First fetch: persists the entity locally at the current
-                        // head (snapshot-served; apply_deltas runs before fetch
-                        // returns, so the head is durable on the client here).
+                        // head (snapshot-served; the fetch returns once its
+                        // pushes have applied, so the head is durable on the client here).
                         let first = client_ctx.fetch::<DocView>("title = 'chain'").await.unwrap();
                         assert_eq!(first.len(), 1, "client must hold the entity before going stale");
 

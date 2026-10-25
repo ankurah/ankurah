@@ -216,6 +216,14 @@ pub struct ScopeProbe {
     pub body: String,
 }
 
+/// Whether `message` updates one of the client's standing queries: its items
+/// carry their queries' relevance, which the data a Fetch has pushed does not.
+fn updates_standing_queries(message: &proto::NodeMessage) -> bool {
+    let proto::NodeMessage::Update(update) = message else { return false };
+    let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
+    items.iter().any(|item| !item.predicate_relevance.is_empty())
+}
+
 /// Registration and preflight allow first use before catalog or policy subscription updates arrive.
 #[tokio::test]
 async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> {
@@ -277,7 +285,7 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
             let held = held.clone();
             tokio::spawn(async move {
                 while let Some(message) = client_rx.recv().await {
-                    if matches!(&message, proto::NodeMessage::Update(_)) {
+                    if updates_standing_queries(&message) {
                         if let Some(held) = held.lock().unwrap().as_mut() {
                             held.push(message);
                             continue;

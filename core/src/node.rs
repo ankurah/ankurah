@@ -43,8 +43,6 @@ mod match_args;
 mod peer_state;
 mod schema_registration;
 mod state;
-// Fetch and SubscribeQuery do not compare known state with these trees yet.
-#[allow(dead_code)]
 pub(crate) mod state_sync;
 #[cfg(test)]
 mod tests;
@@ -105,7 +103,6 @@ where PA: PolicyAgent
     pub(crate) entities: WeakEntitySet,
     /// The node's one LRU of resident digest trees, which every comparison of a
     /// query result with a peer reads.
-    #[allow(dead_code)]
     pub(crate) resident_trees: state_sync::ResidentTrees<PA::ContextData>,
     peer_connections: SafeMap<proto::EntityId, Arc<PeerState<PA::ContextData>>>,
     durable_peers: SafeSet<proto::EntityId>,

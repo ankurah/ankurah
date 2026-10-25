@@ -57,7 +57,7 @@ where
         }
     };
     let mut snapshot = node.resident_trees.snapshot_through_changes(node, selection, Some(spec), credentials.clone()).await?.snapshot;
-    let comparison = OfferComparison::new(&mut snapshot, known).await?;
+    let comparison = OfferComparison::new(&snapshot, known)?;
     let target = snapshot.offer().await?;
     // The push reads current states, never the snapshot: holding it would copy
     // the resident's entries at its next commit.

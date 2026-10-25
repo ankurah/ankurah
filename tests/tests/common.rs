@@ -92,6 +92,10 @@ pub struct MessageGate {
 }
 
 impl MessageGate {
+    /// How many messages the gate holds.
+    #[allow(unused)]
+    pub fn held(&self) -> usize { self.held.lock().unwrap().len() }
+
     /// Take every held message out of the gate without delivering it, as if
     /// the connection had lost them.
     #[allow(unused)]
