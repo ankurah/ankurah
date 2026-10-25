@@ -104,6 +104,64 @@ async fn state_read_hook_filters_fetch_cache_and_live_updates() -> Result<()> {
     Ok(())
 }
 
+/// A responder sends nothing the read policy hides: SyncEntities reports a
+/// hidden entity unavailable, and a Fetch whose offer still lists it finds it
+/// gone from the result; neither pushes it.
+#[tokio::test]
+async fn a_responder_pushes_nothing_the_read_policy_hides() -> Result<()> {
+    let agent = BridgePolicyAgent::new();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    // Updates for the client stay in the gate, so the test reads what each request pushed.
+    let (_conn, gate) = GatedConnection::new(&server, &client, |message| matches!(message, proto::NodeMessage::Update(_))).await;
+    client.system.wait_system_ready().await?;
+    let context = server.context_async(DEFAULT_CONTEXT).await?;
+    let trx = context.begin();
+    let hidden = trx.create(&Pet { name: "Hidden".into(), age: "3".into() }).await?.id();
+    let visible = trx.create(&Pet { name: "Visible".into(), age: "4".into() }).await?.id();
+    trx.commit().await?;
+    let head = server.storage.get_state(hidden).await?.payload.state.head;
+    agent.deny_read_states.lock().unwrap().insert(hidden);
+    let selection: ankql::ast::Selection<ankql::ast::Resolved> = Predicate::MemberOf(context.resolve_model_id::<Pet>().await?).into();
+
+    let entities = vec![proto::EntityHead { entity_id: hidden, head: proto::Clock::default() }];
+    match client
+        .request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::SyncEntities { selection: selection.clone(), entities })
+        .await?
+    {
+        proto::NodeResponseBody::EntitiesSynced { held, unavailable } => assert!(held.is_empty() && unavailable == [hidden]),
+        response => panic!("{response:?}"),
+    }
+
+    let listed = proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id: hidden, head } };
+    let inventory = proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: proto::PackedHeads::try_from(vec![listed])? };
+    let known_state = proto::KnownState { spec: empty_offer(&selection).spec, spans: vec![proto::SpanContent::Heads(inventory)] };
+    let response = client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::Fetch { selection, known_state }).await?;
+    assert!(matches!(response, proto::NodeResponseBody::Fetch(_)), "{response:?}");
+    let pushed = pushed_until(&gate, visible).await;
+    assert!(!pushed.contains(&hidden), "neither request pushed the hidden pet");
+    Ok(())
+}
+
+/// The entities of the updates the gate holds, gathered until one carries `until`.
+async fn pushed_until(gate: &common::MessageGate, until: proto::EntityId) -> HashSet<proto::EntityId> {
+    let mut pushed = HashSet::new();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while !pushed.contains(&until) {
+            for message in gate.take_held() {
+                let proto::NodeMessage::Update(update) = message else { continue };
+                let proto::NodeUpdateBody::SubscriptionUpdate { items } = update.body;
+                pushed.extend(items.iter().map(|item| item.entity_id));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the server pushes the visible pet");
+    pushed
+}
+
 /// Counts received-event validation and allows tests to deny all reads or selected events.
 #[derive(Clone)]
 struct BridgePolicyAgent {
