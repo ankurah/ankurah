@@ -198,7 +198,11 @@ async fn a_json_parameter_binds_as_its_text() -> Result<()> {
 /// a query, in a scalar subquery there, or in an EXISTS, is refused on
 /// Node.js before it runs, where rusqlite reads its values exactly. Selected
 /// from a materialized CTE, from a subquery or CTE that SQLite does not
-/// flatten, or in an IN, it reads the same on every driver.
+/// flatten, or in an IN, it reads the same on every driver. A VALUES of more
+/// than one row is refused as a compound, and also in a subquery that SQLite
+/// does not flatten, and in an IN, where SQLite natively reads its rows with
+/// no affinity; a VALUES of one row is no compound, and an INSERT of several
+/// rows runs through `execute`, which reads no rows.
 /// `refuse_a_compound_select`, in the Node.js executor, says why.
 #[engine_test]
 async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
@@ -208,12 +212,16 @@ async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
         values
     }
     let storage = common::open_in_memory().await?;
-    let (refused, same) = storage
+    let (refused, same, inserted) = storage
         .with_executor(|executor| {
             executor.execute("CREATE TABLE reals (r REAL)", &[])?;
             executor.execute("INSERT INTO reals VALUES (1.5)", &[])?;
             executor.execute("CREATE TABLE integers (i INTEGER)", &[])?;
             executor.execute("INSERT INTO integers VALUES (9007199254740993)", &[])?;
+            executor.execute("CREATE TABLE inserted (v)", &[])?;
+            let inserted = executor
+                .execute("INSERT INTO inserted VALUES (9007199254740993), (CAST(2 AS REAL))", &[])
+                .map_err(|error| error.to_string());
             // Each statement Node.js refuses, with the values rusqlite reads.
             static EXACT: [&str; 2] = ["Integer(9007199254740993)", "Real(1.5)"];
             let refused = [
@@ -226,8 +234,19 @@ async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
                 ("SELECT (SELECT i FROM integers UNION ALL SELECT r FROM reals)", &EXACT[..1]),
                 ("SELECT (SELECT (SELECT i FROM integers UNION ALL SELECT r FROM reals))", &EXACT[..1]),
                 ("SELECT EXISTS (SELECT i FROM integers UNION ALL SELECT r FROM reals)", &["Integer(1)"][..]),
+                // SQLite codes these as a co-routine yielding the rows.
+                ("VALUES (9007199254740993), (CAST(2 AS REAL))", &["Integer(9007199254740993)", "Real(2.0)"][..]),
+                ("SELECT (VALUES (9007199254740993), (CAST(2 AS REAL)))", &["Integer(9007199254740993)"][..]),
+                (
+                    "SELECT * FROM (SELECT DISTINCT column1 FROM (VALUES (9007199254740993), (CAST(2 AS REAL))))",
+                    &["Integer(9007199254740993)", "Real(2.0)"][..],
+                ),
+                ("SELECT 9007199254740993 IN (VALUES (9007199254740992), (CAST(2 AS REAL)))", &["Integer(0)"][..]),
+                // SQLite codes these as a compound, since the statement has a WITH clause.
+                ("WITH a AS (SELECT 1) VALUES (9007199254740993), (CAST(2 AS REAL))", &["Integer(9007199254740993)", "Real(2.0)"][..]),
+                ("WITH a AS (SELECT 1) SELECT (VALUES (9007199254740993), (CAST(2 AS REAL)))", &["Integer(9007199254740993)"][..]),
             ]
-            .map(|(sql, native)| (executor.query(sql, &[]).map(values).map_err(|error| error.refusal()), native));
+            .map(|(sql, native)| (sql, executor.query(sql, &[]).map(values).map_err(|error| error.refusal()), native));
             // Each statement every driver reads, with the values it reads.
             static ROUNDED: [&str; 2] = ["Real(1.5)", "Real(9007199254740992.0)"];
             let same = [
@@ -238,20 +257,32 @@ async fn a_compound_select_reads_exactly_or_is_refused() -> Result<()> {
                 ("WITH x AS (SELECT r FROM reals UNION ALL SELECT i FROM integers) SELECT * FROM x", &ROUNDED[..]),
                 ("SELECT v FROM (SELECT (SELECT i FROM integers UNION ALL SELECT r FROM reals) AS v)", &ROUNDED[1..]),
                 ("SELECT 9007199254740993 IN (SELECT r FROM reals UNION ALL SELECT i FROM integers)", &["Integer(1)"][..]),
+                ("VALUES (9007199254740993)", &["Integer(9007199254740993)"][..]),
+                (
+                    "WITH x AS MATERIALIZED (VALUES (9007199254740993), (CAST(2 AS REAL))) SELECT * FROM x",
+                    &["Real(2.0)", "Real(9007199254740992.0)"][..],
+                ),
+                // A compound natively too, since the statement has a WITH clause.
+                (
+                    "WITH a AS (SELECT 1) SELECT * FROM (SELECT DISTINCT column1 FROM (VALUES (9007199254740993), (CAST(2 AS REAL))))",
+                    &["Real(2.0)", "Real(9007199254740992.0)"][..],
+                ),
+                ("SELECT v FROM inserted", &["Integer(9007199254740993)", "Real(2.0)"][..]),
             ]
             .map(|(sql, expected)| (sql, executor.query(sql, &[]).map(values), expected));
-            Ok((refused, same))
+            Ok((refused, same, inserted))
         })
         .await?;
-    for (read, native) in refused {
+    for (sql, read, native) in refused {
         if cfg!(target_arch = "wasm32") {
-            assert_eq!(read, Err(Some(Refusal::CompoundSelect)), "Node.js refuses the compound SELECT");
+            assert_eq!(read, Err(Some(Refusal::CompoundSelect)), "Node.js refuses the compound SELECT: {sql}");
         } else {
-            assert_eq!(read.expect("rusqlite reads a compound SELECT directly"), native);
+            assert_eq!(read.expect("rusqlite reads a compound SELECT directly"), native, "{sql}");
         }
     }
     for (sql, read, expected) in same {
         assert_eq!(read?, expected, "{sql}");
     }
+    assert_eq!(inserted, Ok(2), "an INSERT of two rows runs through `execute`");
     Ok(())
 }

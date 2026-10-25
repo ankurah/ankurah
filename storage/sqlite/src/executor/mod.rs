@@ -79,12 +79,14 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 /// - A compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the top
 ///   level of a query, or in a scalar subquery there, is refused before it
 ///   runs ([`Refusal::CompoundSelect`]), since the typed reader could read
-///   one of its INTEGERs as a REAL. Selected as
-///   `WITH x AS MATERIALIZED (…) SELECT * FROM x`, a compound SELECT reads
-///   the same on every driver, and no statement of the engine's own holds
-///   one. The Node.js executor's `refuse_a_compound_select` says which
-///   other compounds it lets through, and which it refuses though they read
-///   the same everywhere.
+///   one of its INTEGERs as a REAL. So is a VALUES of more than one row, a
+///   compound of its rows, there and, unless SQLite runs it as a compound
+///   natively too, wherever else it stands, an IN included. Selected as
+///   `WITH x AS MATERIALIZED (…) SELECT * FROM x`, either reads the same on
+///   every driver, and no statement of the engine's own holds one. The
+///   Node.js executor's `refuse_a_compound_select` says which other
+///   compounds it lets through, and which it refuses though they read the
+///   same everywhere.
 /// - A statement with a named parameter (`:a`, `@a`, `#a` or `$a`) is
 ///   refused before it runs ([`Refusal::NamedParameter`]). rusqlite binds a
 ///   call's values to named and positional parameters alike, in order, but

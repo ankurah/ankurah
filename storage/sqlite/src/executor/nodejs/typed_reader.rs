@@ -123,6 +123,16 @@ impl NodeJsConnection {
     /// compound as a COMPOUND QUERY, or as a MERGE when SQLite codes it as a
     /// merge of its SELECTs, as it does under an ORDER BY and, in SQLite
     /// 3.53, for UNION, INTERSECT and EXCEPT.
+    ///
+    /// A VALUES of more than one row is a compound of its rows (UNION ALL).
+    /// Where SQLite codes it so, as it does in a statement with a WITH
+    /// clause, it is refused where another compound is. Elsewhere SQLite
+    /// codes it as a co-routine yielding its rows, which take no affinity
+    /// wherever the VALUES stands, but nested in the typed reader's WITH
+    /// clause it is coded as a compound, whose rows take one: in a subquery
+    /// that SQLite does not flatten, and in an IN too, where the affinity
+    /// changes which values compare equal. So a VALUES coded as a co-routine
+    /// is refused wherever it stands.
     pub(super) fn refuse_a_compound_select(&self, statement: &str, params: &[SqliteValueRef<'_>]) -> Result<(), SqliteError> {
         // Each step of the plan is id, parent, notused, detail. better-sqlite3
         // plans a statement only with its parameters bound.
@@ -149,10 +159,31 @@ impl NodeJsConnection {
                 break;
             }
         }
-        let compound = |detail: &String| detail == "COMPOUND QUERY" || detail.starts_with("MERGE (");
-        if steps.iter().any(|(_, parent, detail)| top_level.contains(parent) && compound(detail)) {
+        let compound = |detail: &String| detail == "COMPOUND QUERY" || detail.starts_with("MERGE (") || values_as_a_compound(detail);
+        if steps.iter().any(|(_, parent, detail)| (top_level.contains(parent) && compound(detail)) || values_as_a_co_routine(detail)) {
             return Err(Refusal::CompoundSelect.into());
         }
         Ok(())
     }
+}
+
+/// Whether a step of a query plan reads a VALUES of more than one row that
+/// SQLite codes as a compound of its rows: "SCAN 2 CONSTANT ROWS", or "SCAN 1
+/// CONSTANT ROW" under a LIMIT, such as a scalar subquery's, where a VALUES
+/// of one row reads as "SCAN CONSTANT ROW".
+fn values_as_a_compound(detail: &str) -> bool {
+    detail
+        .strip_prefix("SCAN ")
+        .and_then(|rest| rest.strip_suffix(" CONSTANT ROWS").or_else(|| rest.strip_suffix(" CONSTANT ROW")))
+        .is_some_and(|count| !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Whether a step of a query plan reads a VALUES of more than one row that
+/// SQLite codes as a co-routine yielding its rows, which the plan names by
+/// their count, as "2-ROW VALUES CLAUSE". A VALUES that SQLite codes as a
+/// compound and reads as a table of its rows is named "0-ROW VALUES CLAUSE".
+fn values_as_a_co_routine(detail: &str) -> bool {
+    detail
+        .find("-ROW VALUES CLAUSE")
+        .is_some_and(|at| detail[..at].rsplit(' ').next().is_some_and(|count| count.parse().is_ok_and(|rows: u32| rows > 0)))
 }

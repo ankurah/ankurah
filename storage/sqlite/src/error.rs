@@ -212,13 +212,15 @@ pub enum Refusal {
     NoStatement,
 
     /// A compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the top
-    /// level of a query, or in a scalar subquery there, refused before it
-    /// runs, since the Node.js executor's typed reader could change one of
-    /// its values (see `refuse_a_compound_select`).
+    /// level of a query, or in a scalar subquery there, or a VALUES of more
+    /// than one row there or, unless SQLite runs it as a compound natively
+    /// too, anywhere in the query, refused before it runs, since the Node.js
+    /// executor's typed reader could change one of its values (see
+    /// `refuse_a_compound_select`).
     #[error(
-        "a compound SELECT at the top level of a query, or in a scalar subquery there, is refused on Node.js, since one of \
-         its INTEGERs could read back as a REAL; select from it as `WITH x AS MATERIALIZED (…) SELECT * FROM x`, which reads \
-         the same on every driver"
+        "a compound SELECT at the top level of a query, or in a scalar subquery there, or a VALUES of more than one row, is \
+         refused on Node.js, since one of its INTEGERs could read back as a REAL; select from it as `WITH x AS MATERIALIZED \
+         (…) SELECT * FROM x`, which reads the same on every driver"
     )]
     CompoundSelect,
 
