@@ -4,7 +4,7 @@
 use super::{
     bootstrap::{ensure_catalog_unchanged, fold_candidate, StorageRead, TreeUpdate, MAX_READ_ATTEMPTS},
     identity::{ensure_filter_unchanged, Access, Coverage, Identity},
-    lease::{Resident, ResidentSnapshot, SnapshotRequest},
+    lease::{Resident, SnapshotRequest},
     Lru,
 };
 use crate::{
@@ -277,7 +277,7 @@ impl<CD: ContextData> ResidentActor<CD> {
         })();
         match selected {
             Ok(snapshot) => {
-                let _ = request.response.send(Ok(ResidentSnapshot { snapshot, changes: self.changes.subscribe() }));
+                let _ = request.response.send(Ok((snapshot, self.changes.subscribe())));
             }
             // An invalid view does not invalidate the source used by other
             // query owners.

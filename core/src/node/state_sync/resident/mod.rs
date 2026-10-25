@@ -19,7 +19,7 @@ use crate::{
 };
 use ankql::ast::{Resolved, Selection};
 use ankurah_proto as proto;
-pub(crate) use lease::{ResidentPin, ResidentSnapshot};
+pub(crate) use lease::{ResidentPin, ResidentSnapshot, TreeChanges};
 use std::{
     collections::VecDeque,
     sync::{

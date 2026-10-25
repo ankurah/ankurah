@@ -127,6 +127,39 @@ async fn an_idle_entry_that_grows_beyond_retention_is_evicted() -> anyhow::Resul
 }
 
 #[tokio::test]
+async fn a_change_signal_pins_its_tree_past_the_count_and_byte_allowances() -> anyhow::Result<()> {
+    let node = node().await?;
+    apply(&node, &genesis("01")?).await?;
+    // Every tree is past both allowances, so the LRU keeps only pinned ones.
+    let cache = ResidentTrees::with_limits(0, 0);
+    let ResidentSnapshot { snapshot, changes } = acquire(&cache, &node, selection(None)).await?.snapshot().await?;
+    drop(snapshot);
+    cache.evict_idle();
+    assert_eq!(cache.len(), 1, "a sync waiting on the signal keeps its tree");
+    drop(changes);
+    assert_eq!(cache.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_change_signal_fires_for_the_trees_own_changes_and_errs_once_the_tree_stops() -> anyhow::Result<()> {
+    let node = node().await?;
+    apply(&node, &genesis("03")?).await?;
+    let ResidentSnapshot { snapshot, mut changes } =
+        node.resident_trees.snapshot(&node, above("02", None), None, vec![DEFAULT_CONTEXT]).await?;
+    drop(snapshot);
+    apply(&node, &genesis("01")?).await?;
+    let quiet = tokio::time::timeout(std::time::Duration::from_millis(100), changes.changed()).await;
+    assert!(quiet.is_err(), "a commit outside the tree's predicate changes nothing");
+    apply(&node, &genesis("04")?).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed()).await??;
+    // A commit whose outcome is in doubt stops the tree.
+    drop(node.reactor.begin_commit().await);
+    assert!(tokio::time::timeout(std::time::Duration::from_secs(5), changes.changed()).await?.is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_snapshot_lease_pins_tree_until_last_raii_owner_drops() -> anyhow::Result<()> {
     let node = node().await?;
     apply(&node, &genesis("01")?).await?;

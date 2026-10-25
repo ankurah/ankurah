@@ -38,8 +38,8 @@ impl<CD: ContextData> ResidentLease<CD> {
         resident.pins.fetch_add(1, Ordering::AcqRel);
         Self { resident, view }
     }
-    /// A snapshot of this lease's view after every commit published so far. The
-    /// snapshot pins the resident while it lives.
+    /// A snapshot of this lease's view after every commit published so far.
+    /// The snapshot and its change signal each pin the resident while they live.
     pub(crate) async fn snapshot(&self) -> anyhow::Result<ResidentSnapshot> {
         let (response, result) = oneshot::channel();
         self.resident
@@ -47,9 +47,10 @@ impl<CD: ContextData> ResidentLease<CD> {
             .send(SnapshotRequest { view: self.view.clone(), response })
             .await
             .map_err(|_| anyhow::anyhow!(SourceError::Changed))?;
-        let mut taken = result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))??;
-        taken.snapshot.resident = Some(ResidentPin { _lease: Arc::new(self.clone()) });
-        Ok(taken)
+        let (mut snapshot, receiver) = result.await.map_err(|_| anyhow::anyhow!(SourceError::Changed))??;
+        let pin = ResidentPin { _lease: Arc::new(self.clone()) };
+        snapshot.resident = Some(pin.clone());
+        Ok(ResidentSnapshot { snapshot, changes: TreeChanges { receiver, _pin: pin } })
     }
 }
 impl<CD: ContextData> Clone for ResidentLease<CD> {
@@ -65,17 +66,30 @@ impl<CD: ContextData> Drop for ResidentLease<CD> {
     }
 }
 
-/// A snapshot of a resident's view, and a signal that the resident's tree has
-/// changed since: it fires at the next change, and errs once the resident stops.
+/// A snapshot of a resident's view, and the signal of its tree's next change.
 pub(crate) struct ResidentSnapshot {
     pub(crate) snapshot: Snapshot,
-    pub(crate) changes: watch::Receiver<u64>,
+    pub(crate) changes: TreeChanges,
 }
 
-/// A lease's request for a snapshot of its view, answered on its own channel.
+/// The signal of a resident tree's next change since a snapshot. It pins the
+/// tree while it lives, so that whatever waits on it keeps its tree, however
+/// many others the LRU holds and however large the tree.
+pub(crate) struct TreeChanges {
+    receiver: watch::Receiver<u64>,
+    _pin: ResidentPin,
+}
+
+impl TreeChanges {
+    /// Wait for the tree's next change; an error once the tree has stopped.
+    pub(crate) async fn changed(&mut self) -> Result<(), watch::error::RecvError> { self.receiver.changed().await }
+}
+
+/// A lease's request for a snapshot of its view, answered on its own channel
+/// with the snapshot and the tree's version to watch.
 pub(super) struct SnapshotRequest<CD: ContextData> {
     pub(super) view: Arc<QueryView<CD>>,
-    pub(super) response: oneshot::Sender<anyhow::Result<ResidentSnapshot>>,
+    pub(super) response: oneshot::Sender<anyhow::Result<(Snapshot, watch::Receiver<u64>)>>,
 }
 
 impl<CD: ContextData> SnapshotRequest<CD> {

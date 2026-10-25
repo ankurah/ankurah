@@ -22,7 +22,7 @@ use self::{
     deadline::{within, IdleDeadline},
     target::{Outstanding, Target},
 };
-use super::ResidentSnapshot;
+use super::{resident::TreeChanges, ResidentSnapshot};
 use crate::{
     error::{ApplyError, RequestError, RetrievalError},
     node::{applier::ApplyFailure, Node},
@@ -248,7 +248,7 @@ where
 
     /// What the copy does not yet match or exceed of `target`, and the signal
     /// of the copy's next change.
-    async fn outstanding(&self, target: &mut Target) -> Result<(Outstanding, tokio::sync::watch::Receiver<u64>), RetrievalError> {
+    async fn outstanding(&self, target: &mut Target) -> Result<(Outstanding, TreeChanges), RetrievalError> {
         let ResidentSnapshot { mut snapshot, changes } = self.snapshot(Some(target.spec.clone())).await?;
         Ok((target.outstanding(self.node, &mut snapshot).await?, changes))
     }
