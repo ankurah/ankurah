@@ -14,7 +14,7 @@ use std::collections::HashMap;
 
 /// Events the check may walk to decide whether a local head covers a
 /// responder's. A copy further ahead counts as uncovered until the
-/// responder's push in answer to a SyncEntities leaves it unchanged, when
+/// responder's pushes in answer to SyncEntities leave it unchanged, when
 /// readiness settles it as diverged.
 const COVERAGE_BUDGET: usize = 256;
 

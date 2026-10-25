@@ -250,7 +250,7 @@ where
     /// of the copy's next change.
     async fn outstanding(&self, target: &mut Target) -> Result<(Outstanding, tokio::sync::watch::Receiver<u64>), RetrievalError> {
         let ResidentSnapshot { mut snapshot, changes } = self.snapshot(Some(target.spec.clone())).await?;
-        Ok((target.outstanding(self.node, &mut snapshot, self.deadline.interval()).await?, changes))
+        Ok((target.outstanding(self.node, &mut snapshot).await?, changes))
     }
 
     /// The failure of the next item the peer pushed for an entity that
@@ -307,6 +307,9 @@ where
             }
             let remaining = self.deadline.interval().saturating_sub(idle_since.elapsed());
             if remaining.is_zero() {
+                if target.settle_diverged(&outstanding, idle_since) {
+                    continue;
+                }
                 if !self.deadline.compare_again() {
                     return Err(RetrievalError::SyncStalled { peer: self.peer });
                 }

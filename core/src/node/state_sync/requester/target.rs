@@ -12,10 +12,7 @@ use crate::{
 use ankurah_digest_tree::leaf_address;
 use ankurah_proto::{Clock, EntityHead, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory, TreeSpec};
 use anyhow::ensure;
-use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    time::Duration,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// The responder's account of its result under `spec`, and what of it the
 /// requester's copy does not cover yet.
@@ -36,29 +33,24 @@ pub(super) struct Target {
     /// For local entities the account does not list, the head the responder
     /// reported holding of each.
     held: HashMap<EntityId, Clock>,
-    /// For each entity a SyncEntities answer reported a head of, what that
-    /// request named the copy's head as, and when the answer came.
+    /// For each entity whose head a SyncEntities answer reported, while the
+    /// copy held one, the latest such answer.
     answered: HashMap<EntityId, Answered>,
-    /// Members settled at the copy's own head, which the responder's push
-    /// left unchanged: no push brings such a copy level.
+    /// Members settled at the copy's own head, which the responder's pushes
+    /// keep leaving unchanged: no push brings such a copy level.
     diverged: HashSet<EntityId>,
 }
 
-/// What a SyncEntities named of an entity whose head its answer reported.
+/// An EntitiesSynced answer's report of one entity that its request named.
 struct Answered {
     /// The copy's head of the entity, as the request named it.
     named: Clock,
+    /// The responder's head of it, as the answer reported it.
+    held: Clock,
     at: Instant,
-}
-
-impl Answered {
-    /// Whether the push that followed the answer left the copy at `local`,
-    /// the head the request named, `settle_after` or longer since. A push
-    /// moves a copy it can bring level, so the copy holds what the
-    /// responder's state does not extend: a concurrent state, which the
-    /// applier does not adopt, or a head too far ahead to compare within the
-    /// coverage budget.
-    fn left_unchanged(&self, local: &Clock, settle_after: Duration) -> bool { self.named == *local && self.at.elapsed() >= settle_after }
+    /// Whether the answer before this one reported the same head for the
+    /// same copy: a re-request found nothing changed.
+    repeated: bool,
 }
 
 /// What the responder described of one span.
@@ -206,7 +198,9 @@ impl Target {
         let at = Instant::now();
         for entity in held {
             if let Some(Some(local)) = named.get(&entity.entity_id) {
-                self.answered.insert(entity.entity_id, Answered { named: local.clone(), at });
+                let previous = self.answered.get(&entity.entity_id);
+                let repeated = previous.is_some_and(|previous| previous.named == *local && previous.held == entity.head);
+                self.answered.insert(entity.entity_id, Answered { named: local.clone(), held: entity.head.clone(), at, repeated });
             }
             match self.uncovered.get_mut(&entity.entity_id) {
                 Some((_, head)) => *head = entity.head,
@@ -225,15 +219,8 @@ impl Target {
     /// What the copy in `snapshot`, a view of the requester's resident for the
     /// query under this target's spec, does not yet match or exceed. A head the
     /// copy covers, or a digest it matches, stays settled: the copy only moves
-    /// forward. So does a member whose copy the responder's push in answer to
-    /// a SyncEntities left unchanged `settle_after` or longer since, with a
-    /// warning that names it.
-    pub(super) async fn outstanding<SE, PA>(
-        &mut self,
-        node: &Node<SE, PA>,
-        snapshot: &mut Snapshot,
-        settle_after: Duration,
-    ) -> anyhow::Result<Outstanding>
+    /// forward.
+    pub(super) async fn outstanding<SE, PA>(&mut self, node: &Node<SE, PA>, snapshot: &mut Snapshot) -> anyhow::Result<Outstanding>
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
@@ -243,18 +230,15 @@ impl Target {
         let outside = self.uncovered.keys().filter(|id| !snapshot.entries.contains_key(id)).copied().collect::<Vec<_>>();
         let mut heads = local_heads(node, outside).await?;
         heads.extend(self.uncovered.keys().filter_map(|id| snapshot.entries.get(id).map(|entry| (*id, entry.head.clone()))));
-        let (mut covered, mut diverged) = (Vec::new(), Vec::new());
+        let mut covered = Vec::new();
         for (id, (address, head)) in &self.uncovered {
             match heads.remove(id) {
                 Some(local) if covers(node, &local, head).await? => covered.push(*id),
-                Some(local) if self.answered.get(id).is_some_and(|answered| answered.left_unchanged(&local, settle_after)) => {
-                    diverged.push(*id)
-                }
                 local => outstanding.heads.push(UncoveredHead { entity_id: *id, address: address.clone(), local }),
             }
         }
-        for id in covered.iter().chain(&diverged) {
-            self.uncovered.remove(id);
+        for id in covered {
+            self.uncovered.remove(&id);
         }
         for region in &mut self.regions {
             match region {
@@ -274,16 +258,11 @@ impl Target {
                         if self.listed.contains(&id) || self.unavailable.contains(&id) || self.diverged.contains(&id) {
                             continue;
                         }
-                        let Some(held) = self.held.get(&id) else {
-                            outstanding.unlisted.push((id, entry.head.clone()));
-                            continue;
+                        let settled = match self.held.get(&id) {
+                            Some(held) => covers(node, &entry.head, held).await?,
+                            None => false,
                         };
-                        if covers(node, &entry.head, held).await? {
-                            continue;
-                        }
-                        if self.answered.get(&id).is_some_and(|answered| answered.left_unchanged(&entry.head, settle_after)) {
-                            diverged.push(id);
-                        } else {
+                        if !settled {
                             outstanding.unlisted.push((id, entry.head.clone()));
                         }
                     }
@@ -291,14 +270,35 @@ impl Target {
                 Region::Matched(_) => {}
             }
         }
-        for id in diverged {
+        Ok(outstanding)
+    }
+
+    /// At the idle deadline, settle each member of `outstanding` whose copy
+    /// the responder's pushes keep leaving unchanged, with a warning that
+    /// names it: a re-request named it again and was answered with the same
+    /// head, the copy still sits at the head both requests named, and the
+    /// latest answer came before `quiet_since`, since when the sync has made
+    /// no progress. A push moves a copy it can bring level, so such a copy
+    /// holds what the responder's state does not extend: a concurrent state,
+    /// which the applier does not adopt, or a head too far ahead to compare
+    /// within the coverage budget. A push that was only lost gets the
+    /// re-request. Whether it settled any.
+    pub(super) fn settle_diverged(&mut self, outstanding: &Outstanding, quiet_since: Instant) -> bool {
+        let unchanged = |id: &EntityId, local: &Clock| {
+            self.answered.get(id).is_some_and(|answered| answered.repeated && answered.named == *local && answered.at <= quiet_since)
+        };
+        let heads = outstanding.heads.iter().filter(|head| head.local.as_ref().is_some_and(|local| unchanged(&head.entity_id, local)));
+        let unlisted = outstanding.unlisted.iter().filter(|(id, local)| unchanged(id, local));
+        let diverged: Vec<_> = heads.map(|head| head.entity_id).chain(unlisted.map(|(id, _)| *id)).collect();
+        for id in &diverged {
             tracing::warn!(
-                "Settled entity {} at the copy's own head, which the responder's push left unchanged: the copy diverged from the \
+                "Settled entity {} at the copy's own head, which the responder's pushes leave unchanged: the copy diverged from the \
                  responder's or is too far ahead of it to compare",
                 id
             );
-            self.diverged.insert(id);
+            self.uncovered.remove(id);
+            self.diverged.insert(*id);
         }
-        Ok(outstanding)
+        !diverged.is_empty()
     }
 }

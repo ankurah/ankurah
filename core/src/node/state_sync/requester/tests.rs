@@ -25,7 +25,7 @@ fn account(heads: &[(EntityId, proto::Clock)]) -> anyhow::Result<KnownState> {
 /// What `node`'s copy of [`members`] does not yet match or exceed of `target`.
 async fn outstanding(node: &TestNode, target: &mut Target) -> anyhow::Result<target::Outstanding> {
     let mut snapshot = node.resident_trees.snapshot(node, members(), Some(target.spec.clone()), vec![]).await?.snapshot;
-    target.outstanding(node, &mut snapshot, Duration::MAX).await
+    target.outstanding(node, &mut snapshot).await
 }
 
 fn head(event: &proto::Event) -> proto::Clock { proto::Clock::singleton(event) }
@@ -306,7 +306,7 @@ async fn a_member_the_account_lists_at_another_address_is_an_uncovered_head_and_
     let pages = vec![SpanContent::Heads(responder_view.page(below)?), SpanContent::Heads(responder_view.page(from)?)];
     let mut target = Target::new(KnownState { spec: position_spec(), spans: pages })?;
 
-    let found = target.outstanding(&node, &mut copy, Duration::MAX).await?;
+    let found = target.outstanding(&node, &mut copy).await?;
     assert_eq!(found.heads.iter().map(|head| head.entity_id).collect::<Vec<_>>(), [id], "the copy lacks the listed head");
     assert!(found.unlisted.is_empty(), "the account lists the member, if elsewhere: {:?}", found.unlisted);
     Ok(())
@@ -382,7 +382,7 @@ async fn under_the_entity_id_fallback_an_opening_push_brings_every_member_and_no
 }
 
 #[tokio::test]
-async fn a_member_whose_copy_diverged_settles_at_the_copys_own_head() -> anyhow::Result<()> {
+async fn a_member_whose_copy_diverged_settles_at_the_copys_own_head_after_a_re_request() -> anyhow::Result<()> {
     let responder = durable().await?;
     let requester = node().await?;
     connect(&responder, &requester).await?;
@@ -394,33 +394,112 @@ async fn a_member_whose_copy_diverged_settles_at_the_copys_own_head() -> anyhow:
     apply(&requester, &here).await?;
     apply(&responder, &labeled(Some(&genesis), "edited there")?).await?;
 
-    // Without settling it, the sync would compare three times and stall.
-    tokio::time::timeout(Duration::from_secs(10), fetch(&requester, responder.id, members(), vec![])).await??;
+    // Its push leaves the copy unchanged at the first idle deadline, which
+    // asks for it, and at the second, which asks again; the third settles it,
+    // where the sync without the rule would compare once more and stall.
+    tokio::time::timeout(Duration::from_secs(12), fetch(&requester, responder.id, members(), vec![])).await??;
     assert_eq!(requester.storage.get_state(genesis.entity_id).await?.payload.state.head, head(&here), "the copy keeps its own head");
     Ok(())
 }
 
+/// A member both nodes hold at `genesis`, which the responder has since
+/// edited to the returned head without the requester.
+async fn behind_on_the_requester(responder: &TestNode, requester: &TestNode) -> anyhow::Result<(proto::Event, proto::Event)> {
+    let genesis = create(&[responder, requester], "behind").await?;
+    let newer = labeled(Some(&genesis), "newer")?;
+    apply(responder, &newer).await?;
+    Ok((genesis, newer))
+}
+
+/// Wait until `target` is ready, then read `member`'s head in the copy at that
+/// moment.
+async fn ready_then_head(
+    sync: &mut QuerySync<'_, crate::test_utils::TestStorage, crate::policy::PermissiveAgent>,
+    target: Target,
+    push: OpeningPush,
+    member: EntityId,
+) -> anyhow::Result<proto::Clock> {
+    let ready: Result<(), ApplyFailure> = sync.until_ready(target, push).await?;
+    ready.map_err(RetrievalError::from)?;
+    Ok(sync.node.storage.get_state(member).await?.payload.state.head)
+}
+
 #[tokio::test]
-async fn an_unlisted_member_settles_once_its_copy_stays_at_the_head_the_request_named() -> anyhow::Result<()> {
+async fn a_member_whose_push_is_held_past_an_idle_interval_while_the_sync_progresses_is_brought_level() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    let (_, newer) = behind_on_the_requester(&responder, &requester).await?;
+    let member = newer.entity_id;
+    // The connection loses the member's pushes: its push landing is simulated below.
+    connect_losing(&responder, &requester, move |message| pushes(message, member)).await?;
+    // The account lists members whose pushes land one by one, and not the
+    // member, which the sync names at once and the responder answers for.
+    let pushed = (0..5).map(|n| labeled(None, &format!("pushed {n}"))).collect::<anyhow::Result<Vec<_>>>()?;
+    let target = Target::new(account(&pushed.iter().map(|event| (event.entity_id, head(event))).collect::<Vec<_>>())?)?;
+    let push = OpeningPush::of(&KnownState { spec: target.spec.clone(), spans: vec![] }, &target);
+    let mut sync = QuerySync::new(&requester, responder.id, members(), vec![]);
+    let (ready, landed) = tokio::join!(ready_then_head(&mut sync, target, push, member), async {
+        for event in &pushed {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            apply(&requester, event).await?;
+        }
+        // Over an idle interval after the member's answer, its push lands.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        apply(&requester, &newer).await
+    });
+    landed?;
+    assert_eq!(ready?, head(&newer), "ready only once the member's push landed, never settled as diverged");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_member_whose_first_repair_push_is_lost_is_asked_for_again_and_brought_level() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    let (genesis, newer) = behind_on_the_requester(&responder, &requester).await?;
+    let member = newer.entity_id;
+    let losing = std::sync::atomic::AtomicBool::new(true);
+    connect_losing(&responder, &requester, move |message| {
+        pushes(message, member) && losing.swap(false, std::sync::atomic::Ordering::SeqCst)
+    })
+    .await?;
+    // The offer listed the member at the copy's head, so the opening push
+    // would bring the responder's newer one; nothing arrives, so the first
+    // idle deadline asks for it, and that push is lost.
+    let target = Target::new(account(&[(member, head(&newer))])?)?;
+    let push = OpeningPush::of(&account(&[(member, head(&genesis))])?, &target);
+    let mut sync = QuerySync::new(&requester, responder.id, members(), vec![]);
+    let head_at_ready = tokio::time::timeout(Duration::from_secs(6), ready_then_head(&mut sync, target, push, member)).await??;
+    assert_eq!(head_at_ready, head(&newer), "the next idle deadline asked again, and that push brought the copy level");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_member_settles_as_diverged_only_once_a_re_request_finds_it_unchanged_before_the_sync_went_quiet() -> anyhow::Result<()> {
     let node = durable().await?;
     let member = create(&[&node], "left the responder's result").await?;
-    let mut target = Target::new(account(&[])?)?;
     // The responder holds a head the copy does not cover, as a concurrent one.
     let theirs = labeled(Some(&member), "edited there")?;
     let named = [(member.entity_id, Some(head(&member)))];
-    target.synced(&named, vec![EntityHead { entity_id: member.entity_id, head: head(&theirs) }], vec![])?;
-
-    let mut snapshot = node.resident_trees.snapshot(&node, members(), Some(target.spec.clone()), vec![]).await?.snapshot;
-    let found = target.outstanding(&node, &mut snapshot, Duration::MAX).await?;
-    assert_eq!(found.unlisted.len(), 1, "the push that followed may still be landing");
-    let found = target.outstanding(&node, &mut snapshot, Duration::ZERO).await?;
-    assert!(found.is_empty(), "once it has had time to land, the unchanged copy is settled");
-
-    // A copy that moved since its request named it is not settled.
+    let answer = || vec![EntityHead { entity_id: member.entity_id, head: head(&theirs) }];
     let mut target = Target::new(account(&[])?)?;
-    target.synced(&named, vec![EntityHead { entity_id: member.entity_id, head: head(&theirs) }], vec![])?;
-    apply(&node, &labeled(Some(&member), "edited here")?).await?;
-    let mut snapshot = node.resident_trees.snapshot(&node, members(), Some(target.spec.clone()), vec![]).await?.snapshot;
-    assert_eq!(target.outstanding(&node, &mut snapshot, Duration::ZERO).await?.unlisted.len(), 1);
+    target.synced(&named, answer(), vec![])?;
+    let found = outstanding(&node, &mut target).await?;
+    assert_eq!(found.unlisted.len(), 1);
+    assert!(!target.settle_diverged(&found, Instant::now()), "one answer: its push may have been lost");
+
+    target.synced(&named, answer(), vec![])?;
+    let answered = Instant::now();
+    assert!(!target.settle_diverged(&found, answered - Duration::from_millis(1)), "the sync progressed since the re-request");
+    assert!(target.settle_diverged(&found, answered), "a re-request found the copy unchanged before the sync went quiet");
+    assert!(outstanding(&node, &mut target).await?.is_empty());
+
+    // A re-request answered with another head is not a repeat.
+    let mut target = Target::new(account(&[])?)?;
+    target.synced(&named, answer(), vec![])?;
+    let newer = labeled(Some(&theirs), "edited there again")?;
+    target.synced(&named, vec![EntityHead { entity_id: member.entity_id, head: head(&newer) }], vec![])?;
+    let found = outstanding(&node, &mut target).await?;
+    assert!(!target.settle_diverged(&found, Instant::now()));
     Ok(())
 }
