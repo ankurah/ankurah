@@ -1,14 +1,13 @@
 //! What only the Node.js executor does: refusing a driver that is not
 //! better-sqlite3's `Database` class, refusing a database it cannot read
 //! exactly, and refusing the statements it cannot read as rusqlite does,
-//! such as a RETURNING statement, a named parameter, or a PRAGMA whose TEXT
-//! holds U+FFFD.
+//! such as a RETURNING statement or a PRAGMA whose TEXT holds U+FFFD.
 #![cfg(target_arch = "wasm32")]
 
 mod common;
 
 use ankurah_storage_sqlite::{
-    executor::SqliteExecutor, DatabaseRefusal, NodeJsConnection, Refusal, SqliteError, SqliteFailure, SqliteStorageEngine, SqliteValueRef,
+    executor::SqliteExecutor, DatabaseRefusal, NodeJsConnection, Refusal, SqliteError, SqliteFailure, SqliteStorageEngine,
 };
 use anyhow::Result;
 use common::better_sqlite3;
@@ -90,61 +89,6 @@ fn refuses_a_database_whose_statements_lack_a_method_the_executor_calls() {
     }
 }
 
-/// A database whose statements report no SQL is refused, since the executor
-/// checks where SQLite ended each statement. A copy of each statement stands
-/// in, holding all but its SQL, each method bound to the real statement,
-/// since better-sqlite3's `source` is a value that cannot change, nor be
-/// hidden behind a Proxy.
-#[wasm_bindgen_test]
-fn refuses_a_database_whose_statements_report_no_sql() {
-    let refusal = refusal(
-        "const copy = {};
-         for (let object = statement; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {
-             for (const name of Object.getOwnPropertyNames(object)) {
-                 if (name === 'source' || name === 'constructor' || name in copy) continue;
-                 copy[name] = forward(statement, name);
-             }
-         }
-         return copy;",
-    );
-    assert_eq!(refusal, refused_database(DatabaseRefusal::NoStatementSource));
-}
-
-/// SQL that goes on past the statement the database reports it prepared is
-/// refused by `execute` and `query` alike, though the scan before preparing
-/// found nothing past that statement but what SQLite skips, since the
-/// driver would run that statement alone. SQL the reported statement's SQL
-/// does not begin is refused as unreadable. A copy of the statement prepared
-/// from `SELECT 1 + 1` stands in, as in
-/// `refuses_a_database_whose_statements_report_no_sql`, reporting other SQL.
-#[wasm_bindgen_test]
-fn refuses_sql_past_the_statement_the_database_reports() {
-    let sql = "SELECT 1 + 1";
-    let reporting = |source: &str| {
-        tampered(&format!(
-            "if (sql !== '{sql}') return statement;
-             const copy = {{ source: '{source}' }};
-             for (let object = statement; object && object !== Object.prototype; object = Object.getPrototypeOf(object)) {{
-                 for (const name of Object.getOwnPropertyNames(object)) {{
-                     if (name === 'source' || name === 'constructor' || name in copy) continue;
-                     copy[name] = forward(statement, name);
-                 }}
-             }}
-             return copy;"
-        ))
-        .unwrap()
-    };
-    let past = reporting("SELECT 1");
-    for refusal in
-        [past.execute(sql, &[]).map(drop), past.query(sql, &[]).map(drop)].map(|outcome| outcome.map_err(|error| error.refusal()))
-    {
-        assert_eq!(refusal, Err(Some(Refusal::SqlPastItsStatement)));
-    }
-    let other = reporting("SELECT 2");
-    let unreadable = r#""SELECT 2" as the SQL of a statement prepared from "SELECT 1 + 1""#.to_owned();
-    assert_eq!(other.query(sql, &[]).err().and_then(|error| error.refusal()), refused_database(DatabaseRefusal::Unreadable(unreadable)));
-}
-
 /// TEXT from a statement SQLite cannot nest in the typed reader, such as a
 /// PRAGMA, is read as the driver's string, and the statement's other values
 /// as their storage classes; a string holding U+FFFD, which better-sqlite3
@@ -188,33 +132,6 @@ async fn a_returning_statement_is_refused_before_it_writes() -> Result<()> {
         .await?;
     for refusal in refusals {
         assert!(matches!(refusal, Err((Some(Refusal::NotNestable(_)), Some(1)))), "a RETURNING statement is refused: {refusal:?}");
-    }
-    assert_eq!(count, 0, "neither insert ran");
-    Ok(())
-}
-
-/// A statement with a named parameter is refused before it runs, where
-/// rusqlite binds a call's values to it in turn: better-sqlite3 binds one
-/// only by name.
-#[wasm_bindgen_test]
-async fn a_named_parameter_is_refused_before_it_runs() -> Result<()> {
-    let storage = common::open_in_memory().await?;
-    let (refusals, count) = storage
-        .with_executor(|executor| {
-            executor.execute("CREATE TABLE things (a, b)", &[])?;
-            let seven = SqliteValueRef::Integer(7);
-            let refusals = [
-                executor.execute("INSERT INTO things VALUES (:a, ?)", &[seven]),
-                executor.execute("INSERT INTO things VALUES (?, @b)", &[seven, seven]),
-                executor.query("SELECT a FROM things WHERE b = $c OR b = #d", &[seven, seven]).map(|rows| rows.len()),
-            ]
-            .map(|outcome| outcome.map_err(|error| error.refusal()));
-            Ok((refusals, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
-        })
-        .await?;
-    // Each refusal names the statement's first named parameter.
-    for (refusal, name) in refusals.into_iter().zip([":a", "@b", "$c"]) {
-        assert_eq!(refusal, Err(Some(Refusal::NamedParameter { name: name.to_owned() })));
     }
     assert_eq!(count, 0, "neither insert ran");
     Ok(())

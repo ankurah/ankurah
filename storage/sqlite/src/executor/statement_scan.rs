@@ -1,15 +1,15 @@
 //! SQL text read as SQLite's tokenizer reads it, for what the executors need
 //! to know before SQLite prepares a statement: whether some SQL holds no
 //! statement, one, or a second after its first, what SQLite skips between
-//! statements, a statement's first keyword, and its first named parameter.
+//! statements, and a statement's first keyword.
 //!
 //! The scan follows SQLite's tokenizer (`sqlite3GetToken` in tokenize.c) for
-//! every kind of token that can hold a semicolon, a keyword, or a character a
-//! named parameter begins with: whitespace and comments, string literals,
-//! quoted names, identifiers and parameters. It finds where a statement ends
-//! as `sqlite3_complete` (complete.c) does, reading a CREATE TRIGGER statement
-//! on through its body to the semicolon after the body's END. Its tests check
-//! each reading against SQLite's own.
+//! every kind of token that can hold a semicolon or a keyword: whitespace and
+//! comments, string literals, quoted names, identifiers and named
+//! parameters. It finds where a statement ends as `sqlite3_complete`
+//! (complete.c) does, reading a CREATE TRIGGER statement on through its body
+//! to the semicolon after the body's END. Its tests check each reading
+//! against SQLite's own.
 
 /// A token of SQL, as the scans tell tokens apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,10 +19,7 @@ enum TokenKind {
     Semicolon,
     /// An identifier, a keyword or a number.
     Word,
-    /// A named parameter: `:name`, `@name`, `#name` or `$name`.
-    Parameter,
-    /// Anything else: a string, a quoted name, a positional parameter, an
-    /// operator.
+    /// Anything else: a string, a quoted name, a parameter, an operator.
     Other,
 }
 
@@ -58,7 +55,9 @@ fn tokens(sql: &str) -> impl Iterator<Item = (TokenKind, &str)> {
                     None => rest.len(),
                 },
             ),
-            [b':' | b'@' | b'#' | b'$', ..] => (TokenKind::Parameter, parameter(rest)),
+            // A named parameter is one token, its suffixes included, so that
+            // a keyword or a semicolon within it ends no statement.
+            [b':' | b'@' | b'#' | b'$', ..] => (TokenKind::Other, parameter(rest)),
             [b'?', digits @ ..] => (TokenKind::Other, 1 + digits.iter().take_while(|byte| byte.is_ascii_digit()).count()),
             // An identifier, a keyword or a number, which a parameter cannot
             // begin inside: `$` continues an identifier.
@@ -127,35 +126,31 @@ pub(crate) fn holds_no_statement(sql: &str) -> bool { tokens(sql).all(|(kind, _)
 /// The statements some SQL holds, as the executors need to know them before
 /// SQLite prepares it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Statements<'s> {
+pub(crate) enum Statements {
     /// No statement: only what SQLite skips between statements, up to the
     /// end or a NUL (see `holds_no_statement`).
     None,
     /// One statement, which ends at `end` (see `FirstStatement::end`) and is
-    /// followed by no more than what SQLite skips, with the first named
-    /// parameter it has, if any: `:name`, `@name`, `#name` or `$name`, with
-    /// the `::` and `(…)` suffixes of SQLite's Tcl form, as SQLite names it.
-    /// better-sqlite3's SQLite is built without that form, and fails to
-    /// prepare SQL that uses it.
-    One { end: usize, named_parameter: Option<&'s str> },
+    /// followed by no more than what SQLite skips.
+    One { end: usize },
     /// A second statement after the first.
     Several,
 }
 
 /// The statements `sql` holds, found in one pass over it.
-pub(crate) fn statements(sql: &str) -> Statements<'_> {
+pub(crate) fn statements(sql: &str) -> Statements {
     let first = first_statement(sql);
     if !first.found {
         Statements::None
     } else if holds_no_statement(&sql[first.end..]) {
-        Statements::One { end: first.end, named_parameter: first.named_parameter }
+        Statements::One { end: first.end }
     } else {
         Statements::Several
     }
 }
 
 /// The first statement of some SQL, as one pass over its tokens finds it.
-struct FirstStatement<'s> {
+struct FirstStatement {
     /// Where it ends: just past the semicolon that ends it, or, when none
     /// does, just past its last token, so that whitespace and comments after
     /// it, a comment that runs to the end of the SQL among them, are no part
@@ -166,24 +161,18 @@ struct FirstStatement<'s> {
     end: usize,
     /// Whether there is a statement at all, rather than only what SQLite skips.
     found: bool,
-    /// The statement's first named parameter.
-    named_parameter: Option<&'s str>,
 }
 
 /// The first statement of `sql`, followed through `sqlite3_complete`'s
 /// states to where it ends.
-fn first_statement(sql: &str) -> FirstStatement<'_> {
+fn first_statement(sql: &str) -> FirstStatement {
     let mut state = State::Start;
-    let mut first = FirstStatement { end: 0, found: false, named_parameter: None };
+    let mut first = FirstStatement { end: 0, found: false };
     for (kind, text) in tokens(sql) {
         let token = match kind {
             TokenKind::Space => continue,
             TokenKind::Semicolon => CompletionToken::Semicolon,
             TokenKind::Word => CompletionToken::of_word(text),
-            TokenKind::Parameter => {
-                first.named_parameter.get_or_insert(text);
-                CompletionToken::Other
-            }
             TokenKind::Other => CompletionToken::Other,
         };
         first.end = offset(sql, text) + text.len();
@@ -281,7 +270,7 @@ mod tests {
 
     use rusqlite::{ffi, Batch, Connection};
 
-    use super::{first_keyword, first_statement, holds_no_statement, skip_to_statement, statements, tokens, Statements, TokenKind};
+    use super::{first_keyword, first_statement, holds_no_statement, skip_to_statement, statements, tokens, Statements};
 
     /// The tables the statements below read.
     const SCHEMA: &str = r#"CREATE TABLE t (a, "b:c", [d@e], `f$g`, "h""i", a$b, "x--y", "p/*q", `j``k`); CREATE TABLE x (a)"#;
@@ -344,9 +333,11 @@ mod tests {
         }
     }
 
-    /// Where `sqlite3_complete`, which reads a byte order mark as a word and a
-    /// vertical tab as an operator, would read a trigger otherwise than SQLite
-    /// does, `first_statement` ends it where SQLite's parser does.
+    /// Where `sqlite3_complete` would end a statement otherwise than SQLite's
+    /// parser does, `first_statement` ends it where the parser does:
+    /// `sqlite3_complete` reads a byte order mark as a word and a vertical tab
+    /// as an operator, which can change where a trigger ends, and reads a
+    /// semicolon in a named parameter's `(…)` suffix as the statement's end.
     #[test]
     fn statements_end_where_the_parser_ends_them() {
         let connection = Connection::open_in_memory().unwrap();
@@ -356,6 +347,7 @@ mod tests {
             "CREATE TRIGGER t2 AFTER INSERT ON x BEGIN SELECT 1; \u{FEFF}END; SELECT 2",
             "CREATE \x0bTRIGGER t3 AFTER INSERT ON x BEGIN SELECT 1; END; SELECT 2",
             ";\u{FEFF};CREATE TRIGGER t4 AFTER INSERT ON x BEGIN SELECT 1;\x0c END ; SELECT 2",
+            "SELECT $a(;); SELECT 2",
         ] {
             // SAFETY: the connection outlives the statement, which is
             // finalized at once, and `tail` points into `sql`.
@@ -472,11 +464,13 @@ mod tests {
         "SELECT :before_nul\0, :after_nul",
     ];
 
-    /// The scan reads each statement's named parameters as SQLite names them,
-    /// in the order SQLite numbers them, which is the order in which each
-    /// name first appears, and `statements` gives the first of them.
+    /// The scan reads each named parameter as one token, as SQLite names it,
+    /// its suffixes included, so that a keyword or a semicolon within one
+    /// ends no statement: the tokens that begin with a named parameter's
+    /// sigil are, in order, the names SQLite numbers, each where it first
+    /// appears.
     #[test]
-    fn the_scan_finds_the_named_parameters_sqlite_finds() {
+    fn the_scan_reads_each_named_parameter_as_sqlite_names_it() {
         let connection = Connection::open_in_memory().unwrap();
         connection.execute_batch(SCHEMA).unwrap();
         for sql in PARAMETERS {
@@ -487,13 +481,9 @@ mod tests {
                 .collect();
             let mut seen = HashSet::new();
             let mut scanned: Vec<&str> =
-                tokens(sql).filter(|(kind, _)| *kind == TokenKind::Parameter).map(|(_, parameter)| parameter).collect();
+                tokens(sql).map(|(_, token)| token).filter(|token| token.starts_with([':', '@', '#', '$'])).collect();
             scanned.retain(|name| seen.insert(*name));
             assert_eq!(scanned, named, "{sql:?}");
-            assert!(
-                matches!(statements(sql), Statements::One { named_parameter, .. } if named_parameter == named.first().copied()),
-                "{sql:?}"
-            );
         }
     }
 }

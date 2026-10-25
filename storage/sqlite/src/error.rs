@@ -68,11 +68,6 @@ pub enum SqliteError {
     UnversionedStore { expected: u32 },
 }
 
-/// SQLite's result code for a misuse of its API, which it returns natively
-/// for a step of SQL that holds no statement.
-#[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
-const SQLITE_MISUSE: i32 = 21;
-
 impl SqliteError {
     /// SQLite's extended result code when SQLite itself refused a statement,
     /// such as 1555 for a duplicate primary key or 5 for a lock held past the
@@ -81,12 +76,16 @@ impl SqliteError {
     /// which is read as the number sqlite3.h gives it. On better-sqlite3 a
     /// name that no SQLite release up to the crate's table of names defines,
     /// as a later release could add, has `None`. On Node.js the executor's
-    /// refusal of SQL that holds no statement answers 21, SQLITE_MISUSE, the
-    /// code SQLite refuses it with natively, and its refusal of a statement
-    /// SQLite cannot nest answers the code of SQLite's error. `None` for
-    /// every other error, a call that passes more or fewer values than its
-    /// statement takes parameters among them: rusqlite and better-sqlite3
-    /// refuse such a call themselves, before SQLite binds anything.
+    /// refusal of a statement SQLite cannot nest answers the code of SQLite's
+    /// error. `None` for every other error, a call that passes more or fewer
+    /// values than its statement takes parameters among them: rusqlite and
+    /// better-sqlite3 refuse such a call themselves, before SQLite binds
+    /// anything.
+    ///
+    /// SQL that holds no statement differs between drivers: natively SQLite
+    /// refuses to run it, with SQLITE_MISUSE, `Some(21)`, where better-sqlite3
+    /// refuses to prepare it itself, as a [`SqliteError::JavaScript`], with
+    /// `None`.
     pub fn sqlite_code(&self) -> Option<i32> {
         match self {
             // rusqlite reports a statement SQLite could not parse as an
@@ -97,8 +96,6 @@ impl SqliteError {
             }
             #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
             SqliteError::Sqlite(failure) | SqliteError::Refused(Refusal::NotNestable(failure)) => failure.code,
-            #[cfg(all(target_arch = "wasm32", feature = "nodejs"))]
-            SqliteError::Refused(Refusal::NoStatement) => Some(SQLITE_MISUSE),
             _ => None,
         }
     }
@@ -116,12 +113,9 @@ impl SqliteError {
     /// `None` for every other error, a call that passes too many values among
     /// them (see `sqlite_code`).
     ///
-    /// It answers the same on every driver except in three cases:
+    /// It answers the same on every driver except in two cases:
     /// - a call that passes too few values: better-sqlite3 refuses it itself,
     ///   as a JavaScript exception, so `refusal` is `None` there;
-    /// - SQL that holds no statement: [`Refusal::NoStatement`] on Node.js,
-    ///   and `None` natively, where SQLite refuses it itself (see
-    ///   `sqlite_code`);
     /// - TEXT that is not UTF-8 in a row of a PRAGMA or an EXPLAIN:
     ///   [`Refusal::TextNotUtf8`] natively, and
     ///   [`Refusal::ReplacementCharacter`] on Node.js, where better-sqlite3
@@ -202,16 +196,6 @@ pub enum Refusal {
         error: Utf8Error,
     },
 
-    /// SQL that holds no statement, only whitespace, semicolons and
-    /// comments, refused before a driver prepares it: SQLite refuses to run
-    /// such SQL, natively with SQLITE_MISUSE, which
-    /// [`SqliteError::sqlite_code`] answers for this refusal too.
-    #[error(
-        "SQL that holds no statement, only whitespace, semicolons and comments, is refused on Node.js, as SQLite refuses to \
-         run it natively (SQLITE_MISUSE)"
-    )]
-    NoStatement,
-
     /// A compound SELECT (UNION, UNION ALL, INTERSECT or EXCEPT) at the top
     /// level of a query, or in a scalar subquery there, or a VALUES of more
     /// than one row there or, unless SQLite runs it as a compound natively
@@ -224,16 +208,6 @@ pub enum Refusal {
          (…) SELECT * FROM x`, which reads the same on every driver"
     )]
     CompoundSelect,
-
-    /// A statement with a named parameter (`:a`, `@a`, `#a` or `$a`), the
-    /// first of which is `name`, refused before it runs: better-sqlite3 binds
-    /// one only by name, where rusqlite binds a call's values to every
-    /// parameter in turn.
-    #[error(
-        "a statement with the named parameter {name} is refused on Node.js, since better-sqlite3 does not bind a call's \
-         values to it in turn, as rusqlite does; write a positional `?` for each parameter"
-    )]
-    NamedParameter { name: String },
 
     /// A query of `width` columns, more than half of SQLite's column limit,
     /// refused before it runs: the Node.js executor's typed reader reads each
@@ -255,15 +229,6 @@ pub enum Refusal {
          clause; write with `execute`, and read with a query"
     )]
     NotNestable(#[source] SqliteFailure),
-
-    /// SQL that goes on past the statement SQLite prepared from it, though
-    /// the scan before preparing found nothing past that statement but what
-    /// SQLite skips: the driver would run that statement alone.
-    #[error(
-        "SQL that goes on past the statement SQLite prepared from it is refused on Node.js, since the driver would run \
-         that statement alone; run each statement in a call of its own"
-    )]
-    SqlPastItsStatement,
 
     /// TEXT holding U+FFFD in column `column` of a PRAGMA's or an EXPLAIN's
     /// row, which SQLite would not nest in a typed reader, so that the driver
@@ -325,14 +290,6 @@ pub enum DatabaseRefusal {
          safeIntegers"
     )]
     NoExactIntegers,
-
-    /// A database whose statements report no SQL, which the executor reads
-    /// to check where SQLite ended each statement.
-    #[error(
-        "a database whose statements report no SQL is refused, since the Node.js executor checks where SQLite ended each \
-         statement through better-sqlite3's `source`"
-    )]
-    NoStatementSource,
 
     /// A database whose text encoding is not UTF-8.
     #[error("a database whose text encoding is not UTF-8 is refused, since the Node.js executor reads TEXT as UTF-8 bytes")]

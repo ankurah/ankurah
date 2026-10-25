@@ -61,8 +61,9 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 /// prepares them. Whitespace, semicolons and comments after the statement
 /// are no second statement, but anything else is, even one byte SQLite
 /// cannot read. A CREATE TRIGGER statement runs on to the END of its body.
-/// SQL that holds only whitespace, semicolons and comments is refused as
-/// SQLite refuses to run it, with SQLITE_MISUSE.
+/// SQL that holds only whitespace, semicolons and comments is refused:
+/// natively SQLite refuses to run it, with SQLITE_MISUSE, and on Node.js
+/// better-sqlite3 refuses to prepare it, in its own words.
 ///
 /// # Where the Node.js executor differs from the native one
 ///
@@ -84,15 +85,12 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///   Node.js executor's `refuse_a_compound_select` says which other
 ///   compounds it lets through, and which it refuses though they read the
 ///   same everywhere.
-/// - A statement with a named parameter (`:a`, `@a`, `#a` or `$a`) is
-///   refused before it runs ([`Refusal::NamedParameter`]). rusqlite binds a
-///   call's values to named and positional parameters alike, in order, but
-///   better-sqlite3 binds a named one only by name. Write a positional `?`
-///   for each parameter.
-/// - better-sqlite3 binds a numbered parameter such as `?1` only by name, as
-///   it binds a named one, so it refuses, in its own words, a call that
-///   gives one a positional value; rusqlite binds the value at that
-///   position.
+/// - better-sqlite3 binds a named parameter (`:a`, `@a`, `#a` or `$a`), and
+///   a numbered one such as `?1`, only by name, which a call's positional
+///   values cannot give, so it refuses, in its own words and before the
+///   statement runs, every call to a statement that has one. rusqlite binds
+///   a call's values to every parameter in turn, a numbered one at its
+///   position. Write a positional `?` for each parameter.
 /// - A statement that yields rows and that SQLite cannot nest in the typed
 ///   reader, such as one with a RETURNING clause, is refused before it can
 ///   write ([`Refusal::NotNestable`]), unless it is a PRAGMA or an EXPLAIN.
@@ -127,7 +125,6 @@ pub(crate) const SESSION_PRAGMAS: &str = "PRAGMA journal_mode=WAL;
 ///   same on every driver, except in the cases their docs list.
 ///
 /// [`Refusal::CompoundSelect`]: crate::Refusal::CompoundSelect
-/// [`Refusal::NamedParameter`]: crate::Refusal::NamedParameter
 /// [`Refusal::NotNestable`]: crate::Refusal::NotNestable
 /// [`Refusal::ReplacementCharacter`]: crate::Refusal::ReplacementCharacter
 /// [`Refusal::TooManyColumns`]: crate::Refusal::TooManyColumns

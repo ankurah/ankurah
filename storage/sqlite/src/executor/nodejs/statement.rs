@@ -1,7 +1,7 @@
 //! The JavaScript statement API the Node.js executor drives: preparing a
-//! statement that hands rows over as the executor reads them, checking the
-//! SQL SQLite prepared, running a statement for its rows, and the values
-//! that cross between Rust and JavaScript.
+//! statement that hands rows over as the executor reads them, refusing SQL
+//! of more than one statement, running a statement for its rows, and the
+//! values that cross between Rust and JavaScript.
 
 use js_sys::{Array, BigInt, Function, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, JsValue};
@@ -54,44 +54,19 @@ pub(super) fn width(statement: &JsValue) -> Result<usize, SqliteError> {
     Ok(columns.length() as usize)
 }
 
-/// A statement's SQL, better-sqlite3's `source`: the SQL it prepared, which
-/// it refuses to prepare when it holds more than one statement.
-pub(super) fn source(statement: &JsValue) -> Result<String, SqliteError> {
-    Reflect::get(statement, &"source".into()).map_err(js_error)?.as_string().ok_or_else(|| DatabaseRefusal::NoStatementSource.into())
-}
-
-/// Refuse SQL that holds no statement, or a second one, before SQLite
-/// prepares anything. Returns the SQL up to the end of its one statement,
-/// which is what the executor prepares, so that better-sqlite3 does not read
-/// the whitespace and comments after it, and the statement's first named
-/// parameter, for `refuse_a_named_parameter`, both found in the same pass
-/// over the SQL.
-///
-/// - SQL that holds a second statement is refused as the native executor
-///   refuses it, since SQLite applies some PRAGMAs while it prepares them.
-///   Whitespace, semicolons and comments after the statement are no
-///   statement.
-/// - SQL that holds no statement, only whitespace, semicolons and comments,
-///   is refused as SQLite refuses to run it natively, with SQLITE_MISUSE,
-///   which the refusal answers as its `sqlite_code`.
-pub(super) fn refuse_all_but_one_statement(sql: &str) -> Result<(&str, Option<&str>), SqliteError> {
+/// Refuse SQL that holds a second statement before SQLite prepares
+/// anything, as the native executor refuses it, since SQLite applies some
+/// PRAGMAs while it prepares them; whitespace, semicolons and comments after
+/// the statement are no statement. Returns the SQL up to the end of its one
+/// statement, which is what the executor prepares, so that better-sqlite3
+/// does not read the whitespace and comments after it. SQL that holds no
+/// statement is returned whole, and better-sqlite3 refuses to prepare it.
+pub(super) fn refuse_a_second_statement(sql: &str) -> Result<&str, SqliteError> {
     match statement_scan::statements(sql) {
-        Statements::One { end, named_parameter } => Ok((&sql[..end], named_parameter)),
+        Statements::One { end } => Ok(&sql[..end]),
         Statements::Several => Err(Refusal::MultipleStatements.into()),
-        Statements::None => Err(Refusal::NoStatement.into()),
+        Statements::None => Ok(sql),
     }
-}
-
-/// Check that SQLite ended the statement it prepared from `sql`, the SQL up
-/// to the end of the statement the scan before preparing found, where the
-/// scan ended it. Should SQLite have ended the statement sooner, the SQL is
-/// refused, since the driver would run that statement alone.
-pub(super) fn refuse_sql_past_its_statement(sql: &str, source: &str) -> Result<(), SqliteError> {
-    let rest = sql.strip_prefix(source).ok_or_else(|| unreadable(format!("{source:?} as the SQL of a statement prepared from {sql:?}")))?;
-    if !statement_scan::holds_no_statement(rest) {
-        return Err(Refusal::SqlPastItsStatement.into());
-    }
-    Ok(())
 }
 
 /// Which rows of a statement a read takes.

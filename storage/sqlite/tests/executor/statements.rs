@@ -123,23 +123,59 @@ async fn a_byte_order_mark_and_semicolons_are_skipped_around_a_statement() -> Re
 }
 
 /// SQL that holds no statement, only what SQLite skips between statements,
-/// is refused by `execute`, `query` and `query_row` alike, on every driver,
-/// as SQLite refuses to run it: SQLITE_MISUSE, 21. Natively SQLite refuses
-/// it; on Node.js the executor does, before a driver prepares it.
+/// is refused by `execute`, `query` and `query_row` alike, on every driver:
+/// natively SQLite refuses to run it, with SQLITE_MISUSE, 21, and on Node.js
+/// better-sqlite3 refuses to prepare it, in its own words.
 #[engine_test]
 async fn sql_that_holds_no_statement_is_refused() -> Result<()> {
     let storage = common::open_in_memory().await?;
-    let codes = storage
+    let outcomes = storage
         .with_executor(|executor| {
             Ok([";", "", "-- c"].map(|sql| {
                 [executor.execute(sql, &[]).map(drop), executor.query(sql, &[]).map(drop), executor.query_row(sql, &[]).map(drop)]
-                    .map(|outcome| outcome.map_err(|error| (error.sqlite_code(), error.refusal())))
+                    .map(|outcome| outcome.map_err(|error| (error.sqlite_code(), common::javascript_message(&error).map(str::to_owned))))
             }))
         })
         .await?;
-    let refusal = if cfg!(target_arch = "wasm32") { Some(Refusal::NoStatement) } else { None };
-    for outcome in codes.iter().flatten() {
-        assert_eq!(outcome, &Err((Some(21), refusal.clone())));
+    let refused = if cfg!(target_arch = "wasm32") {
+        (None, Some("The supplied SQL string contains no statements".to_owned()))
+    } else {
+        (Some(21), None)
+    };
+    for outcome in outcomes.iter().flatten() {
+        assert_eq!(outcome, &Err(refused.clone()));
+    }
+    Ok(())
+}
+
+/// A named parameter (`:a`, `@a`, `#a` or `$a`) takes a call's value in
+/// turn on rusqlite, which binds a call's values to every parameter in
+/// order; better-sqlite3 binds one only by name, so it refuses, in its own
+/// words and before the statement runs, a call that gives one a positional
+/// value (see `SqliteExecutor`).
+#[engine_test]
+async fn a_named_parameter_takes_a_positional_value_on_rusqlite_alone() -> Result<()> {
+    let storage = common::open_in_memory().await?;
+    let (outcomes, stored) = storage
+        .with_executor(|executor| {
+            executor.execute("CREATE TABLE things (a, b)", &[])?;
+            let seven = SqliteValueRef::Integer(7);
+            let outcomes = [
+                executor.execute("INSERT INTO things VALUES (:a, ?)", &[seven, seven]),
+                executor.execute("INSERT INTO things VALUES (?, @b)", &[seven, seven]),
+                executor.query("SELECT a FROM things WHERE b = $c OR b = #d", &[seven, seven]).map(|rows| rows.len()),
+            ]
+            .map(|outcome| outcome.map_err(|error| common::javascript_message(&error).map(str::to_owned).ok_or(error.to_string())));
+            Ok((outcomes, executor.query_row("SELECT count(*) FROM things", &[])?.expect("one row").integer(0)?))
+        })
+        .await?;
+    if cfg!(target_arch = "wasm32") {
+        let many = Err(Ok("Too many parameter values were provided".to_owned()));
+        assert_eq!(outcomes, [many.clone(), many.clone(), many]);
+        assert_eq!(stored, 0, "neither insert ran");
+    } else {
+        assert_eq!(outcomes, [Ok(1), Ok(1), Ok(2)]);
+        assert_eq!(stored, 2);
     }
     Ok(())
 }

@@ -19,7 +19,6 @@
 mod exception;
 mod kept_readers;
 mod open;
-mod parameters;
 mod statement;
 mod typed_reader;
 
@@ -37,10 +36,8 @@ use crate::{
 };
 use exception::js_error;
 use kept_readers::KeptReaders;
-use parameters::refuse_a_named_parameter;
 use statement::{
-    database_method, integer_from_js, js_params, read_rows, refuse_all_but_one_statement, refuse_sql_past_its_statement, source,
-    statement_method, unreadable, width, RowSelection,
+    database_method, integer_from_js, js_params, read_rows, refuse_a_second_statement, statement_method, unreadable, width, RowSelection,
 };
 use typed_reader::{plain_row, typed_reader, typed_row};
 
@@ -170,11 +167,7 @@ impl SqliteExecutor for NodeJsConnection {
     /// would take it and discard a row it yields, so a statement that has
     /// columns steps through `get`, which hands the row over to be refused.
     fn execute(&self, sql: &str, params: &[SqliteValueRef<'_>]) -> Result<usize, SqliteError> {
-        let (statement_sql, named_parameter) = refuse_all_but_one_statement(sql)?;
-        let statement = self.prepare(statement_sql)?;
-        let source = source(&statement)?;
-        refuse_sql_past_its_statement(statement_sql, &source)?;
-        refuse_a_named_parameter(named_parameter)?;
+        let statement = self.prepare(refuse_a_second_statement(sql)?)?;
         if width(&statement)? == 0 {
             // A statement without columns yields no row.
             let result = statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
@@ -226,11 +219,8 @@ impl NodeJsConnection {
                 Err(error) => return Err(error),
             }
         }
-        let (statement_sql, named_parameter) = refuse_all_but_one_statement(sql)?;
+        let statement_sql = refuse_a_second_statement(sql)?;
         let statement = self.prepare(statement_sql)?;
-        let source = source(&statement)?;
-        refuse_sql_past_its_statement(statement_sql, &source)?;
-        refuse_a_named_parameter(named_parameter)?;
         let width = width(&statement)?;
         if width == 0 {
             // A statement without columns yields no rows; it runs for its
@@ -239,10 +229,10 @@ impl NodeJsConnection {
             statement_method(&statement, "run")?.apply(&statement, &js_params(params)).map_err(js_error)?;
             return Ok(Vec::new());
         }
-        // The typed reader nests, and the compound check plans, the source
-        // past what SQLite skips before the statement: the source keeps a
-        // leading semicolon, which a WITH clause cannot hold.
-        let nested = statement_scan::skip_to_statement(&source);
+        // The typed reader nests, and the compound check plans, the statement
+        // past what SQLite skips before it, such as a leading semicolon,
+        // which a WITH clause cannot hold.
+        let nested = statement_scan::skip_to_statement(statement_sql);
         let typed = typed_reader(nested, width);
         match self.prepare(&typed.sql) {
             Ok(reader) => {
@@ -265,7 +255,7 @@ impl NodeJsConnection {
             // among its rows, so it is refused before it runs, with SQLite's
             // error.
             Err(SqliteError::Sqlite(failure)) => {
-                if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| statement_scan::first_keyword(&source).eq_ignore_ascii_case(keyword)) {
+                if !["PRAGMA", "EXPLAIN"].iter().any(|keyword| statement_scan::first_keyword(nested).eq_ignore_ascii_case(keyword)) {
                     return Err(Refusal::NotNestable(failure).into());
                 }
                 read_rows(&statement, params, width, selection)?.into_iter().map(plain_row).collect()
