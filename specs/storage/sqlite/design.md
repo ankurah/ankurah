@@ -97,22 +97,26 @@ driver. Each target compiles one executor:
   one-connection pool so all operations observe the same database.
 - `executor/nodejs`: on wasm32, behind the `nodejs` feature, the engine runs
   inside Node.js on one database object, synchronously on the calling
-  thread. `open` and `open_in_memory` construct a node:sqlite `DatabaseSync`
-  and give it the native connections' session settings. A host that built a
-  database itself, a node:sqlite `DatabaseSync` or a better-sqlite3
-  `Database`, hands it to `SqliteStorageEngine::from_database`, which keeps
-  the host's session settings and refuses a database the executor cannot
-  read exactly. Among those is a database whose node:sqlite skips a numbered
-  parameter as it binds a call's values, as node:sqlite does before Node.js
-  22.20.0 on 22 and 24.7.0 on 24: the executor binds one and reads it back,
-  whatever the release. The executor reads each query's rows through a
-  typed reader, a WITH clause that nests the query and reads each value with
-  its storage class; where that cannot read as rusqlite does, the query is
-  refused before it runs. A PRAGMA or an EXPLAIN, which SQLite does not
-  nest, is the exception: its TEXT is read as the driver's string, and
-  refused after it runs if it holds U+FFFD, which both drivers put in place
-  of a byte that is not UTF-8. `SqliteExecutor`'s documentation lists each
-  way the drivers differ.
+  thread. `open` and `open_in_memory` construct node:sqlite's database
+  (`Database` from Node.js 26.11.0, `DatabaseSync` before) with SQLite's
+  defensive flag off, as a native connection has it, and give it the native
+  connections' session settings. A host that built a database itself, a
+  node:sqlite database or a better-sqlite3 `Database`, hands it to
+  `SqliteStorageEngine::from_database`, which keeps the host's session
+  settings, its defensive flag among them, and refuses a database the
+  executor cannot read exactly. Among those is a database whose node:sqlite
+  skips a numbered parameter as it binds a call's values, as node:sqlite
+  does before Node.js 22.20.0 on 22 and 24.7.0 on 24: the executor binds
+  one and reads it back, whatever the release. The executor reads each
+  query's rows through a typed reader, a WITH clause that nests the query
+  and reads each value with its storage class; a query that the reader
+  would read otherwise than rusqlite does is refused before it runs, except
+  in the cases `SqliteExecutor`'s documentation lists, such as a virtual
+  table's REAL column that returns an INTEGER. A PRAGMA or an EXPLAIN, which
+  SQLite does not nest, is the exception: its TEXT is read as the driver's
+  string, and refused after it runs if it holds U+FFFD, which both drivers
+  put in place of a byte that is not UTF-8. `SqliteExecutor`'s
+  documentation lists each way the drivers differ.
 
 Every driver's errors are typed. Natively they are rusqlite's, as
 `SqliteError::Rusqlite`. On Node.js an error SQLite raised is a

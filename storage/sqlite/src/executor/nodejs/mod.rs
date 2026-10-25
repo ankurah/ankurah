@@ -4,7 +4,8 @@
 //!
 //! An Ankurah node built for wasm32 and run inside Node.js (a VS Code
 //! extension host, an Electron main process, a JavaScript CLI) has no
-//! IndexedDB and no native library, but Node.js ships SQLite as
+//! IndexedDB, and its WASM cannot link SQLite as rusqlite does, but it can
+//! call a SQLite driver the host provides: Node.js ships SQLite as
 //! `node:sqlite`. The executor drives a `DatabaseSync`-shaped JavaScript
 //! object: `exec(sql)`, and `prepare(sql)`, giving statements with
 //! `run(...params)`, `get(...params)`, `all(...params)`, `columns()`,

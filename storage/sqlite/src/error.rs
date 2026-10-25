@@ -118,11 +118,19 @@ impl SqliteError {
     /// `FromSqlConversionFailure` for TEXT that is not UTF-8. On Node.js it
     /// answers the refusal the executor raised.
     ///
-    /// `None` for every other error. That includes a call that passes too
-    /// many values (see `sqlite_code`), on better-sqlite3 a call that passes
-    /// too few, which better-sqlite3 refuses itself, as a JavaScript
-    /// exception, and natively SQL that holds no statement, which SQLite
-    /// refuses itself (see `sqlite_code`).
+    /// `None` for every other error, a call that passes too many values among
+    /// them (see `sqlite_code`).
+    ///
+    /// It answers the same on every driver except in three cases:
+    /// - a call that passes too few values: better-sqlite3 refuses it itself,
+    ///   as a JavaScript exception, so `refusal` is `None` there;
+    /// - SQL that holds no statement: [`Refusal::NoStatement`] on Node.js,
+    ///   and `None` natively, where SQLite refuses it itself (see
+    ///   `sqlite_code`);
+    /// - TEXT that is not UTF-8 in a row of a PRAGMA or an EXPLAIN:
+    ///   [`Refusal::TextNotUtf8`] natively, and
+    ///   [`Refusal::ReplacementCharacter`] on Node.js, whose drivers hand such
+    ///   TEXT over with U+FFFD in place of each byte that is not UTF-8.
     pub fn refusal(&self) -> Option<Refusal> {
         match self {
             #[cfg(not(target_arch = "wasm32"))]
@@ -166,8 +174,10 @@ const NODE_JS_RELEASES: &str = "Node.js 22.20.0 or later on 22, 24.7.0 or later 
 /// [`SqliteError::refusal`] answers, on every driver.
 ///
 /// The first four are rusqlite's own refusals, which the Node.js executor
-/// makes as rusqlite does and in rusqlite's words, so that each reads the
-/// same on every driver. Only the Node.js executor makes the others.
+/// makes as rusqlite does and in rusqlite's words, but for `TooFewValues`,
+/// which cannot name the count of parameters its statement takes; natively,
+/// `SqliteError::Rusqlite` displays each after "SQLite error: ". Only the
+/// Node.js executor makes the others.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum Refusal {
     /// SQL that holds a second statement, refused before SQLite prepares
