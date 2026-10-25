@@ -70,11 +70,11 @@ async fn a_local_entity_the_account_does_not_list_holds_readiness_until_the_resp
     let extras: BTreeSet<_> = outstanding(&node, &mut target).await?.extras.into_iter().map(|(id, _)| id).collect();
     assert_eq!(extras, BTreeSet::from([held.entity_id, gone.entity_id]));
     let named = HashSet::from([held.entity_id, gone.entity_id]);
-    let held_head = proto::KnownEntity { entity_id: held.entity_id, head: head(&held) };
+    let held_head = EntityHead { entity_id: held.entity_id, head: head(&held) };
     target.synced(&named, vec![held_head], vec![gone.entity_id])?;
     assert!(outstanding(&node, &mut target).await?.is_empty(), "covering the held head and an unavailable entity both settle");
 
-    let stray = proto::KnownEntity { entity_id: EntityId::random(), head: proto::Clock::default() };
+    let stray = EntityHead { entity_id: EntityId::random(), head: proto::Clock::default() };
     assert!(target.synced(&named, vec![stray], vec![]).is_err(), "an answer may name only what its request named");
     Ok(())
 }

@@ -9,7 +9,7 @@ use crate::{
     storage::StorageEngine,
 };
 use ankurah_digest_tree::leaf_address;
-use ankurah_proto::{Clock, EntityId, KnownEntity, KnownState, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory, TreeSpec};
+use ankurah_proto::{Clock, EntityHead, EntityId, KnownState, SpanContent, TreeSpan, TreeSpanDigest, TreeSpanInventory, TreeSpec};
 use anyhow::ensure;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -143,7 +143,7 @@ impl Target {
     /// covering it covers the older one; a held head of an entity the account
     /// does not list settles it once covered; and an unavailable entity is no
     /// longer waited for.
-    pub(super) fn synced(&mut self, named: &HashSet<EntityId>, held: Vec<KnownEntity>, unavailable: Vec<EntityId>) -> anyhow::Result<()> {
+    pub(super) fn synced(&mut self, named: &HashSet<EntityId>, held: Vec<EntityHead>, unavailable: Vec<EntityId>) -> anyhow::Result<()> {
         ensure!(
             held.iter().map(|entity| &entity.entity_id).chain(&unavailable).all(|id| named.contains(id)),
             "an EntitiesSynced answer names an entity its request did not"

@@ -99,7 +99,7 @@ pub(crate) async fn sync_entities<SE, PA>(
     node: &Node<SE, PA>,
     peer: proto::EntityId,
     selection: Selection<Resolved>,
-    entities: Vec<proto::KnownEntity>,
+    entities: Vec<proto::EntityHead>,
     credentials: Vec<PA::ContextData>,
 ) -> anyhow::Result<proto::NodeResponseBody>
 where
@@ -118,9 +118,9 @@ where
     for ((entity_id, known), repair) in entities.into_iter().zip(repairs) {
         match repair {
             CurrentStateRepair::Denied => unavailable.push(entity_id),
-            CurrentStateRepair::Current => held.push(proto::KnownEntity { entity_id, head: known.unwrap_or_default() }),
+            CurrentStateRepair::Current => held.push(proto::EntityHead { entity_id, head: known.unwrap_or_default() }),
             CurrentStateRepair::Delta { head, delta } => {
-                held.push(proto::KnownEntity { entity_id, head });
+                held.push(proto::EntityHead { entity_id, head });
                 push.add(node, delta)?;
             }
         }

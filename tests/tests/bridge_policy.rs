@@ -306,7 +306,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
             },
             proto::NodeRequestBody::SyncEntities {
                 selection: selection.clone(),
-                entities: vec![proto::KnownEntity { entity_id, head: known_head.clone() }],
+                entities: vec![proto::EntityHead { entity_id, head: known_head.clone() }],
             },
         ];
         for request in requests {

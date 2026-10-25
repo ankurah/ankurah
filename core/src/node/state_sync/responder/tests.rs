@@ -160,7 +160,7 @@ async fn entity_repairs_push_what_is_behind_and_report_held_heads_and_unavailabl
     let edit = labeled(Some(&behind), "edited")?;
     apply(&node, &edit).await?;
     let unknown = labeled(None, "never committed")?;
-    let known = |event: &proto::Event, head: proto::Clock| proto::KnownEntity { entity_id: event.entity_id, head };
+    let known = |event: &proto::Event, head: proto::Clock| proto::EntityHead { entity_id: event.entity_id, head };
 
     let response = sync_entities(
         &node,
@@ -193,10 +193,10 @@ async fn entity_repairs_push_what_is_behind_and_report_held_heads_and_unavailabl
 async fn an_entity_repair_names_at_most_a_page_of_entities_each_once() -> anyhow::Result<()> {
     let node = durable().await?;
     let (peer, _messages) = recording_peer(&node).await?;
-    let entity = proto::KnownEntity { entity_id: proto::EntityId::random(), head: proto::Clock::default() };
+    let entity = proto::EntityHead { entity_id: proto::EntityId::random(), head: proto::Clock::default() };
     let twice = vec![entity.clone(), entity];
     assert!(sync_entities(&node, peer, members(), twice, vec![]).await.is_err(), "an entity named twice");
-    let many = (0..=MAX_PAGE_HEADS).map(|_| proto::KnownEntity { entity_id: proto::EntityId::random(), head: proto::Clock::default() });
+    let many = (0..=MAX_PAGE_HEADS).map(|_| proto::EntityHead { entity_id: proto::EntityId::random(), head: proto::Clock::default() });
     assert!(sync_entities(&node, peer, members(), many.collect(), vec![]).await.is_err(), "more than a page");
     Ok(())
 }

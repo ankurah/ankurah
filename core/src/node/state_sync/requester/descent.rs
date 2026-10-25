@@ -142,7 +142,7 @@ where
         for page in entities.chunks(MAX_PAGE_HEADS) {
             let named: HashSet<_> = page.iter().map(|(id, _)| *id).collect();
             let entities =
-                page.iter().map(|(id, head)| proto::KnownEntity { entity_id: *id, head: head.clone().unwrap_or_default() }).collect();
+                page.iter().map(|(id, head)| proto::EntityHead { entity_id: *id, head: head.clone().unwrap_or_default() }).collect();
             match self.ask(proto::NodeRequestBody::SyncEntities { selection: self.selection.clone(), entities }).await? {
                 None => return Ok(()),
                 Some(proto::NodeResponseBody::EntitiesSynced { held, unavailable }) => target.synced(&named, held, unavailable)?,

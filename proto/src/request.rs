@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState, EventFragment,
-    EventId, KnownState, RegisterModel, RegisteredModel, SpanAnswer, SpanQuestion, StateFragment, TreeSpec,
+    auth::Attested, clock::Clock, data::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityHead, EntityState,
+    EventFragment, EventId, KnownState, RegisterModel, RegisteredModel, SpanAnswer, SpanQuestion, StateFragment, TreeSpec,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -28,14 +28,6 @@ pub struct NodeRequest {
     pub to: EntityId,
     pub from: EntityId,
     pub body: NodeRequestBody,
-}
-
-/// An entity and the head its sender holds of it; an empty head means the sender
-/// holds none.
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct KnownEntity {
-    pub entity_id: EntityId,
-    pub head: Clock,
 }
 
 /// Causal relation between two clocks: `subject` (local) vs `other`.
@@ -165,8 +157,9 @@ pub enum NodeRequestBody {
     /// request is a credentialless catalog read.
     SyncEntities {
         selection: ast::Selection<ast::Resolved>,
-        /// At most `MAX_PAGE_HEADS` entities.
-        entities: Vec<KnownEntity>,
+        /// At most `MAX_PAGE_HEADS` entities, each with the head the requester holds
+        /// of it; an empty head means the requester holds none.
+        entities: Vec<EntityHead>,
     },
     /// Register one model's schema: an UPSERT the durable node
     /// executes under a process-local mutex. Carries everything the durable
@@ -217,7 +210,7 @@ pub enum NodeResponseBody {
     /// unless the requester's head already equals it; and the entities it holds no
     /// readable state of.
     EntitiesSynced {
-        held: Vec<KnownEntity>,
+        held: Vec<EntityHead>,
         unavailable: Vec<EntityId>,
     },
     /// The resolved schema, with build ids echoed for descriptor binding.
