@@ -44,7 +44,7 @@ fn verify(original: Vec<KeyedEntityHead>) {
     for head in json.to_vec() {
         let view = cursor.next().unwrap();
         assert_eq!(view.key, head.key);
-        assert!(view.entity.head.equals(&head.entity.head));
+        assert_eq!(view.entity.head.to_owned(), head.entity.head);
     }
     assert!(cursor.next().is_none());
 }
@@ -76,17 +76,25 @@ fn plain_fallback_and_prefix_choice_use_actual_encoded_size() {
     assert_eq!(cursor.next().unwrap().key, b"a long shared prefix/two");
 }
 
-fn raw_clock(entries: &[(usize, u8)], mode: u8) -> Vec<u8> {
-    let mut out = vec![mode, 1];
-    if mode == PREFIX {
-        out.push(0);
-    }
-    out.push(0); // empty key
-    out.extend_from_slice(&[9; 32]);
-    codec::put_uint(&mut out, entries.len());
-    for (generation, id) in entries {
-        codec::put_uint(&mut out, *generation);
-        out.extend_from_slice(&[*id; 32]);
+/// A payload of two heads under one eight-byte key, so that sharing it makes the prefix
+/// encoding the smaller. The first head's clock lists `entries` as given; the second's
+/// is empty.
+fn raw_clock(entries: &[(usize, u8)], encoding: u8) -> Vec<u8> {
+    let key = [b'k'; 8];
+    let mut out = vec![encoding, 2];
+    for (n, entries) in [entries, &[]].into_iter().enumerate() {
+        let shared = if encoding == PREFIX && n > 0 { key.len() } else { 0 };
+        if encoding == PREFIX {
+            codec::put_uint(&mut out, shared);
+        }
+        codec::put_uint(&mut out, key.len() - shared);
+        out.extend_from_slice(&key[shared..]);
+        out.extend_from_slice(&[n as u8; 32]);
+        codec::put_uint(&mut out, entries.len());
+        for (generation, id) in entries {
+            codec::put_uint(&mut out, *generation);
+            out.extend_from_slice(&[*id; 32]);
+        }
     }
     out
 }
@@ -96,7 +104,7 @@ fn clocks_must_list_their_tips_in_ascending_event_order() {
     for mode in [PLAIN, PREFIX] {
         let packed = PackedHeads::decode(&raw_clock(&[(1, 1), (7, 2)], mode)).unwrap();
         let expected = Clock::new(vec![(1, EventId::from_bytes([1; 32])), (7, EventId::from_bytes([2; 32]))]).unwrap();
-        assert!(packed.cursor().next().unwrap().entity.head.equals(&expected));
+        assert_eq!(packed.cursor().next().unwrap().entity.head.to_owned(), expected);
         for entries in [vec![(7, 2), (1, 1)], vec![(1, 1), (1, 1)], vec![(1, 1), (2, 1)], vec![(0, 1)]] {
             assert!(PackedHeads::decode(&raw_clock(&entries, mode)).is_err(), "{entries:?}");
         }
@@ -148,9 +156,9 @@ fn encoding_and_decoding_refuse_more_than_one_inventory_may_carry() {
     assert!(repeated.len() < MAX_OFFER_BYTES);
     assert!(matches!(PackedHeads::decode(&repeated), Err(InventoryError::ExceedsLimit(_))));
     assert!(matches!(PackedHeads::try_from(keyed_heads(&vec![vec![42; 4096]; 128], 0)), Err(InventoryError::ExceedsLimit(_))));
-    assert!(matches!(PackedHeads::decode(&repeated_keys(MAX_OFFER_HEADS + 1, 0)), Err(InventoryError::ExceedsLimit(_))));
+    assert!(matches!(PackedHeads::decode(&repeated_keys(MAX_OFFER_HEADS + 1, 8)), Err(InventoryError::ExceedsLimit(_))));
     assert!(matches!(PackedHeads::try_from(keyed_heads(&vec![vec![]; MAX_OFFER_HEADS + 1], 0)), Err(InventoryError::ExceedsLimit(_))));
-    assert!(PackedHeads::decode(&repeated_keys(MAX_OFFER_HEADS, 0)).is_ok());
+    assert!(PackedHeads::decode(&repeated_keys(MAX_OFFER_HEADS, 8)).is_ok());
     assert!(PackedHeads::decode(&vec![PLAIN; MAX_OFFER_BYTES + 1]).is_err());
 }
 
@@ -171,15 +179,42 @@ fn prefix_sharing_saves_wire_bytes_but_not_work() -> bincode::Result<()> {
 
 #[test]
 fn only_the_plain_and_prefix_encodings_are_accepted() {
-    // One head whose generation is written as four bytes, under tags other than the two defined ones.
+    // A payload valid under the plain tag, retagged with tags other than the two defined ones.
+    let payload = raw_clock(&[(1, 1)], PLAIN);
+    assert!(PackedHeads::decode(&payload).is_ok());
     for tag in [0, 3, 4, 255] {
-        let mut payload = vec![tag, 1, 0];
-        payload.extend_from_slice(&[9; 32]);
-        payload.push(1);
-        payload.extend_from_slice(&u32::MAX.to_le_bytes());
-        payload.extend_from_slice(&[7; 32]);
-        assert!(PackedHeads::decode(&payload).is_err(), "tag {tag}");
+        let retagged = [&[tag], &payload[1..]].concat();
+        assert!(PackedHeads::decode(&retagged).is_err(), "tag {tag}");
     }
+}
+
+#[test]
+fn the_prefix_encoding_is_accepted_only_where_the_writer_would_choose_it() {
+    // The first head shares nothing, so one head costs a byte more under the prefix
+    // encoding; a second head sharing a two-byte key saves that byte back, leaving the
+    // sizes equal; a third makes the prefix encoding the smaller.
+    for count in 1..=3 {
+        let written = packed(keyed_heads(&vec![vec![42; 2]; count], 0));
+        let prefix = PackedHeads::decode(&repeated_keys(count, 2));
+        assert_eq!(prefix.is_ok(), written.bytes[0] == PREFIX, "{count} heads");
+    }
+    let prefix = PackedHeads::decode(&repeated_keys(3, 2)).unwrap();
+    assert!(prefix.bytes.len() < prefix.unshared_bytes);
+}
+
+#[test]
+fn integers_are_read_only_in_their_shortest_form() {
+    let read = |bytes: &[u8]| codec::Reader::new(bytes).uint().ok();
+    // Each marker's smallest value, then the largest value of the shorter form before it.
+    assert_eq!(read(&[251, 251, 0]), Some(251));
+    assert_eq!(read(&[251, 250, 0]), None);
+    assert_eq!(read(&[252, 0, 0, 1, 0]), Some(65536));
+    assert_eq!(read(&[252, 255, 255, 0, 0]), None);
+    assert_eq!(read(&[253, 255, 255, 255, 255, 0, 0, 0, 0]), None);
+    // Within a payload: a valid payload, and the same payload with its head count in three bytes.
+    let payload = raw_clock(&[(1, 1)], PLAIN);
+    assert!(PackedHeads::decode(&payload).is_ok());
+    assert!(PackedHeads::decode(&[&[PLAIN, 251, 2, 0], &payload[2..]].concat()).is_err());
 }
 
 #[test]

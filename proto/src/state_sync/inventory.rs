@@ -92,6 +92,9 @@ pub struct KeyedEntityHead {
 pub struct PackedHeads {
     bytes: Bytes,
     len: usize,
+    /// The bytes these heads occupy with every key written whole. Never less than
+    /// `bytes.len()`: the writer, and the reader that validates a received payload,
+    /// keep the prefix encoding only where it saves bytes.
     unshared_bytes: usize,
 }
 
@@ -121,10 +124,6 @@ impl PackedHeads {
 
     pub fn len(&self) -> usize { self.len }
     pub fn is_empty(&self) -> bool { self.len == 0 }
-
-    /// The bytes these heads would occupy with every key written whole: the work
-    /// they describe, whatever prefix sharing saved on the wire.
-    pub fn unshared_bytes(&self) -> usize { self.unshared_bytes }
 
     /// The bytes prefix sharing saved on the wire.
     pub(crate) fn shared_prefix_bytes(&self) -> u64 { (self.unshared_bytes - self.bytes.len()) as u64 }

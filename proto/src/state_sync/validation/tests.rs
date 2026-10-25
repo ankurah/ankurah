@@ -78,6 +78,44 @@ fn an_offer_counts_its_heads_across_inventories() {
 }
 
 #[test]
+fn an_offer_refuses_inventories_whose_work_together_passes_its_limit() {
+    // Four tips make each head 166 bytes of work, so a thousand heads fit one inventory
+    // under the codec's cap, while two such inventories pass the offer's work limit
+    // with fewer heads in all than its head limit.
+    let clock = Clock::new((1..=4).map(|n| (1, EventId::from_bytes([n; 32]))).collect::<Vec<_>>()).unwrap();
+    let inventory = |bounds, ids: std::ops::Range<u16>| {
+        let heads =
+            ids.map(|n| KeyedEntityHead { key: vec![], entity: EntityHead { entity_id: id(n), head: clock.clone() } }).collect::<Vec<_>>();
+        SpanContent::Heads(TreeSpanInventory { bounds, heads: PackedHeads::try_from(heads).unwrap() })
+    };
+    let split = leaf_address(&[], id(1000));
+    let below = inventory(TreeSpan::new(TreeSpan::all().start, Excluded(split.clone())), 0..1000);
+    let above = inventory(TreeSpan::new(Included(split), Unbounded), 1000..2000);
+    assert!(offer(vec![below.clone()]).validate().is_ok());
+    let error = offer(vec![below, above]).validate().unwrap_err();
+    assert!(error.to_string().contains("work limit"), "{error}");
+}
+
+#[test]
+fn a_page_refuses_work_past_its_limit_that_prefix_sharing_kept_off_the_wire() {
+    // A page of heads under one long key: sharing it keeps the wire bytes small, while
+    // the work counts every key whole.
+    let spec = TreeSpec::new(KeySpec::new(vec![IndexKeyPart::asc(PropertyId::Id, ValueType::String)]), ankql::ast::Predicate::True);
+    let page = |key_len: usize| {
+        let key = CanonicalCodec::encode_nullable(spec.key_spec(), &[Some(Value::String("k".repeat(key_len)))]).unwrap();
+        let heads = (0..MAX_PAGE_HEADS as u16)
+            .map(|n| KeyedEntityHead { key: key.clone(), entity: EntityHead { entity_id: id(n), head: head(1) } })
+            .collect::<Vec<_>>();
+        TreeSpanInventory { bounds: TreeSpan::all(), heads: PackedHeads::try_from(heads).unwrap() }
+    };
+    assert!(page(256).validate_page(&spec).is_ok());
+    let long = page(1024);
+    assert!(bincode::serialized_size(&long).unwrap() < MAX_PAGE_BYTES as u64 / 4);
+    let error = long.validate_page(&spec).unwrap_err();
+    assert!(error.to_string().contains("work limit"), "{error}");
+}
+
+#[test]
 fn a_page_holds_at_most_a_page_of_ordered_heads() {
     let page = |ids: Vec<u16>| inventory(TreeSpan::all(), ids.into_iter());
     assert!(page(vec![1, 2]).validate_page(&spec()).is_ok());
