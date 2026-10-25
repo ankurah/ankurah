@@ -8,7 +8,7 @@ uniffi::setup_scaffolding!();
 
 mod entity_id;
 mod error;
-pub mod key_spec;
+mod key_spec;
 mod model_id;
 mod path;
 mod property_id;
