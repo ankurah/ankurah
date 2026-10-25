@@ -19,7 +19,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use common::{Album, Model, Pet, PetView};
+use common::{empty_offer, Album, GatedConnection, Model, Pet, PetView};
 
 #[tokio::test]
 async fn peer_get_preserves_denial_and_absence_even_with_a_cached_entity() -> Result<()> {
@@ -248,11 +248,11 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     context.resolve_model_id::<Pet>().await?;
     agent.deny_reads.store(true, Ordering::SeqCst);
 
-    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
-    let credentials = Vec::<&'static DefaultContext>::new();
-
+    // Advance one stored row of each catalog model with an idempotent membership
+    // event, to exercise a real bridge. The raw storage write bypasses the commit
+    // path, so it precedes the client's connection, whose catalog subscriptions
+    // admit the server's residents for these selections.
+    let mut rows = Vec::new();
     for label in [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID] {
         let model = ankurah::core::schema::system_model_id(label).unwrap();
         let storage = &server.storage;
@@ -261,44 +261,76 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let mut state = states[0].clone();
         let entity_id = state.payload.entity_id;
         let known_head = state.payload.state.head.clone();
-        // Advance the stored row with an idempotent membership event to exercise a real bridge.
         let update = proto::Event::update(
             entity_id,
             known_head.clone(),
             proto::AuthorId::Unknown,
-            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(
-                ankurah::core::schema::system_model_id(label).unwrap(),
-            ))]),
+            proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]),
         );
-        state.payload.state.head = proto::Clock::singleton(&update);
+        let head = proto::Clock::singleton(&update);
+        state.payload.state.head = head.clone();
         let mut transaction = storage.transaction();
         transaction.set_state(&known_head, &state).await?;
         transaction.add_events(&[Attested::opt(update, None)]).await?;
         assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
         let events = storage.dump_entity_events(entity_id).await?;
         assert!(!events.is_empty());
+        // Bring the server's resident catalog entity up to the stored row, as a commit would.
+        server.fetch_entities_from_local(&Predicate::MemberOf(model).into()).await?;
+        rows.push((label, model, entity_id, known_head, head, events));
+    }
 
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    // Updates for the client stay in the gate, so the test reads what each request pushed.
+    let (_conn, gate) = GatedConnection::new(&server, &client, |message| matches!(message, proto::NodeMessage::Update(_))).await;
+    client.system.wait_system_ready().await.unwrap();
+    let credentials = Vec::<&'static DefaultContext>::new();
+
+    for (label, model, entity_id, known_head, head, events) in rows {
+        // The client's offer lists the row at its old head, so the server bridges from it.
+        let selection: ankql::ast::Selection<ankql::ast::Resolved> = Predicate::MemberOf(model).into();
+        let spec = empty_offer(&selection).spec;
+        let listed = proto::KeyedEntityHead { key: vec![], entity: proto::EntityHead { entity_id, head: known_head.clone() } };
+        let inventory = proto::TreeSpanInventory { bounds: proto::TreeSpan::all(), heads: proto::PackedHeads::try_from(vec![listed])? };
+        let offer = proto::KnownState { spec: spec.clone(), spans: vec![proto::SpanContent::Heads(inventory)] };
+        let query_id = proto::QueryId::new();
         let requests = [
             proto::NodeRequestBody::Get { ids: vec![entity_id] },
             proto::NodeRequestBody::GetEvents { event_ids: events.iter().map(|event| event.payload.id()).collect() },
-            proto::NodeRequestBody::Fetch {
-                selection: Predicate::MemberOf(model).into(),
-                known_matches: vec![proto::KnownEntity { entity_id, head: known_head.clone() }],
+            proto::NodeRequestBody::Fetch { selection: selection.clone(), known_state: offer.clone() },
+            proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version: 1, known_state: offer },
+            proto::NodeRequestBody::CompareSpans {
+                selection: selection.clone(),
+                spec,
+                questions: vec![proto::SpanQuestion::Heads(proto::TreeSpan::all())],
             },
-            proto::NodeRequestBody::SubscribeQuery {
-                query_id: proto::QueryId::new(),
-                selection: Predicate::MemberOf(model).into(),
-                version: 1,
-                known_matches: vec![proto::KnownEntity { entity_id, head: known_head }],
+            proto::NodeRequestBody::SyncEntities {
+                selection: selection.clone(),
+                entities: vec![proto::KnownEntity { entity_id, head: known_head.clone() }],
             },
         ];
         for request in requests {
             match client.request(server.id, &credentials, request).await? {
                 proto::NodeResponseBody::Get(results) => assert!(matches!(results.as_slice(), [proto::GetResult::Found(_)])),
                 proto::NodeResponseBody::GetEvents(received) => assert_eq!(received.len(), events.len()),
-                proto::NodeResponseBody::Fetch(deltas) | proto::NodeResponseBody::QuerySubscribed { deltas, .. } => {
-                    let delta = deltas.iter().find(|delta| delta.entity_id == entity_id).expect("catalog row must be readable");
-                    assert!(matches!(&delta.content, proto::DeltaContent::EventBridge { events } if events.len() == 1), "{delta:?}");
+                proto::NodeResponseBody::Fetch(target) => {
+                    assert!(lists(&target.spans, entity_id, &head), "the account lists the catalog row at its head");
+                    assert_eq!(pushed_bridge(&gate, entity_id).await, vec![], "a Fetch's push belongs to no standing query");
+                }
+                proto::NodeResponseBody::QuerySubscribed { target, .. } => {
+                    assert!(lists(&target.spans, entity_id, &head), "the account lists the catalog row at its head");
+                    let initial = vec![(query_id, proto::MembershipChange::Initial)];
+                    assert_eq!(pushed_bridge(&gate, entity_id).await, initial, "a subscription's push is its initial data");
+                }
+                proto::NodeResponseBody::SpansCompared { answers } => {
+                    let [proto::SpanAnswer::Heads(page)] = answers.as_slice() else { panic!("one page answers one heads question") };
+                    let spans = [proto::SpanContent::Heads(page.clone())];
+                    assert!(lists(&spans, entity_id, &head), "the page lists the catalog row at its head");
+                }
+                proto::NodeResponseBody::EntitiesSynced { held, unavailable } => {
+                    assert!(matches!(held.as_slice(), [held] if held.entity_id == entity_id && held.head == head), "{held:?}");
+                    assert!(unavailable.is_empty());
+                    assert_eq!(pushed_bridge(&gate, entity_id).await, vec![], "a repair's push belongs to no standing query");
                 }
                 response => panic!("catalog read failed for {label}: {response:?}"),
             }
@@ -310,16 +342,53 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         proto::ModelId::System(proto::SystemModel::System),
         proto::ModelId::EntityId(proto::EntityId::random()),
     ] {
-        let response = client
-            .request(
-                server.id,
-                &DEFAULT_CONTEXT,
-                proto::NodeRequestBody::Fetch { selection: Predicate::MemberOf(model).into(), known_matches: vec![] },
-            )
-            .await?;
-        assert!(matches!(response, proto::NodeResponseBody::Error(message) if message.contains("all reads denied")));
+        let selection: ankql::ast::Selection<ankql::ast::Resolved> = Predicate::MemberOf(model).into();
+        let spec = empty_offer(&selection).spec;
+        for request in [
+            proto::NodeRequestBody::Fetch { known_state: empty_offer(&selection), selection: selection.clone() },
+            proto::NodeRequestBody::CompareSpans {
+                selection: selection.clone(),
+                spec,
+                questions: vec![proto::SpanQuestion::Digest(proto::TreeSpan::all())],
+            },
+        ] {
+            let response = client.request(server.id, &DEFAULT_CONTEXT, request).await?;
+            assert!(matches!(response, proto::NodeResponseBody::Error(message) if message.contains("all reads denied")));
+        }
     }
     Ok(())
+}
+
+/// Whether `spans` list `entity_id` at `head`.
+fn lists(spans: &[proto::SpanContent], entity_id: proto::EntityId, head: &proto::Clock) -> bool {
+    spans.iter().any(|span| match span {
+        proto::SpanContent::Heads(inventory) => {
+            inventory.heads.to_vec().iter().any(|listed| listed.entity.entity_id == entity_id && &listed.entity.head == head)
+        }
+        proto::SpanContent::Digest(_) => false,
+    })
+}
+
+/// Wait for the gate to hold a push of a one-event bridge to `entity_id`, and
+/// return the push's predicate relevance. The client's own catalog
+/// subscription pushes the row's state, never a bridge.
+async fn pushed_bridge(gate: &common::MessageGate, entity_id: proto::EntityId) -> Vec<(proto::QueryId, proto::MembershipChange)> {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            for message in gate.take_held() {
+                let proto::NodeMessage::Update(update) = message else { continue };
+                let proto::NodeUpdateBody::SubscriptionUpdate { items } = update.body;
+                for item in items.into_iter().filter(|item| item.entity_id == entity_id) {
+                    if matches!(&item.content, proto::UpdateContent::EventOnly(events) if events.len() == 1) {
+                        return item.predicate_relevance;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the server pushes a bridge to the catalog row")
 }
 
 /// Receive side: EventBridge events must pass validate_received_event like
@@ -339,7 +408,8 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 
     let pet_id = {
         let trx = ctx_s.begin();
-        let pet = trx.create(&Pet { name: "bridge-validate".to_string(), age: "1".to_string() }).await?;
+        // A state larger than the edits' events, so the re-fetch is served by a bridge.
+        let pet = trx.create(&Pet { name: "bridge-validate".repeat(256), age: "1".to_string() }).await?;
         let id = pet.id();
         trx.commit().await?;
         id
@@ -391,7 +461,8 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
 
     let pet_id = {
         let trx = ctx_s.begin();
-        let pet = trx.create(&Pet { name: "bridge-redact".to_string(), age: "1".to_string() }).await?;
+        // A state larger than the edits' events, so that only suppression keeps a bridge from serving the re-fetch.
+        let pet = trx.create(&Pet { name: "bridge-redact".repeat(256), age: "1".to_string() }).await?;
         let id = pet.id();
         trx.commit().await?;
         id
@@ -417,8 +488,9 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     // Re-fetch: the bridge would need the denied event, so it must be
     // suppressed entirely. The snapshot fallback arrives but cannot be
     // lineage-verified without the hidden event, so the client refuses it
-    // (the fetch surfaces the per-item failure) rather than adopting
-    // unverifiable state.
+    // rather than adopting unverifiable state; its copy never reaches the
+    // server's account, and the fetch fails once comparing again brings no
+    // progress.
     let refetch = ctx_c.fetch::<PetView>(query.as_str()).await;
     assert!(refetch.is_err(), "client must not silently adopt state whose lineage it cannot verify, got {refetch:?}");
 

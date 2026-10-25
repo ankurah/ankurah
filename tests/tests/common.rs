@@ -49,6 +49,14 @@ pub struct Record {
     pub artist: String,
 }
 
+/// An offer that knows nothing of `selection`'s result, for a raw Fetch or
+/// SubscribeQuery: the responder pushes every member.
+#[allow(unused)]
+pub fn empty_offer(selection: &ankql::ast::Selection<ankql::ast::Resolved>) -> proto::KnownState {
+    let spec = proto::TreeSpec::new(ankurah_core_types::KeySpec::new(vec![]), selection.predicate.clone());
+    proto::KnownState { spec, spans: Vec::new() }
+}
+
 // ---------------------------------------------------------------------------
 // GatedConnection: a LocalProcessConnection variant that lets a test hold
 // selected inbound messages to one node and release them on demand. Used to
@@ -84,6 +92,11 @@ pub struct MessageGate {
 }
 
 impl MessageGate {
+    /// Take every held message out of the gate without delivering it, as if
+    /// the connection had lost them.
+    #[allow(unused)]
+    pub fn take_held(&self) -> Vec<proto::NodeMessage> { std::mem::take(&mut *self.held.lock().unwrap()) }
+
     /// Release all currently-held messages back into the gated node, in arrival order.
     pub async fn release_held<SE, PA>(&self, node: &Node<SE, PA>)
     where
