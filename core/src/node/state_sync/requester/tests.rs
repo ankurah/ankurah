@@ -503,3 +503,39 @@ async fn a_member_settles_as_diverged_only_once_a_re_request_finds_it_unchanged_
     assert!(!target.settle_diverged(&found, Instant::now()));
     Ok(())
 }
+
+#[tokio::test]
+async fn a_fetch_registers_on_the_connection_its_request_goes_out_on() -> anyhow::Result<()> {
+    let responder = durable().await?;
+    let requester = node().await?;
+    let held = create(&[&responder], "held").await?;
+    // The opening push is lost, so the Fetch waits for its idle repair.
+    let losing = std::sync::atomic::AtomicBool::new(true);
+    connect_losing(&responder, &requester, move |message| {
+        pushes(message, held.entity_id) && losing.swap(false, std::sync::atomic::Ordering::SeqCst)
+    })
+    .await?;
+    // The peer reconnects while the Fetch reads its offer, so only the new
+    // connection carries its request.
+    let (entered, reading) = tokio::sync::oneshot::channel();
+    let (release, resume) = tokio::sync::oneshot::channel();
+    requester.storage.hold_fetch.lock().unwrap().insert(model(), (entered, resume));
+    let fetching = fetch(&requester, responder.id, members(), vec![]);
+    tokio::pin!(fetching);
+    tokio::select! {
+        _ = &mut fetching => anyhow::bail!("the fetch finished while its offer's read was held"),
+        entered = reading => entered?,
+    }
+    reconnect(&responder, &requester).await?;
+    let _ = release.send(());
+    tokio::select! {
+        _ = &mut fetching => anyhow::bail!("the fetch finished before its repair"),
+        () = tokio::time::sleep(Duration::from_millis(300)) => {}
+    }
+    let connection = requester.peer_connections.get(&responder.id).expect("the peer reconnected");
+    assert!(connection.fetches.credentials().is_some(), "the connection the request went out on admits the Fetch's pushes");
+    drop(connection);
+    tokio::time::timeout(Duration::from_secs(5), fetching).await??;
+    assert_eq!(requester.storage.get_state(held.entity_id).await?.payload.state.head, head(&held));
+    Ok(())
+}

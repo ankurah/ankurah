@@ -195,6 +195,15 @@ pub(super) async fn connect_losing(
     Ok(requests)
 }
 
+/// Connect `requester` to `responder` again, over a new connection, as after
+/// the last one dropped.
+pub(super) async fn reconnect(responder: &TestNode, requester: &TestNode) -> anyhow::Result<()> {
+    requester.deregister_peer(responder.id);
+    let to_responder = Forward { to: responder.weak(), to_id: responder.id, requests: Arc::default(), loses: Arc::new(|_| false) };
+    requester.register_peer(responder.presence().await?, Box::new(to_responder)).await?;
+    Ok(())
+}
+
 /// The spec keyed by entity id alone that admits every entity.
 pub(super) fn spec() -> proto::TreeSpec { proto::TreeSpec::new(KeySpec::new(vec![]), ankql::ast::Predicate::True) }
 

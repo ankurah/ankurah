@@ -75,10 +75,11 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
     let mut sync = QuerySync::new(node, peer, selection, credentials);
     let offer = sync.offer().await?;
-    // Registered before the request goes out: the peer may push before it answers.
+    // Registered on the connection the request goes out on, and before it goes
+    // out: the peer may push before it answers.
+    let connection = node.peer_connections.get(&peer).ok_or(RequestError::PeerNotConnected)?;
     let _in_flight = connection.fetches.register(sync.credentials.clone());
     drop(connection);
     let request = proto::NodeRequestBody::Fetch { selection: sync.selection.clone(), known_state: offer.clone() };
