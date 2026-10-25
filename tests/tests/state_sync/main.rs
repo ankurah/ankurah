@@ -10,11 +10,13 @@ mod fetch;
 mod live;
 mod loss;
 mod pushes;
+mod readiness;
 
 use common::*;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 type Sled = Node<SledStorageEngine, PermissiveAgent>;
@@ -111,4 +113,15 @@ async fn heads(node: &Sled, ids: &[EntityId]) -> anyhow::Result<BTreeMap<EntityI
         heads.insert(*id, node.storage.get_state(*id).await?.payload.state.head);
     }
     Ok(heads)
+}
+
+/// Wait until `condition` holds, failing with `what` after ten seconds.
+async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let held = tokio::time::timeout(Duration::from_secs(10), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    assert!(held.is_ok(), "{what}");
 }
