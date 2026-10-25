@@ -4,7 +4,7 @@ use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, Mode
 use std::{
     collections::BTreeMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Mutex,
     },
 };
@@ -20,6 +20,8 @@ pub(crate) struct TestStorage {
     pub hold_commit: Mutex<Option<Pause>>,
     pub hold_after_commit: Mutex<Option<Pause>>,
     pub reject_state_read: Mutex<Option<EntityId>>,
+    /// How many reads of events storage has answered.
+    pub event_reads: AtomicUsize,
     fail_next_commit: AtomicBool,
 }
 
@@ -170,6 +172,7 @@ impl StorageEngine for TestStorage {
     }
 
     async fn get_events(&self, ids: Vec<EventId>) -> Result<Vec<Attested<Event>>, RetrievalError> {
+        self.event_reads.fetch_add(1, Ordering::Relaxed);
         let data = self.data.lock().unwrap();
         Ok(ids.into_iter().filter_map(|id| data.events.get(&id).cloned()).collect())
     }

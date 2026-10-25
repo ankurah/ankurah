@@ -539,3 +539,50 @@ async fn a_fetch_registers_on_the_connection_its_request_goes_out_on() -> anyhow
     assert_eq!(requester.storage.get_state(held.entity_id).await?.payload.state.head, head(&held));
     Ok(())
 }
+
+/// Store `events` in `node`'s storage without applying them to any entity.
+async fn store_events(node: &TestNode, events: &[&proto::Event]) -> anyhow::Result<()> {
+    use crate::storage::{StorageEngine, StorageTransaction};
+    let mut transaction = node.storage.transaction();
+    transaction.add_events(&events.iter().map(|event| proto::Attested::from((*event).clone())).collect::<Vec<_>>()).await?;
+    transaction.commit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_copy_found_short_of_a_head_is_not_judged_again_until_it_moves() -> anyhow::Result<()> {
+    let node = durable().await?;
+    let older = create(&[&node], "older").await?;
+    // The newer head's event is stored but unapplied, so a walk of history
+    // settles that the copy is older.
+    let newer = labeled(Some(&older), "newer")?;
+    store_events(&node, &[&newer]).await?;
+    let mut target = Target::new(account(&[(older.entity_id, head(&newer))])?)?;
+
+    assert_eq!(outstanding(&node, &mut target).await?.heads.len(), 1);
+    let reads = node.storage.event_reads.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(outstanding(&node, &mut target).await?.heads.len(), 1);
+    assert_eq!(node.storage.event_reads.load(std::sync::atomic::Ordering::Relaxed), reads, "the unmoved copy is not walked again");
+    apply(&node, &newer).await?;
+    assert!(outstanding(&node, &mut target).await?.is_empty(), "once the copy moves, it is judged again");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_copy_whose_history_is_missing_is_judged_again_once_it_arrives() -> anyhow::Result<()> {
+    // Elsewhere the member reached a newer head; this node takes that state
+    // before the event behind it.
+    let elsewhere = durable().await?;
+    let genesis = create(&[&elsewhere], "first").await?;
+    let newer = labeled(Some(&genesis), "newer")?;
+    apply(&elsewhere, &newer).await?;
+    let node = durable().await?;
+    node.storage.set_state(elsewhere.storage.get_state(genesis.entity_id).await?);
+    store_events(&node, &[&genesis]).await?;
+    let mut target = Target::new(account(&[(genesis.entity_id, head(&genesis))])?)?;
+
+    assert_eq!(outstanding(&node, &mut target).await?.heads.len(), 1, "missing history proves no coverage yet");
+    store_events(&node, &[&newer]).await?;
+    assert!(outstanding(&node, &mut target).await?.is_empty(), "the copy at the same head covers once its history arrives");
+    Ok(())
+}

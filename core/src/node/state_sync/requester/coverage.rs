@@ -18,26 +18,42 @@ use std::collections::HashMap;
 /// readiness settles it as diverged.
 const COVERAGE_BUDGET: usize = 256;
 
+/// What one walk of local history found of whether a local head covers a
+/// responder's head.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Covers {
+    /// The local head is that head, or descends from it.
+    Yes,
+    /// It does not, or the walk ran past its budget: either holds until one
+    /// of the heads moves.
+    No,
+    /// History the walk needs is missing locally, and may arrive later.
+    Unknown,
+}
+
 /// Whether `local` covers `target`: it is that head or descends from it.
-pub(super) async fn covers<SE, PA>(node: &Node<SE, PA>, local: &Clock, target: &Clock) -> anyhow::Result<bool>
+pub(super) async fn covers<SE, PA>(node: &Node<SE, PA>, local: &Clock, target: &Clock) -> anyhow::Result<Covers>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
     if local == target || target.entries().iter().all(|entry| local.entries().contains(entry)) {
-        return Ok(true);
+        return Ok(Covers::Yes);
     }
     if local.is_empty() {
-        return Ok(false);
+        return Ok(Covers::No);
     }
     let relation = match compare(LocalEventGetter::new(node.storage.clone(), node.durable), local, target, COVERAGE_BUDGET).await {
         Ok(relation) => relation,
         // A newer state can arrive before the events behind it. Missing local
         // history proves neither coverage nor an invalid account.
-        Err(RetrievalError::EventNotFound(_)) => return Ok(false),
+        Err(RetrievalError::EventNotFound(_)) => return Ok(Covers::Unknown),
         Err(error) => return Err(error.into()),
     };
-    Ok(matches!(relation.relation, AbstractCausalRelation::Equal | AbstractCausalRelation::StrictDescends { .. }))
+    Ok(match relation.relation {
+        AbstractCausalRelation::Equal | AbstractCausalRelation::StrictDescends { .. } => Covers::Yes,
+        _ => Covers::No,
+    })
 }
 
 /// This node's head of each of `ids` it holds: a resident entity's, or else

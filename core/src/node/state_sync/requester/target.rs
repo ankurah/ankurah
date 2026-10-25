@@ -2,7 +2,7 @@
 //! response that opened its query and from span answers since, and readiness:
 //! whether the requester's copy matches or exceeds it.
 
-use super::coverage::{covers, local_heads};
+use super::coverage::{covers, local_heads, Covers};
 use crate::{
     node::{state_sync::tree::Snapshot, Node},
     policy::PolicyAgent,
@@ -26,19 +26,50 @@ pub(super) struct Target {
     listed: HashSet<EntityId>,
     /// The responder heads seen in the account's inventories and pages that
     /// the copy does not cover yet, each with the entity's address.
-    uncovered: BTreeMap<EntityId, (Vec<u8>, Clock)>,
+    uncovered: BTreeMap<EntityId, (Vec<u8>, AwaitedHead)>,
     /// Entities the responder holds no readable state of, which the requester
     /// stops waiting for.
     unavailable: HashSet<EntityId>,
     /// For local entities the account does not list, the head the responder
     /// reported holding of each.
-    held: HashMap<EntityId, Clock>,
+    held: HashMap<EntityId, AwaitedHead>,
     /// For each entity whose head a SyncEntities answer reported, while the
     /// copy held one, the latest such answer.
     answered: HashMap<EntityId, Answered>,
     /// Members settled at the copy's own head, which the responder's pushes
     /// keep leaving unchanged: no push brings such a copy level.
     diverged: HashSet<EntityId>,
+}
+
+/// A responder head the copy has yet to cover, and the copy's head last found
+/// short of it, which a later look does not judge again while the copy stays
+/// there.
+struct AwaitedHead {
+    head: Clock,
+    short_at: Option<Clock>,
+}
+
+impl AwaitedHead {
+    fn new(head: Clock) -> Self { Self { head, short_at: None } }
+
+    /// Whether `local`, the copy's head, covers this head.
+    async fn covered_by<SE, PA>(&mut self, node: &Node<SE, PA>, local: &Clock) -> anyhow::Result<bool>
+    where
+        SE: StorageEngine + Send + Sync + 'static,
+        PA: PolicyAgent + Send + Sync + 'static,
+    {
+        if self.short_at.as_ref() == Some(local) {
+            return Ok(false);
+        }
+        Ok(match covers(node, local, &self.head).await? {
+            Covers::Yes => true,
+            Covers::No => {
+                self.short_at = Some(local.clone());
+                false
+            }
+            Covers::Unknown => false,
+        })
+    }
 }
 
 /// An EntitiesSynced answer's report of one entity that its request named.
@@ -147,7 +178,8 @@ impl Target {
         while let Some(head) = cursor.next() {
             self.listed.insert(head.entity.entity_id);
             if !self.diverged.contains(&head.entity.entity_id) {
-                self.uncovered.insert(head.entity.entity_id, (leaf_address(head.key, head.entity.entity_id), head.entity.head.to_owned()));
+                let awaited = AwaitedHead::new(head.entity.head.to_owned());
+                self.uncovered.insert(head.entity.entity_id, (leaf_address(head.key, head.entity.entity_id), awaited));
             }
         }
         Region::Listed(inventory.bounds)
@@ -203,9 +235,9 @@ impl Target {
                 self.answered.insert(entity.entity_id, Answered { named: local.clone(), held: entity.head.clone(), at, repeated });
             }
             match self.uncovered.get_mut(&entity.entity_id) {
-                Some((_, head)) => *head = entity.head,
+                Some((_, awaited)) => *awaited = AwaitedHead::new(entity.head),
                 None => {
-                    self.held.insert(entity.entity_id, entity.head);
+                    self.held.insert(entity.entity_id, AwaitedHead::new(entity.head));
                 }
             }
         }
@@ -231,9 +263,9 @@ impl Target {
         let mut heads = local_heads(node, outside).await?;
         heads.extend(self.uncovered.keys().filter_map(|id| snapshot.entries.get(id).map(|entry| (*id, entry.head.clone()))));
         let mut covered = Vec::new();
-        for (id, (address, head)) in &self.uncovered {
+        for (id, (address, awaited)) in &mut self.uncovered {
             match heads.remove(id) {
-                Some(local) if covers(node, &local, head).await? => covered.push(*id),
+                Some(local) if awaited.covered_by(node, &local).await? => covered.push(*id),
                 local => outstanding.heads.push(UncoveredHead { entity_id: *id, address: address.clone(), local }),
             }
         }
@@ -258,8 +290,8 @@ impl Target {
                         if self.listed.contains(&id) || self.unavailable.contains(&id) || self.diverged.contains(&id) {
                             continue;
                         }
-                        let settled = match self.held.get(&id) {
-                            Some(held) => covers(node, &entry.head, held).await?,
+                        let settled = match self.held.get_mut(&id) {
+                            Some(held) => held.covered_by(node, &entry.head).await?,
                             None => false,
                         };
                         if !settled {
