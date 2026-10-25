@@ -540,9 +540,17 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         }
     }
 
-    /// Run established query `query_id`'s periodic check now, whatever its schedule.
+    /// Run every established query's periodic check now, whatever its schedule.
     #[cfg(feature = "test-helpers")]
-    pub(crate) async fn check_now(&self, query_id: proto::QueryId) { self.check(query_id).await }
+    pub(crate) async fn check_all_now(&self) {
+        let established: Vec<_> = {
+            let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
+            subscriptions.iter().filter(|(_, state)| state.check.is_some()).map(|(id, _)| *id).collect()
+        };
+        for query_id in established {
+            self.check(query_id).await;
+        }
+    }
 
     /// Handle errors with retry logic
     fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::EntityId, error: RetrievalError, cancel: &CancelFlag) {

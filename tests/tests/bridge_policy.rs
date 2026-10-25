@@ -359,6 +359,45 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_catalog_live_query_repairs_lost_rows_without_credentials() -> Result<()> {
+    let agent = BridgePolicyAgent::new();
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    server.system.create().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    // While set, every update to the client is lost.
+    let lose = Arc::new(AtomicBool::new(false));
+    let (_conn, _gate) = {
+        let lose = lose.clone();
+        GatedConnection::new(&server, &client, move |message| {
+            lose.load(Ordering::SeqCst) && matches!(message, proto::NodeMessage::Update(_))
+        })
+        .await
+    };
+    client.wait_ready().await?;
+    agent.deny_reads.store(true, Ordering::SeqCst);
+
+    // Registering a model pushes its catalog rows to the client's catalog queries, and they are lost.
+    lose.store(true, Ordering::SeqCst);
+    let model = server.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<Album>().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    lose.store(false, Ordering::SeqCst);
+    assert_eq!(client.catalog.model_id_for("album")?, None, "the client's catalog missed the registration");
+
+    // The catalog queries carry no credentials, and their repair bypasses the deny-all policy.
+    client.check_remote_queries_now().await;
+    client.check_remote_queries_now().await;
+    let repaired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while client.catalog.model_id_for("album").ok().flatten().is_none() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(repaired.is_ok(), "two disagreeing checks repaired the client's catalog");
+    assert_eq!(client.catalog.model_id_for("album")?, Some(model));
+    Ok(())
+}
+
 /// Whether `spans` list `entity_id` at `head`.
 fn lists(spans: &[proto::SpanContent], entity_id: proto::EntityId, head: &proto::Clock) -> bool {
     spans.iter().any(|span| match span {

@@ -826,6 +826,20 @@ where
     #[cfg(feature = "test-helpers")]
     pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.durable_peers.insert(peer_id); }
 
+    /// TEST ONLY: Run the periodic check of every established remote query
+    /// now, whatever its schedule.
+    ///
+    /// Lets tests drive the checks that repair a live query's lost pushes
+    /// without waiting out the schedule's thirty seconds.
+    ///
+    /// Requires the `test-helpers` feature to be enabled.
+    #[cfg(feature = "test-helpers")]
+    pub async fn check_remote_queries_now(&self) {
+        if let Some(relay) = &self.subscription_relay {
+            relay.check_all_now().await;
+        }
+    }
+
     /// TEST ONLY: Observe the session registry — the current credential
     /// of every session backing a context on this node, in the
     /// registry's union order. Values, not handles: observation cannot
