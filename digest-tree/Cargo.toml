@@ -47,7 +47,11 @@ tempfile = "3.23"
 # its test-support feature.
 ankurah-digest-tree = { path = ".", features = ["test-support"] }
 # The tests await the tree's operations.
-tokio = { version = "1.40", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { version = "1.40", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+] }
 # The tests consume scans of a view's members with StreamExt and TryStreamExt.
 futures = "0.3"
 
