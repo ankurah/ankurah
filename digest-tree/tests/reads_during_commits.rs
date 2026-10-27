@@ -170,5 +170,6 @@ async fn a_commit_completes_while_a_range_read_is_half_consumed() {
 
     let changed = [3, 5, 30, 64, 200, 250, 1000];
     let kept: Vec<u64> = read.iter().map(|leaf| leaf.id.0).filter(|id| !changed.contains(id)).collect();
+
     assert_eq!(kept, (0..300).filter(|n| !changed.contains(n)).collect::<Vec<_>>(), "every member left in place, once and in order");
 }

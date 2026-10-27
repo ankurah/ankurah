@@ -76,6 +76,7 @@ async fn a_range_read_stopped_early_reads_only_the_batches_it_yields_from() {
 
     for (stopped_after, rows) in [(3, 65), (65, 65 + 129), (2000, 65 + 129 + 257 + 513 + 1025 + 1025)] {
         let before = store.rows_read();
+
         let read: Vec<Id> =
             tree.view().range(ScanRange::forward(Span::all())).take(stopped_after).map_ok(|leaf| leaf.id).try_collect().await.unwrap();
 
@@ -99,6 +100,7 @@ async fn a_failed_read_ends_the_stream_after_yielding_its_failure() {
     }
 
     store.fail_reads(true);
+
     match scan.next().await {
         Some(Err(Error::Store(failure))) => assert!(failure.is_retryable()),
         other => panic!("expected the store's failure, got {other:?}"),
