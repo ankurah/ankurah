@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::ops::Bound;
 
 use super::rows::StagedRows;
-use super::trie::{Node, Trie, BUCKET_CAPACITY, MERGE_AT};
+use super::trie::{Node, Trie, BUCKET_CAPACITY};
 use super::DigestTree;
 use crate::digest::leaf_encoding;
 use crate::span::split_address;
@@ -147,7 +147,7 @@ fn check_digests<'a, G: DigestGroup>(
         }
 
         let fits = match has_children[index] {
-            true => sum.count() > MERGE_AT,
+            true => sum.count() > BUCKET_CAPACITY,
             false => sum.count() <= BUCKET_CAPACITY,
         };
 

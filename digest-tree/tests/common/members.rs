@@ -35,58 +35,124 @@ impl Encode for Tag {
     fn decode(bytes: &[u8]) -> Result<Self, StoreError> { Ok(Tag(bytes.to_vec())) }
 }
 
-/// The order of one key part's values: the tests' stand-in for an index key
-/// part's direction.
+/// The direction of one key part's values: the tests' stand-in for core's
+/// `IndexDirection`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Order {
+pub enum IndexDirection {
     /// Smallest first.
-    Ascending,
+    Asc,
 
     /// Largest first.
-    Descending,
+    Desc,
 }
 
-/// The tests' stand-in for an owner's key spec: the order of each part of a
-/// key, the most significant first. Members make their keys from it; the
-/// tree only stores it and hands it to them.
+/// One part of a key spec: the tests' stand-in for core's `IndexKeyPart`, a
+/// name and a direction. The stand-in collation takes integers alone, so a
+/// part names no value type, and its name only says what the part holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Spec(pub Vec<Order>);
+pub struct IndexKeyPart {
+    pub key: String,
+    pub direction: IndexDirection,
+}
 
-/// A spec's encoding: one byte per part, `0` for ascending and `1` for
-/// descending.
-impl Encode for Spec {
-    fn encode(&self) -> Vec<u8> { self.0.iter().map(|order| u8::from(*order == Order::Descending)).collect() }
+impl IndexKeyPart {
+    pub fn asc(key: impl Into<String>) -> Self { Self { key: key.into(), direction: IndexDirection::Asc } }
 
-    fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
-        let order = |byte: &u8| match byte {
-            0 => Ok(Order::Ascending),
-            1 => Ok(Order::Descending),
-            _ => Err(StoreError::permanent("a key part's order is 0 or 1")),
-        };
+    pub fn desc(key: impl Into<String>) -> Self { Self { key: key.into(), direction: IndexDirection::Desc } }
+}
 
-        bytes.iter().map(order).collect::<Result<_, _>>().map(Spec)
+/// An ascending key part, as the planner's tests write one: `asc!("year")`.
+macro_rules! asc {
+    ($key:expr) => {
+        $crate::common::IndexKeyPart::asc($key)
+    };
+}
+
+/// A descending key part: `desc!("year")`.
+macro_rules! desc {
+    ($key:expr) => {
+        $crate::common::IndexKeyPart::desc($key)
+    };
+}
+
+pub(crate) use {asc, desc};
+
+/// The tests' stand-in for an owner's key spec, core's `KeySpec`: its parts,
+/// the most significant first. Members make their keys with it; the tree
+/// only stores it and hands it to them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeySpec {
+    pub keyparts: Vec<IndexKeyPart>,
+}
+
+impl KeySpec {
+    pub fn new(keyparts: Vec<IndexKeyPart>) -> Self { Self { keyparts } }
+
+    /// The bytes of `values` under the spec, the tests' stand-in for core's
+    /// `encode_tuple_values_with_key_spec`: each value collated in its
+    /// part's direction, the first part's first, and `None` a missing value.
+    /// Fewer values than parts give a key's leading parts, as a range's bound
+    /// takes them.
+    ///
+    /// A present value is `0x01` and its big-endian bytes with the sign bit
+    /// flipped, so values sort as numbers do; a missing value is `0x02`,
+    /// after every present one, as PostgreSQL sorts NULL; and a descending
+    /// part's bytes are inverted, so that it sorts the other way, missing
+    /// values first.
+    pub fn collate(&self, values: impl IntoIterator<Item = impl Into<Option<i64>>>) -> Vec<u8> {
+        self.keyparts.iter().zip(values).flat_map(|(part, value)| collate(value.into(), part.direction)).collect()
     }
 }
 
-/// A spec of these parts.
-pub fn spec(orders: &[Order]) -> Spec { Spec(orders.to_vec()) }
-
-/// One key part's bytes, the tests' stand-in for an owner's collation: a
-/// present value is `0x01` and its big-endian bytes with the sign bit
-/// flipped, so values sort as numbers do; a missing value is `0x02`, after
-/// every present one, as PostgreSQL sorts NULL; and a descending part's bytes
-/// are inverted, so that it sorts the other way, missing values first.
-pub fn key_part(value: Option<i64>, order: Order) -> Vec<u8> {
+/// One value's bytes in `direction`, as [`KeySpec::collate`] describes them.
+fn collate(value: Option<i64>, direction: IndexDirection) -> Vec<u8> {
     let mut bytes = match value {
         Some(value) => [&[0x01][..], &(value as u64 ^ 1 << 63).to_be_bytes()].concat(),
         None => vec![0x02],
     };
 
-    if order == Order::Descending {
+    if direction == IndexDirection::Desc {
         bytes.iter_mut().for_each(|byte| *byte = !*byte);
     }
 
     bytes
+}
+
+/// A spec's encoding: for each part, its direction's byte, `0` ascending and
+/// `1` descending, then its name's length in a byte and the name.
+impl Encode for KeySpec {
+    fn encode(&self) -> Vec<u8> {
+        let part = |part: &IndexKeyPart| {
+            let length = u8::try_from(part.key.len()).expect("a key part's name is under 256 bytes");
+            [&[u8::from(part.direction == IndexDirection::Desc), length][..], part.key.as_bytes()].concat()
+        };
+
+        self.keyparts.iter().flat_map(part).collect()
+    }
+
+    fn decode(mut bytes: &[u8]) -> Result<Self, StoreError> {
+        let mut keyparts = Vec::new();
+        while let [direction, length, rest @ ..] = bytes {
+            let direction = match direction {
+                0 => IndexDirection::Asc,
+                1 => IndexDirection::Desc,
+                _ => return Err(StoreError::permanent("a key part's direction is 0 or 1")),
+            };
+
+            let (key, after) =
+                rest.split_at_checked(usize::from(*length)).ok_or(StoreError::permanent("a key part's name runs past the spec"))?;
+
+            let key = String::from_utf8(key.to_vec()).map_err(|_| StoreError::permanent("a key part's name is not UTF-8"))?;
+
+            keyparts.push(IndexKeyPart { key, direction });
+            bytes = after;
+        }
+
+        match bytes {
+            [] => Ok(KeySpec { keyparts }),
+            _ => Err(StoreError::permanent("a key part is cut short")),
+        }
+    }
 }
 
 /// A key part a member gives no value for, not even a missing one: the
@@ -110,61 +176,59 @@ impl Item {
     }
 }
 
-impl Member<Spec> for Item {
+impl Member<KeySpec> for Item {
     type Id = Id;
     type Payload = Tag;
     type KeyError = NoValueFor;
 
     fn id(&self) -> Id { self.id }
 
-    fn key(&self, spec: &Spec) -> Result<Vec<u8>, NoValueFor> { key_of(&self.values, spec) }
+    fn key(&self, spec: &KeySpec) -> Result<Vec<u8>, NoValueFor> {
+        match self.values.len() < spec.keyparts.len() {
+            true => Err(NoValueFor(self.values.len())),
+            false => Ok(spec.collate(self.values.iter().copied())),
+        }
+    }
 
     fn payload(&self) -> Tag { self.payload.clone() }
 }
 
-/// The key of a member with these values under `spec`: each value made into
-/// its part's bytes, in the spec's order.
-pub fn key_of(values: &[Option<i64>], spec: &Spec) -> Result<Vec<u8>, NoValueFor> {
-    let parts = spec.0.iter().enumerate().map(|(part, &order)| match values.get(part) {
-        Some(&value) => Ok(key_part(value, order)),
-        None => Err(NoValueFor(part)),
-    });
+/// A spec of one ascending integer part.
+pub fn integer_spec() -> KeySpec { KeySpec::new(vec![asc!("a")]) }
 
-    Ok(parts.collect::<Result<Vec<_>, _>>()?.concat())
+/// A member under the integer spec, its one value `key`, missing when `None`:
+/// `item!(1, Some(5), b"a")`.
+macro_rules! item {
+    ($id:expr, $key:expr, $payload:expr) => {
+        $crate::common::Item::new($id, [$key], $payload)
+    };
 }
 
-/// A spec of one ascending integer part.
-pub fn integer_spec() -> Spec { spec(&[Order::Ascending]) }
-
-/// The key of a member under the integer spec: `key` missing when `None`.
-pub fn integer_key(key: Option<i64>) -> Vec<u8> { key_part(key, Order::Ascending) }
-
-/// A member under the integer spec: `key` missing when `None`.
-pub fn item(id: u64, key: Option<i64>, payload: &[u8]) -> Item { Item::new(id, [key], payload) }
+pub(crate) use item;
 
 /// The rows of a tree of items, in memory.
-pub type ItemStore<G = Ristretto255> = MemoryStore<RowKey, Row<Spec, Tag, G>>;
+pub type ItemStore<G = Ristretto255> = MemoryStore<RowKey, Row<KeySpec, Tag, G>>;
 
 /// A tree of items, in memory.
-pub type ItemTree<G = Ristretto255> = DigestTree<Spec, Id, Tag, G, ItemStore<G>>;
+pub type ItemTree<G = Ristretto255> = DigestTree<KeySpec, Id, Tag, G, ItemStore<G>>;
 
 /// A tree in memory holding exactly `members`.
-pub async fn built<G: DigestGroup>(key_spec: Spec, members: impl IntoIterator<Item = Item>) -> ItemTree<G> {
+pub async fn built<G: DigestGroup>(key_spec: KeySpec, members: impl IntoIterator<Item = Item>) -> ItemTree<G> {
     DigestTree::build(ItemStore::new(), key_spec, members).await.unwrap()
 }
 
 /// Items 0 to 9, each keyed by its own number.
-pub fn ten_items() -> impl Iterator<Item = Item> { (0..10).map(|n| item(n, Some(n as i64), b"")) }
+pub fn ten_items() -> impl Iterator<Item = Item> { (0..10).map(|n| item!(n, Some(n as i64), b"")) }
 
 /// A transaction on a tree of [`ten_items`] that removes item 3, adds item
 /// 10, and moves item 5 to key 50.
-pub fn remove_add_and_move<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
-    tree: &DigestTree<Spec, Id, Tag, Ristretto255, S>,
-) -> Transaction<Spec, Id, Tag, Ristretto255, S> {
+pub fn remove_add_and_move<S: Store<RowKey, Row<KeySpec, Tag, Ristretto255>>>(
+    tree: &DigestTree<KeySpec, Id, Tag, Ristretto255, S>,
+) -> Transaction<KeySpec, Id, Tag, Ristretto255, S> {
     let mut trx = tree.transaction();
-    trx.remove(item(3, Some(3), b"")).unwrap();
-    trx.insert(item(10, Some(10), b"")).unwrap();
-    trx.update(item(5, Some(5), b""), item(5, Some(50), b"")).unwrap();
+    trx.remove(item!(3, Some(3), b"")).unwrap();
+    trx.insert(item!(10, Some(10), b"")).unwrap();
+    trx.update(item!(5, Some(5), b""), item!(5, Some(50), b"")).unwrap();
 
     trx
 }
@@ -172,7 +236,7 @@ pub fn remove_add_and_move<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
 /// The members of a tree of [`ten_items`] once [`remove_add_and_move`] has
 /// committed.
 pub fn removed_added_and_moved() -> impl Iterator<Item = Item> {
-    (0..10).filter(|&n| n != 3 && n != 5).map(|n| item(n, Some(n as i64), b"")).chain([item(5, Some(50), b""), item(10, Some(10), b"")])
+    (0..10).filter(|&n| n != 3 && n != 5).map(|n| item!(n, Some(n as i64), b"")).chain([item!(5, Some(50), b""), item!(10, Some(10), b"")])
 }
 
 /// A member id of any length: its bytes as they are.
@@ -190,28 +254,28 @@ impl MemberId for Name {
 #[derive(Clone, Debug)]
 pub struct Named(pub Vec<u8>, pub Tag);
 
-impl Member<Spec> for Named {
+impl Member<KeySpec> for Named {
     type Id = Name;
     type Payload = Tag;
     type KeyError = Infallible;
 
     fn id(&self) -> Name { Name(self.0.clone()) }
 
-    fn key(&self, _: &Spec) -> Result<Vec<u8>, Infallible> { Ok(Vec::new()) }
+    fn key(&self, _: &KeySpec) -> Result<Vec<u8>, Infallible> { Ok(Vec::new()) }
 
     fn payload(&self) -> Tag { self.1.clone() }
 }
 
 /// A tree of named members, in memory.
-pub type NamedTree = DigestTree<Spec, Name, Tag, Ristretto255, MemoryStore<RowKey, Row<Spec, Tag, Ristretto255>>>;
+pub type NamedTree = DigestTree<KeySpec, Name, Tag, Ristretto255, MemoryStore<RowKey, Row<KeySpec, Tag, Ristretto255>>>;
 
 /// Whether two trees hold the same members with the same digests, as far as
 /// reads can tell: equal members, an equal digest over the whole tree, and a
 /// clean audit of each.
 pub async fn assert_same_tree<G: DigestGroup>(a: &ItemTree<G>, b: &ItemTree<G>) {
     let (a_view, b_view) = (a.view(), b.view());
-    let a_members: Vec<_> = a_view.range(ScanRange::forward(Span::all())).try_collect().await.unwrap();
-    let b_members: Vec<_> = b_view.range(ScanRange::forward(Span::all())).try_collect().await.unwrap();
+    let a_members: Vec<_> = a_view.range(..).try_collect().await.unwrap();
+    let b_members: Vec<_> = b_view.range(..).try_collect().await.unwrap();
 
     assert_eq!(a_members, b_members, "members");
     assert_eq!(a_view.span_digest(&Span::all()).await.unwrap().digest, b_view.span_digest(&Span::all()).await.unwrap().digest, "digest");

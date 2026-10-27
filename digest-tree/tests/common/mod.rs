@@ -1,10 +1,10 @@
 //! What the top-level tests share, a module per concern: the members they
 //! hold and trees of them, stores with quirks a real store may have, the
-//! primer's albums, and a peer's side of reconciling.
+//! introduction's albums, and a peer's side of reconciling.
 
 // Each top-level test file compiles this module into its own binary and uses
 // only part of it.
-#![allow(dead_code, unused_imports, reason = "each test binary uses a different part of the shared fixtures")]
+#![allow(dead_code, unused_imports, unused_macros, reason = "each test binary uses a different part of the shared fixtures")]
 
 mod albums;
 mod members;

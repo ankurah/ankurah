@@ -1,10 +1,10 @@
-//! Albums, the primer's sample members, keyed by the year each came out.
+//! Albums, the introduction's sample members, keyed by the year each came out.
 
 use std::borrow::Cow;
 
 use ankurah_digest_tree::{DigestGroup, DigestTree, DigestTreeView, Member, MemoryStore, Payload, Row, RowKey};
 
-use super::members::{key_of, key_part, spec, Id, NoValueFor, Order, Spec};
+use super::members::{asc, Id, KeySpec, NoValueFor};
 
 /// An album's title: the payload an album tree keeps and digests, so
 /// retitling an album changes it.
@@ -15,45 +15,57 @@ impl Payload for Title {
     fn digest_bytes(&self) -> Cow<'_, [u8]> { Cow::Borrowed(self.0.as_bytes()) }
 }
 
+/// A title compares equal to its text, so a test can name titles plainly.
+impl PartialEq<&str> for Title {
+    fn eq(&self, text: &&str) -> bool { self.0 == *text }
+}
+
 /// An album, the sample member of the top-level tests, keyed by the year it
 /// came out.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Album {
-    id: Id,
-    year: i64,
-    title: Title,
+    pub id: Id,
+    pub year: i64,
+    pub title: Title,
 }
 
-/// An album's key is made of its year, its one value.
-impl Member<Spec> for Album {
+/// An album's key is the year it came out, its one value, collated by the
+/// spec; a spec of more parts asks for values an album lacks.
+impl Member<KeySpec> for Album {
     type Id = Id;
     type Payload = Title;
     type KeyError = NoValueFor;
 
     fn id(&self) -> Id { self.id }
 
-    fn key(&self, spec: &Spec) -> Result<Vec<u8>, NoValueFor> { key_of(&[Some(self.year)], spec) }
+    fn key(&self, spec: &KeySpec) -> Result<Vec<u8>, NoValueFor> {
+        match spec.keyparts.len() {
+            0 | 1 => Ok(spec.collate([self.year])),
+            _ => Err(NoValueFor(1)),
+        }
+    }
 
     fn payload(&self) -> Title { self.title.clone() }
 }
 
-/// Album `id`, out in `year`, titled `title`.
-pub fn album(id: u64, year: i64, title: &str) -> Album { Album { id: Id(id), year, title: Title(title.to_string()) } }
+/// Album `id`, out in `year`, titled `title`: `album!(3, 2013, "Ice on the
+/// Dune")`.
+macro_rules! album {
+    ($id:expr, $year:expr, $title:expr) => {
+        $crate::common::Album { id: $crate::common::Id($id), year: $year, title: $crate::common::Title(($title).into()) }
+    };
+}
 
-/// The spec album trees are keyed by: the year each album came out,
-/// ascending.
-pub fn key_spec() -> Spec { spec(&[Order::Ascending]) }
-
-/// The key of the albums that came out in `year`, as a bound of a key range.
-pub fn year(year: i64) -> Vec<u8> { key_part(Some(year), Order::Ascending) }
+pub(crate) use album;
 
 /// A tree of albums, in memory.
-pub type Tree<G> = DigestTree<Spec, Id, Title, G, MemoryStore<RowKey, Row<Spec, Title, G>>>;
+pub type Tree<G> = DigestTree<KeySpec, Id, Title, G, MemoryStore<RowKey, Row<KeySpec, Title, G>>>;
 
 /// A view of a tree of albums.
-pub type View<G> = DigestTreeView<Spec, Id, Title, G, MemoryStore<RowKey, Row<Spec, Title, G>>>;
+pub type View<G> = DigestTreeView<KeySpec, Id, Title, G, MemoryStore<RowKey, Row<KeySpec, Title, G>>>;
 
-/// A tree of albums in memory, holding exactly `albums`.
+/// A tree of albums in memory, keyed by the year each came out, holding
+/// exactly `albums`.
 pub async fn tree<G: DigestGroup>(albums: impl IntoIterator<Item = Album>) -> Tree<G> {
-    DigestTree::build(MemoryStore::new(), key_spec(), albums).await.unwrap()
+    DigestTree::build(MemoryStore::new(), KeySpec::new(vec![asc!("year")]), albums).await.unwrap()
 }

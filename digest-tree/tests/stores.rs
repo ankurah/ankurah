@@ -4,12 +4,12 @@
 mod common;
 
 use ankurah_digest_tree::{DigestTree, DigestTreeView, Leaf, MemoryStore, Ristretto255, Row, RowKey, ScanRange, Span, Store};
-use common::{built, integer_spec, item, Id, Item, ShortPages, Spec, Tag};
+use common::{built, integer_spec, item, Id, Item, KeySpec, ShortPages, Tag};
 use futures::TryStreamExt;
 
 /// Every member a range read of `view` yields, in its order.
-async fn range_read<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
-    view: &DigestTreeView<Spec, Id, Tag, Ristretto255, S>,
+async fn range_read<S: Store<RowKey, Row<KeySpec, Tag, Ristretto255>>>(
+    view: &DigestTreeView<KeySpec, Id, Tag, Ristretto255, S>,
     range: ScanRange,
 ) -> Vec<Leaf<Id, Tag>> {
     view.range(range).try_collect().await.unwrap()
@@ -17,8 +17,8 @@ async fn range_read<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
 
 /// Commit `changes` to `tree` in one transaction, each the version the tree
 /// holds, if any, and the version to replace it, if any.
-async fn commit<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
-    tree: &DigestTree<Spec, Id, Tag, Ristretto255, S>,
+async fn commit<S: Store<RowKey, Row<KeySpec, Tag, Ristretto255>>>(
+    tree: &DigestTree<KeySpec, Id, Tag, Ristretto255, S>,
     changes: &[(Option<Item>, Option<Item>)],
 ) {
     let mut trx = tree.transaction();
@@ -40,9 +40,9 @@ async fn commit<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
 /// them all.
 #[tokio::test]
 async fn a_tree_over_a_store_with_short_pages_works_as_any_other() {
-    type ShortTree = DigestTree<Spec, Id, Tag, Ristretto255, ShortPages<Row<Spec, Tag, Ristretto255>>>;
+    type ShortTree = DigestTree<KeySpec, Id, Tag, Ristretto255, ShortPages<Row<KeySpec, Tag, Ristretto255>>>;
 
-    let member = |n: u64| item(n, Some((n % 50) as i64), b"");
+    let member = |n: u64| item!(n, Some((n % 50) as i64), b"");
     let members: Vec<Item> = (0..300).map(member).collect();
     let short = ShortTree::build(ShortPages(MemoryStore::new()), integer_spec(), members.clone()).await.unwrap();
     let full = built::<Ristretto255>(integer_spec(), members).await;
@@ -50,9 +50,9 @@ async fn a_tree_over_a_store_with_short_pages_works_as_any_other() {
     // Forty new members and thirty removed, node by node; then the rest of
     // the first 200 moved, enough to lay the tree out anew.
     let small: Vec<(Option<Item>, Option<Item>)> =
-        (300..340).map(|n| (None, Some(item(n, Some(7), b"new")))).chain((0..30).map(|n| (Some(member(n)), None))).collect();
+        (300..340).map(|n| (None, Some(item!(n, Some(7), b"new")))).chain((0..30).map(|n| (Some(member(n)), None))).collect();
 
-    let large: Vec<(Option<Item>, Option<Item>)> = (30..200).map(|n| (Some(member(n)), Some(item(n, Some(-1), b"moved")))).collect();
+    let large: Vec<(Option<Item>, Option<Item>)> = (30..200).map(|n| (Some(member(n)), Some(item!(n, Some(-1), b"moved")))).collect();
     for batch in [small, large] {
         commit(&short, &batch).await;
         commit(&full, &batch).await;
@@ -61,7 +61,7 @@ async fn a_tree_over_a_store_with_short_pages_works_as_any_other() {
         let (short_view, full_view) = (short.view(), full.view());
         assert_eq!(short_view.span_digest(&Span::all()).await.unwrap().digest, full_view.span_digest(&Span::all()).await.unwrap().digest);
 
-        for range in [ScanRange::forward(Span::all()), ScanRange::reverse(Span::all())] {
+        for range in [ScanRange::forward(..), ScanRange::reverse(..)] {
             assert_eq!(range_read(&short_view, range.clone()).await, range_read(&full_view, range).await);
         }
     }
@@ -74,16 +74,16 @@ async fn a_tree_over_a_store_with_short_pages_works_as_any_other() {
 #[tokio::test]
 async fn a_tree_reopened_from_its_sled_files_is_the_same_tree() {
     use ankurah_digest_tree::SledStore;
-    use common::Order;
+    use common::{asc, desc};
 
-    type SledTree = DigestTree<Spec, Id, Tag, Ristretto255, SledStore<Row<Spec, Tag, Ristretto255>>>;
+    type SledTree = DigestTree<KeySpec, Id, Tag, Ristretto255, SledStore<Row<KeySpec, Tag, Ristretto255>>>;
 
     let directory = tempfile::tempdir().unwrap();
 
     // No background flusher: the test flushes the database itself before
     // closing it, so what opens again is exactly what it flushed.
     let config = || sled::Config::new().path(directory.path()).flush_every_ms(None);
-    let key_spec = common::spec(&[Order::Ascending, Order::Descending]);
+    let key_spec = KeySpec::new(vec![asc!("a"), desc!("b")]);
 
     let members: Vec<Item> = (0..300).map(|n| Item::new(n, [Some((n % 7) as i64), Some(n as i64)], &[n as u8])).collect();
 

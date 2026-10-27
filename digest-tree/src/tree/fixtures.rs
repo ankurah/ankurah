@@ -4,29 +4,33 @@
 use std::ops::Bound;
 
 use super::{DigestTree, DigestTreeView};
-use crate::fixtures::{key_part, spec, Id, Item, Order, Spec, Tag};
-use crate::{DigestGroup, Encode, MemoryStore, NodePrefix, Ristretto255, Row, RowKey, ScanDirection, Span, Store};
+use crate::fixtures::{asc, Id, Item, KeySpec, Tag};
+use crate::{DigestGroup, Encode, MemoryStore, NodePrefix, Ristretto255, Row, RowKey, ScanDirection, Store};
 
 /// A tree of the fixtures' members, in memory.
-pub(super) type Tree<G = Ristretto255> = DigestTree<Spec, Id, Tag, G, MemoryStore<RowKey, Row<Spec, Tag, G>>>;
+pub(super) type Tree<G = Ristretto255> = DigestTree<KeySpec, Id, Tag, G, MemoryStore<RowKey, Row<KeySpec, Tag, G>>>;
 
 /// A view of such a tree.
-pub(super) type View<G = Ristretto255> = DigestTreeView<Spec, Id, Tag, G, MemoryStore<RowKey, Row<Spec, Tag, G>>>;
+pub(super) type View<G = Ristretto255> = DigestTreeView<KeySpec, Id, Tag, G, MemoryStore<RowKey, Row<KeySpec, Tag, G>>>;
 
 /// A spec of one ascending integer part.
-pub(super) fn integer_spec() -> Spec { spec(&[Order::Ascending]) }
+pub(super) fn integer_spec() -> KeySpec { KeySpec::new(vec![asc!("a")]) }
 
 /// A spec of no parts: members ordered by id alone.
-pub(super) fn by_id_spec() -> Spec { spec(&[]) }
+pub(super) fn by_id_spec() -> KeySpec { KeySpec::new(vec![]) }
 
-/// The key of a member under the integer spec: `key` missing when `None`.
-pub(super) fn integer_key(key: Option<i64>) -> Vec<u8> { key_part(key, Order::Ascending) }
+/// A member under the integer spec, its one value `key`, missing when `None`:
+/// `item!(1, Some(5), b"a")`.
+macro_rules! item {
+    ($id:expr, $key:expr, $payload:expr) => {
+        $crate::fixtures::Item::new($id, [$key], $payload)
+    };
+}
 
-/// A member under the integer spec: `key` missing when `None`.
-pub(super) fn item(id: u32, key: Option<i64>, payload: &[u8]) -> Item { Item::new(id, [key], payload) }
+pub(super) use item;
 
 /// A tree in memory holding exactly `members`.
-pub(super) async fn built<G: DigestGroup>(key_spec: Spec, members: impl IntoIterator<Item = Item>) -> Tree<G> {
+pub(super) async fn built<G: DigestGroup>(key_spec: KeySpec, members: impl IntoIterator<Item = Item>) -> Tree<G> {
     DigestTree::build(MemoryStore::new(), key_spec, members).await.unwrap()
 }
 
@@ -35,12 +39,6 @@ impl<G: DigestGroup> Tree<G> {
     pub(super) async fn stored_rows(&self) -> Vec<(RowKey, Vec<u8>)> {
         let rows = self.inner.store.range(Bound::Unbounded, Bound::Unbounded, ScanDirection::Forward, usize::MAX).await.unwrap();
         rows.into_iter().map(|(key, row)| (key, row.encode())).collect()
-    }
-
-    /// The rows that say what the tree holds: its metadata and members,
-    /// every row but the nodes.
-    pub(super) async fn member_rows(&self) -> Vec<(RowKey, Vec<u8>)> {
-        self.stored_rows().await.into_iter().filter(|(key, _)| !matches!(key, RowKey::Node(_))).collect()
     }
 
     /// The prefix of every node of the tree's trie.
@@ -55,28 +53,16 @@ impl<G: DigestGroup> Tree<G> {
     }
 
     /// The store, for tests that damage rows.
-    pub(super) fn store(&self) -> &MemoryStore<RowKey, Row<Spec, Tag, G>> { &self.inner.store }
+    pub(super) fn store(&self) -> &MemoryStore<RowKey, Row<KeySpec, Tag, G>> { &self.inner.store }
 }
 
-/// Whether two trees hold the same members with the same digests: equal
-/// metadata and member rows, an equal digest and count over the span of
-/// every node of either trie, and a clean audit of each. Their tries may
-/// differ in shape, since a trie's shape depends on the order its members
-/// came and went in.
+/// Whether two trees are the same tree: the same rows, metadata, members and
+/// nodes alike, since a trie's shape follows from its members alone, and a
+/// clean audit of each.
 pub(super) async fn assert_same_tree<G: DigestGroup>(a: &Tree<G>, b: &Tree<G>) {
-    assert_eq!(a.member_rows().await, b.member_rows().await, "member rows");
+    assert_eq!(a.stored_rows().await, b.stored_rows().await, "rows");
     a.audit().await.unwrap();
     b.audit().await.unwrap();
-
-    let (a_view, b_view) = (a.view(), b.view());
-    let mut spans: Vec<Span> = a.node_prefixes().await.iter().chain(&b.node_prefixes().await).map(NodePrefix::span).collect();
-    spans.push(Span::all());
-
-    for span in spans {
-        let (a_digest, b_digest) = (a_view.span_digest(&span).await.unwrap(), b_view.span_digest(&span).await.unwrap());
-        assert_eq!(a_digest.digest, b_digest.digest, "{span:?}");
-        assert_eq!(a_view.count(&span).await.unwrap(), a_digest.digest.count(), "{span:?}");
-    }
 }
 
 /// A memory store that returns at most three rows per read, as a store that

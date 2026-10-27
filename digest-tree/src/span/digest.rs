@@ -16,9 +16,9 @@ use crate::{Digest, DigestGroup, Error};
 /// where refinement continues. Only a tree makes them. It serializes through a
 /// byte encoding that validates as it decodes.
 ///
-/// A tree names a span with its own subtrees, whose shape depends on the
-/// order its members came and went in, so trees holding the same members can
-/// name one span differently. Peers compare span digests by their `digest`.
+/// A tree names a span with its own subtrees, whose shape depends on its
+/// members, so peers whose trees hold different members can name one span
+/// differently. Peers compare span digests by their `digest`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpanDigest<G: DigestGroup> {
     /// The smallest subtree that contains the span.

@@ -5,15 +5,15 @@
 //! moving every digest on the way, and inserts a branch where an inserted
 //! member lies outside a node's children. Once every edit has walked, the
 //! nodes whose counts moved settle their shape: a bucket grown past its
-//! capacity splits, and a subtree with children shrunk to the merge threshold
-//! merges into one bucket. Settling after the walks means a split reads the
+//! capacity splits, and a subtree with children that one bucket could now
+//! hold merges into one. Settling after the walks means a split reads the
 //! batch's final members, which the digests it replaces already sum, and that
 //! the walks change the shape only where they insert branches.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::tree::rows::StagedRows;
-use crate::tree::trie::{address_begins_another, lay_out, Trie, BUCKET_CAPACITY, MERGE_AT};
+use crate::tree::trie::{address_begins_another, lay_out, Trie, BUCKET_CAPACITY};
 use crate::{Digest, DigestGroup, Error, NodePrefix, Payload, Row, RowKey, ScanDirection, Span, Store};
 
 /// One member's effect on the trie: where its leaf went, and its element.
@@ -220,7 +220,7 @@ where
     async fn settle_node(&mut self, prefix: &NodePrefix, digest: &Digest<G>) -> Result<(), Error> {
         loop {
             match self.children_of(prefix).await? {
-                Some(_) if digest.count() <= MERGE_AT => return self.delete_beneath(prefix).await,
+                Some(_) if digest.count() <= BUCKET_CAPACITY => return self.delete_beneath(prefix).await,
 
                 Some((children, _)) => {
                     if !self.collapse_empty_side(prefix, children).await? {

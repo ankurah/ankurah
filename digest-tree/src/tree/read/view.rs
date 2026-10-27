@@ -85,19 +85,25 @@ where
         Ok(leaf.map(|leaf| Leaf { key: key.to_vec(), id: id.clone(), payload: leaf.payload }))
     }
 
-    /// Every member of the view within `range.span`, as a stream that reads
-    /// them in `range.direction` a batch at a time, through the view's spans
-    /// in that direction.
+    /// Every member of the view within `range`, as a stream that reads them
+    /// in its direction a batch at a time, through the view's spans in that
+    /// direction. `range` is a [`ScanRange`], or a span or a Rust range of key
+    /// bytes, which reads forward: `view.range(..)` reads every member.
     ///
-    /// Each batch takes the tree's read lock for its own read alone. The
-    /// stream holds no lock between batches, and so none while its caller
-    /// holds a member or once it is dropped; commits may land between
-    /// batches. The first batch reads 64 members, as many as a bucket holds,
-    /// so that a span refined down to one bucket is read in one hold of the
-    /// lock; each batch after it reads twice as many as the one before, up to
-    /// 1,024. Each also reads one member past those, which tells the stream
-    /// whether any remain, so that it never takes the lock again for a batch
-    /// that finds nothing. Nothing is read until the stream is first polled.
+    /// The stream reads nothing until it is first polled, and reads each
+    /// batch only once its caller has taken every member of the one before,
+    /// so a stream stopped early reads no further. Each batch takes the
+    /// tree's read lock for its own read alone: commits may land between
+    /// batches, and the stream holds no lock while its caller holds a member
+    /// or once it is dropped. The first batch yields as many members as a
+    /// bucket holds, so that a span refined down to one bucket is read in one
+    /// hold of the lock, and a batch that reads to the end of the range ends
+    /// the stream without another read.
+    ///
+    /// A batch under way keeps the lock until it is read, even while its
+    /// caller stops polling, as a caller does that gives up on `next()` after
+    /// a timeout. A commit to the same tree waits for that batch, so such a
+    /// caller polls the stream on, or drops it, before it awaits a commit.
     ///
     /// Each batch sees one complete state of the tree, and later batches may
     /// see later states. The stream yields members strictly in the order of
@@ -107,7 +113,9 @@ where
     /// and one that moved may be yielded at both addresses.
     ///
     /// A failed read yields its error, and then the stream ends.
-    pub fn range(&self, range: ScanRange) -> Members<K, I, L, G, S> { Members::new(self.tree.clone(), &self.spans, range) }
+    pub fn range(&self, range: impl Into<ScanRange>) -> Members<K, I, L, G, S> {
+        Members::new(self.tree.clone(), &self.spans, range.into())
+    }
 
     /// How many members within `span` the view covers.
     pub async fn count(&self, span: &Span) -> Result<u64, Error> {

@@ -10,14 +10,14 @@ use super::albums::{Album, Title, Tree, View};
 use super::members::Id;
 
 /// A span digest as the other peer receives it.
-pub fn across_the_wire<G: DigestGroup>(span_digest: &SpanDigest<G>) -> SpanDigest<G> {
+fn across_the_wire<G: DigestGroup>(span_digest: &SpanDigest<G>) -> SpanDigest<G> {
     bincode::deserialize(&bincode::serialize(span_digest).unwrap()).unwrap()
 }
 
 /// The narrowest spans whose members differ between two views of the same
 /// spans: start from the root, keep spans whose digests differ, and refine
 /// each with whichever view has structure beneath it.
-pub async fn differing_spans<G: DigestGroup>(ours: &View<G>, theirs: &View<G>) -> Vec<Span> {
+async fn differing_spans<G: DigestGroup>(ours: &View<G>, theirs: &View<G>) -> Vec<Span> {
     let mut pending = vec![across_the_wire(&ours.span_digest(&Span::all()).await.unwrap())];
     let mut differing = Vec::new();
 
@@ -43,7 +43,7 @@ pub async fn differing_spans<G: DigestGroup>(ours: &View<G>, theirs: &View<G>) -
 
 /// Every member of a view within `span`, by address.
 async fn members<G: DigestGroup>(view: &View<G>, span: &Span) -> BTreeMap<Vec<u8>, Leaf<Id, Title>> {
-    view.range(ScanRange::forward(span.clone())).map_ok(|leaf| (leaf_address(&leaf.key, &leaf.id), leaf)).try_collect().await.unwrap()
+    view.range(span.clone()).map_ok(|leaf| (leaf_address(&leaf.key, &leaf.id), leaf)).try_collect().await.unwrap()
 }
 
 /// One member's two sides as a reconciliation finds them: our leaf, if we

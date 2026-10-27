@@ -10,29 +10,50 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use ankurah_digest_tree::{
-    leaf_address, DigestTree, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, ScanRange, Span, Store, StoreError, WriteItem,
+    leaf_address, DigestTree, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Span, Store, StoreError, WriteItem,
 };
-use common::{built, integer_key, integer_spec, item, poll_once, Id, Spec, Tag};
+use common::{built, integer_spec, item, poll_once, Id, KeySpec, Tag};
 use futures::StreamExt;
 
 /// A store whose writes wait while a test holds one gate, and whose next read
-/// of one row, once the test asks for it, waits while the test holds
-/// another: that read keeps the tree's read lock as long as the test likes,
-/// while every other read passes.
+/// of one row, or next read of a range of rows, once the test asks for it,
+/// waits while the test holds another: that read keeps the tree's read lock
+/// as long as the test likes, while every other read passes.
 #[derive(Clone)]
 struct Gated {
-    rows: MemoryStore<RowKey, Row<Spec, Tag, Ristretto255>>,
+    rows: MemoryStore<RowKey, Row<KeySpec, Tag, Ristretto255>>,
 
-    /// The row whose next read waits on `reads` while `hold_next` is set.
-    gated_row: RowKey,
+    /// The row, if any, whose next read waits on `reads` while `hold_next`
+    /// is set.
+    gated_row: Option<RowKey>,
     hold_next: Arc<AtomicBool>,
+
+    /// Set to make the next range read wait on `reads`.
+    hold_next_range: Arc<AtomicBool>,
     reads: Arc<async_lock::RwLock<()>>,
     writes: Arc<async_lock::RwLock<()>>,
 }
 
-impl Store<RowKey, Row<Spec, Tag, Ristretto255>> for Gated {
-    async fn get(&self, key: &RowKey) -> Result<Option<Row<Spec, Tag, Ristretto255>>, StoreError> {
-        let _open = match *key == self.gated_row && self.hold_next.swap(false, Ordering::SeqCst) {
+impl Gated {
+    /// A store over no rows, holding none of its reads.
+    fn new() -> Self {
+        Self {
+            rows: MemoryStore::new(),
+            gated_row: None,
+            hold_next: Arc::default(),
+            hold_next_range: Arc::default(),
+            reads: Arc::default(),
+            writes: Arc::default(),
+        }
+    }
+
+    /// The same store, whose next read of `row` a test can hold.
+    fn gating_row(self, row: RowKey) -> Self { Self { gated_row: Some(row), ..self } }
+}
+
+impl Store<RowKey, Row<KeySpec, Tag, Ristretto255>> for Gated {
+    async fn get(&self, key: &RowKey) -> Result<Option<Row<KeySpec, Tag, Ristretto255>>, StoreError> {
+        let _open = match self.gated_row.as_ref() == Some(key) && self.hold_next.swap(false, Ordering::SeqCst) {
             true => Some(self.reads.read().await),
             false => None,
         };
@@ -46,11 +67,16 @@ impl Store<RowKey, Row<Spec, Tag, Ristretto255>> for Gated {
         end: Bound<&RowKey>,
         direction: ScanDirection,
         limit: usize,
-    ) -> Result<Vec<(RowKey, Row<Spec, Tag, Ristretto255>)>, StoreError> {
+    ) -> Result<Vec<(RowKey, Row<KeySpec, Tag, Ristretto255>)>, StoreError> {
+        let _open = match self.hold_next_range.swap(false, Ordering::SeqCst) {
+            true => Some(self.reads.read().await),
+            false => None,
+        };
+
         self.rows.range(start, end, direction, limit).await
     }
 
-    async fn write(&self, items: Vec<WriteItem<RowKey, Row<Spec, Tag, Ristretto255>>>) -> Result<(), StoreError> {
+    async fn write(&self, items: Vec<WriteItem<RowKey, Row<KeySpec, Tag, Ristretto255>>>) -> Result<(), StoreError> {
         let _open = self.writes.read().await;
         self.rows.write(items).await
     }
@@ -61,19 +87,13 @@ impl Store<RowKey, Row<Spec, Tag, Ristretto255>> for Gated {
 /// out a commit that is writing, and a commit waits out a read under way.
 #[tokio::test]
 async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
-    let (key, id) = (integer_key(Some(50)), Id(50));
-    let gated = Gated {
-        rows: MemoryStore::new(),
-        gated_row: RowKey::Leaf(leaf_address(&key, &id)),
-        hold_next: Arc::default(),
-        reads: Arc::default(),
-        writes: Arc::default(),
-    };
+    let (key, id) = (integer_spec().collate([50]), Id(50));
+    let gated = Gated::new().gating_row(RowKey::Leaf(leaf_address(&key, &id)));
 
-    let tree = DigestTree::<Spec, Id, Tag, Ristretto255, Gated>::build(
+    let tree = DigestTree::<KeySpec, Id, Tag, Ristretto255, Gated>::build(
         gated.clone(),
         integer_spec(),
-        (0..100).map(|n| item(n, Some(n as i64), b"")),
+        (0..100).map(|n| item!(n, Some(n as i64), b"")),
     )
     .await
     .unwrap();
@@ -81,7 +101,7 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
     let view = tree.view();
     let digest = || async { view.span_digest(&Span::all()).await.unwrap().digest };
 
-    let after_first = built::<Ristretto255>(integer_spec(), (0..101).map(|n| item(n, Some(n as i64), b"")))
+    let after_first = built::<Ristretto255>(integer_spec(), (0..101).map(|n| item!(n, Some(n as i64), b"")))
         .await
         .view()
         .span_digest(&Span::all())
@@ -92,7 +112,7 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
     // The commit holds the tree's write lock while its write waits.
     let writes_closed = gated.writes.write().await;
     let mut trx = tree.transaction();
-    trx.insert(item(100, Some(100), b"")).unwrap();
+    trx.insert(item!(100, Some(100), b"")).unwrap();
 
     let mut committing = pin!(trx.commit());
     assert!(poll_once(committing.as_mut()).is_pending());
@@ -114,8 +134,8 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
     assert!(poll_once(reading.as_mut()).is_pending());
 
     let mut trx = tree.transaction();
-    trx.remove(item(50, Some(50), b"")).unwrap();
-    trx.remove(item(100, Some(100), b"")).unwrap();
+    trx.remove(item!(50, Some(50), b"")).unwrap();
+    trx.remove(item!(100, Some(100), b"")).unwrap();
 
     let mut committing = pin!(trx.commit());
     assert!(poll_once(committing.as_mut()).is_pending(), "the commit waits for the read");
@@ -133,8 +153,8 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
 /// yields every member the commit left in place, once and in order.
 #[tokio::test]
 async fn a_commit_completes_while_a_range_read_is_half_consumed() {
-    let tree = built::<Ristretto255>(integer_spec(), (0..300).map(|n| item(n, Some(n as i64), b""))).await;
-    let mut scan = tree.view().range(ScanRange::forward(Span::all()));
+    let tree = built::<Ristretto255>(integer_spec(), (0..300).map(|n| item!(n, Some(n as i64), b""))).await;
+    let mut scan = tree.view().range(..);
 
     // Ten members yielded, of the 64 the first batch read before reading one
     // past them.
@@ -148,12 +168,12 @@ async fn a_commit_completes_while_a_range_read_is_half_consumed() {
     // to ahead of it, one moved the other way, and one inserted ahead.
     let mut trx = tree.transaction();
     for n in [5, 30, 64, 200] {
-        trx.remove(item(n, Some(n as i64), b"")).unwrap();
+        trx.remove(item!(n, Some(n as i64), b"")).unwrap();
     }
 
-    trx.update(item(3, Some(3), b""), item(3, Some(250), b"")).unwrap();
-    trx.update(item(250, Some(250), b""), item(250, Some(-1), b"")).unwrap();
-    trx.insert(item(1000, Some(100), b"")).unwrap();
+    trx.update(item!(3, Some(3), b""), item!(3, Some(250), b"")).unwrap();
+    trx.update(item!(250, Some(250), b""), item!(250, Some(-1), b"")).unwrap();
+    trx.insert(item!(1000, Some(100), b"")).unwrap();
 
     let mut committing = pin!(trx.commit());
     match poll_once(committing.as_mut()) {
@@ -172,4 +192,43 @@ async fn a_commit_completes_while_a_range_read_is_half_consumed() {
     let kept: Vec<u64> = read.iter().map(|leaf| leaf.id.0).filter(|id| !changed.contains(id)).collect();
 
     assert_eq!(kept, (0..300).filter(|n| !changed.contains(n)).collect::<Vec<_>>(), "every member left in place, once and in order");
+}
+
+/// A range read's batch under way keeps the tree's read lock while the store
+/// holds its read, even once its caller gives up on `next()`, so a commit to
+/// the tree waits; dropping the stream drops the batch, and the commit goes
+/// ahead.
+#[tokio::test]
+async fn a_batch_under_way_keeps_the_lock_until_its_stream_is_dropped() {
+    let gated = Gated::new();
+    let tree = DigestTree::<KeySpec, Id, Tag, Ristretto255, Gated>::build(
+        gated.clone(),
+        integer_spec(),
+        (0..100).map(|n| item!(n, Some(n as i64), b"")),
+    )
+    .await
+    .unwrap();
+
+    // The first batch's read waits on the store; the caller's `next()` is
+    // dropped while it waits, as a timeout would drop it.
+    let reads_closed = gated.reads.write().await;
+    gated.hold_next_range.store(true, Ordering::SeqCst);
+
+    let mut scan = tree.view().range(..);
+    assert!(poll_once(pin!(scan.next())).is_pending(), "the first batch waits on the store");
+
+    let mut trx = tree.transaction();
+    trx.remove(item!(5, Some(5), b"")).unwrap();
+
+    let mut committing = pin!(trx.commit());
+    assert!(poll_once(committing.as_mut()).is_pending(), "the commit waits for the batch under way");
+
+    drop(scan);
+
+    match poll_once(committing.as_mut()) {
+        Poll::Ready(committed) => committed.unwrap(),
+        Poll::Pending => panic!("the commit still waited once the stream was dropped"),
+    }
+
+    drop(reads_closed);
 }

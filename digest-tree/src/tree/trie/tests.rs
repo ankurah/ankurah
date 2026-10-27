@@ -103,7 +103,7 @@ fn a_layout_refuses_addresses_that_are_prefixes_of_others() {
 async fn children_and_the_nearest_nodes_beneath_a_prefix_are_found_in_prefix_order() {
     // Keys 0 to 99, with one id each: the root's children branch where the
     // keys' encodings first differ, deep in their bytes.
-    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item(n, Some(i64::from(n)), b""))).await;
+    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b""))).await;
     let rows = StagedRows::new(tree.store());
     let trie = Trie::new(&rows);
     let [first, second] = trie.children(&NodePrefix::root()).await.unwrap().expect("a root of 100 members has children");

@@ -1,16 +1,16 @@
 //! The audit catches each kind of damage to a tree's rows.
 
 use super::*;
-use crate::fixtures::{leaf_element, Id, Item, Spec, Tag};
+use crate::fixtures::{leaf_element, Id, Item, KeySpec, Tag};
 use crate::store::{LeafRow, Meta};
-use crate::tree::fixtures::{built, by_id_spec, integer_key, integer_spec, item, Tree};
+use crate::tree::fixtures::{built, by_id_spec, integer_spec, item, Tree};
 use crate::NodePrefix;
 use crate::{leaf_address, Member, Ristretto255, WriteItem};
 
-type Write = WriteItem<RowKey, Row<Spec, Tag, Ristretto255>>;
+type Write = WriteItem<RowKey, Row<KeySpec, Tag, Ristretto255>>;
 
 /// 100 members under keys 0 to 99: a root and two buckets.
-async fn hundred() -> Tree { built(integer_spec(), (0..100).map(|n| item(n, Some(i64::from(n)), b"payload"))).await }
+async fn hundred() -> Tree { built(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b"payload"))).await }
 
 /// The fault the audit names in `tree` after `damage` is written to its
 /// store.
@@ -23,11 +23,11 @@ async fn fault_after(tree: Tree, damage: Vec<Write>) -> &'static str {
     }
 }
 
-async fn row(tree: &Tree, key: RowKey) -> Row<Spec, Tag, Ristretto255> { tree.store().get(&key).await.unwrap().expect("a stored row") }
+async fn row(tree: &Tree, key: RowKey) -> Row<KeySpec, Tag, Ristretto255> { tree.store().get(&key).await.unwrap().expect("a stored row") }
 
 /// The address of the member with id `id` in a tree of [`hundred`], whose
 /// key is its id.
-fn address(id: u32) -> Vec<u8> { leaf_address(&integer_key(Some(i64::from(id))), &Id(id)) }
+fn address(id: u32) -> Vec<u8> { leaf_address(&integer_spec().collate([i64::from(id)]), &Id(id)) }
 
 async fn digest_of(tree: &Tree, prefix: &NodePrefix) -> Digest<Ristretto255> {
     match row(tree, RowKey::Node(prefix.clone())).await {
@@ -72,7 +72,7 @@ async fn the_audit_catches_a_member_whose_element_is_not_its_leafs() {
 #[tokio::test]
 async fn the_audit_catches_a_member_held_under_two_keys() {
     let tree = hundred().await;
-    let again = item(7, Some(80), b"payload");
+    let again = item!(7, Some(80), b"payload");
     let key = again.key(&integer_spec()).unwrap();
     let address = leaf_address(&key, &Id(7));
     let element = leaf_element::<Ristretto255>(&key, &Id(7).to_bytes(), b"payload");
@@ -100,7 +100,7 @@ async fn the_audit_catches_a_branch_that_lost_a_child() {
 #[tokio::test]
 async fn the_audit_catches_a_member_beneath_no_bucket() {
     let tree = hundred().await;
-    let stray = item(500, Some(-1), b"payload");
+    let stray = item!(500, Some(-1), b"payload");
     let key = stray.key(&integer_spec()).unwrap();
     let address = leaf_address(&key, &Id(500));
 
@@ -116,8 +116,8 @@ async fn the_audit_catches_a_member_beneath_no_bucket() {
     assert_eq!(fault_after(tree, damage).await, "a member lies beneath no bucket");
 }
 
-/// A bucket over its capacity, and a node with children at the merge
-/// threshold, with every digest right.
+/// A bucket over its capacity, and a node with children holding no more than
+/// a bucket holds, with every digest right.
 #[tokio::test]
 async fn the_audit_catches_nodes_whose_counts_their_shape_does_not_allow() {
     let tree = hundred().await;
@@ -126,19 +126,19 @@ async fn the_audit_catches_nodes_whose_counts_their_shape_does_not_allow() {
     assert_eq!(overfull, "a node holds a number of members its shape doesn't allow");
 
     // Keyed by id alone, 65 members split into ids 0 to 63 and id 64; leaving
-    // 31 members beneath the first child and id 64 beneath the second leaves
-    // the root's children holding 32.
+    // 63 members beneath the first child and id 64 beneath the second leaves
+    // the root's children holding 64, which one bucket holds.
     let members = |ids: &mut dyn Iterator<Item = u32>| ids.map(|id| Item::new(id, [], b"")).collect::<Vec<_>>();
     let tree: Tree = built(by_id_spec(), members(&mut (0..65))).await;
 
-    let first: Tree = built(by_id_spec(), members(&mut (0..31))).await;
+    let first: Tree = built(by_id_spec(), members(&mut (0..63))).await;
     let second: Tree = built(by_id_spec(), members(&mut std::iter::once(64))).await;
 
-    let both: Tree = built(by_id_spec(), members(&mut (0..31).chain([64]))).await;
+    let both: Tree = built(by_id_spec(), members(&mut (0..63).chain([64]))).await;
     let nodes = tree.node_prefixes().await;
 
     assert_eq!(
-        fault_after(tree, shrink_to(31..64, &nodes, [&both, &first, &second]).await).await,
+        fault_after(tree, shrink_to(63..64, &nodes, [&both, &first, &second]).await).await,
         "a node holds a number of members its shape doesn't allow"
     );
 }

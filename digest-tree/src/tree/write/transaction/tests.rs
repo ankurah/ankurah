@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::fixtures::{block_on, Item, Spec};
+use crate::fixtures::{block_on, Item, KeySpec};
 use crate::tree::fixtures::{assert_same_tree, built, by_id_spec, integer_spec, item, Tree};
 use crate::{DigestGroup, LtHash16, Ristretto255};
 use proptest::prelude::*;
@@ -19,7 +19,7 @@ struct Planned {
 }
 
 impl Planned {
-    fn item(&self) -> Item { item(self.id, self.key, &self.payload) }
+    fn item(&self) -> Item { item!(self.id, self.key, &self.payload) }
 }
 
 /// Members with ids below `ids`, keys from a narrow range so that many share
@@ -71,7 +71,7 @@ fn planned_change(ids: u32) -> impl Strategy<Value = PlannedChange> {
 /// phase adds members under a run of consecutive ids and a few nearby keys,
 /// which often lie outside what a subtree holds, so that branches are
 /// inserted above old subtrees, and its removals shrink the region's
-/// subtrees to the merge threshold.
+/// subtrees until they merge.
 fn batches(ids: u32) -> impl Strategy<Value = Vec<Vec<PlannedChange>>> {
     let phase = (0..ids, -40i64..40, 40..100u32, proptest::option::weighted(0.75, 50..100u32)).prop_map(
         |(first_id, first_key, count, removed_percent)| {
@@ -96,7 +96,7 @@ fn members(model: &BTreeMap<u32, Planned>) -> Vec<Item> { model.values().map(Pla
 
 /// The tree a sequence of transactions leaves, starting from a build of
 /// `initial`, against a build over the members they leave.
-async fn batches_leave_the_tree_a_build_gives<G: DigestGroup>(key_spec: Spec, initial: Vec<Planned>, batches: Vec<Vec<PlannedChange>>) {
+async fn batches_leave_the_tree_a_build_gives<G: DigestGroup>(key_spec: KeySpec, initial: Vec<Planned>, batches: Vec<Vec<PlannedChange>>) {
     let mut model: BTreeMap<u32, Planned> = initial.into_iter().map(|member| (member.id, member)).collect();
     let tree = built::<G>(key_spec.clone(), members(&model)).await;
 
@@ -111,10 +111,9 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 96, rng_seed: RngSeed::Fixed(0xa991_0001), ..ProptestConfig::default() })]
 
     /// The main oracle: whatever transactions a tree commits, it holds what a
-    /// build over its final members holds, its member rows the same and every
-    /// span's digest and count the same, through splits, merges and inserted
-    /// branches. Its trie may differ in shape, since a shape depends
-    /// on the order members came and went in.
+    /// build over its final members holds, row for row, through splits,
+    /// merges and inserted branches, since a tree's shape depends on its
+    /// members alone, not on the order they came and went in.
     #[test]
     fn any_batches_leave_the_tree_a_build_gives(
         initial in proptest::collection::vec(planned(260), 0..220),
@@ -164,8 +163,8 @@ proptest! {
 }
 
 /// A transaction large against its tree lays the tree out anew, as a build
-/// does, and holds what the same changes committed a few at a time, node by
-/// node, hold.
+/// does, and the same changes committed a few at a time, node by node, leave
+/// the very same rows.
 async fn a_large_batch_matches_small_batches(initial: Vec<Planned>, changes: Vec<PlannedChange>) {
     let mut model: BTreeMap<u32, Planned> = initial.into_iter().map(|member| (member.id, member)).collect();
     let mut few_at_a_time_model = model.clone();
@@ -182,9 +181,6 @@ async fn a_large_batch_matches_small_batches(initial: Vec<Planned>, changes: Vec
 
     let rebuilt = built::<Ristretto255>(integer_spec(), members(&model)).await;
     assert_same_tree(&at_once, &rebuilt).await;
-
-    // Laid out anew, the large batch's tree has a build's very nodes.
-    assert_eq!(at_once.stored_rows().await, rebuilt.stored_rows().await);
 }
 
 /// Changes to distinct ids: at least 128 of them, and at least a quarter of

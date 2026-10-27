@@ -32,41 +32,125 @@ impl Encode for Tag {
     fn decode(bytes: &[u8]) -> Result<Self, StoreError> { Ok(Tag(bytes.to_vec())) }
 }
 
-/// The order of one key part's values: the tests' stand-in for an index key
-/// part's direction.
+/// The direction of one key part's values: the tests' stand-in for core's
+/// `IndexDirection`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Order {
+pub(crate) enum IndexDirection {
     /// Smallest first.
-    Ascending,
+    Asc,
 
     /// Largest first.
-    Descending,
+    Desc,
 }
 
-/// The tests' stand-in for an owner's key spec: the order of each part of a
-/// key, the most significant first. Members make their keys from it; the
-/// tree only stores it and hands it to them.
+/// One part of a key spec: the tests' stand-in for core's `IndexKeyPart`, a
+/// name and a direction. The stand-in collation takes integers alone, so a
+/// part names no value type, and its name only says what the part holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Spec(pub(crate) Vec<Order>);
+pub(crate) struct IndexKeyPart {
+    pub(crate) key: String,
+    pub(crate) direction: IndexDirection,
+}
 
-/// A spec's encoding: one byte per part, `0` for ascending and `1` for
-/// descending.
-impl Encode for Spec {
-    fn encode(&self) -> Vec<u8> { self.0.iter().map(|order| u8::from(*order == Order::Descending)).collect() }
+impl IndexKeyPart {
+    pub(crate) fn asc(key: impl Into<String>) -> Self { Self { key: key.into(), direction: IndexDirection::Asc } }
 
-    fn decode(bytes: &[u8]) -> Result<Self, StoreError> {
-        let order = |byte: &u8| match byte {
-            0 => Ok(Order::Ascending),
-            1 => Ok(Order::Descending),
-            _ => Err(StoreError::permanent("a key part's order is 0 or 1")),
-        };
+    pub(crate) fn desc(key: impl Into<String>) -> Self { Self { key: key.into(), direction: IndexDirection::Desc } }
+}
 
-        bytes.iter().map(order).collect::<Result<_, _>>().map(Spec)
+/// An ascending key part, as the planner's tests write one: `asc!("year")`.
+macro_rules! asc {
+    ($key:expr) => {
+        $crate::fixtures::IndexKeyPart::asc($key)
+    };
+}
+
+/// A descending key part: `desc!("year")`.
+macro_rules! desc {
+    ($key:expr) => {
+        $crate::fixtures::IndexKeyPart::desc($key)
+    };
+}
+
+pub(crate) use {asc, desc};
+
+/// The tests' stand-in for an owner's key spec, core's `KeySpec`: its parts,
+/// the most significant first. Members make their keys with it; the tree
+/// only stores it and hands it to them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeySpec {
+    pub(crate) keyparts: Vec<IndexKeyPart>,
+}
+
+impl KeySpec {
+    pub(crate) fn new(keyparts: Vec<IndexKeyPart>) -> Self { Self { keyparts } }
+
+    /// The bytes of `values` under the spec, the tests' stand-in for core's
+    /// `encode_tuple_values_with_key_spec`: each value collated in its
+    /// part's direction, the first part's first, and `None` a missing value.
+    /// Fewer values than parts give a key's leading parts, as a range's bound
+    /// takes them.
+    ///
+    /// A present value is `0x01` and its big-endian bytes with the sign bit
+    /// flipped, so values sort as numbers do; a missing value is `0x02`,
+    /// after every present one, as PostgreSQL sorts NULL; and a descending
+    /// part's bytes are inverted, so that it sorts the other way, missing
+    /// values first.
+    pub(crate) fn collate(&self, values: impl IntoIterator<Item = impl Into<Option<i64>>>) -> Vec<u8> {
+        self.keyparts.iter().zip(values).flat_map(|(part, value)| collate(value.into(), part.direction)).collect()
     }
 }
 
-/// A spec of these parts.
-pub(crate) fn spec(orders: &[Order]) -> Spec { Spec(orders.to_vec()) }
+/// One value's bytes in `direction`, as [`KeySpec::collate`] describes them.
+fn collate(value: Option<i64>, direction: IndexDirection) -> Vec<u8> {
+    let mut bytes = match value {
+        Some(value) => [&[0x01][..], &(value as u64 ^ 1 << 63).to_be_bytes()].concat(),
+        None => vec![0x02],
+    };
+
+    if direction == IndexDirection::Desc {
+        bytes.iter_mut().for_each(|byte| *byte = !*byte);
+    }
+
+    bytes
+}
+
+/// A spec's encoding: for each part, its direction's byte, `0` ascending and
+/// `1` descending, then its name's length in a byte and the name.
+impl Encode for KeySpec {
+    fn encode(&self) -> Vec<u8> {
+        let part = |part: &IndexKeyPart| {
+            let length = u8::try_from(part.key.len()).expect("a key part's name is under 256 bytes");
+            [&[u8::from(part.direction == IndexDirection::Desc), length][..], part.key.as_bytes()].concat()
+        };
+
+        self.keyparts.iter().flat_map(part).collect()
+    }
+
+    fn decode(mut bytes: &[u8]) -> Result<Self, StoreError> {
+        let mut keyparts = Vec::new();
+        while let [direction, length, rest @ ..] = bytes {
+            let direction = match direction {
+                0 => IndexDirection::Asc,
+                1 => IndexDirection::Desc,
+                _ => return Err(StoreError::permanent("a key part's direction is 0 or 1")),
+            };
+
+            let (key, after) =
+                rest.split_at_checked(usize::from(*length)).ok_or(StoreError::permanent("a key part's name runs past the spec"))?;
+
+            let key = String::from_utf8(key.to_vec()).map_err(|_| StoreError::permanent("a key part's name is not UTF-8"))?;
+
+            keyparts.push(IndexKeyPart { key, direction });
+            bytes = after;
+        }
+
+        match bytes {
+            [] => Ok(KeySpec { keyparts }),
+            _ => Err(StoreError::permanent("a key part is cut short")),
+        }
+    }
+}
 
 /// A member: an id, a value for each key part in turn, `None` where it has
 /// none, and a payload.
@@ -83,20 +167,18 @@ impl Item {
     }
 }
 
-impl Member<Spec> for Item {
+impl Member<KeySpec> for Item {
     type Id = Id;
     type Payload = Tag;
     type KeyError = NoValueFor;
 
     fn id(&self) -> Id { self.id }
 
-    fn key(&self, spec: &Spec) -> Result<Vec<u8>, NoValueFor> {
-        let parts = spec.0.iter().enumerate().map(|(part, &order)| match self.values.get(part) {
-            Some(&value) => Ok(key_part(value, order)),
-            None => Err(NoValueFor(part)),
-        });
-
-        Ok(parts.collect::<Result<Vec<_>, _>>()?.concat())
+    fn key(&self, spec: &KeySpec) -> Result<Vec<u8>, NoValueFor> {
+        match self.values.len() < spec.keyparts.len() {
+            true => Err(NoValueFor(self.values.len())),
+            false => Ok(spec.collate(self.values.iter().copied())),
+        }
     }
 
     fn payload(&self) -> Tag { self.payload.clone() }
@@ -107,24 +189,6 @@ impl Member<Spec> for Item {
 #[derive(Debug, thiserror::Error)]
 #[error("no value for key part {0}")]
 pub(crate) struct NoValueFor(pub(crate) usize);
-
-/// One key part's bytes, the tests' stand-in for an owner's collation: a
-/// present value is `0x01` and its big-endian bytes with the sign bit
-/// flipped, so values sort as numbers do; a missing value is `0x02`, after
-/// every present one, as PostgreSQL sorts NULL; and a descending part's bytes
-/// are inverted, so that it sorts the other way, missing values first.
-pub(crate) fn key_part(value: Option<i64>, order: Order) -> Vec<u8> {
-    let mut bytes = match value {
-        Some(value) => [&[0x01][..], &(value as u64 ^ 1 << 63).to_be_bytes()].concat(),
-        None => vec![0x02],
-    };
-
-    if order == Order::Descending {
-        bytes.iter_mut().for_each(|byte| *byte = !*byte);
-    }
-
-    bytes
-}
 
 /// The element in `G` of the leaf of this key, id and payload.
 pub(crate) fn leaf_element<G: DigestGroup>(key: &[u8], id: &[u8], payload: &[u8]) -> G::Element {

@@ -1,5 +1,5 @@
-//! The trie's shape as members come and go: splits, merges, the gap between
-//! their thresholds, and inserted branches.
+//! The trie's shape as members come and go: splits, merges and inserted
+//! branches.
 
 use crate::fixtures::{leaf_element, Item};
 use crate::tree::fixtures::{assert_same_tree, built, by_id_spec, integer_spec, item, Tree};
@@ -37,36 +37,19 @@ async fn a_bucket_splits_past_its_capacity_into_the_nodes_a_build_lays_out() {
     assert_eq!(tree.stored_rows().await, rebuilt.stored_rows().await);
 }
 
+/// A subtree with children that a removal leaves holding no more than a
+/// bucket holds merges into one bucket, though both its sides still hold
+/// members: the tree holds a build's very rows.
 #[tokio::test]
-async fn a_subtree_merges_into_one_bucket_at_the_merge_threshold() {
+async fn a_subtree_shrunk_to_a_buckets_capacity_merges_into_one_bucket() {
+    // 65 members split into ids 0 to 63 and id 64; removing id 1 leaves 64,
+    // with both sides still holding members.
     let tree = by_id_tree(0..65).await;
-    change(&tree, [], 32..65).await.unwrap();
+    change(&tree, [], [1]).await.unwrap();
 
-    let rebuilt = by_id_tree(0..32).await;
+    let rebuilt = by_id_tree((0..65).filter(|&id| id != 1)).await;
+    assert_eq!(tree.node_prefixes().await.len(), 1, "64 members fit one bucket");
     assert_eq!(tree.stored_rows().await, rebuilt.stored_rows().await);
-}
-
-/// Between the thresholds a subtree keeps the shape it has: a build of the
-/// same members may lay out other nodes, but every digest agrees.
-#[tokio::test]
-async fn between_the_thresholds_a_subtree_keeps_its_shape() {
-    // 65 members split into ids 0 to 63 and id 64; removing 32 of the first
-    // side leaves 33, with both sides still holding members.
-    let shrunk = by_id_tree(0..65).await;
-    change(&shrunk, [], 1..33).await.unwrap();
-    assert_eq!(shrunk.node_prefixes().await.len(), 3, "33 members, above the merge threshold, keep their branch");
-
-    let compact = by_id_tree(std::iter::once(0).chain(33..65)).await;
-    assert_eq!(compact.node_prefixes().await.len(), 1);
-    assert_same_tree(&shrunk, &compact).await;
-
-    // A transaction that adds a 65th member and removes another settles its
-    // shape once its walks are done, on 64 members: a bucket never split.
-    let full = by_id_tree(0..64).await;
-    change(&full, [64], [0]).await.unwrap();
-
-    assert_eq!(full.node_prefixes().await.len(), 1, "a transaction that leaves 64 members leaves one bucket");
-    assert_same_tree(&full, &by_id_tree(1..65).await).await;
 }
 
 /// A removal that empties one side of a branch leaves the branch parting
@@ -97,15 +80,15 @@ async fn a_branch_whose_side_empties_gives_way_to_the_other_side() {
 /// full bucket, past its capacity gives way to that bucket, which then splits.
 #[tokio::test]
 async fn a_branch_that_collapses_onto_an_overfull_bucket_splits_it() {
-    let tree = built::<Ristretto255>(integer_spec(), (0..64).map(|n| item(n, Some(0), b"")).chain([item(100, Some(1), b"")])).await;
+    let tree = built::<Ristretto255>(integer_spec(), (0..64).map(|n| item!(n, Some(0), b"")).chain([item!(100, Some(1), b"")])).await;
     assert_eq!(tree.node_prefixes().await.len(), 3, "64 members on one side, one on the other");
 
     let mut trx = tree.transaction();
-    trx.remove(item(100, Some(1), b"")).unwrap();
-    trx.insert(item(200, Some(0), b"")).unwrap();
+    trx.remove(item!(100, Some(1), b"")).unwrap();
+    trx.insert(item!(200, Some(0), b"")).unwrap();
     trx.commit().await.unwrap();
 
-    assert_same_tree(&tree, &built(integer_spec(), (0..64).chain([200]).map(|n| item(n, Some(0), b""))).await).await;
+    assert_same_tree(&tree, &built(integer_spec(), (0..64).chain([200]).map(|n| item!(n, Some(0), b""))).await).await;
 }
 
 /// A branch whose one side a transaction empties while it empties a side of
@@ -113,19 +96,23 @@ async fn a_branch_that_collapses_onto_an_overfull_bucket_splits_it() {
 /// side in turn.
 #[tokio::test]
 async fn a_branch_that_collapses_onto_a_subtree_with_an_empty_side_collapses_again() {
-    let members = (0..10).map(|n| item(n, Some(0), b"")).chain((100..160).map(|n| item(n, Some(1), b""))).chain([item(300, Some(2), b"")]);
+    // Key 1 keeps more members than a bucket holds, so the root keeps its
+    // children once the transaction is done and must give way twice.
+    let members =
+        (0..10).map(|n| item!(n, Some(0), b"")).chain((100..180).map(|n| item!(n, Some(1), b""))).chain([item!(300, Some(2), b"")]);
+
     let tree = built::<Ristretto255>(integer_spec(), members).await;
-    assert_eq!(tree.node_prefixes().await.len(), 5, "keys 0 and 1 on one side, parted beneath it, and key 2 on the other");
+    assert_eq!(tree.node_prefixes().await.len(), 7, "keys 0 and 1 on one side, parted twice beneath it, and key 2 on the other");
 
     let mut trx = tree.transaction();
-    trx.remove(item(300, Some(2), b"")).unwrap();
+    trx.remove(item!(300, Some(2), b"")).unwrap();
 
     for n in 0..10 {
-        trx.remove(item(n, Some(0), b"")).unwrap();
+        trx.remove(item!(n, Some(0), b"")).unwrap();
     }
 
     trx.commit().await.unwrap();
-    assert_same_tree(&tree, &built(integer_spec(), (100..160).map(|n| item(n, Some(1), b""))).await).await;
+    assert_same_tree(&tree, &built(integer_spec(), (100..180).map(|n| item!(n, Some(1), b""))).await).await;
 }
 
 /// A member beneath a node with children but outside both gets a branch of
@@ -134,11 +121,11 @@ async fn a_branch_that_collapses_onto_a_subtree_with_an_empty_side_collapses_aga
 async fn a_member_outside_a_nodes_children_gets_a_branch_of_its_own() {
     // Keys 0 to 99: the root's children part the keys deep in their bytes,
     // and a negative key lies outside both.
-    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item(n, Some(i64::from(n)), b""))).await;
+    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b""))).await;
     let before = tree.node_prefixes().await;
 
     let mut trx = tree.transaction();
-    trx.insert(item(100, Some(-1), b"")).unwrap();
+    trx.insert(item!(100, Some(-1), b"")).unwrap();
     trx.commit().await.unwrap();
 
     let after = tree.node_prefixes().await;
@@ -146,7 +133,7 @@ async fn a_member_outside_a_nodes_children_gets_a_branch_of_its_own() {
     assert!(before.iter().all(|prefix| after.contains(prefix)), "the old nodes stay");
     assert_same_tree(
         &tree,
-        &built(integer_spec(), (0..100).map(|n| item(n, Some(i64::from(n)), b"")).chain([item(100, Some(-1), b"")])).await,
+        &built(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b"")).chain([item!(100, Some(-1), b"")])).await,
     )
     .await;
 }

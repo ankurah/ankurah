@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use ankurah_digest_tree::{DigestTree, Encode, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Store, StoreError, WriteItem};
 
-use super::members::{Id, Item, Spec, Tag};
+use super::members::{Id, Item, KeySpec, Tag};
 
 /// Every row `store` holds, encoded, in key order.
 pub async fn stored_rows<V: Encode + Clone + Send + Sync + 'static>(store: &impl Store<RowKey, V>) -> Vec<(RowKey, Vec<u8>)> {
@@ -65,90 +65,50 @@ impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for CountingStore<V> {
 }
 
 /// The rows of a tree of items, over a store that counts its writes.
-pub type CountedStore = CountingStore<Row<Spec, Tag, Ristretto255>>;
+pub type CountedStore = CountingStore<Row<KeySpec, Tag, Ristretto255>>;
 
 /// A tree of items over a store that counts its writes.
-pub type CountedTree = DigestTree<Spec, Id, Tag, Ristretto255, CountedStore>;
+pub type CountedTree = DigestTree<KeySpec, Id, Tag, Ristretto255, CountedStore>;
 
 /// A counted tree holding exactly `members`, and its store.
-pub async fn counted(key_spec: Spec, members: impl IntoIterator<Item = Item>) -> (CountedTree, CountedStore) {
+pub async fn counted(key_spec: KeySpec, members: impl IntoIterator<Item = Item>) -> (CountedTree, CountedStore) {
     let store = CountingStore::new();
     (DigestTree::build(store.clone(), key_spec, members).await.unwrap(), store)
 }
 
-/// A memory store whose writes fail while a test says so, as a real store's
-/// may when its disk or its connection goes. Clones share the rows and the
-/// switch.
+/// A memory store whose reads or writes fail while a test says so, as a real
+/// store's may when its disk or its connection goes. Clones share the rows
+/// and the switches.
 #[derive(Clone)]
-pub struct FailingWrites<V> {
+pub struct Failing<V> {
     rows: MemoryStore<RowKey, V>,
-    failing: Arc<AtomicBool>,
+    reads_fail: Arc<AtomicBool>,
+    writes_fail: Arc<AtomicBool>,
 }
 
-impl<V> FailingWrites<V> {
-    pub fn new() -> Self { Self { rows: MemoryStore::new(), failing: Arc::new(AtomicBool::new(false)) } }
-
-    /// Make every write from now on fail, as a failure trying again may fix,
-    /// or succeed again.
-    pub fn fail_writes(&self, failing: bool) { self.failing.store(failing, Ordering::Relaxed) }
-}
-
-impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for FailingWrites<V> {
-    async fn get(&self, key: &RowKey) -> Result<Option<V>, StoreError> { self.rows.get(key).await }
-
-    async fn range(
-        &self,
-        start: Bound<&RowKey>,
-        end: Bound<&RowKey>,
-        direction: ScanDirection,
-        limit: usize,
-    ) -> Result<Vec<(RowKey, V)>, StoreError> {
-        self.rows.range(start, end, direction, limit).await
-    }
-
-    async fn write(&self, items: Vec<WriteItem<RowKey, V>>) -> Result<(), StoreError> {
-        if self.failing.load(Ordering::Relaxed) {
-            return Err(StoreError::retryable("the store's disk went away"));
-        }
-
-        self.rows.write(items).await
-    }
-}
-
-/// The rows of a tree of items, over a store whose writes can fail.
-pub type FailingStore = FailingWrites<Row<Spec, Tag, Ristretto255>>;
-
-/// A tree of items over a store whose writes can fail.
-pub type FailingTree = DigestTree<Spec, Id, Tag, Ristretto255, FailingStore>;
-
-/// A memory store whose reads fail while a test says so, as a real store's
-/// may when its disk or its connection goes. Clones share the rows and the
-/// switch.
-#[derive(Clone)]
-pub struct FailingReads<V> {
-    rows: MemoryStore<RowKey, V>,
-    failing: Arc<AtomicBool>,
-}
-
-impl<V> FailingReads<V> {
-    pub fn new() -> Self { Self { rows: MemoryStore::new(), failing: Arc::new(AtomicBool::new(false)) } }
+impl<V> Failing<V> {
+    pub fn new() -> Self { Self { rows: MemoryStore::new(), reads_fail: Arc::default(), writes_fail: Arc::default() } }
 
     /// Make every read from now on fail, as a failure trying again may fix,
     /// or succeed again.
-    pub fn fail_reads(&self, failing: bool) { self.failing.store(failing, Ordering::Relaxed) }
+    pub fn fail_reads(&self, failing: bool) { self.reads_fail.store(failing, Ordering::Relaxed) }
 
-    /// Refuse a read while the test says reads fail.
-    fn refuse_while_failing(&self) -> Result<(), StoreError> {
-        match self.failing.load(Ordering::Relaxed) {
-            true => Err(StoreError::retryable("the store's disk went away")),
-            false => Ok(()),
-        }
+    /// Make every write from now on fail, as a failure trying again may fix,
+    /// or succeed again.
+    pub fn fail_writes(&self, failing: bool) { self.writes_fail.store(failing, Ordering::Relaxed) }
+}
+
+/// Refuse an operation while its switch says it fails.
+fn refuse_while(failing: &AtomicBool) -> Result<(), StoreError> {
+    match failing.load(Ordering::Relaxed) {
+        true => Err(StoreError::retryable("the store's disk went away")),
+        false => Ok(()),
     }
 }
 
-impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for FailingReads<V> {
+impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for Failing<V> {
     async fn get(&self, key: &RowKey) -> Result<Option<V>, StoreError> {
-        self.refuse_while_failing()?;
+        refuse_while(&self.reads_fail)?;
         self.rows.get(key).await
     }
 
@@ -159,12 +119,21 @@ impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for FailingReads<V> {
         direction: ScanDirection,
         limit: usize,
     ) -> Result<Vec<(RowKey, V)>, StoreError> {
-        self.refuse_while_failing()?;
+        refuse_while(&self.reads_fail)?;
         self.rows.range(start, end, direction, limit).await
     }
 
-    async fn write(&self, items: Vec<WriteItem<RowKey, V>>) -> Result<(), StoreError> { self.rows.write(items).await }
+    async fn write(&self, items: Vec<WriteItem<RowKey, V>>) -> Result<(), StoreError> {
+        refuse_while(&self.writes_fail)?;
+        self.rows.write(items).await
+    }
 }
+
+/// The rows of a tree of items, over a store whose reads or writes can fail.
+pub type FailingStore = Failing<Row<KeySpec, Tag, Ristretto255>>;
+
+/// A tree of items over a store whose reads or writes can fail.
+pub type FailingTree = DigestTree<KeySpec, Id, Tag, Ristretto255, FailingStore>;
 
 /// A memory store that returns at most three rows per read, as a store that
 /// pages its reads may: the tree must read on.

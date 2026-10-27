@@ -8,8 +8,7 @@ use std::pin::pin;
 
 use ankurah_digest_tree::Store;
 use common::{
-    integer_key, integer_spec, item, poll_once, remove_add_and_move, removed_added_and_moved, stored_rows, ten_items, Id, Item, ItemStore,
-    ItemTree,
+    integer_spec, item, poll_once, remove_add_and_move, removed_added_and_moved, stored_rows, ten_items, Id, Item, ItemStore, ItemTree,
 };
 
 /// A tree in memory holding `members`, and its store, which a test writes as
@@ -64,12 +63,12 @@ async fn a_staged_commit_holds_off_reads_and_commits_until_dropped() {
     let (tree, store) = tree_and_store(ten_items()).await;
     let staged = remove_add_and_move(&tree).stage().await.unwrap();
 
-    let (view, key, id) = (tree.view(), integer_key(Some(10)), Id(10));
+    let (view, key, id) = (tree.view(), integer_spec().collate([10]), Id(10));
     let mut reading = pin!(view.member(&key, &id));
     assert!(poll_once(reading.as_mut()).is_pending(), "the read waits for the staged commit");
 
     let mut other = tree.transaction();
-    other.insert(item(11, Some(11), b"")).unwrap();
+    other.insert(item!(11, Some(11), b"")).unwrap();
 
     let mut committing = pin!(other.commit());
     assert!(poll_once(committing.as_mut()).is_pending(), "the commit waits for the staged commit");

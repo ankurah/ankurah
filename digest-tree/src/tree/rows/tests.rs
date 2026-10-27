@@ -1,17 +1,17 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::fixtures::{block_on, Spec, Tag};
+use crate::fixtures::{block_on, KeySpec, Tag};
 use crate::tree::fixtures::ShortPages;
 use crate::{MemoryStore, Ristretto255};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 
-type TestRow = Row<Spec, Tag, Ristretto255>;
+type TestRow = Row<KeySpec, Tag, Ristretto255>;
 
 /// A metadata row holding `n`, so rows tell apart: staging never looks at a
 /// row's kind.
-fn row(n: u8) -> TestRow { Row::Meta(Meta { key_spec: Spec(Vec::new()), group: n }) }
+fn row(n: u8) -> TestRow { Row::Meta(Meta { key_spec: KeySpec::new(vec![]), group: n }) }
 
 fn key(n: u8) -> RowKey { RowKey::Leaf(vec![n]) }
 

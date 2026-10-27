@@ -4,7 +4,7 @@
 
 use std::future::Future;
 use std::mem;
-use std::ops::Bound;
+use std::ops::{Bound, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo, RangeToInclusive};
 use std::pin::Pin;
 use std::task::{ready, Context, Poll};
 use std::vec;
@@ -31,6 +31,11 @@ const LARGEST_BATCH: usize = 1024;
 /// What a [range read](crate::DigestTreeView::range) covers and which way it
 /// reads: a span of addresses, and the direction it reads them in, as a sled
 /// tree's `range` takes a range of keys and its iterator runs either way.
+///
+/// A [`Span`], or a Rust range of key bytes as [`Span::for_key_range`] takes
+/// it, with `..` for every key, converts into a forward read, as a Rust range
+/// runs from its start to its end; [`reverse`](Self::reverse) turns any of
+/// them around.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanRange {
     /// The addresses read.
@@ -41,11 +46,39 @@ pub struct ScanRange {
 }
 
 impl ScanRange {
-    /// `span`, read from its smallest address up.
-    pub fn forward(span: Span) -> Self { Self { span, direction: ScanDirection::Forward } }
+    /// `range`, read from its smallest address up.
+    pub fn forward(range: impl Into<ScanRange>) -> Self { Self { direction: ScanDirection::Forward, ..range.into() } }
 
-    /// `span`, read from its largest address down.
-    pub fn reverse(span: Span) -> Self { Self { span, direction: ScanDirection::Reverse } }
+    /// `range`, read from its largest address down.
+    pub fn reverse(range: impl Into<ScanRange>) -> Self { Self { direction: ScanDirection::Reverse, ..range.into() } }
+}
+
+impl From<Span> for ScanRange {
+    fn from(span: Span) -> Self { Self { span, direction: ScanDirection::Forward } }
+}
+
+impl From<RangeFull> for ScanRange {
+    fn from(_: RangeFull) -> Self { Span::all().into() }
+}
+
+impl<K: AsRef<[u8]>> From<Range<K>> for ScanRange {
+    fn from(keys: Range<K>) -> Self { Span::for_key_range(keys).into() }
+}
+
+impl<K: AsRef<[u8]>> From<RangeInclusive<K>> for ScanRange {
+    fn from(keys: RangeInclusive<K>) -> Self { Span::for_key_range(keys).into() }
+}
+
+impl<K: AsRef<[u8]>> From<RangeFrom<K>> for ScanRange {
+    fn from(keys: RangeFrom<K>) -> Self { Span::for_key_range(keys).into() }
+}
+
+impl<K: AsRef<[u8]>> From<RangeTo<K>> for ScanRange {
+    fn from(keys: RangeTo<K>) -> Self { Span::for_key_range(keys).into() }
+}
+
+impl<K: AsRef<[u8]>> From<RangeToInclusive<K>> for ScanRange {
+    fn from(keys: RangeToInclusive<K>) -> Self { Span::for_key_range(keys).into() }
 }
 
 /// The members of a view within a range, as a stream in the range's
@@ -175,8 +208,9 @@ where
     G: DigestGroup,
     S: Store<RowKey, Row<K, L, G>>,
 {
-    // One member past the batch tells whether any lie beyond it, so that the
-    // scan ends without another batch that finds nothing.
+    // One member past the batch tells whether any lie beyond it, so that a
+    // batch that reaches the end of the range ends the scan without another
+    // read.
     let mut leaves = {
         let _read = tree.inner.lock.read().await;
         first_members(&StagedRows::new(&tree.inner.store), &unread, direction, size + 1).await?

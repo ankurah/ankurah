@@ -6,7 +6,7 @@ mod digest;
 mod prefix;
 
 use std::cmp::Ordering;
-use std::ops::Bound;
+use std::ops::{Bound, RangeBounds};
 
 use serde::{Deserialize, Serialize};
 
@@ -48,13 +48,21 @@ impl Span {
     /// Every address.
     pub fn all() -> Self { Self::new(Bound::Unbounded, Bound::Unbounded) }
 
-    /// The addresses of the members whose keys lie between these bounds. Each
-    /// bound is a key prefix, as the owner's collation encodes a key's leading
-    /// parts, and is widened to every key it begins: an included lower bound
-    /// starts at the first of them and an excluded one after the last, and an
-    /// included upper bound ends after the last of them and an excluded one
-    /// before the first.
-    pub fn for_key_range(lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Self {
+    /// The addresses of the members whose keys lie within `keys`: a range of
+    /// key bytes, such as `from..`, `from..=to` or `..to`, or a pair of
+    /// [`Bound`]s, which can also exclude its start. Each bound is a key
+    /// prefix, as the owner's collation encodes a key's leading parts, and is
+    /// widened to every key it begins: an included lower bound starts at the
+    /// first of them and an excluded one after the last, and an included
+    /// upper bound ends after the last of them and an excluded one before the
+    /// first.
+    ///
+    /// Bounds that borrow their keys, as `(Bound<&[u8]>, Bound<&[u8]>)`, are a
+    /// range two ways over, of `&[u8]` and of `[u8]`, so such a call names the
+    /// key type: `Span::for_key_range::<&[u8]>((lower, upper))`.
+    pub fn for_key_range<K: AsRef<[u8]>>(keys: impl RangeBounds<K>) -> Self {
+        let (lower, upper) = (keys.start_bound().map(|key| key.as_ref()), keys.end_bound().map(|key| key.as_ref()));
+
         let start = match lower {
             Bound::Unbounded => Bound::Unbounded,
             Bound::Included([]) => Bound::Unbounded,

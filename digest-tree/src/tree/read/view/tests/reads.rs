@@ -5,7 +5,7 @@ use std::ops::Bound;
 use super::super::*;
 use crate::fixtures::{block_on, leaf_element, Id, Tag};
 use crate::span::{key_prefix, split_address};
-use crate::tree::fixtures::{built, integer_key, integer_spec, item, Tree, View};
+use crate::tree::fixtures::{built, integer_spec, item, Tree, View};
 use crate::{leaf_address, NodePrefix, Ristretto255, ScanRange};
 use futures::TryStreamExt;
 use proptest::prelude::*;
@@ -17,8 +17,10 @@ struct Model(Vec<(Vec<u8>, Id, Tag)>);
 
 impl Model {
     fn of(members: &[(u32, Option<i64>, Vec<u8>)]) -> Self {
-        let mut rows: Vec<(Vec<u8>, Id, Tag)> =
-            members.iter().map(|(id, key, payload)| (leaf_address(&integer_key(*key), &Id(*id)), Id(*id), Tag(payload.clone()))).collect();
+        let mut rows: Vec<(Vec<u8>, Id, Tag)> = members
+            .iter()
+            .map(|(id, key, payload)| (leaf_address(&integer_spec().collate([*key]), &Id(*id)), Id(*id), Tag(payload.clone())))
+            .collect();
 
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         Self(rows)
@@ -46,8 +48,8 @@ impl Model {
 fn bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
     (0..3u8, proptest::option::weighted(0.9, -3i64..3), proptest::option::of(0..300u32)).prop_map(|(kind, key, id)| {
         let at = match id {
-            Some(id) => leaf_address(&integer_key(key), &Id(id)),
-            None => key_prefix(&integer_key(key)),
+            Some(id) => leaf_address(&integer_spec().collate([key]), &Id(id)),
+            None => key_prefix(&integer_spec().collate([key])),
         };
 
         match kind {
@@ -152,7 +154,7 @@ proptest! {
     fn every_read_matches_a_model_of_the_members(members in members(), selected in proptest::collection::vec(span(), 0..3), spans in proptest::collection::vec(span(), 1..4)) {
         block_on(async {
             let model = Model::of(&members);
-            let tree = built::<Ristretto255>(integer_spec(), members.iter().map(|(id, key, payload)| item(*id, *key, payload))).await;
+            let tree = built::<Ristretto255>(integer_spec(), members.iter().map(|(id, key, payload)| item!(*id, *key, payload))).await;
 
             let (view, covered) = match selected.is_empty() {
                 true => (tree.view(), vec![Span::all()]),

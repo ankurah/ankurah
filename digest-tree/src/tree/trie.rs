@@ -4,24 +4,24 @@
 //!
 //! A node with no children is a bucket, and holds at most
 //! [`BUCKET_CAPACITY`] members. A node with children has exactly two, siblings
-//! that differ in their last bit, and holds more than [`MERGE_AT`] members.
-//! Every member beneath a node with children lies beneath one of them, and
-//! every node but the root holds at least one member: a branch parts
-//! members, so neither of its sides is empty.
+//! that differ in their last bit, and holds more than [`BUCKET_CAPACITY`]
+//! members. Every member beneath a node with children lies beneath one of
+//! them, and every node but the root holds at least one member: a branch
+//! parts members, so neither of its sides is empty. So the trie's shape
+//! follows from its members alone, whatever order they came and went in.
 
 use std::ops::Bound;
 
 use super::rows::{wrong_kind, StagedRows};
 use crate::{Digest, DigestGroup, Error, NodePrefix, Payload, Row, RowKey, ScanDirection, Store};
 
-/// The most members a bucket holds: an insertion that takes a bucket past it
-/// splits the bucket.
+/// The most members a bucket holds. An insertion that takes a bucket past it
+/// splits the bucket, and a removal that leaves a subtree with children
+/// holding this many or fewer merges the subtree into one bucket. Splitting
+/// and merging at the same count keeps the trie's shape a matter of its
+/// members alone, though a bucket that hovers at the count splits and merges
+/// by turns.
 pub(super) const BUCKET_CAPACITY: u64 = 64;
-
-/// A subtree with children that a removal leaves holding this many members
-/// or fewer merges into one bucket. The gap below the capacity keeps a bucket
-/// near it from splitting and merging over and over.
-pub(super) const MERGE_AT: u64 = 32;
 
 /// A node of the trie: its prefix, and the digest of the members beneath it.
 #[derive(Clone, Debug, PartialEq, Eq)]

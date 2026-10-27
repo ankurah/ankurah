@@ -6,19 +6,16 @@ mod common;
 
 use std::ops::Bound;
 
-use ankurah_digest_tree::{leaf_address, DigestTree, Error, Ristretto255, Row, ScanRange, Span};
-use common::{built, counted, integer_key, integer_spec, item, FailingReads, Id, Item, Spec, Tag};
+use ankurah_digest_tree::{leaf_address, Error, Members, Ristretto255, ScanRange, Span};
+use common::{built, counted, integer_spec, item, FailingStore, FailingTree, Id, Item, ItemStore, KeySpec, Tag};
 use futures::{StreamExt, TryStreamExt};
-
-/// A tree of items over a store whose reads can fail.
-type FailingReadsTree = DigestTree<Spec, Id, Tag, Ristretto255, FailingReads<Row<Spec, Tag, Ristretto255>>>;
 
 /// Item `n` of the long reads' tree: 2,500 items over 300 keys, so that each
 /// key holds several members and a span can end among one key's members.
-fn numbered(n: u64) -> Item { item(n, Some((n % 300) as i64), &n.to_be_bytes()) }
+fn numbered(n: u64) -> Item { item!(n, Some((n % 300) as i64), &n.to_be_bytes()) }
 
 /// The address of item `n` of the long reads' tree.
-fn address(n: u64) -> Vec<u8> { leaf_address(&integer_key(Some((n % 300) as i64)), &Id(n)) }
+fn address(n: u64) -> Vec<u8> { leaf_address(&integer_spec().collate([(n % 300) as i64]), &Id(n)) }
 
 /// Range reads of a tree large enough for one to reach its largest batch: of
 /// a view of the whole tree and of a view of several spans, each over the
@@ -34,13 +31,13 @@ async fn a_range_read_yields_every_member_within_its_spans_in_its_direction() {
     let mut model: Vec<(Vec<u8>, Tag)> = (0..2500).map(|n| (address(n), Tag(n.to_be_bytes().to_vec()))).collect();
     model.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let key = |key: i64| integer_key(Some(key));
+    let key = |key: i64| integer_spec().collate([key]);
     let several = vec![
-        Span::for_key_range(Bound::Included(&key(10)), Bound::Excluded(&key(90))),
+        Span::for_key_range(key(10)..key(90)),
         // From after the fifth of key 112's members to the seventh of key
         // 279's.
         Span::new(Bound::Excluded(address(1312)), Bound::Included(address(2079))),
-        Span::for_key_range(Bound::Excluded(&key(285)), Bound::Unbounded),
+        Span::for_key_range((Bound::Excluded(key(285)), Bound::Unbounded)),
     ];
 
     // From the third of key 50's members to short of the eighth of key 190's.
@@ -64,6 +61,21 @@ async fn a_range_read_yields_every_member_within_its_spans_in_its_direction() {
     }
 }
 
+/// A Rust range of keys reads the members whose keys lie within it, forward
+/// unless turned around, its included end covering every member of that key.
+#[tokio::test]
+async fn a_range_of_keys_reads_the_members_whose_keys_lie_within_it() {
+    let spec = integer_spec();
+    let tree = built::<Ristretto255>(spec.clone(), (0..100).map(|n| item!(n, Some(n as i64), b""))).await;
+
+    let forward: Vec<Id> = tree.view().range(spec.collate([10])..spec.collate([20])).map_ok(|leaf| leaf.id).try_collect().await.unwrap();
+    let reverse = tree.view().range(ScanRange::reverse(spec.collate([10])..=spec.collate([20])));
+    let reverse: Vec<Id> = reverse.map_ok(|leaf| leaf.id).try_collect().await.unwrap();
+
+    assert_eq!(forward, (10..20).map(Id).collect::<Vec<_>>());
+    assert_eq!(reverse, (10..=20).rev().map(Id).collect::<Vec<_>>());
+}
+
 /// A range read reads only the batches it yields from: the first of 64
 /// members, as many as a bucket holds, each after it twice as many as the one
 /// before up to 1,024, and with each one member past it, which tells the read
@@ -72,13 +84,12 @@ async fn a_range_read_yields_every_member_within_its_spans_in_its_direction() {
 /// one stopped after 2,000 members, six, the last two of 1,024.
 #[tokio::test]
 async fn a_range_read_stopped_early_reads_only_the_batches_it_yields_from() {
-    let (tree, store) = counted(integer_spec(), (0..5000).map(|n| item(n, Some(n as i64), b""))).await;
+    let (tree, store) = counted(integer_spec(), (0..5000).map(|n| item!(n, Some(n as i64), b""))).await;
 
     for (stopped_after, rows) in [(3, 65), (65, 65 + 129), (2000, 65 + 129 + 257 + 513 + 1025 + 1025)] {
         let before = store.rows_read();
 
-        let read: Vec<Id> =
-            tree.view().range(ScanRange::forward(Span::all())).take(stopped_after).map_ok(|leaf| leaf.id).try_collect().await.unwrap();
+        let read: Vec<Id> = tree.view().range(..).take(stopped_after).map_ok(|leaf| leaf.id).try_collect().await.unwrap();
 
         assert_eq!(read, (0..stopped_after as u64).map(Id).collect::<Vec<_>>());
         assert_eq!(store.rows_read() - before, rows, "stopped after {stopped_after}");
@@ -90,9 +101,9 @@ async fn a_range_read_stopped_early_reads_only_the_batches_it_yields_from() {
 /// once the store reads again.
 #[tokio::test]
 async fn a_failed_read_ends_the_stream_after_yielding_its_failure() {
-    let store = FailingReads::new();
-    let tree = FailingReadsTree::build(store.clone(), integer_spec(), (0..100).map(|n| item(n, Some(n as i64), b""))).await.unwrap();
-    let mut scan = tree.view().range(ScanRange::forward(Span::all()));
+    let store = FailingStore::new();
+    let tree = FailingTree::build(store.clone(), integer_spec(), (0..100).map(|n| item!(n, Some(n as i64), b""))).await.unwrap();
+    let mut scan = tree.view().range(..);
 
     // The first batch's 64 members, read before the store fails.
     for n in 0..64 {
@@ -108,4 +119,13 @@ async fn a_failed_read_ends_the_stream_after_yielding_its_failure() {
 
     store.fail_reads(false);
     assert!(scan.next().await.is_none(), "the stream ended with its failure");
+}
+
+/// A range read is `Unpin`, as stream adapters that poll a stream without
+/// pinning it require: its batch under way sits pinned in a box of its own.
+#[test]
+fn a_range_read_needs_no_pinning() {
+    fn is_unpin<T: Unpin>() {}
+
+    is_unpin::<Members<KeySpec, Id, Tag, Ristretto255, ItemStore>>();
 }

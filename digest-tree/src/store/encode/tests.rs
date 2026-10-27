@@ -1,6 +1,6 @@
 use super::*;
 use crate::digest::leaf_encoding;
-use crate::fixtures::{spec, Order, Spec, Tag};
+use crate::fixtures::{asc, desc, KeySpec, Tag};
 use crate::{LtHash16, Ristretto255};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -50,17 +50,17 @@ fn element<G: DigestGroup>() -> G::Element { G::hash_leaf(&leaf_encoding(b"k", b
 
 /// A row's encoding, decoded and encoded again: equal bytes mean the row
 /// came back whole.
-fn round_trip<G: DigestGroup>(row: &Row<Spec, Tag, G>) -> Vec<u8> { Row::<Spec, Tag, G>::decode(&row.encode()).unwrap().encode() }
+fn round_trip<G: DigestGroup>(row: &Row<KeySpec, Tag, G>) -> Vec<u8> { Row::<KeySpec, Tag, G>::decode(&row.encode()).unwrap().encode() }
 
 fn rows_round_trip<G: DigestGroup>() {
     let element = element::<G>();
     let mut digest = Digest::empty();
     digest.add_element(&element).unwrap();
 
-    let key_spec = spec(&[Order::Ascending, Order::Descending]);
-    let rows: [Row<Spec, Tag, G>; 4] = [
+    let key_spec = KeySpec::new(vec![asc!("a"), desc!("b")]);
+    let rows: [Row<KeySpec, Tag, G>; 4] = [
         Row::Meta(Meta { key_spec: key_spec.clone(), group: G::ROW_VERSION }),
-        Row::Meta(Meta { key_spec: spec(&[]), group: G::ROW_VERSION }),
+        Row::Meta(Meta { key_spec: KeySpec::new(vec![]), group: G::ROW_VERSION }),
         Row::Node(digest),
         Row::Leaf(LeafRow { payload: Tag(b"payload".to_vec()), element }),
     ];
@@ -69,12 +69,12 @@ fn rows_round_trip<G: DigestGroup>() {
         assert_eq!(round_trip(row), row.encode(), "{row:?}");
     }
 
-    match Row::<Spec, Tag, G>::decode(&rows[0].encode()).unwrap() {
+    match Row::<KeySpec, Tag, G>::decode(&rows[0].encode()).unwrap() {
         Row::Meta(meta) => assert_eq!((meta.key_spec, meta.group), (key_spec, G::ROW_VERSION)),
         other => panic!("expected metadata, got {other:?}"),
     }
 
-    match Row::<Spec, Tag, G>::decode(&rows[3].encode()).unwrap() {
+    match Row::<KeySpec, Tag, G>::decode(&rows[3].encode()).unwrap() {
         Row::Leaf(leaf) => assert_eq!((leaf.payload, leaf.element), (Tag(b"payload".to_vec()), element)),
         other => panic!("expected a leaf, got {other:?}"),
     }
@@ -88,16 +88,16 @@ fn lthash16_rows_round_trip() { rows_round_trip::<LtHash16>() }
 
 #[test]
 fn bytes_that_are_no_row_are_refused_permanently() {
-    let leaf = Row::<Spec, Tag, LtHash16>::Leaf(LeafRow { payload: Tag(vec![]), element: element::<LtHash16>() }).encode();
+    let leaf = Row::<KeySpec, Tag, LtHash16>::Leaf(LeafRow { payload: Tag(vec![]), element: element::<LtHash16>() }).encode();
 
     for (bytes, why) in [
         (vec![], "bytes that are no row"),
         (vec![4], "bytes that are no row"),
         (vec![META], "a truncated metadata row"),
-        (vec![META, 1, 7], "a key part's order is 0 or 1"),
+        (vec![META, 1, 7, 0], "a key part's direction is 0 or 1"),
         (leaf, "unknown digest version 2"),
         (vec![NODE, 1], "expected 41 bytes, found 1"),
     ] {
-        assert!(refusal(Row::<Spec, Tag, Ristretto255>::decode(&bytes)).contains(why), "{bytes:02x?}: {why}");
+        assert!(refusal(Row::<KeySpec, Tag, Ristretto255>::decode(&bytes)).contains(why), "{bytes:02x?}: {why}");
     }
 }

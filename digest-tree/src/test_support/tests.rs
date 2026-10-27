@@ -1,10 +1,10 @@
 use super::*;
-use crate::fixtures::{spec, Item, Order};
+use crate::fixtures::{asc, Item, KeySpec};
 use crate::{DigestTree, LtHash16, MemoryStore, Ristretto255, Span};
 
 /// The members' digests sum to the digest of a tree that holds them.
 async fn member_digests_sum_to_the_trees<G: DigestGroup>() {
-    let spec = spec(&[Order::Ascending]);
+    let spec = KeySpec::new(vec![asc!("a")]);
     let members: Vec<Item> = (0..150).map(|n| Item::new(n, [Some(i64::from(n % 9))], &n.to_be_bytes())).collect();
     let digests = members.iter().map(|member| member_digest::<_, _, G>(&spec, member).unwrap());
     let expected = sum_digests(digests).unwrap();
@@ -23,5 +23,5 @@ async fn lthash16_member_digests_sum_to_the_trees() { member_digests_sum_to_the_
 #[test]
 fn a_member_digest_refuses_a_member_without_a_key() {
     let member = Item::new(1, [], b"");
-    assert!(matches!(member_digest::<_, _, Ristretto255>(&spec(&[Order::Ascending]), &member), Err(Error::Key { .. })));
+    assert!(matches!(member_digest::<_, _, Ristretto255>(&KeySpec::new(vec![asc!("a")]), &member), Err(Error::Key { .. })));
 }

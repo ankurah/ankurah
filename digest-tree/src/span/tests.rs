@@ -1,5 +1,5 @@
 use super::*;
-use crate::fixtures::{key_part, Id, Order};
+use crate::fixtures::{asc, Id, KeySpec};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 
@@ -106,13 +106,13 @@ fn bound_values() -> impl Strategy<Value = Vec<i64>> { proptest::collection::vec
 fn key_values() -> impl Strategy<Value = [Option<i64>; 2]> { [proptest::option::of(-3i64..3), proptest::option::of(-3i64..3)] }
 
 /// The key prefix of these leading values, each an ascending integer part.
-fn prefix_of(values: &[Option<i64>]) -> Vec<u8> { values.iter().flat_map(|&value| key_part(value, Order::Ascending)).collect() }
+fn prefix_of(values: &[Option<i64>]) -> Vec<u8> { KeySpec::new(vec![asc!("a"); values.len()]).collate(values.iter().copied()) }
 
-fn bound_of(kind: u8, prefix: &[u8]) -> Bound<&[u8]> {
+fn bound_of(kind: u8, prefix: &[u8]) -> Bound<Vec<u8>> {
     match kind {
         0 => Bound::Unbounded,
-        1 => Bound::Included(prefix),
-        _ => Bound::Excluded(prefix),
+        1 => Bound::Included(prefix.to_vec()),
+        _ => Bound::Excluded(prefix.to_vec()),
     }
 }
 
@@ -131,7 +131,7 @@ proptest! {
     ) {
         let as_prefix = |values: &[i64]| prefix_of(&values.iter().copied().map(Some).collect::<Vec<_>>());
         let (lower_prefix, upper_prefix) = (as_prefix(&lower.1), as_prefix(&upper.1));
-        let span = Span::for_key_range(bound_of(lower.0, &lower_prefix), bound_of(upper.0, &upper_prefix));
+        let span = Span::for_key_range((bound_of(lower.0, &lower_prefix), bound_of(upper.0, &upper_prefix)));
         let address = leaf_address(&prefix_of(&member), &Id(id));
 
         // Missing sorts above every present value.
@@ -149,10 +149,10 @@ proptest! {
 
 #[test]
 fn empty_key_bounds_hold_everything_or_nothing() {
-    assert_eq!(Span::for_key_range(Bound::Included(&[]), Bound::Included(&[])), Span::all());
+    assert_eq!(Span::for_key_range((Bound::Included(Vec::new()), Bound::Included(Vec::new()))), Span::all());
 
-    for (lower, upper) in [(Bound::Excluded(&[][..]), Bound::Unbounded), (Bound::Unbounded, Bound::Excluded(&[][..]))] {
-        let span = Span::for_key_range(lower, upper);
+    for (lower, upper) in [(Bound::Excluded(Vec::new()), Bound::Unbounded), (Bound::Unbounded, Bound::Excluded(Vec::new()))] {
+        let span = Span::for_key_range((lower, upper));
         assert!(span.is_empty() && !span.contains(&[]) && !span.contains(&leaf_address(&[0x02], &Id(1))));
     }
 }
