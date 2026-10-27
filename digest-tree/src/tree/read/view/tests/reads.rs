@@ -6,7 +6,7 @@ use super::super::*;
 use crate::fixtures::{block_on, leaf_element, Id, Tag};
 use crate::span::{key_prefix, split_address};
 use crate::tree::fixtures::{built, integer_key, integer_spec, item, Tree, View};
-use crate::{leaf_address, NodePrefix, Ristretto255, ScanDirection, ScanRange, ViewPlan};
+use crate::{leaf_address, NodePrefix, Ristretto255, ScanRange};
 use futures::TryStreamExt;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -156,10 +156,7 @@ proptest! {
 
             let (view, covered) = match selected.is_empty() {
                 true => (tree.view(), vec![Span::all()]),
-                false => {
-                    let plan = ViewPlan { spans: selected.clone(), direction: ScanDirection::Forward, limit: None };
-                    (tree.select(&plan).await.unwrap(), Span::normalize(selected.clone()))
-                }
+                false => (tree.select(selected.clone()), Span::normalize(selected.clone())),
             };
 
             for span in spans.iter().chain([&Span::all()]) {

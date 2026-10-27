@@ -9,8 +9,8 @@ mod common;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use ankurah_digest_tree::{DigestGroup, LtHash16, Ristretto255, Span, ViewPlan};
-use common::{across_the_wire, album, differing_spans, reconcile, tree, whole, year, Album, Id};
+use ankurah_digest_tree::{DigestGroup, LtHash16, Ristretto255, Span};
+use common::{across_the_wire, album, differing_spans, reconcile, tree, year, Album, Id};
 
 /// Peers that differ in an album's title, in an album each lacks, and in an
 /// album's year, over a tree large enough to branch.
@@ -27,7 +27,7 @@ async fn asymmetric_peers_reconcile<G: DigestGroup>() {
 
     // An album retitled, one removed, one moved to another year, and two
     // added.
-    assert_eq!(reconcile(&ours, &theirs, &albums, &whole()).await, 5);
+    assert_eq!(reconcile(&ours, &theirs, &albums, &[Span::all()]).await, 5);
 
     let (our_root, their_root) =
         (ours.view().span_digest(&Span::all()).await.unwrap(), theirs.view().span_digest(&Span::all()).await.unwrap());
@@ -37,7 +37,7 @@ async fn asymmetric_peers_reconcile<G: DigestGroup>() {
     assert!(moved.0.is_some() && moved.0 == moved.1, "the moved album");
 
     let empty = tree::<G>([]).await;
-    reconcile(&empty, &theirs, &albums, &whole()).await;
+    reconcile(&empty, &theirs, &albums, &[Span::all()]).await;
 
     assert_eq!(empty.view().len().await.unwrap(), albums.len() as u64);
 }
@@ -57,8 +57,7 @@ async fn a_range_reconciles_without_touching_members_outside_it() {
     let theirs = tree::<Ristretto255>(their_albums.values().cloned()).await;
 
     let range = Span::for_key_range(Bound::Included(&year(1910)), Bound::Excluded(&year(1930)));
-    let plan = ViewPlan { spans: vec![range], ..whole() };
-    assert_eq!(reconcile(&ours, &theirs, &their_albums, &plan).await, 20);
+    assert_eq!(reconcile(&ours, &theirs, &their_albums, &[range]).await, 20);
 
     for (id, live) in [(9, false), (10, true), (29, true), (30, false)] {
         let title = ours.view().member(&year(1900 + id as i64), &Id(id)).await.unwrap().unwrap().payload;

@@ -6,7 +6,7 @@ mod common;
 
 use std::ops::Bound;
 
-use ankurah_digest_tree::{leaf_address, DigestTree, Error, Ristretto255, Row, ScanDirection, ScanRange, Span, ViewPlan};
+use ankurah_digest_tree::{leaf_address, DigestTree, Error, Ristretto255, Row, ScanRange, Span};
 use common::{built, counted, integer_key, integer_spec, item, FailingReads, Id, Item, Spec, Tag};
 use futures::{StreamExt, TryStreamExt};
 
@@ -47,7 +47,7 @@ async fn a_range_read_yields_every_member_within_its_spans_in_its_direction() {
     let cutting = Span::new(Bound::Included(address(650)), Bound::Excluded(address(2290)));
 
     for spans in [vec![Span::all()], several] {
-        let view = tree.select(&ViewPlan { spans: spans.clone(), direction: ScanDirection::Forward, limit: None }).await.unwrap();
+        let view = tree.select(spans.clone());
 
         for scanned in [Span::all(), cutting.clone()] {
             let within = |address: &Vec<u8>| scanned.contains(address) && spans.iter().any(|span| span.contains(address));

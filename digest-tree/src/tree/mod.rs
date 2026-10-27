@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_lock::RwLock;
 
-use crate::{DigestGroup, Error, MemberId, Payload, Row, RowKey, Span, Store};
+use crate::{DigestGroup, Error, MemberId, Payload, Row, RowKey, Store};
 
 #[cfg(any(test, feature = "test-support"))]
 mod audit;
@@ -37,26 +37,6 @@ pub enum ScanDirection {
 
     /// Largest first.
     Reverse,
-}
-
-/// The part of a tree a view reads: spans of addresses, or, with a limit,
-/// the window of their first or last members.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ViewPlan {
-    /// The spans of addresses the view covers.
-    pub spans: Vec<Span>,
-
-    /// Which end of the spans a limit takes its members from: for
-    /// [`Forward`](ScanDirection::Forward) the first in address order, for
-    /// [`Reverse`](ScanDirection::Reverse) the last. Without a limit it has
-    /// no effect. A key's parts may each sort ascending or descending, but
-    /// that is the key's own, made by the owner's collation, as a descending
-    /// part of an index inverts its bytes.
-    pub direction: ScanDirection,
-
-    /// Cover at most this many members, from the end `direction` picks: a
-    /// window.
-    pub limit: Option<u64>,
 }
 
 /// A digest tree, held by its owner, who builds and changes it.

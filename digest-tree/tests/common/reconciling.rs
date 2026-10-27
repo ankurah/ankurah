@@ -3,23 +3,20 @@
 
 use std::collections::BTreeMap;
 
-use ankurah_digest_tree::{leaf_address, DigestGroup, Leaf, ScanDirection, ScanRange, Span, SpanDigest, ViewPlan};
+use ankurah_digest_tree::{leaf_address, DigestGroup, Leaf, ScanRange, Span, SpanDigest};
 use futures::TryStreamExt;
 
 use super::albums::{Album, Title, Tree, View};
 use super::members::Id;
-
-/// A plan that reads the whole tree in key order.
-pub fn whole() -> ViewPlan { ViewPlan { spans: vec![Span::all()], direction: ScanDirection::Forward, limit: None } }
 
 /// A span digest as the other peer receives it.
 pub fn across_the_wire<G: DigestGroup>(span_digest: &SpanDigest<G>) -> SpanDigest<G> {
     bincode::deserialize(&bincode::serialize(span_digest).unwrap()).unwrap()
 }
 
-/// The narrowest spans whose members differ between two views of one plan:
-/// start from the root, keep spans whose digests differ, and refine each
-/// with whichever view has structure beneath it.
+/// The narrowest spans whose members differ between two views of the same
+/// spans: start from the root, keep spans whose digests differ, and refine
+/// each with whichever view has structure beneath it.
 pub async fn differing_spans<G: DigestGroup>(ours: &View<G>, theirs: &View<G>) -> Vec<Span> {
     let mut pending = vec![across_the_wire(&ours.span_digest(&Span::all()).await.unwrap())];
     let mut differing = Vec::new();
@@ -53,13 +50,13 @@ async fn members<G: DigestGroup>(view: &View<G>, span: &Span) -> BTreeMap<Vec<u8
 /// hold one, and their album, if they hold one.
 type Sides = (Option<Leaf<Id, Title>>, Option<Album>);
 
-/// Make our tree hold what theirs holds within the plan, in one
+/// Make our tree hold what theirs holds within `spans`, in one
 /// transaction: for each member whose leaves differ in the differing spans,
 /// our leaf, if we hold one, names the version a change replaces, and their
 /// album, as their owner gives it, the version that replaces it. Returns how
 /// many members that changed.
-pub async fn reconcile<G: DigestGroup>(ours: &Tree<G>, theirs: &Tree<G>, their_albums: &BTreeMap<u64, Album>, plan: &ViewPlan) -> usize {
-    let (our_view, their_view) = (ours.select(plan).await.unwrap(), theirs.select(plan).await.unwrap());
+pub async fn reconcile<G: DigestGroup>(ours: &Tree<G>, theirs: &Tree<G>, their_albums: &BTreeMap<u64, Album>, spans: &[Span]) -> usize {
+    let (our_view, their_view) = (ours.select(spans.to_vec()), theirs.select(spans.to_vec()));
 
     // By id: a member moved to another key differs in two spans, and is one
     // update from our leaf at its old key to their album at its new one.
@@ -92,7 +89,7 @@ pub async fn reconcile<G: DigestGroup>(ours: &Tree<G>, theirs: &Tree<G>, their_a
     }
 
     trx.commit().await.unwrap();
-    assert!(differing_spans(&ours.select(plan).await.unwrap(), &their_view).await.is_empty(), "reconciled");
+    assert!(differing_spans(&ours.select(spans.to_vec()), &their_view).await.is_empty(), "reconciled");
 
     count
 }

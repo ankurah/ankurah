@@ -179,12 +179,6 @@ impl Span {
 
         out
     }
-
-    /// The addresses within both a span of `left` and a span of `right`,
-    /// normalized.
-    pub(crate) fn intersect_all(left: &[Self], right: &[Self]) -> Vec<Self> {
-        Self::normalize(left.iter().flat_map(|left| right.iter().filter_map(move |right| left.intersect(right))).collect())
-    }
 }
 
 /// The bound on the far side of `bound`: where a gap ends that the bound

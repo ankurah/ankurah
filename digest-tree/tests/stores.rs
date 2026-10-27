@@ -3,17 +3,16 @@
 
 mod common;
 
-use ankurah_digest_tree::{
-    DigestTree, DigestTreeView, Leaf, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, ScanRange, Span, Store, ViewPlan,
-};
+use ankurah_digest_tree::{DigestTree, DigestTreeView, Leaf, MemoryStore, Ristretto255, Row, RowKey, ScanRange, Span, Store};
 use common::{built, integer_spec, item, Id, Item, ShortPages, Spec, Tag};
 use futures::TryStreamExt;
 
-/// Every member `view` covers, in address order.
-async fn every_member<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
+/// Every member a range read of `view` yields, in its order.
+async fn range_read<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
     view: &DigestTreeView<Spec, Id, Tag, Ristretto255, S>,
+    range: ScanRange,
 ) -> Vec<Leaf<Id, Tag>> {
-    view.range(ScanRange::forward(Span::all())).try_collect().await.unwrap()
+    view.range(range).try_collect().await.unwrap()
 }
 
 /// Commit `changes` to `tree` in one transaction, each the version the tree
@@ -37,7 +36,8 @@ async fn commit<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
 
 /// A store may return fewer rows than asked while more remain: a tree over
 /// one that returns three at a time builds, changes node by node and by
-/// laying out anew, and reads, as a tree over a store that returns them all.
+/// laying out anew, and reads both ways, as a tree over a store that returns
+/// them all.
 #[tokio::test]
 async fn a_tree_over_a_store_with_short_pages_works_as_any_other() {
     type ShortTree = DigestTree<Spec, Id, Tag, Ristretto255, ShortPages<Row<Spec, Tag, Ristretto255>>>;
@@ -60,12 +60,10 @@ async fn a_tree_over_a_store_with_short_pages_works_as_any_other() {
 
         let (short_view, full_view) = (short.view(), full.view());
         assert_eq!(short_view.span_digest(&Span::all()).await.unwrap().digest, full_view.span_digest(&Span::all()).await.unwrap().digest);
-        assert_eq!(every_member(&short_view).await, every_member(&full_view).await);
 
-        let plan = ViewPlan { spans: vec![Span::all()], direction: ScanDirection::Reverse, limit: Some(25) };
-
-        let (short_window, full_window) = (short.select(&plan).await.unwrap(), full.select(&plan).await.unwrap());
-        assert_eq!(every_member(&short_window).await, every_member(&full_window).await);
+        for range in [ScanRange::forward(Span::all()), ScanRange::reverse(Span::all())] {
+            assert_eq!(range_read(&short_view, range.clone()).await, range_read(&full_view, range).await);
+        }
     }
 }
 

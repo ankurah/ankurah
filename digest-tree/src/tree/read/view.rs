@@ -36,11 +36,10 @@ impl<K, I: MemberId, L: Payload> Member<K> for Leaf<I, L> {
     fn payload(&self) -> L { self.payload.clone() }
 }
 
-/// A read-only, live view of a tree: the whole tree, or the part a
-/// [`ViewPlan`](crate::ViewPlan) selects. Each read sees a complete state of
+/// A read-only, live view of a tree: the whole tree, or the part within some
+/// spans ([`select`](DigestTree::select)). Each read sees a complete state of
 /// the tree, and so does each batch of a [range](Self::range) read; two reads
-/// may see different ones. The view's spans, and its window when the plan has
-/// a limit, are fixed when it is made.
+/// may see different ones. The view's spans are fixed when it is made.
 ///
 /// Every read is limited to the view's spans: a member outside them is
 /// neither counted, summed nor returned.

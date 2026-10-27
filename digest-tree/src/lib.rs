@@ -26,10 +26,11 @@
 //! # Owning and reading
 //!
 //! A [`DigestTree`] is built and changed by its owner. A [`DigestTreeView`]
-//! reads it: the whole tree, or the part a [`ViewPlan`] selects. Views are
-//! live: each read sees a complete state of the tree, and two reads may see
-//! different states. A [range read](DigestTreeView::range) streams a view's
-//! members a batch at a time, and each batch sees one state.
+//! reads it: the whole tree, or the part within some spans
+//! ([`select`](DigestTree::select)). Views are live: each read sees a
+//! complete state of the tree, and two reads may see different states. A
+//! [range read](DigestTreeView::range) streams a view's members a batch at a
+//! time, and each batch sees one state.
 //!
 //! A tree is right only while it matches its owner's records, such as the
 //! entities its members stand for. The owner saves each transaction's changes
@@ -67,7 +68,7 @@ pub use span::{leaf_address, NodePrefix, Span, SpanDigest};
 #[cfg(feature = "sled")]
 pub use store::SledStore;
 pub use store::{Encode, MemoryStore, Residency, Row, RowKey, Store, WriteItem};
-pub use tree::{DigestTree, DigestTreeView, Leaf, Members, ScanDirection, ScanRange, StagedCommit, Transaction, ViewPlan};
+pub use tree::{DigestTree, DigestTreeView, Leaf, Members, ScanDirection, ScanRange, StagedCommit, Transaction};
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;

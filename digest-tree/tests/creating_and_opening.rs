@@ -4,8 +4,7 @@
 mod common;
 
 use ankurah_digest_tree::{
-    Digest, DigestGroup, Error, LtHash16, MemberId, Members, Ristretto255, Row, RowKey, ScanDirection, ScanRange, Span, StagedCommit,
-    Store, ViewPlan, WriteItem,
+    Digest, DigestGroup, Error, LtHash16, MemberId, Members, Ristretto255, Row, RowKey, ScanRange, Span, StagedCommit, Store, WriteItem,
 };
 use common::{built, integer_key, integer_spec, item, stored_rows, Id, Item, ItemStore, ItemTree, Spec, Tag};
 
@@ -138,9 +137,6 @@ async fn every_operations_future_can_cross_threads() {
     send(trx.stage());
     is_send::<StagedCommit<Spec, Tag, Ristretto255>>();
 
-    let plan = ViewPlan { spans: vec![Span::all()], direction: ScanDirection::Forward, limit: Some(1) };
-
-    send(tree.select(&plan));
     send(tree.audit());
 
     let view = tree.view();

@@ -68,10 +68,10 @@ fn planned_change(ids: u32) -> impl Strategy<Value = PlannedChange> {
 
 /// Batches small enough to be committed node by node: phases that grow a
 /// region and then mostly empty it again, between batches of any changes. A
-/// phase adds members under ids and keys from windows, which often lie
-/// outside what a subtree holds, so that branches are inserted above old
-/// subtrees, and its removals shrink the region's subtrees to the merge
-/// threshold.
+/// phase adds members under a run of consecutive ids and a few nearby keys,
+/// which often lie outside what a subtree holds, so that branches are
+/// inserted above old subtrees, and its removals shrink the region's
+/// subtrees to the merge threshold.
 fn batches(ids: u32) -> impl Strategy<Value = Vec<Vec<PlannedChange>>> {
     let phase = (0..ids, -40i64..40, 40..100u32, proptest::option::weighted(0.75, 50..100u32)).prop_map(
         |(first_id, first_key, count, removed_percent)| {

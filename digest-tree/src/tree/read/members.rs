@@ -11,7 +11,6 @@ use std::vec;
 
 use futures_core::Stream;
 
-use super::first_members;
 use super::view::Leaf;
 use crate::span::split_address;
 use crate::store::LeafRow;
@@ -195,6 +194,32 @@ where
 
     let members = leaves.into_iter().map(|(address, row)| leaf(&address, row)).collect::<Result<_, _>>()?;
     Ok(Batch { members, unread })
+}
+
+/// The first `limit` members within `spans`, read in `direction`: the spans
+/// one after another in the order given, each in `direction`.
+async fn first_members<K, L, G, S>(
+    rows: &StagedRows<'_, K, L, G, S>,
+    spans: &[Span],
+    direction: ScanDirection,
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, LeafRow<L, G>)>, Error>
+where
+    K: Clone + Send + Sync + 'static,
+    L: Payload,
+    G: DigestGroup,
+    S: Store<RowKey, Row<K, L, G>>,
+{
+    let mut members = Vec::new();
+    for span in spans {
+        if members.len() == limit {
+            break;
+        }
+
+        members.extend(rows.leaves(span, direction, limit - members.len()).await?);
+    }
+
+    Ok(members)
 }
 
 /// The spans of `unread`, in the order the scan reads them, from just past

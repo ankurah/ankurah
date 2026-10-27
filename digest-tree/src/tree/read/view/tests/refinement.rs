@@ -4,7 +4,7 @@ use std::ops::Bound;
 
 use super::super::*;
 use crate::tree::fixtures::{built, integer_key, integer_spec, item};
-use crate::{NodePrefix, Ristretto255, ScanDirection, ViewPlan};
+use crate::{NodePrefix, Ristretto255};
 
 /// A span digest names the deepest node whose subtree holds its span.
 #[tokio::test]
@@ -29,9 +29,7 @@ async fn refining_within_a_view_leaves_out_what_it_doesnt_cover() {
     let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item(n, Some(i64::from(n)), b""))).await;
     let low = Span::for_key_range(Bound::Unbounded, Bound::Excluded(&integer_key(Some(10))));
 
-    let plan = ViewPlan { spans: vec![low.clone()], direction: ScanDirection::Forward, limit: None };
-
-    let view = tree.select(&plan).await.unwrap();
+    let view = tree.select([low.clone()]);
     let root = view.span_digest(&Span::all()).await.unwrap();
     assert_eq!(root.digest.count(), 10);
 
