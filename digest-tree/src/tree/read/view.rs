@@ -97,8 +97,8 @@ where
     /// so that a span refined down to one bucket is read in one hold of the
     /// lock; each batch after it reads twice as many as the one before, up to
     /// 1,024. Each also reads one member past those, which tells the stream
-    /// whether any remain without a read that finds nothing. Nothing is read
-    /// until the stream is first polled.
+    /// whether any remain, so that it never takes the lock again for a batch
+    /// that finds nothing. Nothing is read until the stream is first polled.
     ///
     /// Each batch sees one complete state of the tree, and later batches may
     /// see later states. The stream yields members strictly in the order of

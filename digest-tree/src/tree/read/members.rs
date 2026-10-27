@@ -177,7 +177,7 @@ where
     S: Store<RowKey, Row<K, L, G>>,
 {
     // One member past the batch tells whether any lie beyond it, so that the
-    // scan ends without a read that finds nothing.
+    // scan ends without another batch that finds nothing.
     let mut leaves = {
         let _read = tree.inner.lock.read().await;
         first_members(&StagedRows::new(&tree.inner.store), &unread, direction, size + 1).await?
