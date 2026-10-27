@@ -1,5 +1,5 @@
 //! Reads that race commits: each read sees the tree before a commit or after
-//! it, never between, and so does each batch of a scan of a view's members.
+//! it, never between, and so does each batch of a range read.
 
 mod common;
 
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::task::Poll;
 
 use ankurah_digest_tree::{
-    leaf_address, DigestTree, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Span, Store, StoreError, WriteItem,
+    leaf_address, DigestTree, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, ScanRange, Span, Store, StoreError, WriteItem,
 };
 use common::{built, integer_key, integer_spec, item, poll_once, Id, Spec, Tag};
 use futures::StreamExt;
@@ -128,13 +128,13 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
     assert!(view.member(&key, &id).await.unwrap().is_none(), "the commit removed member 50");
 }
 
-/// A scan holds the tree's lock only while it reads a batch, so a commit
-/// completes at once while the scan is half consumed. The scan then yields
-/// every member the commit left in place, once and in order.
+/// A range read holds the tree's lock only while it reads a batch, so a
+/// commit completes at once while the read is half consumed. The read then
+/// yields every member the commit left in place, once and in order.
 #[tokio::test]
-async fn a_commit_completes_while_a_scan_is_half_consumed() {
+async fn a_commit_completes_while_a_range_read_is_half_consumed() {
     let tree = built::<Ristretto255>(integer_spec(), (0..300).map(|n| item(n, Some(n as i64), b""))).await;
-    let mut scan = tree.view().members(&Span::all());
+    let mut scan = tree.view().range(ScanRange::forward(Span::all()));
 
     // Ten members yielded, of the 64 the first batch read before reading one
     // past them.

@@ -1,4 +1,4 @@
-//! A scan of a view's members: a stream that reads them in the view's
+//! A range read of a view's members: a stream that reads them in the range's
 //! direction a batch at a time, each batch under the tree's read lock for its
 //! own read alone.
 
@@ -29,10 +29,30 @@ const FIRST_BATCH: usize = BUCKET_CAPACITY as usize;
 /// no one hold of it keeps a commit waiting long.
 const LARGEST_BATCH: usize = 1024;
 
-/// The members of a view within a span, as a stream in the view's direction:
-/// what [`DigestTreeView::members`](crate::DigestTreeView::members) returns,
-/// whose docs say what it promises. It owns a handle to the tree, so its
-/// caller can keep it or move it freely.
+/// What a [range read](crate::DigestTreeView::range) covers and which way it
+/// reads: a span of addresses, and the direction it reads them in, as a sled
+/// tree's `range` takes a range of keys and its iterator runs either way.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanRange {
+    /// The addresses read.
+    pub span: Span,
+
+    /// The order they are read in.
+    pub direction: ScanDirection,
+}
+
+impl ScanRange {
+    /// `span`, read from its smallest address up.
+    pub fn forward(span: Span) -> Self { Self { span, direction: ScanDirection::Forward } }
+
+    /// `span`, read from its largest address down.
+    pub fn reverse(span: Span) -> Self { Self { span, direction: ScanDirection::Reverse } }
+}
+
+/// The members of a view within a range, as a stream in the range's
+/// direction: what [`DigestTreeView::range`](crate::DigestTreeView::range)
+/// returns, whose docs say what it promises. It owns a handle to the tree, so
+/// its caller can keep it or move it freely.
 pub struct Members<K, I, L, G: DigestGroup, S> {
     tree: DigestTree<K, I, L, G, S>,
     direction: ScanDirection,
@@ -76,15 +96,17 @@ where
     G: DigestGroup,
     S: Store<RowKey, Row<K, L, G>>,
 {
-    /// A scan of `tree`'s members within `spans`, which are disjoint and in
-    /// address order, read in `direction`. It reads nothing until polled.
-    pub(super) fn new(tree: DigestTree<K, I, L, G, S>, mut spans: Vec<Span>, direction: ScanDirection) -> Self {
-        if direction == ScanDirection::Reverse {
-            spans.reverse();
+    /// A scan of `tree`'s members within `range.span` that lie in one of
+    /// `spans`, a view's, which are disjoint and in address order, read in
+    /// `range.direction`. It reads nothing until polled.
+    pub(super) fn new(tree: DigestTree<K, I, L, G, S>, spans: &[Span], range: ScanRange) -> Self {
+        let mut unread: Vec<Span> = spans.iter().filter_map(|covered| range.span.intersect(covered)).collect();
+        if range.direction == ScanDirection::Reverse {
+            unread.reverse();
         }
 
-        let progress = Progress::Yielding { read: Vec::new().into_iter(), unread: spans };
-        Self { tree, direction, batch_size: FIRST_BATCH, progress }
+        let progress = Progress::Yielding { read: Vec::new().into_iter(), unread };
+        Self { tree, direction: range.direction, batch_size: FIRST_BATCH, progress }
     }
 }
 

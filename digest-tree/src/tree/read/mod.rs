@@ -1,13 +1,13 @@
 //! Reading a tree: views of the whole tree or of the part a plan selects,
 //! the digests they sum over spans, the windows a plan's limit reads, and the
-//! scans that stream a view's members.
+//! range reads that stream a view's members.
 
 mod members;
 mod span_digests;
 mod view;
 mod window;
 
-pub use members::Members;
+pub use members::{Members, ScanRange};
 pub use view::{DigestTreeView, Leaf};
 
 use super::rows::StagedRows;
@@ -23,13 +23,13 @@ where
     G: DigestGroup,
     S: Store<RowKey, Row<K, L, G>>,
 {
-    /// A view of the whole tree, read forward.
-    pub fn view(&self) -> DigestTreeView<K, I, L, G, S> { DigestTreeView::new(self.clone(), vec![Span::all()], ScanDirection::Forward) }
+    /// A view of the whole tree.
+    pub fn view(&self) -> DigestTreeView<K, I, L, G, S> { DigestTreeView::new(self.clone(), vec![Span::all()]) }
 
-    /// A view of the part `plan` selects, read in its direction. A plan with
-    /// a limit reads the window when the view is made: the view covers the
-    /// members the limit admits, or the plan's spans whole if fewer members
-    /// lie within them, since a peer may hold the rest.
+    /// A view of the part `plan` selects. A plan with a limit reads the
+    /// window when the view is made: the view covers the members the limit
+    /// admits, or the plan's spans whole if fewer members lie within them,
+    /// since a peer may hold the rest.
     pub async fn select(&self, plan: &ViewPlan) -> Result<DigestTreeView<K, I, L, G, S>, Error> {
         let spans = Span::normalize(plan.spans.clone());
         let spans = match plan.limit {
@@ -40,7 +40,7 @@ where
             }
         };
 
-        Ok(DigestTreeView::new(self.clone(), spans, plan.direction))
+        Ok(DigestTreeView::new(self.clone(), spans))
     }
 }
 

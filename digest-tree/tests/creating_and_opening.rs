@@ -4,8 +4,8 @@
 mod common;
 
 use ankurah_digest_tree::{
-    Digest, DigestGroup, Error, LtHash16, MemberId, Members, Ristretto255, Row, RowKey, ScanDirection, Span, StagedCommit, Store, ViewPlan,
-    WriteItem,
+    Digest, DigestGroup, Error, LtHash16, MemberId, Members, Ristretto255, Row, RowKey, ScanDirection, ScanRange, Span, StagedCommit,
+    Store, ViewPlan, WriteItem,
 };
 use common::{built, integer_key, integer_spec, item, stored_rows, Id, Item, ItemStore, ItemTree, Spec, Tag};
 
@@ -153,8 +153,8 @@ async fn every_operations_future_can_cross_threads() {
     send(view.span_digest(&Span::all()));
     send(view.refine(&root));
 
-    // A scan of the view's members is a stream, not a future, which its
-    // caller holds across its own awaits.
-    send(view.members(&Span::all()));
+    // A range read is a stream, not a future, which its caller holds across
+    // its own awaits.
+    send(view.range(ScanRange::forward(Span::all())));
     is_send::<Members<Spec, Id, Tag, Ristretto255, ItemStore>>();
 }

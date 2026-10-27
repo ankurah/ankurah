@@ -22,7 +22,7 @@ mod write;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use audit::Audit;
-pub use read::{DigestTreeView, Leaf, Members};
+pub use read::{DigestTreeView, Leaf, Members, ScanRange};
 pub use write::{StagedCommit, Transaction};
 
 use rows::StagedRows;
@@ -39,20 +39,23 @@ pub enum ScanDirection {
     Reverse,
 }
 
-/// The part of a tree a view reads, and the order it reads members in.
+/// The part of a tree a view reads: spans of addresses, or, with a limit,
+/// the window of their first or last members.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewPlan {
     /// The spans of addresses the view covers.
     pub spans: Vec<Span>,
 
-    /// Which way to read members in address order. A key's parts may each
-    /// sort ascending or descending, but that is the key's own, made by the
-    /// owner's collation, as a descending part of an index inverts its bytes.
-    /// With a limit, it also picks which end the window takes its members
-    /// from: the first in address order, or the last.
+    /// Which end of the spans a limit takes its members from: for
+    /// [`Forward`](ScanDirection::Forward) the first in address order, for
+    /// [`Reverse`](ScanDirection::Reverse) the last. Without a limit it has
+    /// no effect. A key's parts may each sort ascending or descending, but
+    /// that is the key's own, made by the owner's collation, as a descending
+    /// part of an index inverts its bytes.
     pub direction: ScanDirection,
 
-    /// Read at most this many members, in that order: a window.
+    /// Cover at most this many members, from the end `direction` picks: a
+    /// window.
     pub limit: Option<u64>,
 }
 

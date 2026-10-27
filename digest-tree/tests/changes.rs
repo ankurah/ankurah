@@ -3,7 +3,7 @@
 
 mod common;
 
-use ankurah_digest_tree::{Error, MemberId, MemoryStore, Ristretto255, Span, Transaction};
+use ankurah_digest_tree::{Error, MemberId, MemoryStore, Ristretto255, ScanRange, Span, Transaction};
 use common::{
     assert_same_tree, built, counted, integer_key, integer_spec, item, remove_add_and_move, removed_added_and_moved, spec, stored_rows,
     ten_items, CountedStore, CountedTree, CountingStore, FailingStore, FailingTree, Id, Item, Named, NamedTree, Order, Spec, Tag,
@@ -70,7 +70,7 @@ async fn a_removal_takes_the_member_out() {
 #[tokio::test]
 async fn a_leaf_read_from_the_tree_names_the_version_a_change_replaces() {
     let tree = built::<Ristretto255>(integer_spec(), [item(1, Some(1), b"a"), item(2, Some(2), b"b")]).await;
-    let leaves: Vec<_> = tree.view().members(&Span::all()).try_collect().await.unwrap();
+    let leaves: Vec<_> = tree.view().range(ScanRange::forward(Span::all())).try_collect().await.unwrap();
 
     let mut trx = tree.transaction();
     trx.update(leaves[0].clone(), item(1, Some(1), b"changed")).unwrap();

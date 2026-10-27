@@ -3,15 +3,17 @@
 
 mod common;
 
-use ankurah_digest_tree::{DigestTree, DigestTreeView, Leaf, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Span, Store, ViewPlan};
+use ankurah_digest_tree::{
+    DigestTree, DigestTreeView, Leaf, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, ScanRange, Span, Store, ViewPlan,
+};
 use common::{built, integer_spec, item, Id, Item, ShortPages, Spec, Tag};
 use futures::TryStreamExt;
 
-/// Every member `view` covers, in its direction.
+/// Every member `view` covers, in address order.
 async fn every_member<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
     view: &DigestTreeView<Spec, Id, Tag, Ristretto255, S>,
 ) -> Vec<Leaf<Id, Tag>> {
-    view.members(&Span::all()).try_collect().await.unwrap()
+    view.range(ScanRange::forward(Span::all())).try_collect().await.unwrap()
 }
 
 /// Commit `changes` to `tree` in one transaction, each the version the tree

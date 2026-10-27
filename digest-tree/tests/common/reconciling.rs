@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use ankurah_digest_tree::{leaf_address, DigestGroup, Leaf, ScanDirection, Span, SpanDigest, ViewPlan};
+use ankurah_digest_tree::{leaf_address, DigestGroup, Leaf, ScanDirection, ScanRange, Span, SpanDigest, ViewPlan};
 use futures::TryStreamExt;
 
 use super::albums::{Album, Title, Tree, View};
@@ -46,7 +46,7 @@ pub async fn differing_spans<G: DigestGroup>(ours: &View<G>, theirs: &View<G>) -
 
 /// Every member of a view within `span`, by address.
 async fn members<G: DigestGroup>(view: &View<G>, span: &Span) -> BTreeMap<Vec<u8>, Leaf<Id, Title>> {
-    view.members(span).map_ok(|leaf| (leaf_address(&leaf.key, &leaf.id), leaf)).try_collect().await.unwrap()
+    view.range(ScanRange::forward(span.clone())).map_ok(|leaf| (leaf_address(&leaf.key, &leaf.id), leaf)).try_collect().await.unwrap()
 }
 
 /// One member's two sides as a reconciliation finds them: our leaf, if we

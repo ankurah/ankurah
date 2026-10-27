@@ -6,7 +6,7 @@ use std::borrow::Cow;
 use std::convert::Infallible;
 
 use ankurah_digest_tree::{
-    DigestGroup, DigestTree, Encode, Member, MemberId, MemoryStore, Payload, Ristretto255, Row, RowKey, Span, Store, StoreError,
+    DigestGroup, DigestTree, Encode, Member, MemberId, MemoryStore, Payload, Ristretto255, Row, RowKey, ScanRange, Span, Store, StoreError,
     Transaction,
 };
 use futures::TryStreamExt;
@@ -210,8 +210,8 @@ pub type NamedTree = DigestTree<Spec, Name, Tag, Ristretto255, MemoryStore<RowKe
 /// clean audit of each.
 pub async fn assert_same_tree<G: DigestGroup>(a: &ItemTree<G>, b: &ItemTree<G>) {
     let (a_view, b_view) = (a.view(), b.view());
-    let a_members: Vec<_> = a_view.members(&Span::all()).try_collect().await.unwrap();
-    let b_members: Vec<_> = b_view.members(&Span::all()).try_collect().await.unwrap();
+    let a_members: Vec<_> = a_view.range(ScanRange::forward(Span::all())).try_collect().await.unwrap();
+    let b_members: Vec<_> = b_view.range(ScanRange::forward(Span::all())).try_collect().await.unwrap();
 
     assert_eq!(a_members, b_members, "members");
     assert_eq!(a_view.span_digest(&Span::all()).await.unwrap().digest, b_view.span_digest(&Span::all()).await.unwrap().digest, "digest");

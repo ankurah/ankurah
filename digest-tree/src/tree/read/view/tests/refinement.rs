@@ -4,7 +4,7 @@ use std::ops::Bound;
 
 use super::super::*;
 use crate::tree::fixtures::{built, integer_key, integer_spec, item};
-use crate::{NodePrefix, Ristretto255, ViewPlan};
+use crate::{NodePrefix, Ristretto255, ScanDirection, ViewPlan};
 
 /// A span digest names the deepest node whose subtree holds its span.
 #[tokio::test]
