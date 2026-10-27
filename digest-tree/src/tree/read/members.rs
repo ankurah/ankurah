@@ -1,6 +1,6 @@
-//! A range read of a view's members: a stream that reads them in the range's
-//! direction a batch at a time, each batch under the tree's read lock for its
-//! own read alone.
+//! A range read of a view's members, called a scan here: a stream that reads
+//! them in the range's direction a batch at a time, each batch under the
+//! tree's read lock for its own read alone.
 
 use std::future::Future;
 use std::mem;

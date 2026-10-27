@@ -46,7 +46,7 @@ where
 
 /// The first `limit` members within `spans`, read in `direction`: the spans
 /// one after another in the order given, each in `direction`. A window
-/// reads its members so, and so does each batch of a scan.
+/// reads its members so, and so does each batch of a range read.
 async fn first_members<'a, K, L, G, S>(
     rows: &StagedRows<'_, K, L, G, S>,
     spans: impl IntoIterator<Item = &'a Span>,
