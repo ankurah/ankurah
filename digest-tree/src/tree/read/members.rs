@@ -187,7 +187,7 @@ where
         true => {
             leaves.truncate(size);
             let (last, _) = leaves.last().expect("a batch yields at least one member");
-            past(unread, last, direction)
+            past(unread, last, direction)?
         }
 
         false => Vec::new(),
@@ -199,9 +199,15 @@ where
 
 /// The spans of `unread`, in the order the scan reads them, from just past
 /// `last` on: the span that holds `last`, cut to the addresses after it in
-/// `direction`, and every span after that one.
-fn past(mut unread: Vec<Span>, last: &[u8], direction: ScanDirection) -> Vec<Span> {
-    let holding = unread.iter().position(|span| span.contains(last)).expect("a member read lies within the spans it was read from");
+/// `direction`, and every span after that one. A read refuses a store's rows
+/// outside the range it asked for, so a `last` outside every span means the
+/// tree's own reads broke.
+fn past(mut unread: Vec<Span>, last: &[u8], direction: ScanDirection) -> Result<Vec<Span>, Error> {
+    let holding = unread
+        .iter()
+        .position(|span| span.contains(last))
+        .ok_or(Error::Inconsistent("a member read lies outside the spans it was read from"))?;
+
     unread.drain(..holding);
 
     let after = Bound::Excluded(last.to_vec());
@@ -210,7 +216,7 @@ fn past(mut unread: Vec<Span>, last: &[u8], direction: ScanDirection) -> Vec<Spa
         ScanDirection::Reverse => unread[0].end = after,
     }
 
-    unread
+    Ok(unread)
 }
 
 /// The member at `address`, as its row holds it. The tree stores only
@@ -222,3 +228,6 @@ fn leaf<I: MemberId, L, G: DigestGroup>(address: &[u8], row: LeafRow<L, G>) -> R
 
     Ok(Leaf { key, id, payload: row.payload })
 }
+
+#[cfg(test)]
+mod tests;
