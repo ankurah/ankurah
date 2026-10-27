@@ -2,6 +2,7 @@
 members = [
     "core-types",
     "core",
+    "digest-tree",
     "derive",
     "proto",
     "examples/wasm-bindings",
@@ -26,6 +27,7 @@ members = [
 default-members = [
     "core-types",
     "core",
+    "digest-tree",
     "derive",
     "proto",
     "examples/model",
