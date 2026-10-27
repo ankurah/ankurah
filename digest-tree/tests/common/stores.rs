@@ -15,24 +15,35 @@ pub async fn stored_rows<V: Encode + Clone + Send + Sync + 'static>(store: &impl
     rows.into_iter().map(|(key, row)| (key, row.encode())).collect()
 }
 
-/// A memory store that counts the batches written to it, so a test can tell
-/// how many writes an operation made, not only what its rows ended up as.
-/// Clones share the rows and the count.
+/// A memory store that counts the batches written to it and the rows its
+/// reads return, so a test can tell how much an operation wrote and read,
+/// not only what its rows ended up as. Clones share the rows and the counts.
 #[derive(Clone)]
 pub struct CountingStore<V> {
     rows: MemoryStore<RowKey, V>,
     writes: Arc<AtomicUsize>,
+    rows_read: Arc<AtomicUsize>,
 }
 
 impl<V> CountingStore<V> {
-    pub fn new() -> Self { Self { rows: MemoryStore::new(), writes: Arc::new(AtomicUsize::new(0)) } }
+    pub fn new() -> Self {
+        Self { rows: MemoryStore::new(), writes: Arc::new(AtomicUsize::new(0)), rows_read: Arc::new(AtomicUsize::new(0)) }
+    }
 
     /// How many batches have been written.
     pub fn writes(&self) -> usize { self.writes.load(Ordering::Relaxed) }
+
+    /// How many rows reads have returned.
+    pub fn rows_read(&self) -> usize { self.rows_read.load(Ordering::Relaxed) }
 }
 
 impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for CountingStore<V> {
-    async fn get(&self, key: &RowKey) -> Result<Option<V>, StoreError> { self.rows.get(key).await }
+    async fn get(&self, key: &RowKey) -> Result<Option<V>, StoreError> {
+        let row = self.rows.get(key).await?;
+        self.rows_read.fetch_add(usize::from(row.is_some()), Ordering::Relaxed);
+
+        Ok(row)
+    }
 
     async fn range(
         &self,
@@ -41,7 +52,10 @@ impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for CountingStore<V> {
         direction: ScanDirection,
         limit: usize,
     ) -> Result<Vec<(RowKey, V)>, StoreError> {
-        self.rows.range(start, end, direction, limit).await
+        let rows = self.rows.range(start, end, direction, limit).await?;
+        self.rows_read.fetch_add(rows.len(), Ordering::Relaxed);
+
+        Ok(rows)
     }
 
     async fn write(&self, items: Vec<WriteItem<RowKey, V>>) -> Result<(), StoreError> {
@@ -106,6 +120,51 @@ pub type FailingStore = FailingWrites<Row<Spec, Tag, Ristretto255>>;
 
 /// A tree of items over a store whose writes can fail.
 pub type FailingTree = DigestTree<Spec, Id, Tag, Ristretto255, FailingStore>;
+
+/// A memory store whose reads fail while a test says so, as a real store's
+/// may when its disk or its connection goes. Clones share the rows and the
+/// switch.
+#[derive(Clone)]
+pub struct FailingReads<V> {
+    rows: MemoryStore<RowKey, V>,
+    failing: Arc<AtomicBool>,
+}
+
+impl<V> FailingReads<V> {
+    pub fn new() -> Self { Self { rows: MemoryStore::new(), failing: Arc::new(AtomicBool::new(false)) } }
+
+    /// Make every read from now on fail, as a failure trying again may fix,
+    /// or succeed again.
+    pub fn fail_reads(&self, failing: bool) { self.failing.store(failing, Ordering::Relaxed) }
+
+    /// Refuse a read while the test says reads fail.
+    fn refuse_while_failing(&self) -> Result<(), StoreError> {
+        match self.failing.load(Ordering::Relaxed) {
+            true => Err(StoreError::retryable("the store's disk went away")),
+            false => Ok(()),
+        }
+    }
+}
+
+impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for FailingReads<V> {
+    async fn get(&self, key: &RowKey) -> Result<Option<V>, StoreError> {
+        self.refuse_while_failing()?;
+        self.rows.get(key).await
+    }
+
+    async fn range(
+        &self,
+        start: Bound<&RowKey>,
+        end: Bound<&RowKey>,
+        direction: ScanDirection,
+        limit: usize,
+    ) -> Result<Vec<(RowKey, V)>, StoreError> {
+        self.refuse_while_failing()?;
+        self.rows.range(start, end, direction, limit).await
+    }
+
+    async fn write(&self, items: Vec<WriteItem<RowKey, V>>) -> Result<(), StoreError> { self.rows.write(items).await }
+}
 
 /// A memory store that returns at most three rows per read, as a store that
 /// pages its reads may: the tree must read on.
