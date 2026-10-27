@@ -2,9 +2,9 @@
 //! spans whose members differ, and one tree repaired from another.
 
 use std::collections::BTreeMap;
-use std::ops::Bound;
 
 use ankurah_digest_tree::{leaf_address, DigestGroup, Leaf, ScanDirection, Span, SpanDigest, ViewPlan};
+use futures::TryStreamExt;
 
 use super::albums::{Album, Title, Tree, View};
 use super::members::Id;
@@ -44,18 +44,9 @@ pub async fn differing_spans<G: DigestGroup>(ours: &View<G>, theirs: &View<G>) -
     differing
 }
 
-/// Every member of a view within `span`, read a page at a time.
+/// Every member of a view within `span`, by address.
 async fn members<G: DigestGroup>(view: &View<G>, span: &Span) -> BTreeMap<Vec<u8>, Leaf<Id, Title>> {
-    let mut members = BTreeMap::new();
-    let mut from = span.clone();
-
-    loop {
-        let page = view.members(&from, 5).await.unwrap();
-        let Some(last) = page.last() else { return members };
-        let address = leaf_address(&last.key, &last.id);
-        from = Span::new(Bound::Excluded(address), span.end.clone());
-        members.extend(page.into_iter().map(|leaf| (leaf_address(&leaf.key, &leaf.id), leaf)));
-    }
+    view.members(span).map_ok(|leaf| (leaf_address(&leaf.key, &leaf.id), leaf)).try_collect().await.unwrap()
 }
 
 /// One member's two sides as a reconciliation finds them: our leaf, if we

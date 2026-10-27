@@ -22,7 +22,7 @@ mod write;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use audit::Audit;
-pub use read::{DigestTreeView, Leaf};
+pub use read::{DigestTreeView, Leaf, Members};
 pub use write::{StagedCommit, Transaction};
 
 use rows::StagedRows;
@@ -48,6 +48,8 @@ pub struct ViewPlan {
     /// Which way to read members in address order. A key's parts may each
     /// sort ascending or descending, but that is the key's own, made by the
     /// owner's collation, as a descending part of an index inverts its bytes.
+    /// With a limit, it also picks which end the window takes its members
+    /// from: the first in address order, or the last.
     pub direction: ScanDirection,
 
     /// Read at most this many members, in that order: a window.

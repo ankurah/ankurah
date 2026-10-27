@@ -6,12 +6,13 @@ mod common;
 
 use std::ops::Bound;
 
-use ankurah_digest_tree::{DigestTree, MemoryStore, Ristretto255, Span};
+use ankurah_digest_tree::{DigestTree, Leaf, MemoryStore, Ristretto255, Span};
 use common::{album, key_spec, year, Id, Title, Tree};
+use futures::TryStreamExt;
 
 /// Members go in through a transaction, and a view reads them back in key
-/// order, here the order of the years the albums came out, up to a limit per
-/// read, or one at a time by key and id.
+/// order, here the order of the years the albums came out, as a stream, or
+/// one at a time by key and id.
 #[tokio::test]
 async fn a_tree_holds_its_members_in_key_order() {
     let tree: Tree<Ristretto255> = DigestTree::create(MemoryStore::new(), key_spec()).await.unwrap();
@@ -23,7 +24,7 @@ async fn a_tree_holds_its_members_in_key_order() {
     trx.commit().await.unwrap();
 
     let view = tree.view();
-    let members = view.members(&Span::all(), 10).await.unwrap();
+    let members: Vec<Leaf<Id, Title>> = view.members(&Span::all()).try_collect().await.unwrap();
 
     assert_eq!(members.iter().map(|leaf| leaf.id).collect::<Vec<_>>(), [Id(2), Id(3), Id(1)]);
     assert_eq!(view.member(&year(2013), &Id(3)).await.unwrap().map(|leaf| leaf.payload), Some(Title("Ice on the Dune".into())));

@@ -7,6 +7,7 @@
 
 use std::ops::Bound;
 
+use super::first_members;
 use crate::tree::rows::StagedRows;
 use crate::{DigestGroup, Error, Payload, Row, RowKey, ScanDirection, Span, Store};
 
@@ -30,29 +31,19 @@ where
     }
 
     let limit = usize::try_from(limit).unwrap_or(usize::MAX);
-    let mut read = 0;
-    let mut last = None;
 
     let mut in_order: Vec<&Span> = spans.iter().collect();
     if direction == ScanDirection::Reverse {
         in_order.reverse();
     }
 
-    for span in in_order {
-        let leaves = rows.leaves(span, direction, limit - read).await?;
-        read += leaves.len();
-        last = leaves.into_iter().last().map(|(address, _)| address).or(last);
+    let read = first_members(rows, in_order, direction, limit).await?;
 
-        if read == limit {
-            break;
-        }
-    }
-
-    match last {
-        Some(last) if read == limit => {
+    match read.last() {
+        Some((last, _)) if read.len() == limit => {
             let admitted = match direction {
-                ScanDirection::Forward => Span::new(Bound::Unbounded, Bound::Included(last)),
-                ScanDirection::Reverse => Span::new(Bound::Included(last), Bound::Unbounded),
+                ScanDirection::Forward => Span::new(Bound::Unbounded, Bound::Included(last.clone())),
+                ScanDirection::Reverse => Span::new(Bound::Included(last.clone()), Bound::Unbounded),
             };
 
             Ok(Span::intersect_all(&spans, &[admitted]))

@@ -9,6 +9,7 @@ use ankurah_digest_tree::{
     DigestGroup, DigestTree, Encode, Member, MemberId, MemoryStore, Payload, Ristretto255, Row, RowKey, Span, Store, StoreError,
     Transaction,
 };
+use futures::TryStreamExt;
 
 /// An id: eight bytes, big-endian.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -209,7 +210,10 @@ pub type NamedTree = DigestTree<Spec, Name, Tag, Ristretto255, MemoryStore<RowKe
 /// clean audit of each.
 pub async fn assert_same_tree<G: DigestGroup>(a: &ItemTree<G>, b: &ItemTree<G>) {
     let (a_view, b_view) = (a.view(), b.view());
-    assert_eq!(a_view.members(&Span::all(), usize::MAX).await.unwrap(), b_view.members(&Span::all(), usize::MAX).await.unwrap(), "members");
+    let a_members: Vec<_> = a_view.members(&Span::all()).try_collect().await.unwrap();
+    let b_members: Vec<_> = b_view.members(&Span::all()).try_collect().await.unwrap();
+
+    assert_eq!(a_members, b_members, "members");
     assert_eq!(a_view.span_digest(&Span::all()).await.unwrap().digest, b_view.span_digest(&Span::all()).await.unwrap().digest, "digest");
 
     a.audit().await.unwrap();

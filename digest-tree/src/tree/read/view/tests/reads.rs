@@ -7,6 +7,7 @@ use crate::fixtures::{block_on, leaf_element, Id, Tag};
 use crate::span::{key_prefix, split_address};
 use crate::tree::fixtures::{built, integer_key, integer_spec, item, Tree, View};
 use crate::{leaf_address, NodePrefix, Ristretto255, ViewPlan};
+use futures::TryStreamExt;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 
@@ -71,24 +72,23 @@ fn members() -> impl Strategy<Value = Vec<(u32, Option<i64>, Vec<u8>)>> {
 }
 
 /// Check every read of `view`, which covers `spans` of a tree holding
-/// `model`, over `span`.
-async fn reads_match_the_model(tree: &Tree, view: &View, model: &Model, spans: &[Span], span: &Span) {
+/// `model` and reads its members in `direction`, over `span`.
+async fn reads_match_the_model(tree: &Tree, view: &View, model: &Model, spans: &[Span], direction: ScanDirection, span: &Span) {
     assert_eq!(view.len().await.unwrap(), model.within(&Span::all(), spans).count() as u64);
     assert_eq!(view.count(span).await.unwrap(), model.within(span, spans).count() as u64);
 
-    // Members, read a page at a time, from the address after the last.
-    let mut read = Vec::new();
-    let mut from = span.clone();
+    // Members, scanned in the view's direction.
+    let read: Vec<(Vec<u8>, Tag)> =
+        view.members(span).map_ok(|leaf| (leaf_address(&leaf.key, &leaf.id), leaf.payload)).try_collect().await.unwrap();
 
-    loop {
-        let page = view.members(&from, 7).await.unwrap();
-        let Some(last) = page.last() else { break };
-        from = Span::new(Bound::Excluded(leaf_address(&last.key, &last.id)), span.end.clone());
-        read.extend(page.into_iter().map(|leaf| (leaf.id, leaf.payload)));
+    let mut expected: Vec<(Vec<u8>, Tag)> =
+        model.within(span, spans).map(|(address, _, payload)| (address.clone(), payload.clone())).collect();
+
+    if direction == ScanDirection::Reverse {
+        expected.reverse();
     }
 
-    let expected: Vec<(Id, Tag)> = model.within(span, spans).map(|(_, id, payload)| (*id, payload.clone())).collect();
-    assert_eq!(read, expected, "members within {span:?}");
+    assert_eq!(read, expected, "members within {span:?}, read {direction:?}");
 
     for (address, id, payload) in model.0.iter().step_by(17) {
         let covered = spans.iter().any(|covered| covered.contains(address));
@@ -148,24 +148,32 @@ fn is_beneath(node: &NodePrefix, prefix: &NodePrefix) -> bool { prefix.contains(
 proptest! {
     #![proptest_config(ProptestConfig { cases: 96, rng_seed: RngSeed::Fixed(0x7ead_0001), ..ProptestConfig::default() })]
 
-    /// Every read of a view of the whole tree, and of a view of some spans,
-    /// against a model of the members.
+    /// Every read of a view of the whole tree, read forward, and of a view
+    /// of some spans, read in either direction, against a model of the
+    /// members.
     #[test]
-    fn every_read_matches_a_model_of_the_members(members in members(), selected in proptest::collection::vec(span(), 0..3), spans in proptest::collection::vec(span(), 1..4)) {
+    fn every_read_matches_a_model_of_the_members(
+        members in members(),
+        selected in proptest::collection::vec(span(), 0..3),
+        spans in proptest::collection::vec(span(), 1..4),
+        reverse in any::<bool>(),
+    ) {
         block_on(async {
             let model = Model::of(&members);
             let tree = built::<Ristretto255>(integer_spec(), members.iter().map(|(id, key, payload)| item(*id, *key, payload))).await;
 
-            let (view, covered) = match selected.is_empty() {
-                true => (tree.view(), vec![Span::all()]),
+            let (view, covered, direction) = match selected.is_empty() {
+                true => (tree.view(), vec![Span::all()], ScanDirection::Forward),
                 false => {
-                    let plan = ViewPlan { spans: selected.clone(), direction: ScanDirection::Forward, limit: None };
-                    (tree.select(&plan).await.unwrap(), Span::normalize(selected.clone()))
+                    let direction = if reverse { ScanDirection::Reverse } else { ScanDirection::Forward };
+                    let plan = ViewPlan { spans: selected.clone(), direction, limit: None };
+
+                    (tree.select(&plan).await.unwrap(), Span::normalize(selected.clone()), direction)
                 }
             };
 
             for span in spans.iter().chain([&Span::all()]) {
-                reads_match_the_model(&tree, &view, &model, &covered, span).await;
+                reads_match_the_model(&tree, &view, &model, &covered, direction, span).await;
             }
         });
     }

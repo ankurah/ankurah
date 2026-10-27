@@ -2,7 +2,8 @@
 
 use std::convert::Infallible;
 
-use crate::span::{address_of, split_address};
+use super::Members;
+use crate::span::address_of;
 use crate::tree::rows::StagedRows;
 use crate::tree::trie::{Node, Trie};
 use crate::tree::DigestTree;
@@ -35,10 +36,12 @@ impl<K, I: MemberId, L: Payload> Member<K> for Leaf<I, L> {
     fn payload(&self) -> L { self.payload.clone() }
 }
 
-/// A read-only, live view of a tree: the whole tree, or the part a
-/// [`ViewPlan`](crate::ViewPlan) selects. Each read sees a complete state of
-/// the tree; two reads may see different ones. The view's spans, and its
-/// window when the plan has a limit, are fixed when it is made.
+/// A read-only, live view of a tree: the whole tree, read forward, or the
+/// part a [`ViewPlan`](crate::ViewPlan) selects, read in the plan's
+/// direction. Each read sees a complete state of the tree, and each batch of
+/// a scan of its [members](Self::members) does; two reads may see different
+/// states. The view's spans, its direction, and its window when the plan has
+/// a limit, are fixed when it is made.
 ///
 /// Every read is limited to the view's spans: a member outside them is
 /// neither counted, summed nor returned.
@@ -47,6 +50,9 @@ pub struct DigestTreeView<K, I, L, G: DigestGroup, S> {
 
     /// Disjoint and in address order.
     spans: Vec<Span>,
+
+    /// The order the view's members are read in.
+    direction: ScanDirection,
 }
 
 impl<K, I, L, G, S> DigestTreeView<K, I, L, G, S>
@@ -57,8 +63,11 @@ where
     G: DigestGroup,
     S: Store<RowKey, Row<K, L, G>>,
 {
-    /// A view of `tree` over `spans`, which are disjoint and in address order.
-    pub(super) fn new(tree: DigestTree<K, I, L, G, S>, spans: Vec<Span>) -> Self { Self { tree, spans } }
+    /// A view of `tree` over `spans`, which are disjoint and in address order,
+    /// whose members are read in `direction`.
+    pub(super) fn new(tree: DigestTree<K, I, L, G, S>, spans: Vec<Span>, direction: ScanDirection) -> Self {
+        Self { tree, spans, direction }
+    }
 
     /// How many members the view covers.
     #[allow(clippy::len_without_is_empty, reason = "the count is a read of the store, which a caller compares with zero as cheaply")]
@@ -84,29 +93,30 @@ where
         Ok(leaf.map(|leaf| Leaf { key: key.to_vec(), id: id.clone(), payload: leaf.payload }))
     }
 
-    /// At most `limit` members within `span`, in address order from the
-    /// span's start. A reader continues from the address after the last
-    /// member it read.
-    pub async fn members(&self, span: &Span, limit: usize) -> Result<Vec<Leaf<I, L>>, Error> {
-        let _read = self.tree.inner.lock.read().await;
-        let rows = StagedRows::new(&self.tree.inner.store);
-        let mut members = Vec::new();
-
-        for covered in &self.spans {
-            let Some(region) = span.intersect(covered) else { continue };
-
-            if members.len() == limit {
-                break;
-            }
-
-            for (address, leaf) in rows.leaves(&region, ScanDirection::Forward, limit - members.len()).await? {
-                let (key, id) = split_address(&address)?;
-                let id = I::from_bytes(&id).ok_or(Error::Inconsistent("a stored address holds no member id"))?;
-                members.push(Leaf { key, id, payload: leaf.payload });
-            }
-        }
-
-        Ok(members)
+    /// Every member of the view within `span`, as a stream that reads them in
+    /// the view's direction, a batch at a time.
+    ///
+    /// Each batch takes the tree's read lock for its own read alone. The
+    /// stream holds no lock between batches, and so none while its caller
+    /// holds a member or once it is dropped; commits may land between
+    /// batches. The first batch reads 64 members, as many as a bucket holds,
+    /// so that a span refined down to one bucket is read in one hold of the
+    /// lock; each batch after it reads twice as many as the one before, up to
+    /// 1,024. Each also reads one member past those, which tells the stream
+    /// whether any remain without a read that finds nothing. Nothing is read
+    /// until the stream is first polled.
+    ///
+    /// Each batch sees one complete state of the tree, and later batches may
+    /// see later states. The stream yields members strictly in the view's
+    /// order of their addresses, so never one address twice. A member that
+    /// keeps its address throughout is yielded exactly once; one inserted,
+    /// removed or moved while the stream runs may be missed, and one that
+    /// moved may be yielded at both addresses.
+    ///
+    /// A failed read yields its error, and then the stream ends.
+    pub fn members(&self, span: &Span) -> Members<K, I, L, G, S> {
+        let within = self.spans.iter().filter_map(|covered| span.intersect(covered)).collect();
+        Members::new(self.tree.clone(), within, self.direction)
     }
 
     /// How many members within `span` the view covers.

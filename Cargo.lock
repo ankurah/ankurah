@@ -240,6 +240,8 @@ dependencies = [
  "blake3",
  "criterion",
  "curve25519-dalek",
+ "futures",
+ "futures-core",
  "proptest",
  "rayon",
  "serde",

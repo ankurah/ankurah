@@ -8,6 +8,7 @@ use common::{
     assert_same_tree, built, counted, integer_key, integer_spec, item, remove_add_and_move, removed_added_and_moved, spec, stored_rows,
     ten_items, CountedStore, CountedTree, CountingStore, FailingStore, FailingTree, Id, Item, Named, NamedTree, Order, Spec, Tag,
 };
+use futures::TryStreamExt;
 
 /// A transaction on a tree over a store that counts its writes.
 type CountedTransaction = Transaction<Spec, Id, Tag, Ristretto255, CountedStore>;
@@ -69,7 +70,7 @@ async fn a_removal_takes_the_member_out() {
 #[tokio::test]
 async fn a_leaf_read_from_the_tree_names_the_version_a_change_replaces() {
     let tree = built::<Ristretto255>(integer_spec(), [item(1, Some(1), b"a"), item(2, Some(2), b"b")]).await;
-    let leaves = tree.view().members(&Span::all(), 10).await.unwrap();
+    let leaves: Vec<_> = tree.view().members(&Span::all()).try_collect().await.unwrap();
 
     let mut trx = tree.transaction();
     trx.update(leaves[0].clone(), item(1, Some(1), b"changed")).unwrap();

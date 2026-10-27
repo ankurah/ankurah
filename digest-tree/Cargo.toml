@@ -23,10 +23,12 @@ async-lock = "3.4"
 blake3 = "1.8.2"
 # No default features: the digests need neither basepoint tables nor zeroizing.
 curve25519-dalek = { version = "4.1.3", default-features = false }
-serde            = { version = "1.0", features = ["derive"] }
-sha2             = "0.10.8"
-sled             = { version = "0.34", optional = true }
-thiserror        = "2"
+# The Stream trait alone, which a scan of a view's members implements.
+futures-core = "0.3"
+serde        = { version = "1.0", features = ["derive"] }
+sha2         = "0.10.8"
+sled         = { version = "0.34", optional = true }
+thiserror    = "2"
 
 # Large builds hash their members on rayon's global pool; wasm32 hashes on the
 # calling thread.
@@ -46,6 +48,8 @@ tempfile = "3.23"
 ankurah-digest-tree = { path = ".", features = ["test-support"] }
 # The tests await the tree's operations.
 tokio = { version = "1.40", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+# The tests consume scans of a view's members with StreamExt and TryStreamExt.
+futures = "0.3"
 
 # criterion's default rayon feature refuses wasm32, and the benchmarks run natively.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]

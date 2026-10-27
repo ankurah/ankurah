@@ -8,6 +8,7 @@ use std::ops::Bound;
 
 use ankurah_digest_tree::{leaf_address, Ristretto255, ScanDirection, Span, ViewPlan};
 use common::{built, key_of, key_part, spec, Id, Item, Order, Spec};
+use futures::TryStreamExt;
 
 /// A member's two key values, `None` when missing.
 type Values = (Option<i64>, Option<i64>);
@@ -76,8 +77,7 @@ async fn a_window_covers_the_first_or_last_members_its_limit_admits() {
                     let plan = ViewPlan { spans: spans.clone(), direction, limit: Some(limit) };
                     let view = tree.select(&plan).await.unwrap();
 
-                    let mut covered: Vec<u64> =
-                        view.members(&Span::all(), usize::MAX).await.unwrap().into_iter().map(|leaf| leaf.id.0).collect();
+                    let mut covered: Vec<u64> = view.members(&Span::all()).map_ok(|leaf| leaf.id.0).try_collect().await.unwrap();
 
                     covered.sort_unstable();
                     let expected = expected(&key_spec, &spans, direction, limit as usize);
@@ -109,7 +109,7 @@ fn compare(a: Option<i64>, b: Option<i64>, order: Order) -> Ordering {
 async fn a_mix_of_orders_is_the_keys_own() {
     for key_spec in mixes() {
         let tree = built::<Ristretto255>(key_spec.clone(), members().into_iter().map(item)).await;
-        let read: Vec<u64> = tree.view().members(&Span::all(), usize::MAX).await.unwrap().into_iter().map(|leaf| leaf.id.0).collect();
+        let read: Vec<u64> = tree.view().members(&Span::all()).map_ok(|leaf| leaf.id.0).try_collect().await.unwrap();
 
         let mut ordered = members();
         let (first, second) = (key_spec.0[0], key_spec.0[1]);
@@ -142,13 +142,14 @@ async fn an_unfilled_limit_keeps_the_plans_spans_whole() {
     }
 }
 
+/// A tree keyed by id alone windows by id, and its view reads the window in
+/// the plan's direction: a reverse window from the largest id down.
 #[tokio::test]
 async fn a_tree_keyed_by_id_alone_windows_by_id() {
     let tree = built::<Ristretto255>(spec(&[]), (0..20).map(|id| Item::new(id, [], b""))).await;
-    for (direction, expected) in [(ScanDirection::Forward, [0, 1, 2]), (ScanDirection::Reverse, [17, 18, 19])] {
+    for (direction, expected) in [(ScanDirection::Forward, [0, 1, 2]), (ScanDirection::Reverse, [19, 18, 17])] {
         let plan = ViewPlan { spans: vec![Span::all()], direction, limit: Some(3) };
-        let ids: Vec<Id> =
-            tree.select(&plan).await.unwrap().members(&Span::all(), 10).await.unwrap().into_iter().map(|leaf| leaf.id).collect();
+        let ids: Vec<Id> = tree.select(&plan).await.unwrap().members(&Span::all()).map_ok(|leaf| leaf.id).try_collect().await.unwrap();
 
         assert_eq!(ids, expected.map(Id));
     }

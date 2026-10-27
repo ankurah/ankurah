@@ -3,8 +3,16 @@
 
 mod common;
 
-use ankurah_digest_tree::{DigestTree, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Span, Store, ViewPlan};
+use ankurah_digest_tree::{DigestTree, DigestTreeView, Leaf, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Span, Store, ViewPlan};
 use common::{built, integer_spec, item, Id, Item, ShortPages, Spec, Tag};
+use futures::TryStreamExt;
+
+/// Every member `view` covers, in its direction.
+async fn every_member<S: Store<RowKey, Row<Spec, Tag, Ristretto255>>>(
+    view: &DigestTreeView<Spec, Id, Tag, Ristretto255, S>,
+) -> Vec<Leaf<Id, Tag>> {
+    view.members(&Span::all()).try_collect().await.unwrap()
+}
 
 /// Commit `changes` to `tree` in one transaction, each the version the tree
 /// holds, if any, and the version to replace it, if any.
@@ -50,15 +58,12 @@ async fn a_tree_over_a_store_with_short_pages_works_as_any_other() {
 
         let (short_view, full_view) = (short.view(), full.view());
         assert_eq!(short_view.span_digest(&Span::all()).await.unwrap().digest, full_view.span_digest(&Span::all()).await.unwrap().digest);
-        assert_eq!(short_view.members(&Span::all(), usize::MAX).await.unwrap(), full_view.members(&Span::all(), usize::MAX).await.unwrap());
+        assert_eq!(every_member(&short_view).await, every_member(&full_view).await);
 
         let plan = ViewPlan { spans: vec![Span::all()], direction: ScanDirection::Reverse, limit: Some(25) };
 
         let (short_window, full_window) = (short.select(&plan).await.unwrap(), full.select(&plan).await.unwrap());
-        assert_eq!(
-            short_window.members(&Span::all(), usize::MAX).await.unwrap(),
-            full_window.members(&Span::all(), usize::MAX).await.unwrap()
-        );
+        assert_eq!(every_member(&short_window).await, every_member(&full_window).await);
     }
 }
 
