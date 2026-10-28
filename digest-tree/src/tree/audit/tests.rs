@@ -18,7 +18,9 @@ type Write = WriteItem<RowKey, Row<Property, Tag, Ristretto255>>;
 fn key_of(value: i64) -> Vec<u8> { member_key(&KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), &item!(0, value, b"")).unwrap() }
 
 /// 100 members under keys 0 to 99: a root and two buckets.
-async fn hundred() -> ItemTree { tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"payload"))) }
+async fn hundred() -> ItemTree {
+    tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"payload")))
+}
 
 /// The fault the audit names in `tree` after `damage` is written to its
 /// store.
@@ -31,7 +33,9 @@ async fn fault_after(tree: ItemTree, damage: Vec<Write>) -> &'static str {
     }
 }
 
-async fn row(tree: &ItemTree, key: RowKey) -> Row<Property, Tag, Ristretto255> { tree.store().get(&key).await.unwrap().expect("a stored row") }
+async fn row(tree: &ItemTree, key: RowKey) -> Row<Property, Tag, Ristretto255> {
+    tree.store().get(&key).await.unwrap().expect("a stored row")
+}
 
 /// The address of the member with id `id` in a tree of [`hundred`], whose
 /// key is its id.

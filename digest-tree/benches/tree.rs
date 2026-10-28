@@ -8,6 +8,8 @@
 use std::borrow::Cow;
 use std::convert::Infallible;
 
+use ankurah_core_types::key_spec::{IndexKeyPart, KeySpec};
+use ankurah_core_types::{Value, ValueType};
 use ankurah_digest_tree::{DigestTree, Member, MemberId, MemoryStore, Payload, Ristretto255, Row, RowKey};
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use tokio::runtime::Runtime;
@@ -38,7 +40,7 @@ struct Album {
     version: Version,
 }
 
-/// The key spec the albums are keyed by: the year each came out.
+/// The property albums are keyed by: the year each came out.
 #[derive(Clone)]
 struct Year;
 
@@ -49,9 +51,8 @@ impl Member<Year> for Album {
 
     fn id(&self) -> Id { self.id }
 
-    /// The year's big-endian bytes with the sign bit flipped, which sort as
-    /// the years do.
-    fn key(&self, _: &Year) -> Result<Vec<u8>, Infallible> { Ok((self.year as u64 ^ 1 << 63).to_be_bytes().to_vec()) }
+    /// An album's one value: its year.
+    fn value(&self, _: &IndexKeyPart<Year>) -> Result<Option<Value>, Infallible> { Ok(Some(Value::I64(self.year))) }
 
     fn payload(&self) -> Version { self.version }
 }
@@ -64,7 +65,8 @@ fn album(n: u64, version: u64) -> Album {
 }
 
 fn build(runtime: &Runtime, members: u64) -> Tree {
-    runtime.block_on(DigestTree::build(MemoryStore::new(), Year, (0..members).map(|n| album(n, 0)))).expect("distinct ids")
+    let years = KeySpec::new(vec![IndexKeyPart::asc(Year, ValueType::I64)]);
+    runtime.block_on(DigestTree::build(MemoryStore::new(), years, (0..members).map(|n| album(n, 0)))).expect("distinct ids")
 }
 
 fn building(c: &mut Criterion) {

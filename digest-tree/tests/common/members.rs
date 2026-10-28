@@ -6,7 +6,9 @@ use std::borrow::Cow;
 
 use ankurah_core_types::key_spec::IndexKeyPart;
 use ankurah_core_types::Value;
-use ankurah_digest_tree::{DigestTree, DigestTreeView, Encode, Member, MemberId, MemoryStore, Payload, Ristretto255, Row, RowKey, StoreError};
+use ankurah_digest_tree::{
+    DigestTree, DigestTreeView, Encode, Member, MemberId, MemoryStore, Payload, Ristretto255, Row, RowKey, StoreError,
+};
 
 /// An id: eight bytes, big-endian.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

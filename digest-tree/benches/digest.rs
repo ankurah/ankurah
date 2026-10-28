@@ -11,6 +11,8 @@ use std::borrow::Cow;
 use std::convert::Infallible;
 use std::hint::black_box;
 
+use ankurah_core_types::key_spec::{IndexKeyPart, KeySpec};
+use ankurah_core_types::{Value, ValueType};
 use ankurah_digest_tree::test_support::{member_digest, sum_digests};
 use ankurah_digest_tree::{Digest, DigestGroup, Encode, LtHash16, Member, MemberId, Payload, Ristretto255, Row, StoreError};
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -59,7 +61,7 @@ impl Encode for Fingerprint {
     fn decode(bytes: &[u8]) -> Result<Self, StoreError> { bytes.try_into().map(Fingerprint).map_err(StoreError::permanent) }
 }
 
-/// The key spec the members are keyed by: the year each came out.
+/// The property albums are keyed by: the year each came out.
 #[derive(Clone)]
 struct Year;
 
@@ -83,9 +85,8 @@ impl Member<Year> for Album {
 
     fn id(&self) -> Id { self.id.clone() }
 
-    /// The year's big-endian bytes with the sign bit flipped, which sort as
-    /// the years do.
-    fn key(&self, _: &Year) -> Result<Vec<u8>, Infallible> { Ok((self.year as u64 ^ 1 << 63).to_be_bytes().to_vec()) }
+    /// An album's one value: its year.
+    fn value(&self, _: &IndexKeyPart<Year>) -> Result<Option<Value>, Infallible> { Ok(Some(Value::I64(self.year))) }
 
     fn payload(&self) -> Fingerprint { self.fingerprint.clone() }
 }
@@ -107,13 +108,14 @@ fn primitives(c: &mut Criterion) {
 /// in front.
 fn group<G: DigestGroup>(c: &mut Criterion, albums: &[Album], label: &str) {
     let name = |benchmark: &str| format!("{label}: {benchmark}");
-    let digests: Vec<Digest<G>> = albums.iter().map(|album| member_digest(&Year, album).expect("an album's key")).collect();
+    let years = KeySpec::new(vec![IndexKeyPart::asc(Year, ValueType::I64)]);
+    let digests: Vec<Digest<G>> = albums.iter().map(|album| member_digest(&years, album).expect("an album's key")).collect();
 
     c.bench_function(&name("a member's digest (its key made, its leaf hashed)"), |b| {
         let mut i = 0;
         b.iter(|| {
             i = (i + 1) % INPUTS;
-            black_box(member_digest::<_, _, G>(&Year, black_box(&albums[i])).expect("an album's key"));
+            black_box(member_digest::<_, _, G>(&years, black_box(&albums[i])).expect("an album's key"));
         })
     });
 

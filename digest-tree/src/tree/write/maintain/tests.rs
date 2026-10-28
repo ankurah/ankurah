@@ -84,15 +84,16 @@ async fn a_branch_whose_side_empties_gives_way_to_the_other_side() {
 /// full bucket, past its capacity gives way to that bucket, which then splits.
 #[tokio::test]
 async fn a_branch_that_collapses_onto_an_overfull_bucket_splits_it() {
-    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..64).map(|n| item!(n, Some(0), b"")).chain([item!(100, Some(1), b"")]));
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+    let tree: ItemTree = tree_of!(spec.clone(), (0..64).map(|n| item!(n, 0, b"")).chain([item!(100, 1, b"")]));
     assert_eq!(tree.node_prefixes().await.len(), 3, "64 members on one side, one on the other");
 
     let mut trx = tree.transaction();
-    trx.remove(item!(100, Some(1), b"")).unwrap();
-    trx.insert(item!(200, Some(0), b"")).unwrap();
+    trx.remove(item!(100, 1, b"")).unwrap();
+    trx.insert(item!(200, 0, b"")).unwrap();
     trx.commit().await.unwrap();
 
-    assert_same_tree(&tree, &tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..64).chain([200]).map(|n| item!(n, Some(0), b"")))).await;
+    assert_same_tree(&tree, &tree_of!(spec, (0..64).chain([200]).map(|n| item!(n, 0, b"")))).await;
 }
 
 /// A branch whose one side a transaction empties while it empties a side of
@@ -102,21 +103,21 @@ async fn a_branch_that_collapses_onto_an_overfull_bucket_splits_it() {
 async fn a_branch_that_collapses_onto_a_subtree_with_an_empty_side_collapses_again() {
     // Key 1 keeps more members than a bucket holds, so the root keeps its
     // children once the transaction is done and must give way twice.
-    let members =
-        (0..10).map(|n| item!(n, Some(0), b"")).chain((100..180).map(|n| item!(n, Some(1), b""))).chain([item!(300, Some(2), b"")]);
+    let members = (0..10).map(|n| item!(n, 0, b"")).chain((100..180).map(|n| item!(n, 1, b""))).chain([item!(300, 2, b"")]);
 
-    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), members);
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+    let tree: ItemTree = tree_of!(spec.clone(), members);
     assert_eq!(tree.node_prefixes().await.len(), 7, "keys 0 and 1 on one side, parted twice beneath it, and key 2 on the other");
 
     let mut trx = tree.transaction();
-    trx.remove(item!(300, Some(2), b"")).unwrap();
+    trx.remove(item!(300, 2, b"")).unwrap();
 
     for n in 0..10 {
-        trx.remove(item!(n, Some(0), b"")).unwrap();
+        trx.remove(item!(n, 0, b"")).unwrap();
     }
 
     trx.commit().await.unwrap();
-    assert_same_tree(&tree, &tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (100..180).map(|n| item!(n, Some(1), b"")))).await;
+    assert_same_tree(&tree, &tree_of!(spec, (100..180).map(|n| item!(n, 1, b"")))).await;
 }
 
 /// A member beneath a node with children but outside both gets a branch of
@@ -125,21 +126,18 @@ async fn a_branch_that_collapses_onto_a_subtree_with_an_empty_side_collapses_aga
 async fn a_member_outside_a_nodes_children_gets_a_branch_of_its_own() {
     // Keys 0 to 99: the root's children part the keys deep in their bytes,
     // and a negative key lies outside both.
-    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"")));
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+    let tree: ItemTree = tree_of!(spec.clone(), (0..100).map(|n| item!(n, n as i64, b"")));
     let before = tree.node_prefixes().await;
 
     let mut trx = tree.transaction();
-    trx.insert(item!(100, Some(-1), b"")).unwrap();
+    trx.insert(item!(100, -1, b"")).unwrap();
     trx.commit().await.unwrap();
 
     let after = tree.node_prefixes().await;
     assert_eq!(after.len(), before.len() + 2, "a branch above the old children, and a bucket for the new member");
     assert!(before.iter().all(|prefix| after.contains(prefix)), "the old nodes stay");
-    assert_same_tree(
-        &tree,
-        &tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"")).chain([item!(100, Some(-1), b"")])),
-    )
-    .await;
+    assert_same_tree(&tree, &tree_of!(spec, (0..100).map(|n| item!(n, n as i64, b"")).chain([item!(100, -1, b"")]))).await;
 }
 
 /// A split sums the bucket's members, and a bucket whose digest disagrees

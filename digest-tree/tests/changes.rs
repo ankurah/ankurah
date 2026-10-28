@@ -135,7 +135,9 @@ async fn a_member_without_a_key_is_refused_at_its_change() {
     trx.insert(item!(2, [Some(2), None], b"b")).unwrap();
 
     match trx.insert(item!(3, [3], b"c")) {
-        Err(Error::Key { member, source }) => assert_eq!((member, source.to_string()), (Id(3).to_bytes().into_owned(), "no property B".into())),
+        Err(Error::Key { member, source }) => {
+            assert_eq!((member, source.to_string()), (Id(3).to_bytes().into_owned(), "no property B".into()))
+        }
         other => panic!("expected a member without a key, got {other:?}"),
     }
 

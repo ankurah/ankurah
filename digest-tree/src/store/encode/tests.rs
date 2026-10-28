@@ -2,8 +2,8 @@ use ankurah_core_types::key_spec::{IndexDirection, IndexKeyPart, KeySpec, NullsO
 use ankurah_core_types::ValueType;
 
 use super::*;
-use crate::digest::leaf_encoding;
 use crate::common::{asc, desc, Property, Tag};
+use crate::digest::leaf_encoding;
 use crate::{LtHash16, Ristretto255};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -74,6 +74,7 @@ fn rows_round_trip<G: DigestGroup>() {
             collation: Some("unicode".into()),
         },
     ]);
+
     let rows: [Row<Property, Tag, G>; 4] = [
         Row::Meta(Meta { key_spec: key_spec.clone(), group: G::ROW_VERSION }),
         Row::Meta(Meta { key_spec: KeySpec::<Property>::new(vec![]), group: G::ROW_VERSION }),

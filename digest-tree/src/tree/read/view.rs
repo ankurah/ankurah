@@ -72,6 +72,7 @@ where
         let values: Vec<Value> = values.into_iter().map(Into::into).collect();
         let key = lookup_key(&self.tree.inner.key_spec, &values)?;
         let address = address_of(&key, &id.to_bytes());
+
         if !self.spans.iter().any(|span| span.contains(&address)) {
             return Ok(None);
         }

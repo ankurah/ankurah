@@ -94,9 +94,10 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
     let fifty = item!(50, 50, b"");
     let gated = Gated::new().gating_row(RowKey::Leaf(leaf_address(&member_key(&spec, &fifty).unwrap(), &fifty.id)));
 
-    let tree = DigestTree::<Property, Id, Tag, Ristretto255, Gated>::build(gated.clone(), spec.clone(), (0..100).map(|n| item!(n, n as i64, b"")))
-        .await
-        .unwrap();
+    let tree =
+        DigestTree::<Property, Id, Tag, Ristretto255, Gated>::build(gated.clone(), spec.clone(), (0..100).map(|n| item!(n, n as i64, b"")))
+            .await
+            .unwrap();
 
     let view = tree.view();
     let digest = || async { view.span_digest(&Span::all()).await.unwrap().digest };

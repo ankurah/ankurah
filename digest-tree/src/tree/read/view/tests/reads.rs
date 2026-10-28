@@ -16,7 +16,9 @@ use crate::span::{key_prefix, split_address};
 use crate::{leaf_address, NodePrefix, Ristretto255, ScanRange};
 
 /// The key of a member holding `value` for property `A`, ascending.
-fn key_of(value: Option<i64>) -> Vec<u8> { member_key(&KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), &item!(0, value, b"")).unwrap() }
+fn key_of(value: Option<i64>) -> Vec<u8> {
+    member_key(&KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), &item!(0, value, b"")).unwrap()
+}
 
 /// The members a test put in a tree, in address order: what reads are
 /// checked against.
@@ -85,7 +87,8 @@ async fn reads_match_the_model(tree: &ItemTree, view: &ItemView, model: &Model, 
     assert_eq!(view.count(span).await.unwrap(), model.within(span, spans).count() as u64);
 
     // Members, read both ways: the same members in opposite orders.
-    let forward: Vec<(Vec<u8>, Tag)> = model.within(span, spans).map(|(address, _, payload, _)| (address.clone(), payload.clone())).collect();
+    let forward: Vec<(Vec<u8>, Tag)> =
+        model.within(span, spans).map(|(address, _, payload, _)| (address.clone(), payload.clone())).collect();
     let reverse: Vec<(Vec<u8>, Tag)> = forward.iter().rev().cloned().collect();
 
     for (range, expected) in [(ScanRange::forward(span.clone()), forward), (ScanRange::reverse(span.clone()), reverse)] {

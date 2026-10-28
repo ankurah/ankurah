@@ -103,7 +103,8 @@ async fn a_range_read_stopped_early_reads_only_the_batches_it_yields_from() {
 #[tokio::test]
 async fn a_failed_read_ends_the_stream_after_yielding_its_failure() {
     let store = FailingStore::new();
-    let tree = FailingTree::build(store.clone(), KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b""))).await.unwrap();
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+    let tree = FailingTree::build(store.clone(), spec, (0..100).map(|n| item!(n, n as i64, b""))).await.unwrap();
     let mut scan = tree.view().range(..);
 
     // The first batch's 64 members, read before the store fails.

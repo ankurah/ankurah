@@ -100,7 +100,11 @@ fn members(model: &BTreeMap<u32, Planned>) -> Vec<Item> { model.values().map(Pla
 
 /// The tree a sequence of transactions leaves, starting from a build of
 /// `initial`, against a build over the members they leave.
-async fn batches_leave_the_tree_a_build_gives<G: DigestGroup>(key_spec: KeySpec<Property>, initial: Vec<Planned>, batches: Vec<Vec<PlannedChange>>) {
+async fn batches_leave_the_tree_a_build_gives<G: DigestGroup>(
+    key_spec: KeySpec<Property>,
+    initial: Vec<Planned>,
+    batches: Vec<Vec<PlannedChange>>,
+) {
     let mut model: BTreeMap<u32, Planned> = initial.into_iter().map(|member| (member.id, member)).collect();
     let tree: ItemTree<G> = tree_of!(key_spec.clone(), members(&model));
 
@@ -176,6 +180,7 @@ async fn a_large_batch_matches_small_batches(initial: Vec<Planned>, changes: Vec
     let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
     let at_once: ItemTree = tree_of!(spec.clone(), members(&model));
     let few_at_a_time: ItemTree = tree_of!(spec.clone(), members(&model));
+
     commit(&at_once, &mut model, &changes).await;
 
     for batch in changes.chunks(7) {

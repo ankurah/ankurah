@@ -31,8 +31,9 @@ async fn a_tree_holds_its_members_in_key_order() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn the_two_newest_albums_read_in_reverse() -> anyhow::Result<()> {
+    let years = KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]);
     let albums = [album!(1, 2016, "Two Vines"), album!(2, 2008, "Walking on a Dream"), album!(3, 2013, "Ice on the Dune")];
-    let tree: Tree<Ristretto255> = DigestTree::build(MemoryStore::new(), KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]), albums).await?;
+    let tree: Tree<Ristretto255> = DigestTree::build(MemoryStore::new(), years, albums).await?;
 
     let newest = tree.view().range(ScanRange::reverse(..)).take(2);
     let titles: Vec<Title> = newest.map_ok(|leaf| leaf.payload).try_collect().await?;
@@ -63,15 +64,16 @@ async fn narrower_views_of_one_tree_serve_different_selections() -> anyhow::Resu
 
 #[tokio::test]
 async fn a_tree_opens_again_from_its_store() -> anyhow::Result<()> {
+    let years = KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]);
     let store = MemoryStore::new();
     let albums = [album!(1, 2016, "Two Vines"), album!(2, 2008, "Walking on a Dream")];
-    let tree: Tree<Ristretto255> = DigestTree::build(store.clone(), KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]), albums).await?;
+    let tree: Tree<Ristretto255> = DigestTree::build(store.clone(), years.clone(), albums).await?;
     let digest = tree.view().span_digest(&Span::all()).await?.digest;
     drop(tree);
 
     let reopened: Tree<Ristretto255> = DigestTree::open(store).await?;
 
-    assert_eq!(reopened.key_spec(), &KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]));
+    assert_eq!(reopened.key_spec(), &years);
     assert_eq!(reopened.view().span_digest(&Span::all()).await?.digest, digest);
 
     Ok(())
@@ -79,8 +81,9 @@ async fn a_tree_opens_again_from_its_store() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn every_change_to_the_members_changes_the_digest() -> anyhow::Result<()> {
+    let years = KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]);
     let albums = [album!(1, 2016, "Two Vines"), album!(2, 2008, "Walking on a Dream")];
-    let tree: Tree<Ristretto255> = DigestTree::build(MemoryStore::new(), KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]), albums).await?;
+    let tree: Tree<Ristretto255> = DigestTree::build(MemoryStore::new(), years, albums).await?;
     let first = tree.view().span_digest(&Span::all()).await?.digest;
 
     let mut trx = tree.transaction();
@@ -103,10 +106,11 @@ async fn every_change_to_the_members_changes_the_digest() -> anyhow::Result<()> 
 
 #[tokio::test]
 async fn trees_of_the_same_members_have_the_same_digest() -> anyhow::Result<()> {
+    let years = KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]);
     let albums = [album!(1, 2016, "Two Vines (Live)"), album!(3, 2013, "Ice on the Dune")];
-    let built: Tree<Ristretto255> = DigestTree::build(MemoryStore::new(), KeySpec::new(vec![asc!(Property::Year, ValueType::I32)]), albums).await?;
+    let built: Tree<Ristretto255> = DigestTree::build(MemoryStore::new(), years.clone(), albums).await?;
 
-    let changed: Tree<Ristretto255> = DigestTree::create(MemoryStore::new(), KeySpec::new(vec![asc!(Property::Year, ValueType::I32)])).await?;
+    let changed: Tree<Ristretto255> = DigestTree::create(MemoryStore::new(), years).await?;
 
     let mut trx = changed.transaction();
     trx.insert(album!(1, 2016, "Two Vines"))?;

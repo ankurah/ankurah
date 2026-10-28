@@ -94,8 +94,7 @@ async fn a_tree_reopened_from_its_sled_files_is_the_same_tree() {
         let db = config().open().unwrap();
         let tree = SledTree::build(SledStore::new(db.open_tree("tree").unwrap()), key_spec.clone(), members.clone()).await.unwrap();
 
-        commit(&tree, &[(Some(members[5].clone()), None), (Some(members[6].clone()), Some(item!(6, [6, 6], b"retitled")))])
-            .await;
+        commit(&tree, &[(Some(members[5].clone()), None), (Some(members[6].clone()), Some(item!(6, [6, 6], b"retitled")))]).await;
 
         let view = tree.view();
         let written = (view.span_digest(&Span::all()).await.unwrap(), view.len().await.unwrap());

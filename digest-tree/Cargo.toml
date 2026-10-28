@@ -11,8 +11,8 @@ repository    = "https://github.com/ankurah/ankurah"
 default = []
 # The disk-backed reference store, over raw sled.
 sled = ["dep:sled"]
-# Helpers for other crates' tests: computing expected digests, and auditing a
-# tree.
+# Helpers for other crates' tests: the keys and digests a tree makes for its
+# members, and auditing a tree.
 test-support = []
 
 [dependencies]
@@ -47,8 +47,8 @@ proptest   = { version = "1.11", default-features = false, features = ["std"] }
 serde_json = "1.0"
 # The sled reopen test needs a directory that outlives one database handle.
 tempfile = "3.23"
-# Top-level tests audit the trees they make, which the crate offers behind
-# its test-support feature.
+# Top-level tests audit the trees they make and place members by their keys,
+# which the crate offers behind its test-support feature.
 ankurah-digest-tree = { path = ".", features = ["test-support"] }
 # The tests await the tree's operations.
 tokio = { version = "1.40", default-features = false, features = [

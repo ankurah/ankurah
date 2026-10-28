@@ -5,9 +5,9 @@
 //! Every change names the version of the member it replaces, as an index's
 //! upkeep reads an entity's old values to remove its old key: an insert names
 //! none, and an update or a removal the version the tree holds. A change's
-//! keys are made at once, so a member without a value, or with a value of
-//! another type than its part's, fails at its own call. Staging checks each
-//! change against the leaves it touches (see `commit`).
+//! keys are made at once, so a member that can't give a value for a key
+//! part, or gives one of another type than the part's, fails at its own call.
+//! Staging checks each change against the leaves it touches (see `commit`).
 
 use std::collections::HashMap;
 

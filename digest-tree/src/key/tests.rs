@@ -38,6 +38,7 @@ fn a_missing_value_is_one_tag_after_every_value_ascending_and_before_them_descen
 fn a_part_s_nulls_order_overrides_postgresql_s() {
     let mut first = asc!(Property::A, ValueType::I64);
     first.nulls = Some(NullsOrder::First);
+
     let mut last = desc!(Property::A, ValueType::I64);
     last.nulls = Some(NullsOrder::Last);
 
@@ -136,11 +137,13 @@ fn sorts_first(part: &IndexKeyPart<Property>) -> bool {
 /// The order of two values in `part`'s order, missing values placed as the
 /// part places them.
 fn compare(part: &IndexKeyPart<Property>, a: Option<i64>, b: Option<i64>) -> Ordering {
-    let first = sorts_first(part);
+    // How a missing value compares with a present one.
+    let missing = if sorts_first(part) { Ordering::Less } else { Ordering::Greater };
+
     match (a, b) {
         (None, None) => Ordering::Equal,
-        (None, Some(_)) => if first { Ordering::Less } else { Ordering::Greater },
-        (Some(_), None) => if first { Ordering::Greater } else { Ordering::Less },
+        (None, Some(_)) => missing,
+        (Some(_), None) => missing.reverse(),
 
         (Some(a), Some(b)) => match part.direction {
             IndexDirection::Asc => a.cmp(&b),
@@ -178,8 +181,7 @@ proptest! {
     /// key begins another.
     #[test]
     fn keys_sort_as_their_values_do(spec in specs(), values in prop::collection::vec((values(), values()), 2..12)) {
-        let keyed: Vec<((Option<i64>, Option<i64>), Vec<u8>)> =
-            values.iter().map(|&(a, b)| ((a, b), key_of(&spec, &[a, b]))).collect();
+        let keyed: Vec<_> = values.iter().map(|&(a, b)| ((a, b), key_of(&spec, &[a, b]))).collect();
 
         for (a_values, a_key) in &keyed {
             for (b_values, b_key) in &keyed {
@@ -206,10 +208,12 @@ proptest! {
             prefix.into_iter().map(|value| value.map(Value::I64)).collect(),
             range.map(|(low, high)| (low.map(Value::I64), high.map(Value::I64))),
         );
+
         let span = span_for(&spec, &key_range).unwrap();
 
         for (index, &(a, b)) in members.iter().enumerate() {
             let address = address_of(&key_of(&spec, &[a, b]), &(index as u64).to_be_bytes());
+
             let (ranged, rest) = match prefix {
                 Some(prefix) => (b, prefix == a),
                 None => (a, true),
