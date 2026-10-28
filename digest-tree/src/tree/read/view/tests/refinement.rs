@@ -1,18 +1,20 @@
 //! How span digests are named and refined.
 
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
+
 use super::super::*;
-use crate::tree::fixtures::{built, integer_spec, item};
-use crate::{NodePrefix, Ristretto255};
+use crate::common::{asc, item, tree_of, ItemTree, Property};
+use crate::NodePrefix;
 
 /// A span digest names the deepest node whose subtree holds its span.
 #[tokio::test]
 async fn a_span_digest_is_named_with_the_smallest_subtree_holding_its_span() {
-    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b""))).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"")));
     let view = tree.view();
     assert_eq!(view.span_digest(&Span::all()).await.unwrap().prefix, NodePrefix::root());
 
-    let seven = integer_spec().collate([7]);
-    let one = Span::for_key_range(seven.clone()..=seven);
+    let one = tree.span_for(7i64..=7).unwrap();
     let named = view.span_digest(&one).await.unwrap();
 
     let buckets: Vec<NodePrefix> = tree.node_prefixes().await.into_iter().filter(|node| *node != NodePrefix::root()).collect();
@@ -25,8 +27,8 @@ async fn a_span_digest_is_named_with_the_smallest_subtree_holding_its_span() {
 /// Refining within a view leaves out what the view doesn't cover.
 #[tokio::test]
 async fn refining_within_a_view_leaves_out_what_it_doesnt_cover() {
-    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b""))).await;
-    let low = Span::for_key_range(..integer_spec().collate([10]));
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"")));
+    let low = tree.span_for(..10i64).unwrap();
 
     let view = tree.select([low.clone()]);
     let root = view.span_digest(&Span::all()).await.unwrap();
@@ -42,7 +44,7 @@ async fn refining_within_a_view_leaves_out_what_it_doesnt_cover() {
 
 #[tokio::test]
 async fn a_bucket_refines_into_nothing_and_a_malformed_span_digest_is_refused() {
-    let tree = built::<Ristretto255>(integer_spec(), (0..10).map(|n| item!(n, Some(i64::from(n)), b""))).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..10).map(|n| item!(n, n as i64, b"")));
     let view = tree.view();
     let root = view.span_digest(&Span::all()).await.unwrap();
     assert!(view.refine(&root).await.unwrap().is_empty(), "a root of ten members is a bucket");

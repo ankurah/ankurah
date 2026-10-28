@@ -11,11 +11,13 @@ repository    = "https://github.com/ankurah/ankurah"
 default = []
 # The disk-backed reference store, over raw sled.
 sled = ["dep:sled"]
-# Helpers for other crates' tests: building canonical keys, computing expected
-# digests, and auditing a tree.
+# Helpers for other crates' tests: computing expected digests, and auditing a
+# tree.
 test-support = []
 
 [dependencies]
+# The values a key holds, how they sort, and the key spec that orders them.
+ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
 # One lock per tree, held across awaits, on any async runtime.
 async-lock = "3.4"
 # std, the one default feature, builds for wasm32 and lets x86 builds choose
@@ -36,6 +38,8 @@ thiserror    = "2"
 rayon = "1.12"
 
 [dev-dependencies]
+# The introduction's tests pass errors on with `?`.
+anyhow = "1.0"
 # Span digests cross the wire through serde: as bytes in bincode, and as a
 # sequence in JSON, which has no byte strings.
 bincode    = "1.3.3"

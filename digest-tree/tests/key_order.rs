@@ -1,16 +1,20 @@
-//! Key order: a tree reads its members in the byte order of their keys, ties
-//! broken by id, whatever mix of orders the owner's keys carry in their parts;
-//! a tree keyed by id alone reads in id order.
+//! Key order: a tree reads its members in their keys' order, each part in its
+//! own direction with missing values where PostgreSQL puts them, ties broken
+//! by id; a range of a part's values holds the members holding values within
+//! it, whichever way the part sorts; and a tree keyed by id alone reads in id
+//! order.
 
 mod common;
 
 use std::cmp::Ordering;
 
-use ankurah_digest_tree::{Ristretto255, ScanRange};
-use common::{asc, built, desc, IndexDirection, Item, KeySpec};
+use ankurah_core_types::key_spec::{IndexDirection, KeySpec};
+use ankurah_core_types::ValueType;
+use ankurah_digest_tree::{KeyRange, ScanRange};
+use common::{asc, desc, item, tree_of, Item, ItemTree, Property};
 use futures::TryStreamExt;
 
-/// A member's two key values, `None` when missing.
+/// A member's values for `A` and `B`, `None` when missing.
 type Values = (Option<i64>, Option<i64>);
 
 /// 90 members over few values, so that ties are many and ids break them,
@@ -25,13 +29,7 @@ fn members() -> Vec<(u64, Values)> {
         .collect()
 }
 
-fn with_values((id, (first, second)): (u64, Values)) -> Item { Item::new(id, [first, second], b"") }
-
-/// Every mix of orders for the two key parts.
-fn mixes() -> Vec<KeySpec> {
-    let firsts = [asc!("a"), desc!("a")];
-    firsts.into_iter().flat_map(|first| [asc!("b"), desc!("b")].map(|second| KeySpec::new(vec![first.clone(), second]))).collect()
-}
+fn with_values((id, (first, second)): (u64, Values)) -> Item { item!(id, [first, second], b"") }
 
 /// How two values compare in a part's order, a missing value after every
 /// present one ascending, and so before them descending.
@@ -45,13 +43,17 @@ fn compare(a: Option<i64>, b: Option<i64>, direction: IndexDirection) -> Orderin
     }
 }
 
-/// The owner's keys carry its mix of orders, so a tree read forward gives
-/// each part in its own order, missing values last ascending and first
-/// descending, ties broken by id.
+/// A tree read forward gives each part in its own order, missing values last
+/// ascending and first descending, ties broken by id.
 #[tokio::test]
-async fn a_mix_of_orders_is_the_keys_own() {
-    for key_spec in mixes() {
-        let tree = built::<Ristretto255>(key_spec.clone(), members().into_iter().map(with_values)).await;
+async fn a_mix_of_orders_reads_each_part_in_its_own() {
+    for key_spec in [
+        KeySpec::new(vec![asc!(Property::A, ValueType::I64), asc!(Property::B, ValueType::I64)]),
+        KeySpec::new(vec![asc!(Property::A, ValueType::I64), desc!(Property::B, ValueType::I64)]),
+        KeySpec::new(vec![desc!(Property::A, ValueType::I64), asc!(Property::B, ValueType::I64)]),
+        KeySpec::new(vec![desc!(Property::A, ValueType::I64), desc!(Property::B, ValueType::I64)]),
+    ] {
+        let tree: ItemTree = tree_of!(key_spec.clone(), members().into_iter().map(with_values));
         let read: Vec<u64> = tree.view().range(..).map_ok(|leaf| leaf.id.0).try_collect().await.unwrap();
 
         let mut ordered = members();
@@ -62,11 +64,30 @@ async fn a_mix_of_orders_is_the_keys_own() {
     }
 }
 
+/// Under an equal first value, a range of a descending second part holds the
+/// members holding values within it, read largest first, and none that holds
+/// no value there: member 52, which holds 2 and nothing, is left out.
+#[tokio::test]
+async fn a_range_of_a_descending_part_holds_its_values_and_no_missing_ones() {
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64), desc!(Property::B, ValueType::I64)]);
+    let tree: ItemTree = tree_of!(spec, members().into_iter().map(with_values));
+
+    let span = tree.span_for(KeyRange::prefix([2i64]).and(0i64..2)).unwrap();
+    let read: Vec<u64> = tree.view().range(span).map_ok(|leaf| leaf.id.0).try_collect().await.unwrap();
+
+    let mut held: Vec<(u64, Values)> =
+        members().into_iter().filter(|(_, (a, b))| *a == Some(2) && b.is_some_and(|b| (0..2).contains(&b))).collect();
+    held.sort_by(|(a_id, a), (b_id, b)| compare(a.1, b.1, IndexDirection::Desc).then(a_id.cmp(b_id)));
+
+    assert_eq!(members()[52], (52, (Some(2), None)));
+    assert_eq!(read, held.into_iter().map(|(id, _)| id).collect::<Vec<_>>());
+}
+
 /// A tree keyed by id alone, under a key spec of no parts, reads in id order:
 /// forward from the smallest id up, and in reverse from the largest down.
 #[tokio::test]
 async fn a_tree_keyed_by_id_alone_reads_in_id_order() {
-    let tree = built::<Ristretto255>(KeySpec::new(vec![]), (0..20).map(|id| Item::new(id, [], b""))).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![]), (0..20).map(|id| item!(id, [], b"")));
     let view = tree.view();
 
     let forward: Vec<u64> = view.range(..).map_ok(|leaf| leaf.id.0).try_collect().await.unwrap();

@@ -4,13 +4,17 @@
 
 use std::collections::BTreeMap;
 
-use crate::fixtures::{block_on, Item, KeySpec};
-use crate::tree::fixtures::{assert_same_tree, built, by_id_spec, integer_spec, item, Tree};
-use crate::{DigestGroup, LtHash16, Ristretto255};
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 
-/// A member under the integer spec, as a test describes it.
+use crate::common::{asc, item, tree_of, Item, ItemTree, Property};
+use crate::fixtures::block_on;
+use crate::tree::fixtures::assert_same_tree;
+use crate::{DigestGroup, LtHash16, Ristretto255};
+
+/// A member holding one value for property `A`, as a test describes it.
 #[derive(Clone, Debug)]
 struct Planned {
     id: u32,
@@ -19,7 +23,7 @@ struct Planned {
 }
 
 impl Planned {
-    fn item(&self) -> Item { item!(self.id, self.key, &self.payload) }
+    fn item(&self) -> Item { item!(u64::from(self.id), self.key, &self.payload) }
 }
 
 /// Members with ids below `ids`, keys from a narrow range so that many share
@@ -42,7 +46,7 @@ enum PlannedChange {
 /// would, and bring `model` up to date. A member to hold is an update if the
 /// model holds its id and an insert if not; a removal of an id the model
 /// doesn't hold names no version, so it is left out.
-async fn commit<G: DigestGroup>(tree: &Tree<G>, model: &mut BTreeMap<u32, Planned>, changes: &[PlannedChange]) {
+async fn commit<G: DigestGroup>(tree: &ItemTree<G>, model: &mut BTreeMap<u32, Planned>, changes: &[PlannedChange]) {
     let mut trx = tree.transaction();
     for change in changes {
         match change {
@@ -96,15 +100,15 @@ fn members(model: &BTreeMap<u32, Planned>) -> Vec<Item> { model.values().map(Pla
 
 /// The tree a sequence of transactions leaves, starting from a build of
 /// `initial`, against a build over the members they leave.
-async fn batches_leave_the_tree_a_build_gives<G: DigestGroup>(key_spec: KeySpec, initial: Vec<Planned>, batches: Vec<Vec<PlannedChange>>) {
+async fn batches_leave_the_tree_a_build_gives<G: DigestGroup>(key_spec: KeySpec<Property>, initial: Vec<Planned>, batches: Vec<Vec<PlannedChange>>) {
     let mut model: BTreeMap<u32, Planned> = initial.into_iter().map(|member| (member.id, member)).collect();
-    let tree = built::<G>(key_spec.clone(), members(&model)).await;
+    let tree: ItemTree<G> = tree_of!(key_spec.clone(), members(&model));
 
     for batch in &batches {
         commit(&tree, &mut model, batch).await;
     }
 
-    assert_same_tree(&tree, &built(key_spec, members(&model)).await).await;
+    assert_same_tree(&tree, &tree_of!(key_spec, members(&model))).await;
 }
 
 proptest! {
@@ -119,7 +123,7 @@ proptest! {
         initial in proptest::collection::vec(planned(260), 0..220),
         batches in batches(260),
     ) {
-        block_on(batches_leave_the_tree_a_build_gives::<Ristretto255>(integer_spec(), initial, batches));
+        block_on(batches_leave_the_tree_a_build_gives::<Ristretto255>(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), initial, batches));
     }
 
     /// The same oracle for a tree keyed by id alone, summed in LtHash16.
@@ -128,7 +132,7 @@ proptest! {
         initial in proptest::collection::vec(planned(200), 0..160),
         batches in batches(200),
     ) {
-        block_on(batches_leave_the_tree_a_build_gives::<LtHash16>(by_id_spec(), initial, batches));
+        block_on(batches_leave_the_tree_a_build_gives::<LtHash16>(KeySpec::new(vec![]), initial, batches));
     }
 
     /// One transaction that empties one side of the root while it changes
@@ -158,7 +162,7 @@ proptest! {
             .chain((0..kept).filter(|&n| Some(kept_key(n)) == removed_key).map(|n| PlannedChange::Remove(1000 + n)))
             .collect();
 
-        block_on(batches_leave_the_tree_a_build_gives::<Ristretto255>(integer_spec(), initial, vec![changes]));
+        block_on(batches_leave_the_tree_a_build_gives::<Ristretto255>(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), initial, vec![changes]));
     }
 }
 
@@ -169,8 +173,9 @@ async fn a_large_batch_matches_small_batches(initial: Vec<Planned>, changes: Vec
     let mut model: BTreeMap<u32, Planned> = initial.into_iter().map(|member| (member.id, member)).collect();
     let mut few_at_a_time_model = model.clone();
 
-    let at_once = built::<Ristretto255>(integer_spec(), members(&model)).await;
-    let few_at_a_time = built::<Ristretto255>(integer_spec(), members(&model)).await;
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+    let at_once: ItemTree = tree_of!(spec.clone(), members(&model));
+    let few_at_a_time: ItemTree = tree_of!(spec.clone(), members(&model));
     commit(&at_once, &mut model, &changes).await;
 
     for batch in changes.chunks(7) {
@@ -179,7 +184,7 @@ async fn a_large_batch_matches_small_batches(initial: Vec<Planned>, changes: Vec
 
     assert_same_tree(&at_once, &few_at_a_time).await;
 
-    let rebuilt = built::<Ristretto255>(integer_spec(), members(&model)).await;
+    let rebuilt: ItemTree = tree_of!(spec, members(&model));
     assert_same_tree(&at_once, &rebuilt).await;
 }
 

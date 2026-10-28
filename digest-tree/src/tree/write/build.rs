@@ -1,10 +1,12 @@
 //! Building a tree whole from its members: every row, the nodes laid out
 //! bottom-up in one pass.
 
+use ankurah_core_types::key_spec::KeySpec;
+
 use super::hashing::{hash_chunk, yield_now, LEAVES_PER_CHUNK};
 use super::Filed;
 use crate::digest::leaf_encoding;
-use crate::member::member_key;
+use crate::key::member_key;
 use crate::span::address_of;
 use crate::store::{LeafRow, Meta};
 use crate::tree::trie::lay_out;
@@ -19,11 +21,11 @@ struct Encoded<L> {
 
 /// Every row of a tree that holds exactly `members` under `key_spec`.
 ///
-/// Every member makes its key before any is hashed, so that a member without
+/// Every member's key is made before any is hashed, so that a member without
 /// a key, or an id given twice, is refused before the costly part. Both
 /// passes go a chunk at a time, yielding to the executor between chunks, so a
 /// large build holds no executor thread for long.
-pub(super) async fn rows<K, I, L, G, M>(key_spec: &K, members: Vec<M>) -> Result<Vec<WriteItem<RowKey, Row<K, L, G>>>, Error>
+pub(super) async fn rows<K, I, L, G, M>(key_spec: &KeySpec<K>, members: Vec<M>) -> Result<Vec<WriteItem<RowKey, Row<K, L, G>>>, Error>
 where
     K: Clone,
     I: MemberId,

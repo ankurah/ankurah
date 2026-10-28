@@ -1,11 +1,14 @@
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
+
 use super::*;
-use crate::fixtures::{asc, Item, KeySpec};
+use crate::common::{asc, item, Item, Property};
 use crate::{DigestTree, LtHash16, MemoryStore, Ristretto255, Span};
 
 /// The members' digests sum to the digest of a tree that holds them.
 async fn member_digests_sum_to_the_trees<G: DigestGroup>() {
-    let spec = KeySpec::new(vec![asc!("a")]);
-    let members: Vec<Item> = (0..150).map(|n| Item::new(n, [Some(i64::from(n % 9))], &n.to_be_bytes())).collect();
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+    let members: Vec<Item> = (0..150u64).map(|n| item!(n, (n % 9) as i64, &n.to_be_bytes())).collect();
     let digests = members.iter().map(|member| member_digest::<_, _, G>(&spec, member).unwrap());
     let expected = sum_digests(digests).unwrap();
     let tree = DigestTree::<_, _, _, G, _>::build(MemoryStore::new(), spec.clone(), members).await.unwrap();
@@ -22,6 +25,7 @@ async fn lthash16_member_digests_sum_to_the_trees() { member_digests_sum_to_the_
 
 #[test]
 fn a_member_digest_refuses_a_member_without_a_key() {
-    let member = Item::new(1, [], b"");
-    assert!(matches!(member_digest::<_, _, Ristretto255>(&KeySpec::new(vec![asc!("a")]), &member), Err(Error::Key { .. })));
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+
+    assert!(matches!(member_digest::<_, _, Ristretto255>(&spec, &item!(1, [], b"")), Err(Error::Key { .. })));
 }

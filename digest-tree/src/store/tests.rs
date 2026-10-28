@@ -1,7 +1,7 @@
 //! The contract every store keeps, run against both reference stores.
 
 use super::*;
-use crate::fixtures::Tag;
+use crate::common::Tag;
 use crate::MemoryStore;
 
 /// Keys of each kind, in key order: kinds sort together, in declared order.

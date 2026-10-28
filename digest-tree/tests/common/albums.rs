@@ -2,9 +2,11 @@
 
 use std::borrow::Cow;
 
-use ankurah_digest_tree::{DigestGroup, DigestTree, DigestTreeView, Member, MemoryStore, Payload, Row, RowKey};
+use ankurah_core_types::key_spec::IndexKeyPart;
+use ankurah_core_types::Value;
+use ankurah_digest_tree::{DigestTree, DigestTreeView, Member, MemoryStore, Payload, Row, RowKey};
 
-use super::members::{asc, Id, KeySpec, NoValueFor};
+use super::members::{Id, NoProperty, Property};
 
 /// An album's title: the payload an album tree keeps and digests, so
 /// retitling an album changes it.
@@ -20,28 +22,27 @@ impl PartialEq<&str> for Title {
     fn eq(&self, text: &&str) -> bool { self.0 == *text }
 }
 
-/// An album, the sample member of the top-level tests, keyed by the year it
-/// came out.
+/// An album, the sample member of the top-level tests: an id, the year it
+/// came out, and its title.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Album {
     pub id: Id,
-    pub year: i64,
+    pub year: i32,
     pub title: Title,
 }
 
-/// An album's key is the year it came out, its one value, collated by the
-/// spec; a spec of more parts asks for values an album lacks.
-impl Member<KeySpec> for Album {
+/// An album holds its year, an `I32`, and no other property.
+impl Member<Property> for Album {
     type Id = Id;
     type Payload = Title;
-    type KeyError = NoValueFor;
+    type KeyError = NoProperty;
 
     fn id(&self) -> Id { self.id }
 
-    fn key(&self, spec: &KeySpec) -> Result<Vec<u8>, NoValueFor> {
-        match spec.keyparts.len() {
-            0 | 1 => Ok(spec.collate([self.year])),
-            _ => Err(NoValueFor(1)),
+    fn value(&self, part: &IndexKeyPart<Property>) -> Result<Option<Value>, NoProperty> {
+        match part.key {
+            Property::Year => Ok(Some(Value::I32(self.year))),
+            other => Err(NoProperty(other)),
         }
     }
 
@@ -59,13 +60,7 @@ macro_rules! album {
 pub(crate) use album;
 
 /// A tree of albums, in memory.
-pub type Tree<G> = DigestTree<KeySpec, Id, Title, G, MemoryStore<RowKey, Row<KeySpec, Title, G>>>;
+pub type Tree<G> = DigestTree<Property, Id, Title, G, MemoryStore<RowKey, Row<Property, Title, G>>>;
 
 /// A view of a tree of albums.
-pub type View<G> = DigestTreeView<KeySpec, Id, Title, G, MemoryStore<RowKey, Row<KeySpec, Title, G>>>;
-
-/// A tree of albums in memory, keyed by the year each came out, holding
-/// exactly `albums`.
-pub async fn tree<G: DigestGroup>(albums: impl IntoIterator<Item = Album>) -> Tree<G> {
-    DigestTree::build(MemoryStore::new(), KeySpec::new(vec![asc!("year")]), albums).await.unwrap()
-}
+pub type View<G> = DigestTreeView<Property, Id, Title, G, MemoryStore<RowKey, Row<Property, Title, G>>>;

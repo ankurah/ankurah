@@ -1,6 +1,9 @@
+use ankurah_core_types::key_spec::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder};
+use ankurah_core_types::ValueType;
+
 use super::*;
 use crate::digest::leaf_encoding;
-use crate::fixtures::{asc, desc, KeySpec, Tag};
+use crate::common::{asc, desc, Property, Tag};
 use crate::{LtHash16, Ristretto255};
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
@@ -50,17 +53,30 @@ fn element<G: DigestGroup>() -> G::Element { G::hash_leaf(&leaf_encoding(b"k", b
 
 /// A row's encoding, decoded and encoded again: equal bytes mean the row
 /// came back whole.
-fn round_trip<G: DigestGroup>(row: &Row<KeySpec, Tag, G>) -> Vec<u8> { Row::<KeySpec, Tag, G>::decode(&row.encode()).unwrap().encode() }
+fn round_trip<G: DigestGroup>(row: &Row<Property, Tag, G>) -> Vec<u8> { Row::<Property, Tag, G>::decode(&row.encode()).unwrap().encode() }
 
 fn rows_round_trip<G: DigestGroup>() {
     let element = element::<G>();
     let mut digest = Digest::empty();
     digest.add_element(&element).unwrap();
 
-    let key_spec = KeySpec::new(vec![asc!("a"), desc!("b")]);
-    let rows: [Row<KeySpec, Tag, G>; 4] = [
+    // Every field of a part a stored spec keeps, though a tree refuses a
+    // spec that names a collation.
+    let key_spec = KeySpec::new(vec![
+        asc!(Property::A, ValueType::I64),
+        desc!(Property::B, ValueType::String),
+        IndexKeyPart {
+            key: Property::Year,
+            sub_path: Some(vec!["released".into(), "year".into()]),
+            direction: IndexDirection::Asc,
+            value_type: ValueType::Json,
+            nulls: Some(NullsOrder::First),
+            collation: Some("unicode".into()),
+        },
+    ]);
+    let rows: [Row<Property, Tag, G>; 4] = [
         Row::Meta(Meta { key_spec: key_spec.clone(), group: G::ROW_VERSION }),
-        Row::Meta(Meta { key_spec: KeySpec::new(vec![]), group: G::ROW_VERSION }),
+        Row::Meta(Meta { key_spec: KeySpec::<Property>::new(vec![]), group: G::ROW_VERSION }),
         Row::Node(digest),
         Row::Leaf(LeafRow { payload: Tag(b"payload".to_vec()), element }),
     ];
@@ -69,12 +85,12 @@ fn rows_round_trip<G: DigestGroup>() {
         assert_eq!(round_trip(row), row.encode(), "{row:?}");
     }
 
-    match Row::<KeySpec, Tag, G>::decode(&rows[0].encode()).unwrap() {
+    match Row::<Property, Tag, G>::decode(&rows[0].encode()).unwrap() {
         Row::Meta(meta) => assert_eq!((meta.key_spec, meta.group), (key_spec, G::ROW_VERSION)),
         other => panic!("expected metadata, got {other:?}"),
     }
 
-    match Row::<KeySpec, Tag, G>::decode(&rows[3].encode()).unwrap() {
+    match Row::<Property, Tag, G>::decode(&rows[3].encode()).unwrap() {
         Row::Leaf(leaf) => assert_eq!((leaf.payload, leaf.element), (Tag(b"payload".to_vec()), element)),
         other => panic!("expected a leaf, got {other:?}"),
     }
@@ -88,16 +104,20 @@ fn lthash16_rows_round_trip() { rows_round_trip::<LtHash16>() }
 
 #[test]
 fn bytes_that_are_no_row_are_refused_permanently() {
-    let leaf = Row::<KeySpec, Tag, LtHash16>::Leaf(LeafRow { payload: Tag(vec![]), element: element::<LtHash16>() }).encode();
+    let leaf = Row::<Property, Tag, LtHash16>::Leaf(LeafRow { payload: Tag(vec![]), element: element::<LtHash16>() }).encode();
 
     for (bytes, why) in [
         (vec![], "bytes that are no row"),
         (vec![4], "bytes that are no row"),
         (vec![META], "a truncated metadata row"),
-        (vec![META, 1, 7, 0], "a key part's direction is 0 or 1"),
+        (vec![META, 1, 0, 0, 0, 1, 9], "bytes that are no property"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 7], "a key part's direction is 0 or 1"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 0, 42], "a key part's value type is unknown"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 0, 2, 3], "a key part's nulls order is 0, 1 or 2"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 0, 2, 0], "a truncated key spec"),
         (leaf, "unknown digest version 2"),
         (vec![NODE, 1], "expected 41 bytes, found 1"),
     ] {
-        assert!(refusal(Row::<KeySpec, Tag, Ristretto255>::decode(&bytes)).contains(why), "{bytes:02x?}: {why}");
+        assert!(refusal(Row::<Property, Tag, Ristretto255>::decode(&bytes)).contains(why), "{bytes:02x?}: {why}");
     }
 }

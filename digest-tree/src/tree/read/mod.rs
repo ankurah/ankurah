@@ -10,7 +10,8 @@ pub use members::{Members, ScanRange};
 pub use view::{DigestTreeView, Leaf};
 
 use super::DigestTree;
-use crate::{DigestGroup, MemberId, Payload, Row, RowKey, Span, Store};
+use crate::key::span_for;
+use crate::{DigestGroup, Error, KeyRange, MemberId, Payload, Row, RowKey, Span, Store};
 
 impl<K, I, L, G, S> DigestTree<K, I, L, G, S>
 where
@@ -30,4 +31,11 @@ where
     pub fn select(&self, spans: impl IntoIterator<Item = Span>) -> DigestTreeView<K, I, L, G, S> {
         DigestTreeView::new(self.clone(), Span::normalize(spans.into_iter().collect()))
     }
+
+    /// The span of the addresses of the members `range` holds: a
+    /// [`KeyRange`], or a Rust range of values for the key's first part. Values
+    /// for more parts than the key has are [`Error::KeyLength`], and a value
+    /// of another type than its part's is [`Error::KeyValueType`]. Making the
+    /// span reads nothing.
+    pub fn span_for(&self, range: impl Into<KeyRange>) -> Result<Span, Error> { span_for(&self.inner.key_spec, &range.into()) }
 }

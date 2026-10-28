@@ -3,7 +3,7 @@
 //! and one that returns the new row came from disk.
 
 use super::*;
-use crate::fixtures::Tag;
+use crate::common::Tag;
 use crate::store::RowKey;
 use crate::NodePrefix;
 

@@ -4,31 +4,32 @@
 //!
 //! Every change names the version of the member it replaces, as an index's
 //! upkeep reads an entity's old values to remove its old key: an insert names
-//! none, and an update or a removal the version the tree holds. A change
-//! makes its member's key at once, so a member that can't make one fails at
-//! its own call. Staging checks each change against the leaves it touches
-//! (see `commit`).
+//! none, and an update or a removal the version the tree holds. A change's
+//! keys are made at once, so a member without a value, or with a value of
+//! another type than its part's, fails at its own call. Staging checks each
+//! change against the leaves it touches (see `commit`).
 
 use std::collections::HashMap;
 
 use async_lock::RwLockWriteGuardArc;
 
 use super::commit;
-use crate::member::member_key;
+use crate::key::member_key;
 use crate::tree::rows::StagedRows;
 use crate::tree::DigestTree;
-use crate::{DigestGroup, Error, Member, MemberId, Payload, Row, RowKey, Store, WriteItem};
+use crate::{DigestGroup, Error, Leaf, Member, MemberId, Payload, Row, RowKey, Store, WriteItem};
 
 /// A batch of changes to a tree, committed together: all of them, or none.
 ///
 /// Each change names the version of the member it replaces: none for an
 /// insert, and for an update or a removal the version the tree holds, as its
-/// owner gave it or as a read returned it, since a [`Leaf`](crate::Leaf) is
-/// a member too. Changes to one member chain: each starts from the version
-/// the one before it left. Nothing is written until [`commit`](Self::commit),
-/// or until its owner writes the rows [`stage`](Self::stage) returns, so a
-/// transaction dropped uncommitted changes nothing; and none holds the tree's
-/// lock until it is staged.
+/// owner gave it, or as a read returned it, through
+/// [`update_leaf`](Self::update_leaf) and [`remove_leaf`](Self::remove_leaf).
+/// Changes to one member chain: each starts from the version the one before
+/// it left. Nothing is written until [`commit`](Self::commit), or until its
+/// owner writes the rows [`stage`](Self::stage) returns, so a transaction
+/// dropped uncommitted changes nothing; and none holds the tree's lock until
+/// it is staged.
 pub struct Transaction<K, I, L, G: DigestGroup, S> {
     tree: DigestTree<K, I, L, G, S>,
 
@@ -63,9 +64,10 @@ where
 {
     pub(super) fn new(tree: DigestTree<K, I, L, G, S>) -> Self { Self { tree, changes: Vec::new(), by_id: HashMap::new() } }
 
-    /// Add `member`, which the tree doesn't hold. A member that can't make its
-    /// key is [`Error::Key`], and one this transaction already holds is
-    /// [`Error::AlreadyHeld`].
+    /// Add `member`, which the tree doesn't hold. A member that can't give a
+    /// value is [`Error::Key`], one that gives a value of another type than
+    /// its part's is [`Error::WrongValueType`], and one this transaction
+    /// already holds is [`Error::AlreadyHeld`].
     ///
     /// The commit checks only the slot under the member's own key. A member
     /// the tree holds under another key goes unnoticed, and the tree then
@@ -86,13 +88,15 @@ where
         N: Member<K, Id = I, Payload = L>,
     {
         let (id, before) = self.version_of(&old)?;
-        let (new_id, after) = self.version_of(&new)?;
+        self.replace(id, before, &new)
+    }
 
-        if new_id != id {
-            return Err(Error::IdChanged { old: id, new: new_id });
-        }
-
-        self.change(id, Some(before), Some(after))
+    /// Replace `old`, a leaf a read of this tree returned, with `new`, as
+    /// [`update`](Self::update) does: for an owner that holds the version it
+    /// replaces only as the tree held it.
+    pub fn update_leaf<N: Member<K, Id = I, Payload = L>>(&mut self, old: Leaf<I, L>, new: N) -> Result<(), Error> {
+        let (id, before) = version_of_leaf(old);
+        self.replace(id, before, &new)
     }
 
     /// Remove `old`, the version of a member the tree holds. An `old` that
@@ -100,6 +104,13 @@ where
     /// [`Error::NotHeld`].
     pub fn remove<O: Member<K, Id = I, Payload = L>>(&mut self, old: O) -> Result<(), Error> {
         let (id, before) = self.version_of(&old)?;
+        self.change(id, Some(before), None)
+    }
+
+    /// Remove `old`, a leaf a read of this tree returned, as
+    /// [`remove`](Self::remove) does.
+    pub fn remove_leaf(&mut self, old: Leaf<I, L>) -> Result<(), Error> {
+        let (id, before) = version_of_leaf(old);
         self.change(id, Some(before), None)
     }
 
@@ -157,6 +168,18 @@ where
         Ok((member.id().to_bytes().into_owned(), Version { key, payload: member.payload() }))
     }
 
+    /// Record a change of the member with id `id` from `before` to `new`,
+    /// which must be a version of the same member.
+    fn replace<N: Member<K, Id = I, Payload = L>>(&mut self, id: Vec<u8>, before: Version<L>, new: &N) -> Result<(), Error> {
+        let (new_id, after) = self.version_of(new)?;
+
+        if new_id != id {
+            return Err(Error::IdChanged { old: id, new: new_id });
+        }
+
+        self.change(id, Some(before), Some(after))
+    }
+
     /// Record a change of the member with id `id` from `from` to `to`. A
     /// member changed earlier in the transaction must change on from the
     /// version that change left it in.
@@ -194,6 +217,11 @@ pub struct StagedCommit<K, L, G: DigestGroup> {
 impl<K, L, G: DigestGroup> StagedCommit<K, L, G> {
     /// The rows to write together: all of them, or none.
     pub fn rows(&self) -> &[WriteItem<RowKey, Row<K, L, G>>] { &self.rows }
+}
+
+/// A leaf's id's bytes, and its version as the tree held it.
+fn version_of_leaf<I: MemberId, L>(leaf: Leaf<I, L>) -> (Vec<u8>, Version<L>) {
+    (leaf.id.to_bytes().into_owned(), Version { key: leaf.key, payload: leaf.payload })
 }
 
 /// Whether two versions, either absent, are the same for the tree: both

@@ -1,20 +1,28 @@
 //! The audit catches each kind of damage to a tree's rows.
 
-use super::*;
-use crate::fixtures::{leaf_element, Id, Item, KeySpec, Tag};
-use crate::store::{LeafRow, Meta};
-use crate::tree::fixtures::{built, by_id_spec, integer_spec, item, Tree};
-use crate::NodePrefix;
-use crate::{leaf_address, Member, Ristretto255, WriteItem};
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
 
-type Write = WriteItem<RowKey, Row<KeySpec, Tag, Ristretto255>>;
+use super::*;
+use crate::common::{asc, item, tree_of, Id, Item, ItemTree, Property, Tag};
+use crate::fixtures::leaf_element;
+use crate::key::member_key;
+use crate::store::{LeafRow, Meta};
+use crate::NodePrefix;
+use crate::{leaf_address, Ristretto255, WriteItem};
+
+type Write = WriteItem<RowKey, Row<Property, Tag, Ristretto255>>;
+
+/// The key of a member holding `value` for property `A`, ascending: the key
+/// of the members of [`hundred`].
+fn key_of(value: i64) -> Vec<u8> { member_key(&KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), &item!(0, value, b"")).unwrap() }
 
 /// 100 members under keys 0 to 99: a root and two buckets.
-async fn hundred() -> Tree { built(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b"payload"))).await }
+async fn hundred() -> ItemTree { tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"payload"))) }
 
 /// The fault the audit names in `tree` after `damage` is written to its
 /// store.
-async fn fault_after(tree: Tree, damage: Vec<Write>) -> &'static str {
+async fn fault_after(tree: ItemTree, damage: Vec<Write>) -> &'static str {
     tree.store().write(damage).await.unwrap();
 
     match tree.audit().await {
@@ -23,13 +31,13 @@ async fn fault_after(tree: Tree, damage: Vec<Write>) -> &'static str {
     }
 }
 
-async fn row(tree: &Tree, key: RowKey) -> Row<KeySpec, Tag, Ristretto255> { tree.store().get(&key).await.unwrap().expect("a stored row") }
+async fn row(tree: &ItemTree, key: RowKey) -> Row<Property, Tag, Ristretto255> { tree.store().get(&key).await.unwrap().expect("a stored row") }
 
 /// The address of the member with id `id` in a tree of [`hundred`], whose
 /// key is its id.
-fn address(id: u32) -> Vec<u8> { leaf_address(&integer_spec().collate([i64::from(id)]), &Id(id)) }
+fn address(id: u64) -> Vec<u8> { leaf_address(&key_of(id as i64), &Id(id)) }
 
-async fn digest_of(tree: &Tree, prefix: &NodePrefix) -> Digest<Ristretto255> {
+async fn digest_of(tree: &ItemTree, prefix: &NodePrefix) -> Digest<Ristretto255> {
     match row(tree, RowKey::Node(prefix.clone())).await {
         Row::Node(digest) => digest,
         other => panic!("a node row, not {other:?}"),
@@ -72,8 +80,7 @@ async fn the_audit_catches_a_member_whose_element_is_not_its_leafs() {
 #[tokio::test]
 async fn the_audit_catches_a_member_held_under_two_keys() {
     let tree = hundred().await;
-    let again = item!(7, Some(80), b"payload");
-    let key = again.key(&integer_spec()).unwrap();
+    let key = key_of(80);
     let address = leaf_address(&key, &Id(7));
     let element = leaf_element::<Ristretto255>(&key, &Id(7).to_bytes(), b"payload");
 
@@ -100,8 +107,7 @@ async fn the_audit_catches_a_branch_that_lost_a_child() {
 #[tokio::test]
 async fn the_audit_catches_a_member_beneath_no_bucket() {
     let tree = hundred().await;
-    let stray = item!(500, Some(-1), b"payload");
-    let key = stray.key(&integer_spec()).unwrap();
+    let key = key_of(-1);
     let address = leaf_address(&key, &Id(500));
 
     let stray_element = leaf_element::<Ristretto255>(&key, &Id(500).to_bytes(), b"payload");
@@ -128,13 +134,13 @@ async fn the_audit_catches_nodes_whose_counts_their_shape_does_not_allow() {
     // Keyed by id alone, 65 members split into ids 0 to 63 and id 64; leaving
     // 63 members beneath the first child and id 64 beneath the second leaves
     // the root's children holding 64, which one bucket holds.
-    let members = |ids: &mut dyn Iterator<Item = u32>| ids.map(|id| Item::new(id, [], b"")).collect::<Vec<_>>();
-    let tree: Tree = built(by_id_spec(), members(&mut (0..65))).await;
+    let members = |ids: &mut dyn Iterator<Item = u64>| ids.map(|id| item!(id, [], b"")).collect::<Vec<Item>>();
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![]), members(&mut (0..65)));
 
-    let first: Tree = built(by_id_spec(), members(&mut (0..63))).await;
-    let second: Tree = built(by_id_spec(), members(&mut std::iter::once(64))).await;
+    let first: ItemTree = tree_of!(KeySpec::new(vec![]), members(&mut (0..63)));
+    let second: ItemTree = tree_of!(KeySpec::new(vec![]), members(&mut std::iter::once(64)));
 
-    let both: Tree = built(by_id_spec(), members(&mut (0..63).chain([64]))).await;
+    let both: ItemTree = tree_of!(KeySpec::new(vec![]), members(&mut (0..63).chain([64])));
     let nodes = tree.node_prefixes().await;
 
     assert_eq!(
@@ -151,11 +157,11 @@ async fn the_audit_catches_a_branch_with_an_empty_side() {
     // Keyed by id alone, 65 members split into ids 0 to 63 and id 64;
     // removing id 64 alone, without collapsing the branch, leaves the second
     // side empty.
-    let members = |ids: &mut dyn Iterator<Item = u32>| ids.map(|id| Item::new(id, [], b"")).collect::<Vec<_>>();
-    let tree: Tree = built(by_id_spec(), members(&mut (0..65))).await;
+    let members = |ids: &mut dyn Iterator<Item = u64>| ids.map(|id| item!(id, [], b"")).collect::<Vec<Item>>();
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![]), members(&mut (0..65)));
 
-    let kept: Tree = built(by_id_spec(), members(&mut (0..64))).await;
-    let empty: Tree = built(by_id_spec(), members(&mut std::iter::empty())).await;
+    let kept: ItemTree = tree_of!(KeySpec::new(vec![]), members(&mut (0..64)));
+    let empty: ItemTree = tree_of!(KeySpec::new(vec![]), members(&mut std::iter::empty()));
 
     let nodes = tree.node_prefixes().await;
     assert_eq!(fault_after(tree, shrink_to(64..65, &nodes, [&kept, &kept, &empty]).await).await, "a branch has an empty side");
@@ -164,7 +170,7 @@ async fn the_audit_catches_a_branch_with_an_empty_side() {
 /// The damage that removes the members with ids in `removed` from a tree
 /// keyed by id alone whose three nodes are `nodes`, and gives each node the
 /// digest of the matching tree's root: a root and two children.
-async fn shrink_to(removed: std::ops::Range<u32>, nodes: &[NodePrefix], digests_from: [&Tree; 3]) -> Vec<Write> {
+async fn shrink_to(removed: std::ops::Range<u64>, nodes: &[NodePrefix], digests_from: [&ItemTree; 3]) -> Vec<Write> {
     let mut damage: Vec<Write> = removed.map(|id| WriteItem::Delete(RowKey::Leaf(leaf_address(&[], &Id(id))))).collect();
 
     for (node, tree) in nodes.iter().zip(digests_from) {
@@ -179,8 +185,8 @@ async fn the_audit_catches_metadata_of_another_group_or_spec() {
     fn identifier<G: DigestGroup>() -> u8 { G::ROW_VERSION }
 
     for meta in [
-        Meta { key_spec: integer_spec(), group: identifier::<crate::LtHash16>() },
-        Meta { key_spec: by_id_spec(), group: identifier::<Ristretto255>() },
+        Meta { key_spec: KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), group: identifier::<crate::LtHash16>() },
+        Meta { key_spec: KeySpec::new(vec![]), group: identifier::<Ristretto255>() },
     ] {
         let fault = fault_after(hundred().await, vec![WriteItem::Put(RowKey::Meta, Row::Meta(meta))]).await;
         assert_eq!(fault, "the metadata row names another group or key spec");

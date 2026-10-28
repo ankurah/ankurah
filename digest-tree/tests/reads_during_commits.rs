@@ -9,10 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::Poll;
 
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
+use ankurah_digest_tree::test_support::member_key;
 use ankurah_digest_tree::{
     leaf_address, DigestTree, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Span, Store, StoreError, WriteItem,
 };
-use common::{built, integer_spec, item, poll_once, Id, KeySpec, Tag};
+use common::{asc, item, poll_once, tree_of, Id, ItemTree, Property, Tag};
 use futures::StreamExt;
 
 /// A store whose writes wait while a test holds one gate, and whose next read
@@ -21,7 +24,7 @@ use futures::StreamExt;
 /// as long as the test likes, while every other read passes.
 #[derive(Clone)]
 struct Gated {
-    rows: MemoryStore<RowKey, Row<KeySpec, Tag, Ristretto255>>,
+    rows: MemoryStore<RowKey, Row<Property, Tag, Ristretto255>>,
 
     /// The row, if any, whose next read waits on `reads` while `hold_next`
     /// is set.
@@ -51,8 +54,8 @@ impl Gated {
     fn gating_row(self, row: RowKey) -> Self { Self { gated_row: Some(row), ..self } }
 }
 
-impl Store<RowKey, Row<KeySpec, Tag, Ristretto255>> for Gated {
-    async fn get(&self, key: &RowKey) -> Result<Option<Row<KeySpec, Tag, Ristretto255>>, StoreError> {
+impl Store<RowKey, Row<Property, Tag, Ristretto255>> for Gated {
+    async fn get(&self, key: &RowKey) -> Result<Option<Row<Property, Tag, Ristretto255>>, StoreError> {
         let _open = match self.gated_row.as_ref() == Some(key) && self.hold_next.swap(false, Ordering::SeqCst) {
             true => Some(self.reads.read().await),
             false => None,
@@ -67,7 +70,7 @@ impl Store<RowKey, Row<KeySpec, Tag, Ristretto255>> for Gated {
         end: Bound<&RowKey>,
         direction: ScanDirection,
         limit: usize,
-    ) -> Result<Vec<(RowKey, Row<KeySpec, Tag, Ristretto255>)>, StoreError> {
+    ) -> Result<Vec<(RowKey, Row<Property, Tag, Ristretto255>)>, StoreError> {
         let _open = match self.hold_next_range.swap(false, Ordering::SeqCst) {
             true => Some(self.reads.read().await),
             false => None,
@@ -76,7 +79,7 @@ impl Store<RowKey, Row<KeySpec, Tag, Ristretto255>> for Gated {
         self.rows.range(start, end, direction, limit).await
     }
 
-    async fn write(&self, items: Vec<WriteItem<RowKey, Row<KeySpec, Tag, Ristretto255>>>) -> Result<(), StoreError> {
+    async fn write(&self, items: Vec<WriteItem<RowKey, Row<Property, Tag, Ristretto255>>>) -> Result<(), StoreError> {
         let _open = self.writes.read().await;
         self.rows.write(items).await
     }
@@ -87,32 +90,24 @@ impl Store<RowKey, Row<KeySpec, Tag, Ristretto255>> for Gated {
 /// out a commit that is writing, and a commit waits out a read under way.
 #[tokio::test]
 async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
-    let (key, id) = (integer_spec().collate([50]), Id(50));
-    let gated = Gated::new().gating_row(RowKey::Leaf(leaf_address(&key, &id)));
+    let spec = KeySpec::new(vec![asc!(Property::A, ValueType::I64)]);
+    let fifty = item!(50, 50, b"");
+    let gated = Gated::new().gating_row(RowKey::Leaf(leaf_address(&member_key(&spec, &fifty).unwrap(), &fifty.id)));
 
-    let tree = DigestTree::<KeySpec, Id, Tag, Ristretto255, Gated>::build(
-        gated.clone(),
-        integer_spec(),
-        (0..100).map(|n| item!(n, Some(n as i64), b"")),
-    )
-    .await
-    .unwrap();
+    let tree = DigestTree::<Property, Id, Tag, Ristretto255, Gated>::build(gated.clone(), spec.clone(), (0..100).map(|n| item!(n, n as i64, b"")))
+        .await
+        .unwrap();
 
     let view = tree.view();
     let digest = || async { view.span_digest(&Span::all()).await.unwrap().digest };
 
-    let after_first = built::<Ristretto255>(integer_spec(), (0..101).map(|n| item!(n, Some(n as i64), b"")))
-        .await
-        .view()
-        .span_digest(&Span::all())
-        .await
-        .unwrap()
-        .digest;
+    let with_100: ItemTree = tree_of!(spec, (0..101).map(|n| item!(n, n as i64, b"")));
+    let after_first = with_100.view().span_digest(&Span::all()).await.unwrap().digest;
 
     // The commit holds the tree's write lock while its write waits.
     let writes_closed = gated.writes.write().await;
     let mut trx = tree.transaction();
-    trx.insert(item!(100, Some(100), b"")).unwrap();
+    trx.insert(item!(100, 100, b"")).unwrap();
 
     let mut committing = pin!(trx.commit());
     assert!(poll_once(committing.as_mut()).is_pending());
@@ -130,12 +125,12 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
     let reads_closed = gated.reads.write().await;
     gated.hold_next.store(true, Ordering::SeqCst);
 
-    let mut reading = pin!(view.member(&key, &id));
+    let mut reading = pin!(view.member([50i64], &Id(50)));
     assert!(poll_once(reading.as_mut()).is_pending());
 
     let mut trx = tree.transaction();
-    trx.remove(item!(50, Some(50), b"")).unwrap();
-    trx.remove(item!(100, Some(100), b"")).unwrap();
+    trx.remove(item!(50, 50, b"")).unwrap();
+    trx.remove(item!(100, 100, b"")).unwrap();
 
     let mut committing = pin!(trx.commit());
     assert!(poll_once(committing.as_mut()).is_pending(), "the commit waits for the read");
@@ -145,7 +140,7 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
 
     committing.await.unwrap();
     assert_eq!(digest().await.count(), 99);
-    assert!(view.member(&key, &id).await.unwrap().is_none(), "the commit removed member 50");
+    assert!(view.member([50i64], &Id(50)).await.unwrap().is_none(), "the commit removed member 50");
 }
 
 /// A range read holds the tree's lock only while it reads a batch, so a
@@ -153,7 +148,7 @@ async fn a_read_racing_a_commit_sees_the_tree_before_or_after_it() {
 /// yields every member the commit left in place, once and in order.
 #[tokio::test]
 async fn a_commit_completes_while_a_range_read_is_half_consumed() {
-    let tree = built::<Ristretto255>(integer_spec(), (0..300).map(|n| item!(n, Some(n as i64), b""))).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..300).map(|n| item!(n, n as i64, b"")));
     let mut scan = tree.view().range(..);
 
     // Ten members yielded, of the 64 the first batch read before reading one
@@ -168,12 +163,12 @@ async fn a_commit_completes_while_a_range_read_is_half_consumed() {
     // to ahead of it, one moved the other way, and one inserted ahead.
     let mut trx = tree.transaction();
     for n in [5, 30, 64, 200] {
-        trx.remove(item!(n, Some(n as i64), b"")).unwrap();
+        trx.remove(item!(n, n as i64, b"")).unwrap();
     }
 
-    trx.update(item!(3, Some(3), b""), item!(3, Some(250), b"")).unwrap();
-    trx.update(item!(250, Some(250), b""), item!(250, Some(-1), b"")).unwrap();
-    trx.insert(item!(1000, Some(100), b"")).unwrap();
+    trx.update(item!(3, 3, b""), item!(3, 250, b"")).unwrap();
+    trx.update(item!(250, 250, b""), item!(250, -1, b"")).unwrap();
+    trx.insert(item!(1000, 100, b"")).unwrap();
 
     let mut committing = pin!(trx.commit());
     match poll_once(committing.as_mut()) {
@@ -201,10 +196,10 @@ async fn a_commit_completes_while_a_range_read_is_half_consumed() {
 #[tokio::test]
 async fn a_batch_under_way_keeps_the_lock_until_its_stream_is_dropped() {
     let gated = Gated::new();
-    let tree = DigestTree::<KeySpec, Id, Tag, Ristretto255, Gated>::build(
+    let tree = DigestTree::<Property, Id, Tag, Ristretto255, Gated>::build(
         gated.clone(),
-        integer_spec(),
-        (0..100).map(|n| item!(n, Some(n as i64), b"")),
+        KeySpec::new(vec![asc!(Property::A, ValueType::I64)]),
+        (0..100).map(|n| item!(n, n as i64, b"")),
     )
     .await
     .unwrap();
@@ -218,7 +213,7 @@ async fn a_batch_under_way_keeps_the_lock_until_its_stream_is_dropped() {
     assert!(poll_once(pin!(scan.next())).is_pending(), "the first batch waits on the store");
 
     let mut trx = tree.transaction();
-    trx.remove(item!(5, Some(5), b"")).unwrap();
+    trx.remove(item!(5, 5, b"")).unwrap();
 
     let mut committing = pin!(trx.commit());
     assert!(poll_once(committing.as_mut()).is_pending(), "the commit waits for the batch under way");

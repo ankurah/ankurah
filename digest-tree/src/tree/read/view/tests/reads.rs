@@ -2,39 +2,44 @@
 
 use std::ops::Bound;
 
-use super::super::*;
-use crate::fixtures::{block_on, leaf_element, Id, Tag};
-use crate::span::{key_prefix, split_address};
-use crate::tree::fixtures::{built, integer_spec, item, Tree, View};
-use crate::{leaf_address, NodePrefix, Ristretto255, ScanRange};
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
 use futures::TryStreamExt;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 
+use super::super::*;
+use crate::common::{asc, item, tree_of, Id, ItemTree, ItemView, Property, Tag};
+use crate::fixtures::{block_on, leaf_element};
+use crate::key::member_key;
+use crate::span::{key_prefix, split_address};
+use crate::{leaf_address, NodePrefix, Ristretto255, ScanRange};
+
+/// The key of a member holding `value` for property `A`, ascending.
+fn key_of(value: Option<i64>) -> Vec<u8> { member_key(&KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), &item!(0, value, b"")).unwrap() }
+
 /// The members a test put in a tree, in address order: what reads are
 /// checked against.
-struct Model(Vec<(Vec<u8>, Id, Tag)>);
+struct Model(Vec<(Vec<u8>, Id, Tag, Option<i64>)>);
 
 impl Model {
-    fn of(members: &[(u32, Option<i64>, Vec<u8>)]) -> Self {
-        let mut rows: Vec<(Vec<u8>, Id, Tag)> = members
-            .iter()
-            .map(|(id, key, payload)| (leaf_address(&integer_spec().collate([*key]), &Id(*id)), Id(*id), Tag(payload.clone())))
-            .collect();
+    fn of(members: &[(u64, Option<i64>, Vec<u8>)]) -> Self {
+        let mut rows: Vec<(Vec<u8>, Id, Tag, Option<i64>)> =
+            members.iter().map(|(id, key, payload)| (leaf_address(&key_of(*key), &Id(*id)), Id(*id), Tag(payload.clone()), *key)).collect();
 
         rows.sort_by(|a, b| a.0.cmp(&b.0));
         Self(rows)
     }
 
     /// The members within `span` that `spans` cover.
-    fn within<'a>(&'a self, span: &'a Span, spans: &'a [Span]) -> impl Iterator<Item = &'a (Vec<u8>, Id, Tag)> + 'a {
+    fn within<'a>(&'a self, span: &'a Span, spans: &'a [Span]) -> impl Iterator<Item = &'a (Vec<u8>, Id, Tag, Option<i64>)> + 'a {
         self.0.iter().filter(move |(address, ..)| span.contains(address) && spans.iter().any(|covered| covered.contains(address)))
     }
 
     /// The digest of the members within `span` that `spans` cover.
     fn digest(&self, span: &Span, spans: &[Span]) -> Digest<Ristretto255> {
         let mut digest = Digest::empty();
-        for (address, id, payload) in self.within(span, spans) {
+        for (address, id, payload, _) in self.within(span, spans) {
             let (key, _) = split_address(address).unwrap();
             digest.add_element(&leaf_element::<Ristretto255>(&key, &id.to_bytes(), &payload.0)).unwrap();
         }
@@ -46,10 +51,10 @@ impl Model {
 /// A bound at a key, or at one member's address within it, so that spans cut
 /// buckets mid-key as well as between keys.
 fn bound() -> impl Strategy<Value = Bound<Vec<u8>>> {
-    (0..3u8, proptest::option::weighted(0.9, -3i64..3), proptest::option::of(0..300u32)).prop_map(|(kind, key, id)| {
+    (0..3u8, proptest::option::weighted(0.9, -3i64..3), proptest::option::of(0..300u64)).prop_map(|(kind, key, id)| {
         let at = match id {
-            Some(id) => leaf_address(&integer_spec().collate([key]), &Id(id)),
-            None => key_prefix(&integer_spec().collate([key])),
+            Some(id) => leaf_address(&key_of(key), &Id(id)),
+            None => key_prefix(&key_of(key)),
         };
 
         match kind {
@@ -64,9 +69,9 @@ fn span() -> impl Strategy<Value = Span> { (bound(), bound()).prop_map(|(start, 
 
 /// Distinct ids with keys from a narrow range, so that keys repeat, and
 /// enough members for the trie to branch.
-fn members() -> impl Strategy<Value = Vec<(u32, Option<i64>, Vec<u8>)>> {
+fn members() -> impl Strategy<Value = Vec<(u64, Option<i64>, Vec<u8>)>> {
     proptest::collection::btree_map(
-        0..300u32,
+        0..300u64,
         (proptest::option::weighted(0.85, -3i64..3), proptest::collection::vec(any::<u8>(), 0..3)),
         0..260,
     )
@@ -75,12 +80,12 @@ fn members() -> impl Strategy<Value = Vec<(u32, Option<i64>, Vec<u8>)>> {
 
 /// Check every read of `view`, which covers `spans` of a tree holding
 /// `model`, over `span`.
-async fn reads_match_the_model(tree: &Tree, view: &View, model: &Model, spans: &[Span], span: &Span) {
+async fn reads_match_the_model(tree: &ItemTree, view: &ItemView, model: &Model, spans: &[Span], span: &Span) {
     assert_eq!(view.len().await.unwrap(), model.within(&Span::all(), spans).count() as u64);
     assert_eq!(view.count(span).await.unwrap(), model.within(span, spans).count() as u64);
 
     // Members, read both ways: the same members in opposite orders.
-    let forward: Vec<(Vec<u8>, Tag)> = model.within(span, spans).map(|(address, _, payload)| (address.clone(), payload.clone())).collect();
+    let forward: Vec<(Vec<u8>, Tag)> = model.within(span, spans).map(|(address, _, payload, _)| (address.clone(), payload.clone())).collect();
     let reverse: Vec<(Vec<u8>, Tag)> = forward.iter().rev().cloned().collect();
 
     for (range, expected) in [(ScanRange::forward(span.clone()), forward), (ScanRange::reverse(span.clone()), reverse)] {
@@ -90,10 +95,12 @@ async fn reads_match_the_model(tree: &Tree, view: &View, model: &Model, spans: &
         assert_eq!(read, expected, "{range:?}");
     }
 
-    for (address, id, payload) in model.0.iter().step_by(17) {
+    // Lookups name a key's values, so only members that hold one.
+    for (address, id, payload, value) in model.0.iter().step_by(17) {
+        let Some(value) = value else { continue };
         let covered = spans.iter().any(|covered| covered.contains(address));
         let (key, _) = split_address(address).unwrap();
-        let leaf = view.member(&key, id).await.unwrap();
+        let leaf = view.member([*value], id).await.unwrap();
 
         assert_eq!(leaf.map(|leaf| (leaf.key, leaf.payload)), covered.then(|| (key, payload.clone())));
     }
@@ -154,7 +161,7 @@ proptest! {
     fn every_read_matches_a_model_of_the_members(members in members(), selected in proptest::collection::vec(span(), 0..3), spans in proptest::collection::vec(span(), 1..4)) {
         block_on(async {
             let model = Model::of(&members);
-            let tree = built::<Ristretto255>(integer_spec(), members.iter().map(|(id, key, payload)| item!(*id, *key, payload))).await;
+            let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), members.iter().map(|(id, key, payload)| item!(*id, *key, payload)));
 
             let (view, covered) = match selected.is_empty() {
                 true => (tree.view(), vec![Span::all()]),

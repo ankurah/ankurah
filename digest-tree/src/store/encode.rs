@@ -6,6 +6,10 @@
 //! keys sort as the keys do. A row begins with the same tag as its key, so a
 //! row decodes without its key.
 
+mod key_spec;
+
+use ankurah_core_types::key_spec::KeySpec;
+
 use super::{Encode, LeafRow, Meta, Row, RowKey};
 use crate::digest::{decode_stored_element, encode_stored_element, stored_element_len};
 use crate::{Digest, DigestGroup, NodePrefix, StoreError};
@@ -97,7 +101,7 @@ impl<K: Encode, L: Encode, G: DigestGroup> Encode for Row<K, L, G> {
 
 fn decode_meta<K: Encode>(body: &[u8]) -> Result<Meta<K>, StoreError> {
     let (&group, key_spec) = body.split_first().ok_or_else(|| StoreError::permanent("a truncated metadata row"))?;
-    Ok(Meta { key_spec: K::decode(key_spec)?, group })
+    Ok(Meta { key_spec: KeySpec::decode(key_spec)?, group })
 }
 
 #[cfg(test)]

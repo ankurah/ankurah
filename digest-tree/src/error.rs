@@ -2,20 +2,74 @@
 
 use std::fmt;
 
+use ankurah_core_types::ValueType;
+
 /// A digest tree's errors, grouped by whose fault each is.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     // The caller's.
-    /// A member couldn't make its key under the tree's spec. A transaction
-    /// records nothing of the change that named it, and a build that held it
-    /// writes nothing.
-    #[error("member {member:02x?} has no key under the tree's spec: {source}")]
+    /// A member couldn't give its value for a part of the tree's key. A
+    /// transaction records nothing of the change that named it, and a build
+    /// that held it writes nothing.
+    #[error("member {member:02x?} couldn't give a value for the tree's key: {source}")]
     Key {
         /// The member's id, as its bytes.
         member: Vec<u8>,
 
-        /// Why the member couldn't make its key.
+        /// Why the member couldn't give its value.
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A member gave a part of the tree's key a value of another type than
+    /// the part's, which would sort its key among values it can't be compared
+    /// with. A transaction records nothing of the change that named it, and a
+    /// build that held it writes nothing.
+    #[error("member {member:02x?} gives key part {part} a {found:?}, where the key spec wants a {expected:?}")]
+    WrongValueType {
+        /// The member's id, as its bytes.
+        member: Vec<u8>,
+
+        /// Which part, counting from zero.
+        part: usize,
+
+        /// The part's type.
+        expected: ValueType,
+
+        /// The value's type.
+        found: ValueType,
+    },
+
+    /// A lookup or a key range gave a part of the tree's key a value of
+    /// another type than the part's.
+    #[error("key part {part} is given a {found:?}, where the key spec wants a {expected:?}")]
+    KeyValueType {
+        /// Which part, counting from zero.
+        part: usize,
+
+        /// The part's type.
+        expected: ValueType,
+
+        /// The value's type.
+        found: ValueType,
+    },
+
+    /// A lookup gave other than one value for each part of the tree's key, or
+    /// a key range gave values for more parts than the key has.
+    #[error("{given} key values given, for a key of {parts} parts")]
+    KeyLength {
+        /// How many parts the key has.
+        parts: usize,
+
+        /// How many values were given.
+        given: usize,
+    },
+
+    /// A key spec's part names a collation. The tree implements none, and
+    /// ignoring the name would order members otherwise than the spec says.
+    #[error("key part {part} names a collation, which the tree doesn't implement")]
+    Collation {
+        /// Which part, counting from zero.
+        part: usize,
     },
 
     /// A change named a version of a member that isn't the one held. At the

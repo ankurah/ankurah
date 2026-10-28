@@ -1,5 +1,5 @@
 //! What the top-level tests share, a module per concern: the members they
-//! hold and trees of them, stores with quirks a real store may have, the
+//! hold, trees of them, stores with quirks a real store may have, the
 //! introduction's albums, and a peer's side of reconciling.
 
 // Each top-level test file compiles this module into its own binary and uses
@@ -10,6 +10,7 @@ mod albums;
 mod members;
 mod reconciling;
 mod stores;
+mod trees;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -19,6 +20,7 @@ pub use albums::*;
 pub use members::*;
 pub use reconciling::*;
 pub use stores::*;
+pub use trees::*;
 
 /// Poll `future` once, with a waker that does nothing: whether it is ready
 /// yet, without waiting for it.

@@ -1,7 +1,11 @@
-use super::*;
-use crate::fixtures::{asc, Id, KeySpec};
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
+
+use super::*;
+use crate::common::{asc, Id, Item, Property};
+use crate::key::member_key;
 
 #[test]
 fn contains_honours_each_kind_of_bound() {
@@ -105,8 +109,12 @@ fn bound_values() -> impl Strategy<Value = Vec<i64>> { proptest::collection::vec
 /// A member's key values: present or missing, missing above every present.
 fn key_values() -> impl Strategy<Value = [Option<i64>; 2]> { [proptest::option::of(-3i64..3), proptest::option::of(-3i64..3)] }
 
-/// The key prefix of these leading values, each an ascending integer part.
-fn prefix_of(values: &[Option<i64>]) -> Vec<u8> { KeySpec::new(vec![asc!("a"); values.len()]).collate(values.iter().copied()) }
+/// The key prefix of these leading values, as the tree encodes them under
+/// ascending integer parts `A` and then `B`.
+fn prefix_of(values: &[Option<i64>]) -> Vec<u8> {
+    let parts = [asc!(Property::A, ValueType::I64), asc!(Property::B, ValueType::I64)];
+    member_key(&KeySpec::new(parts[..values.len()].to_vec()), &Item::new(0, values.iter().copied(), b"")).unwrap()
+}
 
 fn bound_of(kind: u8, prefix: &[u8]) -> Bound<Vec<u8>> {
     match kind {
@@ -127,7 +135,7 @@ proptest! {
         lower in (0..3u8, bound_values()),
         upper in (0..3u8, bound_values()),
         member in key_values(),
-        id in any::<u32>(),
+        id in any::<u64>(),
     ) {
         let as_prefix = |values: &[i64]| prefix_of(&values.iter().copied().map(Some).collect::<Vec<_>>());
         let (lower_prefix, upper_prefix) = (as_prefix(&lower.1), as_prefix(&upper.1));

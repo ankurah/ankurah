@@ -1,19 +1,23 @@
 //! The trie's shape as members come and go: splits, merges and inserted
 //! branches.
 
-use crate::fixtures::{leaf_element, Item};
-use crate::tree::fixtures::{assert_same_tree, built, by_id_spec, integer_spec, item, Tree};
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
+
+use crate::common::{asc, item, tree_of, Item, ItemTree, Property};
+use crate::fixtures::leaf_element;
+use crate::tree::fixtures::assert_same_tree;
 use crate::{Error, NodePrefix, Ristretto255, Row, RowKey, Store, WriteItem};
 
-/// Members keyed by id alone, ids from `ids`.
-fn by_id(ids: impl IntoIterator<Item = u32>) -> Vec<Item> { ids.into_iter().map(|id| Item::new(id, [], b"")).collect() }
+/// Members with ids from `ids` and no values, for a tree keyed by id alone.
+fn by_id(ids: impl IntoIterator<Item = u64>) -> Vec<Item> { ids.into_iter().map(|id| item!(id, [], b"")).collect() }
 
-async fn by_id_tree(ids: impl IntoIterator<Item = u32>) -> Tree { built(by_id_spec(), by_id(ids)).await }
+async fn by_id_tree(ids: impl IntoIterator<Item = u64>) -> ItemTree { tree_of!(KeySpec::new(vec![]), by_id(ids)) }
 
 /// Commit one transaction to a tree keyed by id alone: insert the members
 /// with ids `inserted` and remove those with ids `removed`, each as the tree
 /// holds it.
-async fn change(tree: &Tree, inserted: impl IntoIterator<Item = u32>, removed: impl IntoIterator<Item = u32>) -> Result<(), Error> {
+async fn change(tree: &ItemTree, inserted: impl IntoIterator<Item = u64>, removed: impl IntoIterator<Item = u64>) -> Result<(), Error> {
     let mut trx = tree.transaction();
     for member in by_id(removed) {
         trx.remove(member)?;
@@ -67,7 +71,7 @@ async fn a_branch_whose_side_empties_gives_way_to_the_other_side() {
     // Ids 0 to 199 lie on the root's first side, which has children of its
     // own, and an id with its top bit set alone on the second; removing that
     // id promotes the first side's children to the root's.
-    let lone = 0x8000_0000;
+    let lone = 1 << 63;
     let subtree_side = by_id_tree((0..200).chain([lone])).await;
     let first_side_children = subtree_side.node_prefixes().await.len() - 3;
 
@@ -80,7 +84,7 @@ async fn a_branch_whose_side_empties_gives_way_to_the_other_side() {
 /// full bucket, past its capacity gives way to that bucket, which then splits.
 #[tokio::test]
 async fn a_branch_that_collapses_onto_an_overfull_bucket_splits_it() {
-    let tree = built::<Ristretto255>(integer_spec(), (0..64).map(|n| item!(n, Some(0), b"")).chain([item!(100, Some(1), b"")])).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..64).map(|n| item!(n, Some(0), b"")).chain([item!(100, Some(1), b"")]));
     assert_eq!(tree.node_prefixes().await.len(), 3, "64 members on one side, one on the other");
 
     let mut trx = tree.transaction();
@@ -88,7 +92,7 @@ async fn a_branch_that_collapses_onto_an_overfull_bucket_splits_it() {
     trx.insert(item!(200, Some(0), b"")).unwrap();
     trx.commit().await.unwrap();
 
-    assert_same_tree(&tree, &built(integer_spec(), (0..64).chain([200]).map(|n| item!(n, Some(0), b""))).await).await;
+    assert_same_tree(&tree, &tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..64).chain([200]).map(|n| item!(n, Some(0), b"")))).await;
 }
 
 /// A branch whose one side a transaction empties while it empties a side of
@@ -101,7 +105,7 @@ async fn a_branch_that_collapses_onto_a_subtree_with_an_empty_side_collapses_aga
     let members =
         (0..10).map(|n| item!(n, Some(0), b"")).chain((100..180).map(|n| item!(n, Some(1), b""))).chain([item!(300, Some(2), b"")]);
 
-    let tree = built::<Ristretto255>(integer_spec(), members).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), members);
     assert_eq!(tree.node_prefixes().await.len(), 7, "keys 0 and 1 on one side, parted twice beneath it, and key 2 on the other");
 
     let mut trx = tree.transaction();
@@ -112,7 +116,7 @@ async fn a_branch_that_collapses_onto_a_subtree_with_an_empty_side_collapses_aga
     }
 
     trx.commit().await.unwrap();
-    assert_same_tree(&tree, &built(integer_spec(), (100..180).map(|n| item!(n, Some(1), b""))).await).await;
+    assert_same_tree(&tree, &tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (100..180).map(|n| item!(n, Some(1), b"")))).await;
 }
 
 /// A member beneath a node with children but outside both gets a branch of
@@ -121,7 +125,7 @@ async fn a_branch_that_collapses_onto_a_subtree_with_an_empty_side_collapses_aga
 async fn a_member_outside_a_nodes_children_gets_a_branch_of_its_own() {
     // Keys 0 to 99: the root's children part the keys deep in their bytes,
     // and a negative key lies outside both.
-    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b""))).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"")));
     let before = tree.node_prefixes().await;
 
     let mut trx = tree.transaction();
@@ -133,7 +137,7 @@ async fn a_member_outside_a_nodes_children_gets_a_branch_of_its_own() {
     assert!(before.iter().all(|prefix| after.contains(prefix)), "the old nodes stay");
     assert_same_tree(
         &tree,
-        &built(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b"")).chain([item!(100, Some(-1), b"")])).await,
+        &tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"")).chain([item!(100, Some(-1), b"")])),
     )
     .await;
 }

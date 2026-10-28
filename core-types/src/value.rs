@@ -4,6 +4,8 @@ use thiserror::Error;
 
 use crate::{EntityId, ValueType};
 
+mod collatable;
+
 mod json_as_bytes {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 

@@ -1,13 +1,15 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::fixtures::{block_on, KeySpec, Tag};
+use crate::common::{Property, Tag};
+use crate::fixtures::block_on;
 use crate::tree::fixtures::ShortPages;
 use crate::{MemoryStore, Ristretto255};
+use ankurah_core_types::key_spec::KeySpec;
 use proptest::prelude::*;
 use proptest::test_runner::RngSeed;
 
-type TestRow = Row<KeySpec, Tag, Ristretto255>;
+type TestRow = Row<Property, Tag, Ristretto255>;
 
 /// A metadata row holding `n`, so rows tell apart: staging never looks at a
 /// row's kind.

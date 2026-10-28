@@ -7,8 +7,10 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+use ankurah_core_types::key_spec::KeySpec;
 use async_lock::RwLock;
 
+use crate::key::check_spec;
 use crate::{DigestGroup, Error, MemberId, Payload, Row, RowKey, Store};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -29,7 +31,7 @@ use rows::StagedRows;
 
 /// Which way a read runs over the byte order of what it reads: a store's row
 /// keys, or a tree's addresses. Ascending and descending belong to the parts
-/// of an owner's key, which its collation encodes into the key's bytes.
+/// of a key spec, which the tree encodes into each key's bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScanDirection {
     /// Smallest first.
@@ -41,8 +43,8 @@ pub enum ScanDirection {
 
 /// A digest tree, held by its owner, who builds and changes it.
 ///
-/// `K` is the owner's key spec, which the tree hands to its members to make
-/// their keys and otherwise never reads; `I` is the member id type, `L` the
+/// `K` is the type of the properties its key spec's parts name, from which
+/// the tree makes each member's key; `I` is the member id type, `L` the
 /// payload type, `G` the digest group, and `S` the store. A handle is cheap
 /// to clone, and clones are the same tree: they share its store and its lock.
 /// Open one tree per store and clone it to share it.
@@ -57,7 +59,7 @@ pub struct DigestTree<K, I, L, G: DigestGroup, S> {
 type MemberTypes<I, L, G> = PhantomData<fn() -> (I, L, G)>;
 
 struct Inner<K, S> {
-    key_spec: K,
+    key_spec: KeySpec<K>,
     store: S,
 
     /// Taken for reading by each read, and for writing by each commit from
@@ -80,8 +82,9 @@ where
     S: Store<RowKey, Row<K, L, G>>,
 {
     /// The tree a store already holds, keyed by the spec stored with it:
-    /// [`Error::NoTree`] for a store that holds none, and
-    /// [`Error::WrongGroup`] for a tree summed in another digest group.
+    /// [`Error::NoTree`] for a store that holds none, [`Error::WrongGroup`]
+    /// for a tree summed in another digest group, and [`Error::Collation`]
+    /// for a spec that names a collation.
     ///
     /// Open one tree per store and clone it to share it, as
     /// [`create`](Self::create) explains.
@@ -91,13 +94,14 @@ where
             return Err(Error::WrongGroup);
         }
 
+        check_spec(&meta.key_spec)?;
         Ok(Self::holding(store, meta.key_spec))
     }
 
-    fn holding(store: S, key_spec: K) -> Self {
+    fn holding(store: S, key_spec: KeySpec<K>) -> Self {
         Self { inner: Arc::new(Inner { key_spec, store, lock: Arc::new(RwLock::new(())) }), _members: PhantomData }
     }
 
     /// The spec the tree is keyed by.
-    pub fn key_spec(&self) -> &K { &self.inner.key_spec }
+    pub fn key_spec(&self) -> &KeySpec<K> { &self.inner.key_spec }
 }

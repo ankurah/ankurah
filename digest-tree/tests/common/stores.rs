@@ -5,9 +5,10 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use ankurah_core_types::key_spec::KeySpec;
 use ankurah_digest_tree::{DigestTree, Encode, MemoryStore, Ristretto255, Row, RowKey, ScanDirection, Store, StoreError, WriteItem};
 
-use super::members::{Id, Item, KeySpec, Tag};
+use super::members::{Id, Item, Property, Tag};
 
 /// Every row `store` holds, encoded, in key order.
 pub async fn stored_rows<V: Encode + Clone + Send + Sync + 'static>(store: &impl Store<RowKey, V>) -> Vec<(RowKey, Vec<u8>)> {
@@ -65,13 +66,13 @@ impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for CountingStore<V> {
 }
 
 /// The rows of a tree of items, over a store that counts its writes.
-pub type CountedStore = CountingStore<Row<KeySpec, Tag, Ristretto255>>;
+pub type CountedStore = CountingStore<Row<Property, Tag, Ristretto255>>;
 
 /// A tree of items over a store that counts its writes.
-pub type CountedTree = DigestTree<KeySpec, Id, Tag, Ristretto255, CountedStore>;
+pub type CountedTree = DigestTree<Property, Id, Tag, Ristretto255, CountedStore>;
 
 /// A counted tree holding exactly `members`, and its store.
-pub async fn counted(key_spec: KeySpec, members: impl IntoIterator<Item = Item>) -> (CountedTree, CountedStore) {
+pub async fn counted(key_spec: KeySpec<Property>, members: impl IntoIterator<Item = Item>) -> (CountedTree, CountedStore) {
     let store = CountingStore::new();
     (DigestTree::build(store.clone(), key_spec, members).await.unwrap(), store)
 }
@@ -130,10 +131,10 @@ impl<V: Clone + Send + Sync + 'static> Store<RowKey, V> for Failing<V> {
 }
 
 /// The rows of a tree of items, over a store whose reads or writes can fail.
-pub type FailingStore = Failing<Row<KeySpec, Tag, Ristretto255>>;
+pub type FailingStore = Failing<Row<Property, Tag, Ristretto255>>;
 
 /// A tree of items over a store whose reads or writes can fail.
-pub type FailingTree = DigestTree<KeySpec, Id, Tag, Ristretto255, FailingStore>;
+pub type FailingTree = DigestTree<Property, Id, Tag, Ristretto255, FailingStore>;
 
 /// A memory store that returns at most three rows per read, as a store that
 /// pages its reads may: the tree must read on.

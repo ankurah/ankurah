@@ -234,7 +234,9 @@ dependencies = [
 name = "ankurah-digest-tree"
 version = "0.10.0"
 dependencies = [
+ "ankurah-core-types",
  "ankurah-digest-tree",
+ "anyhow",
  "async-lock",
  "bincode",
  "blake3",

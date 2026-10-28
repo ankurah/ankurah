@@ -19,11 +19,17 @@ pub fn leaf_address(key: &[u8], id: &impl MemberId) -> Vec<u8> { address_of(key,
 pub(crate) fn address_of(key: &[u8], id: &[u8]) -> Vec<u8> {
     let mut address = Vec::with_capacity(key.len() + id.len() + 2 * END.len());
     for field in [key, id] {
-        escape_into(&mut address, field);
-        address.extend_from_slice(&END);
+        frame_into(&mut address, field);
     }
 
     address
+}
+
+/// Append `field` escaped and then ended, as an address holds its key and its
+/// id: framed fields sort as their bytes do, and none begins another.
+pub(crate) fn frame_into(out: &mut Vec<u8>, field: &[u8]) {
+    escape_into(out, field);
+    out.extend_from_slice(&END);
 }
 
 /// What every address begins with whose key begins with `prefix`.

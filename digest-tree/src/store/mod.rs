@@ -3,6 +3,8 @@
 use std::future::Future;
 use std::ops::Bound;
 
+use ankurah_core_types::key_spec::KeySpec;
+
 use crate::{Digest, DigestGroup, NodePrefix, ScanDirection, StoreError};
 
 mod encode;
@@ -101,9 +103,9 @@ impl RowKey {
     }
 }
 
-/// A row a tree keeps, under the tree's key spec `K`. Its contents are the
-/// tree's business; a store keeps it whole, and a byte store encodes it with
-/// [`Encode`].
+/// A row a tree keeps, for a tree whose key spec names properties of type
+/// `K`. Its contents are the tree's business; a store keeps it whole, and a
+/// byte store encodes it with [`Encode`].
 #[derive(Clone, Debug)]
 pub enum Row<K, L, G: DigestGroup> {
     /// The tree's metadata.
@@ -119,7 +121,7 @@ pub enum Row<K, L, G: DigestGroup> {
 /// The tree's metadata row: its key spec and the digest group its sums use.
 #[derive(Clone, Debug)]
 pub struct Meta<K> {
-    pub(crate) key_spec: K,
+    pub(crate) key_spec: KeySpec<K>,
     pub(crate) group: u8,
 }
 

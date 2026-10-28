@@ -9,9 +9,12 @@ mod transaction;
 
 use std::ops::Bound;
 
+use ankurah_core_types::key_spec::KeySpec;
+
 pub use transaction::{StagedCommit, Transaction};
 
 use super::{DigestTree, ScanDirection};
+use crate::key::check_spec;
 use crate::store::Meta;
 use crate::{Digest, DigestGroup, Error, Member, MemberId, NodePrefix, Payload, Row, RowKey, Store, WriteItem};
 
@@ -32,14 +35,16 @@ where
     S: Store<RowKey, Row<K, L, G>>,
 {
     /// An empty tree keyed by `key_spec`, in a store that holds no rows yet:
-    /// [`Error::StoreNotEmpty`] for one that holds any, a tree's or others.
+    /// [`Error::StoreNotEmpty`] for one that holds any, a tree's or others,
+    /// and [`Error::Collation`] for a spec that names a collation.
     ///
     /// Open one tree per store and clone it to share it. Trees opened
     /// separately on one store hold separate locks, so unless the store keeps
     /// [what a tree relies on](Store#what-a-tree-relies-on) itself, two commits
     /// could each read a node's old digest and write their own, losing one
     /// update.
-    pub async fn create(store: S, key_spec: K) -> Result<Self, Error> {
+    pub async fn create(store: S, key_spec: KeySpec<K>) -> Result<Self, Error> {
+        check_spec(&key_spec)?;
         require_empty(&store).await?;
 
         // Every tree has a root, the empty one a root of no members.
@@ -59,17 +64,20 @@ where
     /// The members' keys are made and their leaves hashed a chunk at a time,
     /// yielding to the executor between chunks, and every row is written in
     /// one batch, all of it or none: a build whose write fails leaves the
-    /// store empty, and can run again. A member that can't make its key is
-    /// [`Error::Key`], and the same id twice is [`Error::DuplicateMember`]: a
-    /// caller's bug that keeping either member would hide.
+    /// store empty, and can run again. A member that can't give a value is
+    /// [`Error::Key`], one that gives a value of another type than its part's
+    /// is [`Error::WrongValueType`], and the same id twice is
+    /// [`Error::DuplicateMember`]: a caller's bug that keeping either member
+    /// would hide. A spec that names a collation is [`Error::Collation`].
     ///
     /// Open one tree per store and clone it to share it, as
     /// [`create`](Self::create) explains.
-    pub async fn build<M>(store: S, key_spec: K, members: impl IntoIterator<Item = M>) -> Result<Self, Error>
+    pub async fn build<M>(store: S, key_spec: KeySpec<K>, members: impl IntoIterator<Item = M>) -> Result<Self, Error>
     where M: Member<K, Id = I, Payload = L> {
         // Collected before the first await, so that the caller's iterator is
         // never held across one.
         let members: Vec<M> = members.into_iter().collect();
+        check_spec(&key_spec)?;
         require_empty(&store).await?;
 
         let rows = build::rows::<K, I, L, G, M>(&key_spec, members).await?;

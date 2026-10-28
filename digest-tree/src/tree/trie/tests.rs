@@ -1,13 +1,15 @@
-use super::*;
-use crate::fixtures::to_hex;
-use crate::fixtures::{leaf_element, Id, Item};
-use crate::span::address_of;
-use crate::tree::fixtures::{built, by_id_spec, integer_spec, item};
-use crate::{MemberId, Ristretto255};
+use ankurah_core_types::key_spec::KeySpec;
+use ankurah_core_types::ValueType;
 use sha2::{Digest as _, Sha256};
 
-/// The node rows of a build of `n` members keyed by id alone, ids 0 to `n`
-/// with empty payloads, pinned by the SHA-256 of each node's prefix encoding,
+use super::*;
+use crate::common::{asc, item, tree_of, Id, ItemTree, Property};
+use crate::fixtures::{leaf_element, to_hex};
+use crate::span::address_of;
+use crate::{MemberId, Ristretto255};
+
+/// The node rows of a build of `n` members keyed by id alone, ids 0 to `n` as
+/// eight big-endian bytes, with empty payloads, pinned by the SHA-256 of each node's prefix encoding,
 /// behind its length as an unsigned 32-bit big-endian integer, and its stored
 /// digest, in prefix order. The answers were computed outside this crate,
 /// from the address encoding, the layout rules, the prefix encoding and RFC
@@ -17,10 +19,10 @@ use sha2::{Digest as _, Sha256};
 async fn builds_lay_out_the_nodes_an_independent_implementation_does() {
     for (n, nodes, answer) in [
         (0, 1, "1c3cf3f1ec3b92921f6afcfa42bf08cb4f665ae5e3244a8ef56e50a562798ef1"),
-        (65, 3, "19a850b3d0191f50fce0e2c3c5bc2c3ebf3783e955b3058caf34e46e2251f545"),
-        (4096, 127, "36ebeeda42c5519eb434d29b1f808625960cc90bd3cf1a7f1473d4a1138c4a8a"),
+        (65, 3, "42f1daa95dfb49f497f843b864b869ad7a76739cce1ead3179808febb870f056"),
+        (4096, 127, "e801b25c5e314fb9ab1f304603374ccaafe409bc4af62f25c827874a02d366b4"),
     ] {
-        let tree = built::<Ristretto255>(by_id_spec(), (0..n).map(|id| Item::new(id, [], b""))).await;
+        let tree: ItemTree = tree_of!(KeySpec::new(vec![]), (0..n).map(|id| item!(id, [], b"")));
         let mut rows = Vec::new();
         let mut count = 0;
         for (key, row) in tree.stored_rows().await {
@@ -40,7 +42,7 @@ async fn builds_lay_out_the_nodes_an_independent_implementation_does() {
 
 /// Leaves of these ids under empty keys, with their elements, in address
 /// order.
-fn leaves(ids: impl IntoIterator<Item = u32>) -> Vec<(Vec<u8>, <Ristretto255 as DigestGroup>::Element)> {
+fn leaves(ids: impl IntoIterator<Item = u64>) -> Vec<(Vec<u8>, <Ristretto255 as DigestGroup>::Element)> {
     let mut leaves: Vec<_> = ids
         .into_iter()
         .map(|id| {
@@ -68,10 +70,10 @@ fn a_layout_splits_past_the_capacity_where_the_addresses_first_differ() {
     let leaves = leaves(0..65);
     let nodes = lay_out::<Ristretto255>(&NodePrefix::root(), &placed(&leaves)).unwrap();
 
-    // Ids 0 and 64 first differ at bit 65 of their addresses: past the empty
-    // key's end and three escaped zero bytes, id 0's last byte is zero and id
+    // Ids 0 and 64 first differ at bit 129 of their addresses: past the empty
+    // key's end and seven escaped zero bytes, id 0's last byte is zero and id
     // 64's is 0x40.
-    let (left, right) = (NodePrefix::of(&leaves[0].0, 66), NodePrefix::of(&leaves[64].0, 66));
+    let (left, right) = (NodePrefix::of(&leaves[0].0, 130), NodePrefix::of(&leaves[64].0, 130));
     let prefixes: Vec<&NodePrefix> = nodes.iter().map(|node| &node.prefix).collect();
     assert_eq!(prefixes, [&left, &right, &NodePrefix::root()], "the children, then their parent");
 
@@ -103,7 +105,7 @@ fn a_layout_refuses_addresses_that_are_prefixes_of_others() {
 async fn children_and_the_nearest_nodes_beneath_a_prefix_are_found_in_prefix_order() {
     // Keys 0 to 99, with one id each: the root's children branch where the
     // keys' encodings first differ, deep in their bytes.
-    let tree = built::<Ristretto255>(integer_spec(), (0..100).map(|n| item!(n, Some(i64::from(n)), b""))).await;
+    let tree: ItemTree = tree_of!(KeySpec::new(vec![asc!(Property::A, ValueType::I64)]), (0..100).map(|n| item!(n, n as i64, b"")));
     let rows = StagedRows::new(tree.store());
     let trie = Trie::new(&rows);
     let [first, second] = trie.children(&NodePrefix::root()).await.unwrap().expect("a root of 100 members has children");

@@ -2,7 +2,8 @@
 
 use std::borrow::Cow;
 
-use crate::Error;
+use ankurah_core_types::key_spec::IndexKeyPart;
+use ankurah_core_types::Value;
 
 /// A member's identity: anything that converts to and from bytes, of any
 /// length. Its bytes end the member's address, and its leaf digest covers
@@ -24,8 +25,8 @@ pub trait Payload: Clone + Send + Sync + 'static {
     fn digest_bytes(&self) -> Cow<'_, [u8]>;
 }
 
-/// What the tree reads from something its owner tells it to hold, under the
-/// owner's key spec `K`.
+/// What the tree reads from something its owner tells it to hold, under a key
+/// spec whose parts name properties of type `K`.
 pub trait Member<K> {
     /// The member's id type.
     type Id: MemberId;
@@ -33,18 +34,19 @@ pub trait Member<K> {
     /// The member's payload type.
     type Payload: Payload;
 
-    /// Why the member couldn't make its key.
+    /// Why the member couldn't give a value, as for a part naming a property
+    /// the member doesn't have.
     type KeyError: std::error::Error + Send + Sync + 'static;
 
     /// The member's id.
     fn id(&self) -> Self::Id;
 
-    /// The member's key under `spec`: bytes that sort as the owner orders its
-    /// members, made with the owner's collation. The tree reads nothing in
-    /// them but their order, and members with equal keys sort by id. The
-    /// member's leaf digest covers them too, so peers' trees compare equal
-    /// only if every peer makes the same key for the same member.
-    fn key(&self, spec: &K) -> Result<Vec<u8>, Self::KeyError>;
+    /// The member's value for `part` of the tree's key, or `None` if it has
+    /// none. The tree checks the value's type against the part's, and makes
+    /// the member's key from its values for every part, in the spec's order.
+    /// The member's leaf digest covers its key, so peers' trees compare equal
+    /// only if every peer gives the same values for the same member.
+    fn value(&self, part: &IndexKeyPart<K>) -> Result<Option<Value>, Self::KeyError>;
 
     /// The payload the tree keeps with the member.
     fn payload(&self) -> Self::Payload;
@@ -57,13 +59,7 @@ impl<K, M: Member<K> + ?Sized> Member<K> for &M {
 
     fn id(&self) -> Self::Id { (**self).id() }
 
-    fn key(&self, spec: &K) -> Result<Vec<u8>, Self::KeyError> { (**self).key(spec) }
+    fn value(&self, part: &IndexKeyPart<K>) -> Result<Option<Value>, Self::KeyError> { (**self).value(part) }
 
     fn payload(&self) -> Self::Payload { (**self).payload() }
-}
-
-/// `member`'s key under `spec`, or the error that names the member it
-/// failed for.
-pub(crate) fn member_key<K, M: Member<K>>(spec: &K, member: &M) -> Result<Vec<u8>, Error> {
-    member.key(spec).map_err(|source| Error::Key { member: member.id().to_bytes().into_owned(), source: Box::new(source) })
 }

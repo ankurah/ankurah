@@ -5,14 +5,15 @@
 //! # The model
 //!
 //! - A **member** is anything the tree is told to hold ([`Member`]): it has an
-//!   id ([`MemberId`]), a key it makes under the tree's key spec, and a
+//!   id ([`MemberId`]), a value for each part of the tree's key spec, and a
 //!   [`Payload`] the tree keeps with it and covers in its digest.
-//! - A member's **key** is bytes in its owner's collation: they sort as the
-//!   owner orders its members, any mix of directions across the key's parts
-//!   included. The tree never reads the key spec or a key's parts; it only
-//!   orders keys. A member's **address** is its key and then its id, each
-//!   escaped and ended, so that addresses sort by key and then by id
-//!   ([`leaf_address`]).
+//! - A member's **key** is the tree's encoding of its values under the key
+//!   spec, core's [`KeySpec`](ankurah_core_types::key_spec::KeySpec): each
+//!   value checked against its part's type, and the parts sorting in turn,
+//!   each in its own direction, with members that hold no value placed by
+//!   the part's nulls order. A member's **address** is its key and then its
+//!   id, each escaped and ended, so that addresses sort by key and then by id
+//!   ([`leaf_address`]). A [`KeyRange`] of values names a span of addresses.
 //! - Every subtree holds the **digest** ([`Digest`]) of the members beneath
 //!   it: a sum of one group element per member, and a count. Two trees holding
 //!   the same members, with the same keys and payloads, hold the same digests,
@@ -51,11 +52,21 @@
 
 #![deny(missing_docs)]
 
+// The unit tests share the top-level tests' members, whose file names the
+// crate as they do.
+#[cfg(test)]
+extern crate self as ankurah_digest_tree;
+
 mod bytes;
+#[cfg(test)]
+#[path = "../tests/common/members.rs"]
+#[allow(dead_code, unused_macros, reason = "the unit tests use part of the members they share with the top-level tests")]
+mod common;
 pub mod digest;
 mod error;
 #[cfg(test)]
 mod fixtures;
+mod key;
 mod member;
 mod span;
 mod store;
@@ -63,6 +74,7 @@ mod tree;
 
 pub use digest::{Digest, DigestGroup, LtHash16, Ristretto255};
 pub use error::{Error, StoreError};
+pub use key::KeyRange;
 pub use member::{Member, MemberId, Payload};
 pub use span::{leaf_address, NodePrefix, Span, SpanDigest};
 #[cfg(feature = "sled")]

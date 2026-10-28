@@ -81,8 +81,8 @@ pub async fn reconcile<G: DigestGroup>(ours: &Tree<G>, theirs: &Tree<G>, their_a
 
     for change in changes.into_values() {
         match change {
-            (Some(ours), Some(theirs)) => trx.update(ours, theirs),
-            (Some(ours), None) => trx.remove(ours),
+            (Some(ours), Some(theirs)) => trx.update_leaf(ours, theirs),
+            (Some(ours), None) => trx.remove_leaf(ours),
             (None, theirs) => trx.insert(theirs.expect("a member that differs has a leaf on one side")),
         }
         .unwrap();

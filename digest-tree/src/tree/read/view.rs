@@ -1,18 +1,22 @@
 //! Reading a tree.
 
-use std::convert::Infallible;
+use ankurah_core_types::Value;
 
 use super::{Members, ScanRange};
+use crate::key::lookup_key;
 use crate::span::address_of;
 use crate::tree::rows::StagedRows;
 use crate::tree::trie::{Node, Trie};
 use crate::tree::DigestTree;
-use crate::{Digest, DigestGroup, Error, Member, MemberId, Payload, Row, RowKey, Span, SpanDigest, Store};
+use crate::{Digest, DigestGroup, Error, MemberId, Payload, Row, RowKey, Span, SpanDigest, Store};
 
-/// One member as the tree holds it, as reads return it.
+/// One member as the tree holds it, as reads return it: what a change names,
+/// through [`update_leaf`](crate::Transaction::update_leaf) and
+/// [`remove_leaf`](crate::Transaction::remove_leaf), as the version it
+/// replaces.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leaf<I, L> {
-    /// The member's key, as the member made it.
+    /// The member's key, as the tree made it from the member's values.
     pub key: Vec<u8>,
 
     /// The member's id.
@@ -20,20 +24,6 @@ pub struct Leaf<I, L> {
 
     /// The member's payload.
     pub payload: L,
-}
-
-/// A leaf is a member as the tree holds it, whatever the key spec: what a
-/// caller that read it from the tree names as the version a change replaces.
-impl<K, I: MemberId, L: Payload> Member<K> for Leaf<I, L> {
-    type Id = I;
-    type Payload = L;
-    type KeyError = Infallible;
-
-    fn id(&self) -> I { self.id.clone() }
-
-    fn key(&self, _: &K) -> Result<Vec<u8>, Infallible> { Ok(self.key.clone()) }
-
-    fn payload(&self) -> L { self.payload.clone() }
 }
 
 /// A read-only, live view of a tree: the whole tree, or the part within some
@@ -72,9 +62,16 @@ where
         Ok(self.digest_in_view(&trie, &root, &Span::all()).await?.count())
     }
 
-    /// The member with this key and id, if the view covers it.
-    pub async fn member(&self, key: &[u8], id: &I) -> Result<Option<Leaf<I, L>>, Error> {
-        let address = address_of(key, &id.to_bytes());
+    /// The member with this id whose key holds `values`, one for each part of
+    /// the tree's key, first part first, if the view covers it:
+    /// [`Error::KeyLength`] for other than one value per part, and
+    /// [`Error::KeyValueType`] for a value of another type than its part's. A
+    /// member that holds no value for some part is found by a range read of
+    /// the span of its [`KeyRange`](crate::KeyRange).
+    pub async fn member(&self, values: impl IntoIterator<Item = impl Into<Value>>, id: &I) -> Result<Option<Leaf<I, L>>, Error> {
+        let values: Vec<Value> = values.into_iter().map(Into::into).collect();
+        let key = lookup_key(&self.tree.inner.key_spec, &values)?;
+        let address = address_of(&key, &id.to_bytes());
         if !self.spans.iter().any(|span| span.contains(&address)) {
             return Ok(None);
         }
@@ -82,13 +79,15 @@ where
         let _read = self.tree.inner.lock.read().await;
         let leaf = StagedRows::new(&self.tree.inner.store).leaf(&address).await?;
 
-        Ok(leaf.map(|leaf| Leaf { key: key.to_vec(), id: id.clone(), payload: leaf.payload }))
+        Ok(leaf.map(|leaf| Leaf { key, id: id.clone(), payload: leaf.payload }))
     }
 
     /// Every member of the view within `range`, as a stream that reads them
     /// in its direction a batch at a time, through the view's spans in that
-    /// direction. `range` is a [`ScanRange`], or a span or a Rust range of key
-    /// bytes, which reads forward: `view.range(..)` reads every member.
+    /// direction. `range` is a [`ScanRange`], or a span, which reads forward:
+    /// `view.range(..)` reads every member, and
+    /// [`span_for`](DigestTree::span_for) gives the span of a range of
+    /// values.
     ///
     /// The stream reads nothing until it is first polled, and reads each
     /// batch only once its caller has taken every member of the one before,
