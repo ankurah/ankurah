@@ -8,6 +8,7 @@ use ankurah::core::{
     value::Value,
 };
 use ankurah::proto::{Attested, Clock, EntityId, EntityState, ModelId, State, StateBuffers};
+use futures_util::future::{self, Either};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -380,5 +381,63 @@ async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Resul
     for (_, state) in writes {
         assert_eq!(engine.get_state(state.payload.entity_id).await?.payload.state, state.payload.state);
     }
+    Ok(())
+}
+
+/// Two first writes of one model race to assign the column of a system
+/// property. When the winner's row lands between the loser's conflict check
+/// and its index entries, PostgreSQL refuses the loser's insert with a unique
+/// violation on the column name. Nothing can pause an insert inside that
+/// window, so a trigger produces the same refusal on demand: it holds the first
+/// insert to arrive until the other write has committed, then raises that
+/// violation.
+#[tokio::test]
+async fn the_loser_of_a_race_to_assign_a_system_property_column_adopts_the_winners_column() -> anyhow::Result<()> {
+    let (_container, engine, pool) = common::create_postgres_container_with_pool().await?;
+    let name = PropertyId::System(ankurah::proto::SystemProperty::Name);
+    let model = ModelId::EntityId(entity_id(0xb1));
+
+    // Another model's write creates the column map the trigger attaches to.
+    commit_state(&engine, Clock::default(), ModelId::EntityId(entity_id(0xb2)), state_with_strings(entity_id(0xb3), 1, &[])).await?;
+
+    let gate = pool.get().await?;
+    gate.batch_execute(
+        r#"
+        SELECT pg_advisory_lock(1);
+        CREATE SEQUENCE name_assignments;
+        CREATE FUNCTION hold_and_refuse_the_first_name_assignment() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            IF nextval('name_assignments') = 1 THEN
+                PERFORM pg_advisory_xact_lock(1);
+                RAISE unique_violation USING MESSAGE =
+                    'duplicate key value violates unique constraint "_ankurah_postgres_column_map_model_key_column_name_key"';
+            END IF;
+            RETURN NEW;
+        END $$;
+        CREATE TRIGGER hold_and_refuse_the_first_name_assignment BEFORE INSERT ON "_ankurah_postgres_column_map"
+            FOR EACH ROW WHEN (NEW.column_name = 'name') EXECUTE FUNCTION hold_and_refuse_the_first_name_assignment();
+    "#,
+    )
+    .await?;
+
+    let first = state_for_model(state_with_strings(entity_id(0xb4), 2, &[(name, "shared")]), model);
+    let second = state_for_model(state_with_strings(entity_id(0xb5), 3, &[(name, "shared")]), model);
+    let first_write = std::pin::pin!(commit_canonical_state(&engine, Clock::default(), first.clone()));
+    let second_write = std::pin::pin!(commit_canonical_state(&engine, Clock::default(), second.clone()));
+
+    let (Either::Left((winner, loser)) | Either::Right((winner, loser))) = future::select(first_write, second_write).await;
+    winner?;
+    gate.execute("SELECT pg_advisory_unlock(1)", &[]).await?;
+    loser.await?;
+
+    let named: ankql::ast::Selection<ankql::ast::Resolved> = ankql::ast::Predicate::Comparison {
+        left: Box::new(ankql::ast::Expr::Path(name.into())),
+        operator: ankql::ast::ComparisonOperator::Equal,
+        right: Box::new(ankql::ast::Expr::Literal(Value::String("shared".into()))),
+    }
+    .into();
+    let mut found = engine.fetch_states(&named.and_member_of(model)).await?;
+    found.sort_by_key(|state| state.payload.entity_id);
+    assert_eq!(found, vec![first, second]);
     Ok(())
 }
