@@ -320,9 +320,18 @@ impl Materialization {
                     return Ok(winner);
                 }
                 Err(err) if error_kind(&err) == ErrorKind::UniqueViolation => {
-                    // A different property owns this column name durably.
+                    // An assignment already owns this column name durably.
                     // Refresh the taken-set either way.
                     self.load_column_map(&client).await.map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
+
+                    // That assignment is this property's own when a concurrent
+                    // caller's insert lands between this insert's conflict check
+                    // and its index entries: PostgreSQL then refuses the column
+                    // name instead of ignoring the duplicate property key.
+                    if let Some(column) = self.property_columns.read().unwrap().get(property_id) {
+                        return Ok(column.clone());
+                    }
+
                     if matches!(property_id, PropertyId::System(_)) {
                         // A system property has exactly one candidate name, so
                         // retrying would recompute the same name; refuse now,
