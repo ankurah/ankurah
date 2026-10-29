@@ -116,7 +116,12 @@ impl SqliteStorageEngine {
         let model = *model;
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         conn.with_connection_mut(move |c| {
-            let tx = c.transaction()?;
+            // Take the write lock before reading the model map. In write-ahead-log
+            // mode a transaction that has already read cannot wait for the lock:
+            // its first write fails at once with a busy error when another
+            // connection holds the lock or has committed since that read. Taking
+            // the lock first waits for that writer instead, up to the busy timeout.
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             tx.execute(
                 &format!(
                     r#"CREATE TABLE IF NOT EXISTS "{MODEL_MAP_TABLE}" (
@@ -698,6 +703,36 @@ mod tests {
         );
         let all = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
         assert_eq!(engine.fetch_states(&all.clone().and_member_of(model)).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn model_registration_waits_for_a_write_on_another_connection() -> anyhow::Result<()> {
+        // rusqlite busy handlers are plain functions, so the handler below reaches the writer through a static.
+        static WRITER: std::sync::Mutex<Option<Connection>> = std::sync::Mutex::new(None);
+
+        // The engine connection's busy handler: the first time SQLite asks the
+        // registration to wait for the write lock, the writer commits.
+        fn commit_writer(_attempt: i32) -> bool {
+            WRITER.lock().unwrap().take().is_some_and(|writer| writer.execute_batch("COMMIT").is_ok())
+        }
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("registration.sqlite");
+        // One connection, so the busy handler installed below is the registration's.
+        let pool = bb8::Pool::builder().max_size(1).build(SqliteConnectionManager::file(&path)).await?;
+        let engine = SqliteStorageEngine::new(pool).await?;
+
+        // The model map must already exist: creating it would take the write lock before any read.
+        engine.materialization(&ModelId::EntityId(entity_id(0xa1))).await?;
+
+        let writer = Connection::open(&path)?;
+        writer.execute_batch("BEGIN IMMEDIATE")?;
+        *WRITER.lock().unwrap() = Some(writer);
+        engine.pool.get().await?.with_connection(|c| Ok(c.busy_handler(Some(commit_writer))?)).await?;
+
+        engine.materialization(&ModelId::EntityId(entity_id(0xa2))).await?;
+        assert!(WRITER.lock().unwrap().is_none(), "the registration waited for the writer to commit");
+        Ok(())
     }
 
     #[tokio::test]
