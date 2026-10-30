@@ -1,0 +1,735 @@
+{
+  "build_sha256": "30f231ae37ab9a5529f6556f59302e32bf36ca9b1500bf68b5782a09ee832d79",
+  "comparison_key": "b015a22ea7010f034fad0706055360a773642800932e26409a96620c38be3e06",
+  "compiler": {
+    "target": "x86_64-unknown-linux-gnu",
+    "version": "rustc 1.97.0-nightly (ca9a134e0 2026-04-26)"
+  },
+  "harness": {
+    "description": "Borrowed in-memory DAG comparison and layer preparation; real Sled/local transport lanes.",
+    "id": "dag-borrowed-prepare-and-lanes-v1",
+    "series_generation": "1",
+    "sha256": "55dfb93d8e393c282a420bc55118c79b192ef34491c9084f0638f7a2b54286eb",
+    "source_url": "https://github.com/ankurah/ankurah/tree/f4a43b4e120d61ce8455df070dff5c944215da8b/core/benches",
+    "workload_semantics": {
+      "compare/diamond_chain/16": "dag-borrowed-compare-assert-v1",
+      "compare/diamond_chain/4": "dag-borrowed-compare-assert-v1",
+      "compare/diamond_chain/64": "dag-borrowed-compare-assert-v1",
+      "compare/disjoint/10": "dag-borrowed-compare-assert-v1",
+      "compare/disjoint/100": "dag-borrowed-compare-assert-v1",
+      "compare/linear_deep/10": "dag-borrowed-compare-assert-v1",
+      "compare/linear_deep/100": "dag-borrowed-compare-assert-v1",
+      "compare/linear_deep/1000": "dag-borrowed-compare-assert-v1",
+      "compare/wide_antichain/16": "dag-borrowed-compare-assert-v1",
+      "compare/wide_antichain/4": "dag-borrowed-compare-assert-v1",
+      "compare/wide_antichain/64": "dag-borrowed-compare-assert-v1",
+      "layers/diamond_chain_prepare/16": "dag-borrowed-diamond-prepare-assert-v1",
+      "layers/diamond_chain_prepare/4": "dag-borrowed-diamond-prepare-assert-v1",
+      "layers/diamond_chain_prepare/64": "dag-borrowed-diamond-prepare-assert-v1"
+    }
+  },
+  "id": "41018811861-1",
+  "kind": "hosted",
+  "lockfile_sha256": "bd189e754b9c6a437d8cb3a9c9a31354aeceb3860b8e071c4cf9cefe2f61af5a",
+  "markers": [
+    {
+      "kind": "main",
+      "label": "f4a43b4e",
+      "url": "https://github.com/ankurah/ankurah/commit/f4a43b4e120d61ce8455df070dff5c944215da8b"
+    },
+    {
+      "kind": "pr",
+      "label": "#531",
+      "url": "https://github.com/ankurah/ankurah/pull/531"
+    }
+  ],
+  "measurements": [
+    {
+      "confidence_level": 0.95,
+      "lower": 47.00987313247225,
+      "median": 47.03019800859721,
+      "original_workload": "clock/contains/512",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/contains/512:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 47.046799911162,
+      "workload": "ankurah-core/event_dag/clock/contains/512"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 29.880229889688962,
+      "median": 29.921139433560114,
+      "original_workload": "clock/contains/64",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/contains/64:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 29.96939058777889,
+      "workload": "ankurah-core/event_dag/clock/contains/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 13.42313712153329,
+      "median": 13.433031647991875,
+      "original_workload": "clock/contains/8",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/contains/8:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 13.44499819932464,
+      "workload": "ankurah-core/event_dag/clock/contains/8"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 919.3013505025126,
+      "median": 920.0773329206419,
+      "original_workload": "clock/join/512",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/join/512:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 920.4632726130653,
+      "workload": "ankurah-core/event_dag/clock/join/512"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 486.042893501138,
+      "median": 486.3150256205701,
+      "original_workload": "clock/join/64",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/join/64:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 486.6210629844279,
+      "workload": "ankurah-core/event_dag/clock/join/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 321.28488027270635,
+      "median": 321.43364719519616,
+      "original_workload": "clock/join/8",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/join/8:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 321.6479584120983,
+      "workload": "ankurah-core/event_dag/clock/join/8"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 27055.60476190476,
+      "median": 27139.169966583126,
+      "original_workload": "clock/normalize_from/512",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/normalize_from/512:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 27266.434554334555,
+      "workload": "ankurah-core/event_dag/clock/normalize_from/512"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 2674.104603420616,
+      "median": 2677.406250917693,
+      "original_workload": "clock/normalize_from/64",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/normalize_from/64:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 2683.155812371343,
+      "workload": "ankurah-core/event_dag/clock/normalize_from/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 126.9691998677705,
+      "median": 127.18209369883978,
+      "original_workload": "clock/normalize_from/8",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/clock/normalize_from/8:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 127.80755792227204,
+      "workload": "ankurah-core/event_dag/clock/normalize_from/8"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 6969.7019869203805,
+      "median": 6975.8113609545035,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/diamond_chain/16:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 6987.011681453316,
+      "workload": "compare/diamond_chain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 7100.3111593375215,
+      "median": 7105.01361419848,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/diamond_chain/4:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 7109.035598705501,
+      "workload": "compare/diamond_chain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 6932.55301562133,
+      "median": 6935.272547074692,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/diamond_chain/64:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 6939.181247692875,
+      "workload": "compare/diamond_chain/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 27666.197786131997,
+      "median": 27670.900580254987,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/disjoint/10:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 27682.292358299594,
+      "workload": "compare/disjoint/10"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 297356.29591277667,
+      "median": 297496.2605399408,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/disjoint/100:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 297780.9275987526,
+      "workload": "compare/disjoint/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 8580.229399315282,
+      "median": 8584.252132352942,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/linear_deep/10:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 8589.690941176472,
+      "workload": "compare/linear_deep/10"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 102852.80858585858,
+      "median": 102913.75311609686,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/linear_deep/100:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 102977.17202729045,
+      "workload": "compare/linear_deep/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 1177727.9648541114,
+      "median": 1178634.4521780303,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/linear_deep/1000:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 1179278.9362648223,
+      "workload": "compare/linear_deep/1000"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 18612.15108780109,
+      "median": 18619.983104395604,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/wide_antichain/16:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 18630.412274392274,
+      "workload": "compare/wide_antichain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 4918.898954133065,
+      "median": 4922.364524662911,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/wide_antichain/4:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 4926.027075538477,
+      "workload": "compare/wide_antichain/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 74952.13544392116,
+      "median": 74983.83116883118,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-compare-assert-v1:compare/wide_antichain/64:a17f1d7e379214f1900569b6407936ee7626634f29d10a12e2e4b2cad1312dc4",
+      "unit": "ns",
+      "upper": 75056.62974279327,
+      "workload": "compare/wide_antichain/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 9791.168309963283,
+      "median": 9800.958886728244,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-diamond-prepare-assert-v1:layers/diamond_chain_prepare/16:f37961ebe8ca10f044c31a659a3656a2d6451b3e812e5011a02c80d08aa0f6e2",
+      "unit": "ns",
+      "upper": 9805.076626559716,
+      "workload": "layers/diamond_chain_prepare/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 9733.576723458602,
+      "median": 9738.724259944496,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-diamond-prepare-assert-v1:layers/diamond_chain_prepare/4:f37961ebe8ca10f044c31a659a3656a2d6451b3e812e5011a02c80d08aa0f6e2",
+      "unit": "ns",
+      "upper": 9747.875498670212,
+      "workload": "layers/diamond_chain_prepare/4"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 9722.914524903288,
+      "median": 9727.807812694413,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-diamond-prepare-assert-v1:layers/diamond_chain_prepare/64:f37961ebe8ca10f044c31a659a3656a2d6451b3e812e5011a02c80d08aa0f6e2",
+      "unit": "ns",
+      "upper": 9732.48512372803,
+      "workload": "layers/diamond_chain_prepare/64"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 1513840.2735294118,
+      "median": 1516637.6323076922,
+      "original_workload": "toposort/shuffled_chain/1024",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/toposort/shuffled_chain/1024:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 1520353.4305555555,
+      "workload": "ankurah-core/event_dag/toposort/shuffled_chain/1024"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 130341.51023771269,
+      "median": 130599.48593304845,
+      "original_workload": "toposort/shuffled_chain/128",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/toposort/shuffled_chain/128:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 131027.64232804233,
+      "workload": "ankurah-core/event_dag/toposort/shuffled_chain/128"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 12421.205740740741,
+      "median": 12443.899135802469,
+      "original_workload": "toposort/shuffled_chain/16",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-core/event_dag/toposort/shuffled_chain/16:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 12502.210064805764,
+      "workload": "ankurah-core/event_dag/toposort/shuffled_chain/16"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 8608871.5,
+      "median": 8689132.902777778,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 10,
+        "warm_up_seconds": 1
+      },
+      "samples": 10,
+      "series": "dag-borrowed-prepare-and-lanes-v1:bridge_catchup/100:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 8751190.485714287,
+      "workload": "bridge_catchup/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 84611876.0,
+      "median": 84959291.75,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 10,
+        "warm_up_seconds": 1
+      },
+      "samples": 10,
+      "series": "dag-borrowed-prepare-and-lanes-v1:bridge_catchup/1000:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 85715647.5,
+      "workload": "bridge_catchup/1000"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 438738363.0,
+      "median": 446529222.0,
+      "original_workload": "bridge_catchup/5000",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 10,
+        "warm_up_seconds": 1
+      },
+      "samples": 10,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-tests/lane_perf/bridge_catchup/5000:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 460092849.0,
+      "workload": "ankurah-tests/lane_perf/bridge_catchup/5000"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 308482.01266666665,
+      "median": 310589.28221153846,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 30,
+        "warm_up_seconds": 1
+      },
+      "samples": 30,
+      "series": "dag-borrowed-prepare-and-lanes-v1:commit_to_subscriber_latency/server_edit_to_client_change:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 322790.70416666666,
+      "workload": "commit_to_subscriber_latency/server_edit_to_client_change"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 590127.6666666667,
+      "median": 606815.1888888888,
+      "original_workload": "fresh_fetch_snapshot/100",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 10,
+        "warm_up_seconds": 1
+      },
+      "samples": 10,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-tests/lane_perf/fresh_fetch_snapshot/100:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 613451.3875,
+      "workload": "ankurah-tests/lane_perf/fresh_fetch_snapshot/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 602733.3333333334,
+      "median": 615405.8333333333,
+      "original_workload": "fresh_fetch_snapshot/1000",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 10,
+        "warm_up_seconds": 1
+      },
+      "samples": 10,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-tests/lane_perf/fresh_fetch_snapshot/1000:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 633904.0,
+      "workload": "ankurah-tests/lane_perf/fresh_fetch_snapshot/1000"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 558417.0,
+      "median": 630838.5,
+      "original_workload": "fresh_fetch_snapshot/5000",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 10,
+        "warm_up_seconds": 1
+      },
+      "samples": 10,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-tests/lane_perf/fresh_fetch_snapshot/5000:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 654736.0,
+      "workload": "ankurah-tests/lane_perf/fresh_fetch_snapshot/5000"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 117205.63379629629,
+      "median": 117956.45676328502,
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 40,
+        "warm_up_seconds": 1
+      },
+      "samples": 40,
+      "series": "dag-borrowed-prepare-and-lanes-v1:single_writer_commit/durable_lww_overwrite:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 118529.8888305322,
+      "workload": "single_writer_commit/durable_lww_overwrite"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 2533625.528846154,
+      "median": 2570175.21875,
+      "original_workload": "subscription_establishment/10",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 20,
+        "warm_up_seconds": 1
+      },
+      "samples": 20,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-tests/lane_perf/subscription_establishment/10:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 2579692.7851307187,
+      "workload": "ankurah-tests/lane_perf/subscription_establishment/10"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 24506594.375,
+      "median": 24668733.5,
+      "original_workload": "subscription_establishment/100",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 20,
+        "warm_up_seconds": 1
+      },
+      "samples": 20,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-tests/lane_perf/subscription_establishment/100:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 24769122.5,
+      "workload": "ankurah-tests/lane_perf/subscription_establishment/100"
+    },
+    {
+      "confidence_level": 0.95,
+      "lower": 247579325.0,
+      "median": 248685938.0,
+      "original_workload": "subscription_establishment/1000",
+      "parameters": {
+        "confidence_level": 0.95,
+        "measurement_seconds": 3,
+        "sample_size": 20,
+        "warm_up_seconds": 1
+      },
+      "samples": 20,
+      "series": "dag-borrowed-prepare-and-lanes-v1:ankurah-tests/lane_perf/subscription_establishment/1000:dfa1f14c19c6c65a53f843b6e06d0df6cfe5d79a6e52f717b50dc0ffc6e175f0",
+      "unit": "ns",
+      "upper": 250271952.5,
+      "workload": "ankurah-tests/lane_perf/subscription_establishment/1000"
+    }
+  ],
+  "parameters": {
+    "confidence_level": 0.95,
+    "measurement_seconds": 3,
+    "sample_size": 40,
+    "warm_up_seconds": 1
+  },
+  "profile": "release",
+  "profile_sha256": "37ce2f5418fe38c3a4c335ae06ef433aba8e57d322020730ce3f391d9cc351e5",
+  "raw_url": "https://raw.githubusercontent.com/ankurah/ankurah/benchmark-data/runs/41018811861-1/raw.json",
+  "recorded_at": "2026-10-30T07:14:45.103682+00:00",
+  "run_url": "https://github.com/ankurah/ankurah/actions/runs/41018811861/attempts/1",
+  "runner": {
+    "hardware": "AMD EPYC 7763 64-Core Processor; 4 logical CPUs",
+    "id": "github-ubuntu-24.04",
+    "label": "github-ubuntu-24.04",
+    "os": "Linux-7.0.0-1017-azure-x86_64-with-glibc2.39"
+  },
+  "source": {
+    "committed_at": "2026-10-29T13:25:26-07:00",
+    "label": "f4a43b4e120d61ce8455df070dff5c944215da8b",
+    "ref": "f4a43b4e120d61ce8455df070dff5c944215da8b",
+    "repository": "ankurah/ankurah",
+    "sha": "f4a43b4e120d61ce8455df070dff5c944215da8b"
+  },
+  "status": "ok",
+  "target_results": [
+    {
+      "id": "ankurah-core/event_dag",
+      "original_workloads": [
+        "compare/linear_deep/10",
+        "compare/linear_deep/100",
+        "compare/linear_deep/1000",
+        "compare/diamond_chain/4",
+        "compare/diamond_chain/16",
+        "compare/diamond_chain/64",
+        "compare/wide_antichain/4",
+        "compare/wide_antichain/16",
+        "compare/wide_antichain/64",
+        "compare/disjoint/10",
+        "compare/disjoint/100",
+        "layers/diamond_chain_prepare/4",
+        "layers/diamond_chain_prepare/16",
+        "layers/diamond_chain_prepare/64",
+        "clock/contains/8",
+        "clock/normalize_from/8",
+        "clock/join/8",
+        "clock/contains/64",
+        "clock/normalize_from/64",
+        "clock/join/64",
+        "clock/contains/512",
+        "clock/normalize_from/512",
+        "clock/join/512",
+        "toposort/shuffled_chain/16",
+        "toposort/shuffled_chain/128",
+        "toposort/shuffled_chain/1024"
+      ],
+      "status": "ok"
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "original_workloads": [
+        "single_writer_commit/durable_lww_overwrite",
+        "commit_to_subscriber_latency/server_edit_to_client_change",
+        "fresh_fetch_snapshot/100",
+        "fresh_fetch_snapshot/1000",
+        "fresh_fetch_snapshot/5000",
+        "bridge_catchup/100",
+        "bridge_catchup/1000",
+        "bridge_catchup/5000",
+        "subscription_establishment/10",
+        "subscription_establishment/100",
+        "subscription_establishment/1000"
+      ],
+      "status": "ok"
+    }
+  ]
+}
