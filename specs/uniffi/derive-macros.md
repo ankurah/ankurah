@@ -16,7 +16,7 @@ For a model like `Message`, the `uniffi` feature generates:
 | `MessageMutable` | Object | Editable handle with field setters |
 | `MessageOps` | Object | Singleton with CRUD operations |
 | `MessageInput` | Record | Data for creating new entities |
-| `MessageRef` | Object | Typed wrapper around `Ref<Message>` |
+| `MessageRef` | Object | Typed wrapper around `Ref<Message>`, the form every `Ref<Message>` crosses in |
 | `MessageLiveQuery` | Object | Reactive query subscription |
 | `MessageResultSet` | Object | Query results collection |
 | `MessageChangeSet` | Object | Subscription change notifications |
@@ -75,16 +75,26 @@ impl MessageView {
 }
 ```
 
-### 3. Input Records Use String for EntityId
+### 3. Entity Ids Cross as Objects
 
-`Ref<T>` fields in Input Records become `String` (base64 EntityId) because:
-- UniFFI doesn't support generics
-- EntityId is an Object, can't be in a Record
+Every entity id a model holds crosses the bindings as an object, never as a string, so a foreign
+caller handles ids one way:
+- A plain `EntityId` field crosses as the `EntityId` Object, which exports `Display`, `Eq` and
+  `Hash` (in Swift: `CustomStringConvertible`, `Equatable` and `Hashable`)
+- A `Ref<T>` field crosses as T's generated `TRef` Object, which has `id()`, `get(ctx)`,
+  `from_view(view)` and `from_id(id)`, and is equal and hashes alike by id
+- An `Option` of either crosses as an `Option` of the object
+
+UniFFI carries an Object in a Record field, an `Option` or an owned argument only as `Arc<T>`, so
+the Input record's fields and the Mutable's field wrappers take `Arc<EntityId>` and `Arc<TRef>`,
+and the View's getters and the wrappers' `get` return them. The derive names T's Ref object as
+`<T as UniffiModel>::RefObject`, so a `Ref<T>` field needs only `T` in scope.
 
 ```rust
 #[derive(uniffi::Record)]
 pub struct MessageInput {
-    pub room: String,  // Base64 EntityId, not Ref<Room>
+    pub room: Arc<RoomRef>,      // Ref<Room>
+    pub author: Arc<EntityId>,   // EntityId
     pub text: String,
 }
 ```

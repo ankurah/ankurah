@@ -16,6 +16,7 @@ members = [
     "extensions/*",
     "storage/*",
     "tests",
+    "tests-uniffi",
     "tests-wasm/bindings",
     "ankurah",
     "signals",
@@ -23,6 +24,8 @@ members = [
 
 # Use default-members to exclude wasm crates from `cargo test` - they are tested
 # separately via wasm-pack. See https://github.com/ankurah/ankurah/issues/211
+# tests-uniffi is excluded too: its `ankurah/uniffi` feature would reach every model crate
+# in the build. Test it with `cargo test -p ankurah-tests-uniffi`.
 default-members = [
     "core-types",
     "core",

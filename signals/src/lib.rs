@@ -62,8 +62,9 @@ pub mod react;
 #[cfg(feature = "react-native")]
 pub mod react_native;
 
-// UniFFI scaffolding for react-native feature
-#[cfg(feature = "react-native")]
+// Scaffolding for this crate's uniffi types: SubscriptionGuard, which every
+// model's generated LiveQuery hands out, and the react-native observers.
+#[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
 #[cfg(feature = "jsvalue")]

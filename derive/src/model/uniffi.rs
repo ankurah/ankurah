@@ -1,7 +1,8 @@
 //! UniFFI wrapper generation for Model types.
 //!
 //! Similar to wasm.rs, UniFFI doesn't support generics, so we generate concrete wrapper types:
-//! - `SessionRef` - wraps `Ref<Session>` with `get(ctx)`, `id`, `from(view)` methods
+//! - `SessionRef` - wraps `Ref<Session>`, the form in which every `Ref<Session>` crosses the
+//!   bindings, with `get(ctx)`, `id`, `from_view(view)` and `from_id(id)` methods
 //! - `SessionResultSet`, `SessionLiveQuery`, etc.
 //! - `SessionOps` - singleton with static-like methods (get, fetch, query, create)
 //! - `SessionLiveQueryCallback` - callback trait for subscription updates
@@ -151,34 +152,94 @@ pub fn uniffi_custom_wrappers(model: &crate::model::description::ModelDescriptio
     }
 }
 
-/// Check if a type is Ref<T> and extract the inner type name
-fn is_ref_type(ty: &syn::Type) -> Option<Ident> {
-    if let syn::Type::Path(type_path) = ty {
-        let segment = type_path.path.segments.last()?;
-        if segment.ident == "Ref" {
-            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                if let Some(syn::GenericArgument::Type(syn::Type::Path(inner_path))) = args.args.first() {
-                    return Some(inner_path.path.segments.last()?.ident.clone());
-                }
-            }
-        }
-    }
-    None
+/// How the bindings carry an entity id a model holds, so that a foreign caller handles every id as
+/// an object and never as a string: a plain `EntityId` crosses as the EntityId Object and a `Ref<T>`
+/// as T's generated Ref object, each behind the `Arc` that UniFFI needs to put an Object in a
+/// Record, an `Option` or an owned argument; an `Option` of either crosses as an `Option` of that.
+pub(crate) struct IdBinding {
+    /// `EntityId`, or `<T as UniffiModel>::RefObject` for a `Ref<T>`
+    object: TokenStream,
+    is_ref: bool,
+    optional: bool,
 }
 
-/// Check if a type is Option<Ref<T>> and extract the inner type name
-fn is_option_ref_type(ty: &syn::Type) -> Option<Ident> {
-    if let syn::Type::Path(type_path) = ty {
-        let segment = type_path.path.segments.last()?;
-        if segment.ident == "Option" {
-            if let syn::PathArguments::AngleBracketed(args) = &segment.arguments {
-                if let Some(syn::GenericArgument::Type(inner_type)) = args.args.first() {
-                    return is_ref_type(inner_type);
-                }
-            }
+impl IdBinding {
+    /// How the bindings carry a value of type `ty`, or None when `ty` is not an entity id
+    pub(crate) fn of(ty: &syn::Type) -> Option<Self> {
+        match generic_argument(ty, "Option") {
+            Some(inner) => Self::required(inner).map(|binding| Self { optional: true, ..binding }),
+            None => Self::required(ty),
         }
     }
-    None
+
+    fn required(ty: &syn::Type) -> Option<Self> {
+        if let Some(model) = generic_argument(ty, "Ref") {
+            return Some(Self { object: quote! { <#model as ::ankurah::model::UniffiModel>::RefObject }, is_ref: true, optional: false });
+        }
+        let syn::Type::Path(path) = ty else { return None };
+        let segment = path.path.segments.last()?;
+        (segment.ident == "EntityId" && segment.arguments.is_none()).then(|| Self {
+            object: quote! { ::ankurah::proto::EntityId },
+            is_ref: false,
+            optional: false,
+        })
+    }
+
+    /// The type the bindings carry the value as
+    pub(crate) fn carried_type(&self) -> TokenStream {
+        let object = &self.object;
+        if self.optional {
+            quote! { Option<::std::sync::Arc<#object>> }
+        } else {
+            quote! { ::std::sync::Arc<#object> }
+        }
+    }
+
+    /// Convert `value`, of the carried type, to the model's value
+    pub(crate) fn to_model(&self, value: TokenStream) -> TokenStream {
+        self.each(value, |id| {
+            if self.is_ref {
+                quote! { ::ankurah::property::Ref::new(#id.id()) }
+            } else {
+                quote! { *#id }
+            }
+        })
+    }
+
+    /// Convert `value`, of the model's type, to the carried value
+    pub(crate) fn to_carried(&self, value: TokenStream) -> TokenStream {
+        let object = &self.object;
+        self.each(value, |id| {
+            if self.is_ref {
+                quote! { ::std::sync::Arc::new(#object::from(#id)) }
+            } else {
+                quote! { ::std::sync::Arc::new(#id) }
+            }
+        })
+    }
+
+    /// Apply `convert` to `value`, or to the id inside it when the id is optional
+    fn each(&self, value: TokenStream, convert: impl Fn(TokenStream) -> TokenStream) -> TokenStream {
+        if self.optional {
+            let converted = convert(quote! { id });
+            quote! { #value.map(|id| #converted) }
+        } else {
+            convert(value)
+        }
+    }
+}
+
+/// The type argument of `ty` when `ty` is the generic type `name`, such as `T` in `Option<T>`
+fn generic_argument<'a>(ty: &'a syn::Type, name: &str) -> Option<&'a syn::Type> {
+    let syn::Type::Path(path) = ty else { return None };
+    let segment = path.path.segments.last()?;
+    match &segment.arguments {
+        syn::PathArguments::AngleBracketed(args) if segment.ident == name => match args.args.first() {
+            Some(syn::GenericArgument::Type(argument)) => Some(argument),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Main UniFFI implementation generator for a Model.
@@ -221,21 +282,50 @@ pub fn uniffi_impl(model: &crate::model::description::ModelDescription) -> Token
 
 /// MessageRef(Ref<Message>) - Typed entity reference wrapper for UniFFI
 ///
-/// Wraps `Ref<Model>` with methods for TypeScript/native consumption:
+/// Wraps `Ref<Model>` with methods for TypeScript/native consumption, and carries every `Ref<Model>`
+/// a model holds across the bindings:
 /// - `id()` - Get the EntityId
 /// - `get(ctx)` - Fetch the referenced entity
 /// - `from_view(view)` - Create from a View (constructor-style)
+/// - `from_id(id)` - Create from an EntityId (constructor-style)
+/// - equality and hashing by id
 fn uniffi_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -> TokenStream {
     quote! {
         #[derive(::uniffi::Object)]
+        #[::uniffi::export(Eq, Hash)]
         pub struct #ref_name(::ankurah::property::Ref<#model_name>);
 
-        #[::uniffi::export]
+        impl ::ankurah::model::UniffiModel for #model_name {
+            type RefObject = #ref_name;
+        }
+
+        // A Ref names an entity, so two Refs are equal when they name the same one
+        impl PartialEq for #ref_name {
+            fn eq(&self, other: &Self) -> bool {
+                self.0.id_ref() == other.0.id_ref()
+            }
+        }
+
+        impl Eq for #ref_name {}
+
+        impl ::std::hash::Hash for #ref_name {
+            fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                ::std::hash::Hash::hash(self.0.id_ref(), state)
+            }
+        }
+
+        #[::uniffi::export(async_runtime = "tokio")]
         impl #ref_name {
             /// Create a reference from a View
             #[uniffi::constructor]
             pub fn from_view(view: &#view_name) -> Self {
                 #ref_name(view.r())
+            }
+
+            /// Create a reference to the entity with this id
+            #[uniffi::constructor]
+            pub fn from_id(id: &::ankurah::proto::EntityId) -> Self {
+                #ref_name(::ankurah::property::Ref::new(*id))
             }
 
             /// Get the EntityId (returns owned - works cross-crate)
@@ -269,77 +359,48 @@ fn uniffi_ref_wrapper(ref_name: &Ident, model_name: &Ident, view_name: &Ident) -
 /// MessageInput - UniFFI Record for creating new entities
 ///
 /// This is a value type that can be passed across FFI boundaries.
-/// Ref<T> fields become String (base64 EntityId) since:
-/// 1. UniFFI doesn't support generics
-/// 2. EntityId is an Object, not a Record, so can't be in a Record directly
+/// Entity id fields carry objects, as `IdBinding` describes: `Arc<EntityId>` for an EntityId and
+/// T's Ref object for a Ref<T>.
 fn uniffi_input_record(model: &crate::model::description::ModelDescription, input_name: &Ident, model_name: &Ident) -> TokenStream {
     let fields = model.active_fields();
 
-    // Generate Input Record fields - Ref<T> and Option<Ref<T>> become String/Option<String> (base64 EntityId)
     let input_fields: Vec<_> = fields
         .iter()
         .map(|field| {
             let field_name = field.ident.as_ref().unwrap();
             let field_vis = &field.vis;
-
-            if is_option_ref_type(&field.ty).is_some() {
-                quote! { #field_vis #field_name: Option<String> }
-            } else if is_ref_type(&field.ty).is_some() {
-                quote! { #field_vis #field_name: String }
-            } else {
-                let field_ty = &field.ty;
-                quote! { #field_vis #field_name: #field_ty }
-            }
+            let field_ty = &field.ty;
+            let field_ty = IdBinding::of(field_ty).map_or_else(|| quote! { #field_ty }, |id| id.carried_type());
+            quote! { #field_vis #field_name: #field_ty }
         })
         .collect();
 
-    // Generate conversion from Input to Model - Ref<T> fields parse base64 to EntityId
-    // Uses TryFrom to properly propagate parsing errors instead of panicking
     let field_conversions: Vec<_> = fields
         .iter()
         .map(|field| {
             let field_name = field.ident.as_ref().unwrap();
-
-            if is_option_ref_type(&field.ty).is_some() {
-                // Option<Ref<T>> - parse optional base64 string
-                quote! {
-                    #field_name: match input.#field_name {
-                        Some(ref s) => Some(::ankurah::property::Ref::from(
-                            ::ankurah::proto::EntityId::from_base64(s)?
-                        )),
-                        None => None,
-                    }
-                }
-            } else if is_ref_type(&field.ty).is_some() {
-                // Parse base64 string to EntityId, propagating errors
-                quote! {
-                    #field_name: ::ankurah::property::Ref::from(
-                        ::ankurah::proto::EntityId::from_base64(&input.#field_name)?
-                    )
-                }
-            } else {
-                quote! { #field_name: input.#field_name }
-            }
+            let value = quote! { input.#field_name };
+            let value = match IdBinding::of(&field.ty) {
+                Some(id) => id.to_model(value),
+                None => value,
+            };
+            quote! { #field_name: #value }
         })
         .collect();
 
     quote! {
         /// Input record for creating new entities.
-        /// Ref<T> fields are represented as String (base64 EntityId) since:
-        /// - UniFFI doesn't support generics
-        /// - EntityId is an Object, not a Record
+        /// Its entity id fields carry EntityId and Ref objects, so an id is never a string.
         #[derive(::uniffi::Record)]
         pub struct #input_name {
             #(#input_fields),*
         }
 
-        impl TryFrom<#input_name> for #model_name {
-            type Error = ::ankurah::proto::IdParseError;
-
-            fn try_from(input: #input_name) -> Result<Self, Self::Error> {
-                Ok(#model_name {
+        impl From<#input_name> for #model_name {
+            fn from(input: #input_name) -> Self {
+                #model_name {
                     #(#field_conversions),*
-                })
+                }
             }
         }
     }
@@ -433,29 +494,25 @@ fn uniffi_ops_wrapper(
             }
 
             /// Create a new entity within a transaction, returning its Mutable
-            /// Use the Input record type which has EntityId fields for Ref<T> types
+            /// Use the Input record type, whose id fields take EntityId and Ref objects
             pub async fn create(
                 &self,
                 trx: &::ankurah::transaction::Transaction,
                 input: #input_name,
             ) -> Result<#mutable_name, ::ankurah::core::error::MutationError> {
-                use std::convert::TryInto;
-                let model: #model_name = input.try_into()
-                    .map_err(|e: ::ankurah::proto::IdParseError| ::ankurah::core::error::MutationError::General(Box::new(e)))?;
+                let model = #model_name::from(input);
                 Ok(trx.create(&model).await?.into_core())
             }
 
             /// Create a new entity with an auto-committed transaction
-            /// Use the Input record type which has EntityId fields for Ref<T> types
+            /// Use the Input record type, whose id fields take EntityId and Ref objects
             pub async fn create_one(
                 &self,
                 ctx: &::ankurah::core::context::Context,
                 input: #input_name,
             ) -> Result<#view_name, ::ankurah::core::error::MutationError> {
                 use ::ankurah::Mutable;
-                use std::convert::TryInto;
-                let model: #model_name = input.try_into()
-                    .map_err(|e: ::ankurah::proto::IdParseError| ::ankurah::core::error::MutationError::General(Box::new(e)))?;
+                let model = #model_name::from(input);
                 let tx = ctx.begin();
                 let mutable = tx.create(&model).await?;
                 let view = mutable.read()?;
@@ -474,6 +531,7 @@ fn uniffi_ops_wrapper(
 /// - `get(index)` - Get item at index as Option<Arc<View>>
 /// - `by_id(id)` - Get item by EntityId as Option<Arc<View>>
 /// - `len()` - Get count of items
+/// - `is_empty()` - Check if there are no items
 /// - `is_loaded()` - Check if initial load is complete
 fn uniffi_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> TokenStream {
     quote! {
@@ -503,6 +561,12 @@ fn uniffi_resultset_wrapper(resultset_name: &Ident, view_name: &Ident) -> TokenS
             pub fn len(&self) -> u32 {
                 use ::ankurah::signals::Get;
                 self.0.get().len() as u32
+            }
+
+            /// Check if there are no items
+            pub fn is_empty(&self) -> bool {
+                use ::ankurah::signals::Get;
+                self.0.get().is_empty()
             }
 
             /// Check if initial load is complete
@@ -585,6 +649,7 @@ fn uniffi_changeset_wrapper(changeset_name: &Ident, view_name: &Ident, resultset
 /// - `resultset()` - Get the ResultSet wrapper
 /// - `is_loaded()` - Check if initial load is complete
 /// - `len()` - Get count of items
+/// - `is_empty()` - Check if there are no items
 /// - `error()` - Get any error message
 /// - `subscribe(callback)` - Subscribe to changes, returns guard that unsubscribes on drop
 /// - `update_selection(selection)` - Update the query predicate
@@ -631,6 +696,12 @@ fn uniffi_livequery_wrapper(
             pub fn len(&self) -> u32 {
                 use ::ankurah::signals::Get;
                 self.0.get().len() as u32
+            }
+
+            /// Check if there are no items
+            pub fn is_empty(&self) -> bool {
+                use ::ankurah::signals::Get;
+                self.0.get().is_empty()
             }
 
             /// Get any error from the query
