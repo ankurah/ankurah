@@ -12,6 +12,7 @@ use crate::IdParseError;
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
+#[cfg_attr(feature = "uniffi", uniffi::export(Display, Eq, Hash))]
 /// A durable, globally unique entity identity: the 32 bytes of the entity's
 /// genesis event id.
 ///
@@ -67,8 +68,9 @@ impl EntityId {
     }
 }
 
+// UniFFI shows this text through the exported Display instead, which a Kotlin `toString()`
+// method of this name would clash with
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-#[cfg_attr(feature = "uniffi", uniffi::export)]
 impl EntityId {
     #[cfg_attr(feature = "wasm", wasm_bindgen(js_name = toString))]
     /// Return the canonical base64 representation.

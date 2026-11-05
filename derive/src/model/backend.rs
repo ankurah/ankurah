@@ -7,15 +7,20 @@
 //! - `Ref<T>` → `TRef` conversion for type-safe entity references
 
 use proc_macro2::TokenStream;
-use quote::{format_ident, quote};
+#[cfg(any(feature = "wasm", feature = "uniffi"))]
+use quote::format_ident;
+use quote::quote;
+#[cfg(feature = "wasm")]
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(any(feature = "wasm", feature = "uniffi"))]
 use syn::Type;
 
-// --- Type string helpers for Ref<T> handling ---
+// --- Type string helpers for Ref<T> handling in WASM wrappers ---
 
 /// Rewrite `Ref<Model>` to its associated WASM reference wrapper.
+#[cfg(feature = "wasm")]
 fn convert_ref_to_wrapper(type_str: &str) -> String {
     Regex::new(r"Ref<(\w+)>")
         .unwrap()
@@ -24,12 +29,15 @@ fn convert_ref_to_wrapper(type_str: &str) -> String {
 }
 
 /// Check for `Option<Ref<T>>` pattern.
+#[cfg(feature = "wasm")]
 fn has_option_ref(type_str: &str) -> bool { Regex::new(r"Option<\s*Ref<\w+>").unwrap().is_match(type_str) }
 
 /// Check for bare `Ref<T>` (not wrapped in Option).
+#[cfg(feature = "wasm")]
 fn has_bare_ref(type_str: &str) -> bool { type_str.contains("Ref<") && !has_option_ref(type_str) }
 
 /// Extract model name from `Ref<Model>` (e.g., `"Ref<User>"` → `Some("User")`).
+#[cfg(feature = "wasm")]
 fn extract_ref_model_name(type_str: &str) -> Option<String> {
     Regex::new(r"Ref<(\w+)>").unwrap().captures(type_str).map(|caps| caps[1].to_string())
 }
@@ -190,6 +198,7 @@ impl ActiveTypeDesc {
     /// - `set(value)` → Accepts `TRef | TView` via duck typing on `.id` property
     ///
     /// Returns `(methods, ts_override)` - ts_override provides union type for set().
+    #[cfg(feature = "wasm")]
     fn wasm_methods(&self, context: &str) -> (Vec<TokenStream>, Option<String>) {
         let value_config = &self.backend_config.values[0];
         let substitute_fn = |backend: &ActiveTypeDesc, pattern: &str| backend.do_substitutions(pattern, context);
@@ -401,54 +410,32 @@ impl ActiveTypeDesc {
 
     /// UniFFI methods - generates methods with PropertyError for error handling.
     /// PropertyError has #[uniffi(flat_error)] so it serializes via ToString.
+    /// Entity ids (EntityId or Ref<T>, optional or not) cross as the objects `IdBinding` describes,
+    /// as in the Input record.
+    #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
     fn uniffi_methods(&self, context: &str) -> Vec<TokenStream> {
+        use super::uniffi::IdBinding;
+
         let substitute_fn = |backend: &ActiveTypeDesc, pattern: &str| backend.do_substitutions(pattern, context);
 
         self.value_config.methods.iter().filter(|method| method.uniffi).map(|method| {
             let method_name = format_ident!("{}", method.name);
 
-            // Special case: set with Ref<T> or Option<Ref<T>>
+            // Special case: set with an entity id, optional or not, which arrives as its object
             if method.name == "set" {
-                let substituted_arg = method.args.iter().find_map(|(_, arg_type)| {
-                    let substituted = substitute_fn(self, arg_type);
-                    if substituted.contains("Ref<") { Some(substituted) } else { None }
+                let id_arg = method.args.iter().find_map(|(_, arg_type)| {
+                    let arg_type: Type = syn::parse_str(&substitute_fn(self, arg_type)).expect("Failed to parse arg type");
+                    IdBinding::of(&arg_type).map(|id| (arg_type, id))
                 });
-                if let Some(ref substituted) = substituted_arg {
-                    if let Some(model_name) = extract_ref_model_name(substituted) {
-                        let model_ident = format_ident!("{}", model_name);
-                        if has_option_ref(substituted) {
-                            // Option<Ref<T>> -> Option<String>
-                            return quote! {
-                                pub fn set(&self, value: Option<String>) -> Result<(), ::ankurah::property::PropertyError> {
-                                    let r: Option<::ankurah::property::Ref<#model_ident>> = match value {
-                                        Some(ref s) => {
-                                            let id = ::ankurah::proto::EntityId::from_base64(s)
-                                                .map_err(|e| ::ankurah::property::PropertyError::InvalidValue {
-                                                    value: s.clone(),
-                                                    ty: format!("EntityId ({})", e)
-                                                })?;
-                                            Some(::ankurah::property::Ref::from(id))
-                                        },
-                                        None => None,
-                                    };
-                                    self.0.set(&r)
-                                }
-                            };
-                        } else {
-                            // Ref<T> -> String
-                            return quote! {
-                                pub fn set(&self, value: String) -> Result<(), ::ankurah::property::PropertyError> {
-                                    let id = ::ankurah::proto::EntityId::from_base64(&value)
-                                        .map_err(|e| ::ankurah::property::PropertyError::InvalidValue {
-                                            value: value.clone(),
-                                            ty: format!("EntityId ({})", e)
-                                        })?;
-                                    let r: ::ankurah::property::Ref<#model_ident> = ::ankurah::property::Ref::from(id);
-                                    self.0.set(&r)
-                                }
-                            };
+                if let Some((value_type, id)) = id_arg {
+                    let carried_type = id.carried_type();
+                    let value = id.to_model(quote! { value });
+                    return quote! {
+                        pub fn set(&self, value: #carried_type) -> Result<(), ::ankurah::property::PropertyError> {
+                            let value: #value_type = #value;
+                            self.0.set(&value)
                         }
-                    }
+                    };
                 }
             }
 
@@ -462,8 +449,6 @@ impl ActiveTypeDesc {
             }).collect();
 
             let return_type_str = substitute_fn(self, &method.return_type);
-            let return_has_option_ref = has_option_ref(&return_type_str);
-            let return_has_bare_ref = has_bare_ref(&return_type_str);
             let arg_names: Vec<syn::Ident> = method.args.iter().map(|(name, _)| format_ident!("{}", name)).collect();
 
             let converted_args: Vec<TokenStream> = method.args.iter().zip(arg_names.iter()).map(|((_, arg_type), arg_name)| {
@@ -474,27 +459,26 @@ impl ActiveTypeDesc {
             if return_type_str.starts_with("Result<") {
                 let inner = return_type_str.strip_prefix("Result<").unwrap().strip_suffix(">").unwrap();
                 let ok_type_str = inner.split(", ").next().unwrap();
+                let ok_type: Type = syn::parse_str(ok_type_str).expect("Failed to parse ok type");
                 // Parse and use the original error type from the method signature
                 let err_type_str = inner.split(", ").nth(1).unwrap_or("::ankurah::property::PropertyError");
                 let err_type: Type = syn::parse_str(err_type_str).expect("Failed to parse error type");
-                if return_has_option_ref {
-                    // Result<Option<Ref<T>>, Err> -> Result<Option<String>, Err>
-                    quote! { pub fn #method_name(&self, #(#args),*) -> Result<Option<String>, #err_type> { self.0.#method_name(#(#converted_args),*).map(|opt| opt.map(|r| r.id().to_base64())) } }
-                } else if return_has_bare_ref {
-                    // Result<Ref<T>, Err> -> Result<String, Err>
-                    quote! { pub fn #method_name(&self, #(#args),*) -> Result<String, #err_type> { self.0.#method_name(#(#converted_args),*).map(|r| r.id().to_base64()) } }
+                if let Some(id) = IdBinding::of(&ok_type) {
+                    let carried_type = id.carried_type();
+                    let carried = id.to_carried(quote! { value });
+                    quote! { pub fn #method_name(&self, #(#args),*) -> Result<#carried_type, #err_type> { self.0.#method_name(#(#converted_args),*).map(|value| #carried) } }
                 } else {
-                    let ok_type: Type = syn::parse_str(ok_type_str).expect("Failed to parse ok type");
                     quote! { pub fn #method_name(&self, #(#args),*) -> Result<#ok_type, #err_type> { self.0.#method_name(#(#converted_args),*) } }
                 }
-            } else if return_has_option_ref {
-                // Option<Ref<T>> -> Option<String>
-                quote! { pub fn #method_name(&self, #(#args),*) -> Option<String> { self.0.#method_name(#(#converted_args),*).and_then(|r| Some(r.id().to_base64())) } }
-            } else if return_has_bare_ref {
-                quote! { pub fn #method_name(&self, #(#args),*) -> Option<String> { self.0.#method_name(#(#converted_args),*).map(|r| r.id().to_base64()) } }
             } else {
                 let return_type: Type = syn::parse_str(&return_type_str).expect("Failed to parse return type");
-                quote! { pub fn #method_name(&self, #(#args),*) -> #return_type { self.0.#method_name(#(#converted_args),*) } }
+                if let Some(id) = IdBinding::of(&return_type) {
+                    let carried_type = id.carried_type();
+                    let carried = id.to_carried(quote! { self.0.#method_name(#(#converted_args),*) });
+                    quote! { pub fn #method_name(&self, #(#args),*) -> #carried_type { #carried } }
+                } else {
+                    quote! { pub fn #method_name(&self, #(#args),*) -> #return_type { self.0.#method_name(#(#converted_args),*) } }
+                }
             }
         }).collect()
     }

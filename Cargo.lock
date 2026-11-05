@@ -535,6 +535,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-tests-uniffi"
+version = "0.10.0"
+dependencies = [
+ "ankurah",
+ "ankurah-storage-sqlite",
+ "anyhow",
+ "serde",
+ "tokio",
+ "uniffi",
+]
+
+[[package]]
 name = "ankurah-tests-wasm-bindings"
 version = "0.10.0"
 dependencies = [

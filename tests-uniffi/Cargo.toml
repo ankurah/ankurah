@@ -1,0 +1,21 @@
+[package]
+name    = "ankurah-tests-uniffi"
+version = "0.10.0"
+edition = "2021"
+publish = false
+
+[features]
+# The Model derive puts the bindings' Object derives under the model crate's own `uniffi`
+# feature, as an app's model crate declares it; this crate always builds the bindings.
+default = ["uniffi"]
+uniffi  = ["ankurah/uniffi"]
+
+[dependencies]
+ankurah = { path = "../ankurah", features = ["derive"] }
+serde   = { version = "1", features = ["derive"] }
+uniffi  = { version = "0.29", features = ["tokio"] }
+
+[dev-dependencies]
+ankurah-storage-sqlite = { path = "../storage/sqlite" }
+anyhow                 = "1"
+tokio                  = { version = "1", features = ["macros", "rt-multi-thread"] }

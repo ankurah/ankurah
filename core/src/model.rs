@@ -44,6 +44,13 @@ pub trait Model: Sized {
     ) -> Result<(), PropertyError>;
 }
 
+/// A model exported through UniFFI, whose generated Ref object carries a `Ref` to it across the
+/// bindings; the derive names that object through this trait wherever a model holds such a `Ref`.
+#[cfg(feature = "uniffi")]
+pub trait UniffiModel: Model {
+    type RefObject: From<crate::property::Ref<Self>> + Into<crate::property::Ref<Self>>;
+}
+
 /// A read only view of an Entity which offers typed accessors
 pub trait View {
     type Model: Model;

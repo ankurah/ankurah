@@ -256,8 +256,10 @@ impl Drop for Transaction {
     }
 }
 
+// A foreign caller such as Swift polls `commit` from its own threads, which have
+// no Tokio runtime; committing reaches storage engines that need one.
 #[cfg(feature = "uniffi")]
-#[uniffi::export]
+#[uniffi::export(async_runtime = "tokio")]
 impl Transaction {
     /// Commit the transaction (UniFFI version - uses Arc<Self>)
     /// Simply borrows self and calls commit_local_trx - the alive flag prevents double commits

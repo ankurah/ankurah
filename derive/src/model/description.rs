@@ -309,11 +309,14 @@ impl ModelDescription {
 
     /// Generate UniFFI getter methods for View fields.
     /// Returns projected field values (String, i64, etc.) via the underlying View methods.
-    /// Ref<T> fields return String (base64 EntityId) since UniFFI doesn't support generics.
+    /// Entity id fields return the EntityId and Ref objects that `IdBinding` describes, as the
+    /// Input record takes them.
     /// Uses `uniffi_` prefix internally with `#[uniffi::method(name = "...")]` to expose
     /// with original field names, avoiding conflicts with core Rust methods.
     #[cfg(all(feature = "uniffi", not(feature = "wasm")))]
     pub fn uniffi_view_getters(&self) -> Vec<TokenStream> {
+        use crate::model::uniffi::IdBinding;
+
         self.active_fields
             .iter()
             .map(|field| {
@@ -321,23 +324,14 @@ impl ModelDescription {
                 let uniffi_method_name = format_ident!("uniffi_{}", field_name);
                 let field_name_str = field_name.to_string();
                 let projected_type = &field.ty;
-                let type_str = quote!(#projected_type).to_string();
 
-                // Check Option<Ref<T>> before Ref<T> since "Ref <" matches both
-                if type_str.contains("Option < Ref") || type_str.contains("Option<Ref") {
-                    // Option<Ref<T>> -> return Option<String>
+                if let Some(id) = IdBinding::of(projected_type) {
+                    let carried_type = id.carried_type();
+                    let carried = id.to_carried(quote! { value });
                     quote! {
                         #[uniffi::method(name = #field_name_str)]
-                        pub fn #uniffi_method_name(&self) -> Result<Option<String>, ::ankurah::property::PropertyError> {
-                            self.#field_name().map(|opt| opt.map(|r| r.id().to_base64()))
-                        }
-                    }
-                } else if type_str.contains("Ref <") || type_str.starts_with("Ref<") {
-                    // Ref<T> -> return base64 String
-                    quote! {
-                        #[uniffi::method(name = #field_name_str)]
-                        pub fn #uniffi_method_name(&self) -> Result<String, ::ankurah::property::PropertyError> {
-                            self.#field_name().map(|r| r.id().to_base64())
+                        pub fn #uniffi_method_name(&self) -> Result<#carried_type, ::ankurah::property::PropertyError> {
+                            self.#field_name().map(|value| #carried)
                         }
                     }
                 } else {
