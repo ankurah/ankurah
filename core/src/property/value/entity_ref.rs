@@ -20,6 +20,7 @@ use ankurah_proto::EntityId;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ops::Deref;
 
@@ -32,12 +33,31 @@ use crate::value::Value;
 ///
 /// Stores an `EntityId` internally but carries compile-time type information
 /// about the target model, enabling type-safe `.get()` calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Ref<T> {
     id: EntityId,
     #[serde(skip)]
     _phantom: PhantomData<T>,
+}
+
+// A Ref names an entity, so it copies, compares and hashes as its id, whatever traits T implements:
+// its PhantomData holds no data, only T's type. A derive would also require T to implement each trait.
+// Hashing the id alone keeps a Ref's hash equal to its id's, as Borrow<EntityId> requires.
+impl<T> Clone for Ref<T> {
+    fn clone(&self) -> Self { *self }
+}
+
+impl<T> Copy for Ref<T> {}
+
+impl<T> PartialEq for Ref<T> {
+    fn eq(&self, other: &Self) -> bool { self.id == other.id }
+}
+
+impl<T> Eq for Ref<T> {}
+
+impl<T> Hash for Ref<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) { self.id.hash(state) }
 }
 
 impl<T> Deref for Ref<T> {
