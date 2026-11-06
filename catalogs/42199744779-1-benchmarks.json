@@ -1,0 +1,221 @@
+{
+  "observed": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "status": "discovered",
+      "target": "event_dag",
+      "workloads": [
+        {
+          "id": "compare/linear_deep/10",
+          "original_workload": "compare/linear_deep/10",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/linear_deep/100",
+          "original_workload": "compare/linear_deep/100",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/linear_deep/1000",
+          "original_workload": "compare/linear_deep/1000",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/diamond_chain/4",
+          "original_workload": "compare/diamond_chain/4",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/diamond_chain/16",
+          "original_workload": "compare/diamond_chain/16",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/diamond_chain/64",
+          "original_workload": "compare/diamond_chain/64",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/wide_antichain/4",
+          "original_workload": "compare/wide_antichain/4",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/wide_antichain/16",
+          "original_workload": "compare/wide_antichain/16",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/wide_antichain/64",
+          "original_workload": "compare/wide_antichain/64",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/disjoint/10",
+          "original_workload": "compare/disjoint/10",
+          "unit": "ns"
+        },
+        {
+          "id": "compare/disjoint/100",
+          "original_workload": "compare/disjoint/100",
+          "unit": "ns"
+        },
+        {
+          "id": "layers/diamond_chain_prepare/4",
+          "original_workload": "layers/diamond_chain_prepare/4",
+          "unit": "ns"
+        },
+        {
+          "id": "layers/diamond_chain_prepare/16",
+          "original_workload": "layers/diamond_chain_prepare/16",
+          "unit": "ns"
+        },
+        {
+          "id": "layers/diamond_chain_prepare/64",
+          "original_workload": "layers/diamond_chain_prepare/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/contains/8",
+          "original_workload": "clock/contains/8",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/normalize_from/8",
+          "original_workload": "clock/normalize_from/8",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/join/8",
+          "original_workload": "clock/join/8",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/contains/64",
+          "original_workload": "clock/contains/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/normalize_from/64",
+          "original_workload": "clock/normalize_from/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/join/64",
+          "original_workload": "clock/join/64",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/contains/512",
+          "original_workload": "clock/contains/512",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/normalize_from/512",
+          "original_workload": "clock/normalize_from/512",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/clock/join/512",
+          "original_workload": "clock/join/512",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/toposort/shuffled_chain/16",
+          "original_workload": "toposort/shuffled_chain/16",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/toposort/shuffled_chain/128",
+          "original_workload": "toposort/shuffled_chain/128",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-core/event_dag/toposort/shuffled_chain/1024",
+          "original_workload": "toposort/shuffled_chain/1024",
+          "unit": "ns"
+        }
+      ]
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "package": "ankurah-tests",
+      "status": "discovered",
+      "target": "lane_perf",
+      "workloads": [
+        {
+          "id": "single_writer_commit/durable_lww_overwrite",
+          "original_workload": "single_writer_commit/durable_lww_overwrite",
+          "unit": "ns"
+        },
+        {
+          "id": "commit_to_subscriber_latency/server_edit_to_client_change",
+          "original_workload": "commit_to_subscriber_latency/server_edit_to_client_change",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-tests/lane_perf/fresh_fetch_snapshot/100",
+          "original_workload": "fresh_fetch_snapshot/100",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-tests/lane_perf/fresh_fetch_snapshot/1000",
+          "original_workload": "fresh_fetch_snapshot/1000",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-tests/lane_perf/fresh_fetch_snapshot/5000",
+          "original_workload": "fresh_fetch_snapshot/5000",
+          "unit": "ns"
+        },
+        {
+          "id": "bridge_catchup/100",
+          "original_workload": "bridge_catchup/100",
+          "unit": "ns"
+        },
+        {
+          "id": "bridge_catchup/1000",
+          "original_workload": "bridge_catchup/1000",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-tests/lane_perf/bridge_catchup/5000",
+          "original_workload": "bridge_catchup/5000",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-tests/lane_perf/subscription_establishment/10",
+          "original_workload": "subscription_establishment/10",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-tests/lane_perf/subscription_establishment/100",
+          "original_workload": "subscription_establishment/100",
+          "unit": "ns"
+        },
+        {
+          "id": "ankurah-tests/lane_perf/subscription_establishment/1000",
+          "original_workload": "subscription_establishment/1000",
+          "unit": "ns"
+        }
+      ]
+    }
+  ],
+  "registered": [
+    {
+      "id": "ankurah-core/event_dag",
+      "package": "ankurah-core",
+      "status": "registered",
+      "target": "event_dag",
+      "workloads": []
+    },
+    {
+      "id": "ankurah-tests/lane_perf",
+      "package": "ankurah-tests",
+      "status": "registered",
+      "target": "lane_perf",
+      "workloads": []
+    }
+  ]
+}
