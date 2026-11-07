@@ -203,7 +203,7 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     let mut transaction = storage.transaction();
     transaction.add_events(&expected_events).await?;
     transaction.commit().await?.committed()?;
-    let (resident, events) = fork.commit(&entities, &getter).await?.into_parts();
+    let (resident, events) = fork.commit(&entities, &getter, false).await?.into_parts();
     assert_eq!(entities.get(&genesis.entity_id), Some(resident.clone()));
     assert_eq!(events, expected_events);
     assert_eq!(resident.head(), proto::Clock::from_events([&update, &branch.payload]));
@@ -214,7 +214,7 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
 
     let retry = RemoteTrxEntity::edit(&resident)?;
     retry.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), |_| Ok(None)).await?;
-    assert!(retry.commit(&entities, &getter).await?.events().is_empty(), "already-published events do not notify again");
+    assert!(retry.commit(&entities, &getter, false).await?.events().is_empty(), "already-published events do not notify again");
     assert_eq!(resident.head(), proto::Clock::from_events([&update, &branch.payload]));
     Ok(())
 }
@@ -241,7 +241,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     transaction.set_state(&proto::Clock::default(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
     transaction.add_events(&[Attested::opt(genesis.clone(), None)]).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
-    let (entity, _) = candidate.commit(&node.entities, &events).await?.into_parts();
+    let (entity, _) = candidate.commit(&node.entities, &events, false).await?.into_parts();
 
     let edit =
         Event::update(entity.id(), proto::Clock::singleton(&genesis), AuthorId::Unknown, OperationSet(vec![set(title, "Alice's edit")?]));
@@ -263,7 +263,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     transaction.set_state(&entity.head(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
     transaction.add_events(&[Attested::opt(transfer.clone(), None)]).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
-    candidate.commit(&node.entities, &events).await?;
+    candidate.commit(&node.entities, &events, false).await?;
     release.send(()).unwrap();
     assert!(matches!(
         pending.await.unwrap_err().downcast_ref::<MutationError>(),

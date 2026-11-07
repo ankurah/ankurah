@@ -268,7 +268,7 @@ impl NodeApplier {
                     .await?;
                 Ok(Some(EntityChange::new(entity, events)))
             } else {
-                let change = candidate.commit(&node.entities, event_getter).await?;
+                let change = candidate.commit(&node.entities, event_getter, false).await?;
                 Ok((!change.events().is_empty()).then_some(change))
             }
         })
@@ -301,7 +301,7 @@ impl NodeApplier {
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
             storage_trx.commit().await?.committed()?;
-            let change = candidate.commit(&node.entities, event_getter).await?;
+            let change = candidate.commit(&node.entities, event_getter, false).await?;
             Ok((!change.events().is_empty()).then_some(change))
         })
     }

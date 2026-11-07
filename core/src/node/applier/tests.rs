@@ -901,7 +901,7 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
 
     let (notifications, received) = mpsc::channel();
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
-    let change = candidate.commit(&fixture.node.entities, &NoEventReads).await?;
+    let change = candidate.commit(&fixture.node.entities, &NoEventReads, false).await?;
     // Every applied event is published; no notification may be lost.
     assert_eq!(change.events(), applied);
     assert_eq!(change.entity(), &fixture.entity);
@@ -948,7 +948,7 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
     let latest = fixture.entity.to_state()?;
     let (notifications, received) = mpsc::channel();
     let _listener = fixture.entity.broadcast().reference().listen(notifications);
-    let change = candidate.commit(&fixture.node.entities, &fixture.events).await?;
+    let change = candidate.commit(&fixture.node.entities, &fixture.events, false).await?;
     assert!(change.events().is_empty(), "the reader's newer state already includes this event");
     assert_eq!(fixture.entity.to_state()?, latest);
     assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, latest);
@@ -1064,9 +1064,9 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
             node.entities.with_state(&states, &events, entity.id(), prepared.clone()).await?;
         }
         let change = if reader_loads_snapshot {
-            candidate.commit(&node.entities, &events).await?
+            candidate.commit(&node.entities, &events, false).await?
         } else {
-            candidate.commit(&node.entities, &NoEventReads).await?
+            candidate.commit(&node.entities, &NoEventReads, false).await?
         };
         if reader_loads_snapshot {
             assert!(change.events().is_empty(), "the committed event is already resident");

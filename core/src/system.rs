@@ -195,7 +195,7 @@ where SE: StorageEngine + Send + Sync + 'static
         system_entity.apply_events(&event_getter, std::slice::from_mut(attested_event), |_| Ok(None)).await?;
         let attested_state: Attested<EntityState> = EntityState { entity_id: system_entity.id(), state: system_entity.to_state()? }.into();
         self.store_root(attested_state.clone(), events).await?;
-        let (system_entity, _) = system_entity.commit(&self.0.entities, &event_getter).await?.into_parts();
+        let (system_entity, _) = system_entity.commit(&self.0.entities, &event_getter, false).await?.into_parts();
 
         self.0.items.write().unwrap().push(system_entity);
         *self.0.root.write().unwrap() = Some(attested_state);

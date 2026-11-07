@@ -94,9 +94,17 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         }
         let publication = self.node.commit_publication_lock.lock().await;
         self.storage.commit().await?.committed()?;
+        // Tests widen the window between the storage commit and the publication, in which a read
+        // may load what was committed (tests/tests/publication_window.rs).
+        #[cfg(feature = "test-helpers")]
+        if let Some(ms) = std::env::var("ANKURAH_TEST_PUBLICATION_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
         let mut changes = Vec::new();
         for (_, entity) in self.entities.entries.drain(..) {
-            let change = entity.fork.commit(&self.node.entities, &self.event_getter).await?;
+            // Nothing else can have published a durable node's own events: its reads publish nothing, and its
+            // storage commit excluded other writers.
+            let change = entity.fork.commit(&self.node.entities, &self.event_getter, self.node.durable).await?;
             if !change.events().is_empty() {
                 changes.push(change);
             }

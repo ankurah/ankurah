@@ -129,8 +129,23 @@ impl RemoteTrxEntity {
     }
 
     /// Publish admitted events after storage commits, then redirect any views to the resident entity.
-    pub(crate) async fn commit<G>(self, entities: &WeakEntitySet, getter: &G) -> Result<EntityChange, MutationError>
-    where G: GetEvents + Send + Sync {
+    /// With `nothing_else_published`, every event is published, even one the resident holds already:
+    /// a durable node committing its own transaction knows no other path published them, since the
+    /// storage commit expected the fork's base, so no other writer applied them, and a read that
+    /// loaded the committed state meanwhile (a fetch, a new query's initial rows) told the reactor
+    /// nothing. Dropped, such an event would reach no live query. Without it, only the events this
+    /// commit applied are published, one the resident held already having been published when it
+    /// was applied: an ephemeral node may hear its own commit back from its durable peer first. The
+    /// window stays open there, and on the applier's path.
+    pub(crate) async fn commit<G>(
+        self,
+        entities: &WeakEntitySet,
+        getter: &G,
+        nothing_else_published: bool,
+    ) -> Result<EntityChange, MutationError>
+    where
+        G: GetEvents + Send + Sync,
+    {
         let data = self.0.data();
         let events = std::mem::take(&mut *data.events.lock().unwrap());
 
@@ -154,10 +169,14 @@ impl RemoteTrxEntity {
 
         // A reader may have loaded committed state while this transaction was publishing.
         let applied = resident.state.apply_events(getter, &events).await?;
-        let applied_events = events.into_iter().zip(applied).filter_map(|(event, applied)| applied.then_some(event)).collect();
+        let published = if nothing_else_published {
+            events
+        } else {
+            events.into_iter().zip(applied).filter_map(|(event, applied)| applied.then_some(event)).collect()
+        };
 
         data.committed(resident.clone());
-        Ok(EntityChange::new(Entity::from_resident(resident), applied_events))
+        Ok(EntityChange::new(Entity::from_resident(resident), published))
     }
 
     pub(crate) fn rollback(&self) {
