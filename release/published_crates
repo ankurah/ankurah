@@ -2,6 +2,9 @@
 ankurah-core-types
 ankql
 
+# Digest trees (depends only on ankurah-core-types)
+ankurah-digest-tree
+
 # Tier 2: Core infrastructure (depends only on ankql)
 ankurah-proto
 ankurah-derive

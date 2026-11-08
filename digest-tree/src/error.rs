@@ -1,0 +1,174 @@
+//! What can go wrong, grouped by whose fault it is.
+
+use std::fmt;
+
+use ankurah_core_types::ValueType;
+
+/// A digest tree's errors, grouped by whose fault each is.
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    // The caller's.
+    /// A member couldn't give its value for a part of the tree's key. A
+    /// transaction records nothing of the change that named it, and a
+    /// creation that held it writes nothing.
+    #[error("member {member:02x?} couldn't give a value for the tree's key: {source}")]
+    Key {
+        /// The member's id, as its bytes.
+        member: Vec<u8>,
+
+        /// Why the member couldn't give its value.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    /// A member gave a part of the tree's key a value of another type than
+    /// the part's, which would sort its key among values it can't be compared
+    /// with. A transaction records nothing of the change that named it, and a
+    /// creation that held it writes nothing.
+    #[error("member {member:02x?} gives key part {part} a {found:?}, where the key spec wants a {expected:?}")]
+    WrongValueType {
+        /// The member's id, as its bytes.
+        member: Vec<u8>,
+
+        /// Which part, counting from zero.
+        part: usize,
+
+        /// The part's type.
+        expected: ValueType,
+
+        /// The value's type.
+        found: ValueType,
+    },
+
+    /// A key range gave a part of the tree's key a value of another type
+    /// than the part's.
+    #[error("key part {part} is given a {found:?}, where the key spec wants a {expected:?}")]
+    KeyValueType {
+        /// Which part, counting from zero.
+        part: usize,
+
+        /// The part's type.
+        expected: ValueType,
+
+        /// The value's type.
+        found: ValueType,
+    },
+
+    /// A key range gave values for more parts than the key has.
+    #[error("{given} key values given, for a key of {parts} parts")]
+    KeyLength {
+        /// How many parts the key has.
+        parts: usize,
+
+        /// How many values were given.
+        given: usize,
+    },
+
+    /// A key spec's part names a collation. The tree implements none, and
+    /// ignoring the name would order members otherwise than the spec says.
+    #[error("key part {part} names a collation, which the tree doesn't implement")]
+    Collation {
+        /// Which part, counting from zero.
+        part: usize,
+    },
+
+    /// A change named a version of a member that isn't the one held. At the
+    /// change's call, the transaction had left the member in another version,
+    /// and the change isn't recorded. When the commit is applied, the tree's
+    /// leaf is missing or holds another payload: the tree and its owner
+    /// disagree, so nothing is written, and the owner rebuilds the tree.
+    #[error("member {member:02x?} is not held in the version a change names")]
+    NotHeld {
+        /// The member's id, as its bytes.
+        member: Vec<u8>,
+    },
+
+    /// An insert, or an update moving a member to another key, named a
+    /// version already held: by the transaction, at an insert's call, or by
+    /// the tree under that key, when the commit is applied, and then nothing
+    /// is written.
+    #[error("member {member:02x?} is already held")]
+    AlreadyHeld {
+        /// The member's id, as its bytes.
+        member: Vec<u8>,
+    },
+
+    /// An update's new version is of another member than its old one.
+    #[error("an update gives member {old:02x?} the id {new:02x?}")]
+    IdChanged {
+        /// The old version's id, as its bytes.
+        old: Vec<u8>,
+
+        /// The new version's id, as its bytes.
+        new: Vec<u8>,
+    },
+
+    /// A tree's creation was given two members with the same id. Keeping
+    /// either would hide the mistake.
+    #[error("member {member:02x?} is given twice")]
+    DuplicateMember {
+        /// The member's id, as its bytes.
+        member: Vec<u8>,
+    },
+
+    /// A tree's creation was given a store that already holds rows: a
+    /// tree's, or others'.
+    #[error("the store already holds rows")]
+    StoreNotEmpty,
+
+    /// A commit or a creation was given a transaction on another tree's
+    /// store, where its rows would land beside that tree's.
+    #[error("the transaction is on another tree's store")]
+    OtherTree,
+
+    /// `DigestTree::open` was given a store that holds no tree.
+    #[error("the store holds no tree")]
+    NoTree,
+
+    /// `DigestTree::open` found a tree summed in another digest group.
+    #[error("the store's tree is summed in another digest group")]
+    WrongGroup,
+
+    // The store's.
+    /// The store couldn't read or write.
+    #[error(transparent)]
+    Store(#[from] StoreError),
+
+    // The tree's.
+    /// The tree's own invariant broke: a bug, reported and never repaired
+    /// silently. The owner discards the tree.
+    #[error("the tree is inconsistent: {0}")]
+    Inconsistent(&'static str),
+}
+
+/// A store's failure to read or write, and whether trying again can help.
+#[derive(Debug)]
+pub struct StoreError {
+    source: Box<dyn std::error::Error + Send + Sync>,
+    retryable: bool,
+}
+
+impl StoreError {
+    /// A failure that trying again may fix, such as a lost connection.
+    pub fn retryable(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self { source: source.into(), retryable: true }
+    }
+
+    /// A failure that trying again won't fix, such as corrupt bytes.
+    pub fn permanent(source: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Self {
+        Self { source: source.into(), retryable: false }
+    }
+
+    /// Whether trying again may help.
+    pub fn is_retryable(&self) -> bool { self.retryable }
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.retryable { "retryable" } else { "permanent" };
+        write!(f, "store failure ({kind}): {}", self.source)
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(self.source.as_ref()) }
+}

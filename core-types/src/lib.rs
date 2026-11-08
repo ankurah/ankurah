@@ -1,17 +1,21 @@
 //! Dependency-leaf durable identities and values shared by the query,
-//! protocol, core, and storage crates.
+//! protocol, core, and storage crates, with how values sort, the key specs
+//! that order an index's entries, and which way a read runs over keys.
 
 #![deny(missing_docs)]
 
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
+pub mod collation;
 mod entity_id;
 mod error;
+pub mod key_spec;
 mod model_id;
 mod path;
 mod property_id;
 mod property_path;
+mod scan_direction;
 mod value;
 mod value_type;
 
@@ -21,5 +25,6 @@ pub use model_id::{ModelId, SystemModel};
 pub use path::Path;
 pub use property_id::{PropertyId, SystemProperty};
 pub use property_path::PropertyPath;
+pub use scan_direction::ScanDirection;
 pub use value::{CastError, Value, ValueParseError};
 pub use value_type::ValueType;

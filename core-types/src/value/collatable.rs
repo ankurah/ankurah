@@ -1,6 +1,6 @@
 use crate::collation::Collatable;
 use crate::value::Value;
-use ankurah_core_types::EntityId;
+use crate::EntityId;
 
 // Collation for Value (single value). Tuple framing (type tags/lengths) is handled by higher-level encoders.
 impl Collatable for Value {

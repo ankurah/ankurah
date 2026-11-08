@@ -1,4 +1,3 @@
-mod collatable;
 mod ext;
 
 pub use ankurah_core_types::{CastError, Value, ValueParseError, ValueType};

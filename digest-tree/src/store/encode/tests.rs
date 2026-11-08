@@ -1,0 +1,147 @@
+use ankurah_core_types::key_spec::{IndexDirection, IndexKeyPart, KeySpec, NullsOrder};
+use ankurah_core_types::ValueType;
+
+use super::*;
+use crate::common::{asc, desc, Property, Tag};
+use crate::digest::leaf_encoding;
+use crate::{LtHash16, Ristretto255};
+use proptest::prelude::*;
+use proptest::test_runner::RngSeed;
+
+/// Row keys of every kind, with short bodies so that ties and prefixes are
+/// common.
+fn row_key() -> impl Strategy<Value = RowKey> {
+    let bytes = || proptest::collection::vec(prop_oneof![Just(0u8), Just(0xFF), any::<u8>()], 0..4);
+    prop_oneof![
+        Just(RowKey::Meta),
+        (proptest::collection::vec(any::<bool>(), 0..20))
+            .prop_map(|bits| RowKey::Node(bits.into_iter().fold(NodePrefix::root(), |prefix, bit| prefix.child(bit)))),
+        bytes().prop_map(RowKey::Leaf),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2048, rng_seed: RngSeed::Fixed(0xe4c0_0001), ..ProptestConfig::default() })]
+
+    #[test]
+    fn row_keys_round_trip_and_their_encodings_sort_as_they_do(a in row_key(), b in row_key()) {
+        prop_assert_eq!(RowKey::decode(&a.encode()).unwrap(), a.clone());
+        prop_assert_eq!(a.encode().cmp(&b.encode()), a.cmp(&b), "{:?} against {:?}", a, b);
+    }
+}
+
+/// The message of a decoding's failure, which must be permanent.
+fn refusal<T: std::fmt::Debug>(decoded: Result<T, StoreError>) -> String {
+    let failure = decoded.unwrap_err();
+    assert!(!failure.is_retryable());
+    failure.to_string()
+}
+
+#[test]
+fn bytes_that_are_no_row_key_are_refused_permanently() {
+    for (bytes, why) in [
+        (vec![], "bytes that are no row key"),
+        (vec![4], "bytes that are no row key"),
+        (vec![META, 0], "bytes that are no row key"),
+        (vec![NODE, 254], "a byte past the places of a seven-level walk"),
+    ] {
+        assert!(refusal(RowKey::decode(&bytes)).contains(why), "{bytes:?}: {why}");
+    }
+}
+
+fn element<G: DigestGroup>() -> G::Element { G::hash_leaf(&leaf_encoding(b"k", b"id", b"p")) }
+
+/// A row's encoding, decoded and encoded again: equal bytes mean the row
+/// came back whole.
+fn round_trip<G: DigestGroup>(row: &Row<Property, Tag, G>) -> Vec<u8> { Row::<Property, Tag, G>::decode(&row.encode()).unwrap().encode() }
+
+fn rows_round_trip<G: DigestGroup>() {
+    let element = element::<G>();
+    let mut digest = Digest::empty();
+    digest.add_element(&element).unwrap();
+
+    // Every field of a part a stored spec keeps, though a tree refuses a
+    // spec that names a collation.
+    let key_spec = KeySpec::new(vec![
+        asc!(Property::A, ValueType::I64),
+        desc!(Property::B, ValueType::String),
+        IndexKeyPart {
+            key: Property::Year,
+            sub_path: Some(vec!["released".into(), "year".into()]),
+            direction: IndexDirection::Asc,
+            value_type: ValueType::Json,
+            nulls: Some(NullsOrder::First),
+            collation: Some("unicode".into()),
+        },
+    ]);
+
+    // A bucket, a branch ten bits into its members' addresses, and a branch
+    // whose children share the empty prefix, which encodes as no bytes.
+    let nodes =
+        [None, Some(NodePrefix::of(&[0xB3, 0x40], 10)), Some(NodePrefix::root())].map(|branches_at| NodeRow { digest, branches_at });
+
+    let rows: [Row<Property, Tag, G>; 6] = [
+        Row::Meta(Meta { key_spec: key_spec.clone(), group: G::ROW_VERSION }),
+        Row::Meta(Meta { key_spec: KeySpec::<Property>::new(vec![]), group: G::ROW_VERSION }),
+        Row::Node(nodes[0].clone()),
+        Row::Node(nodes[1].clone()),
+        Row::Node(nodes[2].clone()),
+        Row::Leaf(LeafRow { payload: Tag(b"payload".to_vec()), element }),
+    ];
+
+    for row in &rows {
+        assert_eq!(round_trip(row), row.encode(), "{row:?}");
+    }
+
+    match Row::<Property, Tag, G>::decode(&rows[0].encode()).unwrap() {
+        Row::Meta(meta) => assert_eq!((meta.key_spec, meta.group), (key_spec, G::ROW_VERSION)),
+        other => panic!("expected metadata, got {other:?}"),
+    }
+
+    for (row, node) in rows[2..5].iter().zip(nodes) {
+        match Row::<Property, Tag, G>::decode(&row.encode()).unwrap() {
+            Row::Node(decoded) => assert_eq!(decoded, node),
+            other => panic!("expected a node, got {other:?}"),
+        }
+    }
+
+    match Row::<Property, Tag, G>::decode(&rows[5].encode()).unwrap() {
+        Row::Leaf(leaf) => assert_eq!((leaf.payload, leaf.element), (Tag(b"payload".to_vec()), element)),
+        other => panic!("expected a leaf, got {other:?}"),
+    }
+}
+
+#[test]
+fn ristretto255_rows_round_trip() { rows_round_trip::<Ristretto255>() }
+
+#[test]
+fn lthash16_rows_round_trip() { rows_round_trip::<LtHash16>() }
+
+#[test]
+fn bytes_that_are_no_row_are_refused_permanently() {
+    let leaf = Row::<Property, Tag, LtHash16>::Leaf(LeafRow { payload: Tag(vec![]), element: element::<LtHash16>() }).encode();
+
+    // A bucket's row, and that row with each kind of damage to what follows
+    // its digest.
+    let bucket = Row::<Property, Tag, Ristretto255>::Node(NodeRow { digest: Digest::empty(), branches_at: None }).encode();
+    let with_record = |record: &[u8]| [&bucket[..bucket.len() - 1], record].concat();
+
+    for (bytes, why) in [
+        (vec![], "bytes that are no row"),
+        (vec![4], "bytes that are no row"),
+        (vec![META], "a truncated metadata row"),
+        (vec![META, 1, 0, 0, 0, 1, 9], "bytes that are no property"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 7], "a key part's direction is 0 or 1"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 0, 42], "a key part's value type is unknown"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 0, 2, 3], "a key part's nulls order is 0, 1 or 2"),
+        (vec![META, 1, 0, 0, 0, 1, 1, 0, 2, 0], "a truncated key spec"),
+        (leaf, "unknown digest version 2"),
+        (vec![NODE, 1], "a truncated node row"),
+        (with_record(&[]), "a node row that says neither bucket nor branch"),
+        (with_record(&[2]), "a node row that says neither bucket nor branch"),
+        (with_record(&[BUCKET, 0]), "a node row that says neither bucket nor branch"),
+        (with_record(&[BRANCH, 254]), "a byte past the places of a seven-level walk"),
+    ] {
+        assert!(refusal(Row::<Property, Tag, Ristretto255>::decode(&bytes)).contains(why), "{bytes:02x?}: {why}");
+    }
+}

@@ -1,0 +1,79 @@
+[package]
+name          = "ankurah-digest-tree"
+description   = "Digest trees: sets kept in key order with a digest over every subtree, so two sets compare by their digests"
+version       = "0.10.0"
+edition       = "2021"
+license       = "MIT OR Apache-2.0"
+documentation = "https://docs.rs/ankurah-digest-tree"
+homepage      = "https://github.com/ankurah/ankurah"
+repository    = "https://github.com/ankurah/ankurah"
+
+[features]
+default = []
+# Helpers for other crates' tests: the keys and digests a tree makes for its
+# members, and auditing a tree. Also the store in memory that the crate's
+# introduction, tests and benchmarks keep their trees in.
+test-support = ["dep:tokio"]
+
+[dependencies]
+# The values a key holds, how they sort, and the key spec that orders them.
+ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
+# A reference store's locks, held across awaits, on any async runtime: its
+# transactions' writer's turn, and its readers' lock, a FIFO lock whose waiting
+# readers never wake each other, since on a single-threaded executor two
+# readers waiting behind a commit that awaits an outside event would otherwise
+# hand the wakeup back and forth forever.
+tokio = { version = "1.40", default-features = false, features = ["sync"], optional = true }
+# std, the one default feature, builds for wasm32 and lets x86 builds choose
+# their SIMD implementation at run time.
+blake3 = "1.8.2"
+# No default features: the digests need neither basepoint tables nor zeroizing.
+curve25519-dalek = { version = "4.1.3", default-features = false }
+# The Stream trait alone, which a scan of a view's members implements.
+futures-core = "0.3"
+serde        = { version = "1.0", features = ["derive"] }
+sha2         = "0.10.8"
+thiserror    = "2"
+
+# A large creation or commit hashes its members on rayon's global pool; wasm32
+# hashes on the calling thread.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.12"
+
+[dev-dependencies]
+anyhow = "1.0"
+# Span digests and pages of members cross the wire through serde: as bytes in
+# bincode, and as a sequence in JSON, which has no byte strings.
+bincode    = "1.3.3"
+proptest   = { version = "1.11", default-features = false, features = ["std"] }
+serde_json = "1.0"
+# Top-level tests keep their trees in the memory store, audit them and place
+# members by their keys, which the crate offers behind its test-support
+# feature.
+ankurah-digest-tree = { path = ".", features = ["test-support"] }
+# The tests await the tree's operations; the introduction's wire waits out
+# its latency.
+tokio = { version = "1.40", default-features = false, features = [
+    "rt",
+    "rt-multi-thread",
+    "macros",
+    "time",
+] }
+futures = "0.3"
+
+# criterion's default rayon feature refuses wasm32, and the benchmarks run natively.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+criterion = "0.5"
+
+# harness = false because criterion provides its own harness. The digest
+# benchmark measures hashing and digest arithmetic through the test-support
+# helpers, and the tree benchmark keeps its trees in the memory store.
+[[bench]]
+harness           = false
+name              = "digest"
+required-features = ["test-support"]
+
+[[bench]]
+harness           = false
+name              = "tree"
+required-features = ["test-support"]

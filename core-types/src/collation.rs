@@ -1,11 +1,18 @@
+//! How values sort: each collatable value's bytes sort as the values do.
+
 use std::cmp::Ordering;
 
-use ankurah_proto::EntityId;
+use crate::EntityId;
 /// Represents a bound in a range query
 #[derive(Debug, Clone, PartialEq)]
 pub enum RangeBound<T> {
+    /// The range includes this value.
     Included(T),
+
+    /// The range ends just short of this value.
     Excluded(T),
+
+    /// The range has no bound on this side.
     Unbounded,
 }
 
@@ -29,6 +36,7 @@ pub trait Collatable {
     /// Compare two values in the collation order
     fn compare(&self, other: &Self) -> Ordering { self.to_bytes().cmp(&other.to_bytes()) }
 
+    /// Whether the value lies between these bounds, in the collation order
     fn is_in_range(&self, lower: RangeBound<&Self>, upper: RangeBound<&Self>) -> bool {
         match (lower, upper) {
             (RangeBound::Included(l), RangeBound::Included(u)) => self.compare(l) != Ordering::Less && self.compare(u) != Ordering::Greater,
