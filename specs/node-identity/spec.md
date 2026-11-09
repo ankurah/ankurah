@@ -4,7 +4,8 @@ Status: design of record for the branch `feat/node-identity-attestation`, writte
 2026-11-08 from Daniel's rulings of the same day. Base: origin/main at 03349a58. The
 explainer page that records the reasoning, the verified facts and the retraction audit is
 "Node Identity and the System Root" (kept at ~/ak/ankurah-explainers, outside the
-repository); this file is the part an implementer builds from.
+repository); this file is the part an implementer builds from. Revised on 2026-11-09 after the
+first pass was reassessed; section 12 lists each revision and its reason.
 
 The branch is one pass with no line limit. It is reviewed whole, then re-cut into stacked
 pull requests. Factor prudently: a concern gets a module named for its job, behavior sits
@@ -31,7 +32,8 @@ Every choice below is checked against all seven together.
    records a key and knows nothing of what a key denotes.
 6. **Development stays convenient without shaping production.** A node in a client role, which
    the application defines, discards stale data after a development reseed because the
-   application decides so from its own data; core offers only the reset primitive.
+   application decides so from its own data. Core offers the reset primitive and the place to
+   attach such a decision (a node plugin, section 7); it holds no application concept itself.
 7. **The id derivation changes once.** Entity and event ids are recomputed under the new
    derivation; existing development stores are discarded. Migration tooling is not part of
    this branch.
@@ -44,11 +46,17 @@ Every choice below is checked against all seven together.
 - The minter of a genesis is a cryptographic `Identity`, a node's key by default. `system`
   and `author` leave both id preimages. `AuthorId` leaves the crate.
 - The system root, its creation, adoption, handshake comparison and halt-on-mismatch leave
-  core. `create()` needs nothing but the node's key. A public reset primitive remains.
-- `Membership::Remove` is appended so an entity can leave a component.
+  core, and so does the built-in `_ankurah_system` model, which held nothing but the root.
+  `create()` needs nothing but the node's key. `Node::reset` remains as the public reset
+  primitive.
+- A node carries plugins, attached at construction. A plugin announces bytes inside the
+  node's signed presence and is asked about every peer registration before the peer is
+  registered; it can refuse the peer. Resetting a client after a development reseed is built
+  on it, outside core.
 - Attestations become structured, signed envelopes. Every node attests the events it
-  commits; a durable node attests the states it serves and, when policy says so, the events
-  it admits. Core verifies and strips envelopes before any policy hook sees them.
+  commits; when policy says so, a durable node attests the states it serves and the events it
+  admits. Core verifies and strips envelopes before any policy hook sees them, and accepts a
+  genesis from outside only with its minter's committed attestation.
 - Ankurah ships the Commons publisher's public key as the default trusted publisher, through a
   build-time included file and an overridable `PolicyAgent` method.
 
@@ -197,6 +205,16 @@ impl Event {
   (a publishing tool); a `Context` opened under another identity is not part of this branch.
 - The minter appears in the genesis only. An update's authorship rides the committing node's
   attestation (section 8).
+- The minter is verified, never taken as claimed. At every ingress of a genesis this node did
+  not create (the applier's event arm, `commit_remote_transaction`, the peer event fetch in
+  retrieval), core refuses the event with a typed error unless its verified attestation set
+  holds a `Committed` attestation whose attester equals the genesis's minter. The refusal
+  behaves as a structurally invalid event behaves on that path. A node that serves or relays
+  a genesis sends the stored attestations with it, so the check holds at any distance from
+  the minter. The rule is core's and does not depend on the policy agent: without it a
+  genesis could name any identity as its minter, and `trusted_publishers` would mean nothing.
+  It is the same for a minter that is not a node: a publisher's key signs the committed
+  attestations of the entities it mints.
 - The simulation harness (`tests/src/sim`) seeds one deterministic `Identity` per simulated
   node from the simulation seed and mints under it; `sim_system_id` and its comment go.
 - The LWW tie-break, generations, clocks and the comparison are untouched.
@@ -209,9 +227,22 @@ What leaves, by symbol:
   `Presence.system_root`.
 - core/src/system.rs: `root`, `root()`, `root_id()`, `create()`, `adopt_system()`,
   `store_root`, the root arm of `load_system_catalog`, `allow_system_replacement`,
-  `set_allow_system_replacement`. What stays: the `_ankurah_system` items that are not the
-  root, readiness from the catalog load, the halt state, and the wipe (renamed and made
-  public, below). Keep the type where callers need it; renaming it is for the re-cut.
+  `set_allow_system_replacement`.
+- The built-in model that held the root. The root was the only `_ankurah_system` item main
+  ever created, so nothing is left in it: `SystemModel::System`, `SystemProperty::Item`,
+  `proto::sys`, `SYSTEM_COLLECTION_ID`, `PROTECTED_COLLECTIONS`, `SystemManager::items` and
+  its load step, and the `_ankurah_system` table or tree in every storage engine all go.
+  `ModelId::System(..)` and `PropertyId::System(..)` remain as core's variants for its catalog
+  models and their properties.
+- The readiness gate that load fed. With nothing to load, the system-ready flag,
+  `wait_system_ready`, `is_system_ready`, `require_system_ready`'s readiness half and
+  `NodeState::Uninitialized` have no job. Each goes unless the code shows a job this section
+  missed; a caller that needs a running node uses `Node::wait_ready`, and a caller that only
+  waited for the system load waits for nothing.
+- The name `SystemManager`. What remains is the node's run state: the `NodeState` signal,
+  halt, and reset. It becomes `NodeLifecycle` in `core/src/node/lifecycle.rs`, reached through
+  `Node`'s own methods (`state`, `check_ready`, `wait_ready`, `reset`, and an accessor for the
+  epoch) instead of a public `system` field. `SystemEpoch` keeps its name and meaning.
 - core/src/error.rs: `NodeHaltReason::SystemReplacement`, `MutationError::SystemNotReady`,
   `RequestError::SystemNotReady`, `RegistrationError::SystemNotReady`; `ForeignEntity` and
   `SystemEpoch` stay (the epoch is per node and unrelated to the root).
@@ -225,8 +256,8 @@ What leaves, by symbol:
 
 What is added:
 
-- `Node::reset_local_storage(&self) -> Result<()>`: halts the node with
-  `NodeHaltReason::LocalReset`, then wipes storage through `StorageEngine::delete_all`,
+- `Node::reset(&self) -> Result<()>`: halts the node with `NodeHaltReason::Reset`, then
+  wipes storage through `StorageEngine::delete_all`,
   finishing even if the caller drops the future (today's `hard_reset`, made public and freed
   from the replacement path). Issue #477's contract stands: the host discards the halted node
   and its contexts and live queries, and builds a fresh node on the wiped store.
@@ -237,21 +268,68 @@ What is added:
   signed presence, durable standing by provenance); the authorship claim is updated for
   committed attestations; the system-root rows are retired.
 
-## 7. Membership removal
+## 7. Node plugins
+
+For: behaviour that only some applications want attaches to a node from outside core, several
+to one node, and sees every peer registration before anything is exchanged with that peer.
+Resetting a client after a development reseed is the first such behaviour. The policy agent
+cannot carry it: a node has one agent, and the agent's subject is access.
+
+Built in the pass after the fixes of 2026-11-09; this section is its contract.
 
 ```rust
-pub enum Membership { Add(ModelId), Remove(ModelId) }   // appended
+// core/src/node/plugin.rs
+#[async_trait]
+pub trait NodePlugin<SE, PA>: Send + Sync + 'static {
+    /// Names this plugin's entry in a presence.
+    fn name(&self) -> &'static str;
+    /// Bytes this node announces to every peer under `name`, inside its signed presence.
+    async fn announce(&self, node: &Node<SE, PA>) -> Option<Vec<u8>> { None }
+    /// Asked once per registration, after the presence verifies and trust is decided and
+    /// before the peer is registered. `Err` refuses the peer.
+    async fn peer_registering(&self, node: &Node<SE, PA>, peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> { Ok(()) }
+}
+/// One peer's registration as a plugin sees it: its id, provenance and trust, and the bytes it
+/// announced under the asking plugin's name.
+pub struct PeerRegistration<'a> { .. }
+pub struct PeerRefusal { pub plugin: &'static str, pub reason: String }
+
+// proto/src/peering.rs: in Presence and in PresenceClaims, so the presence signature covers it
+pub announcements: BTreeMap<String, Vec<u8>>
 ```
 
-- A genesis may carry `Add` only; a `Remove` in a genesis is inadmissible
-  (`check_genesis_membership`'s sibling). An update may add or remove. Removing the last
-  membership is allowed: the entity remains addressable by id, typed access reports
-  `MissingComponent`, and `MemberOf` queries no longer match it.
-- `LocalTrxEntity::remove_membership(model)` beside `add_membership`; state application
-  removes the membership; every storage engine updates its membership index on removal; live
-  queries observe the change as a predicate removal.
-- Tests: add then remove in one transaction; remove in a later update; removal observed by a
-  live query on each engine the suite covers.
+- A plugin decides from what the handshake carries. No connector reads a peer's messages
+  while `register_peer` is awaited (the websocket server awaits it inside its receive loop,
+  the websocket client sends its own presence only after it returns, the local-process
+  connector starts its receivers after both registrations), so a plugin cannot ask the peer
+  anything from this hook. A hook that converses with a peer needs a registered but
+  unconfirmed peer state in the node and every connector; it is out of scope until a plugin
+  needs it.
+- Plugins attach at construction, so a plugin sees every registration of its node:
+  `Node::builder(engine, agent)` with `durable()`, `key(..)`, `plug(..)` and `build()`. The
+  builder absorbs `new_with_key` and `new_durable_with_key`, which this branch added; `new`
+  and `new_durable` stay as the shorthands for a node with no plugin. Two plugins under one
+  name fail `build()` with a typed error.
+- `Node::presence` gathers each plugin's announcement, in the order plugged, under its name.
+- `register_peer` asks each plugin, in the order plugged, after the protocol check, the
+  challenge authentication and `peer_trust`, and before anything is inserted. The first
+  refusal returns `PeerConnectionError::Refused(PeerRefusal)` and leaves nothing registered.
+  No lock is held across a hook. A plugin may call `Node::reset` from the hook and then
+  refuse.
+- Each hook on the trait has a consumer in the tree. A further hook arrives with the plugin
+  that needs it.
+
+### 7.1 The first plugin: reset after a reseed
+
+Outside core, in `extensions/`. The application declares a System component (later adopted
+from the Commons) and its server holds one entity of it per seeding. The plugin announces the
+ids of the System entities its node holds. A node the application treats as a client resets
+when a peer trusted as durable announces System entities and the node holds System entities
+and the two sets share none; it then refuses the peer, and the host builds a fresh node on
+the wiped store. Either side holding none is no verdict, so a first connection, a peer that
+is behind, and a peer of the same application all register normally. Whether a mismatch
+resets the node or only refuses the peer is the application's choice when it plugs the
+plugin. The exact types are settled before this plugin is built.
 
 ## 8. Attestation
 
@@ -282,10 +360,12 @@ Production:
 - Every node attaches a `Committed` attestation, signed with its own key, to every event it
   commits, in the local commit path and in `commit_remote_transaction` for the events the
   committing node minted. The claims of a committed attestation are empty in this branch.
-- A durable node attaches a `State` attestation, signed with its own key, to every state it
-  serves (fetch responses, subscription deltas, direct gets). `PolicyAgent::attest_state`
-  becomes `fn attest_state(&self, node, state) -> Option<Vec<u8>>`, returning the claims to
-  carry; `None` carries empty claims. Ephemeral nodes attach no state attestation.
+- `PolicyAgent::attest_state` is `fn attest_state(&self, node, state) -> Option<Vec<u8>>`.
+  When it returns claims, a durable node attaches a `State` attestation carrying them, signed
+  with its own key, to the state it is serving (fetch responses, subscription deltas, direct
+  gets). `None` attaches nothing: no signature is made and none is verified, because nothing
+  in the tree consumes a state attestation yet. `PermissiveAgent` and `JwtAgent` return
+  `None`. Ephemeral nodes attach no state attestation.
 - `PolicyAgent::check_write_event` returns `Result<Admission, AccessDenied>` with
   `pub enum Admission { Attest { claims: Vec<u8> }, Allow }`. On `Attest`, core signs an
   `Admitted` attestation for the event. `PermissiveAgent` answers `Allow`; `JwtAgent` answers
@@ -299,6 +379,8 @@ the peer event fetch in retrieval):
   fails either is stripped and counted under a tracing warning. The payload then reaches
   `validate_received_event` or `validate_received_state` with its verified set, and the agent
   decides sufficiency. `PermissiveAgent` accepts anything, including an empty set.
+- A genesis additionally needs its minter's committed attestation (section 5). That check is
+  core's and runs before the policy hooks.
 - Recognition of an attester as a trusted durable peer or a trusted publisher is the agent's
   decision inside those hooks, reading the node's peer trust and `trusted_publishers`.
 - Storage keeps attestations beside events and states as today; every stored set is empty on
@@ -317,6 +399,15 @@ published definitions and anything else Commons-side; catalog convergence for co
 registered independently; a `Context` opened under a non-node identity; migration tooling in
 ak-cli; iroh. Each is named in the explainer page with its owner.
 
+Membership removal. The first pass built `Membership::Remove` with the rule that a removal
+loses to any addition outside its ancestry. Two replicas that each add a membership and then
+remove it merge to "member" under that rule, although every addition was removed by an event
+that saw it. The sound rule is an observed-remove set, which changes the shape of `State`;
+it is designed on its own. `Membership` keeps `Add` alone, and everything the first pass
+added for removal comes out.
+
+A plugin hook that converses with a peer (section 7).
+
 ## 11. Acceptance
 
 Beyond the suites staying green, these tests exist and state their scenario:
@@ -331,19 +422,46 @@ Beyond the suites staying green, these tests exist and state their scenario:
   another are different entities; `create()` succeeds on a node that has never connected.
 - No root: a durable node and an ephemeral node connect and exchange entities with no root
   anywhere; two independently created durable stores connect and exchange when configured to
-  trust each other; `reset_local_storage` halts and wipes and a fresh node starts clean.
-- Membership removal as in section 7.
+  trust each other; `Node::reset` halts and wipes and a fresh node starts clean; no store
+  holds an `_ankurah_system` table or tree.
+- The minter is verified: a genesis arriving by commit, by subscription update and by event
+  fetch without its minter's committed attestation is refused with the typed error, on a
+  durable and on an ephemeral receiver; one whose only committed attestation is signed by
+  another identity is refused; a genesis relayed through a durable node is accepted by a
+  third node.
+- Plugins (their pass): an announcement travels in the signed presence and a changed one
+  fails the presence signature; a refusing plugin makes `register_peer` return `Refused` with
+  nothing registered, on every connector; plugins are asked in the order plugged; a client
+  holding one seeding's System entity resets and refuses a server announcing another's, and
+  registers normally with a server announcing the same one or none.
 - Attestations: a committed attestation on every locally committed event, verified by the
-  receiving peer; a state attestation on every served state from a durable node; a tampered
+  receiving peer; a state attestation on a served state exactly when the agent's
+  `attest_state` returns claims; a tampered
   attestation and a transplanted attestation are stripped and counted; `Admission::Attest`
   yields an admitted attestation and `Allow` yields none; the trusted-publishers default reads
   the shipped file and an override replaces it.
 
-## 12. Assumptions recorded for the morning review
+## 12. Assumptions, and the revisions of 2026-11-09
 
 - Daniel's "in a file that gets included at build time" (8 November, on the question of where
   a node's seed lives) is taken to mean the Commons publisher's public key (3.3). Node seeds
   keep the embedder-chosen file of the October cut (3.2).
 - The shipped trusted-publishers file is empty until the Commons key exists.
-- State attestations are unconditional on durable nodes; committed attestations are
-  unconditional on every node; admitted attestations follow the agent's `Admission`.
+- Committed attestations are unconditional on every node; state attestations and admitted
+  attestations follow the agent.
+
+Revisions of 2026-11-09, each with its reason:
+
+- `Node::reset`, from Daniel at 19:43Z: "presumably this should be called fn reset, not
+  reset_local_storage?" What is reset is the node, and "local" told a reader nothing.
+- Node plugins (section 7), from Daniel at 19:43Z: "PeerRegistration seems to be a good enough
+  reason to me to have a NodePlugin", and the hook "should indeed be able to refuse the peer".
+  That the hook decides from the signed presence follows from the connectors, as section 7
+  says; Daniel has not yet seen that consequence.
+- Decided by the lead from the intentions in section 1, open to Daniel's review:
+  the minter is verified at ingress (intention 4; section 5); state attestations are made
+  only when the agent returns claims (no consumer exists; section 8); membership removal
+  leaves the branch (section 10), which reverses Daniel's "we can just add ::Remove" of
+  8 November 04:03Z on the failing case named there; the built-in `_ankurah_system` model,
+  the readiness gate it fed and the name `SystemManager` go (section 6), correcting this
+  file's earlier claim that items other than the root remained.
