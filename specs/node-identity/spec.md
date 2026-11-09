@@ -594,6 +594,10 @@ pub enum Subject { Event(EventId), State { entity: EntityId, head: Clock, state_
 - Storage keeps a set as its elements, so one unreadable attestation never makes an event or
   a state unreadable. Merging an attestation that arrives after its event was stored is
   behaviour for a later release.
+- An event's attestations are kept with the event and relayed with it. A state's are not
+  kept: a statement about a state names one head, so a durable node attaches its own agent's
+  statement when it serves a state and stores states without any. Keeping a received one
+  would mean deciding when it stops naming the stored state, and nothing reads them yet.
 - Tests: an attestation of a kind nobody knows, and one whose bytes do not parse, are stored
   and relayed unchanged by a node between two others; a statement moved to another event
   fails its subject check; a changed payload fails its signature.
