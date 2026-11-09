@@ -186,7 +186,7 @@ impl Connection {
 
         // The server's first frame is its opening.
         if self.handshake.borrow().as_ref().is_some_and(|handshake| !handshake.opened()) {
-            self.receive_opening(&data);
+            self.answer_opening(&data);
             return None;
         }
 
@@ -309,7 +309,7 @@ impl Connection {
     /// Answer the server's first frame, its opening, which arrives once the socket is open: send
     /// this node's opening, then read the server's, and close with the versions this node speaks
     /// when the two share none.
-    fn receive_opening(&self, frame: &[u8]) {
+    fn answer_opening(&self, frame: &[u8]) {
         let Some((opening, read)) =
             self.handshake.borrow_mut().as_mut().map(|handshake| (handshake.opening(), handshake.read_opening(frame)))
         else {

@@ -316,13 +316,19 @@ async fn the_server_closes_a_connection_that_sends_a_second_opening() -> Result<
 }
 
 /// A server played frame by frame against a real client: it reads the client's opening, then
-/// sends its own.
-async fn accept_client(listener: &tokio::net::TcpListener, server_opening: proto::Opening) -> (WebSocketStream<TcpStream>, proto::Opening) {
+/// sends `server_opening`, the bytes of its own.
+async fn accept_client(listener: &tokio::net::TcpListener, server_opening: Vec<u8>) -> (WebSocketStream<TcpStream>, proto::Opening) {
     let (stream, _) = listener.accept().await.expect("accept");
     let mut socket = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
     let Some(proto::Message::Open(client_opening)) = receive(&mut socket).await else { panic!("the client opened otherwise") };
-    socket.send(frame(&proto::Message::Open(server_opening))).await.expect("send");
+    socket.send(WsMessage::Binary(server_opening.into())).await.expect("send");
     (socket, client_opening)
+}
+
+/// The bytes of an opening from `server` offering `versions`.
+fn opening_from(server: &NodeKey, versions: proto::ProtocolVersions) -> (proto::Opening, Vec<u8>) {
+    let opening = proto::Opening { versions, challenge: proto::HandshakeChallenge::new(server.node_id()) };
+    (opening, bincode::serialize(&proto::Message::Open(opening)).unwrap())
 }
 
 /// A real client connecting to a raw server on a fresh port.
@@ -338,8 +344,8 @@ async fn client_of_raw_server(
 async fn the_client_refuses_a_server_presence_that_does_not_repeat_the_offers_and_the_chosen_version() -> Result<()> {
     let (listener, _node, client) = client_of_raw_server().await?;
     let server = NodeKey::generate();
-    let server_opening = proto::Opening { versions: SPOKEN, challenge: proto::HandshakeChallenge::new(server.node_id()) };
-    let (mut socket, client_opening) = accept_client(&listener, server_opening).await;
+    let (server_opening, server_frame) = opening_from(&server, SPOKEN);
+    let (mut socket, client_opening) = accept_client(&listener, server_frame).await;
     let mut claims = claims_answering(&server, &client_opening, SPOKEN, true);
     claims.negotiation.chosen = 2;
     socket.send(frame(&proto::Message::Presence(server.sign_presence(claims)))).await?;
@@ -356,8 +362,8 @@ async fn the_client_refuses_a_server_presence_that_does_not_repeat_the_offers_an
 async fn the_client_ignores_unknown_features_announcements_and_message_kinds() -> Result<()> {
     let (listener, node, client) = client_of_raw_server().await?;
     let server = NodeKey::generate();
-    let server_opening = proto::Opening { versions: SPOKEN, challenge: proto::HandshakeChallenge::new(server.node_id()) };
-    let (mut socket, client_opening) = accept_client(&listener, server_opening).await;
+    let (server_opening, server_frame) = opening_from(&server, SPOKEN);
+    let (mut socket, client_opening) = accept_client(&listener, server_frame).await;
     let mut claims = claims_answering(&server, &client_opening, SPOKEN, true);
     claims.features = vec![7, u32::MAX];
     claims.announcements.insert("a plugin the client does not have".into(), vec![1, 2, 3]);
@@ -380,8 +386,8 @@ async fn the_client_ignores_unknown_features_announcements_and_message_kinds() -
 async fn the_client_refuses_a_peer_message_before_the_servers_presence() -> Result<()> {
     let (listener, _node, client) = client_of_raw_server().await?;
     let server = NodeKey::generate();
-    let server_opening = proto::Opening { versions: SPOKEN, challenge: proto::HandshakeChallenge::new(server.node_id()) };
-    let (mut socket, _) = accept_client(&listener, server_opening).await;
+    let (_, server_frame) = opening_from(&server, SPOKEN);
+    let (mut socket, _) = accept_client(&listener, server_frame).await;
     let early =
         proto::Message::PeerMessage(proto::NodeMessage::UnsubscribeQuery { from: server.node_id(), query_id: proto::QueryId::new() });
     socket.send(frame(&early)).await?;
@@ -396,13 +402,15 @@ async fn the_client_refuses_a_peer_message_before_the_servers_presence() -> Resu
 }
 
 /// The client side of a refusal: a server speaking no version the client speaks is answered with
-/// the client's versions, never treated as connected, and not dialed again before the backoff.
+/// the client's versions, never treated as connected, and not dialed again before the backoff. A
+/// version-1 reader rejects the bytes after the server's challenge, so the refusal shows the client
+/// read no further than the versions.
 #[tokio::test]
 async fn the_client_refuses_a_server_sharing_no_version_without_a_hot_loop() -> Result<()> {
     let (listener, _node, client) = client_of_raw_server().await?;
-    let server = NodeKey::generate();
-    let server_opening = proto::Opening { versions: versions(2, 3), challenge: proto::HandshakeChallenge::new(server.node_id()) };
-    let (mut socket, _) = accept_client(&listener, server_opening).await;
+    let (_, mut server_frame) = opening_from(&NodeKey::generate(), versions(2, 3));
+    server_frame.extend_from_slice(b"bytes a version-1 reader rejects");
+    let (mut socket, _) = accept_client(&listener, server_frame).await;
 
     let outcome = tokio::time::timeout(Duration::from_secs(3), client.wait_connected()).await?;
     assert_eq!(outcome, Err(ConnectionError::Peer(PeerConnectionError::NoCommonVersion { ours: SPOKEN, theirs: versions(2, 3) })));

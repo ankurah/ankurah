@@ -87,9 +87,8 @@ pub enum OpeningError {
     Undecodable(String),
 }
 
-/// The variant indices of [`Message::Open`](crate::Message::Open) and
-/// [`Message::NoCommonVersion`](crate::Message::NoCommonVersion), which open their frames in
-/// every protocol version.
+// The variant indices of `Message::Open` and `Message::NoCommonVersion`, which open their frames
+// in every protocol version; message.rs pins them.
 const OPEN_INDEX: u32 = 0;
 const NO_COMMON_VERSION_INDEX: u32 = 1;
 
