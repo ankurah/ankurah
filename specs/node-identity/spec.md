@@ -13,7 +13,7 @@ beside the state it governs, and nothing is written for the branch's own history
 
 ## 1. Intentions
 
-Every choice below is checked against all seven together.
+Every choice below is checked against all eight together.
 
 1. **One graph, held in parts, owned by no one.** Nothing in the data may require two nodes to
    agree on a bounded dataset before they exchange an entity. The system root is such a
@@ -23,10 +23,11 @@ Every choice below is checked against all seven together.
 3. **A node proves who it is and is trusted for what it was granted, never for what it
    claims.** Every node has a key that others verify. Durable standing and the relay of
    commits follow from how a peer was reached and what policy allows, not from a flag.
-4. **Facts about where data came from outlive the connection that carried them.** Who minted an
-   entity, who committed an event, which durable node admitted it or served a state: signed
-   by a cryptographic identity and checkable later. The minter sits inside the entity's id so
-   no relay can drop or re-attribute it.
+4. **Facts about where data came from can outlive the connection that carried them.** Who
+   committed an event, which durable node admitted it or served a state: an application that
+   wants these has a node sign them with its key, and anyone can check them later. The minter
+   sits inside the entity's id so no relay can drop or re-attribute it; whether that claim
+   must be proven by a signature is the application's choice.
 5. **Core knows nodes and nothing else about who.** Application, tenant, system, author and
    owner are components that applications declare or adopt from the Ankurah Commons. Core
    records a key and knows nothing of what a key denotes.
@@ -37,6 +38,10 @@ Every choice below is checked against all seven together.
 7. **The id derivation changes once.** Entity and event ids are recomputed under the new
    derivation; existing development stores are discarded. Migration tooling is not part of
    this branch.
+8. **A toolkit that enables sharing and does not insist on it.** Ankurah is what an
+   application is built from. Core offers abilities; what an application adopts, attests,
+   checks or shares with other applications is its own choice. The Ankurah Commons is what
+   makes sharing possible, for the applications that want it.
 
 ## 2. The change in one view
 
@@ -55,8 +60,7 @@ Every choice below is checked against all seven together.
   on it, outside core.
 - Attestations become structured, signed envelopes. Every node attests the events it
   commits; when policy says so, a durable node attests the states it serves and the events it
-  admits. Core verifies and strips envelopes before any policy hook sees them, and accepts a
-  genesis from outside only with its minter's committed attestation.
+  admits. Core verifies and strips envelopes before any policy hook sees them.
 - Ankurah ships the Commons publisher's public key as the default trusted publisher, through a
   build-time included file and an overridable `PolicyAgent` method.
 
@@ -151,8 +155,8 @@ pub enum Message { Presence(Presence), PeerMessage(NodeMessage), PresenceRejecte
   self-connection, then registers. The protocol-version check stays first.
 - Connectors gain the challenge round trip: websocket client, wasm client, websocket server,
   local-process, and the test harnesses. The server's opening challenge send, its presence
-  send, its rejection send and its pre-admission readiness wait all run under the handshake
-  deadline. The wasm client dispatches no peer frame before the server is authenticated.
+  send and its rejection send all run under the handshake deadline. The wasm client
+  dispatches no peer frame before the server is authenticated.
 - Trust by provenance, Daniel's ruling of 5 October 2026:
 
 ```rust
@@ -205,16 +209,8 @@ impl Event {
   (a publishing tool); a `Context` opened under another identity is not part of this branch.
 - The minter appears in the genesis only. An update's authorship rides the committing node's
   attestation (section 8).
-- The minter is verified, never taken as claimed. At every ingress of a genesis this node did
-  not create (the applier's event arm, `commit_remote_transaction`, the peer event fetch in
-  retrieval), core refuses the event with a typed error unless its verified attestation set
-  holds a `Committed` attestation whose attester equals the genesis's minter. The refusal
-  behaves as a structurally invalid event behaves on that path. A node that serves or relays
-  a genesis sends the stored attestations with it, so the check holds at any distance from
-  the minter. The rule is core's and does not depend on the policy agent: without it a
-  genesis could name any identity as its minter, and `trusted_publishers` would mean nothing.
-  It is the same for a minter that is not a node: a publisher's key signs the committed
-  attestations of the entities it mints.
+- Core does not check that a genesis carries a signature by its minter. Whether a minter's
+  claim must be proven is the application's choice (section 12).
 - The simulation harness (`tests/src/sim`) seeds one deterministic `Identity` per simulated
   node from the simulation seed and mints under it; `sim_system_id` and its comment go.
 - The LWW tie-break, generations, clocks and the comparison are untouched.
@@ -256,7 +252,8 @@ What leaves, by symbol:
 
 What is added:
 
-- `Node::reset(&self) -> Result<()>`: halts the node with `NodeHaltReason::Reset`, then
+- `Node::reset(&self) -> Result<(), MutationError>`: halts the node with
+  `NodeHaltReason::Reset`, then
   wipes storage through `StorageEngine::delete_all`,
   finishing even if the caller drops the future (today's `hard_reset`, made public and freed
   from the replacement path). Issue #477's contract stands: the host discards the halted node
@@ -287,7 +284,7 @@ pub trait NodePlugin<SE, PA>: Send + Sync + 'static {
     async fn announce(&self, node: &Node<SE, PA>) -> Option<Vec<u8>> { None }
     /// Asked once per registration, after the presence verifies and trust is decided and
     /// before the peer is registered. `Err` refuses the peer.
-    async fn peer_registering(&self, node: &Node<SE, PA>, peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> { Ok(()) }
+    async fn register_peer(&self, node: &Node<SE, PA>, peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> { Ok(()) }
 }
 /// One peer's registration as a plugin sees it: its id, provenance and trust, and the bytes it
 /// announced under the asking plugin's name.
@@ -379,8 +376,6 @@ the peer event fetch in retrieval):
   fails either is stripped and counted under a tracing warning. The payload then reaches
   `validate_received_event` or `validate_received_state` with its verified set, and the agent
   decides sufficiency. `PermissiveAgent` accepts anything, including an empty set.
-- A genesis additionally needs its minter's committed attestation (section 5). That check is
-  core's and runs before the policy hooks.
 - Recognition of an attester as a trusted durable peer or a trusted publisher is the agent's
   decision inside those hooks, reading the node's peer trust and `trusted_publishers`.
 - Storage keeps attestations beside events and states as today; every stored set is empty on
@@ -424,11 +419,6 @@ Beyond the suites staying green, these tests exist and state their scenario:
   anywhere; two independently created durable stores connect and exchange when configured to
   trust each other; `Node::reset` halts and wipes and a fresh node starts clean; no store
   holds an `_ankurah_system` table or tree.
-- The minter is verified: a genesis arriving by commit, by subscription update and by event
-  fetch without its minter's committed attestation is refused with the typed error, on a
-  durable and on an ephemeral receiver; one whose only committed attestation is signed by
-  another identity is refused; a genesis relayed through a durable node is accepted by a
-  third node.
 - Plugins (their pass): an announcement travels in the signed presence and a changed one
   fails the presence signature; a refusing plugin makes `register_peer` return `Refused` with
   nothing registered, on every connector; plugins are asked in the order plugged; a client
@@ -443,9 +433,9 @@ Beyond the suites staying green, these tests exist and state their scenario:
 
 ## 12. Assumptions, and the revisions of 2026-11-09
 
-- Daniel's "in a file that gets included at build time" (8 November, on the question of where
-  a node's seed lives) is taken to mean the Commons publisher's public key (3.3). Node seeds
-  keep the embedder-chosen file of the October cut (3.2).
+- Daniel's "in a file that gets included at build time" (8 November) means the Commons
+  publisher's public key (3.3); he confirmed it on 9 November at 20:02Z. Node seeds keep the
+  embedder-chosen file of the October cut (3.2), which is this file's own choice.
 - The shipped trusted-publishers file is empty until the Commons key exists.
 - Committed attestations are unconditional on every node; state attestations and admitted
   attestations follow the agent.
@@ -458,10 +448,42 @@ Revisions of 2026-11-09, each with its reason:
   reason to me to have a NodePlugin", and the hook "should indeed be able to refuse the peer".
   That the hook decides from the signed presence follows from the connectors, as section 7
   says; Daniel has not yet seen that consequence.
-- Decided by the lead from the intentions in section 1, open to Daniel's review:
-  the minter is verified at ingress (intention 4; section 5); state attestations are made
-  only when the agent returns claims (no consumer exists; section 8); membership removal
-  leaves the branch (section 10), which reverses Daniel's "we can just add ::Remove" of
-  8 November 04:03Z on the failing case named there; the built-in `_ankurah_system` model,
-  the readiness gate it fed and the name `SystemManager` go (section 6), correcting this
-  file's earlier claim that items other than the root remained.
+- Decided by the lead from the intentions in section 1, open to Daniel's review: state
+  attestations are made only when the agent returns claims (no consumer exists; section 8);
+  the built-in `_ankurah_system` model, the readiness gate it fed and the name
+  `SystemManager` go (section 6), correcting this file's earlier claim that items other than
+  the root remained.
+- Membership removal leaves the branch (section 10). Daniel at 20:02Z: "I don't think
+  ::Remove is required for this branch, but I do want it soon."
+- The fix pass built these revisions as four commits ending at 762b2dc3. A check that a
+  genesis carries its minter's signature was specified here for a few hours and withdrawn
+  before it was built, for the reason given below.
+
+Rulings of 2026-11-09 that are not built yet. They change sections 1, 7 and 8, and they are
+specified in full, together with the findings of the protocol comparison Daniel asked for,
+before the pass that builds them:
+
+- Ankurah is a toolkit (intention 8). Daniel at 20:18Z: "the goal is for Ankara [Ankurah] to
+  be a sort of toolkit to build your application and enable but not insist upon the sharing
+  of data between applications. That's what Ankara Commons is for, is that enablement."
+- Core offers the ability to attest and no more: an envelope, signing with the node key on
+  request, verifying on request. Daniel at 20:02Z: "I wasn't intending for us to actually
+  check attestations just yet (just to have the ability to author them)"; at 20:15Z: "we
+  could later ship a default attester/verifier plugin which would be used by most
+  applications". So the committed attestation that core signs on every commit becomes the
+  policy agent's choice, and the verify-and-strip at every ingress leaves core. Section 8
+  describes the code as it stands today, not this.
+- The envelope is open. On main an attestation is opaque bytes that the policy agent writes
+  and checks; the closed set of bodies in section 8 took that freedom away. The kind of an
+  attestation becomes a type id shaped like `ModelId`: core's kinds as enum variants, any
+  other kind the entity id of a published definition, carried by core untouched. Daniel at
+  20:14Z: "having an attestation type ID could be valuable. Which would probably be best
+  recorded as an entity ID in and of itself."
+- A type is admitted by whoever consumes it: model and property definitions by the catalog
+  under access control, a plugin's types by the plugin.
+- The plugin hook is `NodePlugin::register_peer`. Daniel at 20:02Z: "there's nothing wrong
+  with having the same fn name on NodePlugin as exists on Node".
+- The Commons key is a temporary single key until its custody is formalized before the
+  crates.io release. A lost or compromised key is replaced out of band, by publishing new
+  keys and new signatures (Daniel at 20:02Z and 20:09Z).
+- Signing one tree root in place of each served state is a later enhancement, not 0.10.
