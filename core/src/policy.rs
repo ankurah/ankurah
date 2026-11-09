@@ -81,11 +81,11 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
 /// - checking access for requests. If approved, yield a ContextData
 /// - deciding which admitted events this node attests, and the claims its attestations carry
-/// - deciding whether the verified attestations on a received event or state suffice
+/// - deciding whether the attestations on a received event or state suffice
 /// - deciding what a connected peer is trusted with, and which publishers it trusts
 ///
-/// Core signs every attestation and verifies every received one; an agent sees
-/// only attestations whose signature verifies and that name the payload.
+/// Core signs every attestation and checks none; an agent receives the attestations
+/// on an event or state exactly as they came.
 ///
 /// Read checks may receive several credentials, one, or none. Implementations
 /// must decide the empty case explicitly and authorize actual entity memberships,
@@ -169,8 +169,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         event: &proto::Event,
     ) -> Result<Admission, AccessDenied>;
 
-    /// Decide whether a received event's attestations suffice. They have already been
-    /// verified: each one's signature is its attester's, and each names this event.
+    /// Decide whether a received event's attestations suffice. They arrive as they came:
+    /// unverified, and not necessarily naming this event.
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -181,8 +181,8 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// The claims a durable node attests when it serves `state`; `None` attaches no state attestation.
     fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<Vec<u8>>;
 
-    /// Decide whether a received state's attestations suffice. They have already been
-    /// verified: each one's signature is its attester's, and each names this state.
+    /// Decide whether a received state's attestations suffice. They arrive as they came:
+    /// unverified, and not necessarily naming this state.
     fn validate_received_state<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,

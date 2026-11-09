@@ -71,7 +71,6 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let expected_head = entity.head();
 
         let mut event = event.clone();
-        attestation::verify_event(&mut event);
         let before = &self.entities.entries[&entity.id()].before;
         let after = entity.read();
         entity

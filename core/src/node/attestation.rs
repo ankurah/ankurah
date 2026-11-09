@@ -1,16 +1,14 @@
-//! The attestations a node signs, and the check every received one passes.
+//! The attestations a node signs.
 //!
 //! A node signs a committed attestation on every event it commits, an admitted
 //! attestation on an event its policy agent asks it to vouch for, and, when it
 //! is durable, a state attestation on a state it serves when its policy agent
-//! returns claims for that state. Before any policy hook sees a received event
-//! or state, the attestations that do not verify under their attester or do
-//! not name that payload are stripped.
+//! returns claims for that state. A node carries the attestations it receives as
+//! they came and checks none of them.
 
 use crate::internal::prelude::*;
 use crate::policy::Admission;
 use proto::{Attestation, AttestationBody, Attested, AttesterRole, EntityState, Event};
-use tracing::warn;
 
 /// This node's committed attestation on `event`, with empty claims.
 pub(crate) fn committed<SE, PA: PolicyAgent>(node: &Node<SE, PA>, event: &Event) -> Attestation {
@@ -39,51 +37,14 @@ pub(crate) fn served_state<SE: StorageEngine, PA: PolicyAgent>(node: &Node<SE, P
     }
 }
 
-/// Strip the attestations on a received event that fail their signature or name another event.
-pub(crate) fn verify_event(event: &mut Attested<Event>) {
-    let stripped = strip(&mut event.attestations.0, |attestation| attestation.covers_event(&event.payload));
-    if stripped > 0 {
-        warn!(stripped, event = %event.payload.id(), "stripped attestations that do not verify for this event");
-    }
-}
-
-/// Strip the attestations on a received state that fail their signature or name another state.
-pub(crate) fn verify_state(state: &mut Attested<EntityState>) {
-    let stripped = strip(&mut state.attestations.0, |attestation| attestation.covers_state(&state.payload));
-    if stripped > 0 {
-        warn!(stripped, entity = %state.payload.entity_id, "stripped attestations that do not verify for this state");
-    }
-}
-
-/// Keep the attestations whose signature verifies and that `covers` the payload; return how many went.
-fn strip(attestations: &mut Vec<Attestation>, covers: impl Fn(&Attestation) -> bool) -> usize {
-    let before = attestations.len();
-    attestations.retain(|attestation| attestation.verify() && covers(attestation));
-    before - attestations.len()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{node::NodeKey, policy::PermissiveAgent, test_utils::TestStorage};
+    use crate::{policy::PermissiveAgent, test_utils::TestStorage};
     use proto::{Clock, Identity, OperationSet, State};
     use std::sync::Arc;
 
     fn genesis(minter: u8) -> Event { Event::genesis(Identity::Ed25519([minter; 32]), OperationSet::default()) }
-
-    #[test]
-    fn a_tampered_and_a_transplanted_attestation_are_stripped_and_counted() {
-        let key = NodeKey::from_seed([3; 32]);
-        let (event, other) = (genesis(1), genesis(2));
-        let genuine = key.attest(AttestationBody::event(&event, AttesterRole::Committed, vec![]));
-        let mut tampered = genuine.clone();
-        tampered.body = AttestationBody::event(&event, AttesterRole::Admitted, vec![1]);
-        let transplanted = key.attest(AttestationBody::event(&other, AttesterRole::Committed, vec![]));
-
-        let mut attestations = vec![tampered, genuine.clone(), transplanted];
-        assert_eq!(strip(&mut attestations, |attestation| attestation.covers_event(&event)), 2);
-        assert_eq!(attestations, vec![genuine]);
-    }
 
     /// `PermissiveAgent` returns no state claims, so neither a durable nor an ephemeral node signs the states it serves.
     #[tokio::test]

@@ -81,8 +81,7 @@ impl NodeApplier {
     {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
-            let mut attested_event: Attested<proto::Event> = (entity_id, fragment).into();
-            super::attestation::verify_event(&mut attested_event);
+            let attested_event: Attested<proto::Event> = (entity_id, fragment).into();
             // A genesis whose id the entity it claims does not derive, or a
             // parent clock that disagrees with the body, is refused before
             // the DAG ever sees it: the sender's framing of the entity id is
@@ -125,8 +124,7 @@ impl NodeApplier {
                 // Batch preparation requires parents before their children.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
 
-                let mut state: Attested<proto::EntityState> = (entity_id, state_fragment.clone()).into();
-                super::attestation::verify_state(&mut state);
+                let state: Attested<proto::EntityState> = (entity_id, state_fragment.clone()).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 if let Some(entity) = Self::save_new_entity(node, &state.payload, &attested_events, event_getter, state_getter).await? {
@@ -376,8 +374,7 @@ impl NodeApplier {
     {
         match delta.content {
             proto::DeltaContent::StateSnapshot { state } => {
-                let mut attested_state: Attested<proto::EntityState> = (delta.entity_id, state).into();
-                super::attestation::verify_state(&mut attested_state);
+                let attested_state: Attested<proto::EntityState> = (delta.entity_id, state).into();
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
                 if let Some(entity) = Self::save_new_entity(node, &attested_state.payload, &[], event_getter, state_getter).await? {

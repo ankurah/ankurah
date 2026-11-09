@@ -198,8 +198,7 @@ where
                 // together with the ignored coverage in
                 // tests/tests/adversarial_wire.rs, and membership
                 // admissibility at BFS time is identity-02's.
-                let mut event = answering_event(peer_events, event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))?;
-                crate::node::attestation::verify_event(&mut event);
+                let event = answering_event(peer_events, event_id).ok_or_else(|| RetrievalError::EventNotFound(event_id.clone()))?;
                 let mut transaction = self.node.storage.transaction();
                 transaction.add_events(std::slice::from_ref(&event)).await?;
                 transaction.commit().await?.committed()?;

@@ -1,13 +1,11 @@
-//! Attestations a node signs and the check every received one passes: a
-//! committed attestation on each event a node commits, an admitted one when
-//! its policy agent asks, a state attestation on a state a durable node serves
-//! when its policy agent returns claims, and stripping of any that fail before
-//! a policy hook sees them.
+//! Attestations a node signs: a committed attestation on each event a node
+//! commits, an admitted one when its policy agent asks, and a state attestation
+//! on a state a durable node serves when its policy agent returns claims.
 
 mod common;
 
 use ankql::ast::{Predicate, Resolved};
-use ankurah::core::{node::NodeInner, node::NodeKey, test_helpers::commit_transaction, util::Iterable};
+use ankurah::core::{node::NodeInner, node::NodeKey, util::Iterable};
 use ankurah::entity::Entity;
 use ankurah::error::ValidationError;
 use ankurah::policy::{AccessDenied, Admission, DefaultContext, PolicyAgent};
@@ -241,62 +239,6 @@ async fn an_attesting_policy_adds_an_admitted_attestation_with_its_claims() -> a
         assert!(matches!(&admitted.body, AttestationBody::Event { claims, .. } if claims == b"admitted by policy"));
         assert_eq!(by(&stored.attestations, client.identity(), AttesterRole::Committed, &stored.payload).len(), 1);
     }
-    Ok(())
-}
-
-#[tokio::test]
-async fn attestations_that_fail_are_stripped_before_any_policy_hook_or_storage_sees_them() -> anyhow::Result<()> {
-    let client_agent = Witness::allowing();
-    let server = node(true, Witness::allowing())?;
-    let client = node(false, client_agent.clone())?;
-    let _connection = LocalProcessConnection::new(&client, &server).await?;
-    let server_context = server.context_async(DEFAULT_CONTEXT).await?;
-    let client_context = client.context_async(DEFAULT_CONTEXT).await?;
-    let _relay = client_context.query_wait::<AlbumView>("true").await?;
-    let transaction = server_context.begin();
-    let id = transaction.create(&Album { name: "target".into(), year: "2026".into() }).await?.id();
-    transaction.commit().await?;
-    let head = client_context.get::<AlbumView>(id).await?.entity().head();
-
-    let key = NodeKey::generate();
-    let forged_update = |head: proto::Clock| {
-        let event = proto::Event::update(id, head, proto::OperationSet::default());
-        let genuine = key.attest(AttestationBody::event(&event, AttesterRole::Committed, vec![]));
-        let mut tampered = genuine.clone();
-        tampered.body = AttestationBody::event(&event, AttesterRole::Admitted, vec![9]);
-        let other = proto::Event::update(id, proto::Clock::singleton(&event), proto::OperationSet::default());
-        let transplanted = key.attest(AttestationBody::event(&other, AttesterRole::Committed, vec![]));
-        (Attested { payload: event, attestations: proto::AttestationSet(vec![tampered, genuine.clone(), transplanted]) }, genuine)
-    };
-
-    // A subscription update: the client's validation hook sees only what verified.
-    let (delivered, genuine) = forged_update(head.clone());
-    let item = proto::SubscriptionUpdateItem {
-        entity_id: id,
-        content: proto::UpdateContent::EventOnly(vec![delivered.clone().into()]),
-        predicate_relevance: vec![],
-    };
-    let update = proto::NodeUpdate {
-        id: proto::UpdateId::new(),
-        from: server.id,
-        to: client.id,
-        body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
-    };
-    client.handle_message(proto::NodeMessage::Update(update)).await?;
-    let seen = client_agent.received_event(&delivered.payload.id()).expect("the hook saw the event");
-    assert_eq!(seen.attestations.0, vec![genuine.clone()]);
-
-    // A committed transaction: the server stores only what verified.
-    let (committed, genuine) = forged_update(server.storage.get_state(id).await?.payload.state.head);
-    commit_transaction(&server, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![committed.clone()]).await?;
-    let stored = server
-        .storage
-        .dump_entity_events(id)
-        .await?
-        .into_iter()
-        .find(|event| event.payload.id() == committed.payload.id())
-        .expect("stored");
-    assert_eq!(stored.attestations.0, vec![genuine]);
     Ok(())
 }
 
