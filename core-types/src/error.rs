@@ -11,6 +11,10 @@ pub enum DecodeError {
     InvalidFallback,
     /// The input used an unsupported identity format.
     InvalidFormat,
+    /// A key or signature's text form named no scheme before its `:`.
+    MissingScheme,
+    /// A key or signature's text form named a scheme this build does not know.
+    UnknownScheme(String),
     /// Another decoder failure.
     Other(anyhow::Error),
 }
@@ -23,6 +27,8 @@ impl std::fmt::Display for DecodeError {
             Self::InvalidLength => write!(f, "Invalid Length"),
             Self::InvalidFallback => write!(f, "Invalid Fallback"),
             Self::InvalidFormat => write!(f, "Invalid Format"),
+            Self::MissingScheme => write!(f, "Missing scheme: expected a scheme such as `ed25519:` before the key"),
+            Self::UnknownScheme(scheme) => write!(f, "Unknown scheme `{scheme}`"),
             Self::Other(error) => write!(f, "Other: {error}"),
         }
     }

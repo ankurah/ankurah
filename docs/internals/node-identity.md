@@ -12,9 +12,11 @@ application, a tenant or an owner is a component the application declares.
 An `Identity` is a public verifying key; its variant names the signature
 scheme, and today the only scheme is ed25519. A `NodeId` is the peer layer's
 name for an identity that is a node, a type of its own so a publisher's key
-cannot be passed where a peer is meant. Both print and serialize, in
-human-readable formats, as the unpadded URL-safe base64 of the key bytes, as
-an `EntityId` does; binary formats write the variant index, then the bytes.
+cannot be passed where a peer is meant. Both print, parse and serialize in
+human-readable formats with their scheme named, `ed25519:` followed by the
+unpadded URL-safe base64 of the key bytes, and a string naming no scheme or an
+unknown one does not parse; binary formats write the variant index, then the
+bytes. A signature's text form names its scheme the same way.
 Verification is strict: a weak key, a key in a non-canonical encoding and a
 non-canonical signature all verify as false.
 

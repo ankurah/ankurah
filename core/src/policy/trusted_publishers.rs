@@ -4,7 +4,7 @@
 use ankurah_proto::{DecodeError, Identity};
 use std::sync::OnceLock;
 
-/// The shipped list: one base64 identity per line, `#` starting a comment.
+/// The shipped list: one identity per line in its text form, `#` starting a comment.
 const SHIPPED: &str = include_str!("trusted_publishers.txt");
 
 /// The identities [`SHIPPED`] lists, parsed once.
@@ -14,13 +14,9 @@ pub(crate) fn shipped() -> Vec<Identity> {
     PARSED.get_or_init(|| parse(SHIPPED).expect("the shipped trusted-publisher list parses")).clone()
 }
 
-/// Parse a trusted-publisher list: one base64 identity per line; blank lines and `#` comments are skipped.
+/// Parse a trusted-publisher list: one identity per line in its text form; blank lines and `#` comments are skipped.
 fn parse(text: &str) -> Result<Vec<Identity>, DecodeError> {
-    text.lines()
-        .map(|line| line.split('#').next().unwrap_or_default().trim())
-        .filter(|line| !line.is_empty())
-        .map(Identity::from_base64)
-        .collect()
+    text.lines().map(|line| line.split('#').next().unwrap_or_default().trim()).filter(|line| !line.is_empty()).map(str::parse).collect()
 }
 
 #[cfg(test)]
@@ -38,9 +34,12 @@ mod tests {
 
     #[test]
     fn a_list_skips_comments_and_blank_lines() {
-        let identity = Identity::Ed25519([5; 32]);
-        let text = format!("# the Commons\n\n{}  # trailing comment\n", identity.to_base64());
-        assert_eq!(parse(&text).unwrap(), vec![identity]);
-        assert!(parse("not base64 at all!").is_err());
+        let text = "# the Commons\n\ned25519:BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU  # trailing comment\n";
+        assert_eq!(parse(text).unwrap(), vec![Identity::Ed25519([5; 32])]);
+        assert!(
+            matches!(parse("BQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQU"), Err(DecodeError::MissingScheme)),
+            "a line must name its scheme"
+        );
+        assert!(parse("ed25519:not base64 at all!").is_err());
     }
 }

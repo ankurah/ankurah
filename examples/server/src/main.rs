@@ -94,7 +94,7 @@ async fn log_generation_task(node: Node<SledStorageEngine, PermissiveAgent>) -> 
                     level,
                     message,
                     source: source.to_string(),
-                    node_id: node.id.to_base64(),
+                    node_id: node.id.to_string(),
                     payload,
                 })
                 .await

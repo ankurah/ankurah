@@ -22,9 +22,9 @@ pub struct Context(pub(crate) Arc<dyn DynContextInner + Send + Sync + 'static>);
 #[cfg(feature = "wasm")]
 #[wasm_bindgen]
 impl Context {
-    /// This node's identity, as the base64 of its key.
+    /// This node's identity in its text form: `ed25519:`, then the base64 of its key.
     #[wasm_bindgen(js_name = "node_id")]
-    pub fn js_node_id(&self) -> String { self.0.node_id().to_base64() }
+    pub fn js_node_id(&self) -> String { self.0.node_id().to_string() }
 }
 
 // Generic methods cannot cross the wasm_bindgen boundary; they live in this

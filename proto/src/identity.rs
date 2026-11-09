@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{fmt, str::FromStr};
 
 use crate::DecodeError;
 
@@ -12,16 +12,18 @@ use crate::DecodeError;
 /// index before the key bytes, and every genesis hashes its minter, so the
 /// index is part of every entity id: variants append and never reorder.
 ///
-/// The human-readable form is the unpadded URL-safe base64 of the key bytes,
-/// as for `EntityId`; binary serializers receive the variant index, then the
-/// bytes.
+/// The text form names the scheme, then the unpadded URL-safe base64 of the
+/// key bytes: `ed25519:` followed by 43 characters. Human-readable serializers
+/// receive the text form; binary serializers receive the variant index, then
+/// the bytes.
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 pub enum Identity {
     /// An ed25519 verifying key in its 32-byte compressed encoding.
     Ed25519([u8; 32]),
 }
 
-/// A signature by an [`Identity`], in the identity's scheme.
+/// A signature by an [`Identity`], in the identity's scheme. Its text form
+/// names the scheme as an identity's does.
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Signature {
     /// A 64-byte ed25519 signature.
@@ -35,25 +37,15 @@ pub enum Signature {
 #[serde(transparent)]
 pub struct NodeId(Identity);
 
+/// The scheme an ed25519 key or signature names in its text form.
+const ED25519: &str = "ed25519";
+
 impl Identity {
-    /// Decode an identity from the unpadded URL-safe base64 of an ed25519 key.
-    pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {
-        let decoded = general_purpose::URL_SAFE_NO_PAD.decode(input).map_err(DecodeError::InvalidBase64)?;
-        let bytes: [u8; 32] = decoded.as_slice().try_into().map_err(|_| DecodeError::InvalidLength)?;
-        Ok(Self::Ed25519(bytes))
-    }
-
-    /// Encode the key bytes as unpadded URL-safe base64.
-    pub fn to_base64(&self) -> String {
-        match self {
-            Self::Ed25519(key) => general_purpose::URL_SAFE_NO_PAD.encode(key),
-        }
-    }
-
-    /// The first six characters of the base64 form, for compact diagnostics.
+    /// The first six characters of the key's base64, without the scheme, for compact diagnostics.
     pub fn to_base64_short(&self) -> String {
-        let value = self.to_base64();
-        value[..6].to_owned()
+        match self {
+            Self::Ed25519(key) => general_purpose::URL_SAFE_NO_PAD.encode(key)[..6].to_owned(),
+        }
     }
 
     /// Whether `signature` is this identity's signature over `message`.
@@ -75,19 +67,36 @@ fn strict_ed25519_key(bytes: &[u8; 32]) -> Option<ed25519_dalek::VerifyingKey> {
     (key.to_edwards().compress().to_bytes() == *bytes && !key.is_weak()).then_some(key)
 }
 
-impl Signature {
-    /// Encode the signature bytes as unpadded URL-safe base64.
-    pub fn to_base64(&self) -> String {
-        match self {
-            Self::Ed25519(signature) => general_purpose::URL_SAFE_NO_PAD.encode(signature),
+/// The scheme and the base64 a text form names, split at the first `:`.
+fn split_scheme(text: &str) -> Result<(&str, &str), DecodeError> { text.split_once(':').ok_or(DecodeError::MissingScheme) }
+
+/// The `N` bytes whose unpadded URL-safe base64 `text` is.
+fn decode_base64<const N: usize>(text: &str) -> Result<[u8; N], DecodeError> {
+    let decoded = general_purpose::URL_SAFE_NO_PAD.decode(text).map_err(DecodeError::InvalidBase64)?;
+    decoded.as_slice().try_into().map_err(|_| DecodeError::InvalidLength)
+}
+
+impl FromStr for Identity {
+    type Err = DecodeError;
+
+    /// Parse the text form: a scheme this build knows, `:`, then the base64 of the key.
+    fn from_str(text: &str) -> Result<Self, DecodeError> {
+        match split_scheme(text)? {
+            (ED25519, key) => Ok(Self::Ed25519(decode_base64(key)?)),
+            (scheme, _) => Err(DecodeError::UnknownScheme(scheme.to_owned())),
         }
     }
+}
 
-    /// Decode an ed25519 signature from unpadded URL-safe base64.
-    pub fn from_base64<T: AsRef<[u8]>>(input: T) -> Result<Self, DecodeError> {
-        let decoded = general_purpose::URL_SAFE_NO_PAD.decode(input).map_err(DecodeError::InvalidBase64)?;
-        let bytes: [u8; 64] = decoded.as_slice().try_into().map_err(|_| DecodeError::InvalidLength)?;
-        Ok(Self::Ed25519(bytes))
+impl FromStr for Signature {
+    type Err = DecodeError;
+
+    /// Parse the text form: a scheme this build knows, `:`, then the base64 of the signature.
+    fn from_str(text: &str) -> Result<Self, DecodeError> {
+        match split_scheme(text)? {
+            (ED25519, signature) => Ok(Self::Ed25519(decode_base64(signature)?)),
+            (scheme, _) => Err(DecodeError::UnknownScheme(scheme.to_owned())),
+        }
     }
 }
 
@@ -109,18 +118,20 @@ impl std::ops::Deref for NodeId {
     fn deref(&self) -> &Identity { &self.0 }
 }
 
+/// The text form; the alternate form `{:#}` is the short diagnostic one, without the scheme.
 impl fmt::Display for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if f.alternate() {
-            f.write_str(&self.to_base64_short())
-        } else {
-            f.write_str(&self.to_base64())
+            return f.write_str(&self.to_base64_short());
+        }
+        match self {
+            Self::Ed25519(key) => write!(f, "{ED25519}:{}", general_purpose::URL_SAFE_NO_PAD.encode(key)),
         }
     }
 }
 
 impl fmt::Debug for Identity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.to_base64()) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, f) }
 }
 
 impl fmt::Display for NodeId {
@@ -132,11 +143,15 @@ impl fmt::Debug for NodeId {
 }
 
 impl fmt::Display for Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.to_base64()) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Ed25519(signature) => write!(f, "{ED25519}:{}", general_purpose::URL_SAFE_NO_PAD.encode(signature)),
+        }
+    }
 }
 
 impl fmt::Debug for Signature {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.to_base64()) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, f) }
 }
 
 /// The binary form of [`Identity`]: the derived enum encoding, variant index then key bytes.
@@ -159,7 +174,7 @@ impl Serialize for Identity {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
         if serializer.is_human_readable() {
-            serializer.serialize_str(&self.to_base64())
+            serializer.collect_str(self)
         } else {
             match *self {
                 Self::Ed25519(key) => IdentityBinary::Ed25519(key).serialize(serializer),
@@ -172,7 +187,7 @@ impl<'de> Deserialize<'de> for Identity {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: serde::Deserializer<'de> {
         if deserializer.is_human_readable() {
-            Self::from_base64(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+            String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
         } else {
             match IdentityBinary::deserialize(deserializer)? {
                 IdentityBinary::Ed25519(key) => Ok(Self::Ed25519(key)),
@@ -185,7 +200,7 @@ impl Serialize for Signature {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where S: serde::Serializer {
         if serializer.is_human_readable() {
-            serializer.serialize_str(&self.to_base64())
+            serializer.collect_str(self)
         } else {
             match self {
                 Self::Ed25519(bytes) => {
@@ -203,7 +218,7 @@ impl<'de> Deserialize<'de> for Signature {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where D: serde::Deserializer<'de> {
         if deserializer.is_human_readable() {
-            Self::from_base64(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+            String::deserialize(deserializer)?.parse().map_err(serde::de::Error::custom)
         } else {
             match SignatureBinary::deserialize(deserializer)? {
                 SignatureBinary::Ed25519(first, second) => {
@@ -232,14 +247,35 @@ mod tests {
         let identity = Identity::Ed25519([7; 32]);
         assert_eq!(bincode::serialize(&identity).unwrap(), [0u32.to_le_bytes().as_slice(), &[7; 32]].concat());
         assert_eq!(bincode::deserialize::<Identity>(&bincode::serialize(&identity).unwrap()).unwrap(), identity);
-        assert_eq!(serde_json::to_string(&identity).unwrap(), format!("\"{}\"", identity.to_base64()));
-        assert_eq!(serde_json::from_str::<Identity>(&serde_json::to_string(&identity).unwrap()).unwrap(), identity);
-        assert_eq!(Identity::from_base64(identity.to_base64()).unwrap(), identity);
-        assert!(matches!(Identity::from_base64("AQIDBAUGBwgJCgsMDQ4PEA"), Err(DecodeError::InvalidLength)));
 
         let node = NodeId::from(identity);
         assert_eq!(bincode::serialize(&node).unwrap(), bincode::serialize(&identity).unwrap(), "a node id encodes as its identity");
-        assert_eq!(serde_json::to_string(&node).unwrap(), serde_json::to_string(&identity).unwrap());
+    }
+
+    /// The text form names the scheme, so a key of a later scheme can never be read as an ed25519 key.
+    #[test]
+    fn an_identity_prints_and_parses_with_its_scheme_named() {
+        let identity = Identity::Ed25519([7; 32]);
+        let text = "ed25519:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+        assert_eq!(identity.to_string(), text);
+        assert_eq!(text.parse::<Identity>().unwrap(), identity);
+        assert_eq!(serde_json::to_string(&identity).unwrap(), format!("\"{text}\""));
+        assert_eq!(serde_json::from_str::<Identity>(&format!("\"{text}\"")).unwrap(), identity);
+        assert_eq!(format!("{identity:#}"), "BwcHBw", "the short diagnostic form names no scheme");
+
+        let node = NodeId::from(identity);
+        assert_eq!(node.to_string(), text, "a node id prints as its identity");
+        assert_eq!(serde_json::to_string(&node).unwrap(), format!("\"{text}\""));
+    }
+
+    #[test]
+    fn identity_text_without_a_known_scheme_is_refused() {
+        assert!(matches!("BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".parse::<Identity>(), Err(DecodeError::MissingScheme)));
+        assert!(
+            matches!("rsa:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc".parse::<Identity>(), Err(DecodeError::UnknownScheme(scheme)) if scheme == "rsa")
+        );
+        assert!(matches!("ed25519:AQIDBAUGBwgJCgsMDQ4PEA".parse::<Identity>(), Err(DecodeError::InvalidLength)));
+        assert!(serde_json::from_str::<Identity>("\"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc\"").is_err());
     }
 
     #[test]
@@ -250,8 +286,14 @@ mod tests {
         let encoded = bincode::serialize(&signature).unwrap();
         assert_eq!(encoded, [0u32.to_le_bytes().as_slice(), &bytes].concat());
         assert_eq!(bincode::deserialize::<Signature>(&encoded).unwrap(), signature);
-        assert_eq!(serde_json::to_string(&signature).unwrap(), format!("\"{}\"", signature.to_base64()));
-        assert_eq!(serde_json::from_str::<Signature>(&serde_json::to_string(&signature).unwrap()).unwrap(), signature);
+
+        let text = "ed25519:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw";
+        assert_eq!(signature.to_string(), text);
+        assert_eq!(text.parse::<Signature>().unwrap(), signature);
+        assert_eq!(serde_json::to_string(&signature).unwrap(), format!("\"{text}\""));
+        assert_eq!(serde_json::from_str::<Signature>(&format!("\"{text}\"")).unwrap(), signature);
+        assert!(matches!(text["ed25519:".len()..].parse::<Signature>(), Err(DecodeError::MissingScheme)));
+        assert!(matches!(text.replacen("ed25519", "rsa", 1).parse::<Signature>(), Err(DecodeError::UnknownScheme(_))));
     }
 
     #[test]
