@@ -168,6 +168,32 @@ async fn the_catalog_holds_the_stored_definitions_before_a_durable_peer_answers(
     assert_eq!(halted, Ok(Err(reason)), "a node halted while its catalog loads stops the wait");
 }
 
+/// A host that sees a node halted by a reset it did not await, such as a plugin's, resets it
+/// again to wait for that wipe before it builds a fresh node on the store.
+#[tokio::test]
+async fn a_reset_returns_only_once_an_earlier_resets_wipe_has_finished() {
+    let storage = Arc::new(TestStorage::default());
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    *storage.hold_delete_all.lock().unwrap() = Some((entered, release_rx));
+    let node = Node::new(storage, PermissiveAgent::new());
+
+    let mut first = Box::pin(node.reset());
+    assert!(futures::poll!(&mut first).is_pending());
+    drop(first);
+    entered_rx.await.unwrap();
+    assert_eq!(node.state().value(), NodeState::Halted(NodeHaltReason::Reset));
+
+    let second = tokio::spawn({
+        let node = node.clone();
+        async move { node.reset().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!second.is_finished(), "the second reset waits for the first one's wipe");
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), second).await.unwrap().unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn dropping_a_starting_node_cancels_its_readiness_wait() {
     let storage = Arc::new(TestStorage::default());

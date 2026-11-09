@@ -13,12 +13,16 @@ impl<SE> Clone for NodeLifecycle<SE> {
 struct Inner<SE> {
     storage: Arc<SE>,
     node_state: Mut<NodeState>,
+    /// Held through each wipe of storage, so wipes run one at a time in the order resets ask for them.
+    wiping: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<SE> NodeLifecycle<SE>
 where SE: StorageEngine + Send + Sync + 'static
 {
-    pub(crate) fn new(storage: Arc<SE>) -> Self { Self(Arc::new(Inner { storage, node_state: Mut::new(NodeState::Startup) })) }
+    pub(crate) fn new(storage: Arc<SE>) -> Self {
+        Self(Arc::new(Inner { storage, node_state: Mut::new(NodeState::Startup), wiping: Arc::new(tokio::sync::Mutex::new(())) }))
+    }
 
     pub(crate) fn node_state(&self) -> Read<NodeState> { self.0.node_state.read() }
 
@@ -52,13 +56,17 @@ where SE: StorageEngine + Send + Sync + 'static
     }
 
     /// Halt with [`NodeHaltReason::Reset`], then delete everything in storage.
-    /// The wipe runs in its own task, so it finishes even if the caller stops waiting.
+    /// The wipe runs in its own task, so it finishes even if the caller stops waiting. A reset
+    /// waits for any earlier reset's wipe before its own, so once it returns none is running.
     pub(crate) async fn reset(&self) -> Result<(), MutationError> {
         self.halt(NodeHaltReason::Reset);
+        // A first reset takes this without waiting, so its wipe is queued before any later reset's.
+        let wiping = self.0.wiping.clone().lock_owned().await;
         let storage = self.0.storage.clone();
         let (finished, completion) = tokio::sync::oneshot::channel();
         crate::task::spawn(async move {
             let _ = finished.send(storage.delete_all().await);
+            drop(wiping);
         });
         // Cannot fail in practice: the task always sends before it ends, and it does not panic.
         completion.await.expect("storage wipe task ended without reporting")?;

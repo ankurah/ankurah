@@ -20,6 +20,7 @@ pub(crate) struct TestStorage {
     pub hold_set_state: Mutex<Option<Pause>>,
     pub hold_commit: Mutex<Option<Pause>>,
     pub hold_after_commit: Mutex<Option<Pause>>,
+    pub hold_delete_all: Mutex<Option<Pause>>,
     pub reject_state_read: Mutex<Option<EntityId>>,
     fail_next_commit: AtomicBool,
 }
@@ -180,6 +181,11 @@ impl StorageEngine for TestStorage {
     }
 
     async fn delete_all(&self) -> Result<bool, MutationError> {
+        let hold = self.hold_delete_all.lock().unwrap().take();
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            release.await.unwrap();
+        }
         *self.data.lock().unwrap() = TestData::default();
         Ok(true)
     }

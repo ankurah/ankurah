@@ -193,7 +193,9 @@ where
 
     /// Halt this node with [`NodeHaltReason::Reset`], then delete everything in its storage.
     /// The wipe finishes even if the caller drops the returned future. The host then discards this
-    /// node with its contexts and live queries, and builds a fresh node on the wiped store.
+    /// node with its contexts and live queries, and builds a fresh node on the wiped store. A host
+    /// that finds the node already halted by a reset it did not await (a plugin's, say) calls this
+    /// to wait for that reset's wipe.
     pub async fn reset(&self) -> Result<(), MutationError> { self.lifecycle.reset().await }
 
     /// Initialization and terminal halt state; independent of peer connectivity.
