@@ -14,9 +14,9 @@ use std::{
 use ankurah_core::{
     error::{MutationError, RetrievalError, StateError},
     schema::CatalogResolver,
-    storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction},
+    storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction, StoreFormatError},
 };
-use ankurah_proto::{AttestationSet, Attested, EntityState, EventBody, EventId, SealedAttestation, State, StateBuffers, PROTOCOL_VERSION};
+use ankurah_proto::{AttestationSet, Attested, EntityState, EventBody, EventId, SealedAttestation, State, StateBuffers};
 use ankurah_proto::{ModelId, SystemModel};
 
 pub mod sql_builder;
@@ -44,8 +44,13 @@ pub const DEFAULT_POOL_SIZE: u32 = 15;
 /// Default connection timeout in seconds
 pub const DEFAULT_CONNECTION_TIMEOUT_SECS: u64 = 30;
 
+/// The format of the stores this engine writes, recorded in each store and checked on every open.
+/// Bump it when this engine's stored layout, or the encoding of anything it stores, changes
+/// incompatibly.
+pub const STORE_FORMAT_VERSION: u32 = 1;
+
 /// Engine-level key/value metadata for the store itself (currently just the
-/// 'protocol_version' record). Not application data: it survives
+/// 'store_format_version' record). Not application data: it survives
 /// [`StorageEngine::delete_all`], because wiping the record would make the store
 /// read as unversioned and refuse its own reopen.
 const META_TABLE: &str = "_ankurah_meta";
@@ -91,8 +96,8 @@ pub struct Postgres {
 impl Postgres {
     /// Create a new storage engine with an existing pool.
     ///
-    /// Records or checks the store's protocol version (see
-    /// `check_protocol_version`) so every construction path verifies
+    /// Records or checks the store's format version (see
+    /// `check_store_format`) so every construction path verifies
     /// the store it is about to serve.
     pub async fn new(pool: bb8::Pool<PostgresConnectionManager<NoTls>>) -> anyhow::Result<Self> {
         let engine = Self {
@@ -101,7 +106,7 @@ impl Postgres {
             resolver: Arc::new(RwLock::new(None)),
             shared_tables_ready: AtomicBool::new(false),
         };
-        engine.check_protocol_version().await?;
+        engine.check_store_format().await?;
         Ok(engine)
     }
 
@@ -322,36 +327,27 @@ impl Postgres {
         Ok(models)
     }
 
-    /// Check the store against [`ankurah_proto::PROTOCOL_VERSION`]:
+    /// Check the store against [`STORE_FORMAT_VERSION`], refusing a store of another format
+    /// with a [`StoreFormatError`]:
     ///
     /// - fresh store (no record, no ankurah tables): write the record, proceed
     /// - record present and equal: proceed
-    /// - record present and different: refuse
+    /// - record present and different or unreadable: refuse
     /// - ankurah tables present but no record: refuse as an unversioned store
-    async fn check_protocol_version(&self) -> anyhow::Result<()> {
+    async fn check_store_format(&self) -> anyhow::Result<()> {
         let client = self.pool.get().await?;
         let rows = client.query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'", &[]).await?;
         let tables: Vec<String> = rows.iter().map(|row| row.get("table_name")).collect();
         let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(&table.as_str()));
+        let read_record = format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'store_format_version'"#);
 
-        let recorded: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
-            client
-                .query_opt(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])
-                .await?
-                .map(|row| row.get(0))
-        } else {
-            None
-        };
+        let recorded: Option<String> =
+            if tables.iter().any(|t| t == META_TABLE) { client.query_opt(&read_record, &[]).await?.map(|row| row.get(0)) } else { None };
 
-        let expected = PROTOCOL_VERSION.to_string();
+        let expected = STORE_FORMAT_VERSION;
         match recorded {
-            Some(found) if found == expected => Ok(()),
-            Some(found) => anyhow::bail!(
-                "incompatible store protocol version: found {found}, required {PROTOCOL_VERSION}; reset your development database (or migrate the store) before opening it with this binary"
-            ),
-            None if has_ankurah_tables => anyhow::bail!(
-                "store has existing ankurah tables but no recorded protocol version (pre-{PROTOCOL_VERSION} store); reset your development database (or migrate the store) before opening it with this binary"
-            ),
+            Some(record) => Ok(StoreFormatError::check_decimal_record(&record, expected)?),
+            None if has_ankurah_tables => Err(StoreFormatError::Unversioned { expected }.into()),
             None => {
                 // Fresh store: claim the record, serializing concurrent first
                 // opens the same way other engine DDL is serialized.
@@ -363,24 +359,15 @@ impl Postgres {
                     client
                         .execute(
                             &format!(
-                                r#"INSERT INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', $1) ON CONFLICT ("key") DO NOTHING"#
+                                r#"INSERT INTO "{META_TABLE}" ("key", "value") VALUES ('store_format_version', $1) ON CONFLICT ("key") DO NOTHING"#
                             ),
-                            &[&expected],
+                            &[&expected.to_string()],
                         )
                         .await?;
                     // Re-read: if another process recorded between our scan and
-                    // our insert, the store must still match this binary.
-                    let reread: String = client
-                        .query_one(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), &[])
-                        .await?
-                        .get(0);
-                    if reread == expected {
-                        Ok(())
-                    } else {
-                        anyhow::bail!(
-                            "incompatible store protocol version: found {reread}, required {PROTOCOL_VERSION}; reset your development database (or migrate the store) before opening it with this binary"
-                        )
-                    }
+                    // our insert, the store must still match this engine.
+                    let reread: String = client.query_one(&read_record, &[]).await?.get(0);
+                    Ok(StoreFormatError::check_decimal_record(&reread, expected)?)
                 }
                 .await;
                 release_ddl_lock(&client, lock_key).await?;

@@ -196,15 +196,19 @@ See [Event Retrieval and Staging](retrieval.md) and
 
 ## Lifecycle operations
 
-The protocol-version record is checked on every engine open. A recognizable
-Ankurah store without a version record is refused, as is a store written by a
-different protocol version. Unrelated tables in a shared SQL database do not
-make that database an Ankurah store.
+Each engine records the format version of the stores it writes, its own
+`STORE_FORMAT_VERSION`, separately from the protocol version, so a change to
+the wire or to one engine's layout never discards another engine's stores. The
+record is checked on every engine open: a store recording another format, a
+record that names no version, and a recognizable Ankurah store with no record
+are each refused with a `StoreFormatError` naming the version found and the
+version the engine reads. Unrelated tables in a shared SQL database do not make
+that database an Ankurah store.
 
 `delete_all` is an Ankurah reset, not a database reset. PostgreSQL and SQLite
 delete their fixed internal tables plus dynamic tables recorded in their model
 registries; unrelated application tables survive. Engine compatibility
-metadata remains so the emptied store can reopen under the same protocol
+metadata remains so the emptied store can reopen under the same format
 version.
 
 `list_materializations` is deliberately non-creating: inspection does not

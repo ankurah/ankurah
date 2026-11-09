@@ -1,17 +1,23 @@
-//! Protocol-version record semantics: a fresh store is marked with
-//! `ankurah_proto::PROTOCOL_VERSION` on engine construction and checked on
-//! every open; a store carrying a different (or missing) record refuses to
-//! open, advising a development-database reset.
+//! Store format record semantics: a fresh store is marked with this engine's
+//! `STORE_FORMAT_VERSION` on engine construction and checked on every open; a
+//! store carrying a different (or missing) record refuses to open with a
+//! `StoreFormatError`.
 
-use ankurah_core::storage::StorageEngine;
-use ankurah_proto::{ModelId, SystemModel, PROTOCOL_VERSION};
-use ankurah_storage_sqlite::SqliteStorageEngine;
+use ankurah_core::storage::{StorageEngine, StoreFormatError};
+use ankurah_proto::{ModelId, SystemModel};
+use ankurah_storage_sqlite::{SqliteStorageEngine, STORE_FORMAT_VERSION};
 
 /// Create the model catalog's materialization, so the store holds Ankurah data beside its version record.
 async fn touch_catalog_materialization(engine: &SqliteStorageEngine) -> anyhow::Result<()> {
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
     engine.fetch_states(&selection.clone().and_member_of(ModelId::System(SystemModel::Model))).await?;
     Ok(())
+}
+
+/// The refusal opening the store at `path` meets, as the typed store format error.
+async fn refusal(path: &std::path::Path) -> StoreFormatError {
+    let error = SqliteStorageEngine::open(path).await.err().expect("the store is refused");
+    error.downcast_ref::<StoreFormatError>().cloned().unwrap_or_else(|| panic!("not a store format refusal: {error}"))
 }
 
 /// A uniquely named database file in the system temp dir, removed on drop.
@@ -33,7 +39,7 @@ impl Drop for TempDb {
 }
 
 #[tokio::test]
-async fn fresh_store_records_version_and_reopens() -> anyhow::Result<()> {
+async fn a_fresh_store_records_its_format_version_and_reopens() -> anyhow::Result<()> {
     let db = TempDb::new("fresh");
 
     // A fresh store records the version at engine construction.
@@ -42,12 +48,12 @@ async fn fresh_store_records_version_and_reopens() -> anyhow::Result<()> {
         touch_catalog_materialization(&engine).await?;
     }
 
-    // The record carries the running protocol version.
+    // The record carries this engine's format version.
     {
         let conn = rusqlite::Connection::open(db.path())?;
         let value: String =
-            conn.query_row(r#"SELECT "value" FROM "_ankurah_meta" WHERE "key" = 'protocol_version'"#, [], |row| row.get(0))?;
-        assert_eq!(value, PROTOCOL_VERSION.to_string());
+            conn.query_row(r#"SELECT "value" FROM "_ankurah_meta" WHERE "key" = 'store_format_version'"#, [], |row| row.get(0))?;
+        assert_eq!(value, STORE_FORMAT_VERSION.to_string());
     }
 
     // Reopening a store with the matching record proceeds.
@@ -76,28 +82,30 @@ async fn unrelated_tables_do_not_block_initialization_or_get_dropped() -> anyhow
 }
 
 #[tokio::test]
-async fn mismatched_version_refuses() -> anyhow::Result<()> {
+async fn a_store_of_another_format_is_refused_naming_both_versions() -> anyhow::Result<()> {
     let db = TempDb::new("mismatch");
     {
         let _engine = SqliteStorageEngine::open(db.path()).await?;
     }
 
     // Rewrite the stored version out of band.
-    {
+    let rewrite = |value: &str| -> anyhow::Result<()> {
         let conn = rusqlite::Connection::open(db.path())?;
-        conn.execute(r#"UPDATE "_ankurah_meta" SET "value" = '999' WHERE "key" = 'protocol_version'"#, [])?;
-    }
-
-    let err = match SqliteStorageEngine::open(db.path()).await {
-        Ok(_) => panic!("expected the mismatched version to refuse the open"),
-        Err(e) => e.to_string(),
+        conn.execute(r#"UPDATE "_ankurah_meta" SET "value" = ? WHERE "key" = 'store_format_version'"#, [value])?;
+        Ok(())
     };
-    assert!(err.contains("999") && err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the found and expected versions: {err}");
+    rewrite("999")?;
+    assert_eq!(refusal(db.path()).await, StoreFormatError::Mismatch { found: 999, expected: STORE_FORMAT_VERSION });
+    rewrite("not a version")?;
+    assert_eq!(
+        refusal(db.path()).await,
+        StoreFormatError::UnreadableRecord { record: "not a version".into(), expected: STORE_FORMAT_VERSION }
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn unversioned_store_with_data_refuses() -> anyhow::Result<()> {
+async fn a_store_with_data_but_no_format_version_is_refused() -> anyhow::Result<()> {
     let db = TempDb::new("unversioned");
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;
@@ -111,16 +119,12 @@ async fn unversioned_store_with_data_refuses() -> anyhow::Result<()> {
         conn.execute(r#"DROP TABLE "_ankurah_meta""#, [])?;
     }
 
-    let err = match SqliteStorageEngine::open(db.path()).await {
-        Ok(_) => panic!("expected the unversioned store with existing data to refuse the open"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the expected version: {err}");
+    assert_eq!(refusal(db.path()).await, StoreFormatError::Unversioned { expected: STORE_FORMAT_VERSION });
     Ok(())
 }
 
 #[tokio::test]
-async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
+async fn collection_wipe_preserves_the_format_record() -> anyhow::Result<()> {
     let db = TempDb::new("wipe");
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;

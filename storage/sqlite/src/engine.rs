@@ -11,8 +11,10 @@ use std::sync::Arc;
 
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::schema::CatalogResolver;
-use ankurah_core::storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction};
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
+use ankurah_core::storage::{
+    CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction, StoreFormatError,
+};
+use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers};
 use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, Connection, OptionalExtension, TransactionBehavior};
@@ -30,8 +32,13 @@ pub use transaction::SqliteTransaction;
 /// Default connection pool size
 pub const DEFAULT_POOL_SIZE: u32 = 10;
 
+/// The format of the stores this engine writes, recorded in each store and checked on every open.
+/// Bump it when this engine's stored layout, or the encoding of anything it stores, changes
+/// incompatibly.
+pub const STORE_FORMAT_VERSION: u32 = 1;
+
 /// Engine-level key/value metadata for the store itself (currently just the
-/// 'protocol_version' record). Not application data: it survives
+/// 'store_format_version' record). Not application data: it survives
 /// [`StorageEngine::delete_all`], because wiping the record would make the store
 /// read as unversioned and refuse its own reopen.
 const META_TABLE: &str = "_ankurah_meta";
@@ -185,12 +192,13 @@ impl SqliteStorageEngine {
 
     /// Create a new storage engine with an existing pool.
     ///
-    /// Records or checks the store's protocol version (see
-    /// `check_protocol_version`) so every construction path verifies
+    /// Records or checks the store's format version (see
+    /// `check_store_format`) so every construction path verifies
     /// the store it is about to serve.
     pub async fn new(pool: bb8::Pool<SqliteConnectionManager>) -> anyhow::Result<Self> {
         let engine = Self { pool, materializations: SafeMap::new(), resolver: Arc::new(std::sync::RwLock::new(None)) };
-        engine.check_protocol_version().await?;
+        // A storage failure while checking, then the refusal of a store of another format.
+        engine.check_store_format().await??;
         Ok(engine)
     }
 
@@ -279,22 +287,26 @@ impl SqliteStorageEngine {
             .cloned()
     }
 
-    /// Check the store against [`ankurah_proto::PROTOCOL_VERSION`]:
+    /// Check the store against [`STORE_FORMAT_VERSION`]:
     ///
     /// - fresh store (no record, no ankurah tables): write the record, proceed
     /// - record present and equal: proceed
-    /// - record present and different: refuse
+    /// - record present and different or unreadable: refuse
     /// - ankurah tables present but no record: refuse as an unversioned store
-    async fn check_protocol_version(&self) -> Result<(), SqliteError> {
+    ///
+    /// A failure to read the store is the outer error, a refusal the inner one.
+    async fn check_store_format(&self) -> Result<Result<(), StoreFormatError>, SqliteError> {
         let conn = self.pool.get().await.map_err(|e| SqliteError::Pool(e.to_string()))?;
         conn.with_connection(|c| {
             let mut stmt = c.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")?;
             let tables: Vec<String> = stmt.query_map([], |row| row.get(0))?.filter_map(|r| r.ok()).collect();
             let has_ankurah_tables = tables.iter().any(|table| FIXED_STORAGE_TABLES.contains(&table.as_str()));
+            let read_record = |c: &Connection| {
+                c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'store_format_version'"#), [], |row| row.get(0))
+            };
 
             let recorded: Option<String> = if tables.iter().any(|t| t == META_TABLE) {
-                match c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| row.get(0))
-                {
+                match read_record(c) {
                     Ok(value) => Some(value),
                     Err(rusqlite::Error::QueryReturnedNoRows) => None,
                     Err(e) => return Err(SqliteError::Rusqlite(e)),
@@ -303,29 +315,21 @@ impl SqliteStorageEngine {
                 None
             };
 
-            let expected = PROTOCOL_VERSION.to_string();
+            let expected = STORE_FORMAT_VERSION;
             match recorded {
-                Some(found) if found == expected => Ok(()),
-                Some(found) => Err(SqliteError::ProtocolVersionMismatch { found, expected: PROTOCOL_VERSION }),
-                None if has_ankurah_tables => Err(SqliteError::UnversionedStore { expected: PROTOCOL_VERSION }),
+                Some(record) => Ok(StoreFormatError::check_decimal_record(&record, expected)),
+                None if has_ankurah_tables => Ok(Err(StoreFormatError::Unversioned { expected })),
                 None => {
                     // Fresh store: claim the record.
                     c.execute(&format!(r#"CREATE TABLE IF NOT EXISTS "{META_TABLE}" ("key" TEXT PRIMARY KEY, "value" TEXT)"#), [])?;
                     c.execute(
-                        &format!(r#"INSERT OR IGNORE INTO "{META_TABLE}" ("key", "value") VALUES ('protocol_version', ?)"#),
-                        rusqlite::params![expected],
+                        &format!(r#"INSERT OR IGNORE INTO "{META_TABLE}" ("key", "value") VALUES ('store_format_version', ?)"#),
+                        rusqlite::params![expected.to_string()],
                     )?;
                     // Re-read: if another process recorded between our scan and
-                    // our insert, the store must still match this binary.
-                    let reread: String =
-                        c.query_row(&format!(r#"SELECT "value" FROM "{META_TABLE}" WHERE "key" = 'protocol_version'"#), [], |row| {
-                            row.get(0)
-                        })?;
-                    if reread == expected {
-                        Ok(())
-                    } else {
-                        Err(SqliteError::ProtocolVersionMismatch { found: reread, expected: PROTOCOL_VERSION })
-                    }
+                    // our insert, the store must still match this engine.
+                    let reread: String = read_record(c)?;
+                    Ok(StoreFormatError::check_decimal_record(&reread, expected))
                 }
             }
         })

@@ -29,6 +29,9 @@ pub trait StorageDump: StorageEngine {
 mod catalog;
 pub use catalog::CatalogResolver;
 
+mod format;
+pub use format::StoreFormatError;
+
 mod read;
 pub use read::GetStateResult;
 
