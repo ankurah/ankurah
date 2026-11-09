@@ -53,3 +53,56 @@ impl std::fmt::Display for NodeMessage {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        identity::{Identity, Signature},
+        request::{NodeRequestBody, NodeResponseBody, RequestId},
+        update::{NodeUpdateAckBody, NodeUpdateBody, UpdateId},
+    };
+
+    fn node(byte: u8) -> NodeId { Identity::Ed25519([byte; 32]).into() }
+
+    /// The first four bytes of a message are its variant index, which every peer reads to frame it.
+    #[test]
+    fn message_variant_order_is_pinned() {
+        let challenge = HandshakeChallenge::new(node(1));
+        let presence = Presence {
+            node_id: node(2),
+            durable: false,
+            challenge,
+            timestamp: 0,
+            signature: Signature::Ed25519([0; 64]),
+            protocol_version: 1,
+        };
+        let unsubscribe = NodeMessage::UnsubscribeQuery { from: node(2), query_id: QueryId::test(1) };
+        for (message, index) in [
+            (Message::Presence(presence), [0, 0, 0, 0]),
+            (Message::PeerMessage(unsubscribe), [1, 0, 0, 0]),
+            (Message::PresenceRejected(PresenceRejection { expected: 1, received: 0 }), [2, 0, 0, 0]),
+            (Message::Challenge(challenge), [3, 0, 0, 0]),
+        ] {
+            assert_eq!(bincode::serialize(&message).unwrap()[..4], index, "{message}");
+        }
+    }
+
+    #[test]
+    fn node_message_variant_order_is_pinned() {
+        let (from, to) = (node(1), node(2));
+        let request = NodeRequest { id: RequestId::new(), to, from, body: NodeRequestBody::Get { ids: vec![] } };
+        let response = NodeResponse { request_id: RequestId::new(), from, to, body: NodeResponseBody::Success };
+        let update = NodeUpdate { id: UpdateId::new(), from, to, body: NodeUpdateBody::SubscriptionUpdate { items: vec![] } };
+        let ack = NodeUpdateAck { id: UpdateId::new(), from, to, body: NodeUpdateAckBody::Success };
+        for (message, index) in [
+            (NodeMessage::Request { auth: vec![], request }, [0, 0, 0, 0]),
+            (NodeMessage::Response(response), [1, 0, 0, 0]),
+            (NodeMessage::Update(update), [2, 0, 0, 0]),
+            (NodeMessage::UpdateAck(ack), [3, 0, 0, 0]),
+            (NodeMessage::UnsubscribeQuery { from, query_id: QueryId::test(1) }, [4, 0, 0, 0]),
+        ] {
+            assert_eq!(bincode::serialize(&message).unwrap()[..4], index, "{message}");
+        }
+    }
+}

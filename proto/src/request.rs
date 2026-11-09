@@ -309,3 +309,81 @@ impl std::fmt::Display for EntityDelta {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{State, StateFragment};
+
+    fn selection() -> ast::Selection<ast::Resolved> { ast::Selection { predicate: ast::Predicate::True, order_by: None, limit: None } }
+
+    fn state() -> StateFragment { StateFragment { state: State::default(), attestations: Default::default() } }
+
+    fn index(value: &impl Serialize) -> [u8; 4] { bincode::serialize(value).unwrap()[..4].try_into().unwrap() }
+
+    /// A body's first four bytes are its variant index, which names the request a peer is asked to serve.
+    #[test]
+    fn request_body_variant_order_is_pinned() {
+        let model = RegisterModel { label: "m".into(), name: "m".into(), explicit_id: None, build_id: [0; 16], properties: vec![] };
+        let bodies = [
+            NodeRequestBody::CommitTransaction { id: TransactionId::new(), events: vec![] },
+            NodeRequestBody::Get { ids: vec![] },
+            NodeRequestBody::GetEvents { event_ids: vec![] },
+            NodeRequestBody::Fetch { selection: selection(), known_matches: vec![] },
+            NodeRequestBody::SubscribeQuery { query_id: QueryId::test(1), selection: selection(), version: 0, known_matches: vec![] },
+            NodeRequestBody::RegisterSchema { model },
+        ];
+        let indices: Vec<_> = bodies.iter().map(index).collect();
+        assert_eq!(indices, [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0]]);
+    }
+
+    #[test]
+    fn response_body_variant_order_is_pinned() {
+        let model = RegisteredModel { id: EntityId::from_bytes([1; 32]), label: "m".into(), name: "m".into(), properties: vec![] };
+        let bodies = [
+            NodeResponseBody::CommitComplete { id: TransactionId::new() },
+            NodeResponseBody::Fetch(vec![]),
+            NodeResponseBody::Get(vec![]),
+            NodeResponseBody::GetEvents(vec![]),
+            NodeResponseBody::QuerySubscribed { query_id: QueryId::test(1), deltas: vec![] },
+            NodeResponseBody::SchemaRegistered { model },
+            NodeResponseBody::Success,
+            NodeResponseBody::Error("e".into()),
+        ];
+        let indices: Vec<_> = bodies.iter().map(index).collect();
+        assert_eq!(
+            indices,
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0], [6, 0, 0, 0], [7, 0, 0, 0]]
+        );
+    }
+
+    #[test]
+    fn delta_get_result_and_causal_relation_variant_order_is_pinned() {
+        let relation = CausalAssertionFragment { relation: CausalRelation::Equal, attestations: Default::default() };
+        let deltas = [
+            DeltaContent::StateSnapshot { state: state() },
+            DeltaContent::EventBridge { events: vec![] },
+            DeltaContent::StateAndRelation { state: state(), relation },
+        ];
+        assert_eq!(deltas.iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]);
+
+        let entity = EntityId::from_bytes([1; 32]);
+        let found = Attested::from(EntityState { entity_id: entity, state: State::default() });
+        let results = [GetResult::Found(found), GetResult::NotFound(entity), GetResult::AccessDenied(entity)];
+        assert_eq!(results.iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]);
+
+        let (root, clock) = (EventId::from_bytes([2; 32]), Clock::default());
+        let relations = [
+            CausalRelation::Equal,
+            CausalRelation::StrictDescends,
+            CausalRelation::StrictAscends,
+            CausalRelation::DivergedSince { meet: clock.clone(), subject: clock.clone(), other: clock.clone() },
+            CausalRelation::Disjoint { gca: None, subject_root: root.clone(), other_root: root },
+            CausalRelation::BudgetExceeded { subject: clock.clone(), other: clock },
+        ];
+        assert_eq!(
+            relations.iter().map(index).collect::<Vec<_>>(),
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0]]
+        );
+    }
+}

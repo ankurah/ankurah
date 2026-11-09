@@ -617,6 +617,15 @@ mod tests {
         update.validate_structure().expect("a parented update is well formed");
     }
 
+    /// An event body's first four bytes are its variant index, and every stored and carried event begins with it.
+    #[test]
+    fn event_body_variant_order_is_pinned() {
+        let genesis = Event::genesis(minter(), operations());
+        let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), operations());
+        assert_eq!(bincode::serialize(&genesis.body).unwrap()[..4], [0, 0, 0, 0], "EventBody::Genesis");
+        assert_eq!(bincode::serialize(&update.body).unwrap()[..4], [1, 0, 0, 0], "EventBody::Update");
+    }
+
     #[test]
     fn a_genesis_is_generation_one() {
         let genesis = Event::genesis(minter(), operations());

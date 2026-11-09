@@ -243,9 +243,9 @@ mod tests {
     }
 
     /// Variant order is part of the bincode contract for event payloads:
-    /// Backend = 0, Membership = 1, and Membership::Add = 0. Payload
-    /// encodings inside the variants are pinned by ankurah-core-types' own
-    /// golden tests.
+    /// Backend = 0, Membership = 1, Membership::Add = 0, and for a carried
+    /// operation Bytes = 0, Erased = 1. Payload encodings inside the variants
+    /// are pinned by ankurah-core-types' own golden tests.
     #[test]
     fn operation_variant_order_is_pinned() {
         let backend =
@@ -261,5 +261,8 @@ mod tests {
             let round: Operation = bincode::deserialize(&bytes).unwrap();
             assert_eq!(bincode::serialize(&round).unwrap(), bytes);
         }
+
+        assert_eq!(bincode::serialize(&CarriedOperation::Bytes(vec![])).unwrap()[..4], [0, 0, 0, 0], "CarriedOperation::Bytes");
+        assert_eq!(bincode::serialize(&CarriedOperation::Erased([0; 32])).unwrap()[..4], [1, 0, 0, 0], "CarriedOperation::Erased");
     }
 }

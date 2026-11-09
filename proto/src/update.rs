@@ -143,3 +143,28 @@ impl std::fmt::Display for NodeUpdateAckBody {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::State;
+
+    fn index(value: &impl Serialize) -> [u8; 4] { bincode::serialize(value).unwrap()[..4].try_into().unwrap() }
+
+    /// Each update enum's first four bytes are its variant index, which the receiving peer reads to decode it.
+    #[test]
+    fn update_variant_order_is_pinned() {
+        assert_eq!(index(&NodeUpdateBody::SubscriptionUpdate { items: vec![] }), [0, 0, 0, 0]);
+        assert_eq!(
+            [NodeUpdateAckBody::Success, NodeUpdateAckBody::Error("e".into())].iter().map(index).collect::<Vec<_>>(),
+            [[0, 0, 0, 0], [1, 0, 0, 0]]
+        );
+
+        let state = StateFragment { state: State::default(), attestations: Default::default() };
+        let contents = [UpdateContent::EventOnly(vec![]), UpdateContent::StateAndEvent(state, vec![])];
+        assert_eq!(contents.iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0]]);
+
+        let changes = [MembershipChange::Initial, MembershipChange::Add, MembershipChange::Remove];
+        assert_eq!(changes.iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]);
+    }
+}
