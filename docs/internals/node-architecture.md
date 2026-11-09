@@ -39,8 +39,8 @@ the [Event Retrieval and Staging](retrieval.md) document.
 
 Each node has an ed25519 key. Connections open with a challenge-signed
 handshake, whether a peer counts as durable follows from how it was reached,
-and nodes sign attestations on the events they commit and the states they
-serve. See [Node Identity, Peer Trust and Attestation](node-identity.md).
+and a node signs attestations on events and states when its application's
+policy asks for them. See [Node Identity, Peer Trust and Attestation](node-identity.md).
 
 
 ## The Replication Protocol

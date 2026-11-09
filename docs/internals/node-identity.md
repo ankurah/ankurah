@@ -2,10 +2,11 @@
 
 Every node has a key that other nodes verify. That key is how a node proves
 who it is when it connects, how the entities it creates name their minter,
-and how the facts a node vouches for, such as "I committed this event" or "I
-held this state", stay checkable after the connection that carried them is
-gone. Core records keys and nothing about what a key denotes: an
-application, a tenant or an owner is a component the application declares.
+and how a statement an application has a node make about an event or a state,
+such as "I committed this event" or "I held this state", stays checkable after
+the connection that carried it is gone. Core records keys and nothing about
+what a key denotes: an application, a tenant or an owner is a component the
+application declares.
 
 ## Identities and Node Keys
 
@@ -95,40 +96,47 @@ encoding of each value inside it, byte by byte, with test vectors.
 entity needs nothing but the node's key: a node that has never connected to
 anyone can mint. Because the minter is hashed into the id, no relay can drop
 or re-attribute it; the same content minted under another identity is a
-different entity. An update names no minter: who wrote an update rides the
-committing node's attestation.
+different entity. An update names no minter; an application that wants to
+record who committed an update has the committing node attest it.
 
 ## Attestations
 
-An attestation is an attester `Identity`, a body, and the attester's
-signature over `ankurah.attestation.v1` followed by the body. An event
-attestation names the event's id and the attester's role, `Committed` or
-`Admitted`; a state attestation names the entity, its head and a digest of
-the whole state (SHA-256 over `ankurah.state.v1` followed by the state). Both
-carry claims, bytes a policy agent chooses.
+An attestation is a statement one identity signs about one event or one entity
+state, which anyone who later holds it can check without the connection that
+carried it. A `Statement` names its attester, its subject (an event by its id,
+or a state by its entity, its head and a digest of the whole state: SHA-256
+over `ankurah.state.v1` followed by the state), its kind and its payload. The
+kind is the entity id of the definition that says what the statement means and
+how to read the payload; core defines no kinds. A `SealedAttestation` is the
+statement's exact bytes and the attester's signature over
+`ankurah.attestation.v1` followed by those bytes.
 
-Core signs every attestation with the node's key:
+A node makes an attestation only when its application's policy agent asks for
+one, and seals it with the node's own key:
 
-- every node attaches a `Committed` attestation to every event it commits
-  locally, with empty claims;
-- when a policy agent's `check_write_event` answers `Admission::Attest`, the
-  node attaches an `Admitted` attestation carrying the agent's claims;
-  `Admission::Allow` adds none;
-- when `PolicyAgent::attest_state` returns claims for a state a durable node
+- when `check_write_event` returns an `AttestationRequest`, the node that ran
+  the check attaches a statement about the event with the request's kind and
+  payload. The check runs on a local commit and on a durable node admitting
+  another node's commit;
+- when `PolicyAgent::attest_state` returns one for a state a durable node
   serves, in fetch responses, subscription deltas and direct gets, the node
-  attaches a state attestation carrying them; `None` attaches nothing, and no
-  signature is made. `PermissiveAgent` and `JwtAgent` return `None`.
-  Ephemeral nodes attach none.
+  attaches a statement about that state. Ephemeral nodes attach none.
 
-Wherever an event or a state arrives from a peer, core checks each of its
-attestations before any policy hook runs: the signature must verify under the
-attester, and the attestation must name the payload it travels with (the
-event's recomputed id, or the state's entity, head and digest). An
-attestation that fails either is stripped, and the number stripped is logged
-as a warning. `validate_received_event` and `validate_received_state` then see
-only attestations that verified, and the agent decides whether they suffice;
-recognising an attester as a trusted durable peer or a trusted publisher is
-the agent's decision. Stored events keep their attestations.
+An agent that returns `None` has its node sign nothing. `PermissiveAgent` and
+`JwtAgent` return `None` from both hooks.
+
+Core checks no attestation. It stores and relays the attestations on an event
+exactly as they came, including ones it cannot read, and
+`validate_received_event` and `validate_received_state` receive them
+unchanged. A received state's attestations go no further than
+`validate_received_state`: a node stores every state without attestations, and
+a durable node serves a state with only the one its own agent requests. An
+agent that cares opens one with `SealedAttestation::open`, which
+yields the statement only if the bytes decode and the signature verifies under
+the statement's attester, and then checks that the subject names the event or
+state in hand (`Subject::names_event`, `Subject::names_state`). Whether an
+attestation suffices, and whether its attester is a trusted durable peer or a
+trusted publisher, is the agent's decision.
 
 `PolicyAgent::trusted_publishers` names the identities whose published
 component and property definitions a node may adopt. By default it returns

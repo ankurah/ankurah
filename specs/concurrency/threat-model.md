@@ -102,10 +102,11 @@ It does **not** buy (each on a named gap or agent responsibility):
 
 - **Authorization**: the hash says nothing about whether an author was allowed;
   that needs policy layered above the DAG (Finding 6; 274-B; OrbitDB `canAppend`).
-  Attribution is now partly structural, though not by the hash alone: a genesis
-  hashes its minter's `Identity` into the entity id, and the committing node signs
-  a `Committed` attestation (`proto/src/auth.rs`) on every event it commits, which
-  core verifies at every ingress before the agent sees it (C4-20).
+  Attribution is partly structural, though not by the hash alone: a genesis hashes
+  its minter's `Identity` into the entity id. Who committed or admitted an update is
+  a signed fact only when the application's policy agent has the node attest it
+  (`proto/src/auth.rs`); core checks no attestation, and an agent opens the ones it
+  cares about (C4-20).
 - **Equivocation resistance / DoS bound**: every forged concurrent event is a
   distinct genuine hash, so de-dup stops identical replays but not flooding of
   distinct ones; unsigned hash-DAG CRDTs permit unbounded distinct valid
@@ -443,10 +444,9 @@ before it is written to storage.
 Trust tier: currently trusted-peer (should be attestation-dependent).
 Enforcing seam: **none today.** `retrieval.rs` `CachedEventGetter::get_event`, the
 remote branch: on `NodeResponseBody::GetEvents(peer_events)` it loops
-`self.collection.add_event(event)` with no `validate_received_event` and no filter
-that returned ids match the requested id (contrast `validate_and_stage`). Core does
-strip the event's attestations that fail verification before storing it, but no
-policy hook judges what remains.
+`self.collection.add_event(event)` with no `validate_received_event`, no attestation
+check, and no filter that returned ids match the requested id (contrast
+`validate_and_stage`).
 Falsifying attack (T1/T3): during an ephemeral node's BFS fetch of a missing parent,
 the durable peer returns crafted events (including unrequested ids), written straight
 to permanent storage, altering state and polluting the store, bypassing policy.
@@ -562,29 +562,32 @@ the ingress seam. Gap G-6.
 
 ### 3.6 Convergence-boundary claims (what no ingress can enforce)
 
-**C4-20. Authorship is attested; authorization is not structural.**
+**C4-20. Authorship is attested when policy asks; authorization is not structural.**
 Invariant: the DAG proves *what* an event contains and *that* it happened-before its
-named ancestors; it does not prove *whether its author was allowed*. Who committed an
-event is a signed fact: the committing node attaches a `Committed` attestation, and a
-genesis also names its minter inside its id.
+named ancestors; it does not prove *who* committed it or *whether they were allowed*. A
+genesis names its minter inside its id; any other fact about who committed, admitted
+or served something is a statement a node signs when its policy agent requests one.
 Trust tier: attestation-dependent by construction.
-Enforcing seam: `proto/src/auth.rs` defines the envelope (attester `Identity`, body
-naming the event or state, signature over `ankurah.attestation.v1` and the body) and
-its `verify`/`covers_event`/`covers_state` checks. `core/src/node/attestation.rs`
-signs committed, admitted and served-state attestations with the node key, and strips
-any received attestation that fails its signature or names another payload in the
-applier, the remote commit funnel and the peer event fetch, before
-`PolicyAgent::validate_received_event`/`validate_received_state`/`check_write_event`
-run. Whether the verified attestations suffice remains the agent's decision.
-Falsifying attack (T2): a peer cannot forge another identity's attestation or move
-one onto a different event; it can still sign its own events, omit attestations, or
-relay events that carry none. Rejecting those needs an agent that requires a
-recognised attester; PermissiveAgent and JwtAgent accept anything.
-Test arm: `attestation::every_committed_event_carries_its_committers_attestation_which_the_receiver_verifies`,
-`attestation::attestations_that_fail_are_stripped_before_any_policy_hook_or_storage_sees_them`,
-`attestation::an_attesting_policy_adds_an_admitted_attestation_with_its_claims`.
-Status: authorship attested and verified at ingress; authorization stays the agent's
-(Finding 6, 274-B). Frames after the handshake are still unsigned (G-8).
+Enforcing seam: `proto/src/auth.rs` defines the sealed attestation: a `Statement`
+(attester `Identity`, subject naming the event or the state, kind, payload) carried as
+its exact bytes with the attester's signature over `ankurah.attestation.v1` and those
+bytes. `SealedAttestation::open` yields the statement only if the bytes decode and the
+signature verifies, and `Subject::names_event`/`names_state` check the subject against
+the payload in hand. `core/src/node/attestation.rs` seals a statement with the node key
+when `check_write_event` or `attest_state` requests one, and only then. Core checks no
+attestation on arrival: `validate_received_event`/`validate_received_state` receive the
+attestations as they came, and the agent opens and judges the ones it cares about.
+Falsifying attack (T2): forge authorship. A forged attestation, or one moved onto
+another event, fails `open` or the subject check, but only an agent that runs both and
+requires a recognised attester rejects it; a peer can always omit attestations or relay
+events that carry none. PermissiveAgent and JwtAgent request and check none.
+Test arm: `attestation::each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests`,
+`attestation::a_relaying_node_keeps_every_attestation_on_an_event_unchanged`, and in
+`ankurah-proto` `auth::tests::{a_changed_attester_subject_kind_or_payload_fails_the_signature,
+an_event_subject_names_only_its_event}`.
+Status: enforced-by-design boundary: core seals and opens attestations, and an agent
+decides which to make and which to require (Finding 6, 274-B). Frames after the
+handshake are still unsigned (G-8).
 
 **C4-21. Validated ingress can enforce only I-confluent, before(u)-local invariants.**
 Invariant: a validated-ingress check (#274) is load-bearing for convergence only if it
@@ -651,10 +654,9 @@ for a real PolicyAgent.
 |---|---|---|---|
 | `node_applier::validate_and_stage` (`validate_received_event`) | admits an event fragment on EventOnly/StateAndEvent/EventBridge | `PolicyAgent::validate_received_event` | a forbidden event is staged, applied, and committed; the head advances on unauthorized data (C4-14) |
 | `node_applier::apply_delta_inner` + `apply_update` (`validate_received_state`) | admits a state snapshot | `PolicyAgent::validate_received_state` | a forged state is adopted as the entity's state on the StrictDescends fast path, bypassing event history (C4-14) |
-| `node/attestation.rs` `verify_event` / `verify_state` (every ingress) | strips received attestations whose signature fails or that name another payload, before any hook runs | core (`Attestation::verify`, `covers_event`, `covers_state`) | nothing to lie about: a forged or transplanted attestation never reaches an agent; an omitted one is the agent's to require |
-| `transaction/remote.rs` `RemoteTransaction::add_event` (`check_write_event`) | authorizes a remote transaction's event; `Admission::Attest` has the node sign an `Admitted` attestation stored on the event | `PolicyAgent::check_write_event` | an unauthorized remote transaction is admitted, attested and persisted; on the creation-event path the entity is already mutated before the check (C4-19, #243) |
-| `transaction/local.rs` `Transaction::commit_with` (`check_write_event`) | authorizes a locally generated event on a fork; the node signs a `Committed` attestation, and an `Admitted` one on `Admission::Attest` | `PolicyAgent::check_write_event` | a local event that policy should reject is attested and committed |
-| `node/attestation.rs` `served_state` (fetch responses, subscription deltas, direct gets) | a durable node attaches a state attestation, carrying the claims `attest_state` returns, to a state it serves when the agent returns claims; `None` attaches none | `PolicyAgent::attest_state` (claims) / `validate_received_state` (consumes downstream) | a peer accepts a state the origin never legitimately held; state authority is only as strong as the agent's recognition of the attester |
+| `transaction/remote.rs` `RemoteTransaction::add_event` (`check_write_event`) | authorizes a remote transaction's event; an `AttestationRequest` it returns has the node seal a statement about the event, stored on it | `PolicyAgent::check_write_event` | an unauthorized remote transaction is admitted, attested and persisted; on the creation-event path the entity is already mutated before the check (C4-19, #243) |
+| `transaction/local.rs` `Transaction::commit_with` (`check_write_event`) | authorizes a locally generated event on a fork; an `AttestationRequest` it returns has the node seal a statement about the event | `PolicyAgent::check_write_event` | a local event that policy should reject is attested and committed |
+| `node/attestation.rs` `served_state` (fetch responses, subscription deltas, direct gets) | a durable node seals the statement `attest_state` requests about a state it serves; `None` attaches none | `PolicyAgent::attest_state` (requests) / `validate_received_state` (consumes downstream) | a peer accepts a state the origin never legitimately held; state authority is only as strong as the agent's recognition of the attester |
 | `node.rs GetEvents` + `collect_event_bridge` (`check_read_event`) | read-filters served events | `PolicyAgent::check_read_event` | events leak to an unauthorized reader (C4-18) |
 | `PolicyAgent::validate_causal_assertion` (`CausalAssertion`) | would validate a peer's *claim* about lineage between two heads | **no consumer today** | defined but unused: `validate_causal_assertion` has zero call sites in core; `CausalAssertion`/`CausalAssertionFragment` (`proto/src/request.rs`) carry a `CausalRelation` + `AttestationSet` that nothing in the applier or comparison path consumes. If a future path trusts an asserted relation without re-deriving it, a lying peer substitutes a false `StrictDescends`/`Disjoint` for a real divergence. Gap G-9. |
 | `#271` sealed-prefix checkpoint (future) | a durable-tier attestation that a history prefix is canonical, carrying a genesis attestation so identity survives pruning | future `PolicyAgent` seal-validation | a lying seal lets a T3 durable node rewrite or amputate history below the seal, or forge the genesis binding so Disjoint detection accepts a foreign lineage. This is why #271 must justify sealing by *authority scope*, not by "everyone has it" (lit review Finding 4). |
@@ -675,7 +677,7 @@ PermissiveAgent every security gap is moot, which is itself meta-gap G-0.
 | Gap | Description | Severity rationale | Owner |
 |---|---|---|---|
 | G-0 | PermissiveAgent is the default and enforces nothing | Meta: every attestation-dependent claim is nil until a real agent is deployed. Not a bug (it is the intended default for open development) but the reader must know the security claims are conditional. | Deployment choice; #274 designs the agent surface |
-| G-1 | BFS-time remote event fetch skips `validate_received_event` and response-id filtering; it strips unverified attestations but no agent judges the rest (C4-15) | Critical with a real agent: a peer injects unvalidated events straight into permanent storage mid-BFS, altering state and bypassing policy. No impact under PermissiveAgent. | #244, closed by #274 |
+| G-1 | BFS-time remote event fetch skips `validate_received_event`, attestation check, and response-id filtering (C4-15) | Critical with a real agent: a peer injects unvalidated events straight into permanent storage mid-BFS, altering state and bypassing policy. No impact under PermissiveAgent. | #244, closed by #274 |
 | G-2 | Collection is not bound into the event id; attribution rides the message envelope (C4-02) | Medium: a peer can steer identical content into a chosen collection's storage; cross-collection contamination is possible if policy keys on the wrong collection. | #274 (bind or validate collection at ingress) |
 | G-3 | No size/count limit on incoming event messages, and no bound on the `collect_event_bridge` backward walk (C4-17) | Medium DoS: memory exhaustion on receive (#246) or forced full-history serialization on serve (#247). Rated low in the issues; genuine under an adversarial peer. | #246, #247, closed by #274 (ingress size limits) |
 | G-4 | Equivocation / concurrency flooding: content-hash de-dup stops identical replays but not unbounded distinct valid concurrent events (C4-13) | High DoS: an adversary inflates the antichain and forces unbounded staging and deep/wide merges with no finite-harm bound. Unsigned hash-DAG CRDTs have no structural cap (lit review Finding 7, Blocklace). | #246/#274 (rate/quantity cap) or a signature-attribution layer; cross-referenced from #271 horizon |
@@ -723,7 +725,7 @@ assertion, not a wire arm, per the claim body).
 | C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |
 | C4-18 | `bridge_policy::test_event_bridge_respects_read_policy_on_send` | existing-suite |
 | C4-19 | none here (creation-event fork asymmetry is gap G-6; the remote-transaction path with a rejecting agent is owned by #243) | design-boundary |
-| C4-20 | `attestation::{every_committed_event_carries_its_committers_attestation_which_the_receiver_verifies, attestations_that_fail_are_stripped_before_any_policy_hook_or_storage_sees_them, an_attesting_policy_adds_an_admitted_attestation_with_its_claims}` | enforced-pass for attested authorship; authorization remains the agent's |
+| C4-20 | `attestation::{each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests, a_relaying_node_keeps_every_attestation_on_an_event_unchanged}`; `ankurah-proto` `auth::tests` (a changed statement fails its signature, a moved one its subject check) | design-boundary: the arms pin the ability to seal, carry and open; requiring an attestation is the agent's |
 | C4-21 | I-confluence boundary is a design assertion for #274 and a C3 conformance audit, not a wire arm (per the claim body) | design-boundary |
 | C4-22 | enforced by absence: `Event` carries no depth/generation field to forge; the forged-generation arm activates when #266 lands | design-boundary |
 | G-4 | `adversarial_wire::equivocation_flood_antichain_is_bounded` | gap-red-ignored (G-4, #246 / signature layer) |
@@ -734,11 +736,10 @@ green arms (C4-01, C4-03, C4-04, C4-05, C4-06, C4-07, C4-09 partial, C4-11,
 C4-12, and C4-16 for the handshake and durable routing but not the unsigned frames
 after it); the three open ingress gaps are pinned by red-ignored arms
 (C4-15/G-1, C4-17/G-3, plus G-4); the attestation-dependent admission/read claims
-are already pinned by the existing policy suite (C4-14, C4-18), and attested
-authorship by the attestation suite (C4-20); and the remaining claims are
-documented boundaries a wire arm cannot cheaply or meaningfully add here (C4-02,
-C4-08, C4-10, C4-13, C4-19, C4-21, C4-22), each with its owning issue or workstream
-named above.
+are already pinned by the existing policy suite (C4-14, C4-18); and the remaining
+claims are documented boundaries a wire arm cannot cheaply or meaningfully add here
+(C4-02, C4-08, C4-10, C4-13, C4-19, C4-20, C4-21, C4-22), each with its owning issue
+or workstream named above, the attestation suite pinning the ability C4-20 rests on.
 
 No arm contradicted a claim. One behavior warranted a precise assertion choice:
 on an ephemeral node a rejected second genesis (C4-06) still causes BFS to pull
