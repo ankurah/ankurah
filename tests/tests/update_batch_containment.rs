@@ -88,7 +88,7 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         id: proto::UpdateId::new(),
         from: server.id,
         to: client.id,
-        body: proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] },
+        body: proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] }),
     };
     client.handle_message(proto::NodeMessage::Update(update)).await?;
 
@@ -152,9 +152,9 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
         id: proto::UpdateId::new(),
         from: server.id,
         to: client.id,
-        body: proto::NodeUpdateBody::SubscriptionUpdate {
+        body: proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![event_only_item(ev_a), event_only_item(ev_unknown), event_only_item(ev_b)],
-        },
+        }),
     };
 
     // handle_message reports per-update failures to the sender via

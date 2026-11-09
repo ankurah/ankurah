@@ -86,6 +86,16 @@ collected events into causal (oldest-first) order.
 > Chunked bridge framing, size limits, and resource governance are tracked in
 > the phase-2 spec (`specs/concurrency/phase-2.md`).
 
+### What a node cannot read
+
+A request, a response and an update each carry their body as length-prefixed
+bytes, so the message, its ids and its addresses decode even when the body is
+of a kind a later build added. A node answers a request whose body it cannot
+read with `NodeResponseBody::Unsupported`, acknowledges such an update with
+`NodeUpdateAckBody::Unsupported`, and fails a request whose response it cannot
+read with `RequestError::UnreadableResponse`. A message of a kind it does not
+know at all is dropped and the connection stays up.
+
 
 ## Subscription Propagation
 

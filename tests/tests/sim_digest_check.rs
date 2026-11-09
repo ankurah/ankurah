@@ -20,13 +20,13 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
         id: proto::UpdateId::new(),
         from: proto::NodeId::from(proto::Identity::Ed25519([1; 32])),
         to: proto::NodeId::from(proto::Identity::Ed25519([2; 32])),
-        body: proto::NodeUpdateBody::SubscriptionUpdate {
+        body: proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
                 entity_id: entity,
                 content: proto::UpdateContent::EventOnly(vec![frag]),
                 predicate_relevance: vec![],
             }],
-        },
+        }),
     })
 }
 

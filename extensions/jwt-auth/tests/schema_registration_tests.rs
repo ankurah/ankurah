@@ -80,13 +80,18 @@ async fn wire_register(
     node.handle_message(proto::NodeMessage::Request {
         // One empty entry is an anonymous credential, not an empty credential set.
         auth: vec![auth],
-        request: proto::NodeRequest { id: id.clone(), from: peer, to: node.id, body: proto::NodeRequestBody::RegisterSchema { model } },
+        request: proto::NodeRequest {
+            id: id.clone(),
+            from: peer,
+            to: node.id,
+            body: proto::CarriedBody::encode(&proto::NodeRequestBody::RegisterSchema { model }),
+        },
     })
     .await?;
     match replies.try_recv()? {
         proto::NodeMessage::Response(response) => {
             assert_eq!(response.request_id, id);
-            Ok(response.body)
+            Ok(response.body.decode()?)
         }
         other => anyhow::bail!("expected registration response, got {other:?}"),
     }
@@ -317,8 +322,9 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
                 let updates = held.lock().unwrap();
                 catalog_ids.iter().all(|id| {
                     updates.as_ref().unwrap().iter().any(|message| match message {
-                        proto::NodeMessage::Update(update) => match &update.body {
-                            proto::NodeUpdateBody::SubscriptionUpdate { items } => items.iter().any(|item| item.entity_id == *id),
+                        proto::NodeMessage::Update(update) => match update.body.decode() {
+                            Ok(proto::NodeUpdateBody::SubscriptionUpdate { items }) => items.iter().any(|item| item.entity_id == *id),
+                            Err(_) => false,
                         },
                         _ => false,
                     })

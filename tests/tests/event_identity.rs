@@ -160,7 +160,7 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
         let relayed = relayed.clone();
         GatedConnection::new(&client, &server, move |message: &proto::NodeMessage| {
             if let proto::NodeMessage::Request { request, .. } = message {
-                if let proto::NodeRequestBody::CommitTransaction { events, .. } = &request.body {
+                if let Ok(proto::NodeRequestBody::CommitTransaction { events, .. }) = request.body.decode() {
                     relayed.lock().unwrap().extend(events.iter().map(|event| event.payload.clone()));
                 }
             }

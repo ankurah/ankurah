@@ -357,7 +357,9 @@ it reads anything else:
 
 The first twelve bytes of either frame are the variant index, then the lowest
 and the highest version, each a `u32`. Variant 2 is the presence of 3.6, and
-variant 3 carries every message after the handshake.
+variant 3 carries every message after the handshake. A request, a response or
+an update there carries its body as a byte string, so the message decodes even
+when its body is of a kind the receiver does not know.
 
 A receiver reads the twelve bytes of the peer's first frame before anything
 else in it:

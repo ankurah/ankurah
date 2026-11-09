@@ -219,7 +219,7 @@ impl<'a> Workload<'a> {
             id: proto::UpdateId::new(),
             from: self.nodes[origin].id(),
             to: self.nodes[dst].id(),
-            body: proto::NodeUpdateBody::SubscriptionUpdate { items },
+            body: proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate { items }),
         })
     }
 
@@ -266,11 +266,12 @@ impl<'a> Workload<'a> {
         for event in &events {
             let event_id = event.payload.id();
             for &dst in &node_indices {
+                let body = proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![event.clone()] };
                 let request = proto::NodeRequest {
                     id: proto::RequestId::new(),
                     to: node_ids[dst],
                     from: origin_id,
-                    body: proto::NodeRequestBody::CommitTransaction { id: proto::TransactionId::new(), events: vec![event.clone()] },
+                    body: proto::CarriedBody::encode(&body),
                 };
                 let message = proto::NodeMessage::Request { auth: vec![proto::AuthData(vec![])], request };
                 self.scheduler.enqueue_event(origin, dst, entity, event_id.clone(), message);

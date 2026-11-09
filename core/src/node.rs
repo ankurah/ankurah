@@ -430,15 +430,12 @@ where
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
-        let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
-
         // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
         // follow-on uses #426's node session union for catalog queries.
-        let auth = if crate::schema::request_bypasses_policy(&request.body) {
-            Vec::new()
-        } else {
-            self.policy_agent.sign_request(self, cdata, &request)?
-        };
+        let bypasses_policy = crate::schema::request_bypasses_policy(&request_body);
+        let request =
+            proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: proto::CarriedBody::encode(&request_body) };
+        let auth = if bypasses_policy { Vec::new() } else { self.policy_agent.sign_request(self, cdata, &request)? };
 
         {
             // Checked and sent with no await between, through the connection that was checked.
@@ -478,7 +475,8 @@ where
         // Store the response channel
         connection.pending_updates.insert(id.clone(), response_tx);
 
-        let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body: notification });
+        let body = proto::CarriedBody::encode(&notification);
+        let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body });
 
         match connection.send_message(notification) {
             Ok(_) => {}
@@ -514,9 +512,15 @@ where
                     let from = self.id;
 
                     // TODO - validate the from node id is the one we're connected to
-                    let body = match self.handle_update(update).await {
-                        Ok(_) => proto::NodeUpdateAckBody::Success,
-                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                    let body = match update.body.decode() {
+                        Ok(body) => match self.handle_update(update.from, body).await {
+                            Ok(_) => proto::NodeUpdateAckBody::Success,
+                            Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                        },
+                        Err(unreadable) => {
+                            debug!("Node({}) cannot read update {} from {}: {}", self.id, id, update.from, unreadable);
+                            proto::NodeUpdateAckBody::Unsupported
+                        }
                     };
 
                     sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
@@ -545,25 +549,33 @@ where
                         return Ok(());
                     }
 
-                    // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
-                    // follow-on uses #426's node session union for catalog queries.
-                    let cdata = if crate::schema::request_bypasses_policy(&request.body) {
-                        Ok(Vec::new())
-                    } else {
-                        self.policy_agent.check_request(self, &auth, &request).await
-                    };
-                    let body = match cdata {
-                        Ok(cdata) => match self.handle_request(&cdata, request).await {
-                            Ok(result) => result,
-                            Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                        },
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                    let body = match request.body.decode() {
+                        Ok(body) => {
+                            // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
+                            // follow-on uses #426's node session union for catalog queries.
+                            let cdata = if crate::schema::request_bypasses_policy(&body) {
+                                Ok(Vec::new())
+                            } else {
+                                self.policy_agent.check_request(self, &auth, &request).await
+                            };
+                            match cdata {
+                                Ok(cdata) => match self.handle_request(&cdata, from, body).await {
+                                    Ok(result) => result,
+                                    Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                                },
+                                Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                            }
+                        }
+                        Err(unreadable) => {
+                            debug!("Node({}) cannot read request {} from {}: {}", self.id, request_id, from, unreadable);
+                            proto::NodeResponseBody::Unsupported
+                        }
                     };
                     let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
                         request_id,
                         from: self.id,
                         to: from,
-                        body,
+                        body: proto::CarriedBody::encode(&body),
                     }));
                 }
             }
@@ -571,7 +583,8 @@ where
                 debug!("Node {} received response {}", self.id, response);
                 let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
                 if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
-                    tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                    tx.send(response.body.decode().map_err(RequestError::UnreadableResponse))
+                        .map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
@@ -584,10 +597,17 @@ where
         Ok(())
     }
 
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
-    async fn handle_request<C>(&self, cdata: &C, request: proto::NodeRequest) -> anyhow::Result<proto::NodeResponseBody>
-    where C: Iterable<PA::ContextData> {
-        match request.body {
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(body = %body)))]
+    async fn handle_request<C>(
+        &self,
+        cdata: &C,
+        from: proto::NodeId,
+        body: proto::NodeRequestBody,
+    ) -> anyhow::Result<proto::NodeResponseBody>
+    where
+        C: Iterable<PA::ContextData>,
+    {
+        match body {
             proto::NodeRequestBody::CommitTransaction { id, events } => handler::commit_transaction(self, cdata, id, events).await,
             proto::NodeRequestBody::RegisterSchema { model } => {
                 let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
@@ -643,7 +663,7 @@ where
             }
             proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
             proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
-                let peer_state = self.peer_connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
+                let peer_state = self.peer_connections.get(&from).ok_or_else(|| anyhow!("Peer {} not connected", from))?;
                 // Catalog subscriptions carry no credential; others carry exactly one.
                 let cdata = match cdata.iterable().at_most_one() {
                     Ok(cdata) => cdata,
@@ -658,16 +678,16 @@ where
         }
     }
 
-    async fn handle_update(&self, notification: proto::NodeUpdate) -> anyhow::Result<()> {
-        let Some(_connection) = self.peer_connections.get(&notification.from) else {
-            return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
+    async fn handle_update(&self, from: proto::NodeId, body: proto::NodeUpdateBody) -> anyhow::Result<()> {
+        let Some(_connection) = self.peer_connections.get(&from) else {
+            return Err(anyhow!("Rejected notification from unknown node {}", from));
         };
 
-        match notification.body {
+        match body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
-                tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
+                tracing::debug!("Node({}) received subscription update from peer {}", self.id, from);
                 self.lifecycle.check_not_halted()?;
-                crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
+                crate::node::applier::NodeApplier::apply_updates(self, &from, items).await?;
                 Ok(())
             }
         }

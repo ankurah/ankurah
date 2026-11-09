@@ -16,7 +16,8 @@ async fn a_reset_does_not_wait_for_an_inflight_commit() -> anyhow::Result<()> {
             GatedConnection::new(&server, &client, move |message| {
                 if matches!(
                     message,
-                    proto::NodeMessage::Response(proto::NodeResponse { body: proto::NodeResponseBody::CommitComplete { .. }, .. })
+                    proto::NodeMessage::Response(response)
+                        if matches!(response.body.decode(), Ok(proto::NodeResponseBody::CommitComplete { .. }))
                 ) {
                     response_held.notify_one();
                     true
@@ -170,11 +171,8 @@ async fn held_remote_commit_allows_an_unrelated_commit_and_inbound_update() -> a
         let (_connection, gate) = {
             let request_held = request_held.clone();
             GatedConnection::new(&client, &server, move |message| {
-                if let proto::NodeMessage::Request {
-                    request: proto::NodeRequest { body: proto::NodeRequestBody::CommitTransaction { events, .. }, .. },
-                    ..
-                } = message
-                {
+                if let proto::NodeMessage::Request { request, .. } = message {
+                    let Ok(proto::NodeRequestBody::CommitTransaction { events, .. }) = request.body.decode() else { return false };
                     if events.iter().any(|event| event.payload.entity_id == held_id) {
                         request_held.notify_one();
                         return true;

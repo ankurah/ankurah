@@ -150,7 +150,7 @@ async fn application_traffic_before_the_server_registers_closes_the_connection()
             request_id: proto::RequestId::new(),
             from: server,
             to: node.id(),
-            body: proto::NodeResponseBody::Success,
+            body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
         };
         deliver(socket, &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(response))).unwrap());
         client.state.read().wait_for(|state| matches!(state, ConnectionState::Error { .. })).await;
@@ -249,7 +249,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                     request_id: proto::RequestId::new(),
                     from: peer,
                     to: node.id(),
-                    body: proto::NodeResponseBody::Success,
+                    body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
                 })))
                 .unwrap(),
             );
@@ -452,7 +452,7 @@ async fn a_message_of_an_unknown_kind_after_the_handshake_is_ignored() {
             request_id: proto::RequestId::new(),
             from: server.node_id(),
             to: node.id(),
-            body: proto::NodeResponseBody::Success,
+            body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
         };
         deliver(socket, &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(response))).unwrap());
         node.0.handled.read().wait_for(|count| *count == 1).await;

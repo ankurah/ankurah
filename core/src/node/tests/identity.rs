@@ -17,14 +17,11 @@ async fn answered_handshake(client: &TestNode, server: &TestNode) -> (Handshake,
 fn commit_relays(messages: &mpsc::Receiver<proto::NodeMessage>) -> usize {
     messages
         .try_iter()
-        .filter(|message| {
-            matches!(
-                message,
-                proto::NodeMessage::Request {
-                    request: proto::NodeRequest { body: proto::NodeRequestBody::CommitTransaction { .. }, .. },
-                    ..
-                }
-            )
+        .filter(|message| match message {
+            proto::NodeMessage::Request { request, .. } => {
+                matches!(request.body.decode(), Ok(proto::NodeRequestBody::CommitTransaction { .. }))
+            }
+            _ => false,
         })
         .count()
 }

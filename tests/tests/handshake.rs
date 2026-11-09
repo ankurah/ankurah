@@ -59,7 +59,8 @@ where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
 /// `None` if the connection closes first. A connected node sends requests of its own meanwhile.
 async fn request_answered<S>(socket: &mut WebSocketStream<S>, from: proto::NodeId, peer: proto::NodeId) -> Option<proto::NodeResponse>
 where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
-    let request = proto::NodeRequest { id: proto::RequestId::new(), to: peer, from, body: proto::NodeRequestBody::Get { ids: vec![] } };
+    let body = proto::CarriedBody::encode(&proto::NodeRequestBody::Get { ids: vec![] });
+    let request = proto::NodeRequest { id: proto::RequestId::new(), to: peer, from, body };
     let request_id = request.id.clone();
     socket.send(frame(&proto::Message::PeerMessage(proto::NodeMessage::Request { auth: vec![Default::default()], request }))).await.ok()?;
     loop {
@@ -197,6 +198,37 @@ async fn the_server_ignores_a_message_of_an_unknown_kind_and_keeps_the_connectio
     client.socket.send(WsMessage::Binary(vec![99, 0, 0, 0].into())).await?;
     client.socket.send(WsMessage::Binary(vec![3, 0, 0, 0, 99, 0, 0, 0].into())).await?;
     assert!(request_answered(&mut client.socket, client.key.node_id(), server_node.id).await.is_some(), "the server answers a request");
+    server_task.abort();
+    Ok(())
+}
+
+/// The request's frame decodes around a body of a kind the server does not know, so the server
+/// can address its answer.
+#[tokio::test]
+async fn the_server_answers_a_request_whose_body_it_cannot_read_with_unsupported() -> Result<()> {
+    let (server_node, server_url, server_task) = start_test_server().await?;
+    let mut client = RawClient::open(&server_url, SPOKEN).await?;
+    client.present(|_| {}).await?;
+    assert!(eventually(|| server_node.peer_trust(&client.key.node_id()).is_some()).await);
+
+    // Variant 99 of the request body, carried as its bytes.
+    let body = bincode::deserialize(&bincode::serialize(&vec![99u8, 0, 0, 0])?)?;
+    let request = proto::NodeRequest { id: proto::RequestId::new(), to: server_node.id, from: client.key.node_id(), body };
+    let request_id = request.id.clone();
+    client
+        .socket
+        .send(frame(&proto::Message::PeerMessage(proto::NodeMessage::Request { auth: vec![Default::default()], request })))
+        .await?;
+    let response = loop {
+        match receive(&mut client.socket).await {
+            Some(proto::Message::PeerMessage(proto::NodeMessage::Response(response))) if response.request_id == request_id => {
+                break response
+            }
+            Some(_) => continue,
+            None => panic!("the server closed instead of answering"),
+        }
+    };
+    assert!(matches!(response.body.decode(), Ok(proto::NodeResponseBody::Unsupported)), "{:?}", response.body);
     server_task.abort();
     Ok(())
 }

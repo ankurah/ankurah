@@ -43,10 +43,12 @@ fn auth_data(message: &proto::NodeMessage) -> &[proto::AuthData] {
 }
 
 fn is_commit_relay(message: &proto::NodeMessage) -> bool {
-    matches!(
-        message,
-        proto::NodeMessage::Request { request: proto::NodeRequest { body: proto::NodeRequestBody::CommitTransaction { .. }, .. }, .. }
-    )
+    match message {
+        proto::NodeMessage::Request { request, .. } => {
+            matches!(request.body.decode(), Ok(proto::NodeRequestBody::CommitTransaction { .. }))
+        }
+        _ => false,
+    }
 }
 
 /// A peer that connects to a durable node and claims to be durable is served

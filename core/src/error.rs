@@ -171,6 +171,8 @@ pub enum RequestError {
     InternalChannelClosed,
     #[error("Unexpected response: {0:?}")]
     UnexpectedResponse(ankurah_proto::NodeResponseBody),
+    #[error("the peer's response cannot be read: {0}")]
+    UnreadableResponse(ankurah_proto::UnreadableBody),
     #[error("Access denied: {0}")]
     AccessDenied(AccessDenied),
 }

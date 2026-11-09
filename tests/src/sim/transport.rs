@@ -93,18 +93,22 @@ pub fn message_digest(message: &proto::NodeMessage) -> String {
 /// Canonical, correlation-id-free description of a message's payload.
 fn semantic_descriptor(message: &proto::NodeMessage) -> String {
     match message {
-        proto::NodeMessage::Request { request, .. } => {
-            format!("REQ {}", request_descriptor(&request.body))
-        }
-        proto::NodeMessage::Response(response) => {
-            format!("RESP {}", response_descriptor(&response.body))
-        }
-        proto::NodeMessage::Update(update) => {
-            let proto::NodeUpdateBody::SubscriptionUpdate { items } = &update.body;
-            let mut parts: Vec<String> = items.iter().map(update_item_descriptor).collect();
-            parts.sort();
-            format!("UPD [{}]", parts.join(","))
-        }
+        proto::NodeMessage::Request { request, .. } => match request.body.decode() {
+            Ok(body) => format!("REQ {}", request_descriptor(&body)),
+            Err(unreadable) => format!("REQ {unreadable}"),
+        },
+        proto::NodeMessage::Response(response) => match response.body.decode() {
+            Ok(body) => format!("RESP {}", response_descriptor(&body)),
+            Err(unreadable) => format!("RESP {unreadable}"),
+        },
+        proto::NodeMessage::Update(update) => match update.body.decode() {
+            Ok(proto::NodeUpdateBody::SubscriptionUpdate { items }) => {
+                let mut parts: Vec<String> = items.iter().map(update_item_descriptor).collect();
+                parts.sort();
+                format!("UPD [{}]", parts.join(","))
+            }
+            Err(unreadable) => format!("UPD {unreadable}"),
+        },
         proto::NodeMessage::UpdateAck(ack) => format!("ACK {}", matches!(ack.body, proto::NodeUpdateAckBody::Success)),
         proto::NodeMessage::UnsubscribeQuery { .. } => "UNSUB".to_string(),
     }
@@ -162,6 +166,7 @@ fn response_descriptor(body: &proto::NodeResponseBody) -> String {
         // Include the error text so two distinct rejections are distinguishable
         // in the trace (advisory path, but keeps the digest faithful).
         proto::NodeResponseBody::Error(e) => format!("error:{e}"),
+        proto::NodeResponseBody::Unsupported => "unsupported".to_string(),
     }
 }
 

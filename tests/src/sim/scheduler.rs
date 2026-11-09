@@ -152,11 +152,11 @@ impl Scheduler {
     fn is_catalog_read(&mut self, message: &proto::NodeMessage) -> bool {
         match message {
             proto::NodeMessage::Request { request, .. } => {
-                let protected = match &request.body {
-                    proto::NodeRequestBody::Fetch { selection, .. } => {
+                let protected = match request.body.decode() {
+                    Ok(proto::NodeRequestBody::Fetch { selection, .. }) => {
                         selection.predicate.referenced_models().iter().any(ankurah::core::schema::reads_bypass_policy)
                     }
-                    proto::NodeRequestBody::SubscribeQuery { .. } => true,
+                    Ok(proto::NodeRequestBody::SubscribeQuery { .. }) => true,
                     _ => return false,
                 };
                 if !protected {

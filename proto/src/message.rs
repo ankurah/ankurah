@@ -58,6 +58,7 @@ impl std::fmt::Display for NodeMessage {
 mod tests {
     use super::*;
     use crate::{
+        carried_body::CarriedBody,
         identity::{Identity, Signature},
         peering::{HandshakeChallenge, PresenceClaims, VersionNegotiation},
         request::{NodeRequestBody, NodeResponseBody, RequestId},
@@ -96,9 +97,10 @@ mod tests {
     #[test]
     fn node_message_variant_order_is_pinned() {
         let (from, to) = (node(1), node(2));
-        let request = NodeRequest { id: RequestId::new(), to, from, body: NodeRequestBody::Get { ids: vec![] } };
-        let response = NodeResponse { request_id: RequestId::new(), from, to, body: NodeResponseBody::Success };
-        let update = NodeUpdate { id: UpdateId::new(), from, to, body: NodeUpdateBody::SubscriptionUpdate { items: vec![] } };
+        let request = NodeRequest { id: RequestId::new(), to, from, body: CarriedBody::encode(&NodeRequestBody::Get { ids: vec![] }) };
+        let response = NodeResponse { request_id: RequestId::new(), from, to, body: CarriedBody::encode(&NodeResponseBody::Success) };
+        let body = CarriedBody::encode(&NodeUpdateBody::SubscriptionUpdate { items: vec![] });
+        let update = NodeUpdate { id: UpdateId::new(), from, to, body };
         let ack = NodeUpdateAck { id: UpdateId::new(), from, to, body: NodeUpdateAckBody::Success };
         for (message, index) in [
             (NodeMessage::Request { auth: vec![], request }, [0, 0, 0, 0]),

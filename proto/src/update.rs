@@ -1,4 +1,7 @@
-use crate::{auth::Attested, data::EntityState, id::EntityId, identity::NodeId, subscription::QueryId, EventFragment, StateFragment};
+use crate::{
+    auth::Attested, carried_body::CarriedBody, data::EntityState, id::EntityId, identity::NodeId, subscription::QueryId, EventFragment,
+    StateFragment,
+};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -67,7 +70,7 @@ pub struct NodeUpdate {
     pub id: UpdateId,
     pub from: NodeId,
     pub to: NodeId,
-    pub body: NodeUpdateBody,
+    pub body: CarriedBody<NodeUpdateBody>,
 }
 
 /// An acknowledgement of an update from one node to another
@@ -83,6 +86,8 @@ pub struct NodeUpdateAck {
 pub enum NodeUpdateAckBody {
     Success,
     Error(String),
+    /// The acknowledgement of an update whose body the receiver cannot read.
+    Unsupported,
 }
 
 impl std::fmt::Display for UpdateId {
@@ -140,6 +145,7 @@ impl std::fmt::Display for NodeUpdateAckBody {
         match self {
             NodeUpdateAckBody::Success => write!(f, "Success"),
             NodeUpdateAckBody::Error(e) => write!(f, "Error: {e}"),
+            NodeUpdateAckBody::Unsupported => write!(f, "Unsupported"),
         }
     }
 }
@@ -156,8 +162,11 @@ mod tests {
     fn update_variant_order_is_pinned() {
         assert_eq!(index(&NodeUpdateBody::SubscriptionUpdate { items: vec![] }), [0, 0, 0, 0]);
         assert_eq!(
-            [NodeUpdateAckBody::Success, NodeUpdateAckBody::Error("e".into())].iter().map(index).collect::<Vec<_>>(),
-            [[0, 0, 0, 0], [1, 0, 0, 0]]
+            [NodeUpdateAckBody::Success, NodeUpdateAckBody::Error("e".into()), NodeUpdateAckBody::Unsupported]
+                .iter()
+                .map(index)
+                .collect::<Vec<_>>(),
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]
         );
 
         let state = StateFragment { state: State::default(), attestations: Default::default() };

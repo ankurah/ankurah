@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, data::Event, id::EntityId, identity::NodeId, subscription::QueryId, transaction::TransactionId,
-    EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
+    auth::Attested, carried_body::CarriedBody, clock::Clock, data::Event, id::EntityId, identity::NodeId, subscription::QueryId,
+    transaction::TransactionId, EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -27,7 +27,7 @@ pub struct NodeRequest {
     pub id: RequestId,
     pub to: NodeId,
     pub from: NodeId,
-    pub body: NodeRequestBody,
+    pub body: CarriedBody<NodeRequestBody>,
 }
 
 /// Entity with known head for lineage attestation
@@ -159,7 +159,7 @@ pub struct NodeResponse {
     pub request_id: RequestId,
     pub from: NodeId,
     pub to: NodeId,
-    pub body: NodeResponseBody,
+    pub body: CarriedBody<NodeResponseBody>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -182,6 +182,8 @@ pub enum NodeResponseBody {
     },
     Success,
     Error(String),
+    /// The answer to a request whose body the responder cannot read.
+    Unsupported,
 }
 
 /// A known-ID read reports denial separately from absence, without returning denied state.
@@ -287,6 +289,7 @@ impl std::fmt::Display for NodeResponseBody {
             }
             NodeResponseBody::Success => write!(f, "Success"),
             NodeResponseBody::Error(e) => write!(f, "Error: {e}"),
+            NodeResponseBody::Unsupported => write!(f, "Unsupported"),
         }
     }
 }
@@ -349,11 +352,12 @@ mod tests {
             NodeResponseBody::SchemaRegistered { model },
             NodeResponseBody::Success,
             NodeResponseBody::Error("e".into()),
+            NodeResponseBody::Unsupported,
         ];
         let indices: Vec<_> = bodies.iter().map(index).collect();
         assert_eq!(
             indices,
-            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0], [6, 0, 0, 0], [7, 0, 0, 0]]
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0], [6, 0, 0, 0], [7, 0, 0, 0], [8, 0, 0, 0]]
         );
     }
 

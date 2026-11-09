@@ -7,6 +7,7 @@ use ankurah_signals::Subscribe;
 
 mod commit;
 mod identity;
+mod unreadable_bodies;
 
 #[derive(Clone)]
 struct ClosedSender(proto::NodeId);
