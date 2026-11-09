@@ -64,7 +64,7 @@ impl<'a> Workload<'a> {
     /// it to all other nodes through the scheduler, and return its id. The id
     /// is deterministic (seed-derived counter).
     pub async fn create_at(&mut self, origin: usize, field: Field, value: &str) -> proto::EntityId {
-        let event = model::genesis_event(self.next_entity, field, value);
+        let event = model::genesis_event(self.nodes[origin].node.identity(), self.next_entity, field, value);
         let id = event.entity_id;
         self.next_entity += 1;
 
@@ -383,7 +383,7 @@ where
     runtime.block_on(async move {
         let mut rng = SimRng::new(seed);
         let captured = Captured::new();
-        let nodes = build_nodes(node_count, captured.clone()).await.expect("nodes build");
+        let nodes = build_nodes(node_count, seed, captured.clone()).await.expect("nodes build");
 
         let durable = nodes.iter().find(|node| node.durable).expect("the simulation has a durable node");
 

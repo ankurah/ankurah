@@ -115,7 +115,7 @@ impl std::fmt::Display for Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AuthorId, OperationSet};
+    use crate::{Identity, OperationSet};
 
     fn id(b: u8) -> EventId { EventId::from_bytes([b; 32]) }
 
@@ -145,10 +145,10 @@ mod tests {
 
     #[test]
     fn event_constructors_preserve_generations() {
-        let a = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
-        let b = Event::update(a.entity_id, Clock::singleton(&a), AuthorId::Unknown, OperationSet::default());
-        let c = Event::update(a.entity_id, Clock::singleton(&b), AuthorId::Unknown, OperationSet::default());
-        let d = Event::update(a.entity_id, Clock::singleton(&a), AuthorId::Unknown, OperationSet::default());
+        let a = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
+        let b = Event::update(a.entity_id, Clock::singleton(&a), OperationSet::default());
+        let c = Event::update(a.entity_id, Clock::singleton(&b), OperationSet::default());
+        let d = Event::update(a.entity_id, Clock::singleton(&a), OperationSet::default());
         assert_eq!(Clock::genesis(a.id()), Clock::singleton(&a));
         let mut head = Clock::singleton(&b);
         assert!(head.remove(&b.id()));

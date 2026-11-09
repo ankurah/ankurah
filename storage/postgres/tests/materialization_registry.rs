@@ -327,12 +327,7 @@ async fn events_and_states_rollback_together_on_write_failure() -> anyhow::Resul
     let mut events = Vec::new();
     let mut writes = Vec::new();
     for old in &initial {
-        let event = ankurah::proto::Event::update(
-            old.payload.entity_id,
-            old.payload.state.head.clone(),
-            ankurah::proto::AuthorId::Unknown,
-            Default::default(),
-        );
+        let event = ankurah::proto::Event::update(old.payload.entity_id, old.payload.state.head.clone(), Default::default());
         let mut state = state_with_strings(old.payload.entity_id, 3, &[(property, "after")]);
         state.payload.state.head = Clock::singleton(&event);
         events.push(Attested::opt(event, None));

@@ -3,16 +3,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, author::AuthorId, clock::Clock, id::EntityId, AttestationSet, DecodeError};
+use crate::{auth::Attested, clock::Clock, id::EntityId, identity::Identity, AttestationSet, DecodeError};
 use ankurah_core_types::ModelId;
 
 /// Domain tag for genesis event ids. Separates the two preimage shapes so no
 /// genesis preimage can ever equal an update preimage, and versions the
 /// derivation scheme.
-pub const GENESIS_TAG: &[u8] = b"org.ankurah.genesis.v0";
+pub const GENESIS_TAG: &[u8] = b"org.ankurah.genesis.v1";
 
 /// Domain tag for update event ids. See [`GENESIS_TAG`].
-pub const EVENT_TAG: &[u8] = b"org.ankurah.event.v0";
+pub const EVENT_TAG: &[u8] = b"org.ankurah.event.v1";
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -22,42 +22,27 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// The id of a genesis event: `SHA-256(GENESIS_TAG || bincode(system,
-    /// nonce, timestamp, author, operations))`. Membership is carried in the
-    /// operations and therefore contributes to the entity's identity.
-    pub fn from_genesis_parts(
-        system: &Option<EntityId>,
-        nonce: &[u8; 32],
-        timestamp: u64,
-        author: &AuthorId,
-        operations: &OperationSet,
-    ) -> Self {
+    /// The id of a genesis event: `SHA-256(GENESIS_TAG || bincode(minter,
+    /// nonce, timestamp, operations))`. The minter and the memberships carried
+    /// in the operations are part of the entity's identity.
+    pub fn from_genesis_parts(minter: &Identity, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(GENESIS_TAG);
-        hasher.update(bincode::serialize(system).unwrap());
+        hasher.update(bincode::serialize(minter).unwrap());
         hasher.update(bincode::serialize(nonce).unwrap());
         hasher.update(bincode::serialize(&timestamp).unwrap());
-        hasher.update(bincode::serialize(author).unwrap());
         hasher.update(bincode::serialize(operations).unwrap());
         Self(hasher.finalize().into())
     }
 
     /// The id of an update event: `SHA-256(EVENT_TAG || bincode(entity_id,
-    /// author, nonce, timestamp, operations, parent))`. Model projections stay
-    /// outside the canonical event and its identity. The nonce is what makes an
-    /// event id unguessable to anyone who was not sent the event.
-    pub fn from_update_parts(
-        entity_id: &EntityId,
-        author: &AuthorId,
-        nonce: &[u8; 32],
-        timestamp: u64,
-        operations: &OperationSet,
-        parent: &Clock,
-    ) -> Self {
+    /// nonce, timestamp, operations, parent))`. Model projections stay outside
+    /// the canonical event and its identity. The nonce is what makes an event
+    /// id unguessable to anyone who was not sent the event.
+    pub fn from_update_parts(entity_id: &EntityId, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet, parent: &Clock) -> Self {
         let mut hasher = Sha256::new();
         hasher.update(EVENT_TAG);
         hasher.update(bincode::serialize(entity_id).unwrap());
-        hasher.update(bincode::serialize(author).unwrap());
         hasher.update(bincode::serialize(nonce).unwrap());
         hasher.update(bincode::serialize(&timestamp).unwrap());
         hasher.update(bincode::serialize(operations).unwrap());
@@ -168,15 +153,15 @@ impl AsRef<Event> for Event {
 /// carries its initial operations, frozen when `create()` returns; every
 /// later event is an update.
 ///
-/// Both shapes carry a nonce, a timestamp, and an author, and all three are
-/// inside the event's id hash. They sit in the variants rather than on
-/// [`Event`] so one blob carries a whole body through storage and the wire.
+/// Both shapes carry a nonce and a timestamp, and both are inside the
+/// event's id hash. They sit in the variants rather than on [`Event`] so one
+/// blob carries a whole body through storage and the wire.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub enum EventBody {
     Genesis {
-        /// The system root's entity id; `None` ONLY for the system root
-        /// entity itself, which has no system above it.
-        system: Option<EntityId>,
+        /// The identity that minted the entity, a node's key by default. It
+        /// is inside the entity's id, so no relay can drop or re-attribute it.
+        minter: Identity,
         /// Creator-random, drawn once when the event is minted. Two
         /// `create()` calls with identical payloads draw different nonces and
         /// are therefore different entities; a retry that re-sends the
@@ -186,9 +171,6 @@ pub enum EventBody {
         /// the timestamp inside a ULID carried. It adds entropy and keeps a
         /// creation-time signal for storage locality.
         timestamp: u64,
-        /// Who the creator says wrote this. Always [`AuthorId::Unknown`]
-        /// today; see [`AuthorId`].
-        author: AuthorId,
         /// The entity's initial property values and model memberships.
         operations: OperationSet,
     },
@@ -199,9 +181,6 @@ pub enum EventBody {
         /// Unix ms as the creator reported it. Advisory; see the genesis
         /// field of the same name.
         timestamp: u64,
-        /// Who the creator says wrote this. Always [`AuthorId::Unknown`]
-        /// today; see [`AuthorId`].
-        author: AuthorId,
         operations: OperationSet,
     },
 }
@@ -220,23 +199,19 @@ pub enum EventStructureError {
 }
 
 impl Event {
-    /// Mint an entity: freeze `operations` into a genesis, draw its nonce and
-    /// timestamp, and derive the entity id from the whole of it. The id is
-    /// the return value's `entity_id`.
-    pub fn genesis(system: Option<EntityId>, author: AuthorId, operations: OperationSet) -> Self {
+    /// Mint an entity under `minter`: freeze `operations` into a genesis,
+    /// draw its nonce and timestamp, and derive the entity id from the whole
+    /// of it. The id is the return value's `entity_id`.
+    pub fn genesis(minter: Identity, operations: OperationSet) -> Self {
         let nonce = draw_nonce();
         let timestamp = crate::time::unix_ms_now();
-        let entity_id: EntityId = EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations).into();
-        Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { system, nonce, timestamp, author, operations } }
+        let entity_id: EntityId = EventId::from_genesis_parts(&minter, &nonce, timestamp, &operations).into();
+        Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { minter, nonce, timestamp, operations } }
     }
 
     /// Mint an update extending `parent`, drawing its nonce and timestamp.
-    pub fn update(entity_id: EntityId, parent: Clock, author: AuthorId, operations: OperationSet) -> Self {
-        Event {
-            entity_id,
-            parent,
-            body: EventBody::Update { nonce: draw_nonce(), timestamp: crate::time::unix_ms_now(), author, operations },
-        }
+    pub fn update(entity_id: EntityId, parent: Clock, operations: OperationSet) -> Self {
+        Event { entity_id, parent, body: EventBody::Update { nonce: draw_nonce(), timestamp: crate::time::unix_ms_now(), operations } }
     }
 
     pub fn is_entity_create(&self) -> bool { matches!(self.body, EventBody::Genesis { .. }) }
@@ -262,10 +237,11 @@ impl Event {
         }
     }
 
-    /// Who the creator says wrote this event.
-    pub fn author(&self) -> AuthorId {
+    /// The identity that minted the entity, for a genesis; an update names no minter.
+    pub fn minter(&self) -> Option<Identity> {
         match &self.body {
-            EventBody::Genesis { author, .. } | EventBody::Update { author, .. } => *author,
+            EventBody::Genesis { minter, .. } => Some(*minter),
+            EventBody::Update { .. } => None,
         }
     }
 
@@ -280,11 +256,11 @@ impl Event {
 
     pub fn id(&self) -> EventId {
         match &self.body {
-            EventBody::Genesis { system, nonce, timestamp, author, operations } => {
-                EventId::from_genesis_parts(system, nonce, *timestamp, author, operations)
+            EventBody::Genesis { minter, nonce, timestamp, operations } => {
+                EventId::from_genesis_parts(minter, nonce, *timestamp, operations)
             }
-            EventBody::Update { nonce, timestamp, author, operations } => {
-                EventId::from_update_parts(&self.entity_id, author, nonce, *timestamp, operations, &self.parent)
+            EventBody::Update { nonce, timestamp, operations } => {
+                EventId::from_update_parts(&self.entity_id, nonce, *timestamp, operations, &self.parent)
             }
         }
     }
@@ -583,6 +559,8 @@ mod tests {
         OperationSet::from_backends(BTreeMap::from([("lww".to_string(), vec![BackendOperation { diff: vec![1, 2, 3] }])]))
     }
 
+    fn minter() -> Identity { Identity::Ed25519([9u8; 32]) }
+
     /// Both preimages, computed independently, byte for byte. Concatenating
     /// the fields' bincode encodings is the same as encoding the tuple,
     /// because bincode writes no framing between them.
@@ -594,29 +572,30 @@ mod tests {
     /// recomputation is for.
     #[test]
     fn derivation_preimages_match_the_spec() {
-        let genesis_tag: &[u8] = b"org.ankurah.genesis.v0";
-        let event_tag: &[u8] = b"org.ankurah.event.v0";
+        let genesis_tag: &[u8] = b"org.ankurah.genesis.v1";
+        let event_tag: &[u8] = b"org.ankurah.event.v1";
         assert_eq!(GENESIS_TAG, genesis_tag, "the genesis tag is these exact bytes");
         assert_eq!(EVENT_TAG, event_tag, "the update tag is these exact bytes");
         assert_ne!(genesis_tag, event_tag, "the two tags differ, which is what keeps the preimage shapes apart");
 
-        let system = Some(EntityId::from_bytes([9u8; 32]));
         let nonce = [3u8; 32];
         let timestamp = 1_720_000_000_123u64;
-        let author = AuthorId::Unknown;
         let operations = operations();
 
+        // The minter is the variant index, then the key bytes.
+        let minter_bytes = [0u32.to_le_bytes().as_slice(), &[9u8; 32]].concat();
         let mut preimage = genesis_tag.to_vec();
-        preimage.extend(bincode::serialize(&(system, nonce, timestamp, author, operations.clone())).unwrap());
+        preimage.extend(&minter_bytes);
+        preimage.extend(bincode::serialize(&(nonce, timestamp, operations.clone())).unwrap());
         let expected: [u8; 32] = Sha256::digest(&preimage).into();
-        assert_eq!(EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations), EventId::from_bytes(expected));
+        assert_eq!(EventId::from_genesis_parts(&minter(), &nonce, timestamp, &operations), EventId::from_bytes(expected));
 
         let entity_id = EntityId::from_bytes([7u8; 32]);
         let parent = Clock::genesis(EventId::from_bytes([5u8; 32]));
         let mut preimage = event_tag.to_vec();
-        preimage.extend(bincode::serialize(&(entity_id, author, nonce, timestamp, operations.clone(), parent.clone())).unwrap());
+        preimage.extend(bincode::serialize(&(entity_id, nonce, timestamp, operations.clone(), parent.clone())).unwrap());
         let expected: [u8; 32] = Sha256::digest(&preimage).into();
-        assert_eq!(EventId::from_update_parts(&entity_id, &author, &nonce, timestamp, &operations, &parent), EventId::from_bytes(expected));
+        assert_eq!(EventId::from_update_parts(&entity_id, &nonce, timestamp, &operations, &parent), EventId::from_bytes(expected));
     }
 
     /// The two tags keep the two preimage shapes apart even when every hashed
@@ -625,53 +604,40 @@ mod tests {
     fn the_two_preimage_shapes_never_collide() {
         let nonce = [1u8; 32];
         let timestamp = 42u64;
-        let author = AuthorId::Unknown;
         let operations = operations();
-        let genesis = EventId::from_genesis_parts(&None, &nonce, timestamp, &author, &operations);
-        let update =
-            EventId::from_update_parts(&EntityId::from_bytes([0u8; 32]), &author, &nonce, timestamp, &operations, &Clock::default());
+        let genesis = EventId::from_genesis_parts(&Identity::Ed25519([0u8; 32]), &nonce, timestamp, &operations);
+        let update = EventId::from_update_parts(&EntityId::from_bytes([0u8; 32]), &nonce, timestamp, &operations, &Clock::default());
         assert_ne!(genesis, update);
     }
 
-    /// The system root's genesis (`None`) and a non-root genesis under any
-    /// system are distinct, and two systems give the same content two ids.
+    /// The minter is inside the genesis id: the same content minted under two
+    /// identities is two entities, so no relay can re-attribute an entity
+    /// without changing what it is.
     #[test]
-    fn a_genesis_id_binds_its_system() {
-        let nonce = [1u8; 32];
-        let timestamp = 42u64;
-        let author = AuthorId::Unknown;
-        let operations = operations();
-        let root = EventId::from_genesis_parts(&None, &nonce, timestamp, &author, &operations);
-        let under_a = EventId::from_genesis_parts(&Some(EntityId::from_bytes([1u8; 32])), &nonce, timestamp, &author, &operations);
-        let under_b = EventId::from_genesis_parts(&Some(EntityId::from_bytes([2u8; 32])), &nonce, timestamp, &author, &operations);
-        assert_ne!(root, under_a);
-        assert_ne!(under_a, under_b);
-    }
-
-    /// Changing the author changes the id, which is what makes the author
-    /// unforgeable-in-place rather than an editable annotation.
-    #[test]
-    fn the_author_is_inside_both_ids() {
+    fn the_minter_is_inside_the_genesis_id() {
         let nonce = [4u8; 32];
         let timestamp = 7u64;
         let operations = operations();
-        let author = AuthorId::Id(EntityId::from_bytes([6u8; 32]));
         assert_ne!(
-            EventId::from_genesis_parts(&None, &nonce, timestamp, &AuthorId::Unknown, &operations),
-            EventId::from_genesis_parts(&None, &nonce, timestamp, &author, &operations)
+            EventId::from_genesis_parts(&Identity::Ed25519([1u8; 32]), &nonce, timestamp, &operations),
+            EventId::from_genesis_parts(&Identity::Ed25519([2u8; 32]), &nonce, timestamp, &operations)
         );
 
-        let entity_id = EntityId::from_bytes([7u8; 32]);
-        let parent = Clock::genesis(EventId::from_bytes([5u8; 32]));
-        assert_ne!(
-            EventId::from_update_parts(&entity_id, &AuthorId::Unknown, &nonce, timestamp, &operations, &parent),
-            EventId::from_update_parts(&entity_id, &author, &nonce, timestamp, &operations, &parent)
+        let event = Event::genesis(minter(), operations.clone());
+        assert_eq!(event.minter(), Some(minter()));
+        let mut reattributed = event.clone();
+        let EventBody::Genesis { minter: named, .. } = &mut reattributed.body else { unreachable!("Event::genesis mints a genesis") };
+        *named = Identity::Ed25519([8u8; 32]);
+        assert!(
+            matches!(reattributed.validate_structure(), Err(EventStructureError::GenesisIdMismatch { .. })),
+            "a genesis whose minter was swapped no longer derives the entity it names"
         );
+        assert_eq!(Event::update(event.entity_id, Clock::singleton(&event), operations).minter(), None, "an update names no minter");
     }
 
     #[test]
     fn a_minted_genesis_names_the_entity_its_content_derives() {
-        let event = Event::genesis(Some(EntityId::from_bytes([9u8; 32])), AuthorId::Unknown, operations());
+        let event = Event::genesis(minter(), operations());
         assert!(event.is_entity_create());
         assert!(event.parent.is_empty());
         assert_eq!(EntityId::from(event.id()), event.entity_id);
@@ -679,7 +645,7 @@ mod tests {
 
         // Two create calls draw two nonces: identical payloads are still two
         // distinct entities.
-        let again = Event::genesis(Some(EntityId::from_bytes([9u8; 32])), AuthorId::Unknown, operations());
+        let again = Event::genesis(minter(), operations());
         assert_ne!(event.entity_id, again.entity_id);
         assert_ne!(event.nonce(), again.nonce());
     }
@@ -687,27 +653,26 @@ mod tests {
     #[test]
     fn structural_validation_refuses_contradictory_shapes() {
         // A genesis that claims some other entity's id.
-        let mut genesis = Event::genesis(None, AuthorId::Unknown, operations());
+        let mut genesis = Event::genesis(minter(), operations());
         genesis.entity_id = EntityId::from_bytes([0xABu8; 32]);
         assert!(matches!(genesis.validate_structure(), Err(EventStructureError::GenesisIdMismatch { .. })));
 
         // A genesis with a parent clock.
-        let mut genesis = Event::genesis(None, AuthorId::Unknown, operations());
+        let mut genesis = Event::genesis(minter(), operations());
         genesis.parent = Clock::genesis(EventId::from_bytes([1u8; 32]));
         assert_eq!(genesis.validate_structure(), Err(EventStructureError::GenesisWithParent));
 
         // An update with no parent: parent is empty if and only if genesis.
-        let update = Event::update(EntityId::from_bytes([7u8; 32]), Clock::default(), AuthorId::Unknown, operations());
+        let update = Event::update(EntityId::from_bytes([7u8; 32]), Clock::default(), operations());
         assert_eq!(update.validate_structure(), Err(EventStructureError::UpdateWithoutParent));
 
-        let update =
-            Event::update(EntityId::from_bytes([7u8; 32]), Clock::genesis(EventId::from_bytes([1u8; 32])), AuthorId::Unknown, operations());
+        let update = Event::update(EntityId::from_bytes([7u8; 32]), Clock::genesis(EventId::from_bytes([1u8; 32])), operations());
         update.validate_structure().expect("a parented update is well formed");
     }
 
     #[test]
     fn a_genesis_is_generation_one() {
-        let genesis = Event::genesis(None, AuthorId::Unknown, operations());
+        let genesis = Event::genesis(minter(), operations());
         assert_eq!(genesis.generation(), 1);
     }
 
@@ -715,7 +680,7 @@ mod tests {
     fn parent_annotations_are_hashed_even_when_the_maximum_does_not_change() {
         let (a, b) = (EventId::from_bytes([1; 32]), EventId::from_bytes([2; 32]));
         let parent = Clock::new(vec![(2, a.clone()), (7, b.clone())]).unwrap();
-        let update = Event::update(EntityId::from_bytes([7; 32]), parent, AuthorId::Unknown, operations());
+        let update = Event::update(EntityId::from_bytes([7; 32]), parent, operations());
         let mut changed = update.clone();
         changed.parent = Clock::new(vec![(3, a), (7, b)]).unwrap();
         assert_eq!(update.generation(), 8);
@@ -726,7 +691,7 @@ mod tests {
     #[test]
     fn generation_is_derived_from_parents_and_saturates() {
         let at = |generation| Clock::new(vec![(generation, EventId::from_bytes([1; 32]))]).unwrap();
-        let update = |parent| Event::update(EntityId::from_bytes([7; 32]), parent, AuthorId::Unknown, operations());
+        let update = |parent| Event::update(EntityId::from_bytes([7; 32]), parent, operations());
         assert_eq!(update(at(1)).generation(), 2);
         assert_eq!(update(Clock::new(vec![(3, EventId::from_bytes([1; 32])), (7, EventId::from_bytes([2; 32]))]).unwrap()).generation(), 8);
         assert_eq!(update(at(u32::MAX - 1)).generation(), u32::MAX);

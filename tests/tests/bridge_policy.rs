@@ -265,7 +265,6 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let update = proto::Event::update(
             entity_id,
             known_head.clone(),
-            proto::AuthorId::Unknown,
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(
                 ankurah::core::schema::system_model_id(label).unwrap(),
             ))]),

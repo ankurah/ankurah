@@ -323,7 +323,7 @@ mod tests {
 
     #[test]
     fn layers_keep_the_greater_rank_in_either_order() {
-        use ankurah_proto::{AuthorId, Clock, Event, OperationSet};
+        use ankurah_proto::{Clock, Event, OperationSet};
         let scratch = LWWBackend::new();
         scratch.set(title(), Some(Value::String("shallower".into())));
         let shallower = crate::test_helpers::commit_backend(&scratch, 9).unwrap();
@@ -334,12 +334,7 @@ mod tests {
                 let event = Event {
                     entity_id: shallower.entity_id,
                     parent: Clock::singleton(&shallower),
-                    body: ankurah_proto::EventBody::Update {
-                        nonce: [seed; 32],
-                        timestamp: 0,
-                        author: AuthorId::Unknown,
-                        operations: operations.clone(),
-                    },
+                    body: ankurah_proto::EventBody::Update { nonce: [seed; 32], timestamp: 0, operations: operations.clone() },
                 };
                 (event.id() < shallower.id()).then_some(event)
             })

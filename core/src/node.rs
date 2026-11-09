@@ -232,7 +232,7 @@ where
             key
         });
         let id = key.node_id();
-        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
+        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable, key.identity());
         let alive = Mut::new(true);
         let state = system_manager.node_state();
         let run = {
@@ -304,6 +304,9 @@ where
         node
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
+
+    /// The identity this node mints and signs under.
+    pub fn identity(&self) -> proto::Identity { self.id.identity() }
 
     /// Issue a fresh challenge for one new connection. Send its value to the peer, then pass it to
     /// [`Node::register_peer`] with the peer's presence.

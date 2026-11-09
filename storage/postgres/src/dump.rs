@@ -188,7 +188,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use ankurah_core::storage::{StorageCommitOutcome, StorageEngine, StorageTransaction};
-    use ankurah_proto::{AuthorId, OperationSet};
+    use ankurah_proto::{Identity, OperationSet};
     use futures_util::{pin_mut, StreamExt};
     use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
@@ -205,7 +205,7 @@ mod tests {
         let storage = Postgres::open(&format!("host={host} port={port} user=postgres password=postgres dbname=ankurah")).await?;
         let mut expected = BTreeSet::new();
         for _ in 0..RECORDS {
-            let event = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+            let event = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
             let entity_id = event.entity_id;
             let state = Attested::opt(
                 EntityState {

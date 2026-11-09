@@ -11,6 +11,9 @@ use ankurah::proto::{self, Attested};
 use ankurah_tests::sim::model;
 use ankurah_tests::sim::transport::message_digest;
 
+/// The node every forged genesis here is minted under.
+const MINTER: proto::Identity = proto::Identity::Ed25519([1; 32]);
+
 fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> proto::NodeMessage {
     let frag: proto::EventFragment = ev.into();
     proto::NodeMessage::Update(proto::NodeUpdate {
@@ -31,8 +34,8 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
 fn digest_distinguishes_different_eventonly_batches_same_count() {
     // Two different single-event EventOnly updates: same shape and
     // cardinality, different content.
-    let one = model::genesis_event(1, model::Field::Title, "one");
-    let two = model::genesis_event(1, model::Field::Title, "two");
+    let one = model::genesis_event(MINTER, 1, model::Field::Title, "one");
+    let two = model::genesis_event(MINTER, 1, model::Field::Title, "two");
     let d1 = message_digest(&event_only_message(one.entity_id, model::attest(one.clone())));
     let d2 = message_digest(&event_only_message(two.entity_id, model::attest(two)));
     assert_ne!(d1, d2, "different EventOnly batches for one entity must have different digests");
@@ -41,7 +44,7 @@ fn digest_distinguishes_different_eventonly_batches_same_count() {
 #[test]
 fn digest_is_stable_for_identical_content() {
     // The other half of the property: equal content must hash equal.
-    let same = model::genesis_event(2, model::Field::Title, "same");
+    let same = model::genesis_event(MINTER, 2, model::Field::Title, "same");
     let d1 = message_digest(&event_only_message(same.entity_id, model::attest(same.clone())));
     let d2 = message_digest(&event_only_message(same.entity_id, model::attest(same)));
     assert_eq!(d1, d2, "identical content must produce identical digests");

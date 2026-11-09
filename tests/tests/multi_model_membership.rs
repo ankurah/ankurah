@@ -61,7 +61,7 @@ async fn local_and_remote_commits_preserve_plural_membership() -> anyhow::Result
 
     let plural = storage.get_state(entity_id).await?;
     assert_eq!(plural.payload.state.memberships, [album_model, pet_model].into());
-    let update = proto::Event::update(entity_id, plural.payload.state.head, proto::AuthorId::Unknown, proto::OperationSet::default());
+    let update = proto::Event::update(entity_id, plural.payload.state.head, proto::OperationSet::default());
     let events = vec![proto::Attested::opt(update, None)];
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), events).await?;
 

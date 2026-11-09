@@ -231,8 +231,7 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
     let token = keys.sign(&claims, Duration::from_hours(1))?;
     let context = JwtContext::from_claims(claims, token);
 
-    let event =
-        ankurah::proto::Event::update(denied_record.id(), denied_record.head(), ankurah::proto::AuthorId::Unknown, Default::default());
+    let event = ankurah::proto::Event::update(denied_record.id(), denied_record.head(), Default::default());
     let result = agent.check_write_event(&node, &context, &denied_record, &allowed_record, &event);
     assert!(result.is_err(), "updates must not retag an out-of-scope row into the caller's scope");
 

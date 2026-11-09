@@ -7,6 +7,10 @@ use ankurah::core::value::Value;
 use ankurah::proto::{self, Attested, ModelId, PropertyId, SystemModel, SystemProperty};
 use std::collections::BTreeMap;
 
+/// The identity forged catalog rows are minted under. A constant, so a forged
+/// catalog keeps the same ids in every run.
+const FORGER: proto::Identity = proto::Identity::Ed25519([0x5A; 32]);
+
 pub struct ForgedCatalog {
     pub model: proto::EntityId,
     pub properties: Vec<proto::EntityId>,
@@ -93,16 +97,14 @@ fn row(
     let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), lww.clone())]));
     operations.push(proto::Operation::Membership(proto::Membership::Add(membership.clone())));
 
-    let system = Some(proto::EntityId::from_bytes([0x5A; 32]));
     let nonce = content_nonce(counter, &[b"catalog-row", namespace, collection.as_bytes()]);
-    let author = proto::AuthorId::Unknown;
     let timestamp = 0u64;
-    let event_id = proto::EventId::from_genesis_parts(&system, &nonce, timestamp, &author, &operations);
+    let event_id = proto::EventId::from_genesis_parts(&FORGER, &nonce, timestamp, &operations);
     let entity_id: proto::EntityId = event_id.clone().into();
     let event = proto::Event {
         entity_id,
         parent: proto::Clock::default(),
-        body: proto::EventBody::Genesis { system, nonce, timestamp, author, operations },
+        body: proto::EventBody::Genesis { minter: FORGER, nonce, timestamp, operations },
     };
 
     let stored = LWWBackend::new();

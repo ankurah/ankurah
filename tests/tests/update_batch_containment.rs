@@ -18,12 +18,7 @@ fn forge_title_event(title_prop: proto::PropertyId, entity_id: proto::EntityId, 
     let backend = LWWBackend::new();
     backend.set(title_prop, Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event::update(
-        entity_id,
-        parent,
-        proto::AuthorId::Unknown,
-        proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-    )
+    proto::Event::update(entity_id, parent, proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])))
 }
 
 fn event_only_item(event: proto::Event) -> proto::SubscriptionUpdateItem {
@@ -79,7 +74,6 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
         proto::Event::update(
             rec_id,
             ev_parent.parent.clone(),
-            proto::AuthorId::Unknown,
             proto::OperationSet::from_backends(std::collections::BTreeMap::from([("lww".to_owned(), ops)])),
         )
     };

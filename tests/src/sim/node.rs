@@ -8,11 +8,12 @@
 //! head-maintenance logic is mocked.
 //!
 //! Nodes are addressed by a stable logical index (0, 1, 2, ...) assigned at
-//! construction. Scheduling, faults, and the trace key on that index and never
-//! on the node's id, which is random and would leak entropy into the
-//! schedule.
+//! construction. Scheduling, faults, and the trace key on that index. Each
+//! node's key, and so its id and every identity it mints under, derives from
+//! the simulation seed and that index.
 
 use ankurah::core::connector::PeerProvenance;
+use ankurah::core::node::NodeKey;
 use ankurah::core::test_helpers::commit_transaction;
 use ankurah::proto::{self, Attested};
 use ankurah::storage::StorageEngine;
@@ -121,23 +122,24 @@ impl SimNode {
 }
 
 /// Build `n` nodes: node 0 is durable and owns the system root; the rest are
-/// ephemeral and join node 0's system. All nodes share one capture sink.
+/// ephemeral and join node 0's system. All nodes share one capture sink, and
+/// each node's key derives from `seed` and its index.
 /// Returns the nodes and the shared `Captured` for the scheduler.
-pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<SimNode>> {
+pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Result<Vec<SimNode>> {
     assert!(n >= 1, "need at least one node");
     let mut nodes = Vec::with_capacity(n);
 
     // Plant the deterministic catalog before the durable node starts.
     let durable_engine = Arc::new(SledStorageEngine::new_test()?);
     crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
-    let durable = Node::new_durable(durable_engine, PermissiveAgent::new());
+    let durable = Node::new_durable_with_key(durable_engine, PermissiveAgent::new(), sim_node_key(seed, 0));
     durable.system.create().await?;
     durable.wait_ready().await?;
     nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
 
     // Nodes 1..n: ephemeral.
     for index in 1..n {
-        let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+        let node = Node::new_with_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), sim_node_key(seed, index));
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 
@@ -145,6 +147,17 @@ pub async fn build_nodes(n: usize, captured: Captured) -> anyhow::Result<Vec<Sim
     seed_sim_schema(&nodes[0])?;
 
     Ok(nodes)
+}
+
+/// The key of the node at `index` in the simulation `seed`: a hash of both, so
+/// a run's node ids and minted entity ids repeat with its seed.
+fn sim_node_key(seed: u64, index: usize) -> NodeKey {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"ankurah.sim.node-key.v0");
+    hasher.update(seed.to_be_bytes());
+    hasher.update((index as u64).to_be_bytes());
+    NodeKey::from_seed(hasher.finalize().into())
 }
 
 /// Seed and bind the deterministic `SimRecord` catalog on one node. The

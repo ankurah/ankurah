@@ -58,10 +58,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Return the node's identity, even if its weak handle can no longer upgrade.
     fn node_id(&self) -> proto::NodeId { self.node.node_id() }
 
-    /// This node's system root entity id, which every non-root genesis binds
-    /// into its own id. `None` before the node has created or adopted a system.
-    fn system_id(&self) -> Option<proto::EntityId> { self.node.upgrade().ok().and_then(|node| node.system.root_id()) }
-
     /// Check whether this context may write the entity.
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         let node = self.node.upgrade()?;

@@ -118,7 +118,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use ankurah_core::storage::StorageDump;
-    use ankurah_proto::{AttestationSet, AuthorId, OperationSet, State};
+    use ankurah_proto::{AttestationSet, Identity, OperationSet, State};
     use futures::{pin_mut, StreamExt};
 
     use super::*;
@@ -126,8 +126,10 @@ mod tests {
     #[tokio::test]
     async fn dump_identifies_both_sides_of_an_event_key_mismatch() -> anyhow::Result<()> {
         let storage = SledStorageEngine::new_test()?;
-        let event =
-            Attested { payload: Event::genesis(None, AuthorId::Unknown, OperationSet::default()), attestations: AttestationSet::default() };
+        let event = Attested {
+            payload: Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default()),
+            attestations: AttestationSet::default(),
+        };
         let stored_key = vec![0xab; event.payload.id().as_bytes().len()];
         {
             let database = storage.database.lock().unwrap();
@@ -156,7 +158,7 @@ mod tests {
             let database = storage.database.lock().unwrap();
             for _ in 0..RECORDS {
                 let event = Attested {
-                    payload: Event::genesis(None, AuthorId::Unknown, OperationSet::default()),
+                    payload: Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default()),
                     attestations: AttestationSet::default(),
                 };
                 let entity_id = event.payload.entity_id;

@@ -260,10 +260,10 @@ mod tests {
         let mut nonce = [0u8; 32];
         nonce[0] = seed;
 
-        let author = ankurah_proto::AuthorId::Unknown;
+        let minter = ankurah_proto::Identity::Ed25519([seed; 32]);
         let operations = OperationSet::default();
-        let entity_id = EntityId::from(EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
-        let body = ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations };
+        let entity_id = EntityId::from(EventId::from_genesis_parts(&minter, &nonce, 0, &operations));
+        let body = ankurah_proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations };
         Event { entity_id, body, parent: Clock::default() }
     }
 

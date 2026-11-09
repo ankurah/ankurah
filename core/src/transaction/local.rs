@@ -60,12 +60,11 @@ impl Transaction {
         &self.entities[index]
     }
 
-    /// Mint an entity after registering its model in the current system epoch.
+    /// Mint an entity under this node's identity after registering its model in the current system epoch.
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let (model_id, epoch) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
 
-        let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
-        let entity = LocalTrxEntity::new(Some(system), proto::AuthorId::Unknown, epoch, self.alive.clone());
+        let entity = LocalTrxEntity::new(self.dyncontext.node_id().identity(), epoch, self.alive.clone());
         model.initialize_new_entity(&entity, model_id, epoch)?;
         self.dyncontext.check_write(&entity.read())?;
 
@@ -87,7 +86,7 @@ impl Transaction {
             let _guard = self.snapshot_creation_lock.lock().unwrap();
             match self.get_trx_entity(id) {
                 Some(entity) => entity,
-                None => self.add_entity(LocalTrxEntity::edit(&source, proto::AuthorId::Unknown, self.alive.clone())?),
+                None => self.add_entity(LocalTrxEntity::edit(&source, self.alive.clone())?),
             }
         };
         MutableBorrow::new(entity)
@@ -106,7 +105,7 @@ impl Transaction {
             let _guard = self.snapshot_creation_lock.lock().unwrap();
             match self.get_trx_entity(&resident.id()) {
                 Some(entity) => entity,
-                None => self.add_entity(LocalTrxEntity::edit(&resident, proto::AuthorId::Unknown, self.alive.clone())?),
+                None => self.add_entity(LocalTrxEntity::edit(&resident, self.alive.clone())?),
             }
         };
         MutableBorrow::new(entity)

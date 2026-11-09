@@ -56,13 +56,13 @@ pub fn commit_backend<B: crate::property::backend::PropertyBackend>(backend: &B,
         B::property_backend_name().to_owned(),
         backend.to_operations()?.unwrap_or_default(),
     )]));
+    let minter = proto::Identity::Ed25519([seed; 32]);
     let nonce = [seed; 32];
-    let author = proto::AuthorId::Unknown;
-    let entity_id = proto::EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations).into();
+    let entity_id = proto::EventId::from_genesis_parts(&minter, &nonce, 0, &operations).into();
     let event = proto::Event {
         entity_id,
         parent: proto::Clock::default(),
-        body: proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations },
+        body: proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations },
     };
     apply_backend_event(backend, &event)?;
     Ok(event)

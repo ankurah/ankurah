@@ -43,15 +43,6 @@ pub fn uncreated_entity_id(counter: u64) -> proto::EntityId {
     proto::EntityId::from_bytes(bytes)
 }
 
-/// The system root every forged genesis binds itself to.
-///
-/// A real system root's id is derived from its own genesis and so differs on
-/// every run; the harness needs a constant to keep ids seed-derived. Nothing
-/// checks an event's `system` field against the receiving node's root yet,
-/// so a constant is sound here. Whichever branch adds that check has to seed
-/// the sim nodes with a deterministic root instead.
-pub fn sim_system_id() -> proto::EntityId { proto::EntityId::from_bytes([0x5A; 32]) }
-
 /// A nonce derived from the event's own content and its place in the schedule,
 /// rather than drawn at random.
 ///
@@ -164,21 +155,20 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
     proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]))
 }
 
-/// Forge an entity's genesis event, deriving its entity id from the event's
-/// own content exactly as the production mint does. `counter` is the caller's
-/// mint sequence number, which distinguishes two entities that would otherwise
-/// be created with identical content; `field`/`value` seed the initial state.
-pub fn genesis_event(counter: u64, field: Field, value: &str) -> proto::Event {
+/// Forge an entity's genesis event minted under `minter`, deriving its entity
+/// id from the event's own content exactly as the production mint does.
+/// `counter` is the caller's mint sequence number, which distinguishes two
+/// entities that would otherwise be created with identical content;
+/// `field`/`value` seed the initial state.
+pub fn genesis_event(minter: proto::Identity, counter: u64, field: Field, value: &str) -> proto::Event {
     let mut operations = lww_ops(field, value);
     operations.push(proto::Operation::Membership(proto::Membership::Add(ankurah::ModelId::EntityId(sim_model_id()))));
-    let system = Some(sim_system_id());
     let nonce = content_nonce(counter, &[field.name().as_bytes(), value.as_bytes()]);
-    let author = proto::AuthorId::Unknown;
-    let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&system, &nonce, SIM_TIMESTAMP, &author, &operations).into();
+    let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&minter, &nonce, SIM_TIMESTAMP, &operations).into();
     proto::Event {
         entity_id,
         parent: proto::Clock::default(),
-        body: proto::EventBody::Genesis { system, nonce, timestamp: SIM_TIMESTAMP, author, operations },
+        body: proto::EventBody::Genesis { minter, nonce, timestamp: SIM_TIMESTAMP, operations },
     }
 }
 
@@ -193,12 +183,7 @@ pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, v
     proto::Event {
         entity_id: entity,
         parent,
-        body: proto::EventBody::Update {
-            nonce,
-            timestamp: SIM_TIMESTAMP,
-            author: proto::AuthorId::Unknown,
-            operations: lww_ops(field, value),
-        },
+        body: proto::EventBody::Update { nonce, timestamp: SIM_TIMESTAMP, operations: lww_ops(field, value) },
     }
 }
 

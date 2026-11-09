@@ -41,12 +41,7 @@ fn forge_title_event(f: &Fixture, entity_id: proto::EntityId, parent: proto::Clo
     let backend = LWWBackend::new();
     backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event::update(
-        entity_id,
-        parent,
-        proto::AuthorId::Unknown,
-        proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-    )
+    proto::Event::update(entity_id, parent, proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])))
 }
 
 /// Forge a genesis that CLAIMS `entity_id` rather than the entity its own
@@ -58,7 +53,7 @@ fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) 
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]));
     operations.push(proto::Operation::Membership(proto::Membership::Add(f.model)));
-    let mut event = proto::Event::genesis(None, proto::AuthorId::Unknown, operations);
+    let mut event = proto::Event::genesis(proto::Identity::Ed25519([1; 32]), operations);
     event.entity_id = entity_id;
     event
 }
@@ -188,12 +183,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         let backend = LWWBackend::new();
         backend.set(common::resolved_prop(&f.server, Record::descriptor(), "artist"), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event::update(
-            rec_id,
-            head0.clone(),
-            proto::AuthorId::Unknown,
-            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-        )
+        proto::Event::update(rec_id, head0.clone(), proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])))
     };
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
@@ -281,7 +271,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         operations.push(proto::Operation::Membership(proto::Membership::Add(f.model)));
         // A genesis claiming an existing entity's id: structurally invalid
         // now that a genesis names whatever entity its own content derives.
-        let mut event = proto::Event::genesis(None, proto::AuthorId::Unknown, operations);
+        let mut event = proto::Event::genesis(proto::Identity::Ed25519([1; 32]), operations);
         event.entity_id = rec_id;
         event
     };
@@ -332,12 +322,7 @@ fn declared_cycle_is_unconstructible_content_addressing() {
         let backend = LWWBackend::new();
         backend.set(title_prop, Some(Value::String(title.to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event::update(
-            entity,
-            parent,
-            proto::AuthorId::Unknown,
-            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-        )
+        proto::Event::update(entity, parent, proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])))
     };
 
     // Start from two independent events and try to wire A.parent := [B.id()]

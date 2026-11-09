@@ -253,10 +253,9 @@ pub enum MutationError {
     EventStructure(ankurah_proto::EventStructureError),
     #[error("inadmissible event: {0}")]
     InadmissibleEvent(InadmissibleEvent),
-    /// The node does not know its system root, so it cannot derive an entity
-    /// id: a non-root genesis binds the root into its own id. A caller that
-    /// reaches this on an ephemeral node can retry once the handshake with a
-    /// durable peer has established the system.
+    /// The node does not know its system root yet. A caller that reaches this
+    /// on an ephemeral node can retry once the handshake with a durable peer
+    /// has established the system.
     #[error("the node does not know its system root yet")]
     SystemNotReady,
     /// A commit-path invariant about an event's provenance, as opposed to

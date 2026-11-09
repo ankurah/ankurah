@@ -45,6 +45,8 @@ struct Inner<SE> {
     storage: Arc<SE>,
     entities: WeakEntitySet,
     durable: bool,
+    /// The node's identity, which the root genesis is minted under.
+    minter: proto::Identity,
     root: RwLock<Option<Attested<EntityState>>>,
     items: RwLock<Vec<Entity>>,
     loaded: OnceLock<bool>,
@@ -60,11 +62,12 @@ struct Inner<SE> {
 impl<SE> SystemManager<SE>
 where SE: StorageEngine + Send + Sync + 'static
 {
-    pub(crate) fn new(storage: Arc<SE>, entities: WeakEntitySet, durable: bool) -> Self {
+    pub(crate) fn new(storage: Arc<SE>, entities: WeakEntitySet, durable: bool, minter: proto::Identity) -> Self {
         let me = Self(Arc::new(Inner {
             storage,
             entities,
             durable,
+            minter,
             items: RwLock::new(Vec::new()),
             root: RwLock::new(None),
             loaded: OnceLock::new(),
@@ -87,8 +90,7 @@ where SE: StorageEngine + Send + Sync + 'static
 
     pub fn root(&self) -> Option<Attested<EntityState>> { self.0.root.read().unwrap().as_ref().map(|r| r.clone()) }
 
-    /// The system root's entity id, which every non-root genesis binds into
-    /// its own id. `None` until this node has created or adopted a system.
+    /// The system root's entity id. `None` until this node has created or adopted a system.
     pub fn root_id(&self) -> Option<proto::EntityId> { self.0.root.read().unwrap().as_ref().map(|r| r.payload.entity_id) }
 
     pub fn items(&self) -> Vec<Entity> { self.0.items.read().unwrap().clone() }
@@ -180,9 +182,8 @@ where SE: StorageEngine + Send + Sync + 'static
         // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
         let storage = self.0.storage.clone();
 
-        // The root genesis alone has no parent system to bind.
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let pending = crate::entity::LocalTrxEntity::new(None, proto::AuthorId::Unknown, self.0.entities.system_epoch(), alive);
+        let pending = crate::entity::LocalTrxEntity::new(self.0.minter, self.0.entities.system_epoch(), alive);
         pending.add_membership(proto::ModelId::System(proto::SystemModel::System))?;
         // Cannot fail: `pending` is open, and `get_backend` creates a missing LWW backend.
         let lww_backend = pending.get_backend::<LWWBackend>().expect("LWW Backend should exist");

@@ -162,12 +162,12 @@ fn fixture_body(
 ) -> (EntityId, ankurah_proto::EventBody) {
     let mut nonce = [0u8; 32];
     nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
-    let author = ankurah_proto::AuthorId::Unknown;
     if parent.is_empty() {
-        let entity_id = EntityId::from(ankurah_proto::EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
-        (entity_id, ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations })
+        let minter = ankurah_proto::Identity::Ed25519([0; 32]);
+        let entity_id = EntityId::from(ankurah_proto::EventId::from_genesis_parts(&minter, &nonce, 0, &operations));
+        (entity_id, ankurah_proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations })
     } else {
-        (seeded_entity_id, ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations })
+        (seeded_entity_id, ankurah_proto::EventBody::Update { nonce, timestamp: 0, operations })
     }
 }
 

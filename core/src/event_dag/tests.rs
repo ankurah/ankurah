@@ -17,7 +17,7 @@ fn prop(name: &str) -> ankurah_proto::PropertyId {
 
 use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
-use ankurah_proto::{AuthorId, Clock, EntityId, Event, EventId, EventStructureError, OperationSet};
+use ankurah_proto::{Clock, EntityId, Event, EventId, EventStructureError, OperationSet};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -64,11 +64,10 @@ impl GetEvents for MockRetriever {
 fn fixture_body(nonce_seed: &[u8], parent: &Clock, operations: OperationSet) -> ankurah_proto::EventBody {
     let mut nonce = [0u8; 32];
     nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
-    let author = ankurah_proto::AuthorId::Unknown;
     if parent.is_empty() {
-        ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations }
+        ankurah_proto::EventBody::Genesis { minter: ankurah_proto::Identity::Ed25519([0; 32]), nonce, timestamp: 0, operations }
     } else {
-        ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations }
+        ankurah_proto::EventBody::Update { nonce, timestamp: 0, operations }
     }
 }
 
@@ -404,7 +403,7 @@ async fn direct_descendant_checks_each_parent_without_fetching_it() {
     // Both false claims leave the child's generation at 4. Neither parent is retrievable.
     for claimed in [1, 3] {
         let parent = Clock::new(vec![(claimed, older.clone()), (3, newer.clone())]).unwrap();
-        let event = Event::update(EntityId::from_bytes([3; 32]), parent, AuthorId::Unknown, OperationSet::default());
+        let event = Event::update(EntityId::from_bytes([3; 32]), parent, OperationSet::default());
         assert_eq!(event.generation(), 4);
         let subject = Clock::singleton(&event);
         let mut retriever = MockRetriever::new();
@@ -422,7 +421,7 @@ async fn comparison_rejects_false_generation_claims_in_read_ancestors() {
     let mut retriever = MockRetriever::new();
     let root = make_test_event(&retriever, 1, &[]);
     retriever.add_event(root.clone());
-    let forged = Event::update(root.entity_id, Clock::new(vec![(9, root.id())]).unwrap(), AuthorId::Unknown, OperationSet::default());
+    let forged = Event::update(root.entity_id, Clock::new(vec![(9, root.id())]).unwrap(), OperationSet::default());
     retriever.add_event(forged.clone());
     let tip = make_test_event(&retriever, 3, &[forged.id()]);
     retriever.add_event(tip.clone());
@@ -441,7 +440,7 @@ async fn diverged_comparison_checks_available_parent_generations() {
     retriever.add_event(root.clone());
     let child = make_test_event(&retriever, 2, &[root.id()]);
     retriever.add_event(child.clone());
-    let forged = Event::update(root.entity_id, Clock::new(vec![(9, root.id())]).unwrap(), AuthorId::Unknown, OperationSet::default());
+    let forged = Event::update(root.entity_id, Clock::new(vec![(9, root.id())]).unwrap(), OperationSet::default());
     retriever.add_event(forged.clone());
     let subject = Clock::singleton(&forged);
     let comparison = Clock::singleton(&child);
@@ -453,7 +452,7 @@ async fn diverged_comparison_checks_available_parent_generations() {
 
     // With no parent event and matching claims on both sides, its generation remains unverified.
     retriever.events.remove(&root.id());
-    let other = Event::update(root.entity_id, forged.parent.clone(), AuthorId::Unknown, OperationSet::default());
+    let other = Event::update(root.entity_id, forged.parent.clone(), OperationSet::default());
     let comparison = Clock::singleton(&other);
     retriever.add_event(other);
     assert!(matches!(compare(retriever, &subject, &comparison, 100).await.unwrap().relation, AbstractCausalRelation::DivergedSince { .. }));
@@ -464,7 +463,7 @@ async fn annotated_multitip_head_keeps_the_direct_descendant_fast_path() {
     let (a, b) = (EventId::from_bytes([1; 32]), EventId::from_bytes([2; 32]));
     // Generations decrease in ID order.
     let parents = Clock::new(vec![(7, a), (2, b)]).unwrap();
-    let event = Event::update(EntityId::from_bytes([3; 32]), parents.clone(), ankurah_proto::AuthorId::Unknown, OperationSet::default());
+    let event = Event::update(EntityId::from_bytes([3; 32]), parents.clone(), OperationSet::default());
     let subject = Clock::singleton(&event);
     let expected = AbstractCausalRelation::StrictDescends { chain: vec![event.id()] };
     let mut retriever = MockRetriever::new();
