@@ -103,9 +103,11 @@ Core signs every attestation with the node's key:
 - when a policy agent's `check_write_event` answers `Admission::Attest`, the
   node attaches an `Admitted` attestation carrying the agent's claims;
   `Admission::Allow` adds none;
-- a durable node attaches a state attestation to every state it serves, in
-  fetch responses, subscription deltas and direct gets, carrying the claims
-  `PolicyAgent::attest_state` returns. Ephemeral nodes attach none.
+- when `PolicyAgent::attest_state` returns claims for a state a durable node
+  serves, in fetch responses, subscription deltas and direct gets, the node
+  attaches a state attestation carrying them; `None` attaches nothing, and no
+  signature is made. `PermissiveAgent` and `JwtAgent` return `None`.
+  Ephemeral nodes attach none.
 
 Wherever an event or a state arrives from a peer, core checks each of its
 attestations before any policy hook runs: the signature must verify under the

@@ -2,9 +2,10 @@
 //!
 //! A node signs a committed attestation on every event it commits, an admitted
 //! attestation on an event its policy agent asks it to vouch for, and, when it
-//! is durable, a state attestation on every state it serves. Before any policy
-//! hook sees a received event or state, the attestations that do not verify
-//! under their attester or do not name that payload are stripped.
+//! is durable, a state attestation on a state it serves when its policy agent
+//! returns claims for that state. Before any policy hook sees a received event
+//! or state, the attestations that do not verify under their attester or do
+//! not name that payload are stripped.
 
 use crate::internal::prelude::*;
 use crate::policy::Admission;
@@ -24,15 +25,18 @@ pub(crate) fn admitted<SE, PA: PolicyAgent>(node: &Node<SE, PA>, event: &Event, 
     }
 }
 
-/// `state` as this node serves it: a durable node attaches its state attestation, carrying the
-/// claims its policy agent returns; an ephemeral node attaches none.
+/// `state` as this node serves it: a durable node attaches a state attestation carrying the claims
+/// its policy agent returns, and signs nothing when the agent returns none; an ephemeral node
+/// attaches none.
 pub(crate) fn served_state<SE: StorageEngine, PA: PolicyAgent>(node: &Node<SE, PA>, state: EntityState) -> Attested<EntityState> {
-    if !node.durable {
-        return state.into();
+    let claims = if node.durable { node.policy_agent.attest_state(node, &state) } else { None };
+    match claims {
+        Some(claims) => {
+            let attestation = node.key.attest(AttestationBody::state(&state, claims));
+            Attested::opt(state, Some(attestation))
+        }
+        None => state.into(),
     }
-    let claims = node.policy_agent.attest_state(node, &state).unwrap_or_default();
-    let attestation = node.key.attest(AttestationBody::state(&state, claims));
-    Attested::opt(state, Some(attestation))
 }
 
 /// Strip the attestations on a received event that fail their signature or name another event.
@@ -81,17 +85,14 @@ mod tests {
         assert_eq!(attestations, vec![genuine]);
     }
 
+    /// `PermissiveAgent` returns no state claims, so neither a durable nor an ephemeral node signs the states it serves.
     #[tokio::test]
-    async fn a_durable_node_signs_the_states_it_serves_and_an_ephemeral_node_does_not() {
+    async fn a_state_served_under_an_agent_that_returns_no_claims_carries_no_attestation() {
         let event = genesis(1);
         let state = EntityState { entity_id: event.entity_id, state: State { head: Clock::singleton(&event), ..State::default() } };
 
         let durable = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        let served = served_state(&durable, state.clone());
-        let [attestation] = served.attestations.0.as_slice() else { panic!("one state attestation, got {:?}", served.attestations) };
-        assert_eq!(attestation.attester, durable.identity());
-        assert!(attestation.verify() && attestation.covers_state(&state));
-
+        assert!(served_state(&durable, state.clone()).attestations.is_empty());
         let ephemeral = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
         assert!(served_state(&ephemeral, state).attestations.is_empty());
     }

@@ -178,7 +178,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
-    /// The claims a durable node's state attestation carries when it serves `state`; `None` carries empty claims.
+    /// The claims a durable node attests when it serves `state`; `None` attaches no state attestation.
     fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<Vec<u8>>;
 
     /// Decide whether a received state's attestations suffice. They have already been

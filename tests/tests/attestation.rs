@@ -1,7 +1,8 @@
 //! Attestations a node signs and the check every received one passes: a
 //! committed attestation on each event a node commits, an admitted one when
-//! its policy agent asks, a state attestation on each state a durable node
-//! serves, and stripping of any that fail before a policy hook sees them.
+//! its policy agent asks, a state attestation on a state a durable node serves
+//! when its policy agent returns claims, and stripping of any that fail before
+//! a policy hook sees them.
 
 mod common;
 
@@ -16,18 +17,21 @@ use proto::{Attestation, AttestationBody, Attested, AttesterRole};
 use std::sync::{Arc, Mutex};
 
 /// Permissive in what it allows. It records the attestations its validation
-/// hooks receive, attests admitted events when given claims, and trusts the
-/// publishers it lists.
+/// hooks receive, attests admitted events and served states when given claims
+/// for them, and trusts the publishers it lists.
 #[derive(Clone)]
 struct Witness {
     admission_claims: Option<Vec<u8>>,
+    state_claims: Option<Vec<u8>>,
     trusted: Vec<proto::Identity>,
     events: Arc<Mutex<Vec<Attested<proto::Event>>>>,
     states: Arc<Mutex<Vec<Attested<proto::EntityState>>>>,
 }
 
 impl Witness {
-    fn allowing() -> Self { Self { admission_claims: None, trusted: Vec::new(), events: Arc::default(), states: Arc::default() } }
+    fn allowing() -> Self {
+        Self { admission_claims: None, state_claims: None, trusted: Vec::new(), events: Arc::default(), states: Arc::default() }
+    }
 
     fn attesting(claims: Vec<u8>) -> Self { Self { admission_claims: Some(claims), ..Self::allowing() } }
 
@@ -88,7 +92,7 @@ impl PolicyAgent for Witness {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<Vec<u8>> { None }
+    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<Vec<u8>> { self.state_claims.clone() }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
@@ -179,15 +183,46 @@ async fn every_committed_event_carries_its_committers_attestation_which_the_rece
     .await?;
     let received = client_agent.received_event(&update.payload.id()).unwrap();
     assert_eq!(by(&received.attestations, server.identity(), AttesterRole::Committed, &received.payload).len(), 1);
+    Ok(())
+}
 
-    for state in client_agent.states.lock().unwrap().iter() {
-        let [attestation] = state.attestations.0.as_slice() else {
-            panic!("one state attestation per served state, got {:?}", state.attestations)
+/// A durable node attests a state it serves exactly when its policy agent returns claims for it,
+/// and the attestation carries those claims; an ephemeral node attests none, whatever its agent returns.
+#[tokio::test]
+async fn a_served_state_is_attested_exactly_when_a_durable_nodes_policy_returns_claims() -> anyhow::Result<()> {
+    for claims in [None, Some(b"served by policy".to_vec())] {
+        let agent = Witness { state_claims: claims.clone(), ..Witness::allowing() };
+        let server = node(true, agent.clone())?;
+        let client = node(false, agent)?;
+        let _connection = LocalProcessConnection::new(&client, &server).await?;
+        let transaction = client.context_async(DEFAULT_CONTEXT).await?.begin();
+        let id = transaction.create(&Album { name: "served".into(), year: "2026".into() }).await?.id();
+        transaction.commit().await?;
+
+        let get = || proto::NodeRequestBody::Get { ids: vec![id] };
+        let served = |response: proto::NodeResponseBody| match response {
+            proto::NodeResponseBody::Get(results) => match results.as_slice() {
+                [proto::GetResult::Found(state)] => state.clone(),
+                other => panic!("expected the state, got {other:?}"),
+            },
+            other => panic!("expected a Get response, got {other:?}"),
         };
-        assert_eq!(attestation.attester, server.identity(), "the durable server attests every state it serves");
-        assert!(attestation.verify() && attestation.covers_state(&state.payload));
+        let from_server = served(client.request(server.id, &DEFAULT_CONTEXT, get()).await?);
+        let from_client = served(server.request(client.id, &DEFAULT_CONTEXT, get()).await?);
+
+        assert!(from_client.attestations.is_empty(), "an ephemeral node attests no state it serves");
+        match claims {
+            None => assert!(from_server.attestations.is_empty(), "without claims the durable node signs nothing"),
+            Some(claims) => {
+                let [attestation] = from_server.attestations.0.as_slice() else {
+                    panic!("one state attestation, got {:?}", from_server.attestations)
+                };
+                assert_eq!(attestation.attester, server.identity());
+                assert!(attestation.verify() && attestation.covers_state(&from_server.payload));
+                assert!(matches!(&attestation.body, AttestationBody::State { claims: carried, .. } if *carried == claims));
+            }
+        }
     }
-    assert!(!client_agent.states.lock().unwrap().is_empty(), "the client received served states");
     Ok(())
 }
 
