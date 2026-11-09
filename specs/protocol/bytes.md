@@ -1,12 +1,10 @@
 # The Bytes Ankurah Hashes and Signs
 
 This document is the authority for every byte string Ankurah hashes or signs,
-and for the encoding of each value inside those strings. The `ankurah-proto`
-crate is an implementation of it, and the vectors in section 5 are pinned by
-tests beside the types they cover.
-
-The presence string changes in a later pass of the 0.10 work
-(specs/node-identity/spec.md section 13); this document changes with it.
+for the encoding of each value inside those strings, and for the frames that
+open a connection. The `ankurah-proto` crate is an implementation of it, and
+the vectors in sections 5 and 6 are pinned by tests beside the types they
+cover.
 
 ## 1. Encoding rules
 
@@ -133,8 +131,33 @@ string; `memberships`, a set of `ModelId` (ordered as in 3.3); `head: Clock`.
 
 `HandshakeChallenge` is a struct: `issuer: NodeId`, `nonce: [u8; 32]`.
 
+`ProtocolVersions` is a struct: `lowest: u32`, `highest: u32`. It names every
+protocol version from the lowest to the highest; one whose lowest exceeds its
+highest names none.
+
+`VersionNegotiation` is a struct: `offered: ProtocolVersions`, the versions the
+signer offered in its opening frame (section 6); `peer_offered:
+ProtocolVersions`, the versions it saw the receiver offer; `chosen: u32`, the
+version it chose, the highest both include.
+
 `PresenceClaims` is a struct: `node_id: NodeId`, `durable: bool`, `challenge:
-HandshakeChallenge`, `timestamp: u64`, `protocol_version: u32`.
+HandshakeChallenge` (the receiver's), `timestamp: u64` (unix milliseconds,
+advisory), `negotiation: VersionNegotiation`, `features`, a sequence of `u32`,
+and `announcements`, a map from `String` to byte string. Each feature is a
+number core assigns to an ability a later build adds; each announcement is what
+one of the signer's plugins announces, under the plugin's name. A receiver
+ignores a feature number and an announcement name it does not know.
+
+A presence is a struct: `claims: PresenceClaims`, then `signature: Signature`,
+the signature of 4.5. It travels as variant 2 of the `Message` enum of section
+6.
+
+A receiver accepts a presence only if its claims repeat the receiver's own
+negotiation from the other side: `offered` is what the receiver saw the signer
+offer, `peer_offered` is what the receiver offered, and `chosen` is the version
+the receiver chose. Opening frames carry no signature, so a party between the
+two sides could change one; the presence signed after it then names other
+offers and is refused.
 
 ### 3.7 Attestations
 
@@ -262,7 +285,9 @@ entry, generation 1 and event id `[0x66; 32]`:
 
 Presence signed bytes for node `Ed25519([0x99; 32])`, durable, answering the
 challenge issued by `Ed25519([0x77; 32])` with nonce `[0x88; 32]`, timestamp
-`1720000000000`, protocol version 1:
+`1720000000000`, having offered versions 1 to 3 and seen versions 1 to 1
+offered, and chosen version 1, naming feature 7 and announcing `0102` under
+`"p"`:
 
 ```text
 13616e6b757261682e70726573656e63652e7631
@@ -271,7 +296,9 @@ challenge issued by `Ed25519([0x77; 32])` with nonce `[0x88; 32]`, timestamp
 00000000 7777777777777777777777777777777777777777777777777777777777777777
 8888888888888888888888888888888888888888888888888888888888888888
 0030fd7790010000
-01000000
+01000000 03000000 01000000 01000000 01000000
+0100000000000000 07000000
+0100000000000000 0100000000000000 70 0200000000000000 0102
 ```
 
 Attestation signed bytes for the statement by `Ed25519([0x11; 32])` about
@@ -314,3 +341,54 @@ eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 
 The line breaks and spaces in the last four vectors separate fields; the
 string is the bytes alone.
+
+## 6. The frames that open a connection
+
+Everything two nodes exchange is framed as a `Message`, an enum. The first
+frame each side of a connection sends is an opening. Two of the enum's
+variants keep their index and their first twelve bytes in every protocol
+version, so a node can tell whether it shares a version with its peer before
+it reads anything else:
+
+| Index | Variant | Fields |
+|---|---|---|
+| 0 | `Open` | `versions: ProtocolVersions` (the versions the sender speaks), then `challenge: HandshakeChallenge` |
+| 1 | `NoCommonVersion` | `ProtocolVersions` (the versions the sender speaks) |
+
+The first twelve bytes of either frame are the variant index, then the lowest
+and the highest version, each a `u32`. Variant 2 is the presence of 3.6, and
+variant 3 carries every message after the handshake.
+
+A receiver reads the twelve bytes of the peer's first frame before anything
+else in it:
+
+- Index 0, an opening. When the two sides' versions share one, both sides use
+  the highest version both include, and the receiver reads the rest of the
+  frame. In version 1 the rest is the challenge and nothing after it. When they
+  share none, the receiver does not read the rest: it answers with
+  `NoCommonVersion` carrying its own versions, and closes.
+- Index 1, a refusal: the peer speaks the versions it carries. The receiver
+  closes.
+- Any other index, or fewer than twelve bytes: the receiver closes.
+
+A build that offers version 1 sends exactly the version-1 layout of the
+opening, since a receiver that speaks only version 1 reads the rest of the
+frame under it. Once both openings are read, each side answers the other's
+challenge with its presence.
+
+Vectors. The opening offering versions 1 to 3, with the challenge issued by
+`Ed25519([0x77; 32])` with nonce `[0x88; 32]`:
+
+```text
+00000000 01000000 03000000
+00000000 7777777777777777777777777777777777777777777777777777777777777777
+8888888888888888888888888888888888888888888888888888888888888888
+```
+
+The refusal from a node that speaks versions 1 to 1:
+
+```text
+01000000 01000000 01000000
+```
+
+As in section 5, the line breaks and spaces separate fields.

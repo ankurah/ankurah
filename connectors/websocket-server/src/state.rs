@@ -1,15 +1,14 @@
-use ankurah_core::connector::{IssuedChallenge, SendError};
+use ankurah_core::connector::{Handshake, SendError};
 use ankurah_proto as proto;
 use axum::extract::ws::WebSocket;
 use futures_util::stream::SplitSink;
 
 pub enum Connection {
-    /// Handshaking. `answered` records that this node answered the peer's one challenge; the
-    /// sender and `challenge` are taken when the peer's presence, which must answer it, arrives.
+    /// Handshaking. The sender and this node's side of the handshake are taken when the peer's
+    /// presence, which must complete the handshake, arrives.
     Initial {
         sender: Option<SplitSink<WebSocket, axum::extract::ws::Message>>,
-        challenge: Option<IssuedChallenge>,
-        answered: bool,
+        handshake: Option<Handshake>,
     },
     Established(super::sender::WebSocketClientSender),
 }

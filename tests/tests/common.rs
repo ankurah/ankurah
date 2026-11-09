@@ -158,21 +158,22 @@ impl GatedConnection {
         } else {
             (PeerProvenance::Configured, PeerProvenance::Inbound)
         };
+        let (mut other_side, mut gated_side) = (other.begin_handshake(), gated.begin_handshake());
+        other_side.receive_opening(gated_side.opening()).expect("both nodes speak this build's protocol versions");
+        gated_side.receive_opening(other_side.opening()).expect("both nodes speak this build's protocol versions");
+        let other_presence = other.presence(&other_side).await.expect("the other node is loaded");
+        let gated_presence = gated.presence(&gated_side).await.expect("the gated node is loaded");
         let register_other = async {
-            let challenge = other.issue_challenge();
-            let presence = gated.presence(challenge.challenge()).await.expect("the gated node is loaded");
             other
-                .register_peer(presence, challenge, other_provenance, Box::new(GatedSender { sender: gated_tx, node_id: gated.id }))
+                .register_peer(gated_presence, other_side, other_provenance, Box::new(GatedSender { sender: gated_tx, node_id: gated.id }))
                 .await
-                .expect("gated peers use the current protocol version");
+                .expect("each presence answers the other side's handshake");
         };
         let register_gated = async {
-            let challenge = gated.issue_challenge();
-            let presence = other.presence(challenge.challenge()).await.expect("the other node is loaded");
             gated
-                .register_peer(presence, challenge, gated_provenance, Box::new(GatedSender { sender: other_tx, node_id: other.id }))
+                .register_peer(other_presence, gated_side, gated_provenance, Box::new(GatedSender { sender: other_tx, node_id: other.id }))
                 .await
-                .expect("gated peers use the current protocol version");
+                .expect("each presence answers the other side's handshake");
         };
         if gated_dials {
             register_gated.await;

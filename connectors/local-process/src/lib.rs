@@ -64,19 +64,16 @@ where
         } else {
             (PeerProvenance::Configured, PeerProvenance::Inbound)
         };
-        let (challenge1, challenge2) = (node1.issue_challenge(), node2.issue_challenge());
-        let register_node1 = async {
-            let presence = node2.presence(challenge1.challenge()).await?;
-            node1
-                .register_peer(presence, challenge1, provenance1, Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id }))
-                .await
-        };
-        let register_node2 = async {
-            let presence = node1.presence(challenge2.challenge()).await?;
-            node2
-                .register_peer(presence, challenge2, provenance2, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }))
-                .await
-        };
+        // Each opening goes to the other side as it is, and both presences are signed before the
+        // registrations spend the handshakes they were made from.
+        let (mut handshake1, mut handshake2) = (node1.begin_handshake(), node2.begin_handshake());
+        handshake1.receive_opening(handshake2.opening())?;
+        handshake2.receive_opening(handshake1.opening())?;
+        let (presence1, presence2) = (node1.presence(&handshake1).await?, node2.presence(&handshake2).await?);
+        let register_node1 =
+            node1.register_peer(presence2, handshake1, provenance1, Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id }));
+        let register_node2 =
+            node2.register_peer(presence1, handshake2, provenance2, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }));
         // The dialing side registers its peer first, as a websocket client registers the server before sending its presence.
         if node2_dials {
             register_node2.await?;

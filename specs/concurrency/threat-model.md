@@ -51,10 +51,13 @@ and fall back to a durable peer: `CachedEventGetter::get_event` checks staging, 
 local storage, then `node.get_durable_peer_random()`.
 
 Peer identity is **authenticated at the handshake, and peer class follows
-provenance**: each side answers the other's fresh challenge with a `Presence` signed
-by its node key, and `node.rs` `register_peer` refuses a presence that does not
-answer the challenge issued for that connection, whose signature does not verify, or
-that names the node itself. A durable claim counts only when `PolicyAgent::peer_trust`
+provenance**: each side opens with the protocol versions it speaks and a fresh
+challenge, and answers the other's challenge with a `Presence` signed by its node
+key. `node.rs` `register_peer` refuses a presence that does not answer the challenge
+issued for that connection, whose signature does not verify, that names the node
+itself, or that does not repeat the versions both openings offered and the version
+chosen, so a party that alters the unsigned openings to lower the version is found
+out. A durable claim counts only when `PolicyAgent::peer_trust`
 grants it; the default grants it to a peer this node dialed from its own
 configuration and never to a peer that connected to it. Only a granted peer enters
 `durable_peers`, from which `get_durable_peer_random` picks the peer an ephemeral node
@@ -463,13 +466,14 @@ Invariant (desired): the peer an ephemeral node fetches authoritative events fro
 authenticated as genuinely durable, not merely self-asserting.
 Trust tier: trusted-peer, for a peer this node was configured to dial.
 Enforcing seam: `node.rs` `register_peer` verifies the signed presence against the
-challenge this node issued for the connection (`IssuedChallenge::authenticate` in
-`connector.rs`), then asks `PolicyAgent::peer_trust` whether the peer is durable. By
+challenge and the version offers of this node's side of the connection's handshake
+(`Handshake::authenticate` in `connector/handshake.rs`), then asks
+`PolicyAgent::peer_trust` whether the peer is durable. By
 default only a peer reached as `PeerProvenance::Configured` may be; an `Inbound`
 peer's durable claim is ignored. Only a durable-trusted peer enters `durable_peers`,
 where `get_durable_peer_random` picks the fetch source and the commit relay finds its
 targets. An id's latest registration decides, and registrations of one id apply one at
-a time: anyone can relay this node's fresh challenge to a durable peer's server and
+a time: anyone can relay this node's fresh opening to a durable peer's server and
 register the answer inbound, so a durable-trusted id that registers again without
 durable trust is dropped from `durable_peers` and the subscription relay at that
 moment. Every request to a peer chosen as durable (`Node::request_durable`) re-checks the
@@ -483,8 +487,9 @@ a peer that connects to the node; a configured peer is still trusted on its clai
 Test arm: `peer_trust_tests::inbound_durable_claim_is_not_a_relay_target`
 (jwt-auth: an inbound durable claimant receives no local commit and cannot fail a
 root context commit) and `node::tests::identity` (core: forged signature, replayed
-presence, reflected self-connection, provenance trust, a durable id registered again
-inbound, concurrent registrations of one id) and
+presence, reflected self-connection, a presence that does not repeat the version
+offers, provenance trust, a durable id registered again inbound, concurrent
+registrations of one id) and
 `client_relay::tests::a_subscription_send_refuses_a_peer_whose_connection_lost_durable_trust`
 (core: a send whose peer lost durable trust while it waited is refused).
 Status: partial. Which keys are a deployment's durable members is not recorded, so a

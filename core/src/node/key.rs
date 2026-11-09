@@ -85,19 +85,8 @@ impl NodeKey {
         proto::Statement { attester: self.identity(), subject, kind, payload }.seal(|bytes| self.sign(bytes))
     }
 
-    /// Sign a presence answering `challenge`: this key's identity and its durable claim.
-    pub fn sign_presence(&self, durable: bool, challenge: proto::HandshakeChallenge) -> proto::Presence {
-        let mut presence = proto::Presence {
-            node_id: self.node_id(),
-            durable,
-            challenge,
-            timestamp: proto::time::unix_ms_now(),
-            signature: proto::Signature::Ed25519([0; 64]),
-            protocol_version: proto::PROTOCOL_VERSION,
-        };
-        presence.signature = self.sign(&presence.claims().signable_bytes());
-        presence
-    }
+    /// Sign a presence making `claims`. It verifies only if the claims name this key's node.
+    pub fn sign_presence(&self, claims: proto::PresenceClaims) -> proto::Presence { claims.sign(|bytes| self.sign(bytes)) }
 }
 
 /// Persist the directory entry that names `path`, so a newly linked key survives power loss.

@@ -3,11 +3,10 @@
 
 use std::collections::BTreeMap;
 
-use bincode::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::domain_tag::DomainTag;
+use crate::{domain_tag::DomainTag, encoding::decode_exact};
 use ankurah_core_types::ModelId;
 
 /// Ordered top-level mutations that make up one event's content, decoded: what
@@ -142,11 +141,7 @@ impl CarriedOperation {
     /// The operation these bytes encode.
     pub fn decode(&self) -> Result<Operation, UnreadableOperation> {
         match self {
-            // The encoding `bincode::serialize` writes; bytes left over after the operation make it unreadable.
-            Self::Bytes(bytes) => bincode::DefaultOptions::new()
-                .with_fixint_encoding()
-                .deserialize(bytes)
-                .map_err(|error| UnreadableOperation::Undecodable(error.to_string())),
+            Self::Bytes(bytes) => decode_exact(bytes).map_err(|error| UnreadableOperation::Undecodable(error.to_string())),
             Self::Erased(_) => Err(UnreadableOperation::Erased),
         }
     }

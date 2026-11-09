@@ -2,7 +2,7 @@ use crate::client::ClientInner;
 use crate::connection_state::ConnectionState;
 use ankurah::signals::Wait;
 use ankurah_core::action_info;
-use ankurah_core::connector::IssuedChallenge;
+use ankurah_core::connector::Handshake;
 use ankurah_core::connector::NodeComms;
 use ankurah_core::connector::PeerConnectionError;
 use ankurah_core::connector::PeerProvenance;
@@ -33,10 +33,8 @@ pub struct ConnectionInner {
     state: RwLock<ConnectionState>,
     node: Box<dyn NodeComms>,
     client: Weak<ClientInner>,
-    /// Ours, which the server's presence must answer; taken when that presence arrives.
-    challenge: RefCell<Option<IssuedChallenge>>,
-    /// The server's, which our presence answers.
-    server_challenge: Cell<Option<proto::HandshakeChallenge>>,
+    /// This node's side of the handshake; taken when the server's presence arrives.
+    handshake: RefCell<Option<Handshake>>,
     registered_peer: Cell<Option<proto::NodeId>>,
     receive_task: Cell<Option<RemoteHandle<()>>>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
@@ -60,15 +58,14 @@ impl Connection {
         let state = RwLock::new(ConnectionState::Connecting { url: url.clone() });
         let (mut incoming, mut messages) = mpsc::channel(MAX_QUEUED_MESSAGES);
 
-        let challenge = RefCell::new(Some(node.issue_challenge()));
+        let handshake = RefCell::new(Some(node.begin_handshake()));
         let me = Connection(Arc::new(SendWrapper::new(ConnectionInner {
             ws: Arc::new(ws),
             url,
             state,
             node,
             client,
-            challenge,
-            server_challenge: Cell::new(None),
+            handshake,
             registered_peer: Cell::new(None),
             receive_task: Cell::new(None),
             _callbacks: Mutex::new(None),
@@ -187,45 +184,28 @@ impl Connection {
         let array = Uint8Array::new(&array_buffer);
         let data = array.to_vec();
 
+        // The server's first frame is its opening.
+        if self.handshake.borrow().as_ref().is_some_and(|handshake| !handshake.opened()) {
+            self.receive_opening(&data);
+            return None;
+        }
+
         if let Ok(message) = bincode::deserialize::<proto::Message>(&data) {
             match message {
-                proto::Message::Challenge(server_challenge) => {
-                    let ours = self.challenge.borrow().as_ref().map(IssuedChallenge::challenge);
-                    let Some(ours) = ours.filter(|_| self.server_challenge.get().is_none()) else {
-                        warn!("Ignoring repeated handshake challenge from {}", self.url);
-                        return None;
-                    };
-                    self.server_challenge.set(Some(server_challenge));
-                    // The server opens with its challenge, so the socket is open for ours.
-                    if let Err(error) = self.send_message(proto::Message::Challenge(ours)) {
-                        self.disconnect();
-                        self.set_state(ConnectionState::Error { message: format!("Failed to send challenge: {error:?}"), cause: None });
-                        return None;
-                    }
+                proto::Message::Open(_) => warn!("Ignoring repeated opening from {}", self.url),
+                proto::Message::NoCommonVersion(theirs) => {
+                    let refusal = PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs };
+                    error!("Server {} refused connection: {}", self.url, refusal);
+                    self.disconnect();
+                    self.set_state(ConnectionState::Error { message: refusal.to_string(), cause: Some(refusal) });
                 }
                 proto::Message::Presence(server_presence) => {
-                    // Pre-check the version so the server learns why we are
-                    // leaving; register_peer re-enforces this for every transport.
-                    if !proto::protocol_compatible(server_presence.protocol_version) {
-                        let rejection =
-                            proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: server_presence.protocol_version };
-                        error!("Refusing server {}: {}", self.url, rejection);
-                        let _ = self.send_message(proto::Message::PresenceRejected(rejection.clone()));
-                        self.disconnect();
-                        self.set_state(ConnectionState::Error { message: rejection.to_string(), cause: Some(rejection.into()) });
-                        return None;
-                    }
                     let state = { self.state.read().unwrap().clone() };
                     match state {
                         ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
                         ConnectionState::Connecting { .. } => {
-                            let (Some(challenge), Some(server_challenge)) =
-                                (self.challenge.borrow_mut().take(), self.server_challenge.get())
-                            else {
-                                let message = format!("Server {} sent its presence before its handshake challenge", self.url);
-                                error!("{}", message);
-                                self.disconnect();
-                                self.set_state(ConnectionState::Error { message, cause: None });
+                            let Some(handshake) = self.handshake.borrow_mut().take() else {
+                                warn!("Received duplicate server presence, ignoring");
                                 return None;
                             };
                             // Register BEFORE publishing Connected: observers of the
@@ -233,29 +213,28 @@ impl Connection {
                             // registered (or that registration is about to refuse).
                             let weak = Arc::downgrade(&self.0);
                             let node = self.node.cloned();
-                            let sender = Box::new(WebSocketPeerSender {
-                                recipient_node_id: server_presence.node_id,
-                                ws: SendWrapper::new(self.ws.clone()),
-                            });
+                            let server = server_presence.claims.node_id;
+                            let sender = Box::new(WebSocketPeerSender { recipient_node_id: server, ws: SendWrapper::new(self.ws.clone()) });
                             return Some(async move {
-                                let presence = match node
-                                    .register_peer(server_presence.clone(), challenge, PeerProvenance::Configured, sender)
-                                    .await
-                                {
-                                    Ok(()) => {
-                                        if let Some(connection) = weak.upgrade().map(Connection) {
-                                            connection.registered_peer.set(Some(server_presence.node_id));
-                                        } else {
-                                            node.deregister_peer(server_presence.node_id);
-                                            return;
-                                        }
-                                        node.presence(server_challenge).await.map_err(PeerConnectionError::from)
-                                    }
+                                // Signed before registration spends the handshake.
+                                let presence = match node.presence(&handshake).await {
+                                    Ok(presence) => node
+                                        .register_peer(server_presence.clone(), handshake, PeerProvenance::Configured, sender)
+                                        .await
+                                        .map(|()| presence),
                                     Err(error) => Err(error),
                                 };
-                                let Some(connection) = weak.upgrade().map(Connection) else { return };
+                                let Some(connection) = weak.upgrade().map(Connection) else {
+                                    if presence.is_ok() {
+                                        node.deregister_peer(server);
+                                    }
+                                    return;
+                                };
                                 let presence = match presence {
-                                    Ok(presence) => presence,
+                                    Ok(presence) => {
+                                        connection.registered_peer.set(Some(server));
+                                        presence
+                                    }
                                     Err(rejection) => {
                                         error!("Refusing server {}: {}", connection.url, rejection);
                                         connection.disconnect();
@@ -292,11 +271,6 @@ impl Connection {
                         }
                     }
                 }
-                proto::Message::PresenceRejected(rejection) => {
-                    error!("Server {} refused connection: {}", self.url, rejection);
-                    self.disconnect();
-                    self.set_state(ConnectionState::Error { message: rejection.to_string(), cause: Some(rejection.into()) });
-                }
                 proto::Message::PeerMessage(msg) => {
                     if self.registered_peer.get().is_none() {
                         // As the native client: nothing an unregistered server says may reach the node.
@@ -330,6 +304,35 @@ impl Connection {
             }
         }
         None
+    }
+
+    /// Answer the server's first frame, its opening, which arrives once the socket is open: send
+    /// this node's opening, then read the server's, and close with the versions this node speaks
+    /// when the two share none.
+    fn receive_opening(&self, frame: &[u8]) {
+        let Some((opening, read)) =
+            self.handshake.borrow_mut().as_mut().map(|handshake| (handshake.opening(), handshake.read_opening(frame)))
+        else {
+            return;
+        };
+        let refusal = match self.send_message(proto::Message::Open(opening)) {
+            Ok(()) => match read {
+                Ok(()) => return,
+                Err(refusal) => refusal,
+            },
+            Err(error) => {
+                self.disconnect();
+                self.set_state(ConnectionState::Error { message: format!("Failed to send opening: {error:?}"), cause: None });
+                return;
+            }
+        };
+        error!("Refusing server {}: {}", self.url, refusal);
+        if let PeerConnectionError::NoCommonVersion { ours, .. } = refusal {
+            // Best effort: the connection closes either way.
+            let _ = self.send_message(proto::Message::NoCommonVersion(ours));
+        }
+        self.disconnect();
+        self.set_state(ConnectionState::Error { message: refusal.to_string(), cause: Some(refusal) });
     }
 
     fn send_message(&self, message: proto::Message) -> Result<(), JsValue> {

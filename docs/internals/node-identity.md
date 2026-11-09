@@ -32,17 +32,33 @@ chooses.
 
 ## The Handshake
 
-When a connection opens, each side sends the other a fresh `HandshakeChallenge`
-and answers the one it receives with a signed `Presence`: its `NodeId`,
-whether it claims to be durable, the challenge it answers, an advisory
-timestamp and the protocol version, signed under the tag
-`ankurah.presence.v1`. `register_peer` checks the protocol version first,
-then accepts the presence only if it answers the single-use challenge this
-node issued for that connection, its signature verifies under the key it
-names, and it does not name this node itself. A presence copied from another
-connection answers a different challenge and is refused. Nothing in the
-handshake compares datasets: two nodes that share no history connect as
-readily as two that share all of it.
+When a connection opens, each side first sends an opening: the range of
+protocol versions it speaks and a fresh `HandshakeChallenge`. An opening's
+first twelve bytes, its frame's variant index and then the lowest and the
+highest version, keep their place and meaning in every protocol version, so a
+node reads them before anything else and learns whether it can talk to a
+build newer or older than itself. The two sides use the highest version both
+speak. A node that speaks none of the versions its peer offers answers with
+the versions it does speak and closes, without reading the rest of the peer's
+opening.
+
+Each side then answers the other's challenge with a signed `Presence`: its
+`NodeId`, whether it claims to be durable, the challenge it answers, an
+advisory timestamp, the versions it offered, the versions it saw its peer
+offer and the version it chose, the feature numbers it has, and its plugins'
+announcements, all signed under the tag `ankurah.presence.v1`. A node ignores
+a feature number or an announcement name it does not know; this build assigns
+no feature numbers. Connectors hold each connection's side of the handshake
+in a `Handshake`, and `register_peer` spends it: it accepts the presence only
+if it answers the single-use challenge this node issued for that connection,
+its signature verifies under the key it names, it does not name this node
+itself, and it repeats the offers this node sent and saw and the version this
+node chose. Openings carry no signature, so a party between the two nodes
+could change the offers to lower the version chosen; the peer then signs
+offers that differ from this node's, and its presence is refused. A presence
+copied from another connection answers a different challenge and is refused.
+Nothing in the handshake compares datasets: two nodes that share no history
+connect as readily as two that share all of it.
 
 The signed presence authenticates the handshake only; frames after it are not
 signed. A peer that authenticated its own connection can still name another
@@ -66,7 +82,7 @@ inbound peer's durable claim is logged and otherwise ignored.
 
 A node id's latest registration decides its trust, and registrations of one
 id apply one at a time. Anyone can get a node's presence for a fresh
-challenge by relaying that challenge to that node, so an id trusted as durable
+opening by relaying that opening to that node, so an id trusted as durable
 can be registered again over a connection that is not. Durable routing for
 that id is dropped at that moment, and every request to a peer chosen because
 it is durable re-checks, as it is sent, that the peer's current connection is

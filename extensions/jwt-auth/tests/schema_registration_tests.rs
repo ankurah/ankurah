@@ -2,7 +2,7 @@ mod common;
 
 use ankurah::{Model, Node, Ref};
 use ankurah_core::{
-    connector::{PeerProvenance, PeerSender, SendError},
+    connector::{Handshake, PeerProvenance, PeerSender, SendError},
     error::{MutationError, RetrievalError},
     node::NodeKey,
     policy::AccessDenied,
@@ -61,6 +61,14 @@ impl PeerSender for ReplySender {
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
+/// `node`'s side of a fresh handshake with a peer that holds only `key`, and that peer's presence answering it.
+fn keyed_handshake(node: &TestNode, key: &NodeKey) -> (Handshake, proto::Presence) {
+    let (mut ours, mut theirs) = (node.begin_handshake(), Handshake::new(key.node_id()));
+    ours.receive_opening(theirs.opening()).unwrap();
+    theirs.receive_opening(ours.opening()).unwrap();
+    (ours, key.sign_presence(theirs.presence_claims(key.node_id(), false).unwrap()))
+}
+
 async fn wire_register(
     node: &TestNode,
     peer: proto::NodeId,
@@ -96,9 +104,8 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (tx, mut replies) = mpsc::unbounded_channel();
-    let challenge = node.issue_challenge();
-    let presence = key.sign_presence(false, challenge.challenge());
-    node.register_peer(presence, challenge, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
+    let (handshake, presence) = keyed_handshake(&node, &key);
+    node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
     let model = proto::RegisterModel::from(RegistrationRecord::descriptor());
     let response = wire_register(&node, peer, &mut replies, proto::AuthData::default(), model.clone()).await?;
     assert!(
@@ -145,9 +152,8 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
         let key = NodeKey::generate();
         let peer = key.node_id();
         let (tx, mut replies) = mpsc::unbounded_channel();
-        let challenge = node.issue_challenge();
-        let presence = key.sign_presence(false, challenge.challenge());
-        node.register_peer(presence, challenge, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
+        let (handshake, presence) = keyed_handshake(&node, &key);
+        node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
         let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
         let auth = proto::AuthData(common::sign_token(&common::test_keys(), &claims).into_bytes());
         let model = proto::RegisterModel::from(Role::descriptor());
@@ -234,15 +240,20 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
         let (server_tx, mut server_rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
-        let challenge = client.issue_challenge();
-        let presence = server.presence(challenge.challenge()).await?;
+        let (mut client_side, mut server_side) = (client.begin_handshake(), server.begin_handshake());
+        client_side.receive_opening(server_side.opening())?;
+        server_side.receive_opening(client_side.opening())?;
+        let (client_presence, server_presence) = (client.presence(&client_side).await?, server.presence(&server_side).await?);
         client
-            .register_peer(presence, challenge, PeerProvenance::Configured, Box::new(ReplySender { peer: server.id, tx: server_tx }))
+            .register_peer(
+                server_presence,
+                client_side,
+                PeerProvenance::Configured,
+                Box::new(ReplySender { peer: server.id, tx: server_tx }),
+            )
             .await?;
-        let challenge = server.issue_challenge();
-        let presence = client.presence(challenge.challenge()).await?;
         server
-            .register_peer(presence, challenge, PeerProvenance::Inbound, Box::new(ReplySender { peer: client.id, tx: client_tx }))
+            .register_peer(client_presence, server_side, PeerProvenance::Inbound, Box::new(ReplySender { peer: client.id, tx: client_tx }))
             .await?;
 
         let held = Arc::new(Mutex::new(None::<Vec<proto::NodeMessage>>));

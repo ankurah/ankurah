@@ -1168,7 +1168,7 @@ mod tests {
         use crate::connector::{PeerProvenance, PeerSender, SendError};
         use crate::node::Node;
         use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
-        use crate::test_utils::TestStorage;
+        use crate::test_utils::{opened_handshakes, TestStorage};
 
         #[derive(Clone)]
         struct Recorder(NodeId, std::sync::mpsc::Sender<proto::NodeMessage>);
@@ -1183,10 +1183,10 @@ mod tests {
         let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
         let storage = Arc::new(TestStorage::default());
         let client = Node::new(storage.clone(), PermissiveAgent::new());
-        let challenge = client.issue_challenge();
-        let presence = server.presence(challenge.challenge()).await.unwrap();
+        let (handshake, theirs) = opened_handshakes(client.id, server.id);
+        let presence = server.presence(&theirs).await.unwrap();
         let (sent, _messages) = std::sync::mpsc::channel();
-        client.register_peer(presence, challenge, PeerProvenance::Configured, Box::new(Recorder(server.id, sent))).await.unwrap();
+        client.register_peer(presence, handshake, PeerProvenance::Configured, Box::new(Recorder(server.id, sent))).await.unwrap();
 
         let model = ModelId::EntityId(EntityId::from_bytes([9; 32]));
         let (entered, entered_rx) = tokio::sync::oneshot::channel();
@@ -1202,12 +1202,12 @@ mod tests {
             _ = &mut subscribe => panic!("the subscription finished before its local read"),
         }
 
-        // Anyone can get the server's presence for the client's fresh challenge by relaying it.
-        let challenge = client.issue_challenge();
-        let relayed = server.presence(challenge.challenge()).await.unwrap();
+        // Anyone can get the server's presence for the client's fresh opening by relaying it.
+        let (handshake, theirs) = opened_handshakes(client.id, server.id);
+        let relayed = server.presence(&theirs).await.unwrap();
         let (relayer_sent, relayer_messages) = std::sync::mpsc::channel();
         let relayer = Box::new(Recorder(server.id, relayer_sent));
-        client.register_peer(relayed, challenge, PeerProvenance::Inbound, relayer).await.unwrap();
+        client.register_peer(relayed, handshake, PeerProvenance::Inbound, relayer).await.unwrap();
 
         release.send(()).unwrap();
         let outcome =

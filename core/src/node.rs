@@ -13,7 +13,7 @@ use std::{
 };
 use tokio::sync::oneshot;
 
-use crate::connector::{IssuedChallenge, PeerConnectionError, PeerProvenance, PeerSender};
+use crate::connector::{Handshake, PeerConnectionError, PeerProvenance, PeerSender};
 use crate::context::{Context, ContextAuth, ContextInner};
 use crate::entity::WeakEntitySet;
 use crate::error::{NodeHaltReason, NodeReadinessError, RequestError};
@@ -315,58 +315,56 @@ where
     /// The identity this node mints and signs under.
     pub fn identity(&self) -> proto::Identity { self.id.identity() }
 
-    /// Issue a fresh challenge for one new connection. Send its value to the peer, then pass it to
-    /// [`Node::register_peer`] with the peer's presence.
-    pub fn issue_challenge(&self) -> IssuedChallenge { IssuedChallenge::new(self.id) }
+    /// Begin this node's side of one new connection's handshake. Send its opening to the peer
+    /// first, take the peer's opening into it, then pass it to [`Node::register_peer`] with the
+    /// peer's presence.
+    pub fn begin_handshake(&self) -> Handshake { Handshake::new(self.id) }
 
-    /// Sign this node's presence answering a peer's challenge; a halted node signs none.
-    pub async fn presence(&self, challenge: proto::HandshakeChallenge) -> Result<proto::Presence, NodeHaltReason> {
+    /// Sign this node's presence answering the peer on `handshake`'s connection; a halted node
+    /// signs none, and none answers before the peer's opening arrives.
+    pub async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
         self.lifecycle.check_not_halted()?;
-        Ok(self.key.sign_presence(self.durable, challenge))
+        Ok(self.key.sign_presence(handshake.presence_claims(self.id, self.durable)?))
     }
 
-    /// Register a peer connection whose presence answers `challenge`, which this node issued for it.
+    /// Register a peer connection whose presence completes `handshake`, this node's side of it.
     /// `provenance` says how the connection was made; the policy agent's [`PolicyAgent::peer_trust`]
     /// decides from it whether the peer is durable.
-    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.node_id.to_base64_short(), durable = %presence.durable)))]
+    #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.claims.node_id.to_base64_short(), durable = %presence.claims.durable)))]
     pub async fn register_peer(
         &self,
         presence: proto::Presence,
-        challenge: IssuedChallenge,
+        handshake: Handshake,
         provenance: PeerProvenance,
         sender: Box<dyn PeerSender>,
     ) -> Result<(), PeerConnectionError> {
         action_info!(self, "register_peer", "{}", &presence);
 
-        if !proto::protocol_compatible(presence.protocol_version) {
-            let rejection = proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
-            warn!("Node({}) refusing peer {}: {}", self.id, presence.node_id, rejection);
-            return Err(rejection.into());
-        }
-        if let Err(refusal) = challenge.authenticate(self.id, &presence) {
+        if let Err(refusal) = handshake.authenticate(self.id, &presence) {
             warn!("Node({}) refusing peer: {}", self.id, refusal);
             return Err(refusal);
         }
-        let trust = self.policy_agent.peer_trust(&presence.node_id, provenance, presence.durable);
-        if presence.durable && !trust.durable {
-            info!("Node({}) serves {:?} peer {} as not durable despite its durable claim", self.id, provenance, presence.node_id);
+        let proto::PresenceClaims { node_id: peer, durable: claimed_durable, .. } = presence.claims;
+        let trust = self.policy_agent.peer_trust(&peer, provenance, claimed_durable);
+        if claimed_durable && !trust.durable {
+            info!("Node({}) serves {:?} peer {} as not durable despite its durable claim", self.id, provenance, peer);
         }
 
         self.lifecycle.check_not_halted()?;
-        let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
+        let subscription_handler = SubscriptionHandler::new(peer, self);
         let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // The latest registration decides trust: an id registering again without durable trust
         // leaves durable routing before its new sender is reachable.
-        if !trust.durable && self.durable_peers.remove(&presence.node_id) {
+        if !trust.durable && self.durable_peers.remove(&peer) {
             if let Some(ref relay) = self.subscription_relay {
-                relay.notify_peer_disconnected(presence.node_id);
+                relay.notify_peer_disconnected(peer);
             }
         }
-        self.peer_connections.insert(presence.node_id, Arc::new(PeerState::new(sender, trust, subscription_handler)));
+        self.peer_connections.insert(peer, Arc::new(PeerState::new(sender, trust, subscription_handler)));
         if trust.durable {
-            self.durable_peers.insert(presence.node_id);
+            self.durable_peers.insert(peer);
             if let Some(ref relay) = self.subscription_relay {
-                relay.notify_peer_connected(presence.node_id);
+                relay.notify_peer_connected(peer);
             }
         }
         // TODO send hello message to the peer, including present head state for all relevant collections

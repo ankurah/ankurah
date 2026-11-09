@@ -1,4 +1,3 @@
-use bincode::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -6,6 +5,7 @@ use crate::{
     clock::Clock,
     data::{EntityState, Event, EventId},
     domain_tag::DomainTag,
+    encoding::decode_exact,
     id::EntityId,
     identity::{Identity, Signature},
 };
@@ -96,12 +96,9 @@ fn signed_bytes(statement: &[u8]) -> Vec<u8> {
     bytes
 }
 
-/// The value `bytes` hold in the encoding `bincode::serialize` writes; bytes left over make them undecodable.
+/// The value `bytes` hold; bytes left over make them undecodable.
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, AttestationError> {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .deserialize(bytes)
-        .map_err(|error| AttestationError::Undecodable(error.to_string()))
+    decode_exact(bytes).map_err(|error| AttestationError::Undecodable(error.to_string()))
 }
 
 impl Subject {

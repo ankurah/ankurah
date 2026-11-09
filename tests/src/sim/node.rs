@@ -39,16 +39,14 @@ impl SimNode {
     /// Register `peer` as a connected peer of this node, installing a
     /// `SimSender` so anything this node sends *to* `peer` is captured for the
     /// scheduler. Mirrors `Node::register_peer` as `LocalProcessConnection`
-    /// would, including initial system adoption from a durable peer.
-    /// `provenance` is this node's side of the connection: `Configured` if it dialed.
+    /// would. `provenance` is this node's side of the connection: `Configured` if it dialed.
     pub async fn connect_to(&self, peer: &SimNode, provenance: PeerProvenance) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        let challenge = self.node.issue_challenge();
-        let presence = peer.node.presence(challenge.challenge()).await.expect("sim peers do not halt during setup");
-        self.node
-            .register_peer(presence, challenge, provenance, Box::new(sender))
-            .await
-            .expect("sim peers share this build's protocol version");
+        let (mut ours, mut theirs) = (self.node.begin_handshake(), peer.node.begin_handshake());
+        ours.receive_opening(theirs.opening()).expect("sim peers share this build's protocol versions");
+        theirs.receive_opening(ours.opening()).expect("sim peers share this build's protocol versions");
+        let presence = peer.node.presence(&theirs).await.expect("sim peers do not halt during setup");
+        self.node.register_peer(presence, ours, provenance, Box::new(sender)).await.expect("sim peers answer each other's handshakes");
     }
 
     /// Ingest a forged batch of events directly through the production remote

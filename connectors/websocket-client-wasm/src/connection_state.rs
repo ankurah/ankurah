@@ -42,10 +42,14 @@ impl ConnectionStateEnum {
         let ConnectionState::Error { cause, .. } = &self.0 else { return None };
         Some(
             match cause {
-                Some(PeerConnectionError::Protocol(_)) => "Protocol",
+                Some(PeerConnectionError::NoCommonVersion { .. }) => "NoCommonVersion",
+                Some(PeerConnectionError::UnreadableOpening(_)) => "UnreadableOpening",
+                Some(PeerConnectionError::RepeatedOpening) => "RepeatedOpening",
+                Some(PeerConnectionError::NoOpening) => "NoOpening",
                 Some(PeerConnectionError::ChallengeMismatch(_)) => "ChallengeMismatch",
                 Some(PeerConnectionError::InvalidSignature(_)) => "InvalidSignature",
                 Some(PeerConnectionError::SelfConnection(_)) => "SelfConnection",
+                Some(PeerConnectionError::OfferMismatch(_)) => "OfferMismatch",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",
                 None => "Transport",
             }

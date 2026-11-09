@@ -15,18 +15,15 @@ use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 
 type Socket = WebSocketStream<TcpStream>;
 
-/// Play the server's half of the handshake: open with `server`'s challenge, then answer the client's.
+/// Play the server's half of the handshake: open, then answer the client's opening.
 async fn advertise(socket: &mut Socket, server: &Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<()> {
-    let challenge = proto::Message::Challenge(server.issue_challenge().challenge());
-    socket.send(Message::Binary(bincode::serialize(&challenge)?.into())).await?;
-    let client_challenge = match socket.next().await.transpose()? {
-        Some(Message::Binary(bytes)) => match bincode::deserialize(&bytes)? {
-            proto::Message::Challenge(challenge) => challenge,
-            other => anyhow::bail!("expected the client's challenge, got {other:?}"),
-        },
-        other => anyhow::bail!("expected the client's challenge frame, got {other:?}"),
-    };
-    let presence = server.presence(client_challenge).await?;
+    let mut handshake = server.begin_handshake();
+    socket.send(Message::Binary(bincode::serialize(&proto::Message::Open(handshake.opening()))?.into())).await?;
+    match socket.next().await.transpose()? {
+        Some(Message::Binary(bytes)) => handshake.read_opening(&bytes)?,
+        other => anyhow::bail!("expected the client's opening frame, got {other:?}"),
+    }
+    let presence = server.presence(&handshake).await?;
     socket.send(Message::Binary(bincode::serialize(&proto::Message::Presence(presence))?.into())).await?;
     Ok(())
 }

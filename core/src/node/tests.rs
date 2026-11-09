@@ -2,7 +2,7 @@ use super::*;
 use crate::connector::SendError;
 use crate::node::handler::commit_transaction;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
-use crate::test_utils::TestStorage;
+use crate::test_utils::{opened_handshakes, TestStorage};
 use ankurah_signals::Subscribe;
 
 mod commit;
@@ -28,7 +28,27 @@ impl PeerSender for RecordingSender {
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-/// Register a peer with no node behind it: `key` signs a presence answering the node's challenge.
+/// Register a peer with no node behind it: `key` signs the claims `claims` makes of what its side
+/// of the handshake would claim.
+async fn register_keyed_peer_claiming<SE, PA>(
+    node: &Node<SE, PA>,
+    key: &NodeKey,
+    durable: bool,
+    claims: impl FnOnce(&mut proto::PresenceClaims),
+    provenance: PeerProvenance,
+    sender: Box<dyn PeerSender>,
+) -> Result<(), PeerConnectionError>
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    let (ours, theirs) = opened_handshakes(node.id, key.node_id());
+    let mut presence_claims = theirs.presence_claims(key.node_id(), durable)?;
+    claims(&mut presence_claims);
+    node.register_peer(key.sign_presence(presence_claims), ours, provenance, sender).await
+}
+
+/// Register a peer with no node behind it: `key` signs a presence answering the node's side of a fresh handshake.
 async fn register_keyed_peer<SE, PA>(
     node: &Node<SE, PA>,
     key: &NodeKey,
@@ -40,28 +60,25 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let challenge = node.issue_challenge();
-    let presence = key.sign_presence(durable, challenge.challenge());
-    node.register_peer(presence, challenge, provenance, sender).await
+    register_keyed_peer_claiming(node, key, durable, |_| {}, provenance, sender).await
 }
-
-/// A challenge from some other node, for presences that are not registered.
-fn foreign_challenge() -> proto::HandshakeChallenge { proto::HandshakeChallenge::new(NodeKey::generate().node_id()) }
 
 #[tokio::test]
 async fn presence_signs_this_nodes_claims_and_a_halted_node_has_none() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    let challenge = foreign_challenge();
-    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(challenge)).await.unwrap().unwrap();
-    assert_eq!(presence.node_id, node.id);
-    assert!(!presence.durable);
-    assert_eq!(presence.challenge, challenge);
+    let (handshake, peer) = opened_handshakes(node.id, NodeKey::generate().node_id());
+    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(&handshake)).await.unwrap().unwrap();
+    let claims = &presence.claims;
+    assert_eq!(claims.node_id, node.id);
+    assert!(!claims.durable);
+    assert_eq!(claims.challenge, peer.opening().challenge);
     assert!(presence.signature_is_valid());
-    assert_eq!(presence.protocol_version, proto::PROTOCOL_VERSION);
+    let spoken = proto::ProtocolVersions::SPOKEN;
+    assert_eq!(claims.negotiation, proto::VersionNegotiation { offered: spoken, peer_offered: spoken, chosen: proto::PROTOCOL_VERSION });
 
     let halt_reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("test failure".into()));
     assert_eq!(node.state().value(), NodeState::Halted(halt_reason.clone()));
-    assert_eq!(node.presence(foreign_challenge()).await.unwrap_err(), halt_reason);
+    assert_eq!(node.presence(&handshake).await.unwrap_err(), PeerConnectionError::NodeHalted(halt_reason));
 }
 
 #[tokio::test]
@@ -140,12 +157,13 @@ async fn presence_does_not_wait_for_startup() {
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
     assert_eq!(node.state().value(), NodeState::Startup);
-    let presence = node.presence(foreign_challenge());
+    let (handshake, _) = opened_handshakes(node.id, NodeKey::generate().node_id());
+    let presence = node.presence(&handshake);
     tokio::pin!(presence);
     let std::task::Poll::Ready(presence) = futures::poll!(&mut presence) else { panic!("presence waited for startup") };
     let presence = presence.unwrap();
-    assert_eq!(presence.node_id, node.id);
-    assert!(presence.durable);
+    assert_eq!(presence.claims.node_id, node.id);
+    assert!(presence.claims.durable);
 }
 
 #[tokio::test]

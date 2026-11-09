@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth::AuthData,
     identity::NodeId,
-    peering::{HandshakeChallenge, Presence, PresenceRejection},
+    peering::{Opening, Presence, ProtocolVersions},
     request::{NodeRequest, NodeResponse},
     subscription::QueryId,
     update::{NodeUpdate, NodeUpdateAck},
@@ -11,14 +11,14 @@ use crate::{
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Message {
+    /// The first frame each side of a connection sends, before any presence.
+    Open(Opening),
+    /// The answer to an opening that offers no version the receiver speaks: the versions the
+    /// receiver speaks. The connection closes right after. Laid out as an opening's first twelve
+    /// bytes, so any build reads it.
+    NoCommonVersion(ProtocolVersions),
     Presence(Presence),
     PeerMessage(NodeMessage),
-    /// Best-effort notice that the sender is refusing the connection over
-    /// a protocol version mismatch; the connection closes right after.
-    PresenceRejected(PresenceRejection),
-    /// A fresh challenge the receiver's presence must answer. Each side sends
-    /// one when a connection opens, before any presence.
-    Challenge(HandshakeChallenge),
     // TODO RPC messages
 }
 
@@ -34,10 +34,10 @@ pub enum NodeMessage {
 impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Message::Open(opening) => write!(f, "Open: versions {} from {:#}", opening.versions, opening.challenge.issuer()),
+            Message::NoCommonVersion(versions) => write!(f, "NoCommonVersion: speaks {versions}"),
             Message::Presence(presence) => write!(f, "Presence: {}", presence),
             Message::PeerMessage(node_message) => write!(f, "PeerMessage: {}", node_message),
-            Message::PresenceRejected(rejection) => write!(f, "PresenceRejected: {}", rejection),
-            Message::Challenge(challenge) => write!(f, "Challenge from {:#}", challenge.issuer()),
         }
     }
 }
@@ -59,6 +59,7 @@ mod tests {
     use super::*;
     use crate::{
         identity::{Identity, Signature},
+        peering::{HandshakeChallenge, PresenceClaims, VersionNegotiation},
         request::{NodeRequestBody, NodeResponseBody, RequestId},
         update::{NodeUpdateAckBody, NodeUpdateBody, UpdateId},
     };
@@ -66,23 +67,27 @@ mod tests {
     fn node(byte: u8) -> NodeId { Identity::Ed25519([byte; 32]).into() }
 
     /// The first four bytes of a message are its variant index, which every peer reads to frame it.
+    /// The opening's and the refusal's stay fixed in every protocol version.
     #[test]
     fn message_variant_order_is_pinned() {
         let challenge = HandshakeChallenge::new(node(1));
-        let presence = Presence {
+        let versions = ProtocolVersions::SPOKEN;
+        let claims = PresenceClaims {
             node_id: node(2),
             durable: false,
             challenge,
             timestamp: 0,
-            signature: Signature::Ed25519([0; 64]),
-            protocol_version: 1,
+            negotiation: VersionNegotiation { offered: versions, peer_offered: versions, chosen: 1 },
+            features: vec![],
+            announcements: Default::default(),
         };
+        let presence = Presence { claims, signature: Signature::Ed25519([0; 64]) };
         let unsubscribe = NodeMessage::UnsubscribeQuery { from: node(2), query_id: QueryId::test(1) };
         for (message, index) in [
-            (Message::Presence(presence), [0, 0, 0, 0]),
-            (Message::PeerMessage(unsubscribe), [1, 0, 0, 0]),
-            (Message::PresenceRejected(PresenceRejection { expected: 1, received: 0 }), [2, 0, 0, 0]),
-            (Message::Challenge(challenge), [3, 0, 0, 0]),
+            (Message::Open(Opening { versions, challenge }), [0, 0, 0, 0]),
+            (Message::NoCommonVersion(versions), [1, 0, 0, 0]),
+            (Message::Presence(presence), [2, 0, 0, 0]),
+            (Message::PeerMessage(unsubscribe), [3, 0, 0, 0]),
         ] {
             assert_eq!(bincode::serialize(&message).unwrap()[..4], index, "{message}");
         }

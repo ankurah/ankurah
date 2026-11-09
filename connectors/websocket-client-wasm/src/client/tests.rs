@@ -1,7 +1,7 @@
 use super::*;
 use ankurah::signals::Signal;
 use ankurah_core::{
-    connector::{IssuedChallenge, PeerProvenance, PeerSender},
+    connector::{Handshake, PeerProvenance, PeerSender},
     error::NodeHaltReason,
     node::NodeKey,
 };
@@ -37,6 +37,7 @@ export function close_from_server(index) {
     sockets[index].onclose(new CloseEvent("close", { code: 1000 }));
 }
 export function sent_count(index) { return sockets[index].sent.length; }
+export function sent_frame(index, position) { return new Uint8Array(sockets[index].sent[position]); }
 export function socket_count() { return sockets.length; }
 export function is_closed(index) { return sockets[index].readyState === 3; }
 "#)]
@@ -46,6 +47,7 @@ extern "C" {
     fn deliver(index: usize, bytes: &[u8]);
     fn close_from_server(index: usize);
     fn sent_count(index: usize) -> usize;
+    fn sent_frame(index: usize, position: usize) -> Vec<u8>;
     fn socket_count() -> usize;
     fn is_closed(index: usize) -> bool;
 }
@@ -72,17 +74,17 @@ struct AdmissionState {
 #[async_trait]
 impl NodeComms for HeldAdmission {
     fn id(&self) -> proto::NodeId { self.0.key.node_id() }
-    fn issue_challenge(&self) -> IssuedChallenge { IssuedChallenge::new(self.id()) }
-    async fn presence(&self, challenge: proto::HandshakeChallenge) -> Result<proto::Presence, NodeHaltReason> {
+    fn begin_handshake(&self) -> Handshake { Handshake::new(self.id()) }
+    async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
         let release = self.0.release_presence.lock().unwrap().take().unwrap();
         self.0.presence_started.set(true);
         release.await.map_err(|_| NodeHaltReason::CatalogLoad("presence cancelled".into()))?;
-        Ok(self.0.key.sign_presence(false, challenge))
+        Ok(self.0.key.sign_presence(handshake.presence_claims(self.id(), false)?))
     }
     async fn register_peer(
         &self,
         _: proto::Presence,
-        _: IssuedChallenge,
+        _: Handshake,
         _: PeerProvenance,
         _: Box<dyn PeerSender>,
     ) -> Result<(), PeerConnectionError> {
@@ -99,6 +101,18 @@ impl NodeComms for HeldAdmission {
         Ok(())
     }
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
+}
+
+/// The frames a server sends to open a connection: its opening, and its presence answering a
+/// client's. The fixture's registration reads neither, so the presence answers a client of its own.
+fn server_handshake(server: &NodeKey) -> (Vec<u8>, Vec<u8>) {
+    let mut handshake = Handshake::new(server.node_id());
+    handshake.receive_opening(Handshake::new(NodeKey::generate().node_id()).opening()).unwrap();
+    let presence = server.sign_presence(handshake.presence_claims(server.node_id(), true).unwrap());
+    (
+        bincode::serialize(&proto::Message::Open(handshake.opening())).unwrap(),
+        bincode::serialize(&proto::Message::Presence(presence)).unwrap(),
+    )
 }
 
 #[wasm_bindgen_test]
@@ -129,8 +143,9 @@ async fn application_traffic_before_the_server_registers_closes_the_connection()
         let socket = socket_count();
         client.connect().unwrap();
 
-        let server = NodeKey::from_seed([2; 32]).node_id();
-        deliver(socket, &bincode::serialize(&proto::Message::Challenge(proto::HandshakeChallenge::new(server))).unwrap());
+        let server_key = NodeKey::from_seed([2; 32]);
+        let server = server_key.node_id();
+        deliver(socket, &server_handshake(&server_key).0);
         let response = proto::NodeResponse {
             request_id: proto::RequestId::new(),
             from: server,
@@ -219,14 +234,15 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
             assert!(futures::poll!(&mut ready).is_pending());
             let server = NodeKey::from_seed([2; 32]);
             let peer = server.node_id();
-            deliver(socket, &bincode::serialize(&proto::Message::Challenge(proto::HandshakeChallenge::new(peer))).unwrap());
-            // The receive loop answers the server's challenge with ours.
+            let (opening, presence) = server_handshake(&server);
+            deliver(socket, &opening);
+            // The receive loop answers the server's opening with ours.
             while sent_count(socket) == 0 {
                 sleep(Duration::ZERO).await;
             }
-            assert_eq!(sent_count(socket), 1, "the server's challenge is answered with ours");
-            let presence = server.sign_presence(true, proto::HandshakeChallenge::new(node.id()));
-            deliver(socket, &bincode::serialize(&proto::Message::Presence(presence)).unwrap());
+            assert_eq!(sent_count(socket), 1, "the server's opening is answered with ours");
+            assert!(matches!(bincode::deserialize(&sent_frame(socket, 0)).unwrap(), proto::Message::Open(_)));
+            deliver(socket, &presence);
             deliver(
                 socket,
                 &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(proto::NodeResponse {
@@ -237,20 +253,21 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 })))
                 .unwrap(),
             );
-            node.0.started.read().wait_for(|started| *started).await;
-            assert!(!node.0.published.value());
-            assert_eq!(node.0.handled.value(), 0, "the following frame must wait for admission");
-            assert_eq!(sent_count(socket), 1, "client presence must wait for admission");
+            // The client signs its presence before registration spends the handshake.
+            node.0.presence_started.read().wait_for(|started| *started).await;
+            assert!(!node.0.started.value(), "registration waits for the presence");
+            assert_eq!(node.0.handled.value(), 0, "the following frame must wait for presence");
+            assert_eq!(sent_count(socket), 1);
 
-            let release = if close_before_admission {
-                release
-            } else {
-                release.send(()).unwrap();
-                node.0.presence_started.read().wait_for(|started| *started).await;
-                assert!(node.0.published.value());
-                assert_eq!(node.0.handled.value(), 0, "the following frame must wait for presence");
-                assert_eq!(sent_count(socket), 1);
+            let release = if close_before_presence {
                 release_presence
+            } else {
+                release_presence.send(()).unwrap();
+                node.0.started.read().wait_for(|started| *started).await;
+                assert!(!node.0.published.value());
+                assert_eq!(node.0.handled.value(), 0, "the following frame must wait for admission");
+                assert_eq!(sent_count(socket), 1, "client presence must wait for admission");
+                release
             };
 
             if close_before_admission || close_before_presence {
@@ -333,4 +350,116 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
     futures::pin_mut!(run);
     let outcome = futures::future::select(run, Box::pin(sleep(Duration::from_secs(5)))).await;
     assert!(matches!(outcome, futures::future::Either::Left(_)), "admission test exceeded five seconds");
+}
+
+/// A fixture node whose presence and registration finish at once, and a client over it.
+fn admitting_client() -> (HeldAdmission, Arc<ClientInner>) {
+    let (release, receiver) = oneshot::channel();
+    let (release_presence, presence_receiver) = oneshot::channel();
+    release.send(()).unwrap();
+    release_presence.send(()).unwrap();
+    let node = HeldAdmission(Arc::new(AdmissionState {
+        started: Mut::new(false),
+        published: Mut::new(false),
+        handled: Mut::new(0),
+        release: Mutex::new(Some(receiver)),
+        presence_started: Mut::new(false),
+        release_presence: Mutex::new(Some(presence_receiver)),
+        node_state: Mut::new(NodeState::Running),
+        key: NodeKey::from_seed([1; 32]),
+    }));
+    let client = Arc::new(ClientInner {
+        server_url: "ws://mock.invalid".into(),
+        connection: RefCell::new(None),
+        state: Mut::new(ConnectionState::None),
+        node: Box::new(node.clone()),
+        run: Calculated::new(|| true),
+        reconnect_delay: RefCell::new(0),
+    });
+    (node, client)
+}
+
+fn open_frame(versions: proto::ProtocolVersions) -> Vec<u8> {
+    let challenge = proto::HandshakeChallenge::new(NodeKey::from_seed([2; 32]).node_id());
+    bincode::serialize(&proto::Message::Open(proto::Opening { versions, challenge })).unwrap()
+}
+
+#[wasm_bindgen_test]
+async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this_nodes_versions() {
+    mock_websockets();
+    let _restore = RestoreWebSockets;
+    let run = async {
+        let (_node, client) = admitting_client();
+        let socket = socket_count();
+        client.connect().unwrap();
+        deliver(socket, &open_frame(proto::ProtocolVersions { lowest: 1, highest: 3 }));
+        while sent_count(socket) == 0 {
+            sleep(Duration::ZERO).await;
+        }
+        sleep(Duration::ZERO).await;
+        match bincode::deserialize(&sent_frame(socket, 0)).unwrap() {
+            proto::Message::Open(opening) => assert_eq!(opening.versions, proto::ProtocolVersions::SPOKEN),
+            other => panic!("the client answered a wider opening with {other}"),
+        }
+        assert_eq!(sent_count(socket), 1, "the client waits for the server's presence");
+        assert!(!is_closed(socket));
+        assert!(matches!(client.state.value(), ConnectionState::Connecting { .. }));
+
+        let (_node, client) = admitting_client();
+        let socket = socket_count();
+        client.connect().unwrap();
+        // A version-1 reader would reject these trailing bytes, so the refusal shows they were never read.
+        let mut frame = open_frame(proto::ProtocolVersions { lowest: 2, highest: 3 });
+        frame.extend_from_slice(b"bytes a version-1 reader rejects");
+        deliver(socket, &frame);
+        client.state.read().wait_for(|state| matches!(state, ConnectionState::Error { .. })).await;
+        let refusal = PeerConnectionError::NoCommonVersion {
+            ours: proto::ProtocolVersions::SPOKEN,
+            theirs: proto::ProtocolVersions { lowest: 2, highest: 3 },
+        };
+        assert!(matches!(client.state.value(), ConnectionState::Error { cause: Some(cause), .. } if cause == refusal));
+        assert_eq!(sent_count(socket), 2, "the client's opening, then its refusal");
+        assert!(matches!(
+            bincode::deserialize(&sent_frame(socket, 1)).unwrap(),
+            proto::Message::NoCommonVersion(versions) if versions == proto::ProtocolVersions::SPOKEN
+        ));
+        assert!(is_closed(socket));
+    };
+    futures::pin_mut!(run);
+    let outcome = futures::future::select(run, Box::pin(sleep(Duration::from_secs(5)))).await;
+    assert!(matches!(outcome, futures::future::Either::Left(_)), "the openings were not answered within five seconds");
+}
+
+/// A later build may send a message or a peer message this build has no kind for.
+#[wasm_bindgen_test]
+async fn a_message_of_an_unknown_kind_after_the_handshake_is_ignored() {
+    mock_websockets();
+    let _restore = RestoreWebSockets;
+    let run = async {
+        let (node, client) = admitting_client();
+        let socket = socket_count();
+        client.connect().unwrap();
+        let server = NodeKey::from_seed([2; 32]);
+        let (opening, presence) = server_handshake(&server);
+        deliver(socket, &opening);
+        deliver(socket, &presence);
+        client.state.read().wait_for(|state| matches!(state, ConnectionState::Connected { .. })).await;
+
+        // Variant 99 of `Message`, then variant 99 of `NodeMessage` inside a peer message.
+        deliver(socket, &[99, 0, 0, 0]);
+        deliver(socket, &[3, 0, 0, 0, 99, 0, 0, 0]);
+        let response = proto::NodeResponse {
+            request_id: proto::RequestId::new(),
+            from: server.node_id(),
+            to: node.id(),
+            body: proto::NodeResponseBody::Success,
+        };
+        deliver(socket, &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(response))).unwrap());
+        node.0.handled.read().wait_for(|count| *count == 1).await;
+        assert!(matches!(client.state.value(), ConnectionState::Connected { .. }));
+        assert!(!is_closed(socket));
+    };
+    futures::pin_mut!(run);
+    let outcome = futures::future::select(run, Box::pin(sleep(Duration::from_secs(5)))).await;
+    assert!(matches!(outcome, futures::future::Either::Left(_)), "the connection did not keep working within five seconds");
 }

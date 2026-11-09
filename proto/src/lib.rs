@@ -5,6 +5,7 @@ pub mod auth;
 pub mod clock;
 pub mod data;
 pub mod domain_tag;
+mod encoding;
 pub mod error;
 pub mod human_id;
 pub mod id;
