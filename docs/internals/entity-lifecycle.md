@@ -114,10 +114,20 @@ Five phases execute in order:
 
 **1. Generate events.** Each entity's pending property operations (via
 [`to_operations()`](property-backends.md#the-propertybackend-trait)) and
-membership additions become an event. A creation whose ID was never demanded
+membership changes become an event. A creation whose ID was never demanded
 gets a single genesis containing all of them. Otherwise they form an update
 whose parent is the current head, retained alongside any genesis frozen earlier.
 Unchanged edits are skipped, and their views return to the resident entity.
+
+A membership change records only what differs from what the entity's earlier
+events recorded: adding and then removing a model in one transaction records
+neither. Removing a model, even an entity's last one, leaves the entity
+addressable by id; typed access through that model then reports
+`MissingComponent`. When a removal and an addition of the same model are
+concurrent, the removal loses, so every node reaches the same membership in
+whatever order the two arrive: membership application consults every event
+the comparison loaded since the meet that changes a membership, on either
+side.
 
 **2. Apply and authorize.** Preserve an original snapshot and a working
 `RemoteTrxEntity` per entity. Apply each event and authorize its
@@ -242,7 +252,7 @@ The comparison's [causal relation](event-dag.md#key-concepts) determines the lay
 | `Equal` | Already integrated -- no-op |
 | `StrictDescends` | Use the compared head as the meet; apply layers and replace the superseded tips |
 | `StrictAscends` | Event is older than current state -- no-op |
-| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#key-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), add the layers' membership additions, then advance the head through the newly applied events, preserving concurrent tips |
+| `DivergedSince` | True concurrency -- compute [event layers](event-dag.md#key-concepts) from the meet point, merge per-backend via [`apply_layer`](property-backends.md#the-propertybackend-trait), apply the layers' membership changes, then advance the head through the newly applied events, preserving concurrent tips |
 | `Disjoint` | Different lineage -- error |
 | `BudgetExceeded` | DAG traversal too deep -- error |
 

@@ -129,8 +129,9 @@ impl PolicyAgent for TrustListedPeers {
 
 /// Two durable stores created independently, each configured to trust the
 /// other, relay their commits to each other although nothing in either store
-/// names the other. Each registered its models on its own, so the comparison
-/// is by stored state: converging the two catalogs is not this branch's job.
+/// names the other. Each registered its models on its own, so the check reads
+/// stored state rather than typed views: two catalogs registered apart do not
+/// converge on one model id.
 #[tokio::test]
 async fn two_independently_created_durable_stores_exchange_when_configured_to_trust_each_other() -> anyhow::Result<()> {
     let trusted = Arc::new(Mutex::new(Vec::new()));

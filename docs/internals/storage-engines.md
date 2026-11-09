@@ -95,8 +95,9 @@ multi-entity application transaction.
 The engine chooses how to represent the durable set
 `(EntityId, ModelId)`. Before writing, it compares its stored associations with
 the complete membership set in the proposed canonical state, inserts any new
-memberships, rejects removals in this revision, and refreshes every member
-model's materialization.
+memberships, drops the entity from the materialization and association of any
+model the state no longer holds, and refreshes every member model's
+materialization.
 
 This distinction matters in two cases:
 
@@ -108,9 +109,10 @@ This distinction matters in two cases:
 
 Queries do not create associations merely by scanning a materialization:
 anything returned by that materialization is already associated. In the
-current protocol, only an attested `Membership::Add` operation creates an
-association, either in the genesis event or in a later event that adds a
-model to an existing entity. A typed API for that addition is still open
+current protocol, only a `Membership::Add` operation creates an association,
+either in the genesis event or in a later event that adds a model to an
+existing entity, and only a `Membership::Remove` in a later event ends one; a
+genesis may not carry a removal. A typed API for these changes is still open
 (#412).
 
 ## Catalog resolver and physical names
