@@ -50,6 +50,7 @@ impl ConnectionStateEnum {
                 Some(PeerConnectionError::InvalidSignature(_)) => "InvalidSignature",
                 Some(PeerConnectionError::SelfConnection(_)) => "SelfConnection",
                 Some(PeerConnectionError::OfferMismatch(_)) => "OfferMismatch",
+                Some(PeerConnectionError::Refused(_)) => "Refused",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",
                 None => "Transport",
             }

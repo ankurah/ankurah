@@ -25,6 +25,8 @@ pub enum PeerConnectionError {
     SelfConnection(proto::NodeId),
     #[error("presence from node {0} does not repeat the versions offered and chosen on this connection")]
     OfferMismatch(proto::NodeId),
+    #[error("{0}")]
+    Refused(crate::node::PeerRefusal),
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
 }

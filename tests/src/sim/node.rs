@@ -130,13 +130,14 @@ pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Res
     // Plant the deterministic catalog before the durable node starts.
     let durable_engine = Arc::new(SledStorageEngine::new_test()?);
     crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
-    let durable = Node::new_durable_with_key(durable_engine, PermissiveAgent::new(), sim_node_key(seed, 0));
+    let durable = Node::builder(durable_engine, PermissiveAgent::new()).durable().key(sim_node_key(seed, 0)).build()?;
     durable.wait_ready().await?;
     nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
 
     // Nodes 1..n: ephemeral.
     for index in 1..n {
-        let node = Node::new_with_key(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new(), sim_node_key(seed, index));
+        let node =
+            Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).key(sim_node_key(seed, index)).build()?;
         nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
     }
 

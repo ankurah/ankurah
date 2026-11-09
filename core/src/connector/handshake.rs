@@ -56,7 +56,8 @@ impl Handshake {
 
     /// The claims `node_id`'s presence makes on this connection: it answers the peer's challenge,
     /// and records the versions the two sides offered and the version chosen. They name no
-    /// feature, since this build assigns none, and carry no announcement.
+    /// feature, since this build assigns none, and carry no announcement until a node adds its
+    /// plugins' ([`Node::presence`](crate::Node::presence)).
     pub fn presence_claims(&self, node_id: proto::NodeId, durable: bool) -> Result<proto::PresenceClaims, PeerConnectionError> {
         let peer = self.peer.as_ref().ok_or(PeerConnectionError::NoOpening)?;
         Ok(proto::PresenceClaims {

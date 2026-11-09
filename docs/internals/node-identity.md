@@ -26,7 +26,7 @@ signing; policy agents and transports never see it, and its `Debug` prints
 only the public identity. A node built without a key draws a fresh one, so
 its identity lasts only as long as the process; a durable node built that way
 logs a notice saying so. A deployment that wants a durable node to keep its
-identity passes a key to `Node::new_durable_with_key`, and
+identity gives it a key through `Node::builder(..).durable().key(..)`, and
 `NodeKey::load_or_create` keeps the 32-byte seed in a file the embedder
 chooses.
 

@@ -224,8 +224,9 @@ async fn a_durable_node_keeps_its_identity_across_a_restart_with_its_persisted_k
     let path = dir.join("node.key");
     let storage = Arc::new(TestStorage::default());
 
-    let first = Node::new_durable_with_key(storage.clone(), PermissiveAgent::new(), NodeKey::load_or_create(&path).unwrap()).id;
-    let restarted = Node::new_durable_with_key(storage.clone(), PermissiveAgent::new(), NodeKey::load_or_create(&path).unwrap()).id;
+    let keyed = || Node::builder(storage.clone(), PermissiveAgent::new()).durable().key(NodeKey::load_or_create(&path).unwrap()).build();
+    let first = keyed().unwrap().id;
+    let restarted = keyed().unwrap().id;
     assert_eq!(restarted, first);
     std::fs::remove_dir_all(&dir).unwrap();
 
