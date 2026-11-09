@@ -75,10 +75,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let after = entity.read();
         entity
             .apply_events(&self.event_getter, std::slice::from_mut(&mut event), |event| {
-                // No committed attestation here: this funnel admits events another node committed, and it
-                // cannot tell which updates this node wrote. The committing node signs in its local commit.
-                let admission = self.policy.check_write_event(self.node, before, &after, event)?;
-                Ok(attestation::admitted(self.node, event, admission).into_iter().collect())
+                Ok(attestation::on_event(self.node, event, self.policy.check_write_event(self.node, before, &after, event)?))
             })
             .await?;
         self.storage.add_events(std::slice::from_ref(&event)).await?;

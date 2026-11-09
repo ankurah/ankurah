@@ -8,7 +8,7 @@ use ankurah_core::{
     entity::Entity,
     error::ValidationError,
     node::{Node, NodeInner, WeakNode},
-    policy::{AccessDenied, Admission, PolicyAgent},
+    policy::{AccessDenied, AttestationRequest, PolicyAgent},
     schema::registration::RegistrationPlan,
     storage::StorageEngine,
     util::Iterable,
@@ -294,11 +294,11 @@ impl PolicyAgent for JwtAgent {
         entity_before: &Entity,
         entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Admission, AccessDenied> {
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
         if !cdata.is_privileged() {
             self.policy()?.check_write(cdata, (!entity_before.head().is_empty()).then_some(entity_before), entity_after)?;
         }
-        Ok(Admission::Allow)
+        Ok(None)
     }
 
     fn validate_received_event<SE: StorageEngine>(
@@ -310,7 +310,7 @@ impl PolicyAgent for JwtAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<Vec<u8>> { None }
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<AttestationRequest> { None }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

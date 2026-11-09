@@ -1,40 +1,26 @@
-//! The attestations a node signs.
-//!
-//! A node signs a committed attestation on every event it commits, an admitted
-//! attestation on an event its policy agent asks it to vouch for, and, when it
-//! is durable, a state attestation on a state it serves when its policy agent
-//! returns claims for that state. A node carries the attestations it receives as
-//! they came and checks none of them.
+//! The attestations a node makes: only those its policy agent requests, each a statement
+//! about an event the node checked or a state it serves, sealed with the node's key. A node
+//! carries the attestations it receives as they came and checks none of them.
 
 use crate::internal::prelude::*;
-use crate::policy::Admission;
-use proto::{Attestation, AttestationBody, Attested, AttesterRole, EntityState, Event};
+use crate::policy::AttestationRequest;
+use proto::{Attested, EntityState, Event, SealedAttestation, Subject};
 
-/// This node's committed attestation on `event`, with empty claims.
-pub(crate) fn committed<SE, PA: PolicyAgent>(node: &Node<SE, PA>, event: &Event) -> Attestation {
-    node.key.attest(AttestationBody::event(event, AttesterRole::Committed, Vec::new()))
+/// This node's attestation on `event`, when its policy agent's check requested one.
+pub(crate) fn on_event<SE, PA: PolicyAgent>(
+    node: &Node<SE, PA>,
+    event: &Event,
+    request: Option<AttestationRequest>,
+) -> Option<SealedAttestation> {
+    request.map(|request| node.key.attest(Subject::event(event), request.kind, request.payload))
 }
 
-/// This node's admitted attestation on `event`, when its policy agent asked for one.
-pub(crate) fn admitted<SE, PA: PolicyAgent>(node: &Node<SE, PA>, event: &Event, admission: Admission) -> Option<Attestation> {
-    match admission {
-        Admission::Attest { claims } => Some(node.key.attest(AttestationBody::event(event, AttesterRole::Admitted, claims))),
-        Admission::Allow => None,
-    }
-}
-
-/// `state` as this node serves it: a durable node attaches a state attestation carrying the claims
-/// its policy agent returns, and signs nothing when the agent returns none; an ephemeral node
-/// attaches none.
+/// `state` as this node serves it: a durable node attaches the attestation its policy agent
+/// requests for the state, and an ephemeral node attaches none.
 pub(crate) fn served_state<SE: StorageEngine, PA: PolicyAgent>(node: &Node<SE, PA>, state: EntityState) -> Attested<EntityState> {
-    let claims = if node.durable { node.policy_agent.attest_state(node, &state) } else { None };
-    match claims {
-        Some(claims) => {
-            let attestation = node.key.attest(AttestationBody::state(&state, claims));
-            Attested::opt(state, Some(attestation))
-        }
-        None => state.into(),
-    }
+    let request = if node.durable { node.policy_agent.attest_state(node, &state) } else { None };
+    let attestation = request.map(|request| node.key.attest(Subject::state(&state), request.kind, request.payload));
+    Attested::opt(state, attestation)
 }
 
 #[cfg(test)]
@@ -46,9 +32,9 @@ mod tests {
 
     fn genesis(minter: u8) -> Event { Event::genesis(Identity::Ed25519([minter; 32]), OperationSet::default()) }
 
-    /// `PermissiveAgent` returns no state claims, so neither a durable nor an ephemeral node signs the states it serves.
+    /// `PermissiveAgent` requests no attestation, so neither a durable nor an ephemeral node signs the states it serves.
     #[tokio::test]
-    async fn a_state_served_under_an_agent_that_returns_no_claims_carries_no_attestation() {
+    async fn a_state_served_under_an_agent_that_requests_nothing_carries_no_attestation() {
         let event = genesis(1);
         let state = EntityState { entity_id: event.entity_id, state: State { head: Clock::singleton(&event), ..State::default() } };
 

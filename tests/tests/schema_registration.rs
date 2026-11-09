@@ -684,8 +684,8 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         _entity_before: &ankurah::core::entity::Entity,
         _entity_after: &ankurah::core::entity::Entity,
         _event: &proto::Event,
-    ) -> Result<ankurah::policy::Admission, ankurah::policy::AccessDenied> {
-        Ok(ankurah::policy::Admission::Allow)
+    ) -> Result<Option<ankurah::policy::AttestationRequest>, ankurah::policy::AccessDenied> {
+        Ok(None)
     }
 
     fn check_schema_registration<SE: ankurah::core::storage::StorageEngine>(
@@ -713,7 +713,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
         &self,
         _node: &Node<SE, Self>,
         _state: &proto::EntityState,
-    ) -> Option<Vec<u8>> {
+    ) -> Option<ankurah::policy::AttestationRequest> {
         None
     }
 

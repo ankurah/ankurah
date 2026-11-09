@@ -80,10 +80,9 @@ impl NodeKey {
         }
     }
 
-    /// Sign `body` as this key's attestation.
-    pub fn attest(&self, body: proto::AttestationBody) -> proto::Attestation {
-        let signature = self.sign(&body.signable_bytes());
-        proto::Attestation { attester: self.identity(), body, signature }
+    /// Seal this key's statement about `subject`: of `kind`, saying `payload`.
+    pub fn attest(&self, subject: proto::Subject, kind: proto::EntityId, payload: Vec<u8>) -> proto::SealedAttestation {
+        proto::Statement { attester: self.identity(), subject, kind, payload }.seal(|bytes| self.sign(bytes))
     }
 
     /// Sign a presence answering `challenge`: this key's identity and its durable claim.

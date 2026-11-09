@@ -213,9 +213,7 @@ impl Transaction {
                 let mut events = events.clone();
                 entity_after
                     .apply_events(&event_getter, &mut events, |event| {
-                        let admission = policy.check_write_event(node, &entity_before, &after, event)?;
-                        let committed = attestation::committed(node, event);
-                        Ok(std::iter::once(committed).chain(attestation::admitted(node, event, admission)).collect())
+                        Ok(attestation::on_event(node, event, policy.check_write_event(node, &entity_before, &after, event)?))
                     })
                     .await?;
                 storage_trx.add_events(&events).await?;

@@ -1,4 +1,4 @@
-use super::{AccessDenied, Admission, PolicyAgent};
+use super::{AccessDenied, AttestationRequest, PolicyAgent};
 use crate::context::ContextAuth;
 use crate::entity::{Entity, TemporaryEntity};
 use crate::error::{InadmissibleEvent, MutationError};
@@ -221,11 +221,11 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
         before: &Entity,
         after: &Entity,
         event: &Event,
-    ) -> Result<Admission, MutationError> {
+    ) -> Result<Option<AttestationRequest>, MutationError> {
         self.check_models(after.memberships())?;
         match &self.auth {
             ContextAuth::Sessions(_) => Ok(self.agent.check_write_event(node, &self.write_credential()?, before, after, event)?),
-            ContextAuth::Privileged => Ok(Admission::Allow),
+            ContextAuth::Privileged => Ok(None),
         }
     }
 }

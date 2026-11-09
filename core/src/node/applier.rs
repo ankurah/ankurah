@@ -250,7 +250,7 @@ impl NodeApplier {
             if adopted {
                 Self::check_snapshot_events(node, snapshot, &expected_head, &events, event_getter).await?;
             } else {
-                candidate.apply_events(event_getter, &mut events, |_| Ok(Vec::new())).await?;
+                candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
             }
             let state: Attested<proto::EntityState> = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? }.into();
             let mut storage_trx = node.storage.transaction();
@@ -290,7 +290,7 @@ impl NodeApplier {
             let candidate = RemoteTrxEntity::for_event(&node.entities, &state_getter, event_getter, &first.payload).await?;
             let expected_head = candidate.head();
             let mut events = events.to_vec();
-            candidate.apply_events(event_getter, &mut events, |_| Ok(Vec::new())).await?;
+            candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state.into()).await?;

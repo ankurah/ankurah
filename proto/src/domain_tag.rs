@@ -16,7 +16,7 @@ pub enum DomainTag {
     Operation,
     /// The claims a presence signature covers.
     Presence,
-    /// The body an attestation signature covers.
+    /// The statement an attestation signature covers.
     Attestation,
     /// The digest of an entity state.
     State,

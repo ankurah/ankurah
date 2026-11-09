@@ -5,8 +5,8 @@ and for the encoding of each value inside those strings. The `ankurah-proto`
 crate is an implementation of it, and the vectors in section 5 are pinned by
 tests beside the types they cover.
 
-The presence and attestation strings change in later passes of the 0.10 work
-(specs/node-identity/spec.md section 13); this document changes with them.
+The presence string changes in a later pass of the 0.10 work
+(specs/node-identity/spec.md section 13); this document changes with it.
 
 ## 1. Encoding rules
 
@@ -136,16 +136,32 @@ string; `memberships`, a set of `ModelId` (ordered as in 3.3); `head: Clock`.
 `PresenceClaims` is a struct: `node_id: NodeId`, `durable: bool`, `challenge:
 HandshakeChallenge`, `timestamp: u64`, `protocol_version: u32`.
 
-### 3.7 Attestation bodies
+### 3.7 Attestations
 
-`AttestationBody` is an enum:
+`Subject` is an enum naming what a statement is about:
 
 | Index | Variant | Fields |
 |---|---|---|
-| 0 | `Event` | `event: EventId`, `role: AttesterRole`, `claims` (byte string) |
-| 1 | `State` | `entity: EntityId`, `head: Clock`, `state_digest: [u8; 32]`, `claims` (byte string) |
+| 0 | `Event` | `EventId` |
+| 1 | `State` | `entity: EntityId`, `head: Clock`, `state_digest: [u8; 32]` (the state digest of 4.4) |
 
-`AttesterRole` is an enum without fields: 0 `Committed`, 1 `Admitted`.
+`Statement` is a struct: `attester: Identity`, `subject: Subject`, `kind:
+EntityId`, `payload` (byte string). `kind` is the entity id of the definition
+that says what the statement means and how to read `payload`; core defines no
+kinds.
+
+A sealed attestation is a byte string holding a struct: `statement`, a byte
+string holding the encoding of one `Statement` exactly as its attester produced
+it, then `signature: Signature`. An `AttestationSet` is a sequence of sealed
+attestations, each a byte string, so a node reads a set whose attestations it
+cannot read, and keeps and relays each attestation's bytes unchanged.
+
+A sealed attestation opens only if its bytes hold that struct and nothing after
+it, the statement bytes hold one `Statement` and nothing after it, and the
+signature verifies under the statement's attester over the signed bytes of 4.6,
+taken from the statement bytes as carried. A statement whose bytes decode but
+would encode differently, such as a head whose entries are out of order, is
+checked against the bytes it carries, never against a re-encoding.
 
 ## 4. The strings
 
@@ -198,11 +214,12 @@ bytes.
 ### 4.6 Attestation signature
 
 ```text
-signed bytes = tag(attestation) || AttestationBody
+signed bytes = tag(attestation) || statement
 ```
 
-The signature is the ed25519 signature of the attester's key over the signed
-bytes.
+where `statement` is the statement bytes a sealed attestation carries, without
+their length. The signature is the ed25519 signature of the attester's key over
+the signed bytes.
 
 ### 4.7 Verification
 
@@ -257,28 +274,43 @@ challenge issued by `Ed25519([0x77; 32])` with nonce `[0x88; 32]`, timestamp
 01000000
 ```
 
-Attestation signed bytes for `Event { event: [0xaa; 32], role: Admitted,
-claims: 07 }`:
+Attestation signed bytes for the statement by `Ed25519([0x11; 32])` about
+`Event([0xaa; 32])`, of kind `[0xee; 32]`, with payload `07`:
 
 ```text
 16616e6b757261682e6174746573746174696f6e2e7631
-00000000
-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-01000000
+00000000 1111111111111111111111111111111111111111111111111111111111111111
+00000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 0100000000000000 07
 ```
 
-and for `State { entity: [0xbb; 32], head: one entry, generation 2 and event
-id [0xcc; 32], state_digest: [0xdd; 32], claims: empty }`:
+and for the statement by the same attester, of the same kind, about `State {
+entity: [0xbb; 32], head: one entry, generation 2 and event id [0xcc; 32],
+state_digest: [0xdd; 32] }`, with an empty payload:
 
 ```text
 16616e6b757261682e6174746573746174696f6e2e7631
-01000000
-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+00000000 1111111111111111111111111111111111111111111111111111111111111111
+01000000 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 0100000000000000 02000000 cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
 0000000000000000
 ```
 
-The line breaks and spaces in the last three vectors separate fields; the
+The first statement sealed with the signature `Ed25519([0x99; 64])`, which
+shows the layout and does not verify: the statement's length (113 bytes), the
+statement, then the signature.
+
+```text
+7100000000000000
+00000000 1111111111111111111111111111111111111111111111111111111111111111
+00000000 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+0100000000000000 07
+00000000 99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999
+```
+
+The line breaks and spaces in the last four vectors separate fields; the
 string is the bytes alone.

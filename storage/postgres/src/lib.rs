@@ -16,7 +16,7 @@ use ankurah_core::{
     schema::CatalogResolver,
     storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction},
 };
-use ankurah_proto::{Attestation, AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
+use ankurah_proto::{AttestationSet, Attested, EntityState, EventBody, EventId, SealedAttestation, State, StateBuffers, PROTOCOL_VERSION};
 use ankurah_proto::{ModelId, SystemModel};
 
 pub mod sql_builder;
@@ -563,7 +563,7 @@ fn state_from_row(row: &tokio_postgres::Row, memberships: BTreeSet<ModelId>) -> 
     let attestations = attestation_bytes
         .into_iter()
         .map(|bytes| bincode::deserialize(&bytes))
-        .collect::<Result<Vec<Attestation>, _>>()
+        .collect::<Result<Vec<SealedAttestation>, _>>()
         .map_err(RetrievalError::storage)?;
     Ok(Attested {
         payload: EntityState { entity_id, state: State { state_buffers: StateBuffers(state_buffers), memberships, head } },

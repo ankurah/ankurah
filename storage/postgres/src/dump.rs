@@ -7,7 +7,7 @@ use ankurah_core::{
     storage::{StorageDump, StorageDumpItem},
 };
 use ankurah_proto::{
-    Attestation, AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, ModelId, State, StateBuffers,
+    AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, ModelId, SealedAttestation, State, StateBuffers,
 };
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
@@ -163,7 +163,7 @@ async fn state_page(client: &tokio_postgres::Client, after: Option<&EntityId>) -
         let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
         let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
         let attestations =
-            attestation_bytes.into_iter().map(|bytes| bincode::deserialize::<Attestation>(&bytes)).collect::<Result<Vec<_>, _>>()?;
+            attestation_bytes.into_iter().map(|bytes| bincode::deserialize::<SealedAttestation>(&bytes)).collect::<Result<Vec<_>, _>>()?;
         let memberships = client
             .query(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = $1 ORDER BY "model_key""#), &[&entity_id])
             .await
