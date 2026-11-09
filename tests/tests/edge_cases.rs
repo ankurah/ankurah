@@ -605,7 +605,7 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
 
     // Setup: Durable D and Ephemeral E
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;

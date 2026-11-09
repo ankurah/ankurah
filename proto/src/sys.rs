@@ -1,9 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// What an entity in the `_ankurah_system` collection describes, JSON-encoded in its item property.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Item {
-    /// The genesis clock for the system - this serves as the root of the clock tree for all entities in the system
-    SysRoot,
     Collection {
         name: String,
     },

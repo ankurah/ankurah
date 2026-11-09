@@ -35,7 +35,6 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     let storage = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(storage.clone(), agent.clone());
-    node.system.create().await?;
     agent
         .set_policy(
             &node,
@@ -136,7 +135,6 @@ async fn existing_membership_authorizes_addition_but_new_membership_cannot_autho
     )?);
     let storage = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(storage.clone(), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
     let root = node.context_async(JwtContext::Root).await?;
     let attachment = root.resolve_model_id::<Attachment>().await?;
@@ -204,7 +202,6 @@ async fn wildcard_cannot_use_unconfigured_membership_to_escape_a_scope() -> anyh
     let agent = JwtAgent::new_ephemeral();
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent
         .set_policy(
             &node,

@@ -1,15 +1,12 @@
 mod common;
 
-use ankurah::core::{
-    connector::PeerConnectionError,
-    error::{NodeHaltReason, NodeReadinessError, RetrievalError},
-};
+use ankurah::core::error::{NodeHaltReason, NodeReadinessError, RetrievalError};
 use common::*;
 use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 
 #[tokio::test]
-async fn system_replacement_does_not_wait_for_an_inflight_commit() -> anyhow::Result<()> {
+async fn a_local_reset_does_not_wait_for_an_inflight_commit() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = durable_sled_setup().await?;
         let client = ephemeral_sled_setup().await?;
@@ -30,20 +27,13 @@ async fn system_replacement_does_not_wait_for_an_inflight_commit() -> anyhow::Re
             .await
         };
         let context = client.context_async(DEFAULT_CONTEXT).await?;
-        let root = client.system.root().expect("original root");
         let transaction = context.begin();
         transaction.create(&Album { name: "in flight".into(), year: "2026".into() }).await?;
         let commit = tokio::spawn(transaction.commit());
         tokio::time::timeout(Duration::from_secs(2), response_held.notified()).await?;
 
-        let other = durable_sled_setup().await?;
-        let proposed = other.system.root().expect("replacement root");
-        let halt_reason = NodeHaltReason::SystemReplacement { current: root.payload.entity_id, proposed: proposed.payload.entity_id };
-        client.set_allow_system_replacement(true);
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(2), client.system.adopt_system(proposed)).await?,
-            Err(PeerConnectionError::NodeHalted(halt_reason.clone()))
-        );
+        tokio::time::timeout(Duration::from_secs(2), client.reset_local_storage()).await??;
+        let halt_reason = NodeHaltReason::LocalReset;
         commit.abort();
         assert!(matches!(
             context.begin().commit().await,
@@ -53,7 +43,6 @@ async fn system_replacement_does_not_wait_for_an_inflight_commit() -> anyhow::Re
         gate.release_held(&client).await;
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
         assert!(client.system.system_epoch().is_none());
-        assert!(client.system.root().is_none());
         assert_eq!(client.system.wait_system_ready().await, Err(halt_reason));
         Ok(())
     })
@@ -76,17 +65,13 @@ async fn halted_node_stops_queries_and_new_operations_but_retained_views_remain_
         query.wait_durable_answered().await?;
         let retained = context.get::<AlbumView>(id).await?;
         let epoch = client.system.system_epoch();
-        let root = client.system.root().expect("original root");
         let transaction = context.begin();
         retained.edit(&transaction)?.name()?.replace("must not commit")?;
         assert_eq!(query.ids(), vec![id]);
         assert!(query.loaded());
 
-        let other = durable_sled_setup().await?;
-        let proposed = other.system.root().expect("replacement root");
-        let halt_reason = NodeHaltReason::SystemReplacement { current: root.payload.entity_id, proposed: proposed.payload.entity_id };
-        client.set_allow_system_replacement(true);
-        assert_eq!(client.system.adopt_system(proposed).await, Err(PeerConnectionError::NodeHalted(halt_reason.clone())));
+        client.reset_local_storage().await?;
+        let halt_reason = NodeHaltReason::LocalReset;
 
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
         assert!(client.system.system_epoch().is_none());

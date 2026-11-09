@@ -1,9 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    identity::{NodeId, Signature},
-    Attested, EntityState,
-};
+use crate::identity::{NodeId, Signature};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -59,7 +56,6 @@ impl HandshakeChallenge {
 pub struct Presence {
     pub node_id: NodeId,
     pub durable: bool,
-    pub system_root: Option<Attested<EntityState>>,
     /// The challenge this presence answers.
     pub challenge: HandshakeChallenge,
     /// Unix ms when the presence was signed. Advisory: nothing checks it.
@@ -108,21 +104,7 @@ impl Presence {
 
 impl std::fmt::Display for Presence {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match &self.system_root {
-            Some(r) => {
-                write!(
-                    f,
-                    "Presence[{}: durable {} proto v{} system_root: {}]",
-                    self.node_id.to_base64_short(),
-                    self.durable,
-                    self.protocol_version,
-                    r.payload
-                )
-            }
-            None => {
-                write!(f, "Presence[{}: durable {} proto v{}]", self.node_id.to_base64_short(), self.durable, self.protocol_version)
-            }
-        }
+        write!(f, "Presence[{}: durable {} proto v{}]", self.node_id.to_base64_short(), self.durable, self.protocol_version)
     }
 }
 
@@ -164,7 +146,6 @@ mod tests {
         let unsigned = Presence {
             node_id: node_id(&key(42)),
             durable: true,
-            system_root: None,
             challenge: HandshakeChallenge::new(node_id(&key(41))),
             timestamp: 1_720_000_000_000,
             signature: Signature::Ed25519([0; 64]),

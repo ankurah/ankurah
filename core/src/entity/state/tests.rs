@@ -227,3 +227,55 @@ async fn multi_layer_application_advances_head_only_after_success() -> anyhow::R
     assert_eq!(state.head(), Clock::from_events([&c, &y]));
     Ok(())
 }
+
+fn membership(change: Membership) -> OperationSet { OperationSet(vec![ankurah_proto::Operation::Membership(change)]) }
+
+/// A removal concurrent with an addition of the same model loses, whichever of
+/// the two a node applies first, so every node ends holding the same membership.
+#[tokio::test]
+async fn a_concurrent_removal_loses_to_an_addition_whichever_arrives_first() -> anyhow::Result<()> {
+    let model = ModelId::EntityId(ankurah_proto::EntityId::from_bytes([7; 32]));
+    let genesis = Event::genesis(Identity::Ed25519([1; 32]), membership(Membership::Add(model)));
+    let removal = Event::update(genesis.entity_id, Clock::singleton(&genesis), membership(Membership::Remove(model)));
+    // A concurrent branch one event deeper, so the addition sits in a later layer than the removal.
+    let unrelated = Event::update(genesis.entity_id, Clock::singleton(&genesis), OperationSet::default());
+    let addition = Event::update(genesis.entity_id, Clock::singleton(&unrelated), membership(Membership::Add(model)));
+    let served = ServedGetter::of(&[&genesis, &removal, &unrelated, &addition]);
+
+    for order in [[&removal, &unrelated, &addition], [&unrelated, &addition, &removal]] {
+        let state = EntityState::empty();
+        state.apply_events(&served, &[&genesis]).await?;
+        for event in order {
+            assert_eq!(state.apply_events(&served, &[event]).await?, vec![true]);
+        }
+        assert_eq!(state.memberships(), [model].into(), "applied in the order {:?}", order.map(|event| event.id()));
+        assert_eq!(state.head(), Clock::from_events([&removal, &addition]));
+    }
+    Ok(())
+}
+
+/// A removal that follows the addition it removes takes effect, and leaves the
+/// entity's other memberships in place.
+#[tokio::test]
+async fn a_removal_after_the_addition_it_follows_removes_the_membership() -> anyhow::Result<()> {
+    let (kept, removed) =
+        (ModelId::EntityId(ankurah_proto::EntityId::from_bytes([7; 32])), ModelId::EntityId(ankurah_proto::EntityId::from_bytes([8; 32])));
+    let genesis = Event::genesis(
+        Identity::Ed25519([1; 32]),
+        OperationSet(vec![
+            ankurah_proto::Operation::Membership(Membership::Add(kept)),
+            ankurah_proto::Operation::Membership(Membership::Add(removed)),
+        ]),
+    );
+    let removal = Event::update(genesis.entity_id, Clock::singleton(&genesis), membership(Membership::Remove(removed)));
+    let served = ServedGetter::of(&[&genesis, &removal]);
+    let state = EntityState::empty();
+    state.apply_events(&served, &[&genesis]).await?;
+    state.apply_events(&served, &[&removal]).await?;
+    assert_eq!(state.memberships(), [kept].into());
+
+    let last = Event::update(genesis.entity_id, Clock::singleton(&removal), membership(Membership::Remove(kept)));
+    state.apply_events(&ServedGetter::of(&[&genesis, &removal, &last]), &[&last]).await?;
+    assert!(state.memberships().is_empty(), "removing the last membership is allowed");
+    Ok(())
+}

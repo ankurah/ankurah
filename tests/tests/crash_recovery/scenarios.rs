@@ -78,7 +78,7 @@ async fn armed_child_node(crash: CrashPoint) -> Result<(CrashNode, Arc<CrashStor
     ankurah_tests::catalog_forge::plant(&*sled, album_forge()).await?;
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-    node.system.create().await?;
+    node.system.wait_system_ready().await?;
     seed_album_catalog(&node)?;
     node.wait_ready().await?;
     // Bootstrap complete: from here on, operations are the workload under test.
@@ -94,7 +94,7 @@ pub(super) async fn generate_creation_batch(n: usize) -> Result<Vec<Attested<pro
     let helper_engine = Arc::new(SledStorageEngine::new_test()?);
     ankurah_tests::catalog_forge::plant(&*helper_engine, album_forge()).await?;
     let helper = Node::new_durable(helper_engine, PermissiveAgent::new());
-    helper.system.create().await?;
+    helper.system.wait_system_ready().await?;
     seed_album_catalog(&helper)?;
     helper.wait_ready().await?;
     let ctx = helper.context(c)?;
@@ -237,12 +237,10 @@ async fn scenario_2_mid_batch() -> Result<()> {
     // Reconvergence: reopen the node under test and re-deliver the whole batch,
     // exactly as the sending peer would on retry. Everything must converge.
     let node = Node::new_durable(Arc::new(engine), PermissiveAgent::new());
-    // The system root persisted before the workload, so the reopened durable
-    // node loads it and becomes ready on its own (no create/join). Seeding
-    // must wait for that readiness: the seeded binding resolves under the
-    // node's system epoch, which exists only once the system is ready.
+    // Seeding must wait for the local system to load: the seeded binding
+    // resolves under the node's system epoch, which exists only once the
+    // system is ready.
     node.system.wait_system_ready().await.unwrap();
-    assert!(node.system.is_system_ready(), "reopened durable node must load its persisted system root");
     seed_album_catalog(&node)?;
     // The gate on redelivered events consults the catalog, which the
     // reopened projection refills from the planted rows: wait for its
@@ -290,7 +288,7 @@ async fn child_mid_merge() -> Result<()> {
     ankurah_tests::catalog_forge::plant(&*sled, album_forge()).await?;
     let engine = Arc::new(CrashStorageEngine::new(sled, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-    node.system.create().await?;
+    node.system.wait_system_ready().await?;
     seed_album_catalog(&node)?;
     node.wait_ready().await?;
     let ctx = node.context(c)?;

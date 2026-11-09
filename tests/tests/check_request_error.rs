@@ -122,7 +122,7 @@ impl PolicyAgent for RejectingAgent {
 async fn check_request_error_returns_to_client() -> Result<()> {
     // Server uses RejectingAgent - will reject all incoming requests
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), RejectingAgent);
-    server.system.create().await?;
+    server.wait_ready().await?;
 
     // Client uses PermissiveAgent - allows local operations
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

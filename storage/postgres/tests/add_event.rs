@@ -12,7 +12,6 @@ async fn add_event_postgres() -> Result<()> {
 
     let storage_engine = Arc::new(storage_engine);
     let node = Node::new_durable(storage_engine.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     let context = node.context_async(c).await?;
 
     let trx = context.begin();

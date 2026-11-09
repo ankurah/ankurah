@@ -268,7 +268,7 @@ impl Connection {
                                     connection.disconnect();
                                     return;
                                 }
-                                // Advertise our root only after accepting the server's system.
+                                // Send our presence only once the server is registered, so its frames never arrive first.
                                 if let Err(error) = connection.send_message(proto::Message::Presence(presence)) {
                                     connection.disconnect();
                                     connection.set_state(ConnectionState::Error {

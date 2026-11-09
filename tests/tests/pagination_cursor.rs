@@ -40,7 +40,6 @@ const TIMESTAMP_STEP: i64 = 1000;
 
 async fn setup() -> Result<Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    node.system.create().await?;
     Ok(node.context_async(DEFAULT_CONTEXT).await?)
 }
 
@@ -150,7 +149,7 @@ async fn test_pagination_forward() -> Result<()> {
 #[tokio::test]
 async fn test_pagination_inter_node() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&server, &client).await?;

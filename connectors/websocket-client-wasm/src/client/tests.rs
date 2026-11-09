@@ -88,7 +88,7 @@ impl NodeComms for HeldAdmission {
     ) -> Result<(), PeerConnectionError> {
         let release = self.0.release.lock().unwrap().take().unwrap();
         self.0.started.set(true);
-        release.await.map_err(|_| PeerConnectionError::MissingSystem)?;
+        release.await.map_err(|_| PeerConnectionError::ChallengeMismatch(self.id()))?;
         self.0.published.set(true);
         Ok(())
     }
@@ -283,7 +283,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 if !halt {
                     assert!(futures::poll!(&mut ready).is_pending(), "ready must wait through a transport error");
                     if close_before_admission {
-                        let cause = PeerConnectionError::MissingSystem;
+                        let cause = PeerConnectionError::ChallengeMismatch(node.id());
                         client.state.set(ConnectionState::Error { message: cause.to_string(), cause: Some(cause) });
                     } else {
                         node.0.node_state.set(NodeState::Halted(NodeHaltReason::SystemLoad("fixture".into())));

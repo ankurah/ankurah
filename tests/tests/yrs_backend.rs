@@ -15,7 +15,6 @@ pub struct Document {
 
 async fn setup() -> Result<ankurah::Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
     Ok(node.context_async(DEFAULT_CONTEXT).await.unwrap())
 }
 

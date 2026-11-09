@@ -145,6 +145,48 @@ pub async fn check_id_order(engine: &impl StorageEngine) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A state that drops a membership leaves that model's materialization: neither
+/// a membership scan nor a property-indexed, ordered scan of the model finds the
+/// entity, its other memberships still match, and dropping the last one leaves
+/// it addressable by id.
+pub async fn check_removal(engine: &impl StorageEngine) -> anyhow::Result<()> {
+    let labels: Arc<dyn CatalogResolver> = Arc::new(Labels);
+    engine.set_catalog_resolver(Arc::downgrade(&labels));
+    let [a, b] = [101, 102].map(|byte| ModelId::EntityId(id(byte)));
+    let p = PropertyId::EntityId(id(201));
+    let member = Predicate::MemberOf;
+    let and = |left, right| Predicate::And(Box::new(left), Box::new(right));
+    let ordered_b = Selection {
+        predicate: and(
+            member(b),
+            Predicate::Comparison {
+                left: Box::new(Expr::Path(p.into())),
+                operator: ComparisonOperator::GreaterThanOrEqual,
+                right: Box::new(Expr::Literal(Value::String("a".into()))),
+            },
+        ),
+        order_by: Some(vec![OrderByItem { path: p.into(), direction: OrderDirection::Asc }]),
+        limit: Some(5),
+    };
+    let ids = |states: Vec<Attested<EntityState>>| states.into_iter().map(|state| state.payload.entity_id).collect::<Vec<_>>();
+
+    write(engine, 7, &[a, b], &[(p, "x")]).await?;
+    write(engine, 8, &[b], &[(p, "y")]).await?;
+    assert_eq!(ids(engine.fetch_states(&ordered_b).await?), vec![id(7), id(8)]);
+
+    write(engine, 7, &[a], &[(p, "xx")]).await?;
+    assert_eq!(ids(engine.fetch_states(&ordered_b).await?), vec![id(8)], "an ordered scan of the dropped model");
+    assert_eq!(ids(engine.fetch_states(&member(b).into()).await?), vec![id(8)], "a membership scan of the dropped model");
+    assert_eq!(ids(engine.fetch_states(&member(a).into()).await?), vec![id(7)], "the kept membership still matches");
+    assert_eq!(engine.get_state(id(7)).await?.payload.state.memberships, [a].into());
+
+    write(engine, 7, &[], &[(p, "xxx")]).await?;
+    assert!(engine.fetch_states(&member(a).into()).await?.is_empty());
+    assert!(engine.get_state(id(7)).await?.payload.state.memberships.is_empty(), "the entity remains addressable by id");
+    assert!(ids(engine.fetch_states(&Predicate::Not(Box::new(member(a))).into()).await?).contains(&id(7)));
+    Ok(())
+}
+
 fn equals(property: PropertyId, value: &str) -> Predicate<Resolved> {
     Predicate::Comparison {
         left: Box::new(Expr::Path(property.into())),

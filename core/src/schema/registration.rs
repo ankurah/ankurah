@@ -14,9 +14,6 @@ pub enum RegistrationError {
     /// Registration was attempted on a node without durable storage.
     #[error("registration executes on durable nodes; this node is ephemeral")]
     NotDurable,
-    /// The node has not established a system root or catalog epoch.
-    #[error("system is not ready")]
-    SystemNotReady,
     /// Strict offline registration could not consult an allocator.
     #[error(
         "collection '{0}' has never been registered on this node and no durable peer is connected; \

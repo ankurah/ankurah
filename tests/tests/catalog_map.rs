@@ -100,7 +100,6 @@ async fn durable_map_resolves_after_reconstruction() -> anyhow::Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let model_id = {
         let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-        node.system.create().await?;
         node.wait_ready().await?;
         let model_id = node.context_async(DEFAULT_CONTEXT).await.unwrap().resolve_model_id::<Album>().await?;
         wait_resolve(&node, "album", "name").await.expect("catalog should resolve the registered model");
@@ -206,12 +205,12 @@ async fn catalog_projection_does_not_retain_node() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn uninitialized_durable_does_not_retain_catalog_manager() -> anyhow::Result<()> {
+async fn a_starting_durable_node_is_not_retained_by_catalog_startup() -> anyhow::Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-    tokio::time::timeout(Duration::from_secs(1), node.system.wait_loaded()).await.expect("empty durable storage must finish loading")?;
-    assert!(!node.system.is_system_ready());
-    assert!(node.system.root().is_none());
+    tokio::time::timeout(Duration::from_secs(1), node.system.wait_system_ready())
+        .await
+        .expect("empty durable storage must finish loading")?;
 
     let weak = node.weak();
     drop(node);
@@ -221,7 +220,7 @@ async fn uninitialized_durable_does_not_retain_catalog_manager() -> anyhow::Resu
         }
     })
     .await
-    .expect("an uninitialized durable node must not be retained by catalog startup");
+    .expect("a starting durable node must not be retained by catalog startup");
     tokio::time::timeout(Duration::from_secs(1), async {
         while Arc::strong_count(&engine) != 1 {
             tokio::task::yield_now().await;

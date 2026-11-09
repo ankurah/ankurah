@@ -49,18 +49,15 @@ where
 fn foreign_challenge() -> proto::HandshakeChallenge { proto::HandshakeChallenge::new(NodeKey::generate().node_id()) }
 
 #[tokio::test]
-async fn presence_does_not_require_an_adopted_system_but_rejects_a_halted_node() {
+async fn presence_signs_this_nodes_claims_and_a_halted_node_has_none() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let challenge = foreign_challenge();
     let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence(challenge)).await.unwrap().unwrap();
     assert_eq!(presence.node_id, node.id);
     assert!(!presence.durable);
-    assert!(presence.system_root.is_none());
     assert_eq!(presence.challenge, challenge);
     assert!(presence.signature_is_valid());
     assert_eq!(presence.protocol_version, proto::PROTOCOL_VERSION);
-    assert!(!node.system.is_system_ready());
-    assert_eq!(node.state().value(), NodeState::Uninitialized);
 
     let halt_reason = node.system.halt(NodeHaltReason::SystemLoad("test failure".into()));
     assert_eq!(node.state().value(), NodeState::Halted(halt_reason.clone()));
@@ -84,7 +81,7 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
         assert!(futures::poll!(&mut ready).is_pending());
         let (changes, observed) = std::sync::mpsc::channel();
         let _subscription = state.subscribe(changes);
-        node.system.create().await.unwrap();
+        node.system.wait_system_ready().await.unwrap();
         entered_rx.await.unwrap();
         assert_eq!(state.value(), NodeState::Startup);
         assert!(run.get());
@@ -120,7 +117,7 @@ async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
     let storage = Arc::new(TestStorage::default());
     let weak_storage = Arc::downgrade(&storage);
     let node = Node::new(storage, PermissiveAgent::new());
-    node.system.wait_loaded().await.unwrap();
+    node.system.wait_system_ready().await.unwrap();
     let weak = node.weak();
     let run = node.run.clone();
     drop(node);
@@ -136,13 +133,8 @@ async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
 }
 
 #[tokio::test]
-async fn presence_waits_for_the_persisted_system_root() {
+async fn presence_waits_for_the_local_system_to_load() {
     let storage = Arc::new(TestStorage::default());
-    let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    seed.system.create().await.unwrap();
-    let root = seed.system.root().unwrap();
-    drop(seed);
-
     let (entered, entered_rx) = oneshot::channel();
     let (release, release_rx) = oneshot::channel();
     storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::System), (entered, release_rx));
@@ -155,7 +147,6 @@ async fn presence_waits_for_the_persisted_system_root() {
     let presence = tokio::time::timeout(std::time::Duration::from_secs(2), presence).await.unwrap().unwrap();
     assert_eq!(presence.node_id, node.id);
     assert!(presence.durable);
-    assert_eq!(presence.system_root, Some(root));
 }
 
 #[tokio::test]
@@ -177,7 +168,6 @@ async fn disconnect_releases_pending_requests() {
 async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await.unwrap();
     node.wait_ready().await.unwrap();
     let transaction = node.privileged_context().begin();
     let id = transaction.create(&crate::schema::catalog::SysModelRow { label: "test".into(), name: "Test".into() }).await.unwrap().id();
@@ -211,7 +201,6 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
 async fn remote_creations_are_not_registered_or_published_before_storage_succeeds() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let a = ModelId::EntityId(proto::EntityId::random());
     let b = ModelId::EntityId(proto::EntityId::random());
@@ -262,7 +251,6 @@ async fn remote_creations_are_not_registered_or_published_before_storage_succeed
 async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let [a, b, c] = [1, 2, 3].map(|byte| ModelId::EntityId(proto::EntityId::from_bytes([byte; 32])));
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);

@@ -1,11 +1,11 @@
 use crate::{
     error::{LineageError, MutationError, RetrievalError, StateError},
-    event_dag::{AbstractCausalRelation, EventLayer, EventLayers, DEFAULT_BUDGET},
+    event_dag::{AbstractCausalRelation, CausalRelation, EventLayer, EventLayers, DEFAULT_BUDGET},
     property::backend::{backend_from_string, PropertyBackend},
     retrieval::GetEvents,
     value::Value,
 };
-use ankurah_proto::{Clock, Event, ModelId, OperationSet, PropertyId, State};
+use ankurah_proto::{Clock, Event, Membership, ModelId, OperationSet, PropertyId, State};
 use ankurah_signals::broadcast::Broadcast;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -42,8 +42,16 @@ impl EntityInnerState {
                     }
                 }
                 for membership in event.operations().memberships() {
-                    let ankurah_proto::Membership::Add(model) = membership;
-                    self.memberships.insert(*model);
+                    match membership {
+                        Membership::Add(model) => {
+                            self.memberships.insert(*model);
+                        }
+                        Membership::Remove(model) => {
+                            if !added_outside_ancestry(layer, event, model) {
+                                self.memberships.remove(model);
+                            }
+                        }
+                    }
                 }
             }
             for backend in self.backends.values() {
@@ -91,6 +99,22 @@ impl EntityInnerState {
     }
 }
 
+/// Whether an event the comparison loaded, which `removal` does not descend from, adds `model`.
+///
+/// A removal concurrent with an addition of the same model loses: it takes
+/// effect only over the additions it causally follows. Every node then reaches
+/// the same membership whichever order the two events arrive in. An addition
+/// that descends from the removal would re-add the model anyway, so skipping
+/// the removal for it changes nothing.
+fn added_outside_ancestry(layer: &EventLayer, removal: &Event, model: &ModelId) -> bool {
+    let removal_id = removal.id();
+    let adds = Membership::Add(*model);
+    layer.membership_changes().iter().any(|event| {
+        event.operations().memberships().any(|membership| *membership == adds)
+            && layer.compare(&removal_id, &event.id()) != CausalRelation::Descends
+    })
+}
+
 /// State and notifications shared by committed and transaction-local entities.
 #[derive(Debug)]
 pub(crate) struct EntityState {
@@ -134,6 +158,14 @@ impl EntityState {
             self.broadcast.send(());
         }
         added
+    }
+
+    pub(super) fn remove_membership(&self, model: &ModelId) -> bool {
+        let removed = self.inner.write().unwrap().memberships.remove(model);
+        if removed {
+            self.broadcast.send(());
+        }
+        removed
     }
 
     pub(crate) fn value(&self, property: &PropertyId) -> Option<Value> {

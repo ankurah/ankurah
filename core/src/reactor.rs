@@ -396,7 +396,6 @@ mod tests {
             test_utils::TestStorage,
         };
         let node = Node::new_durable(std::sync::Arc::new(TestStorage::default()), PermissiveAgent::new());
-        node.system.create().await.unwrap();
         let query =
             node.context_async(DEFAULT_CONTEXT).await.unwrap().query_wait::<crate::schema::catalog::SysModelRowView>("true").await.unwrap();
         assert!(query.loaded());

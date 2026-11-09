@@ -25,6 +25,8 @@ struct EntityRow {
     encoded_memberships: IVec,
     values: Vec<(PropertyId, Option<Value>)>,
     materializations: Vec<PreparedMaterialization>,
+    /// The materialization trees of models the stored entity belongs to and this write drops.
+    removed: Vec<(ModelId, sled::Tree)>,
 }
 
 struct PreparedMaterialization {
@@ -86,6 +88,7 @@ impl StorageTransaction for SledTransaction<'_> {
             encoded_memberships: bincode::serialize(&state.payload.state.memberships)?.into(),
             values,
             materializations: Vec::new(),
+            removed: Vec::new(),
         };
         if let Some(index) = index {
             write.expected_head = self.entities[index].expected_head.clone();
@@ -132,6 +135,17 @@ fn commit_staged(
             let tree = database.db.open_tree(model_tree_name(model)).map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
             entity.materializations.push(PreparedMaterialization { model: *model, tree, values: values.clone(), encoded: encoded.clone() });
         }
+        let stored: BTreeSet<ModelId> = database
+            .entity_models_tree
+            .get(entity.entity_id.to_bytes())
+            .map_err(|error| MutationError::UpdateFailed(Box::new(error)))?
+            .map(|bytes| bincode::deserialize(bytes.as_ref()))
+            .transpose()?
+            .unwrap_or_default();
+        for model in stored.difference(&entity.memberships) {
+            let tree = database.db.open_tree(model_tree_name(model)).map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
+            entity.removed.push((*model, tree));
+        }
     }
     entities.sort_by_key(|entity| entity.entity_id);
     let mut trees = vec![database.entities_tree.clone(), database.entity_models_tree.clone(), database.events_tree.clone()];
@@ -140,8 +154,10 @@ fn commit_staged(
         tree_positions.insert(tree.name().to_vec(), position);
     }
     for entity in &entities {
-        for materialization in &entity.materializations {
-            for tree in std::iter::once(&materialization.tree).chain(index_snapshot.iter().map(Index::tree)) {
+        let model_trees =
+            entity.materializations.iter().map(|materialization| &materialization.tree).chain(entity.removed.iter().map(|(_, tree)| tree));
+        for model_tree in model_trees {
+            for tree in std::iter::once(model_tree).chain(index_snapshot.iter().map(Index::tree)) {
                 let name = tree.name().to_vec();
                 if !tree_positions.contains_key(&name) {
                     let position = trees.len();
@@ -191,11 +207,25 @@ fn commit_staged(
                 .map(|bytes| bincode::deserialize(bytes.as_ref()).map_err(sled_abort))
                 .transpose()?
                 .unwrap_or_default();
-            let models = &prepared.memberships;
-            if !previous_models.is_subset(models) {
-                return Err(ConflictableTransactionError::Abort(SledCommitAbort::Invalid(format!(
-                    "canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported"
-                ))));
+            for model in previous_models.difference(&prepared.memberships) {
+                let (_, tree) = prepared
+                    .removed
+                    .iter()
+                    .find(|(removed, _)| removed == model)
+                    .ok_or_else(|| sled_abort(format!("entity {entity_id} gained membership {model} while its commit was prepared")))?;
+                let model_position = *tree_positions
+                    .get(tree.name().as_ref())
+                    .ok_or_else(|| sled_abort("a removed membership's tree is absent from the transaction"))?;
+                let Some(bytes) = transactional[model_position].remove(key.clone())? else { continue };
+                let values = bincode::deserialize::<Vec<(u32, Value)>>(bytes.as_ref()).map_err(sled_abort)?;
+                for index in &index_snapshot {
+                    if let Some(old_key) = index.build_key(&entity_id, model, &values).map_err(sled_abort)? {
+                        let index_position = *tree_positions
+                            .get(index.tree().name().as_ref())
+                            .ok_or_else(|| sled_abort("prepared sled index tree is absent from transaction"))?;
+                        transactional[index_position].remove(old_key)?;
+                    }
+                }
             }
             associations.insert(key.clone(), prepared.encoded_memberships.clone())?;
             canonical.insert(key.clone(), prepared.encoded_state.clone())?;

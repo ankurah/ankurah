@@ -28,7 +28,6 @@ pub struct Video {
 async fn pg_property_backends() -> Result<()> {
     let (_container, storage_engine) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     let trx = ctx.begin();

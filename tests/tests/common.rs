@@ -151,8 +151,8 @@ impl GatedConnection {
     {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
-        other.system.wait_loaded().await.unwrap();
-        gated.system.wait_loaded().await.unwrap();
+        other.system.wait_system_ready().await.unwrap();
+        gated.system.wait_system_ready().await.unwrap();
         // As LocalProcessConnection: an ephemeral node dials a durable one, otherwise `other` dials.
         let gated_dials = other.durable && !gated.durable;
         let (other_provenance, gated_provenance) = if gated_dials {
@@ -466,7 +466,6 @@ pub fn years(query: &LiveQuery<AlbumView>) -> Vec<String> { query.peek().iter().
 #[allow(unused)]
 pub async fn durable_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAgent>, anyhow::Error> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     Ok(node)
 }
@@ -642,7 +641,7 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     // Create and initialize server node
     let server_storage = Arc::new(SledStorageEngine::new_test()?);
     let server_node = Node::new_durable(server_storage, PermissiveAgent::new());
-    server_node.system.create().await?;
+    server_node.wait_ready().await?;
 
     let mut rng = rand::thread_rng();
 

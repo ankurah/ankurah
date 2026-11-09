@@ -187,9 +187,10 @@ where
         Self::build(engine, policy_agent, true, SmallRng::from_entropy(), Some(key))
     }
 
-    /// Wipe local storage when a different system is offered, so a new node can adopt it.
-    /// Disabled by default. A different system always halts this node; it never recovers in place.
-    pub fn set_allow_system_replacement(&self, allow: bool) { self.system.set_allow_system_replacement(allow); }
+    /// Halt this node with [`NodeHaltReason::LocalReset`], then delete everything in its local storage.
+    /// The wipe finishes even if the caller drops the returned future. The host then discards this
+    /// node with its contexts and live queries, and builds a fresh node on the wiped store.
+    pub async fn reset_local_storage(&self) -> anyhow::Result<()> { self.system.reset_local_storage().await }
 
     /// Initialization and terminal halt state; independent of peer connectivity.
     pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }
@@ -232,7 +233,7 @@ where
             key
         });
         let id = key.node_id();
-        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable, key.identity());
+        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
         let alive = Mut::new(true);
         let state = system_manager.node_state();
         let run = {
@@ -312,10 +313,10 @@ where
     /// [`Node::register_peer`] with the peer's presence.
     pub fn issue_challenge(&self) -> IssuedChallenge { IssuedChallenge::new(self.id) }
 
-    /// Sign this node's presence answering a peer's challenge, after local system storage loads; an unadopted node has no root.
+    /// Sign this node's presence answering a peer's challenge, after its local system loads.
     pub async fn presence(&self, challenge: proto::HandshakeChallenge) -> Result<proto::Presence, NodeHaltReason> {
-        self.system.wait_loaded().await?;
-        Ok(proto::Presence { system_root: self.system.root(), ..self.key.sign_presence(self.durable, challenge) })
+        self.system.wait_system_ready().await?;
+        Ok(self.key.sign_presence(self.durable, challenge))
     }
 
     /// Register a peer connection whose presence answers `challenge`, which this node issued for it.
@@ -345,14 +346,7 @@ where
             info!("Node({}) serves {:?} peer {} as not durable despite its durable claim", self.id, provenance, presence.node_id);
         }
 
-        self.system.wait_loaded().await?;
-        if trust.durable && !self.durable {
-            self.system.adopt_system(presence.system_root.clone().ok_or(PeerConnectionError::MissingSystem)?).await?;
-        } else if let (Some(current), Some(offered)) = (self.system.root_id(), &presence.system_root) {
-            if current != offered.payload.entity_id {
-                return Err(PeerConnectionError::SystemMismatch { current, offered: offered.payload.entity_id });
-            }
-        }
+        self.system.wait_system_ready().await?;
         let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
         let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // The latest registration decides trust: an id registering again without durable trust

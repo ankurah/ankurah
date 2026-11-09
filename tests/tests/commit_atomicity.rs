@@ -71,7 +71,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         // Catalog writes use System models; this workload's only ordinary
         // model is Album, so count the exact allocated model arm without
         // reconstructing identity from its schema label.
-        if event.operations().memberships().any(|proto::Membership::Add(model)| matches!(model, ankurah::ModelId::EntityId(_)))
+        if event.operations().memberships().any(|membership| matches!(membership, proto::Membership::Add(ankurah::ModelId::EntityId(_))))
             && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1
         {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));
@@ -122,7 +122,6 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
 #[tokio::test]
 async fn test_multi_entity_commit_denial_leaves_nothing_durable() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), DenySecondAlbumEventAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await?;
 
     let trx = ctx.begin();

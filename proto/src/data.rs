@@ -352,6 +352,7 @@ impl std::fmt::Display for OperationSet {
                         format!("{} => {}b", backend, operations.iter().map(|operation| operation.diff.len()).sum::<usize>())
                     }
                     Operation::Membership(Membership::Add(model)) => format!("membership +{model}"),
+                    Operation::Membership(Membership::Remove(model)) => format!("membership -{model}"),
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -425,6 +426,8 @@ pub enum Operation {
 pub enum Membership {
     /// Add the model-backed membership.
     Add(ModelId),
+    /// Remove the model-backed membership. Only an update may carry it.
+    Remove(ModelId),
 }
 
 /// An opaque operation generated and interpreted by a named property backend.
@@ -705,7 +708,7 @@ mod operation_wire_tests {
     use ankurah_core_types::SystemModel;
 
     /// Variant order is part of the bincode contract for event payloads:
-    /// Backend = 0, Membership = 1, and Membership::Add = 0. Payload
+    /// Backend = 0, Membership = 1, Membership::Add = 0 and Membership::Remove = 1. Payload
     /// encodings inside the variants are pinned by ankurah-core-types' own
     /// golden tests.
     #[test]
@@ -719,7 +722,12 @@ mod operation_wire_tests {
         assert_eq!(&membership[..4], [1, 0, 0, 0], "Operation::Membership must encode as variant 1");
         assert_eq!(&membership[4..8], [0, 0, 0, 0], "Membership::Add must encode as variant 0");
 
-        for bytes in [backend, membership] {
+        let removal = bincode::serialize(&Operation::Membership(Membership::Remove(ModelId::System(SystemModel::Model)))).unwrap();
+        assert_eq!(&removal[..4], [1, 0, 0, 0]);
+        assert_eq!(&removal[4..8], [1, 0, 0, 0], "Membership::Remove must encode as variant 1");
+        assert_eq!(removal[8..], membership[8..], "both variants encode the model the same way");
+
+        for bytes in [backend, membership, removal] {
             let round: Operation = bincode::deserialize(&bytes).unwrap();
             assert_eq!(bincode::serialize(&round).unwrap(), bytes);
         }

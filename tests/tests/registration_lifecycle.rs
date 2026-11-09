@@ -2,7 +2,6 @@
 
 mod common;
 use ankurah::core::{
-    connector::PeerConnectionError,
     error::{NodeHaltReason, RetrievalError},
     schema::registration::RegistrationError,
     session::{Session, SessionSet},
@@ -742,7 +741,6 @@ async fn offline_register_is_strict_reconnect_proceeds() -> anyhow::Result<()> {
     server.wait_ready().await?;
     client.wait_ready().await?;
 
-    // Build the context after the initial system root has been adopted.
     let ctx = client.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // DISCONNECT: dropping the connection deregisters the peer on both
@@ -797,12 +795,8 @@ async fn halted_node_cannot_reregister_even_an_already_bound_descriptor() -> any
         assert!(!schema_registered(&client, Gadget::descriptor()));
         assert!(server.catalog.model_by_label("gadget").unwrap().is_none());
 
-        let other = durable_sled_setup().await?;
-        let root = client.system.root().expect("current root");
-        let proposed = other.system.root().expect("other root");
-        let halt_reason = NodeHaltReason::SystemReplacement { current: root.payload.entity_id, proposed: proposed.payload.entity_id };
-        client.set_allow_system_replacement(true);
-        assert_eq!(client.system.adopt_system(proposed).await, Err(PeerConnectionError::NodeHalted(halt_reason.clone())));
+        client.reset_local_storage().await?;
+        let halt_reason = NodeHaltReason::LocalReset;
 
         let bound_error = ctx.resolve_model_id::<Gizmo>().await.expect_err("halting must take priority over the already-bound fast path");
         assert!(matches!(bound_error, RegistrationError::Retrieval(RetrievalError::NodeHalted(error)) if error == halt_reason));

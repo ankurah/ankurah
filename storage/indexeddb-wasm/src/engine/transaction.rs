@@ -109,7 +109,7 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
         let db_connection = engine.db.get_connection().await;
         SendWrapper::new(async move {
             let store_names = js_sys::Array::new();
-            for name in ["entities", "entity_models", "materializations", "events"] {
+            for name in ["entities", "entity_models", "materializations", "events", MODEL_REGISTRATIONS_STORE] {
                 store_names.push(&JsValue::from_str(name));
             }
             let transaction = db_connection
@@ -119,6 +119,7 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
             let entities = transaction.object_store("entities").require("get canonical entities store")?;
             let associations = transaction.object_store("entity_models").require("get entity-model association store")?;
             let materializations = transaction.object_store("materializations").require("get materializations store")?;
+            let registrations = transaction.object_store(MODEL_REGISTRATIONS_STORE).require("get model registration store")?;
 
             let mut ordered = staged_entities.iter().enumerate().collect::<Vec<_>>();
             ordered.sort_by_key(|(_, write)| write.entity_id);
@@ -149,11 +150,6 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
             for (_, write) in &ordered {
                 let entity_id = write.entity_id;
                 let prior = associated_models_in_store(&associations, entity_id).await?;
-                if !prior.is_subset(&write.memberships) {
-                    return Err(RetrievalError::Other(format!(
-                        "canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported"
-                    )));
-                }
                 prior_models.insert(entity_id, prior);
             }
 
@@ -169,6 +165,19 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
                 let prior = prior_models
                     .remove(&entity_id)
                     .ok_or_else(|| RetrievalError::Other(format!("storage batch omitted the prior model set for entity {entity_id}")))?;
+                for model in prior.difference(&write.memberships) {
+                    let request = associations
+                        .delete(&JsValue::from_str(&entity_model_key(entity_id, model)))
+                        .require("delete entity-model association")?;
+                    cb_future(&request, "success", "error").await.require("await entity-model association delete")?;
+                    let name = registrations.get(&JsValue::from_str(&model_registration_key(model))).require("get model registration")?;
+                    cb_future(&name, "success", "error").await.require("await model registration")?;
+                    if let Some(name) = name.result().require("get model registration result")?.as_string() {
+                        let key = crate::bucket::materialization_entity_key(&name, entity_id);
+                        let request = materializations.delete(&JsValue::from_str(&key)).require("delete materialized entity")?;
+                        cb_future(&request, "success", "error").await.require("await materialized entity delete")?;
+                    }
+                }
                 for model in &write.memberships {
                     if !prior.contains(model) {
                         let request = associations

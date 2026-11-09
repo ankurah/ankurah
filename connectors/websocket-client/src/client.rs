@@ -468,7 +468,7 @@ where
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
 
-        // Advertise our system only after admission, so an old cached root cannot preempt adoption.
+        // Send our presence only once the server is registered, so its frames never arrive first.
         let presence = proto::Message::Presence(inner.node.presence(server_challenge).await.map_err(PeerConnectionError::from)?);
         sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
 

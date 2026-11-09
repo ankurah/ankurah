@@ -361,7 +361,6 @@ mod tests {
         ] {
             let storage = Arc::new(TestStorage::default());
             let mut node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-            node.system.create().await?;
             let context = node.context_async(DEFAULT_CONTEXT).await?;
             context.resolve_model_id::<PublicationModel>().await?;
             let healthy = context.resolve_model_id::<MissingPublicationModel>().await?;
@@ -410,7 +409,6 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let model = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?;
                 seed.catalog.model_by_label(PublicationModel::descriptor().label)?.unwrap().0
             };
@@ -443,7 +441,6 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let node = Node::new(storage, PermissiveAgent::new());
@@ -472,7 +469,6 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let (fetch_entered, fetch_observed) = tokio::sync::oneshot::channel();

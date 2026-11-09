@@ -69,3 +69,24 @@ async fn membership_rejection_does_not_read_entity_state() -> anyhow::Result<()>
     IndexedDBStorageEngine::cleanup(&name).await?;
     Ok(())
 }
+
+#[path = "../../common/tests/support/membership_removal.rs"]
+mod removal;
+
+#[wasm_bindgen_test]
+async fn removed_memberships() -> anyhow::Result<()> {
+    let name = format!("removed_memberships_{}", ulid::Ulid::new());
+    let engine = IndexedDBStorageEngine::open(&name).await?;
+    cases::check_removal(&engine).await?;
+    engine.db.close().await;
+    IndexedDBStorageEngine::cleanup(&name).await?;
+    Ok(())
+}
+
+#[wasm_bindgen_test]
+async fn a_removed_membership_leaves_live_queries() -> anyhow::Result<()> {
+    let name = format!("removed_membership_live_{}", ulid::Ulid::new());
+    removal::check_live_removal(IndexedDBStorageEngine::open(&name).await?).await?;
+    IndexedDBStorageEngine::cleanup(&name).await?;
+    Ok(())
+}

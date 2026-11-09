@@ -56,8 +56,8 @@ impl AccessDenied {}
 /// What this node grants a connected peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerTrust {
-    /// Whether this node treats the peer as durable: a relay target for local commits, a source for
-    /// durable reads, and the source an ephemeral node adopts its system from.
+    /// Whether this node treats the peer as durable: a relay target for local commits and a source
+    /// for durable reads.
     pub durable: bool,
 }
 

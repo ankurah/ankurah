@@ -9,7 +9,6 @@ use common::*;
 async fn local_and_remote_commits_preserve_plural_membership() -> anyhow::Result<()> {
     let storage = std::sync::Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await?;
     node.wait_ready().await?;
     let epoch = node.system.system_epoch().unwrap();
@@ -114,5 +113,77 @@ async fn local_and_remote_commits_preserve_plural_membership() -> anyhow::Result
     let pet = pet.to_model()?;
     assert_eq!((album.name.as_str(), album.year.as_str()), ("Shared entity", "2027"));
     assert_eq!((pet.name.as_str(), pet.age.as_str()), ("Nori", "3"));
+    Ok(())
+}
+
+/// Membership changes that cancel out inside one transaction record nothing:
+/// a creation that adds and removes a model mints a genesis without either
+/// (a genesis may not carry a removal), and an edit that removes and re-adds
+/// one emits no membership operation at all.
+#[tokio::test]
+async fn membership_changes_that_cancel_in_one_transaction_record_nothing() -> anyhow::Result<()> {
+    let storage = std::sync::Arc::new(SledStorageEngine::new_test()?);
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    let ctx = node.context_async(DEFAULT_CONTEXT).await?;
+    let album_model = ctx.resolve_model_id::<Album>().await?;
+    let pet_model = ctx.resolve_model_id::<Pet>().await?;
+    let touches = |model: proto::ModelId| {
+        move |event: &proto::Attested<proto::Event>| {
+            event.payload.operations().memberships().any(|membership| match membership {
+                proto::Membership::Add(changed) | proto::Membership::Remove(changed) => *changed == model,
+            })
+        }
+    };
+
+    let trx = ctx.begin();
+    let album = trx.create(&Album { name: "Changed its mind".into(), year: "2026".into() }).await?;
+    album.entity().add_membership(pet_model)?;
+    album.entity().remove_membership(&pet_model)?;
+    let id = album.id();
+    drop(album);
+    trx.commit().await?;
+    let events = storage.dump_entity_events(id).await?;
+    assert_eq!(events.len(), 1, "only the genesis");
+    assert!(!events.iter().any(touches(pet_model)), "the genesis neither adds nor removes the cancelled model");
+    assert_eq!(storage.get_state(id).await?.payload.state.memberships, [album_model].into());
+
+    let trx = ctx.begin();
+    let album = trx.get::<Album>(&id).await?;
+    album.entity().remove_membership(&album_model)?;
+    album.entity().add_membership(album_model)?;
+    album.name()?.replace("Same memberships")?;
+    drop(album);
+    trx.commit().await?;
+    let events = storage.dump_entity_events(id).await?;
+    assert_eq!(events.len(), 2);
+    assert!(events.iter().filter(|event| !event.payload.is_entity_create()).all(|event| !touches(album_model)(event)));
+    assert_eq!(storage.get_state(id).await?.payload.state.memberships, [album_model].into());
+    Ok(())
+}
+
+/// A removal in a later update records `Membership::Remove` in that update.
+#[tokio::test]
+async fn a_removal_in_a_later_update_is_recorded_in_that_update() -> anyhow::Result<()> {
+    let storage = std::sync::Arc::new(SledStorageEngine::new_test()?);
+    let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
+    let ctx = node.context_async(DEFAULT_CONTEXT).await?;
+    let album_model = ctx.resolve_model_id::<Album>().await?;
+    let pet_model = ctx.resolve_model_id::<Pet>().await?;
+
+    let trx = ctx.begin();
+    let album = trx.create(&Album { name: "Two components".into(), year: "2026".into() }).await?;
+    album.entity().add_membership(pet_model)?;
+    let id = album.id();
+    drop(album);
+    trx.commit().await?;
+
+    let trx = ctx.begin();
+    trx.get::<Album>(&id).await?.entity().remove_membership(&pet_model)?;
+    trx.commit().await?;
+
+    let events = storage.dump_entity_events(id).await?;
+    let update = events.iter().find(|event| !event.payload.is_entity_create()).expect("the removal is an update");
+    assert_eq!(update.payload.operations().memberships().collect::<Vec<_>>(), vec![&proto::Membership::Remove(pet_model)]);
+    assert_eq!(storage.get_state(id).await?.payload.state.memberships, [album_model].into());
     Ok(())
 }

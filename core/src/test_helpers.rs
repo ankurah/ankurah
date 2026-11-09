@@ -18,7 +18,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let epoch = node.system.system_epoch().ok_or(RegistrationError::SystemNotReady)?;
+    let epoch = node.system.require_system_ready()?;
     crate::schema::catalog::register::accept(&mut schema.registrant(epoch), model)
 }
 

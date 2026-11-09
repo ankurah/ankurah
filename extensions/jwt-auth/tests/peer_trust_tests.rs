@@ -57,7 +57,6 @@ async fn inbound_durable_claim_is_not_a_relay_target() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), common::blog_config_path())?;
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
     node.wait_ready().await?;
 

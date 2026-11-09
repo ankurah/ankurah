@@ -121,8 +121,8 @@ impl SimNode {
     }
 }
 
-/// Build `n` nodes: node 0 is durable and owns the system root; the rest are
-/// ephemeral and join node 0's system. All nodes share one capture sink, and
+/// Build `n` nodes: node 0 is durable and holds the forged catalog; the rest
+/// are ephemeral and connect to it. All nodes share one capture sink, and
 /// each node's key derives from `seed` and its index.
 /// Returns the nodes and the shared `Captured` for the scheduler.
 pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Result<Vec<SimNode>> {
@@ -133,7 +133,6 @@ pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Res
     let durable_engine = Arc::new(SledStorageEngine::new_test()?);
     crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
     let durable = Node::new_durable_with_key(durable_engine, PermissiveAgent::new(), sim_node_key(seed, 0));
-    durable.system.create().await?;
     durable.wait_ready().await?;
     nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
 

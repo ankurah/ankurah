@@ -21,3 +21,22 @@ async fn indexed_memberships() -> anyhow::Result<()> {
     assert_eq!(index.tree().len(), 7, "one entry per membership, including the membership added after backfill");
     Ok(())
 }
+
+#[path = "../../common/tests/support/membership_removal.rs"]
+mod removal;
+
+#[tokio::test]
+async fn removed_memberships() -> anyhow::Result<()> {
+    let engine = ankurah_storage_sled::SledStorageEngine::new_test()?;
+    cases::check_removal(&engine).await?;
+    let database = engine.database.lock().unwrap();
+    let indexes = database.index_manager.indexes.read().unwrap();
+    let entries: usize = indexes.values().map(|index| index.tree().len()).sum();
+    assert_eq!(entries, 1, "only the membership the store still holds keeps a property index entry");
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_removed_membership_leaves_live_queries() -> anyhow::Result<()> {
+    removal::check_live_removal(ankurah_storage_sled::SledStorageEngine::new_test()?).await
+}

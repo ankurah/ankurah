@@ -41,7 +41,6 @@ async fn connect_recording_event_requests(
 async fn commits_stamp_from_the_head_including_after_multitip_rehydration() -> Result<()> {
     let storage = Arc::new(CountEventReads { inner: SledStorageEngine::new_test()?, reads: AtomicUsize::new(0) });
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let ctx = node.context_async(c).await?;
 

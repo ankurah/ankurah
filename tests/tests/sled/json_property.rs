@@ -22,7 +22,6 @@ pub struct Track {
 async fn setup_track_context() -> Result<ankurah::Context> {
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
-    node.system.create().await?;
     Ok(node.context_async(DEFAULT_CONTEXT).await.unwrap())
 }
 

@@ -77,7 +77,7 @@ fn names(query: &LiveQuery<AlbumView>) -> Result<Vec<String>> {
 /// the creation in storage before the live query is told of it, or the case missed the window.
 async fn heard(writer: Writer, concurrent_query: bool) -> Result<Heard> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
     ephemeral.wait_ready().await?;
@@ -119,7 +119,7 @@ async fn heard(writer: Writer, concurrent_query: bool) -> Result<Heard> {
 /// the case missed the window.
 async fn heard_edit(writer: Writer, concurrent_query: bool) -> Result<Heard> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
     ephemeral.wait_ready().await?;

@@ -43,13 +43,9 @@ impl ConnectionStateEnum {
         Some(
             match cause {
                 Some(PeerConnectionError::Protocol(_)) => "Protocol",
-                Some(PeerConnectionError::SystemMismatch { .. }) => "SystemMismatch",
-                Some(PeerConnectionError::MissingSystem) => "MissingSystem",
-                Some(PeerConnectionError::InvalidSystem(_)) => "InvalidSystem",
                 Some(PeerConnectionError::ChallengeMismatch(_)) => "ChallengeMismatch",
                 Some(PeerConnectionError::InvalidSignature(_)) => "InvalidSignature",
                 Some(PeerConnectionError::SelfConnection(_)) => "SelfConnection",
-                Some(PeerConnectionError::SystemReset(_)) => "SystemReset",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",
                 None => "Transport",
             }

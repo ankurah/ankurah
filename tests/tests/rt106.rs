@@ -11,7 +11,7 @@ use crate::common::*;
 async fn rt106() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Set up server (durable) and client (ephemeral)
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client_storage = Arc::new(SledStorageEngine::new_test().unwrap());
     let client = Node::new(client_storage.clone(), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&server, &client).await?;

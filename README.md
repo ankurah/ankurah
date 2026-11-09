@@ -128,7 +128,6 @@ WebSocket server & client • Embeddable axum routes • Authentication hooks �
 **Server**
 <pre><code transclude="docs/example/server/src/main.rs#server-example">let storage = SledStorageEngine::with_path(storage_dir)?;
 let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-node.system.create().await?;
 
 let mut server = WebsocketServer::new(node);
 println!(&quot;Running server...&quot;);
@@ -137,11 +136,11 @@ server.run(&quot;0.0.0.0:9797&quot;).await?;</code></pre>
 **Rust Client**
 <pre><code transclude="docs/example/server/src/main.rs#rust-client-example">let storage = SledStorageEngine::new_test()?;
 let node = Node::new(Arc::new(storage), PermissiveAgent::new());
-let _client = WebsocketClient::new(node.clone(), &quot;ws://localhost:9797&quot;).await?;
-node.system.wait_system_ready().await?;
+let client = WebsocketClient::new(node.clone(), &quot;ws://localhost:9797&quot;).await?;
+client.wait_connected().await?;
 
 // Create album
-let ctx = node.context(ankurah::policy::DEFAULT_CONTEXT)?;
+let ctx = node.context_async(ankurah::policy::DEFAULT_CONTEXT).await?;
 let trx = ctx.begin();
 trx.create(&amp;Album { name: &quot;Parade&quot;.into(), artist: &quot;Prince&quot;.into(), year: 1986 }).await?;
 trx.commit().await?;</code></pre>
@@ -150,9 +149,8 @@ trx.commit().await?;</code></pre>
 <pre><code transclude="docs/example/wasm-bindings/src/lib.rs#client-example">let storage = IndexedDBStorageEngine::open(&quot;myapp&quot;).await?;
 let node = Node::new(Arc::new(storage), PermissiveAgent::new());
 let _client = WebsocketClient::new(node.clone(), server_url)?;
-node.system.wait_system_ready().await?;
 
-let context = node.context(DEFAULT_CONTEXT)?;
+let context = node.context_async(DEFAULT_CONTEXT).await?;
 let _albums = context.query::&lt;ankurah_doc_example_model::AlbumView&gt;(&quot;year &gt; 1985&quot;)?;</code></pre>
 
 **React Component**

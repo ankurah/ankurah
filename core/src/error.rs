@@ -16,8 +16,9 @@ pub enum NodeHaltReason {
     CatalogLoad(String),
     #[error("failed to initialize policy: {0}")]
     PolicyAgentStartFailed(String),
-    #[error("system replacement requires a new node (current {current}, proposed {proposed})")]
-    SystemReplacement { current: EntityId, proposed: EntityId },
+    /// [`crate::Node::reset_local_storage`] wiped this node's storage; the host builds a new node on it.
+    #[error("local storage was reset; a new node must be built on the wiped store")]
+    LocalReset,
 }
 
 #[derive(Error, Debug)]
@@ -164,8 +165,6 @@ pub enum RequestError {
     NotTrustedAsDurable(ankurah_proto::NodeId),
     #[error("Connection lost")]
     ConnectionLost,
-    #[error("System not ready")]
-    SystemNotReady,
     #[error("Server error: {0}")]
     ServerError(String),
     #[error("Send error: {0}")]
@@ -253,11 +252,6 @@ pub enum MutationError {
     EventStructure(ankurah_proto::EventStructureError),
     #[error("inadmissible event: {0}")]
     InadmissibleEvent(InadmissibleEvent),
-    /// The node does not know its system root yet. A caller that reaches this
-    /// on an ephemeral node can retry once the handshake with a durable peer
-    /// has established the system.
-    #[error("the node does not know its system root yet")]
-    SystemNotReady,
     /// A commit-path invariant about an event's provenance, as opposed to
     /// [`MutationError::EventStructure`], which is about its shape. The string
     /// names which one.

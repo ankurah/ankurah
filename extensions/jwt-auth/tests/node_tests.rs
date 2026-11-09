@@ -35,7 +35,6 @@ async fn test_jwt_agent_single_durable_node() -> anyhow::Result<()> {
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let claims = make_claims("editor-1", &["Editor"], "editor@blog.com");
@@ -60,7 +59,6 @@ async fn test_jwt_agent_reader_cannot_write_post() -> anyhow::Result<()> {
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let claims = make_claims("reader-1", &["Reader"], "reader@blog.com");
@@ -99,7 +97,6 @@ async fn test_write_scope_allows_matching_ref_and_denies_other_ref() -> anyhow::
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let root = node.context_async(JwtContext::system()).await?;
@@ -154,7 +151,6 @@ async fn test_read_scope_denies_direct_get_for_out_of_scope_resident_entity() ->
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let root = node.context_async(JwtContext::system()).await?;
@@ -209,7 +205,6 @@ async fn test_update_scope_requires_before_and_after_state() -> anyhow::Result<(
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let root = node.context_async(JwtContext::system()).await?;
@@ -248,7 +243,6 @@ async fn test_jwt_agent_durable_ephemeral_pair() -> anyhow::Result<()> {
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), JwtAgent::new_ephemeral());
 
-    node1.system.create().await?;
     agent.set_policy(&node1, &agent.config()).await?;
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
     node2.system.wait_system_ready().await.unwrap();
@@ -293,7 +287,6 @@ async fn test_jwt_check_request_roundtrip() -> anyhow::Result<()> {
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), JwtAgent::new_ephemeral());
 
-    node1.system.create().await?;
     agent.set_policy(&node1, &agent.config()).await?;
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
     node2.system.wait_system_ready().await.unwrap();
@@ -368,7 +361,6 @@ async fn test_root_context_bypasses_all_policy_checks() -> anyhow::Result<()> {
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let root_ctx = JwtContext::system();

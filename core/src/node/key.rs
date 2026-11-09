@@ -85,7 +85,6 @@ impl NodeKey {
         let mut presence = proto::Presence {
             node_id: self.node_id(),
             durable,
-            system_root: None,
             challenge,
             timestamp: proto::time::unix_ms_now(),
             signature: proto::Signature::Ed25519([0; 64]),

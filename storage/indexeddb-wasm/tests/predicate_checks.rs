@@ -131,7 +131,6 @@ async fn test_indexeddb_predicate_checks() -> Result<(), anyhow::Error> {
     let db_name = format!("test_predicate_{}", ulid::Ulid::new());
     let storage = IndexedDBStorageEngine::open(&db_name).await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     for case in &cases {

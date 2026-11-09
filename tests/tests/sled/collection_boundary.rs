@@ -31,7 +31,6 @@ async fn test_collection_boundary_excludes_other_collections() -> Result<(), any
 async fn test_prefix_guard_toggle_effect() -> Result<(), anyhow::Error> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // Insert albums across multiple years and a couple of books (different collection)

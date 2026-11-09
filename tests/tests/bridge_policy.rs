@@ -27,7 +27,6 @@ async fn peer_get_preserves_denial_and_absence_even_with_a_cached_entity() -> Re
 
     let agent = BridgePolicyAgent::new();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    server.system.create().await?;
     let context = server.context_async(DEFAULT_CONTEXT).await?;
     let trx = context.begin();
     let id = trx.create(&Pet { name: "Nori".into(), age: "3".into() }).await?.id();
@@ -69,7 +68,6 @@ async fn state_read_hook_filters_fetch_cache_and_live_updates() -> Result<()> {
 
     let agent = BridgePolicyAgent::new();
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     let context = node.context_async(DEFAULT_CONTEXT).await?;
     let trx = context.begin();
     let hidden = trx.create(&Pet { name: "Hidden".into(), age: "3".into() }).await?.id();
@@ -243,7 +241,6 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
 
     let agent = BridgePolicyAgent::new();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    server.system.create().await?;
     let context = server.context_async(DEFAULT_CONTEXT).await?;
     context.resolve_model_id::<Pet>().await?;
     agent.deny_reads.store(true, Ordering::SeqCst);
@@ -326,7 +323,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
 #[tokio::test]
 async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client_agent = BridgePolicyAgent::new();
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), client_agent.clone());
 
@@ -379,7 +376,7 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
 async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     let server_agent = BridgePolicyAgent::new();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), server_agent.clone());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
@@ -441,7 +438,7 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
 async fn get_events_retrieves_identities_across_model_memberships() -> Result<()> {
     let agent = BridgePolicyAgent::new();
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), agent.clone());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
     client.system.wait_system_ready().await?;

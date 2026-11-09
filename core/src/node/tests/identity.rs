@@ -91,7 +91,6 @@ fn the_default_policy_trusts_a_durable_claim_only_from_a_configured_peer() {
 #[tokio::test]
 async fn only_a_configured_durable_peer_receives_local_commits() {
     let node = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    node.system.create().await.unwrap();
     let (inbound, configured) = (NodeKey::generate(), NodeKey::generate());
     let (inbound_sent, inbound_messages) = mpsc::channel();
     let (configured_sent, configured_messages) = mpsc::channel();
@@ -114,7 +113,6 @@ async fn only_a_configured_durable_peer_receives_local_commits() {
 #[tokio::test]
 async fn a_durable_peer_registering_again_inbound_leaves_durable_routing() {
     let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    server.system.create().await.unwrap();
     let client = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let relay = client.subscription_relay.as_ref().unwrap();
 
@@ -144,7 +142,6 @@ async fn a_durable_peer_registering_again_inbound_leaves_durable_routing() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_registrations_of_one_id_leave_durable_routing_matching_the_connection_that_won() {
     let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    server.system.create().await.unwrap();
     let client = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let register = |provenance| {
         let (client, server) = (client.clone(), server.clone());
@@ -167,29 +164,6 @@ async fn concurrent_registrations_of_one_id_leave_durable_routing_matching_the_c
             assert_eq!(client.subscription_relay.as_ref().unwrap().is_connected(&server.id), durable);
         }
     }
-}
-
-#[tokio::test]
-async fn an_ephemeral_node_adopts_a_root_only_from_a_peer_it_trusts_as_durable() {
-    let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    server.system.create().await.unwrap();
-    let client = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-
-    // An inbound peer offering a genuine root is not a source the client adopts from.
-    let squatter = NodeKey::generate();
-    let challenge = client.issue_challenge();
-    let presence = proto::Presence { system_root: server.system.root(), ..squatter.sign_presence(true, challenge.challenge()) };
-    let (sent, _) = mpsc::channel();
-    client.register_peer(presence, challenge, PeerProvenance::Inbound, Box::new(RecordingSender(squatter.node_id(), sent))).await.unwrap();
-    assert_eq!(client.system.root_id(), None);
-    assert!(client.get_durable_peers().is_empty());
-
-    let challenge = client.issue_challenge();
-    let presence = server.presence(challenge.challenge()).await.unwrap();
-    let (sent, _) = mpsc::channel();
-    client.register_peer(presence, challenge, PeerProvenance::Configured, Box::new(RecordingSender(server.id, sent))).await.unwrap();
-    assert_eq!(client.system.root_id(), server.system.root_id());
-    assert_eq!(client.get_durable_peers(), vec![server.id]);
 }
 
 #[cfg(not(target_arch = "wasm32"))]

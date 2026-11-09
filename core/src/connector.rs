@@ -8,20 +8,12 @@ use crate::{policy::PolicyAgent, storage::StorageEngine, Node, NodeState};
 pub enum PeerConnectionError {
     #[error("{0}")]
     Protocol(#[from] proto::PresenceRejection),
-    #[error("peer belongs to a different system (current {current}, offered {offered})")]
-    SystemMismatch { current: proto::EntityId, offered: proto::EntityId },
-    #[error("durable peer did not advertise a system")]
-    MissingSystem,
-    #[error("invalid system: {0}")]
-    InvalidSystem(String),
     #[error("presence from node {0} answers a challenge this connection did not issue")]
     ChallengeMismatch(proto::NodeId),
     #[error("presence signature is not valid for node {0}")]
     InvalidSignature(proto::NodeId),
     #[error("node {0} refused a connection to itself")]
     SelfConnection(proto::NodeId),
-    #[error("failed to wipe local storage for system replacement: {0}")]
-    SystemReset(String),
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
 }
@@ -99,7 +91,7 @@ pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::NodeId;
     /// Issue a fresh challenge for one new connection.
     fn issue_challenge(&self) -> IssuedChallenge;
-    /// Sign this node's presence answering a peer's challenge, after local system storage loads; an unadopted node has no root.
+    /// Sign this node's presence answering a peer's challenge, after its local system loads.
     async fn presence(&self, challenge: proto::HandshakeChallenge) -> Result<proto::Presence, crate::error::NodeHaltReason>;
     async fn register_peer(
         &self,

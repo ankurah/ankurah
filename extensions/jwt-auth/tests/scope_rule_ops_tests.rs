@@ -52,7 +52,6 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), scope_ops_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node1.system.create().await?;
     agent.set_policy(&node1, &agent.config()).await?;
 
     // Seed one owner-keyed and one administrator-keyed assignment as system.

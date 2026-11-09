@@ -102,7 +102,6 @@ struct Fixture {
 
 async fn fixture() -> Result<Fixture> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
     let ctx_s = server.context_async(c).await?;

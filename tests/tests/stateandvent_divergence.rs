@@ -25,7 +25,7 @@ use std::sync::Arc;
 async fn test_stateandvent_divergence_subscription() -> Result<()> {
     // Setup: Durable D and Ephemeral E connected
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
+    durable.wait_ready().await?;
     let ephemeral = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&ephemeral, &durable).await?;
@@ -123,7 +123,7 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
 #[tokio::test]
 async fn test_two_ephemeral_divergence_subscription() -> Result<()> {
     let durable = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    durable.system.create().await?;
+    durable.wait_ready().await?;
 
     let ephemeral1 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let ephemeral2 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

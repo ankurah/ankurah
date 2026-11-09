@@ -1,112 +1,71 @@
+use crate::error::{NodeHaltReason, NodeReadinessError};
 use crate::internal::prelude::*;
-use crate::{connector::PeerConnectionError, error::NodeHaltReason};
-use ankurah_proto::{Attested, EntityState, Event};
 use ankurah_signals::{Mut, Read, Wait};
-use anyhow::{anyhow, Result};
-use proto::PropertyId;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, OnceLock, RwLock,
-};
-use tokio::sync::Notify;
+use anyhow::Result;
+use std::sync::{Arc, RwLock};
 
 use crate::entity::WeakEntitySet;
 use crate::property::{Property, PropertyError};
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
-use crate::storage::{StorageCommitOutcome, StorageTransaction};
-use crate::{property::backend::LWWBackend, value::Value};
+use crate::value::Value;
 pub const SYSTEM_COLLECTION_ID: &str = "_ankurah_system";
 pub const PROTECTED_COLLECTIONS: &[&str] = &[SYSTEM_COLLECTION_ID];
 
-/// Tracks the local system root and system-scoped runtime state.
+/// A node's local system state: the `_ankurah_system` items in its storage,
+/// readiness once they load, and the node's run state up to terminal halt.
 pub struct SystemManager<SE>(Arc<Inner<SE>>);
 impl<SE> Clone for SystemManager<SE> {
     fn clone(&self) -> Self { Self(self.0.clone()) }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SystemEpochError {
-    #[error("system is not ready")]
-    NotReady,
-    #[error("node halted: {0}")]
-    Halted(#[from] NodeHaltReason),
-}
-
-impl From<SystemEpochError> for MutationError {
-    fn from(error: SystemEpochError) -> Self {
-        match error {
-            SystemEpochError::NotReady => Self::SystemNotReady,
-            SystemEpochError::Halted(error) => Self::NodeHalted(error),
-        }
-    }
 }
 
 struct Inner<SE> {
     storage: Arc<SE>,
     entities: WeakEntitySet,
     durable: bool,
-    /// The node's identity, which the root genesis is minted under.
-    minter: proto::Identity,
-    root: RwLock<Option<Attested<EntityState>>>,
     items: RwLock<Vec<Entity>>,
-    loaded: OnceLock<bool>,
-    loading: Notify,
+    /// Set once the items load; cleared again only when local storage is reset.
     system_ready: RwLock<bool>,
-    allow_system_replacement: AtomicBool,
     node_state: Mut<NodeState>,
-    /// Hold the root check through persistence and publication so concurrent create/adopt
-    /// calls cannot both claim an uninitialized node. Ordinary reads and writes do not take it.
-    root_write: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<SE> SystemManager<SE>
 where SE: StorageEngine + Send + Sync + 'static
 {
-    pub(crate) fn new(storage: Arc<SE>, entities: WeakEntitySet, durable: bool, minter: proto::Identity) -> Self {
+    pub(crate) fn new(storage: Arc<SE>, entities: WeakEntitySet, durable: bool) -> Self {
         let me = Self(Arc::new(Inner {
             storage,
             entities,
             durable,
-            minter,
             items: RwLock::new(Vec::new()),
-            root: RwLock::new(None),
-            loaded: OnceLock::new(),
-            loading: Notify::new(),
             system_ready: RwLock::new(false),
-            allow_system_replacement: AtomicBool::new(false),
             node_state: Mut::new(NodeState::Uninitialized),
-            root_write: Arc::new(tokio::sync::Mutex::new(())),
         }));
         {
             let me = me.clone();
             crate::task::spawn(async move {
-                if let Err(e) = me.load_system_catalog().await {
-                    me.halt(NodeHaltReason::SystemLoad(e.to_string()));
+                match me.load_system_items().await {
+                    Ok(()) => me.mark_system_ready(),
+                    Err(e) => {
+                        me.halt(NodeHaltReason::SystemLoad(e.to_string()));
+                    }
                 }
             });
         }
         me
     }
 
-    pub fn root(&self) -> Option<Attested<EntityState>> { self.0.root.read().unwrap().as_ref().map(|r| r.clone()) }
-
-    /// The system root's entity id. `None` until this node has created or adopted a system.
-    pub fn root_id(&self) -> Option<proto::EntityId> { self.0.root.read().unwrap().as_ref().map(|r| r.payload.entity_id) }
-
     pub fn items(&self) -> Vec<Entity> { self.0.items.read().unwrap().clone() }
 
-    /// Whether a system is initialized and the node has not halted.
+    /// Whether the local system has loaded and the node has not halted.
     pub fn is_system_ready(&self) -> bool { self.check_not_halted().is_ok() && *self.0.system_ready.read().unwrap() }
 
-    /// This node's immutable system epoch, absent until a system is ready or after a hard reset.
+    /// This node's immutable system epoch, absent until the local system loads or after a reset.
     pub fn system_epoch(&self) -> Option<SystemEpoch> { self.0.system_ready.read().unwrap().then_some(self.0.entities.system_epoch()) }
 
-    pub(crate) fn require_system_ready(&self) -> Result<SystemEpoch, SystemEpochError> {
+    pub(crate) fn require_system_ready(&self) -> Result<SystemEpoch, NodeReadinessError> {
         self.check_not_halted()?;
-        self.system_epoch().ok_or(SystemEpochError::NotReady)
+        self.system_epoch().ok_or(NodeReadinessError::NotReady)
     }
-
-    pub(crate) fn set_allow_system_replacement(&self, allow: bool) { self.0.allow_system_replacement.store(allow, Ordering::Release); }
 
     pub(crate) fn node_state(&self) -> Read<NodeState> { self.0.node_state.read() }
 
@@ -130,18 +89,16 @@ where SE: StorageEngine + Send + Sync + 'static
     /// Publish terminal halt; services observe the state and stop their own work.
     /// In-flight storage work may still finish.
     pub(crate) fn halt(&self, halt_reason: NodeHaltReason) -> NodeHaltReason {
-        let halt_reason = self.0.node_state.update(|state| match state {
+        self.0.node_state.update(|state| match state {
             NodeState::Halted(reason) => reason.clone(),
             NodeState::Uninitialized | NodeState::Startup | NodeState::Running => {
                 *state = NodeState::Halted(halt_reason.clone());
                 halt_reason
             }
-        });
-        self.0.loading.notify_waiters();
-        halt_reason
+        })
     }
 
-    /// Publish readiness after creating, adopting, or loading the persisted system root.
+    /// Publish readiness once the local system items have loaded.
     fn mark_system_ready(&self) {
         self.0.node_state.update(|state| {
             *self.0.system_ready.write().unwrap() = true;
@@ -151,7 +108,7 @@ where SE: StorageEngine + Send + Sync + 'static
         });
     }
 
-    /// Wait for system initialization, or return the reason the node halted.
+    /// Wait for the local system to load, or return the reason the node halted.
     pub async fn wait_system_ready(&self) -> Result<(), NodeHaltReason> {
         self.node_state()
             .wait_for(|state| match state {
@@ -162,169 +119,33 @@ where SE: StorageEngine + Send + Sync + 'static
             .await
     }
 
-    /// Create the system root on a durable node.
-    pub async fn create(&self) -> Result<()> {
-        if !self.0.durable {
-            return Err(anyhow!("Only durable nodes can create a new system"));
-        }
-
-        self.wait_loaded().await?;
-        let _root_write = self.0.root_write.lock().await;
-        self.check_not_halted()?;
-
-        {
-            let items = self.0.items.read().unwrap();
-            if !items.is_empty() {
-                return Err(anyhow!("System root already exists"));
-            }
-        }
-
-        // TODO - see if we can use the Model derive macro for a SysCatalogItem model rather than doing this manually
-        let storage = self.0.storage.clone();
-
-        let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let pending = crate::entity::LocalTrxEntity::new(self.0.minter, self.0.entities.system_epoch(), alive);
-        pending.add_membership(proto::ModelId::System(proto::SystemModel::System))?;
-        // Cannot fail: `pending` is open, and `get_backend` creates a missing LWW backend.
-        let lww_backend = pending.get_backend::<LWWBackend>().expect("LWW Backend should exist");
-        lww_backend.set(PropertyId::System(proto::SystemProperty::Item), proto::sys::Item::SysRoot.into_value()?);
-
-        let mut events = pending.prepare_events()?;
-        let attested_event = &mut events[0];
-        let system_entity = crate::entity::RemoteTrxEntity::new(&attested_event.payload, self.0.entities.system_epoch())?;
-        let event_getter = LocalEventGetter::new(storage.clone(), true);
-        system_entity.apply_events(&event_getter, std::slice::from_mut(attested_event), |_| Ok(None)).await?;
-        let attested_state: Attested<EntityState> = EntityState { entity_id: system_entity.id(), state: system_entity.to_state()? }.into();
-        self.store_root(attested_state.clone(), events).await?;
-        let (system_entity, _) = system_entity.commit(&self.0.entities, &event_getter, false).await?.into_parts();
-
-        self.0.items.write().unwrap().push(system_entity);
-        *self.0.root.write().unwrap() = Some(attested_state);
-
-        self.mark_system_ready();
-
-        Ok(())
-    }
-
-    async fn store_root(&self, state: Attested<EntityState>, events: Vec<Attested<Event>>) -> Result<(), MutationError> {
-        let mut transaction = self.0.storage.transaction();
-        transaction.set_state(&proto::Clock::default(), &state).await?;
-        transaction.add_events(&events).await?;
-        // FIXME: need Into/From impl for StorageCommitOutcome to MutationError
-        match transaction.commit().await? {
-            StorageCommitOutcome::Committed(_) => Ok(()),
-            StorageCommitOutcome::Conflict { .. } => Err(MutationError::AlreadyExists),
-        }
-    }
-
-    /// Adopt a system once; a different system halts this node and optionally wipes its storage.
-    pub async fn adopt_system(&self, state: Attested<EntityState>) -> Result<(), PeerConnectionError> {
-        self.wait_loaded().await?;
-        if self.0.durable {
-            return Err(PeerConnectionError::InvalidSystem("durable nodes create their own system".into()));
-        }
-        if !state.payload.state.memberships.contains(&ModelId::System(proto::SystemModel::System)) || state.payload.state.head.is_empty() {
-            return Err(PeerConnectionError::InvalidSystem("expected a materialized system root".into()));
-        }
-        let candidate = crate::entity::TemporaryEntity::new(state.payload.entity_id, &state.payload.state)
-            .map_err(|error| PeerConnectionError::InvalidSystem(error.to_string()))?;
-        let item = proto::sys::Item::from_value(crate::selection::filter::Filterable::value(
-            &candidate,
-            &PropertyId::System(proto::SystemProperty::Item),
-        ))
-        .map_err(|error| PeerConnectionError::InvalidSystem(error.to_string()))?;
-        if !matches!(item, proto::sys::Item::SysRoot) {
-            return Err(PeerConnectionError::InvalidSystem("expected a system root item".into()));
-        }
-
-        let root_write = self.0.root_write.clone().lock_owned().await;
-        self.check_not_halted()?;
-        if let Some(current) = self.root_id() {
-            let offered = state.payload.entity_id;
-            if current == offered {
-                self.mark_system_ready();
-                return Ok(());
-            }
-            let reset = self.0.allow_system_replacement.load(Ordering::Acquire);
-            let reason = self.halt(NodeHaltReason::SystemReplacement { current, proposed: offered });
-            drop(root_write);
-            if reset {
-                let system = self.clone();
-                let (finished, completion) = tokio::sync::oneshot::channel();
-                // Halting can cancel the connection; the storage wipe must finish independently.
-                crate::task::spawn(async move {
-                    let result = system.hard_reset().await.map_err(|error| PeerConnectionError::SystemReset(error.to_string()));
-                    if let Err(error) = &result {
-                        tracing::error!(%error, "System replacement storage wipe failed");
-                    }
-                    let _ = finished.send(result);
-                });
-                completion.await.expect("system reset task panicked")?;
-            }
-            return Err(reason.into());
-        }
-
-        // Finish initial adoption even if its connection is canceled.
+    /// Halt with [`NodeHaltReason::LocalReset`], then delete everything in local storage.
+    /// The wipe runs in its own task, so it finishes even if the caller stops waiting.
+    pub(crate) async fn reset_local_storage(&self) -> Result<()> {
+        self.halt(NodeHaltReason::LocalReset);
         let system = self.clone();
         let (finished, completion) = tokio::sync::oneshot::channel();
         crate::task::spawn(async move {
-            let result = system.store_root(state.clone(), Vec::new()).await;
-            if result.is_ok() {
-                *system.0.root.write().unwrap() = Some(state);
-                system.mark_system_ready();
-            }
-            drop(root_write);
-            let result = match result {
-                Ok(_) => Ok(()),
-                Err(error) => Err(system.halt(NodeHaltReason::SystemLoad(error.to_string())).into()),
-            };
-            let _ = finished.send(result);
+            let _ = finished.send(system.wipe_local_storage().await);
         });
-        completion.await.expect("system adoption task panicked")
+        // Cannot fail in practice: the task always sends before it ends, and it does not panic.
+        completion.await.expect("local storage wipe task ended without reporting")
     }
 
-    /// Delete persisted entities, events and materializations, and clear local system metadata.
-    /// Does not restart the node or reset its reactor/livequeries.
-    /// Stop outstanding storage work before wiping; await completion before reusing the store.
-    pub async fn hard_reset(&self) -> Result<()> {
+    /// Delete persisted entities, events and materializations, and clear the loaded items.
+    async fn wipe_local_storage(&self) -> Result<()> {
         self.0.storage.delete_all().await?;
         self.0.items.write().unwrap().clear();
-        *self.0.root.write().unwrap() = None;
         *self.0.system_ready.write().unwrap() = false;
         Ok(())
     }
 
-    /// Whether the persisted system root and items have loaded; independent of schema catalog readiness.
-    pub fn is_loaded(&self) -> bool { self.0.loaded.get().is_some() }
-
-    /// Wait for local system loading, or return the node's terminal halt.
-    pub async fn wait_loaded(&self) -> Result<(), NodeHaltReason> {
-        loop {
-            let notified = self.0.loading.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            self.check_not_halted()?;
-            if self.is_loaded() {
-                return Ok(());
-            }
-
-            notified.await;
-        }
-    }
-
-    async fn load_system_catalog(&self) -> Result<()> {
-        if self.is_loaded() {
-            return Err(anyhow!("System catalog already loaded"));
-        }
-
+    async fn load_system_items(&self) -> Result<()> {
         let storage = self.0.storage.clone();
-
-        let mut entities = Vec::new();
-        let mut root_state = None;
-
         let state_getter = LocalStateGetter::new(storage.clone());
         let event_getter = LocalEventGetter::new(storage.clone(), self.0.durable);
 
+        let mut entities = Vec::new();
         for state in storage
             .fetch_states(&ankql::ast::Selection {
                 predicate: ankql::ast::Predicate::MemberOf(ModelId::System(proto::SystemModel::System)),
@@ -335,36 +156,9 @@ where SE: StorageEngine + Send + Sync + 'static
         {
             let (_entity_changed, entity) =
                 self.0.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state.clone()).await?;
-            let item = proto::sys::Item::from_value(entity.property_value(&PropertyId::System(proto::SystemProperty::Item))?)?;
-            if let proto::sys::Item::SysRoot = &item {
-                if state.payload.state.head.is_empty() {
-                    return Err(anyhow!("persisted system root has no head"));
-                }
-                if root_state.is_some() {
-                    return Err(anyhow!("multiple persisted system roots"));
-                }
-                root_state = Some(state);
-            }
             entities.push(entity);
         }
-
-        {
-            let mut items = self.0.items.write().unwrap();
-            items.extend(entities);
-        }
-
-        let has_root = root_state.is_some();
-        {
-            let mut root = self.0.root.write().expect("Root lock poisoned");
-            *root = root_state;
-        }
-
-        if has_root {
-            self.mark_system_ready();
-        }
-
-        self.0.loaded.set(has_root).expect("Loading flag already set");
-        self.0.loading.notify_waiters();
+        self.0.items.write().unwrap().extend(entities);
         Ok(())
     }
 }
@@ -372,102 +166,30 @@ where SE: StorageEngine + Send + Sync + 'static
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{node::Node, policy::PermissiveAgent, storage::StorageEngine, test_utils::TestStorage};
+    use crate::{node::Node, policy::PermissiveAgent, test_utils::TestStorage};
 
     #[tokio::test]
-    async fn adoption_waits_for_the_initial_persisted_root_load() {
-        let storage = Arc::new(TestStorage::default());
-        let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-        seed.system.create().await.unwrap();
-        let root = seed.system.root_id().unwrap();
-        drop(seed);
-
-        let (entered, entered_rx) = tokio::sync::oneshot::channel();
-        let (release, release_rx) = tokio::sync::oneshot::channel();
-        storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::System), (entered, release_rx));
-        let offered = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        offered.system.create().await.unwrap();
-        let node = Node::new(storage.clone(), PermissiveAgent::new());
-        entered_rx.await.unwrap();
-        let adoption = node.system.adopt_system(offered.system.root().unwrap());
-        tokio::pin!(adoption);
-        assert!(futures::poll!(&mut adoption).is_pending());
-        release.send(()).unwrap();
-        let error = tokio::time::timeout(std::time::Duration::from_secs(2), adoption).await.unwrap().unwrap_err();
-        assert!(matches!(error, PeerConnectionError::NodeHalted(NodeHaltReason::SystemReplacement { current, .. }) if current == root));
-        assert!(node.system.is_loaded());
-        assert!(!node.system.is_system_ready());
-        assert_eq!(node.system.root_id(), Some(root));
-        assert!(node.state().value().halt_reason().is_some());
-        assert!(storage.get_state(root).await.is_ok());
+    async fn an_ephemeral_node_loads_its_system_without_any_peer() {
+        let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+        tokio::time::timeout(std::time::Duration::from_secs(2), node.system.wait_system_ready()).await.unwrap().unwrap();
+        assert!(node.system.is_system_ready());
+        assert!(node.system.system_epoch().is_some());
     }
 
     #[tokio::test]
-    async fn cancelled_connection_does_not_cancel_the_storage_wipe() {
-        let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        server.system.create().await.unwrap();
+    async fn an_unreadable_persisted_system_item_fails_readiness_instead_of_hanging() {
         let storage = Arc::new(TestStorage::default());
-        let client = Node::new(storage.clone(), PermissiveAgent::new());
-        client.system.adopt_system(server.system.root().unwrap()).await.unwrap();
-        let replacement = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        replacement.system.create().await.unwrap();
-        client.set_allow_system_replacement(true);
-
-        let mut adoption = Box::pin(client.system.adopt_system(replacement.system.root().unwrap()));
-        assert!(futures::poll!(&mut adoption).is_pending());
-        assert!(client.state().value().halt_reason().is_some());
-        drop(adoption);
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while client.system.root_id().is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let reopened = Node::new(storage, PermissiveAgent::new());
-        reopened.system.wait_loaded().await.unwrap();
-        assert!(reopened.system.root_id().is_none());
-        reopened.system.adopt_system(replacement.system.root().unwrap()).await.unwrap();
-        assert_eq!(reopened.system.root_id(), replacement.system.root_id());
-    }
-
-    #[tokio::test]
-    async fn unreadable_persisted_root_fails_readiness_instead_of_hanging() {
-        let storage = Arc::new(TestStorage::default());
-        let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-        seed.system.create().await.unwrap();
-        let mut root = seed.system.root().unwrap();
-        root.payload.state.state_buffers.0.insert("lww".into(), vec![0xff]);
-        storage.set_state(root);
-        drop(seed);
+        let state = proto::State {
+            state_buffers: proto::StateBuffers([("lww".to_owned(), vec![0xff])].into()),
+            memberships: [ModelId::System(proto::SystemModel::System)].into(),
+            head: proto::Clock::genesis(proto::EventId::from_bytes([1; 32])),
+        };
+        storage.set_state(proto::EntityState { entity_id: proto::EntityId::from_bytes([2; 32]), state }.into());
 
         let node = Node::new_durable(storage, PermissiveAgent::new());
         let error = tokio::time::timeout(std::time::Duration::from_secs(2), node.system.wait_system_ready()).await.unwrap().unwrap_err();
         assert!(matches!(error, NodeHaltReason::SystemLoad(_)));
-        assert_eq!(node.context_async(crate::policy::DEFAULT_CONTEXT).await.err(), Some(error.clone().into()));
-        assert_eq!(node.system.wait_loaded().await, Err(error));
-    }
-
-    #[tokio::test]
-    async fn cancelled_connection_does_not_leave_a_half_adopted_system() {
-        let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        server.system.create().await.unwrap();
-        let storage = Arc::new(TestStorage::default());
-        let client = Node::new(storage.clone(), PermissiveAgent::new());
-        client.system.wait_loaded().await.unwrap();
-        let (entered, entered_rx) = tokio::sync::oneshot::channel();
-        let (release, release_rx) = tokio::sync::oneshot::channel();
-        *storage.hold_commit.lock().unwrap() = Some((entered, release_rx));
-
-        let mut adoption = Box::pin(client.system.adopt_system(server.system.root().unwrap()));
-        assert!(futures::poll!(&mut adoption).is_pending());
-        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
-        drop(adoption);
-        release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), client.system.wait_system_ready()).await.unwrap().unwrap();
-        assert_eq!(client.system.root_id(), server.system.root_id());
-        assert!(storage.get_state(server.system.root_id().unwrap()).await.is_ok());
-        assert!(client.state().value().halt_reason().is_none());
+        assert_eq!(node.context_async(crate::policy::DEFAULT_CONTEXT).await.err(), Some(error.into()));
     }
 }
 

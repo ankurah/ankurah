@@ -765,7 +765,7 @@ async fn check_schema_registration_gates_creates() -> anyhow::Result<()> {
         })),
     };
     let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_forbidden.clone());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), deny_forbidden);
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();
@@ -808,7 +808,7 @@ async fn policy_verb_skipped_on_noop_reregistration() -> anyhow::Result<()> {
         }
     };
     let server = Node::new_durable(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), counting.clone());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(std::sync::Arc::new(SledStorageEngine::new_test().unwrap()), counting);
     let _conn = LocalProcessConnection::new(&server, &client).await?;
     client.system.wait_system_ready().await.unwrap();

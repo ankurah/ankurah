@@ -214,9 +214,8 @@ where
                         }
                         match state {
                             Connection::Initial { sender, challenge, .. } => {
-                                // Local system storage within the deadline: on a durable node it is
-                                // all that registration waits for.
-                                match tokio::time::timeout_at(handshake_deadline, node.system.wait_loaded()).await {
+                                // The local system load within the deadline: it is all that registration waits for.
+                                match tokio::time::timeout_at(handshake_deadline, node.system.wait_system_ready()).await {
                                     Ok(Ok(())) => {}
                                     Ok(Err(error)) => {
                                         warn!("Cannot admit websocket peer at {client_ip}: {error}");

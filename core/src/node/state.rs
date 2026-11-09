@@ -3,9 +3,9 @@ use crate::error::{NodeHaltReason, NodeReadinessError};
 /// A node's initialization and terminal lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NodeState {
-    /// No system has been created, adopted, or restored yet; connections are allowed.
+    /// The local system has not loaded yet; connections are allowed.
     Uninitialized,
-    /// The system is established; catalog or policy initialization is still in progress.
+    /// The local system has loaded; catalog or policy initialization is still in progress.
     Startup,
     /// System, catalog, and policy initialization are complete; connectivity is independent.
     Running,

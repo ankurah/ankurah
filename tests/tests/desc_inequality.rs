@@ -87,7 +87,6 @@ const TIMESTAMP_STEP: i64 = 1000;
 
 async fn setup() -> Result<Context> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    node.system.create().await?;
     Ok(node.context_async(DEFAULT_CONTEXT).await?)
 }
 

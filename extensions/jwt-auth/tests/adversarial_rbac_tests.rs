@@ -26,7 +26,6 @@ async fn test_reader_cannot_write_post_via_ephemeral() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node1.system.create().await?;
     agent.set_policy(&node1, &agent.config()).await?;
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
@@ -84,7 +83,6 @@ async fn test_nouser_cannot_write_anything() -> anyhow::Result<()> {
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let ctx = JwtContext::NoUser;
@@ -109,7 +107,6 @@ async fn test_root_context_cannot_be_sent_over_wire() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node1.system.create().await?;
     agent.set_policy(&node1, &agent.config()).await?;
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
@@ -144,7 +141,6 @@ async fn test_non_privileged_cannot_write_policy_records() -> anyhow::Result<()>
 
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let admin_claims = make_claims("admin-1", &["Admin"], "admin@blog.com");

@@ -162,7 +162,6 @@ Example: with `claims.sub = "user123"`, the filter `"assigned_to = $jwt.sub"` is
 let keys = SigningKeys::generate()?;  // or SigningKeys::from_pem(pem)
 let agent = JwtAgent::new_durable(keys, "path/to/policy.json")?;
 let node = Node::new_durable(storage, agent.clone());
-node.system.create().await?;
 agent.set_policy(&node, &agent.config()).await?;  // or agent.set_policy_from_file(&node, path)
 node.wait_ready().await?;
 ```

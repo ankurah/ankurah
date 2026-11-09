@@ -57,7 +57,9 @@ where
         if let Some(system) = schema.system {
             return Ok((proto::ModelId::System(system), node.entities.system_epoch()));
         }
-        let epoch = node.system.system_epoch().ok_or(RegistrationError::SystemNotReady)?;
+        // The local system load is transient at startup, so registration waits it out rather than failing.
+        node.system.wait_system_ready().await?;
+        let epoch = node.system.require_system_ready()?;
         if schema.resolved.get(epoch).is_err() {
             let mut registrant = schema.registrant(epoch);
             let auth = match &self.auth {
@@ -145,10 +147,17 @@ where
         };
         let context = ContextInner { node: NodeHandle::Weak(node.weak()), auth: ContextAuth::Sessions(sessions) };
         let system = node.system.clone();
+        let catalog = node.catalog.clone();
 
         Box::pin(async move {
-            if system.system_epoch().is_none() {
-                system.wait_system_ready().await?;
+            system.wait_system_ready().await?;
+            // A user model waits for the catalog without holding the node: an ephemeral node's catalog
+            // waits for a durable peer. The catalog's own queries are over system models and need no catalog.
+            if schema.system.is_none() {
+                tokio::select! {
+                    () = catalog.wait_ready() => {}
+                    reason = system.wait_halted() => return Err(reason.into()),
+                }
             }
 
             context.ensure_registered(schema).await?;

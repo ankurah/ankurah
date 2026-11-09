@@ -77,7 +77,7 @@ where
                 .register_peer(presence, challenge2, provenance2, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }))
                 .await
         };
-        // The dialing side registers first, so an ephemeral node adopts before advertising its own system.
+        // The dialing side registers its peer first, as a websocket client registers the server before sending its presence.
         if node2_dials {
             register_node2.await?;
             if let Err(error) = register_node1.await {

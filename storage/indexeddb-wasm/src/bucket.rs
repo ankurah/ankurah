@@ -132,7 +132,7 @@ fn decode_property_column_row(prefix: &str, key: &str, column: PropertyColumn) -
     Ok((property_id, column))
 }
 
-fn materialization_entity_key(materialization_name: &str, entity_id: proto::EntityId) -> String {
+pub(crate) fn materialization_entity_key(materialization_name: &str, entity_id: proto::EntityId) -> String {
     format!("{materialization_name}\0{}", entity_id.to_base64())
 }
 

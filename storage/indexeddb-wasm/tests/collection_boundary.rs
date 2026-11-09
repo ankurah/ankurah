@@ -26,7 +26,6 @@ async fn catalog_get_cannot_relabel_a_nonresident_private_entity() -> anyhow::Re
     let engine = Arc::new(IndexedDBStorageEngine::open(&name).await?);
     {
         let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-        node.system.create().await?;
         node.wait_ready().await?;
         let context = node.context(DEFAULT_CONTEXT)?;
         let private_id = {

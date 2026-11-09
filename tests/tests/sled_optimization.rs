@@ -20,7 +20,6 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Setup
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
-    node.system.create().await?;
     let context = node.context_async(c).await.unwrap();
 
     // Create multiple entities
@@ -95,7 +94,6 @@ async fn test_id_range_with_where_clause() -> Result<()> {
 
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
-    node.system.create().await?;
     let context = node.context_async(c).await.unwrap();
 
     // Create several entities
@@ -152,7 +150,6 @@ async fn test_id_range_with_where_clause() -> Result<()> {
 async fn test_negated_residual_is_filtered_before_limit() -> Result<()> {
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let context = node.context_async(c).await.unwrap();
 
     let trx = context.begin();

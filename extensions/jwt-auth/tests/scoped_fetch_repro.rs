@@ -65,7 +65,6 @@ async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
     server_agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
     server_agent.set_keys(JwtKeys::Signing(keys.clone()));
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), server_agent.clone());
-    server.system.create().await?;
     server_agent.set_policy(&server, &server_agent.config()).await?;
 
     let root = server.context_async(JwtContext::system()).await?;

@@ -59,9 +59,6 @@ pub async fn create_test_context(db_name: &str) -> Result<Context, JsValue> {
     let storage = IndexedDBStorageEngine::open(db_name).await.map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-
-    node.system.create().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-
     node.context_async(DEFAULT_CONTEXT).await.map_err(|e| JsValue::from_str(&e.to_string()))
 }
 

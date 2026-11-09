@@ -33,7 +33,6 @@ pub struct RegistrationRecord {
 async fn setup() -> anyhow::Result<TestNode> {
     let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
     node.wait_ready().await?;
     Ok(node)
@@ -229,7 +228,6 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
         agent.update_config(serde_json::from_str(config)?);
         let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-        server.system.create().await?;
         agent.set_policy(&server, &agent.config()).await?;
         let agent = JwtAgent::new_durable(common::test_keys(), common::blog_config_path())?;
         agent.update_config(serde_json::from_str(config)?);

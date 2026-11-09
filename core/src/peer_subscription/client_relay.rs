@@ -502,7 +502,6 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 // The peer stopped being durable; another one may serve the subscription.
                 RequestError::NotTrustedAsDurable(_) => true,
                 RequestError::ConnectionLost => true,
-                RequestError::SystemNotReady => true,
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
                 RequestError::ServerError(_) => false,
@@ -573,7 +572,7 @@ where
         version: u32,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
-        node.system.system_epoch().ok_or(RequestError::SystemNotReady)?;
+        node.system.require_system_ready().map_err(RequestError::from)?;
 
         // 1. Pre-fetch known_matches from local storage
         let known_matches: Vec<ankurah_proto::KnownEntity> = node
@@ -1182,7 +1181,6 @@ mod tests {
         }
 
         let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        server.system.create().await.unwrap();
         let storage = Arc::new(TestStorage::default());
         let client = Node::new(storage.clone(), PermissiveAgent::new());
         let challenge = client.issue_challenge();

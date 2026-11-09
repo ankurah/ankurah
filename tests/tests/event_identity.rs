@@ -19,7 +19,7 @@ type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
 async fn durable_node() -> Result<TestNode> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     Ok(node)
 }
 
@@ -149,7 +149,7 @@ async fn typed_creation_includes_its_model_membership() -> Result<()> {
 #[tokio::test]
 async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     // Record every event the client relays to the server. The filter returns
@@ -191,13 +191,15 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
     Ok(())
 }
 
-/// A genesis names the identity that minted it, which a transaction takes
-/// from its node. The minter is inside the genesis id, so the id a caller
-/// holds commits to the node that created the entity.
+/// Minting needs nothing but the node's key: a node that has never connected
+/// to any peer creates an entity, and the genesis names that node as its
+/// minter. The minter is inside the genesis id, so the id a caller holds
+/// commits to the node that created the entity.
 #[tokio::test]
-async fn a_genesis_names_the_node_that_minted_it() -> Result<()> {
+async fn a_node_that_has_never_connected_mints_under_its_own_identity() -> Result<()> {
     let node = durable_node().await?;
     let ctx = node.context_async(c).await?;
+    assert!(node.get_durable_peers().is_empty(), "this node has never connected");
 
     let trx = ctx.begin();
     let id = trx.create(&Album { name: "Ascension".to_owned(), year: "1966".to_owned() }).await?.id();

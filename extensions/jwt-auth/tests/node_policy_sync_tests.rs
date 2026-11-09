@@ -27,7 +27,6 @@ async fn test_ephemeral_receives_policy_via_livequery() -> anyhow::Result<()> {
     // Create durable node with full agent
     let durable_agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), durable_agent.clone());
-    node1.system.create().await?;
     durable_agent.set_policy(&node1, &durable_agent.config()).await?;
 
     let root_ctx = node1.context_async(JwtContext::system()).await?;
