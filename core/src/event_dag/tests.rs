@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use crate::error::RetrievalError;
-use crate::event_dag::EventLayer;
+use crate::event_dag::{EventLayer, LayerEvent};
 use crate::property::backend::lww::LWWBackend;
 use crate::property::backend::PropertyBackend;
 use crate::retrieval::GetEvents;
@@ -17,7 +17,7 @@ fn prop(name: &str) -> ankurah_proto::PropertyId {
 
 use super::comparison::compare;
 use super::relation::AbstractCausalRelation;
-use ankurah_proto::{Clock, EntityId, Event, EventId, EventStructureError, OperationSet};
+use ankurah_proto::{CarriedOperations, Clock, EntityId, Event, EventId, EventStructureError, OperationSet};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -62,6 +62,7 @@ impl GetEvents for MockRetriever {
 /// does not satisfy `Event::validate_structure`. Nothing on the paths under
 /// test consults it: lineage comparison sees only ids and parent clocks.
 fn fixture_body(nonce_seed: &[u8], parent: &Clock, operations: OperationSet) -> ankurah_proto::EventBody {
+    let operations = CarriedOperations::encode(&operations);
     let mut nonce = [0u8; 32];
     nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
     if parent.is_empty() {
@@ -129,7 +130,7 @@ fn make_lww_event(seed: u8, properties: Vec<(&str, &str)>) -> Event {
 fn make_lww_event_with_parent(retriever: &MockRetriever, seed: u8, properties: Vec<(&str, &str)>, parent_ids: &[EventId]) -> Event {
     let event = make_lww_event(seed, properties);
     let parent = retriever.clock(parent_ids);
-    Event { body: fixture_body(&[seed], &parent, event.operations().clone()), parent, ..event }
+    Event { body: fixture_body(&[seed], &parent, event.operations().decode().unwrap()), parent, ..event }
 }
 
 fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event], context_events: &[&Event]) -> EventLayer {
@@ -143,6 +144,9 @@ fn layer_from_refs_with_context(already_applied: &[&Event], to_apply: &[&Event],
 fn layer_from_refs(already_applied: &[&Event], to_apply: &[&Event]) -> EventLayer {
     layer_from_refs_with_context(already_applied, to_apply, &[])
 }
+
+/// The events a layer holds, without the operations read from them.
+fn layer_events(entries: &[LayerEvent]) -> Vec<Event> { entries.iter().map(|entry| entry.event.clone()).collect() }
 
 // ============================================================================
 // BASIC COMPARISON TESTS
@@ -2085,10 +2089,10 @@ mod phase4_mixed_parent_merge {
         let mut all_event_ids: Vec<EventId> = Vec::new();
         for layer in all_layers {
             for e in &layer.already_applied {
-                all_event_ids.push(e.id());
+                all_event_ids.push(e.event.id());
             }
             for e in &layer.to_apply {
-                all_event_ids.push(e.id());
+                all_event_ids.push(e.event.id());
             }
         }
 
@@ -2101,28 +2105,28 @@ mod phase4_mixed_parent_merge {
         // E must appear in a later layer than both C and G
         let e_layer_idx = all_layers
             .iter()
-            .position(|l| l.to_apply.iter().any(|ev| ev.id() == id_e) || l.already_applied.iter().any(|ev| ev.id() == id_e))
+            .position(|l| l.to_apply.iter().any(|ev| ev.event.id() == id_e) || l.already_applied.iter().any(|ev| ev.event.id() == id_e))
             .expect("E must appear in some layer");
 
         let g_layer_idx = all_layers
             .iter()
-            .position(|l| l.to_apply.iter().any(|ev| ev.id() == id_g) || l.already_applied.iter().any(|ev| ev.id() == id_g))
+            .position(|l| l.to_apply.iter().any(|ev| ev.event.id() == id_g) || l.already_applied.iter().any(|ev| ev.event.id() == id_g))
             .expect("G must appear in some layer");
 
         let c_layer_idx = all_layers
             .iter()
-            .position(|l| l.to_apply.iter().any(|ev| ev.id() == id_c) || l.already_applied.iter().any(|ev| ev.id() == id_c))
+            .position(|l| l.to_apply.iter().any(|ev| ev.event.id() == id_c) || l.already_applied.iter().any(|ev| ev.event.id() == id_c))
             .expect("C must appear in some layer");
 
         assert!(e_layer_idx > g_layer_idx, "Merge event E (layer {}) must be after G (layer {})", e_layer_idx, g_layer_idx);
         assert!(e_layer_idx > c_layer_idx, "Merge event E (layer {}) must be after C (layer {})", e_layer_idx, c_layer_idx);
 
         // B should be in already_applied (it's in current head ancestry)
-        let b_in_already = all_layers.iter().any(|l| l.already_applied.iter().any(|ev| ev.id() == id_b));
+        let b_in_already = all_layers.iter().any(|l| l.already_applied.iter().any(|ev| ev.event.id() == id_b));
         assert!(b_in_already, "B should be in already_applied (current head ancestry)");
 
         // G should be in to_apply (it's NOT in current head ancestry)
-        let g_in_to_apply = all_layers.iter().any(|l| l.to_apply.iter().any(|ev| ev.id() == id_g));
+        let g_in_to_apply = all_layers.iter().any(|l| l.to_apply.iter().any(|ev| ev.event.id() == id_g));
         assert!(g_in_to_apply, "G should be in to_apply (not in current head ancestry)");
     }
 }
@@ -3258,8 +3262,8 @@ mod generation_comparison {
         let layers = EventLayers::load(accumulator, vec![head.id()], vec![head.id()], &[&head, &first, &last]).await.unwrap();
         assert_eq!(layers.per_event().map(|layers| layers.len()).collect::<Vec<_>>(), vec![0, 1, 1]);
         let [first_layer, last_layer] = layers.layers() else { panic!("expected the two new writes") };
-        assert_eq!(first_layer.to_apply, vec![first.clone()]);
-        assert_eq!(last_layer.to_apply, vec![last.clone()]);
+        assert_eq!(layer_events(&first_layer.to_apply), vec![first.clone()]);
+        assert_eq!(layer_events(&last_layer.to_apply), vec![last.clone()]);
         assert!(first_layer.already_applied.is_empty());
         assert!(last_layer.already_applied.is_empty());
         assert_eq!(last_layer.compare(&last.id(), &root.id()), CausalRelation::Descends);
@@ -3321,7 +3325,7 @@ mod generation_comparison {
         let layers = EventLayers::prepare(&retriever, &[&incoming], &Clock::from_events([&left, &right])).await.unwrap();
         let [layer] = layers.layers() else { panic!("expected one layer") };
         assert!(layer.already_applied.is_empty());
-        assert_eq!(layer.to_apply, vec![incoming.clone()]);
+        assert_eq!(layer_events(&layer.to_apply), vec![incoming.clone()]);
         assert_eq!(layer.compare(&incoming.id(), &left.id()), CausalRelation::Descends);
         assert_eq!(layer.compare(&incoming.id(), &right.id()), CausalRelation::Descends);
         assert_eq!(retriever.reads(), 1, "only the staged incoming event was read");
@@ -3338,7 +3342,7 @@ mod generation_comparison {
         let layers = EventLayers::prepare(&retriever, &[&genesis], &Clock::default()).await.unwrap();
         let [layer] = layers.layers() else { panic!("expected one layer") };
         assert!(layer.already_applied.is_empty());
-        assert_eq!(layer.to_apply, vec![genesis]);
+        assert_eq!(layer_events(&layer.to_apply), vec![genesis]);
         assert_eq!(retriever.reads(), 1);
     }
 

@@ -10,10 +10,12 @@ pub enum InadmissibleEvent {
     MissingGenesisMembership,
 }
 
-/// Require a genesis to establish at least one membership; updates need not add any.
-pub(crate) fn check_genesis_membership(event: &proto::Event) -> Result<(), InadmissibleEvent> {
-    if event.is_entity_create() && event.operations().memberships().next().is_none() {
-        return Err(InadmissibleEvent::MissingGenesisMembership);
+/// Require that this build can read every operation `event` carries, and that a genesis establishes at least one
+/// membership; updates need not add any.
+pub(crate) fn check_operations(event: &proto::Event) -> Result<(), MutationError> {
+    let operations = event.operations().decode()?;
+    if event.is_entity_create() && operations.memberships().next().is_none() {
+        return Err(InadmissibleEvent::MissingGenesisMembership.into());
     }
     Ok(())
 }

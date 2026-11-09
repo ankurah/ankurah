@@ -1,6 +1,6 @@
 use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
-use crate::node::{attestation, event_admissibility::check_genesis_membership};
+use crate::node::{attestation, event_admissibility::check_operations};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -66,7 +66,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         // Clear only on success, so errors and dropped futures leave the transaction poisoned.
         self.failed = true;
         event.payload.validate_structure()?;
-        check_genesis_membership(&event.payload)?;
+        check_operations(&event.payload)?;
         let entity = self.get_entity(&event.payload).await?;
         let expected_head = entity.head();
 

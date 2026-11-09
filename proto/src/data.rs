@@ -3,7 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, domain_tag::DomainTag, id::EntityId, identity::Identity, AttestationSet, DecodeError};
+use crate::{
+    auth::Attested,
+    clock::Clock,
+    domain_tag::DomainTag,
+    id::EntityId,
+    identity::Identity,
+    operation::{CarriedOperations, OperationSet},
+    AttestationSet, DecodeError,
+};
 use ankurah_core_types::ModelId;
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
@@ -14,32 +22,35 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// The id of a genesis event: `SHA-256(DomainTag::Genesis || bincode(minter,
-    /// nonce, timestamp, operations))`. The minter and the memberships carried
-    /// in the operations are part of the entity's identity.
-    pub fn from_genesis_parts(minter: &Identity, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(DomainTag::Genesis.encoded());
-        hasher.update(bincode::serialize(minter).unwrap());
-        hasher.update(bincode::serialize(nonce).unwrap());
-        hasher.update(bincode::serialize(&timestamp).unwrap());
-        hasher.update(bincode::serialize(operations).unwrap());
-        Self(hasher.finalize().into())
+    /// The id of a genesis event: SHA-256 over [`DomainTag::Genesis`], then the
+    /// minter, nonce and timestamp, the operation count and each operation's
+    /// digest. The minter and the memberships carried in the operations are
+    /// part of the entity's identity.
+    pub fn from_genesis_parts(minter: &Identity, nonce: &[u8; 32], timestamp: u64, operations: &CarriedOperations) -> Self {
+        Self::from_preimage(DomainTag::Genesis, &(minter, nonce, timestamp, operations.digests()))
     }
 
-    /// The id of an update event: `SHA-256(DomainTag::Event || bincode(entity_id,
-    /// nonce, timestamp, operations, parent))`. Model projections stay outside
-    /// the canonical event and its identity. The nonce is what makes an event
-    /// id unguessable to anyone who was not sent the event.
-    pub fn from_update_parts(entity_id: &EntityId, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet, parent: &Clock) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(DomainTag::Event.encoded());
-        hasher.update(bincode::serialize(entity_id).unwrap());
-        hasher.update(bincode::serialize(nonce).unwrap());
-        hasher.update(bincode::serialize(&timestamp).unwrap());
-        hasher.update(bincode::serialize(operations).unwrap());
-        hasher.update(bincode::serialize(parent).unwrap());
-        Self(hasher.finalize().into())
+    /// The id of an update event: SHA-256 over [`DomainTag::Event`], then the
+    /// entity id, nonce and timestamp, the operation count and each operation's
+    /// digest, and the parent clock. Model projections stay outside the
+    /// canonical event and its identity. The nonce is what makes an event id
+    /// unguessable to anyone who was not sent the event.
+    pub fn from_update_parts(
+        entity_id: &EntityId,
+        nonce: &[u8; 32],
+        timestamp: u64,
+        operations: &CarriedOperations,
+        parent: &Clock,
+    ) -> Self {
+        Self::from_preimage(DomainTag::Event, &(entity_id, nonce, timestamp, operations.digests(), parent))
+    }
+
+    /// SHA-256 over `tag`, then the bincode of `fields`.
+    fn from_preimage(tag: DomainTag, fields: &impl Serialize) -> Self {
+        let mut preimage = tag.encoded();
+        // Cannot fail: bincode encodes every id field, and writing to a vector cannot fail.
+        bincode::serialize_into(&mut preimage, fields).expect("event id fields encode");
+        Self(Sha256::digest(&preimage).into())
     }
     pub fn to_base64(&self) -> String {
         use base64::{engine::general_purpose, Engine as _};
@@ -164,7 +175,7 @@ pub enum EventBody {
         /// creation-time signal for storage locality.
         timestamp: u64,
         /// The entity's initial property values and model memberships.
-        operations: OperationSet,
+        operations: CarriedOperations,
     },
     Update {
         /// Creator-random, drawn once when the event is minted. An event id
@@ -173,7 +184,7 @@ pub enum EventBody {
         /// Unix ms as the creator reported it. Advisory; see the genesis
         /// field of the same name.
         timestamp: u64,
-        operations: OperationSet,
+        operations: CarriedOperations,
     },
 }
 
@@ -195,6 +206,7 @@ impl Event {
     /// draw its nonce and timestamp, and derive the entity id from the whole
     /// of it. The id is the return value's `entity_id`.
     pub fn genesis(minter: Identity, operations: OperationSet) -> Self {
+        let operations = CarriedOperations::encode(&operations);
         let nonce = draw_nonce();
         let timestamp = crate::time::unix_ms_now();
         let entity_id: EntityId = EventId::from_genesis_parts(&minter, &nonce, timestamp, &operations).into();
@@ -203,13 +215,14 @@ impl Event {
 
     /// Mint an update extending `parent`, drawing its nonce and timestamp.
     pub fn update(entity_id: EntityId, parent: Clock, operations: OperationSet) -> Self {
+        let operations = CarriedOperations::encode(&operations);
         Event { entity_id, parent, body: EventBody::Update { nonce: draw_nonce(), timestamp: crate::time::unix_ms_now(), operations } }
     }
 
     pub fn is_entity_create(&self) -> bool { matches!(self.body, EventBody::Genesis { .. }) }
 
-    /// The event's operations, whichever shape carries them.
-    pub fn operations(&self) -> &OperationSet {
+    /// The operations the event carries, whichever shape carries them.
+    pub fn operations(&self) -> &CarriedOperations {
         match &self.body {
             EventBody::Genesis { operations, .. } | EventBody::Update { operations, .. } => operations,
         }
@@ -327,105 +340,6 @@ impl From<(EntityId, StateFragment)> for Attested<EntityState> {
     }
 }
 
-/// Ordered top-level mutations that make up one event's content-addressed
-/// payload.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
-pub struct OperationSet(pub Vec<Operation>);
-
-impl std::fmt::Display for OperationSet {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "OperationSet({})",
-            self.0
-                .iter()
-                .map(|operation| match operation {
-                    Operation::Backend { backend, operations } => {
-                        format!("{} => {}b", backend, operations.iter().map(|operation| operation.diff.len()).sum::<usize>())
-                    }
-                    Operation::Membership(Membership::Add(model)) => format!("membership +{model}"),
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        )
-    }
-}
-
-impl std::ops::Deref for OperationSet {
-    type Target = [Operation];
-    fn deref(&self) -> &Self::Target { &self.0 }
-}
-
-impl OperationSet {
-    /// Build the event-level operation sequence for backend-generated diffs.
-    ///
-    /// The input map's stable ordering gives locally generated events a
-    /// deterministic operation order.
-    pub fn from_backends(backends: BTreeMap<String, Vec<BackendOperation>>) -> Self {
-        Self(backends.into_iter().map(|(backend, operations)| Operation::Backend { backend, operations }).collect())
-    }
-
-    /// Append one event-level operation.
-    pub fn push(&mut self, operation: Operation) { self.0.push(operation); }
-
-    /// Iterate backend operation batches in event order.
-    pub fn backends(&self) -> impl Iterator<Item = (&str, &[BackendOperation])> {
-        self.0.iter().filter_map(|operation| match operation {
-            Operation::Backend { backend, operations } => Some((backend.as_str(), operations.as_slice())),
-            Operation::Membership(_) => None,
-        })
-    }
-
-    /// Iterate all backend diffs addressed to `backend`, preserving event
-    /// order even if an untrusted event contains more than one batch.
-    pub fn backend_operations<'a>(&'a self, backend: &'a str) -> impl Iterator<Item = &'a BackendOperation> {
-        self.0.iter().flat_map(move |operation| match operation {
-            Operation::Backend { backend: candidate, operations } if candidate == backend => operations.iter(),
-            Operation::Backend { .. } | Operation::Membership(_) => [].iter(),
-        })
-    }
-
-    /// Iterate explicit membership mutations in event order.
-    pub fn memberships(&self) -> impl Iterator<Item = &Membership> {
-        self.0.iter().filter_map(|operation| match operation {
-            Operation::Membership(membership) => Some(membership),
-            Operation::Backend { .. } => None,
-        })
-    }
-}
-
-/// A top-level mutation carried by an entity event.
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
-pub enum Operation {
-    /// Apply opaque diffs to one property backend.
-    Backend {
-        /// Registered property backend name.
-        backend: String,
-        /// Ordered opaque operations understood by that backend.
-        operations: Vec<BackendOperation>,
-    },
-    /// Change the entity's explicit model-backed membership state.
-    Membership(Membership),
-}
-
-/// An explicit mutation of an entity's model-backed membership state: which
-/// model an ENTITY belongs to, asserted in the attested event stream (the
-/// sole authority for that fact). Distinct from the catalog's
-/// model-property memberships, which are property-to-model records
-/// (`_ankurah_model_property`).
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum Membership {
-    /// Add the model-backed membership.
-    Add(ModelId),
-}
-
-/// An opaque operation generated and interpreted by a named property backend.
-#[derive(Debug, Serialize, Deserialize, Clone, Hash, Eq, PartialEq)]
-pub struct BackendOperation {
-    /// Opaque diff interpreted by the selected property backend.
-    pub diff: Vec<u8>,
-}
-
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct EntityState {
     pub entity_id: EntityId,
@@ -523,6 +437,7 @@ impl Attested<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation::{BackendOperation, CarriedOperation};
 
     #[test]
     fn test_event_id_json_serialization() {
@@ -551,38 +466,78 @@ mod tests {
         OperationSet::from_backends(BTreeMap::from([("lww".to_string(), vec![BackendOperation { diff: vec![1, 2, 3] }])]))
     }
 
+    fn carried() -> CarriedOperations { CarriedOperations::encode(&operations()) }
+
     fn minter() -> Identity { Identity::Ed25519([9u8; 32]) }
 
-    /// Both preimages, computed independently, byte for byte. Concatenating
-    /// the fields' bincode encodings is the same as encoding the tuple,
-    /// because bincode writes no framing between them.
+    /// Both preimages, computed independently, byte for byte: the tag, the
+    /// fields, the operation count and each operation's digest.
     ///
     /// The tags are written out here as literals rather than read from
     /// [`DomainTag`], so that a coordinated edit cannot change both sides of
     /// the comparison and still pass.
     #[test]
     fn derivation_preimages_match_the_spec() {
-        let genesis_tag: &[u8] = b"\x12ankurah.genesis.v1";
-        let event_tag: &[u8] = b"\x10ankurah.event.v1";
-
         let nonce = [3u8; 32];
         let timestamp = 1_720_000_000_123u64;
-        let operations = operations();
+        let operations = carried();
+        let CarriedOperation::Bytes(bytes) = &operations.0[0] else { unreachable!("an encoded operation carries its bytes") };
+        let digest: [u8; 32] = Sha256::digest([b"\x14ankurah.operation.v1".as_slice(), bytes].concat()).into();
+        let count_and_digests = [1u64.to_le_bytes().as_slice(), &digest].concat();
 
-        // The minter is the variant index, then the key bytes.
-        let minter_bytes = [0u32.to_le_bytes().as_slice(), &[9u8; 32]].concat();
-        let mut preimage = genesis_tag.to_vec();
-        preimage.extend(&minter_bytes);
-        preimage.extend(bincode::serialize(&(nonce, timestamp, operations.clone())).unwrap());
+        // The minter is its variant index, then the key bytes.
+        let preimage =
+            [b"\x12ankurah.genesis.v1".as_slice(), &0u32.to_le_bytes(), &[9u8; 32], &nonce, &timestamp.to_le_bytes(), &count_and_digests]
+                .concat();
         let expected: [u8; 32] = Sha256::digest(&preimage).into();
         assert_eq!(EventId::from_genesis_parts(&minter(), &nonce, timestamp, &operations), EventId::from_bytes(expected));
 
+        // The parent is its entry count, then each entry's generation and event id.
         let entity_id = EntityId::from_bytes([7u8; 32]);
         let parent = Clock::genesis(EventId::from_bytes([5u8; 32]));
-        let mut preimage = event_tag.to_vec();
-        preimage.extend(bincode::serialize(&(entity_id, nonce, timestamp, operations.clone(), parent.clone())).unwrap());
+        let preimage = [
+            b"\x10ankurah.event.v1".as_slice(),
+            &[7u8; 32],
+            &nonce,
+            &timestamp.to_le_bytes(),
+            &count_and_digests,
+            &1u64.to_le_bytes(),
+            &1u32.to_le_bytes(),
+            &[5u8; 32],
+        ]
+        .concat();
         let expected: [u8; 32] = Sha256::digest(&preimage).into();
         assert_eq!(EventId::from_update_parts(&entity_id, &nonce, timestamp, &operations, &parent), EventId::from_bytes(expected));
+    }
+
+    /// An event's id covers each operation's digest and not its bytes, so an
+    /// operation whose bytes are replaced by their digest leaves the id unchanged.
+    #[test]
+    fn erasing_an_operation_leaves_the_event_id_unchanged() {
+        let genesis = Event::genesis(minter(), operations());
+        let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), operations());
+        for event in [genesis, update] {
+            let mut erased = event.clone();
+            let (EventBody::Genesis { operations, .. } | EventBody::Update { operations, .. }) = &mut erased.body;
+            operations.0[0] = CarriedOperation::Erased(operations.0[0].digest());
+            assert_ne!(erased.body, event.body);
+            assert_eq!(erased.id(), event.id());
+            erased.validate_structure().expect("an erased operation leaves the event well formed");
+        }
+    }
+
+    /// An operation of a kind this build does not know still has a digest, so the
+    /// event that carries it still derives its id and passes structural validation.
+    #[test]
+    fn an_event_holding_an_operation_of_an_unknown_kind_derives_its_id() {
+        // Variant index 2, which no build of `Operation` defines yet.
+        let operations = CarriedOperations(vec![CarriedOperation::Bytes(vec![2, 0, 0, 0, 7])]);
+        let nonce = [6u8; 32];
+        let entity_id = EventId::from_genesis_parts(&minter(), &nonce, 0, &operations).into();
+        let genesis =
+            Event { entity_id, parent: Clock::default(), body: EventBody::Genesis { minter: minter(), nonce, timestamp: 0, operations } };
+        genesis.validate_structure().expect("the genesis derives the id it names");
+        assert!(genesis.operations().decode().is_err());
     }
 
     /// The two tags keep the two preimage shapes apart even when every hashed
@@ -591,7 +546,7 @@ mod tests {
     fn the_two_preimage_shapes_never_collide() {
         let nonce = [1u8; 32];
         let timestamp = 42u64;
-        let operations = operations();
+        let operations = carried();
         let genesis = EventId::from_genesis_parts(&Identity::Ed25519([0u8; 32]), &nonce, timestamp, &operations);
         let update = EventId::from_update_parts(&EntityId::from_bytes([0u8; 32]), &nonce, timestamp, &operations, &Clock::default());
         assert_ne!(genesis, update);
@@ -604,12 +559,13 @@ mod tests {
     fn the_minter_is_inside_the_genesis_id() {
         let nonce = [4u8; 32];
         let timestamp = 7u64;
-        let operations = operations();
+        let carried = carried();
         assert_ne!(
-            EventId::from_genesis_parts(&Identity::Ed25519([1u8; 32]), &nonce, timestamp, &operations),
-            EventId::from_genesis_parts(&Identity::Ed25519([2u8; 32]), &nonce, timestamp, &operations)
+            EventId::from_genesis_parts(&Identity::Ed25519([1u8; 32]), &nonce, timestamp, &carried),
+            EventId::from_genesis_parts(&Identity::Ed25519([2u8; 32]), &nonce, timestamp, &carried)
         );
 
+        let operations = operations();
         let event = Event::genesis(minter(), operations.clone());
         assert_eq!(event.minter(), Some(minter()));
         let mut reattributed = event.clone();
@@ -683,32 +639,5 @@ mod tests {
         assert_eq!(update(Clock::new(vec![(3, EventId::from_bytes([1; 32])), (7, EventId::from_bytes([2; 32]))]).unwrap()).generation(), 8);
         assert_eq!(update(at(u32::MAX - 1)).generation(), u32::MAX);
         assert_eq!(update(at(u32::MAX)).generation(), u32::MAX);
-    }
-}
-
-#[cfg(test)]
-mod operation_wire_tests {
-    use super::*;
-    use ankurah_core_types::SystemModel;
-
-    /// Variant order is part of the bincode contract for event payloads:
-    /// Backend = 0, Membership = 1, and Membership::Add = 0. Payload
-    /// encodings inside the variants are pinned by ankurah-core-types' own
-    /// golden tests.
-    #[test]
-    fn operation_variant_order_is_pinned() {
-        let backend =
-            bincode::serialize(&Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![7] }] })
-                .unwrap();
-        assert_eq!(&backend[..4], [0, 0, 0, 0], "Operation::Backend must encode as variant 0");
-
-        let membership = bincode::serialize(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))).unwrap();
-        assert_eq!(&membership[..4], [1, 0, 0, 0], "Operation::Membership must encode as variant 1");
-        assert_eq!(&membership[4..8], [0, 0, 0, 0], "Membership::Add must encode as variant 0");
-
-        for bytes in [backend, membership] {
-            let round: Operation = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(bincode::serialize(&round).unwrap(), bytes);
-        }
     }
 }

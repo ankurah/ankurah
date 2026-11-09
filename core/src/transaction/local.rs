@@ -7,7 +7,7 @@ use ankurah_proto::{EntityId, EntityState, Event};
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::{attestation, event_admissibility::check_genesis_membership};
+use crate::node::{attestation, event_admissibility::check_operations};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -186,7 +186,7 @@ impl Transaction {
             let events = entity.prepare_events()?;
             for event in &events {
                 event.payload.validate_structure()?;
-                check_genesis_membership(&event.payload)?;
+                check_operations(&event.payload)?;
             }
             if !events.is_empty() {
                 entity_events.push((entity, events));

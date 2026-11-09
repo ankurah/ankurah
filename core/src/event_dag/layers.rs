@@ -8,11 +8,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use crate::error::{LineageError, MutationError, RetrievalError};
+use crate::error::{LineageError, MutationError};
 use crate::event_dag::accumulator::{compute_ancestry_from_dag, is_descendant_dag, ComparisonResult, EventAccumulator};
 use crate::event_dag::{compare, AbstractCausalRelation, DEFAULT_BUDGET};
 use crate::retrieval::GetEvents;
-use ankurah_proto::{Clock, Event, EventId};
+use ankurah_proto::{Clock, Event, EventId, OperationSet, UnreadableOperation};
 use smallvec::SmallVec;
 
 /// Causal relation types for event layer comparison.
@@ -190,9 +190,9 @@ impl EventLayers {
 
         let mut ordered = Vec::new();
         while let Some(layer) = source.next().await? {
-            let mut groups: BTreeMap<usize, Vec<Event>> = BTreeMap::new();
-            for event in layer.to_apply {
-                groups.entry(owner[&event.id()]).or_default().push(event);
+            let mut groups: BTreeMap<usize, Vec<LayerEvent>> = BTreeMap::new();
+            for entry in layer.to_apply {
+                groups.entry(owner[&entry.event.id()]).or_default().push(entry);
             }
             let mut already_applied = layer.already_applied;
             for (i, to_apply) in groups {
@@ -280,7 +280,7 @@ impl<E: GetEvents> LayerTraversal<E> {
     }
 
     /// Load the next layer containing new events, in causal order.
-    async fn next(&mut self) -> Result<Option<EventLayer>, RetrievalError> {
+    async fn next(&mut self) -> Result<Option<EventLayer>, MutationError> {
         while !self.frontier.is_empty() {
             let mut to_apply = Vec::new();
             let mut already_applied = Vec::new();
@@ -292,7 +292,7 @@ impl<E: GetEvents> LayerTraversal<E> {
                 }
                 self.processed.insert(id.clone());
 
-                let event = self.accumulator.get_event(id).await?;
+                let event = LayerEvent::read(self.accumulator.get_event(id).await?)?;
 
                 // Partition based on whether already in local head ancestry
                 if self.current_head_ancestry.contains(id) {
@@ -347,9 +347,9 @@ impl<E: GetEvents> LayerTraversal<E> {
 #[derive(Debug, Clone)]
 pub struct EventLayer {
     /// Previously applied events, supplied only as comparison context.
-    pub(crate) already_applied: Vec<Event>,
+    pub(crate) already_applied: Vec<LayerEvent>,
     /// Concurrent events whose operations are ready to apply.
-    pub(crate) to_apply: Vec<Event>,
+    pub(crate) to_apply: Vec<LayerEvent>,
     /// Parent links covering both compared histories from the meet to their heads.
     /// Includes this layer's events and may also contain older history read during
     /// comparison. Boundary parents may be referenced without their own map entries.
@@ -358,11 +358,28 @@ pub struct EventLayer {
     dag_from_meet: Arc<BTreeMap<EventId, Clock>>,
 }
 
+/// An event in a layer, with the operations read from it once, as the layer loaded.
+#[derive(Debug, Clone)]
+pub(crate) struct LayerEvent {
+    pub(crate) event: Event,
+    pub(crate) operations: OperationSet,
+}
+
+impl LayerEvent {
+    /// `event` with its operations decoded, if this build can read every one of them.
+    pub(crate) fn read(event: Event) -> Result<Self, UnreadableOperation> {
+        let operations = event.operations().decode()?;
+        Ok(Self { event, operations })
+    }
+}
+
 impl EventLayer {
     /// Create a layer with parent links covering the compared histories from the meet.
     #[cfg(test)]
     pub(crate) fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag_from_meet: Arc<BTreeMap<EventId, Clock>>) -> Self {
-        Self { already_applied, to_apply, dag_from_meet }
+        // Test events carry operations this build wrote, so each reads.
+        let read = |events: Vec<Event>| events.into_iter().map(|event| LayerEvent::read(event).expect("test events read")).collect();
+        Self { already_applied: read(already_applied), to_apply: read(to_apply), dag_from_meet }
     }
 
     /// Check whether an event_id is present in the accumulated DAG.

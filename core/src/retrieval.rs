@@ -145,17 +145,21 @@ where
 }
 
 /// The event in a peer's `GetEvents` response that actually answers a request
-/// for `event_id`: one that recomputes to the id asked for and is structurally
-/// well formed.
+/// for `event_id`: one that recomputes to the id asked for, is structurally
+/// well formed, and carries only operations this build can read.
 ///
-/// Both are the peer's word rather than ours. An event that derives some other
+/// All three are the peer's word rather than ours. An event that derives some other
 /// id does not answer this request, and caching it under the requested id would
 /// make every later reader of that id read the wrong event. A malformed one --
 /// a genesis whose content derives a different id, a genesis carrying a parent
 /// clock, an update carrying none -- would reach the DAG layers, where its
-/// backend diffs and its membership are applied to the requesting entity.
+/// backend diffs and its membership are applied to the requesting entity. One
+/// holding an operation this build cannot read could never apply, and storing it
+/// would leave the entity silently stale.
 fn answering_event(peer_events: Vec<Attested<Event>>, event_id: &EventId) -> Option<Attested<Event>> {
-    peer_events.into_iter().find(|event| event.payload.id() == *event_id && event.payload.validate_structure().is_ok())
+    peer_events.into_iter().find(|event| {
+        event.payload.id() == *event_id && event.payload.validate_structure().is_ok() && event.payload.operations().decode().is_ok()
+    })
 }
 
 #[async_trait]
@@ -247,7 +251,7 @@ impl<SE: StorageEngine> GetState for LocalStateGetter<SE> {
 mod tests {
     use super::*;
     use crate::test_utils::TestStorage;
-    use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, Event, EventId, OperationSet};
+    use ankurah_proto::{AttestationSet, Attested, CarriedOperations, Clock, EntityId, Event, EventId, OperationSet};
     use std::sync::Arc;
 
     /// Create a test genesis with a deterministic content-hashed ID.
@@ -262,7 +266,7 @@ mod tests {
         nonce[0] = seed;
 
         let minter = ankurah_proto::Identity::Ed25519([seed; 32]);
-        let operations = OperationSet::default();
+        let operations = CarriedOperations::encode(&OperationSet::default());
         let entity_id = EntityId::from(EventId::from_genesis_parts(&minter, &nonce, 0, &operations));
         let body = ankurah_proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations };
         Event { entity_id, body, parent: Clock::default() }
@@ -351,5 +355,21 @@ mod tests {
 
         let ephemeral_getter = LocalEventGetter::new(collection, false);
         assert!(!ephemeral_getter.storage_is_definitive(), "Ephemeral getter should report storage as non-definitive");
+    }
+
+    /// A peer's answer holding an operation this build cannot read does not answer the request, though its id
+    /// matches, so the getter neither returns nor stores it.
+    #[test]
+    fn a_peer_event_holding_an_operation_this_build_cannot_read_does_not_answer() {
+        let event = make_test_event(4);
+        assert!(answering_event(vec![event.clone().into()], &event.id()).is_some());
+
+        let mut unreadable = event.clone();
+        let ankurah_proto::EventBody::Genesis { operations, .. } = &mut unreadable.body else { unreachable!("a test genesis") };
+        // Variant index 2, which no build of `Operation` defines yet.
+        operations.0.push(ankurah_proto::CarriedOperation::Bytes(vec![2, 0, 0, 0]));
+        let unreadable = Event { entity_id: EntityId::from(unreadable.id()), ..unreadable };
+        unreadable.validate_structure().expect("the unreadable genesis still derives the id it names");
+        assert!(answering_event(vec![unreadable.clone().into()], &unreadable.id()).is_none());
     }
 }

@@ -713,6 +713,57 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
     Ok(())
 }
 
+/// Operations this build cannot read: one whose bytes were erased, and one of a kind no build defines yet.
+fn unreadable_operations() -> anyhow::Result<[proto::CarriedOperation; 2]> {
+    let erased = proto::CarriedOperation::Erased(proto::CarriedOperation::encode(&value_operation("erased")?).digest());
+    // Variant index 2, which no build of `Operation` defines yet.
+    Ok([erased, proto::CarriedOperation::Bytes(vec![2, 0, 0, 0])])
+}
+
+/// An update over the fixture's genesis carrying one readable operation and then `unreadable`.
+fn update_holding(fixture: &Fixture, unreadable: proto::CarriedOperation) -> anyhow::Result<Event> {
+    let mut update = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("read")?]));
+    let proto::EventBody::Update { operations, .. } = &mut update.body else { unreachable!("Event::update mints an update") };
+    operations.0.push(unreadable);
+    Ok(update)
+}
+
+/// Each event ingress refuses an event holding an operation this build cannot read before storing anything, and
+/// leaves the entity as it was.
+#[tokio::test]
+async fn event_ingress_refuses_an_event_holding_an_operation_it_cannot_read() -> anyhow::Result<()> {
+    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+        for unreadable in unreadable_operations()? {
+            let fixture = Fixture::new().await?;
+            let update = update_holding(&fixture, unreadable.clone())?;
+            let error = fixture.deliver(ingress, vec![update.clone()]).await.unwrap_err();
+            assert!(
+                matches!(&error, MutationError::UnreadableOperation(refused) if Err(refused.clone()) == unreadable.decode()),
+                "{ingress:?}: {error}"
+            );
+            assert!(fixture.storage.get_events(vec![update.id()]).await?.is_empty(), "{ingress:?}");
+            assert_eq!(fixture.entity.head(), Clock::singleton(&fixture.genesis), "{ingress:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Adopting a snapshot applies none of the events it carries, so an event among them holding an operation this build
+/// cannot read is refused on arrival; otherwise it would be stored and never applied.
+#[tokio::test]
+async fn a_snapshot_carrying_an_event_that_holds_an_operation_it_cannot_read_is_refused() -> anyhow::Result<()> {
+    for unreadable in unreadable_operations()? {
+        let fixture = Fixture::new().await?;
+        let update = update_holding(&fixture, unreadable.clone())?;
+        let state = State { head: Clock::singleton(&update), ..fixture.entity.to_state()? };
+        let error = fixture.apply_snapshot(SnapshotIngress::StateAndEvent, state, update.clone()).await.unwrap_err();
+        assert!(matches!(&error, MutationError::UnreadableOperation(refused) if Err(refused.clone()) == unreadable.decode()), "{error}");
+        assert!(fixture.storage.get_events(vec![update.id()]).await?.is_empty());
+        assert_eq!(fixture.entity.head(), Clock::singleton(&fixture.genesis));
+    }
+    Ok(())
+}
+
 /// Comparison's missing-parent error takes precedence over a known generation mismatch.
 /// No event in the batch is applied when history preparation fails.
 #[tokio::test]

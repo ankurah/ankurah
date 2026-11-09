@@ -163,6 +163,7 @@ fn lww_ops(field: Field, value: &str) -> proto::OperationSet {
 pub fn genesis_event(minter: proto::Identity, counter: u64, field: Field, value: &str) -> proto::Event {
     let mut operations = lww_ops(field, value);
     operations.push(proto::Operation::Membership(proto::Membership::Add(ankurah::ModelId::EntityId(sim_model_id()))));
+    let operations = proto::CarriedOperations::encode(&operations);
     let nonce = content_nonce(counter, &[field.name().as_bytes(), value.as_bytes()]);
     let entity_id: proto::EntityId = proto::EventId::from_genesis_parts(&minter, &nonce, SIM_TIMESTAMP, &operations).into();
     proto::Event {
@@ -183,7 +184,11 @@ pub fn edit_event(entity: proto::EntityId, parent: proto::Clock, field: Field, v
     proto::Event {
         entity_id: entity,
         parent,
-        body: proto::EventBody::Update { nonce, timestamp: SIM_TIMESTAMP, operations: lww_ops(field, value) },
+        body: proto::EventBody::Update {
+            nonce,
+            timestamp: SIM_TIMESTAMP,
+            operations: proto::CarriedOperations::encode(&lww_ops(field, value)),
+        },
     }
 }
 

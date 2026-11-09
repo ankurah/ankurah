@@ -47,6 +47,8 @@ async fn local_and_remote_commits_preserve_plural_membership() -> anyhow::Result
     assert!(membership_events.iter().any(|event| event
         .payload
         .operations()
+        .decode()
+        .unwrap()
         .memberships()
         .any(|operation| matches!(operation, proto::Membership::Add(model) if *model == pet_model))));
     assert_eq!(pets.peek().iter().map(View::id).collect::<Vec<_>>(), vec![entity_id]);

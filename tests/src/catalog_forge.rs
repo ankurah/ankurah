@@ -96,6 +96,7 @@ fn row(
     let lww = staged.to_operations().expect("staged LWW values extract").expect("a written LWW backend yields operations");
     let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), lww.clone())]));
     operations.push(proto::Operation::Membership(proto::Membership::Add(membership.clone())));
+    let operations = proto::CarriedOperations::encode(&operations);
 
     let nonce = content_nonce(counter, &[b"catalog-row", namespace, collection.as_bytes()]);
     let timestamp = 0u64;

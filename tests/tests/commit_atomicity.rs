@@ -71,7 +71,8 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         // Catalog writes use System models; this workload's only ordinary
         // model is Album, so count the exact allocated model arm without
         // reconstructing identity from its schema label.
-        if event.operations().memberships().any(|membership| matches!(membership, proto::Membership::Add(ankurah::ModelId::EntityId(_))))
+        let operations = event.operations().decode().expect("an event reaches the policy only once its operations read");
+        if operations.memberships().any(|membership| matches!(membership, proto::Membership::Add(ankurah::ModelId::EntityId(_))))
             && self.album_checks.fetch_add(1, Ordering::SeqCst) >= 1
         {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));

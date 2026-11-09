@@ -129,7 +129,7 @@ async fn typed_creation_includes_its_model_membership() -> Result<()> {
     trx.commit().await?;
 
     let genesis = entity_events(&node, id).await?.into_iter().find(|e| e.is_entity_create()).expect("genesis");
-    assert_eq!(genesis.operations().memberships().count(), 1, "an entity's first event carries exactly one membership addition");
+    assert_eq!(genesis.operations().decode()?.memberships().count(), 1, "an entity's first event carries exactly one membership addition");
     Ok(())
 }
 

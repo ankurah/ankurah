@@ -248,6 +248,9 @@ pub enum MutationError {
     InvalidEvent,
     #[error("malformed event: {0}")]
     EventStructure(ankurah_proto::EventStructureError),
+    /// The event carries an operation this build cannot read, so it is refused rather than stored unapplied.
+    #[error("unreadable event: {0}")]
+    UnreadableOperation(ankurah_proto::UnreadableOperation),
     #[error("inadmissible event: {0}")]
     InadmissibleEvent(InadmissibleEvent),
     /// A commit-path invariant about an event's provenance, as opposed to
@@ -287,6 +290,10 @@ impl From<NodeReadinessError> for MutationError {
 
 impl From<ankurah_proto::EventStructureError> for MutationError {
     fn from(err: ankurah_proto::EventStructureError) -> Self { MutationError::EventStructure(err) }
+}
+
+impl From<ankurah_proto::UnreadableOperation> for MutationError {
+    fn from(err: ankurah_proto::UnreadableOperation) -> Self { MutationError::UnreadableOperation(err) }
 }
 
 impl From<InadmissibleEvent> for MutationError {

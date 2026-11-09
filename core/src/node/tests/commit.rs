@@ -333,3 +333,41 @@ async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> any
     assert_eq!(stored.head, proto::Clock::singleton(&genesis));
     Ok(())
 }
+
+/// A remote commit holding an operation this build cannot read is refused for its entity and stores nothing: an
+/// update of a kind this build does not know, and an already committed update resent with an operation erased, which
+/// keeps its id and would otherwise replace the stored bytes.
+#[tokio::test]
+async fn a_durable_node_refuses_a_remote_commit_holding_an_operation_it_cannot_read() -> anyhow::Result<()> {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
+    node.wait_ready().await?;
+    let membership = Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))));
+    let genesis = Event::genesis(node.identity(), OperationSet(vec![membership.clone()]));
+    let committed = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![membership]));
+    commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into(), committed.clone().into()])
+        .await?;
+
+    let mut erased = committed.clone();
+    let proto::EventBody::Update { operations, .. } = &mut erased.body else { unreachable!("Event::update mints an update") };
+    let erased_operation = proto::CarriedOperation::Erased(operations.0[0].digest());
+    operations.0[0] = erased_operation.clone();
+    let mut unknown_kind = Event::update(genesis.entity_id, proto::Clock::singleton(&committed), OperationSet::default());
+    let proto::EventBody::Update { operations, .. } = &mut unknown_kind.body else { unreachable!("Event::update mints an update") };
+    // Variant index 2, which no build of `Operation` defines yet.
+    let unknown_operation = proto::CarriedOperation::Bytes(vec![2, 0, 0, 0]);
+    operations.0.push(unknown_operation.clone());
+
+    for (event, operation) in [(erased, erased_operation), (unknown_kind.clone(), unknown_operation)] {
+        let error = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![event.into()]).await.unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<MutationError>(), Some(MutationError::UnreadableOperation(refused)) if Err(refused.clone()) == operation.decode()),
+            "{error}"
+        );
+    }
+    let stored: Vec<_> =
+        storage.get_events(vec![committed.id(), unknown_kind.id()]).await?.into_iter().map(|event| event.payload).collect();
+    assert_eq!(stored, vec![committed.clone()], "the committed update keeps its bytes and the unknown kind is not stored");
+    assert_eq!(storage.get_state(genesis.entity_id).await?.payload.state.head, proto::Clock::singleton(&committed));
+    Ok(())
+}

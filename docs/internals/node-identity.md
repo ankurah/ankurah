@@ -76,8 +76,9 @@ A genesis names the `Identity` that minted it, and the minter is inside the
 entity's id:
 
 ```text
-genesis id = SHA-256(tag(genesis) || minter || nonce || timestamp || operations)
-update id  = SHA-256(tag(event) || entity_id || nonce || timestamp || operations || parent)
+operation digest = SHA-256(tag(operation) || the operation's bytes)
+genesis id = SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n)
+update id  = SHA-256(tag(event) || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent)
 ```
 
 Every string Ankurah hashes or signs opens with a domain tag naming what the

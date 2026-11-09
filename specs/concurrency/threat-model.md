@@ -174,11 +174,15 @@ arm** (the C4 part-2 test that pins it), and **Status** (enforced | open gap (ow
 ### 3.1 Structural integrity claims (content addressing)
 
 **C4-01. Event identity is a verifiable content hash.**
-Invariant: an event's id equals `SHA-256(bincode(entity_id) || bincode(operations)
-|| bincode(parent))`, recomputed from contents on every use, never read from the
-wire; a peer cannot present an event under an id its contents do not hash to.
+Invariant: an update's id equals `SHA-256(tag(event) || entity_id || nonce ||
+timestamp || count || digest_1 .. digest_n || parent)` and a genesis's id equals
+`SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 ..
+digest_n)`, where each digest is `SHA-256(tag(operation) || the operation's
+bytes)`; recomputed from contents on every use, never read from the wire; a peer
+cannot present an event under an id its contents do not hash to.
 Trust tier: Byzantine-safe.
-Enforcing seam: `proto/src/data.rs` `EventId::from_parts` (the hash) and `Event::id()`
+Enforcing seam: `proto/src/data.rs` `EventId::from_genesis_parts` and
+`EventId::from_update_parts` (the hash) and `Event::id()`
 (recomputes on every call; no id field is stored or deserialized). `accumulator.rs`
 `accumulate` keys the DAG by `event.id()` and `retrieval.rs` `stage_event` keys
 staging by `event.id()`, so a lying declared id cannot enter the graph or be
