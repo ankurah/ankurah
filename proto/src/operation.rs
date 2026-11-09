@@ -178,7 +178,7 @@ impl CarriedOperations {
     }
 
     /// Each operation's digest, in order: what an event's id covers in place of the operations.
-    pub fn digests(&self) -> Vec<[u8; 32]> { self.0.iter().map(CarriedOperation::digest).collect() }
+    pub(crate) fn digests(&self) -> Vec<[u8; 32]> { self.0.iter().map(CarriedOperation::digest).collect() }
 }
 
 impl std::fmt::Display for CarriedOperations {
