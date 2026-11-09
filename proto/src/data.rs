@@ -3,16 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{auth::Attested, clock::Clock, id::EntityId, identity::Identity, AttestationSet, DecodeError};
+use crate::{auth::Attested, clock::Clock, domain_tag::DomainTag, id::EntityId, identity::Identity, AttestationSet, DecodeError};
 use ankurah_core_types::ModelId;
-
-/// Domain tag for genesis event ids. Separates the two preimage shapes so no
-/// genesis preimage can ever equal an update preimage, and versions the
-/// derivation scheme.
-pub const GENESIS_TAG: &[u8] = b"org.ankurah.genesis.v1";
-
-/// Domain tag for update event ids. See [`GENESIS_TAG`].
-pub const EVENT_TAG: &[u8] = b"org.ankurah.event.v1";
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -22,12 +14,12 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// The id of a genesis event: `SHA-256(GENESIS_TAG || bincode(minter,
+    /// The id of a genesis event: `SHA-256(DomainTag::Genesis || bincode(minter,
     /// nonce, timestamp, operations))`. The minter and the memberships carried
     /// in the operations are part of the entity's identity.
     pub fn from_genesis_parts(minter: &Identity, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(GENESIS_TAG);
+        hasher.update(DomainTag::Genesis.encoded());
         hasher.update(bincode::serialize(minter).unwrap());
         hasher.update(bincode::serialize(nonce).unwrap());
         hasher.update(bincode::serialize(&timestamp).unwrap());
@@ -35,13 +27,13 @@ impl EventId {
         Self(hasher.finalize().into())
     }
 
-    /// The id of an update event: `SHA-256(EVENT_TAG || bincode(entity_id,
+    /// The id of an update event: `SHA-256(DomainTag::Event || bincode(entity_id,
     /// nonce, timestamp, operations, parent))`. Model projections stay outside
     /// the canonical event and its identity. The nonce is what makes an event
     /// id unguessable to anyone who was not sent the event.
     pub fn from_update_parts(entity_id: &EntityId, nonce: &[u8; 32], timestamp: u64, operations: &OperationSet, parent: &Clock) -> Self {
         let mut hasher = Sha256::new();
-        hasher.update(EVENT_TAG);
+        hasher.update(DomainTag::Event.encoded());
         hasher.update(bincode::serialize(entity_id).unwrap());
         hasher.update(bincode::serialize(nonce).unwrap());
         hasher.update(bincode::serialize(&timestamp).unwrap());
@@ -566,17 +558,12 @@ mod tests {
     /// because bincode writes no framing between them.
     ///
     /// The tags are written out here as literals rather than read from
-    /// [`GENESIS_TAG`] and [`EVENT_TAG`]. Reusing the constants would let a
-    /// typo, a swap, or any coordinated edit change both sides of the
-    /// comparison and still pass, which is the one thing an independent
-    /// recomputation is for.
+    /// [`DomainTag`], so that a coordinated edit cannot change both sides of
+    /// the comparison and still pass.
     #[test]
     fn derivation_preimages_match_the_spec() {
-        let genesis_tag: &[u8] = b"org.ankurah.genesis.v1";
-        let event_tag: &[u8] = b"org.ankurah.event.v1";
-        assert_eq!(GENESIS_TAG, genesis_tag, "the genesis tag is these exact bytes");
-        assert_eq!(EVENT_TAG, event_tag, "the update tag is these exact bytes");
-        assert_ne!(genesis_tag, event_tag, "the two tags differ, which is what keeps the preimage shapes apart");
+        let genesis_tag: &[u8] = b"\x12ankurah.genesis.v1";
+        let event_tag: &[u8] = b"\x10ankurah.event.v1";
 
         let nonce = [3u8; 32];
         let timestamp = 1_720_000_000_123u64;

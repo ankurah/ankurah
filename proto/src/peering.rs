@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::identity::{NodeId, Signature};
+use crate::{
+    domain_tag::DomainTag,
+    identity::{NodeId, Signature},
+};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -26,9 +29,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// changed message. Isolated here so a future version can widen acceptance
 /// to a range without touching the handshake again.
 pub fn protocol_compatible(remote: u32) -> bool { remote == PROTOCOL_VERSION }
-
-/// Domain tag that precedes a presence's claims in the bytes its signature covers.
-pub const PRESENCE_TAG: &[u8] = b"ankurah.presence.v1";
 
 /// A fresh nonce a node sends the peer on a new connection. The peer's presence
 /// must answer it, so a presence signed for one connection does not
@@ -77,9 +77,9 @@ pub struct PresenceClaims {
 }
 
 impl PresenceClaims {
-    /// The bytes a presence signature covers: [`PRESENCE_TAG`], then the bincode claims.
+    /// The bytes a presence signature covers: [`DomainTag::Presence`], then the bincode claims.
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut bytes = PRESENCE_TAG.to_vec();
+        let mut bytes = DomainTag::Presence.encoded();
         // Cannot fail: every field is a fixed-shape value bincode can encode.
         bytes.extend(bincode::serialize(self).expect("presence claims serialize"));
         bytes
@@ -167,9 +167,8 @@ mod tests {
     #[test]
     fn the_signed_bytes_are_the_tag_then_the_claims() {
         let claims = presence().claims();
-        assert_eq!(PRESENCE_TAG, b"ankurah.presence.v1");
         let fields = (claims.node_id, claims.durable, claims.challenge, claims.timestamp, claims.protocol_version);
-        assert_eq!(claims.signable_bytes(), [PRESENCE_TAG, &bincode::serialize(&fields).unwrap()].concat());
+        assert_eq!(claims.signable_bytes(), [b"\x13ankurah.presence.v1".as_slice(), &bincode::serialize(&fields).unwrap()].concat());
     }
 
     #[test]

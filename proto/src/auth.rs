@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     clock::Clock,
     data::{EntityState, Event, EventId},
+    domain_tag::DomainTag,
     id::EntityId,
     identity::{Identity, Signature},
 };
@@ -12,12 +13,6 @@ use crate::{
 /// or some other arbitrary data at the discretion of the Policy Agent
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AuthData(pub Vec<u8>);
-
-/// Domain tag that precedes an attestation's body in the bytes its signature covers.
-pub const ATTESTATION_TAG: &[u8] = b"ankurah.attestation.v1";
-
-/// Domain tag of a state digest: SHA-256 over this tag, then the bincode of the `EntityState`.
-pub const STATE_DIGEST_TAG: &[u8] = b"ankurah.state.v1";
 
 /// A signed statement by an identity about one event or one state, which any
 /// node that later receives the payload can check without the connection that
@@ -57,19 +52,19 @@ impl AttestationBody {
         Self::State { entity: state.entity_id, head: state.state.head.clone(), state_digest: state_digest(state), claims }
     }
 
-    /// The bytes an attestation signature covers: [`ATTESTATION_TAG`], then the bincode body.
+    /// The bytes an attestation signature covers: [`DomainTag::Attestation`], then the bincode body.
     pub fn signable_bytes(&self) -> Vec<u8> {
-        let mut bytes = ATTESTATION_TAG.to_vec();
+        let mut bytes = DomainTag::Attestation.encoded();
         // Cannot fail: every field is a value bincode can encode.
         bytes.extend(bincode::serialize(self).expect("attestation bodies serialize"));
         bytes
     }
 }
 
-/// SHA-256 over [`STATE_DIGEST_TAG`], then the bincode of `state`.
+/// SHA-256 over [`DomainTag::State`], then the bincode of `state`.
 pub fn state_digest(state: &EntityState) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(STATE_DIGEST_TAG);
+    hasher.update(DomainTag::State.encoded());
     // Cannot fail: bincode encodes every field of an entity state.
     hasher.update(bincode::serialize(state).expect("entity states serialize"));
     hasher.finalize().into()
@@ -147,14 +142,12 @@ mod tests {
 
     #[test]
     fn the_signed_bytes_and_the_state_digest_follow_their_recipes() {
-        assert_eq!(ATTESTATION_TAG, b"ankurah.attestation.v1");
-        assert_eq!(STATE_DIGEST_TAG, b"ankurah.state.v1");
         let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
         let body = AttestationBody::event(&genesis, AttesterRole::Committed, vec![7]);
-        assert_eq!(body.signable_bytes(), [b"ankurah.attestation.v1".as_slice(), &bincode::serialize(&body).unwrap()].concat());
+        assert_eq!(body.signable_bytes(), [b"\x16ankurah.attestation.v1".as_slice(), &bincode::serialize(&body).unwrap()].concat());
 
         let state = state(&genesis);
-        let expected: [u8; 32] = Sha256::digest([b"ankurah.state.v1".as_slice(), &bincode::serialize(&state).unwrap()].concat()).into();
+        let expected: [u8; 32] = Sha256::digest([b"\x10ankurah.state.v1".as_slice(), &bincode::serialize(&state).unwrap()].concat()).into();
         assert_eq!(state_digest(&state), expected);
     }
 
