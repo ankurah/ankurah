@@ -1,0 +1,25 @@
+[package]
+name        = "ankurah-system-reset"
+description = "Ankurah node plugin that resets a client node whose durable peer was seeded afresh"
+version     = "0.10.0"
+edition     = "2021"
+license     = "MIT OR Apache-2.0"
+homepage    = "https://github.com/ankurah/ankurah"
+repository  = "https://github.com/ankurah/ankurah"
+
+[dependencies]
+ankurah-core = { path = "../../core", version = "=0.10.0" }
+ankql        = { path = "../../ankql", version = "=0.10.0" }
+async-trait  = "0.1"
+thiserror    = "2"
+tracing      = "0.1"
+
+[dev-dependencies]
+ankurah                         = { path = "../../ankurah", features = ["derive"], version = "=0.10.0" }
+ankurah-storage-sled            = { path = "../../storage/sled", version = "=0.10.0" }
+ankurah-connector-local-process = { path = "../../connectors/local-process", version = "=0.10.0" }
+ankurah-websocket-client        = { path = "../../connectors/websocket-client", version = "=0.10.0" }
+ankurah-websocket-server        = { path = "../../connectors/websocket-server", version = "=0.10.0" }
+anyhow                          = "1.0"
+serde                           = { version = "1.0", features = ["derive"] }
+tokio                           = { version = "1", features = ["full"] }

@@ -497,6 +497,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ankurah-system-reset"
+version = "0.10.0"
+dependencies = [
+ "ankql",
+ "ankurah",
+ "ankurah-connector-local-process",
+ "ankurah-core",
+ "ankurah-storage-sled",
+ "ankurah-websocket-client",
+ "ankurah-websocket-server",
+ "anyhow",
+ "async-trait",
+ "serde",
+ "thiserror 2.0.17",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ankurah-tests"
 version = "0.10.0"
 dependencies = [
