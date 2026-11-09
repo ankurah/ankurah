@@ -487,3 +487,173 @@ before the pass that builds them:
   crates.io release. A lost or compromised key is replaced out of band, by publishing new
   keys and new signatures (Daniel at 20:02Z and 20:09Z).
 - Signing one tree root in place of each served state is a later enhancement, not 0.10.
+
+## 13. The protocol-shape work
+
+Built after the fix pass, in four passes, one implementer at a time, each its own commits.
+It follows Daniel's rulings in section 12 and the comparison he asked for (the report
+"Ankurah protocol future proofing", kept outside the repository). Where this section and
+sections 4, 7 or 8 disagree, this section governs.
+
+The test for every item here: it lands in bytes that a 0.10 node hashes, signs, stores or
+exchanges, and leaving it for later would force a second break. After the freeze the 0.10 node
+is the older peer in every compatibility question, so most items are about what it can hold
+or refuse cleanly without understanding. Every extension point that 0.10 leaves unused is
+written to by a test.
+
+Two calls that steer the rest:
+
+- A node refuses an event holding an operation it cannot read (one of a kind it does not
+  know, or one whose bytes were erased), with a typed error for that entity, and does not
+  store it unapplied; a stored but unapplied event would leave the node's state silently
+  stale. A sender withholds what a peer has not announced it understands. An attestation the
+  node cannot read is different: it changes no state, so it is kept and relayed untouched.
+- Bytes that an id or a signature covers are carried, stored and relayed exactly as their
+  author produced them. No engine, backend or relay re-encodes an operation's bytes or an
+  attestation's bytes.
+
+### 13.1 Pass A: the bytes of an event
+
+For: an event's id can be recomputed by a node that cannot read its operations, an
+operation's content can later be erased without changing any id, and the ids stop depending
+on what a serializer crate happens to emit.
+
+- Domain tags. One family, `ankurah.<name>.v1`, declared together in one module of proto:
+  `genesis`, `event`, `operation`, `presence`, `attestation`, `state`. A tag enters a
+  preimage as one length byte followed by its bytes. A test pins each tag's bytes and that no
+  tag's encoded form is a prefix of another's. A new derivation is a new variant with a new
+  tag, never a new meaning for an existing one.
+- Carried operations. An event body carries each operation as the bytes its author produced,
+  or as only their digest once the bytes have been erased:
+
+```rust
+pub enum CarriedOperation { Bytes(Vec<u8>), Erased([u8; 32]) }
+// operation digest = SHA-256( tag(operation) || bytes )        for Bytes
+//                  = the 32 bytes carried                      for Erased
+// genesis id = SHA-256( tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n )
+// update id  = SHA-256( tag(event) || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent )
+```
+
+  The bytes of one operation are the encoding of today's `Operation`. Building an event
+  encodes each operation once; reading one decodes it and yields a typed error for bytes of a
+  kind this build does not know and for an erased operation. Applying an event with either
+  is refused with that error, as the first call above says. Nothing in 0.10 erases; a test
+  builds an event with an erased operation and shows its id unchanged. Whether erased content
+  needs a salt is left to the operation kinds that want one: the digest covers whatever bytes
+  the operation carries.
+- The byte specification. `specs/protocol/bytes.md` writes out, byte by byte, every string
+  that is hashed or signed (both event ids, the operation digest, the state digest, the
+  presence claims, an attestation's signed bytes) and the encoding of each type inside them.
+  The encoding stays what bincode 1.3.3's default produces today (fixed-width little-endian
+  integers, four-byte variant indices, eight-byte lengths); the document is the authority and
+  the crate is an implementation of it. Tests compare each string against literal hex whose
+  expected side never calls a serializer. `bincode` is pinned to exactly 1.3.3.
+- Variant order. Tests pin the index of every variant of every enum on the wire or in a
+  hashed string that is not pinned today (`Message`, `NodeMessage`, the request, response and
+  update bodies, `Value`, `EventBody`, `Operation`, `Membership`).
+- Text forms. `Identity` and `Signature` print and parse with their scheme named
+  (`ed25519:` then the base64), in `Display`, `FromStr`, human-readable serde, the trusted
+  publishers file, and the wasm and uniffi surfaces.
+
+### 13.2 Pass B: attestation as an ability
+
+For: a node can sign a statement about an event or a state when its application asks, and
+anyone holding the statement can check it later. Core makes no statement on its own and
+checks none; an application chooses both through its policy agent now and through a plugin
+later. Replaces section 8.
+
+```rust
+/// One attestation as it travels and is stored. A node keeps and relays these bytes whether
+/// or not it can read them.
+pub struct SealedAttestation(pub Vec<u8>);
+pub struct AttestationSet(pub Vec<SealedAttestation>);
+
+/// What a sealed attestation holds: the statement's exact bytes and a signature over them.
+struct Sealed { statement: Vec<u8>, signature: Signature }
+/// The statement, read from those bytes.
+pub struct Statement { pub attester: Identity, pub subject: Subject, pub kind: EntityId, pub payload: Vec<u8> }
+pub enum Subject { Event(EventId), State { entity: EntityId, head: Clock, state_digest: [u8; 32] } }
+// signature over: tag(attestation) || statement bytes, exactly as carried
+```
+
+- `kind` is the entity id of the definition that says what the statement means and how to
+  read `payload`. Core defines no kinds, because core makes no statements. Tests use ids of
+  their own.
+- The attester, the subject, the kind and the payload are all inside the signed bytes, and a
+  signature is checked against the carried bytes, never against a re-encoding.
+- `PolicyAgent::check_write_event` returns `Result<Option<AttestationRequest>, AccessDenied>`
+  and `attest_state` returns `Option<AttestationRequest>`, where
+  `AttestationRequest { kind: EntityId, payload: Vec<u8> }`. When an agent returns one, the
+  node that ran the hook signs a statement about that event or state with its own key and
+  attaches it. `Admission` and `AttesterRole` go. Core attaches nothing otherwise: the
+  attestation core signs on every commit today goes.
+- Core no longer verifies or strips on arrival. `validate_received_event` and
+  `validate_received_state` receive the set as it came. An agent opens the attestations it
+  cares about (`SealedAttestation::open` yields the statement only if the bytes parse and the
+  signature verifies under the attester) and checks that the subject is the payload in hand.
+- Storage keeps a set as its elements, so one unreadable attestation never makes an event or
+  a state unreadable. Merging an attestation that arrives after its event was stored is
+  behaviour for a later release.
+- Tests: an attestation of a kind nobody knows, and one whose bytes do not parse, are stored
+  and relayed unchanged by a node between two others; a statement moved to another event
+  fails its subject check; a changed payload fails its signature.
+
+### 13.3 Pass C: the handshake, requests and stores
+
+For: two builds that differ can find out cleanly whether they can talk and what each
+understands, and a 0.10 node answers what it cannot read instead of going silent.
+
+- The opening frame. The first frame each side sends is `Message::Open`, variant 0, whose
+  first twelve bytes are its variant index, then the lowest and the highest protocol version
+  the sender speaks. Those twelve bytes keep their position and meaning in every later
+  version. The challenge follows them. The two sides use the highest version both speak; with
+  none in common the receiver answers with its own range and closes.
+- Signed offers. `PresenceClaims` gains the sender's own range, the range it saw the peer
+  offer, and the version chosen, so a party in the middle cannot lower the choice unnoticed:
+  each side checks that the peer's claims repeat the offer it actually sent. In 0.10 both
+  ends of the range are 1.
+- What a node understands. After the version fields, `Presence` and its claims carry
+  `features: Vec<u32>` (numbers core assigns to things a later build may add; a number a node
+  does not know is ignored; 0.10 assigns none) and
+  `announcements: BTreeMap<String, Vec<u8>>` for plugins (section 13.4), where a name a node
+  does not know is ignored. The keys are names and not definition ids: no definition exists
+  to name yet, and a presence is never stored, so changing the key type later is an ordinary
+  version step.
+- Bodies as carried bytes. A request, a response and an update each carry their body as
+  length-prefixed bytes, so the frame, its ids and its addresses always decode. A request
+  whose body this build cannot read is answered with `NodeResponseBody::Unsupported`; an
+  update likewise in its acknowledgement; a response body the requester cannot read fails
+  that request with a typed error.
+- Stores. Each engine records a store format version of its own, separate from the protocol
+  version, and refuses a store of another format with a typed error naming both.
+- Tests: an opening frame offering a wider range settles on 1; one with no version in common
+  is refused with the receiver's range; a presence whose repeated offer was altered is
+  refused; unknown feature numbers and announcement names are ignored; a request with an
+  unknown body kind receives `Unsupported`.
+
+### 13.4 Pass D: node plugins and reset after a reseed
+
+Section 7 stands, with the hook named `register_peer` and announcements as 13.3 defines them.
+
+- `extensions/system-reset`: a plugin over the application's own System model `M` (any
+  model the application designates; the Commons will publish one later). It announces the
+  ids of the `M` entities its node holds. In `register_peer`, for a peer trusted as durable:
+  when the peer announced some, the node holds some, and the two share none, it refuses the
+  peer, after resetting the node if the application chose reset. Otherwise it accepts, and a
+  node that holds none of the announced entities fetches them once the peer is registered,
+  so a first connection leaves the node holding its System entity.
+- Tests, through the websocket connectors and the local-process connector: a client that
+  held one seeding's System entity meets a server seeded again, resets, and the host's fresh
+  node on the wiped store connects and holds the new entity; the same client against the same
+  seeding, against a server announcing nothing, and on its first connection registers
+  normally; a durable node configured to refuse does so without resetting.
+
+### 13.5 Left for later, each with what keeps it possible
+
+Erasing an operation (the digest); new operation kinds and membership removal (carried
+operations, and the removal task, which must settle the shape of `State` before the freeze);
+a signed tree root, key rotation, delegation, thresholds (new statement kinds, and identity
+or signature variants announced as features); signed frames after the handshake and new
+requests (features and carried bodies); replacing the serializer crate (the byte
+specification); merging later attestations into stored rows; a version byte per stored
+record, which the store format version makes unnecessary for now.
