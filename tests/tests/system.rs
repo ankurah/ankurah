@@ -30,7 +30,7 @@ async fn a_restarted_durable_node_keeps_its_entities_under_a_new_epoch() -> anyh
 }
 
 #[tokio::test]
-async fn reset_local_storage_halts_and_wipes_and_a_fresh_node_starts_clean() -> anyhow::Result<()> {
+async fn reset_halts_the_node_and_wipes_its_store_and_a_fresh_node_starts_clean() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = durable_sled_setup().await?;
         let transaction = server.context(DEFAULT_CONTEXT)?.begin();
@@ -44,8 +44,8 @@ async fn reset_local_storage_halts_and_wipes_and_a_fresh_node_starts_clean() -> 
         let retained = context.get::<PetView>(id).await?;
         assert!(engine.get_state(id).await.is_ok());
 
-        client.reset_local_storage().await?;
-        let halt_reason = NodeHaltReason::LocalReset;
+        client.reset().await?;
+        let halt_reason = NodeHaltReason::Reset;
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
         assert!(!client.system.is_system_ready());
         assert!(client.system.system_epoch().is_none());
@@ -70,7 +70,7 @@ async fn reset_local_storage_halts_and_wipes_and_a_fresh_node_starts_clean() -> 
 }
 
 #[tokio::test]
-async fn reset_local_storage_finishes_its_wipe_when_the_caller_stops_waiting() -> anyhow::Result<()> {
+async fn reset_finishes_its_wipe_when_the_caller_stops_waiting() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let engine = Arc::new(SledStorageEngine::new_test()?);
         let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
@@ -78,9 +78,9 @@ async fn reset_local_storage_finishes_its_wipe_when_the_caller_stops_waiting() -
         let id = transaction.create(&Pet { name: "wiped".into(), age: "2".into() }).await?.id();
         transaction.commit().await?;
 
-        let mut reset = Box::pin(node.reset_local_storage());
+        let mut reset = Box::pin(node.reset());
         let _ = futures_util::poll!(&mut reset);
-        assert_eq!(node.state().peek(), NodeState::Halted(NodeHaltReason::LocalReset), "the node halts before the wipe");
+        assert_eq!(node.state().peek(), NodeState::Halted(NodeHaltReason::Reset), "the node halts before the wipe");
         drop(reset);
         tokio::time::timeout(Duration::from_secs(2), async {
             while engine.get_state(id).await.is_ok() {

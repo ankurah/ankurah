@@ -188,10 +188,10 @@ where
         Self::build(engine, policy_agent, true, SmallRng::from_entropy(), Some(key))
     }
 
-    /// Halt this node with [`NodeHaltReason::LocalReset`], then delete everything in its local storage.
+    /// Halt this node with [`NodeHaltReason::Reset`], then delete everything in its storage.
     /// The wipe finishes even if the caller drops the returned future. The host then discards this
     /// node with its contexts and live queries, and builds a fresh node on the wiped store.
-    pub async fn reset_local_storage(&self) -> anyhow::Result<()> { self.system.reset_local_storage().await }
+    pub async fn reset(&self) -> anyhow::Result<()> { self.system.reset().await }
 
     /// Initialization and terminal halt state; independent of peer connectivity.
     pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }

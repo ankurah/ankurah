@@ -119,21 +119,21 @@ where SE: StorageEngine + Send + Sync + 'static
             .await
     }
 
-    /// Halt with [`NodeHaltReason::LocalReset`], then delete everything in local storage.
+    /// Halt with [`NodeHaltReason::Reset`], then delete everything in storage.
     /// The wipe runs in its own task, so it finishes even if the caller stops waiting.
-    pub(crate) async fn reset_local_storage(&self) -> Result<()> {
-        self.halt(NodeHaltReason::LocalReset);
+    pub(crate) async fn reset(&self) -> Result<()> {
+        self.halt(NodeHaltReason::Reset);
         let system = self.clone();
         let (finished, completion) = tokio::sync::oneshot::channel();
         crate::task::spawn(async move {
-            let _ = finished.send(system.wipe_local_storage().await);
+            let _ = finished.send(system.wipe_storage().await);
         });
         // Cannot fail in practice: the task always sends before it ends, and it does not panic.
-        completion.await.expect("local storage wipe task ended without reporting")
+        completion.await.expect("storage wipe task ended without reporting")
     }
 
     /// Delete persisted entities, events and materializations, and clear the loaded items.
-    async fn wipe_local_storage(&self) -> Result<()> {
+    async fn wipe_storage(&self) -> Result<()> {
         self.0.storage.delete_all().await?;
         self.0.items.write().unwrap().clear();
         *self.0.system_ready.write().unwrap() = false;

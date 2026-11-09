@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 
 #[tokio::test]
-async fn a_local_reset_does_not_wait_for_an_inflight_commit() -> anyhow::Result<()> {
+async fn a_reset_does_not_wait_for_an_inflight_commit() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = durable_sled_setup().await?;
         let client = ephemeral_sled_setup().await?;
@@ -32,8 +32,8 @@ async fn a_local_reset_does_not_wait_for_an_inflight_commit() -> anyhow::Result<
         let commit = tokio::spawn(transaction.commit());
         tokio::time::timeout(Duration::from_secs(2), response_held.notified()).await?;
 
-        tokio::time::timeout(Duration::from_secs(2), client.reset_local_storage()).await??;
-        let halt_reason = NodeHaltReason::LocalReset;
+        tokio::time::timeout(Duration::from_secs(2), client.reset()).await??;
+        let halt_reason = NodeHaltReason::Reset;
         commit.abort();
         assert!(matches!(
             context.begin().commit().await,
@@ -70,8 +70,8 @@ async fn halted_node_stops_queries_and_new_operations_but_retained_views_remain_
         assert_eq!(query.ids(), vec![id]);
         assert!(query.loaded());
 
-        client.reset_local_storage().await?;
-        let halt_reason = NodeHaltReason::LocalReset;
+        client.reset().await?;
+        let halt_reason = NodeHaltReason::Reset;
 
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
         assert!(client.system.system_epoch().is_none());

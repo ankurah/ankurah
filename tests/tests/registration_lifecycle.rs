@@ -795,8 +795,8 @@ async fn halted_node_cannot_reregister_even_an_already_bound_descriptor() -> any
         assert!(!schema_registered(&client, Gadget::descriptor()));
         assert!(server.catalog.model_by_label("gadget").unwrap().is_none());
 
-        client.reset_local_storage().await?;
-        let halt_reason = NodeHaltReason::LocalReset;
+        client.reset().await?;
+        let halt_reason = NodeHaltReason::Reset;
 
         let bound_error = ctx.resolve_model_id::<Gizmo>().await.expect_err("halting must take priority over the already-bound fast path");
         assert!(matches!(bound_error, RegistrationError::Retrieval(RetrievalError::NodeHalted(error)) if error == halt_reason));

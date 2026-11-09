@@ -123,13 +123,12 @@ the list Ankurah ships in `core/src/policy/trusted_publishers.txt`, which is
 empty until the Commons publisher's key exists; an application overrides it
 with its own.
 
-## Resetting Local Storage
+## Resetting a Node
 
-`Node::reset_local_storage` halts the node with `NodeHaltReason::LocalReset`
-and then wipes its storage through `StorageEngine::delete_all`; the wipe
-finishes even if the caller stops waiting. The host then discards the halted
-node with its contexts and live queries, and builds a fresh node on the wiped
-store.
+`Node::reset` halts the node with `NodeHaltReason::Reset` and then wipes its
+storage through `StorageEngine::delete_all`; the wipe finishes even if the
+caller stops waiting. The host then discards the halted node with its contexts
+and live queries, and builds a fresh node on the wiped store.
 
 Core never decides when to reset. A node in a client role that should discard
 stale data after a development reseed does so because the application, from

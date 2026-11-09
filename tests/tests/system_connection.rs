@@ -32,7 +32,7 @@ async fn advertise(socket: &mut Socket, server: &Node<SledStorageEngine, Permiss
 }
 
 #[tokio::test]
-async fn a_local_reset_stops_native_reconnects_permanently() -> anyhow::Result<()> {
+async fn a_reset_stops_native_reconnects_permanently() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = durable_sled_setup().await?;
         let node = ephemeral_sled_setup().await?;
@@ -43,8 +43,8 @@ async fn a_local_reset_stops_native_reconnects_permanently() -> anyhow::Result<(
         advertise(&mut socket, &server).await?;
         client.wait_connected().await?;
 
-        node.reset_local_storage().await?;
-        let halt_reason = NodeHaltReason::LocalReset;
+        node.reset().await?;
+        let halt_reason = NodeHaltReason::Reset;
         let expected = ConnectionError::Peer(PeerConnectionError::NodeHalted(halt_reason.clone()));
         let state = client.state();
         state.wait_value(ConnectionState::Error(expected.clone())).await;

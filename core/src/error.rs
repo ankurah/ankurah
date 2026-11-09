@@ -16,9 +16,9 @@ pub enum NodeHaltReason {
     CatalogLoad(String),
     #[error("failed to initialize policy: {0}")]
     PolicyAgentStartFailed(String),
-    /// [`crate::Node::reset_local_storage`] wiped this node's storage; the host builds a new node on it.
-    #[error("local storage was reset; a new node must be built on the wiped store")]
-    LocalReset,
+    /// [`crate::Node::reset`] halted this node and wiped its storage; the host builds a new node on it.
+    #[error("the node was reset; a new node must be built on the wiped store")]
+    Reset,
 }
 
 #[derive(Error, Debug)]
