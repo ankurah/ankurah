@@ -81,7 +81,8 @@ impl NodeApplier {
     {
         let mut attested_events = Vec::new();
         for fragment in event_fragments {
-            let attested_event: Attested<proto::Event> = (entity_id, fragment).into();
+            let mut attested_event: Attested<proto::Event> = (entity_id, fragment).into();
+            super::attestation::verify_event(&mut attested_event);
             // A genesis whose id the entity it claims does not derive, or a
             // parent clock that disagrees with the body, is refused before
             // the DAG ever sees it: the sender's framing of the entity id is
@@ -124,7 +125,8 @@ impl NodeApplier {
                 // Batch preparation requires parents before their children.
                 let attested_events = crate::event_dag::ordering::topo_sort_events(attested_events)?;
 
-                let state: Attested<proto::EntityState> = (entity_id, state_fragment.clone()).into();
+                let mut state: Attested<proto::EntityState> = (entity_id, state_fragment.clone()).into();
+                super::attestation::verify_state(&mut state);
                 node.policy_agent.validate_received_state(node, from_peer_id, &state)?;
 
                 if let Some(entity) = Self::save_new_entity(node, &state.payload, &attested_events, event_getter, state_getter).await? {
@@ -212,9 +214,8 @@ impl NodeApplier {
         // Reject undecodable snapshots before persisting them or attaching a resident.
         crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
         Self::check_snapshot_events(node, state, &proto::Clock::default(), events, event_getter).await?;
-        let attestation = node.policy_agent.attest_state(node, state);
         let mut storage_trx = node.storage.transaction();
-        storage_trx.set_state(&proto::Clock::default(), &Attested::opt(state.clone(), attestation)).await?;
+        storage_trx.set_state(&proto::Clock::default(), &state.clone().into()).await?;
         storage_trx.add_events(events).await?;
         let _publication = node.commit_publication_lock.lock().await;
         match storage_trx.commit().await? {
@@ -251,11 +252,9 @@ impl NodeApplier {
             if adopted {
                 Self::check_snapshot_events(node, snapshot, &expected_head, &events, event_getter).await?;
             } else {
-                candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
+                candidate.apply_events(event_getter, &mut events, |_| Ok(Vec::new())).await?;
             }
-            let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
-            let attestation = node.policy_agent.attest_state(node, &state);
-            let state = Attested::opt(state, attestation);
+            let state: Attested<proto::EntityState> = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? }.into();
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
@@ -293,11 +292,10 @@ impl NodeApplier {
             let candidate = RemoteTrxEntity::for_event(&node.entities, &state_getter, event_getter, &first.payload).await?;
             let expected_head = candidate.head();
             let mut events = events.to_vec();
-            candidate.apply_events(event_getter, &mut events, |_| Ok(None)).await?;
+            candidate.apply_events(event_getter, &mut events, |_| Ok(Vec::new())).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
-            let attestation = node.policy_agent.attest_state(node, &state);
             let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+            storage_trx.set_state(&expected_head, &state.into()).await?;
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
             storage_trx.commit().await?.committed()?;
@@ -378,7 +376,8 @@ impl NodeApplier {
     {
         match delta.content {
             proto::DeltaContent::StateSnapshot { state } => {
-                let attested_state: Attested<proto::EntityState> = (delta.entity_id, state).into();
+                let mut attested_state: Attested<proto::EntityState> = (delta.entity_id, state).into();
+                super::attestation::verify_state(&mut attested_state);
                 node.policy_agent.validate_received_state(node, from_peer_id, &attested_state)?;
 
                 if let Some(entity) = Self::save_new_entity(node, &attested_state.payload, &[], event_getter, state_getter).await? {

@@ -2,12 +2,12 @@ use crate::internal::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ankurah_proto::{Attested, EntityId, EntityState, Event};
+use ankurah_proto::{EntityId, EntityState, Event};
 
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::event_admissibility::check_genesis_membership;
+use crate::node::{attestation, event_admissibility::check_genesis_membership};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -212,12 +212,15 @@ impl Transaction {
                 let expected_head = entity_after.head();
                 let mut events = events.clone();
                 entity_after
-                    .apply_events(&event_getter, &mut events, |event| policy.check_write_event(node, &entity_before, &after, event))
+                    .apply_events(&event_getter, &mut events, |event| {
+                        let admission = policy.check_write_event(node, &entity_before, &after, event)?;
+                        let committed = attestation::committed(node, event);
+                        Ok(std::iter::once(committed).chain(attestation::admitted(node, event, admission)).collect())
+                    })
                     .await?;
                 storage_trx.add_events(&events).await?;
                 let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
-                let attestation = policy.attest_state(node, &state);
-                storage_trx.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+                storage_trx.set_state(&expected_head, &state.into()).await?;
                 attested_events.extend(events);
                 forks.push((entity, entity_after));
             }

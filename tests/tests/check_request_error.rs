@@ -9,7 +9,7 @@ use ankql::ast::Predicate;
 use ankurah::core::node::ContextData;
 use ankurah::core::util::Iterable;
 use ankurah::error::ValidationError;
-use ankurah::policy::{AccessDenied, PolicyAgent, DEFAULT_CONTEXT};
+use ankurah::policy::{AccessDenied, Admission, PolicyAgent, DEFAULT_CONTEXT};
 use ankurah::proto::{self, AuthData};
 use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
@@ -68,8 +68,8 @@ impl PolicyAgent for RejectingAgent {
         _entity_before: &ankurah::core::entity::Entity,
         _entity_after: &ankurah::core::entity::Entity,
         _event: &proto::Event,
-    ) -> std::result::Result<Option<proto::Attestation>, AccessDenied> {
-        Ok(None)
+    ) -> std::result::Result<Admission, AccessDenied> {
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
@@ -81,7 +81,7 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<Vec<u8>> { None }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

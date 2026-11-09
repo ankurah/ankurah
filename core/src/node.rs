@@ -35,6 +35,7 @@ use tracing::instrument;
 use tracing::{debug, info, warn};
 
 pub mod applier;
+pub(crate) mod attestation;
 mod erased;
 pub(crate) mod event_admissibility;
 pub(crate) mod handler;
@@ -628,6 +629,13 @@ where
                 let mut results: Vec<_> =
                     self.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().map(Into::into).collect();
                 policy.check_reads(&mut results);
+                let results = results
+                    .into_iter()
+                    .map(|result| match result {
+                        proto::GetResult::Found(state) => proto::GetResult::Found(attestation::served_state(self, state.payload)),
+                        unserved => unserved,
+                    })
+                    .collect();
                 Ok(proto::NodeResponseBody::Get(results))
             }
             proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
@@ -703,7 +711,7 @@ where
         C: crate::util::Iterable<PA::ContextData>,
     {
         // Destructure to take ownership and avoid clones
-        let proto::Attested { payload: proto::EntityState { entity_id, state }, attestations } = entity_state;
+        let proto::EntityState { entity_id, state } = entity_state.payload;
         let current_head = &state.head;
 
         // Entity is in known_matches - try to optimize the response
@@ -732,7 +740,7 @@ where
         }
 
         // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
-        let state_fragment = proto::StateFragment { state, attestations };
+        let state_fragment = attestation::served_state(self, proto::EntityState { entity_id, state }).into();
         Ok(Some(proto::EntityDelta { entity_id, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
     }
 

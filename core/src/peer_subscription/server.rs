@@ -1,5 +1,5 @@
 use ankql::ast::Resolved;
-use ankurah_proto::{self as proto, Attested};
+use ankurah_proto as proto;
 use tracing::warn;
 
 use crate::{
@@ -153,14 +153,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         // TASK: Audit SubscriptionUpdate vs QuerySubscribed sequencing https://github.com/ankurah/ankurah/issues/147
 
         // TASK: Optimize to avoid re-attesting entities fetched from storage https://github.com/ankurah/ankurah/issues/148
-        let initial_states: Vec<_> = matching_entities
-            .into_iter()
-            .filter_map(|e| {
-                let entity_state = e.to_entity_state().ok()?;
-                let attestation = node.policy_agent.attest_state(node, &entity_state);
-                Some(Attested::opt(entity_state, attestation))
-            })
-            .collect();
+        let initial_states: Vec<_> = matching_entities.into_iter().filter_map(|e| Some(e.to_entity_state().ok()?.into())).collect();
 
         let expanded_states = crate::util::expand_states::expand_states(
             initial_states,
@@ -198,7 +191,6 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    // Convert entity to EntityState and attest it
     let entity_state = match item.entity.to_entity_state() {
         Ok(entity_state) => entity_state,
         Err(e) => {
@@ -207,8 +199,7 @@ where
         }
     };
 
-    let attestation = node.policy_agent.attest_state(node, &entity_state);
-    let attested_state = Attested::opt(entity_state, attestation);
+    let attested_state = crate::node::attestation::served_state(node, entity_state);
 
     // Events should already be attested
     let attested_events = item.events;

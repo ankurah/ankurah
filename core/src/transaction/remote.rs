@@ -1,6 +1,6 @@
 use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
-use crate::node::event_admissibility::check_genesis_membership;
+use crate::node::{attestation, event_admissibility::check_genesis_membership};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -71,17 +71,18 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let expected_head = entity.head();
 
         let mut event = event.clone();
+        attestation::verify_event(&mut event);
         let before = &self.entities.entries[&entity.id()].before;
         let after = entity.read();
         entity
             .apply_events(&self.event_getter, std::slice::from_mut(&mut event), |event| {
-                self.policy.check_write_event(self.node, before, &after, event)
+                let admission = self.policy.check_write_event(self.node, before, &after, event)?;
+                Ok(attestation::admitted(self.node, event, admission).into_iter().collect())
             })
             .await?;
         self.storage.add_events(std::slice::from_ref(&event)).await?;
         let state = EntityState { entity_id: entity.id(), state: entity.to_state()? };
-        let attestation = self.policy.attest_state(self.node, &state);
-        self.storage.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+        self.storage.set_state(&expected_head, &state.into()).await?;
         self.failed = false;
         Ok(())
     }

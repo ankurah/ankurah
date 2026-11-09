@@ -81,13 +81,14 @@ impl RemoteTrxEntity {
         self.0.data().state.apply_state(getter, state).await
     }
 
-    /// Prepare the whole batch with one comparison, then apply and check each event in causal order.
+    /// Prepare the whole batch with one comparison, then apply and check each event in causal order,
+    /// attaching the attestations `check` returns for it.
     /// Preparation failure changes nothing. After application or policy failure, discard the fork; do not commit it.
     pub(crate) async fn apply_events<G>(
         &self,
         getter: &G,
         events: &mut [Attested<Event>],
-        mut check: impl FnMut(&Event) -> Result<Option<Attestation>, MutationError>,
+        mut check: impl FnMut(&Event) -> Result<Vec<Attestation>, MutationError>,
     ) -> Result<(), MutationError>
     where
         G: GetEvents + Send + Sync,
@@ -104,9 +105,7 @@ impl RemoteTrxEntity {
         let prepared = EventLayers::prepare(&getter, events, &head).await?;
         for (event, layers) in events.iter_mut().zip(prepared.per_event()) {
             let applied = data.state.apply_prepared_layers(&mut head, layers)?;
-            if let Some(attestation) = check(&event.payload)? {
-                event.attestations.push(attestation);
-            }
+            event.attestations.0.extend(check(&event.payload)?);
             if applied {
                 data.events.lock().unwrap().push(event.clone());
             }

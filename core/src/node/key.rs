@@ -80,6 +80,12 @@ impl NodeKey {
         }
     }
 
+    /// Sign `body` as this key's attestation.
+    pub fn attest(&self, body: proto::AttestationBody) -> proto::Attestation {
+        let signature = self.sign(&body.signable_bytes());
+        proto::Attestation { attester: self.identity(), body, signature }
+    }
+
     /// Sign a presence answering `challenge`: this key's identity and its durable claim.
     pub fn sign_presence(&self, durable: bool, challenge: proto::HandshakeChallenge) -> proto::Presence {
         let mut presence = proto::Presence {

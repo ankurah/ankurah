@@ -16,6 +16,7 @@ use thiserror::Error;
 use tracing::debug;
 
 mod context;
+mod trusted_publishers;
 pub use context::ContextPolicy;
 
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
@@ -53,6 +54,16 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 
 impl AccessDenied {}
 
+/// A policy agent's verdict on an event it allows: whether this node signs an
+/// admitted attestation for it, and the claims that attestation carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Admission {
+    /// Allow the event, and have this node sign an admitted attestation carrying `claims`.
+    Attest { claims: Vec<u8> },
+    /// Allow the event without attesting it.
+    Allow,
+}
+
 /// What this node grants a connected peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerTrust {
@@ -69,9 +80,12 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// PolicyAgents control access to resources, by:
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
 /// - checking access for requests. If approved, yield a ContextData
-/// - attesting events for requests that were approved
-/// - validating attestations for events
-/// - deciding what a connected peer is trusted with
+/// - deciding which admitted events this node attests, and the claims its attestations carry
+/// - deciding whether the verified attestations on a received event or state suffice
+/// - deciding what a connected peer is trusted with, and which publishers it trusts
+///
+/// Core signs every attestation and verifies every received one; an agent sees
+/// only attestations whose signature verifies and that name the payload.
 ///
 /// Read checks may receive several credentials, one, or none. Implementations
 /// must decide the empty case explicitly and authorize actual entity memberships,
@@ -145,7 +159,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     }
 
     /// Authorize a proposed event, seeing the transaction's original state
-    /// and its state after applying the event; optionally return an attestation.
+    /// and its state after applying the event, and say whether this node attests it.
     fn check_write_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -153,10 +167,10 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         entity_before: &Entity,
         entity_after: &Entity,
         event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied>;
+    ) -> Result<Admission, AccessDenied>;
 
-    /// Validate an event attestation
-    /// This could be used to validate that the event has sufficient attestation as to be trusted
+    /// Decide whether a received event's attestations suffice. They have already been
+    /// verified: each one's signature is its attester's, and each names this event.
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -164,9 +178,11 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
-    /// Attest a state which the caller asserts is valid. Implementation may return None if no attestation is required
-    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation>;
+    /// The claims a durable node's state attestation carries when it serves `state`; `None` carries empty claims.
+    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<Vec<u8>>;
 
+    /// Decide whether a received state's attestations suffice. They have already been
+    /// verified: each one's signature is its attester's, and each names this state.
     fn validate_received_state<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -227,6 +243,10 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         }
     }
 
+    /// The identities whose published definitions this node may adopt. By default, the list
+    /// Ankurah ships in `trusted_publishers.txt`; an application overrides it with its own.
+    fn trusted_publishers(&self) -> Vec<proto::Identity> { trusted_publishers::shipped() }
+
     // // For checking if a context can subscribe to changes
     // fn can_subscribe(&self, data: &Self::ContextData, collection: &ModelId, predicate: &Predicate) -> AccessResult;
 
@@ -279,7 +299,6 @@ impl PolicyAgent for PermissiveAgent {
         Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
     }
 
-    /// Create an attestation for an event
     fn check_write_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
@@ -287,8 +306,8 @@ impl PolicyAgent for PermissiveAgent {
         _entity_before: &Entity,
         _entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
-        Ok(None)
+    ) -> Result<Admission, AccessDenied> {
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
@@ -300,11 +319,7 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
-        // This PolicyAgent does not require attestation, so we return None
-        // Client/Server policy agents may also return None and defer to the server identity to validate the received state
-        None
-    }
+    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<Vec<u8>> { None }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

@@ -1,4 +1,4 @@
-use super::{AccessDenied, PolicyAgent};
+use super::{AccessDenied, Admission, PolicyAgent};
 use crate::context::ContextAuth;
 use crate::entity::{Entity, TemporaryEntity};
 use crate::error::{InadmissibleEvent, MutationError};
@@ -7,7 +7,7 @@ use crate::selection::filter::evaluate_predicate;
 use crate::storage::StorageEngine;
 use crate::util::Iterable;
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{Attestation, Attested, EntityId, EntityState, Event, GetResult, ModelId, State};
+use ankurah_proto::{Attested, EntityId, Event, GetResult, ModelId, State};
 use ankurah_signals::{ListenerGuard, Mut, Peek, Signal};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -221,18 +221,11 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
         before: &Entity,
         after: &Entity,
         event: &Event,
-    ) -> Result<Option<Attestation>, MutationError> {
+    ) -> Result<Admission, MutationError> {
         self.check_models(after.memberships())?;
         match &self.auth {
             ContextAuth::Sessions(_) => Ok(self.agent.check_write_event(node, &self.write_credential()?, before, after, event)?),
-            ContextAuth::Privileged => Ok(None),
-        }
-    }
-
-    pub(crate) fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, PA>, state: &EntityState) -> Option<Attestation> {
-        match &self.auth {
-            ContextAuth::Sessions(_) => self.agent.attest_state(node, state),
-            ContextAuth::Privileged => None,
+            ContextAuth::Privileged => Ok(Admission::Allow),
         }
     }
 }

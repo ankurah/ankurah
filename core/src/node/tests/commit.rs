@@ -3,7 +3,7 @@ use crate::{
     entity::{Entity, LocalTrxEntity, RemoteTrxEntity},
     error::{LineageError, MutationError, ValidationError},
     node::Node,
-    policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
+    policy::{AccessDenied, Admission, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     property::backend::{LWWBackend, PropertyBackend},
     reactor::ChangeNotification,
     retrieval::{LocalEventGetter, SuspenseEvents},
@@ -25,6 +25,11 @@ struct OwnerOnlyAgent {
     checked_owners: Arc<Mutex<Vec<Option<Value>>>>,
 }
 
+/// An admitted attestation on `event` by the test key `seed` derives.
+fn attested_by(seed: u8, event: &Event) -> proto::Attestation {
+    crate::node::NodeKey::from_seed([seed; 32]).attest(proto::AttestationBody::event(event, proto::AttesterRole::Admitted, vec![]))
+}
+
 #[async_trait::async_trait]
 impl PolicyAgent for OwnerOnlyAgent {
     type ContextData = &'static DefaultContext;
@@ -36,7 +41,7 @@ impl PolicyAgent for OwnerOnlyAgent {
         before: &Entity,
         after: &Entity,
         event: &Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Admission, AccessDenied> {
         assert_eq!(before.id(), event.entity_id);
         assert_eq!(after.id(), event.entity_id);
         assert!(after.head().contains(&event.id()), "the policy must see the event applied to the working fork");
@@ -45,7 +50,7 @@ impl PolicyAgent for OwnerOnlyAgent {
         if owner != Some(Value::String("Alice".into())) {
             return Err(AccessDenied::ByPolicy("Alice no longer owns this entity"));
         }
-        Ok(None)
+        Ok(Admission::Allow)
     }
 
     fn sign_request<SE: StorageEngine, C: Iterable<Self::ContextData>>(
@@ -70,7 +75,7 @@ impl PolicyAgent for OwnerOnlyAgent {
 
     fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&Event>) -> Result<(), AccessDenied> { Ok(()) }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<proto::Attestation> { None }
+    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<Vec<u8>> { None }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
@@ -169,24 +174,25 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     let entities = crate::entity::WeakEntitySet::new(crate::schema::SystemEpoch::allocate());
     let fork = RemoteTrxEntity::new(&genesis, entities.system_epoch())?;
     let before = fork.snapshot();
-    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(None)).await?;
+    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(Vec::new())).await?;
 
     let update = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![set(property, "Bob")?]));
-    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), |_| Ok(None)).await?;
+    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), |_| Ok(Vec::new())).await?;
     let branch_property = PropertyId::EntityId(EntityId::from_bytes([2; 32]));
     let branch = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![set(branch_property, "branch")?]));
-    let mut branch = Attested::opt(branch, Some(proto::Attestation(vec![1, 2, 3])));
+    let carried = attested_by(1, &branch);
+    let mut branch = Attested::opt(branch, Some(carried.clone()));
     // Divergence must find the earlier fork events without storage or explicit staging.
     fork.apply_events(&getter, std::slice::from_mut(&mut branch), |event| {
         assert_eq!(event.entity_id, before.id());
         assert_eq!(before.value(&branch_property), None);
         assert_eq!(fork.read().value(&branch_property), Some(Value::String("branch".into())));
-        Ok(Some(proto::Attestation(vec![4, 5, 6])))
+        Ok(vec![attested_by(2, event)])
     })
     .await?;
-    assert_eq!(*branch.attestations, vec![proto::Attestation(vec![1, 2, 3]), proto::Attestation(vec![4, 5, 6])]);
+    assert_eq!(*branch.attestations, vec![carried, attested_by(2, &branch.payload)], "the check's attestation joins the carried one");
     // Redelivered events must not appear twice in the published change.
-    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(None)).await?;
+    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(Vec::new())).await?;
     assert!(entities.get(&genesis.entity_id).is_none());
 
     let expected_events = vec![genesis.clone().into(), update.clone().into(), branch.clone()];
@@ -203,7 +209,7 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     assert_eq!(before.value(&property), None);
 
     let retry = RemoteTrxEntity::edit(&resident)?;
-    retry.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), |_| Ok(None)).await?;
+    retry.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), |_| Ok(Vec::new())).await?;
     assert!(retry.commit(&entities, &getter, false).await?.events().is_empty(), "already-published events do not notify again");
     assert_eq!(resident.head(), proto::Clock::from_events([&update, &branch.payload]));
     Ok(())
@@ -224,7 +230,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     );
     events.stage_event(genesis.clone());
     let candidate = RemoteTrxEntity::new(&genesis, node.entities.system_epoch())?;
-    candidate.apply_events(&events, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(None)).await?;
+    candidate.apply_events(&events, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(Vec::new())).await?;
     let mut transaction = storage.transaction();
     transaction.set_state(&proto::Clock::default(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
     transaction.add_events(&[Attested::opt(genesis.clone(), None)]).await?;
@@ -245,7 +251,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     let transfer = Event::update(entity.id(), proto::Clock::singleton(&genesis), OperationSet(vec![set(owner, "Bob")?]));
     events.stage_event(transfer.clone());
     let candidate = RemoteTrxEntity::edit(&entity)?;
-    candidate.apply_events(&events, std::slice::from_mut(&mut Attested::from(transfer.clone())), |_| Ok(None)).await?;
+    candidate.apply_events(&events, std::slice::from_mut(&mut Attested::from(transfer.clone())), |_| Ok(Vec::new())).await?;
     let mut transaction = storage.transaction();
     transaction.set_state(&entity.head(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
     transaction.add_events(&[Attested::opt(transfer.clone(), None)]).await?;

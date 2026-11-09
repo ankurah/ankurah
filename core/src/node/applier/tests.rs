@@ -13,6 +13,11 @@ use proto::{
 };
 use std::sync::{mpsc, Arc};
 
+/// An admitted attestation on `event`, signed by a fixed test key.
+fn admitted(event: &Event) -> proto::Attestation {
+    crate::node::NodeKey::from_seed([7; 32]).attest(proto::AttestationBody::event(event, proto::AttesterRole::Admitted, vec![7]))
+}
+
 /// The peer every delivery in these tests arrives from.
 fn peer() -> NodeId { NodeId::from(proto::Identity::Ed25519([5; 32])) }
 
@@ -340,7 +345,7 @@ async fn assert_failed_snapshot_keeps_resident(ingress: SnapshotIngress) -> anyh
     );
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), |_| Ok(Vec::new())).await?;
     let snapshot = candidate.to_state()?;
     if matches!(ingress, SnapshotIngress::DivergedStateAndEvent) {
         let local = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
@@ -408,7 +413,7 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
     let last = Event::update(fixture.entity.id(), Clock::singleton(&second), OperationSet(vec![value_operation("incoming")?]));
     let mut events = vec![Attested::from(first), Attested::from(second), Attested::from(last.clone())];
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut events, |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut events, |_| Ok(Vec::new())).await?;
     let update = proto::SubscriptionUpdateItem {
         entity_id: fixture.entity.id(),
         content: proto::UpdateContent::StateAndEvent(
@@ -453,7 +458,7 @@ async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_a
     let fixture = Fixture::new().await?;
     let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(Vec::new())).await?;
     let snapshot = candidate.to_state()?;
     let update = proto::SubscriptionUpdateItem {
         entity_id: fixture.entity.id(),
@@ -490,7 +495,7 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(Vec::new())).await?;
     let delta = proto::EntityDelta {
         entity_id: fixture.entity.id(),
         content: proto::DeltaContent::StateSnapshot {
@@ -528,7 +533,7 @@ async fn unchanged_bare_snapshots_do_not_write_storage() -> anyhow::Result<()> {
     let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.into()], |_| Ok(Vec::new())).await?;
     let concurrent = candidate.to_state()?;
     let local = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("local")?]));
     fixture.commit_event(local).await?;
@@ -558,7 +563,7 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
     let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(Vec::new())).await?;
     let snapshot = candidate.to_state()?;
     fixture.apply_snapshot(SnapshotIngress::Snapshot, snapshot.clone(), incoming.clone()).await?;
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
@@ -808,7 +813,7 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
     let last = Event::update(fixture.entity.id(), Clock::singleton(&intermediate), OperationSet(vec![value_operation("last")?]));
     let mut applied = vec![Attested::from(first), Attested::from(intermediate), Attested::from(last)];
     for event in &mut applied {
-        candidate.apply_events(&fixture.events, std::slice::from_mut(event), |_| Ok(None)).await?;
+        candidate.apply_events(&fixture.events, std::slice::from_mut(event), |_| Ok(Vec::new())).await?;
     }
     let prepared = candidate.to_state()?;
     let mut transaction = fixture.storage.transaction();
@@ -845,7 +850,7 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
     let fixture = Fixture::new().await?;
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     let incoming = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), OperationSet(vec![value_operation("incoming")?]));
-    candidate.apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), |_| Ok(Vec::new())).await?;
     let prepared = candidate.to_state()?;
     let mut transaction = fixture.storage.transaction();
     transaction
@@ -899,7 +904,7 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     // An unpublished fork admits the update while its parent is unavailable.
     let candidate = RemoteTrxEntity::edit(&entity)?;
     let mut admitted = Attested::opt(update.clone(), None);
-    candidate.apply_events(&events, std::slice::from_mut(&mut admitted), |_| Ok(None)).await?;
+    candidate.apply_events(&events, std::slice::from_mut(&mut admitted), |_| Ok(Vec::new())).await?;
     assert_eq!(candidate.head(), admitted_head);
 
     // The parent arrives before a fresh application attempt.
@@ -944,7 +949,7 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
 
         let candidate = RemoteTrxEntity::edit(&entity)?;
         let mut admitted = Attested::from(update.clone());
-        candidate.apply_events(&events, std::slice::from_mut(&mut admitted), |_| Ok(None)).await?;
+        candidate.apply_events(&events, std::slice::from_mut(&mut admitted), |_| Ok(Vec::new())).await?;
         let prepared = candidate.to_state()?;
         let mut transaction = storage.transaction();
         transaction
@@ -1017,7 +1022,7 @@ async fn batch_policy_checks_intermediate_states_and_stops_at_first_failure() ->
             if value == Some(Value::String("forbidden".into())) {
                 return Err(MutationError::InvalidUpdate("policy denied intermediate state"));
             }
-            Ok(Some(proto::Attestation(vec![7])))
+            Ok(vec![admitted(event)])
         })
         .await
         .unwrap_err();
@@ -1026,7 +1031,7 @@ async fn batch_policy_checks_intermediate_states_and_stops_at_first_failure() ->
         checked,
         vec![(accepted.id(), Some(Value::String("allowed".into()))), (denied.id(), Some(Value::String("forbidden".into()))),]
     );
-    assert_eq!(events[0], Attested::opt(accepted.clone(), Some(proto::Attestation(vec![7]))));
+    assert_eq!(events[0], Attested::opt(accepted.clone(), Some(admitted(&accepted))));
     assert!(events[1].attestations.is_empty());
     assert!(events[2].attestations.is_empty());
     assert_eq!(getter.tip_reads.load(std::sync::atomic::Ordering::Relaxed), 1, "the batch uses one comparison");
@@ -1119,7 +1124,7 @@ async fn batch_checks_concurrent_events_before_later_operations_in_the_same_laye
     candidate
         .apply_events(&fixture.events, &mut events, |event| {
             checked.push((event.id(), view.memberships()));
-            Ok(None)
+            Ok(Vec::new())
         })
         .await?;
     assert_eq!(
@@ -1146,7 +1151,7 @@ async fn batch_extension_does_not_fetch_the_existing_head() -> anyhow::Result<()
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     let mut events = vec![Attested::from(first), Attested::from(second)];
     // An ephemeral node may have adopted this state without storing its head event.
-    candidate.apply_events(&NoEventReads, &mut events, |_| Ok(None)).await?;
+    candidate.apply_events(&NoEventReads, &mut events, |_| Ok(Vec::new())).await?;
     assert_eq!(candidate.head(), expected_head);
     Ok(())
 }
@@ -1167,7 +1172,7 @@ async fn supplied_batch_can_exceed_the_single_event_history_budget() -> anyhow::
     candidate
         .apply_events(&fixture.events, &mut events, |_| {
             checks += 1;
-            Ok(None)
+            Ok(Vec::new())
         })
         .await?;
     assert_eq!(checks, count);

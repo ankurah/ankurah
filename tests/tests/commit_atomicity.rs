@@ -5,7 +5,7 @@ use ankurah::core::{
     entity::Entity,
     error::ValidationError,
     node::{Node as NodeInnerAlias, NodeInner},
-    policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
+    policy::{AccessDenied, Admission, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::StorageEngine,
     util::Iterable,
 };
@@ -67,7 +67,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         _entity_before: &Entity,
         _entity_after: &Entity,
         event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Admission, AccessDenied> {
         // Catalog writes use System models; this workload's only ordinary
         // model is Album, so count the exact allocated model arm without
         // reconstructing identity from its schema label.
@@ -76,7 +76,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         {
             return Err(AccessDenied::ByPolicy("test agent denies the second album event"));
         }
-        Ok(None)
+        Ok(Admission::Allow)
     }
 
     fn validate_received_event<SE: StorageEngine>(
@@ -88,9 +88,7 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &NodeInnerAlias<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
-        None
-    }
+    fn attest_state<SE: StorageEngine>(&self, _node: &NodeInnerAlias<SE, Self>, _state: &proto::EntityState) -> Option<Vec<u8>> { None }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,
