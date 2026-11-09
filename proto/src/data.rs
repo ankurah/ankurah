@@ -437,7 +437,8 @@ impl Attested<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation::{BackendOperation, CarriedOperation};
+    use crate::operation::{BackendOperation, CarriedOperation, Membership, Operation};
+    use ankurah_core_types::SystemModel;
 
     #[test]
     fn test_event_id_json_serialization() {
@@ -470,44 +471,47 @@ mod tests {
 
     fn minter() -> Identity { Identity::Ed25519([9u8; 32]) }
 
-    /// Both preimages, computed independently, byte for byte: the tag, the
-    /// fields, the operation count and each operation's digest.
-    ///
-    /// The tags are written out here as literals rather than read from
-    /// [`DomainTag`], so that a coordinated edit cannot change both sides of
-    /// the comparison and still pass.
+    /// The id vectors of specs/protocol/bytes.md section 5: a genesis and an update over zero, one and two
+    /// operations, and over the one operation erased, which leaves each id unchanged.
     #[test]
-    fn derivation_preimages_match_the_spec() {
-        let nonce = [3u8; 32];
-        let timestamp = 1_720_000_000_123u64;
-        let operations = carried();
-        let CarriedOperation::Bytes(bytes) = &operations.0[0] else { unreachable!("an encoded operation carries its bytes") };
-        let digest: [u8; 32] = Sha256::digest([b"\x14ankurah.operation.v1".as_slice(), bytes].concat()).into();
-        let count_and_digests = [1u64.to_le_bytes().as_slice(), &digest].concat();
+    fn event_ids_match_the_byte_specification_vectors() {
+        let membership = CarriedOperation::encode(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))));
+        let backend = CarriedOperation::encode(&Operation::Backend {
+            backend: "lww".to_owned(),
+            operations: vec![BackendOperation { diff: vec![1, 2, 3] }],
+        });
+        let erased = CarriedOperation::Erased(membership.digest());
+        let minter = Identity::Ed25519([0x11; 32]);
+        let (nonce, timestamp) = ([0x22; 32], 1_720_000_000_000);
+        let entity_id = EntityId::from_bytes([0x33; 32]);
+        let parent = Clock::new(vec![(1, EventId::from_bytes([0x44; 32]))]).unwrap();
 
-        // The minter is its variant index, then the key bytes.
-        let preimage =
-            [b"\x12ankurah.genesis.v1".as_slice(), &0u32.to_le_bytes(), &[9u8; 32], &nonce, &timestamp.to_le_bytes(), &count_and_digests]
-                .concat();
-        let expected: [u8; 32] = Sha256::digest(&preimage).into();
-        assert_eq!(EventId::from_genesis_parts(&minter(), &nonce, timestamp, &operations), EventId::from_bytes(expected));
-
-        // The parent is its entry count, then each entry's generation and event id.
-        let entity_id = EntityId::from_bytes([7u8; 32]);
-        let parent = Clock::genesis(EventId::from_bytes([5u8; 32]));
-        let preimage = [
-            b"\x10ankurah.event.v1".as_slice(),
-            &[7u8; 32],
-            &nonce,
-            &timestamp.to_le_bytes(),
-            &count_and_digests,
-            &1u64.to_le_bytes(),
-            &1u32.to_le_bytes(),
-            &[5u8; 32],
-        ]
-        .concat();
-        let expected: [u8; 32] = Sha256::digest(&preimage).into();
-        assert_eq!(EventId::from_update_parts(&entity_id, &nonce, timestamp, &operations, &parent), EventId::from_bytes(expected));
+        for (operations, genesis, update) in [
+            (
+                vec![],
+                "133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649",
+                "ea0c549736a30f74f83fc27165938ccd17ac57c5b955fe4a1347f74b32372aa8",
+            ),
+            (
+                vec![membership.clone()],
+                "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
+                "e865a554005226a6dc65c5a8dc039f7d40cd2e658833e741bb6d3a149c0dfe7c",
+            ),
+            (
+                vec![membership, backend],
+                "0395ecaf7e93f57b19cf2098a8161c6c0c72b182ff1f5dfc8a0525359cd927a3",
+                "76c6835c83eb2aba276df5ad184fca20075a513a9140db37cc00e43e6cb63623",
+            ),
+            (
+                vec![erased],
+                "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
+                "e865a554005226a6dc65c5a8dc039f7d40cd2e658833e741bb6d3a149c0dfe7c",
+            ),
+        ] {
+            let operations = CarriedOperations(operations);
+            assert_eq!(hex::encode(EventId::from_genesis_parts(&minter, &nonce, timestamp, &operations).as_bytes()), genesis);
+            assert_eq!(hex::encode(EventId::from_update_parts(&entity_id, &nonce, timestamp, &operations, &parent).as_bytes()), update);
+        }
     }
 
     /// An event's id covers each operation's digest and not its bytes, so an

@@ -197,6 +197,25 @@ mod tests {
 
     fn membership() -> Operation { Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))) }
 
+    /// The operation vectors of specs/protocol/bytes.md section 5: each operation's bytes and its digest.
+    #[test]
+    fn operation_bytes_and_digests_match_the_byte_specification_vectors() {
+        let backend = Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![1, 2, 3] }] };
+        for (operation, bytes, digest) in [
+            (membership(), "01000000000000000100000000000000", "76ef9eee987e3dc3a09adbf20c51740e948216e9a8f79bdd1994deffedf5fd98"),
+            (
+                backend,
+                "0000000003000000000000006c777701000000000000000300000000000000010203",
+                "75307fbd9932f311bc6799c89a2051231dc6e731410b47a0096484352f219db5",
+            ),
+        ] {
+            let carried = CarriedOperation::encode(&operation);
+            assert_eq!(carried, CarriedOperation::Bytes(hex::decode(bytes).unwrap()));
+            assert_eq!(hex::encode(carried.digest()), digest);
+            assert_eq!(CarriedOperation::Erased(carried.digest()).digest(), carried.digest(), "an erased operation keeps its digest");
+        }
+    }
+
     #[test]
     fn a_carried_operation_decodes_to_the_operation_it_encodes() {
         let backend = Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![1, 2, 3] }] };

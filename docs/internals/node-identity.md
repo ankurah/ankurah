@@ -85,7 +85,9 @@ Every string Ankurah hashes or signs opens with a domain tag naming what the
 string is for: `ankurah.genesis.v1`, `ankurah.event.v1`,
 `ankurah.operation.v1`, `ankurah.presence.v1`, `ankurah.attestation.v1` or
 `ankurah.state.v1`, written as one length byte followed by the tag's bytes, so
-that a string made for one purpose can never be read as another's.
+that a string made for one purpose can never be read as another's. The
+repository's `specs/protocol/bytes.md` writes out every such string, and the
+encoding of each value inside it, byte by byte, with test vectors.
 
 `Transaction::create` mints under the node's own identity, so creating an
 entity needs nothing but the node's key: a node that has never connected to

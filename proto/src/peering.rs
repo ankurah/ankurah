@@ -164,11 +164,20 @@ mod tests {
         }
     }
 
+    /// The presence vector of specs/protocol/bytes.md section 5: the bytes a presence signature covers.
     #[test]
-    fn the_signed_bytes_are_the_tag_then_the_claims() {
-        let claims = presence().claims();
-        let fields = (claims.node_id, claims.durable, claims.challenge, claims.timestamp, claims.protocol_version);
-        assert_eq!(claims.signable_bytes(), [b"\x13ankurah.presence.v1".as_slice(), &bincode::serialize(&fields).unwrap()].concat());
+    fn the_signed_bytes_match_the_byte_specification_vector() {
+        let claims = PresenceClaims {
+            node_id: Identity::Ed25519([0x99; 32]).into(),
+            durable: true,
+            challenge: HandshakeChallenge { issuer: Identity::Ed25519([0x77; 32]).into(), nonce: [0x88; 32] },
+            timestamp: 1_720_000_000_000,
+            protocol_version: 1,
+        };
+        assert_eq!(
+            hex::encode(claims.signable_bytes()),
+            "13616e6b757261682e70726573656e63652e76310000000099999999999999999999999999999999999999999999999999999999999999990100000000777777777777777777777777777777777777777777777777777777777777777788888888888888888888888888888888888888888888888888888888888888880030fd779001000001000000"
+        );
     }
 
     #[test]

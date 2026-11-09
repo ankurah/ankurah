@@ -126,8 +126,9 @@ impl<T: Clone> Clone for Attested<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{OperationSet, State};
+    use crate::{ModelId, OperationSet, State, StateBuffers, SystemModel};
     use ed25519_dalek::Signer;
+    use std::collections::{BTreeMap, BTreeSet};
 
     fn signed(key: &ed25519_dalek::SigningKey, body: AttestationBody) -> Attestation {
         let signature = Signature::Ed25519(key.sign(&body.signable_bytes()).to_bytes());
@@ -140,15 +141,38 @@ mod tests {
         EntityState { entity_id: genesis.entity_id, state: State { head: Clock::singleton(genesis), ..State::default() } }
     }
 
+    /// The state digest vector of specs/protocol/bytes.md section 5.
     #[test]
-    fn the_signed_bytes_and_the_state_digest_follow_their_recipes() {
-        let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
-        let body = AttestationBody::event(&genesis, AttesterRole::Committed, vec![7]);
-        assert_eq!(body.signable_bytes(), [b"\x16ankurah.attestation.v1".as_slice(), &bincode::serialize(&body).unwrap()].concat());
+    fn the_state_digest_matches_the_byte_specification_vector() {
+        let state = EntityState {
+            entity_id: EntityId::from_bytes([0x55; 32]),
+            state: State {
+                state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), vec![1, 2, 3])])),
+                memberships: BTreeSet::from([ModelId::System(SystemModel::Model)]),
+                head: Clock::new(vec![(1, EventId::from_bytes([0x66; 32]))]).unwrap(),
+            },
+        };
+        assert_eq!(hex::encode(state_digest(&state)), "05e2003ec33f79b0e5b1aec10579c2c75fde70fd91971765028855fb8509221e");
+    }
 
-        let state = state(&genesis);
-        let expected: [u8; 32] = Sha256::digest([b"\x10ankurah.state.v1".as_slice(), &bincode::serialize(&state).unwrap()].concat()).into();
-        assert_eq!(state_digest(&state), expected);
+    /// The attestation vectors of specs/protocol/bytes.md section 5: the bytes each body's signature covers.
+    #[test]
+    fn the_signed_bytes_match_the_byte_specification_vectors() {
+        let event = AttestationBody::Event { event: EventId::from_bytes([0xaa; 32]), role: AttesterRole::Admitted, claims: vec![7] };
+        assert_eq!(
+            hex::encode(event.signable_bytes()),
+            "16616e6b757261682e6174746573746174696f6e2e763100000000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa01000000010000000000000007"
+        );
+        let state = AttestationBody::State {
+            entity: EntityId::from_bytes([0xbb; 32]),
+            head: Clock::new(vec![(2, EventId::from_bytes([0xcc; 32]))]).unwrap(),
+            state_digest: [0xdd; 32],
+            claims: vec![],
+        };
+        assert_eq!(
+            hex::encode(state.signable_bytes()),
+            "16616e6b757261682e6174746573746174696f6e2e763101000000bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb010000000000000002000000ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd0000000000000000"
+        );
     }
 
     /// Bodies and roles are on the wire and in storage, so their variant order is pinned.

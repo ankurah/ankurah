@@ -329,6 +329,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "getrandom 0.3.4",
+ "hex",
  "js-sys",
  "postgres-types",
  "rand 0.9.2",
