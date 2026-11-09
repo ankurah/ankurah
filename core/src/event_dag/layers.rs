@@ -166,7 +166,6 @@ impl EventLayers {
             while let Some(layer) = source.next().await? {
                 prepared.layers.push(layer);
             }
-            source.share_membership_changes(prepared.layers.iter_mut());
             prepared.boundaries[1] = prepared.layers.len();
             return Ok(prepared);
         }
@@ -203,13 +202,11 @@ impl EventLayers {
                         already_applied: already_applied.clone(),
                         to_apply: to_apply.clone(),
                         dag_from_meet: Arc::clone(&layer.dag_from_meet),
-                        membership_changes: Arc::from([]),
                     },
                 ));
                 already_applied.extend(to_apply);
             }
         }
-        source.share_membership_changes(ordered.iter_mut().map(|(_, layer)| layer));
         // Keep causal order within each input while placing its layers before its policy check.
         ordered.sort_by_key(|(i, _)| *i);
         for (i, layer) in ordered {
@@ -244,9 +241,6 @@ struct LayerTraversal<E: GetEvents> {
     // Iteration state
     processed: BTreeSet<EventId>,
     frontier: BTreeSet<EventId>,
-
-    /// Every event loaded so far, on either side of the meet, that changes a model membership.
-    membership_changes: Vec<Event>,
 }
 
 impl<E: GetEvents> LayerTraversal<E> {
@@ -282,15 +276,7 @@ impl<E: GetEvents> LayerTraversal<E> {
             .cloned()
             .collect();
 
-        Self { accumulator, current_head_ancestry, children_index, dag_from_meet, processed, frontier, membership_changes: Vec::new() }
-    }
-
-    /// Hand every finished layer the membership changes the whole traversal loaded.
-    fn share_membership_changes<'a>(&mut self, layers: impl IntoIterator<Item = &'a mut EventLayer>) {
-        let changes: Arc<[Event]> = std::mem::take(&mut self.membership_changes).into();
-        for layer in layers {
-            layer.membership_changes = Arc::clone(&changes);
-        }
+        Self { accumulator, current_head_ancestry, children_index, dag_from_meet, processed, frontier }
     }
 
     /// Load the next layer containing new events, in causal order.
@@ -307,9 +293,6 @@ impl<E: GetEvents> LayerTraversal<E> {
                 self.processed.insert(id.clone());
 
                 let event = self.accumulator.get_event(id).await?;
-                if event.operations().memberships().next().is_some() {
-                    self.membership_changes.push(event.clone());
-                }
 
                 // Partition based on whether already in local head ancestry
                 if self.current_head_ancestry.contains(id) {
@@ -341,12 +324,7 @@ impl<E: GetEvents> LayerTraversal<E> {
             self.frontier = next_frontier;
 
             if !to_apply.is_empty() {
-                return Ok(Some(EventLayer {
-                    to_apply,
-                    already_applied,
-                    dag_from_meet: Arc::clone(&self.dag_from_meet),
-                    membership_changes: Arc::from([]),
-                }));
+                return Ok(Some(EventLayer { to_apply, already_applied, dag_from_meet: Arc::clone(&self.dag_from_meet) }));
             }
         }
         Ok(None)
@@ -372,10 +350,6 @@ pub struct EventLayer {
     pub(crate) already_applied: Vec<Event>,
     /// Concurrent events whose operations are ready to apply.
     pub(crate) to_apply: Vec<Event>,
-    /// Every event the comparison loaded from the meet onward, applied or not, that changes
-    /// a model membership: what membership application consults for concurrent changes,
-    /// including ones in layers this layer's input does not reach.
-    membership_changes: Arc<[Event]>,
     /// Parent links covering both compared histories from the meet to their heads.
     /// Includes this layer's events and may also contain older history read during
     /// comparison. Boundary parents may be referenced without their own map entries.
@@ -388,13 +362,8 @@ impl EventLayer {
     /// Create a layer with parent links covering the compared histories from the meet.
     #[cfg(test)]
     pub(crate) fn new(already_applied: Vec<Event>, to_apply: Vec<Event>, dag_from_meet: Arc<BTreeMap<EventId, Clock>>) -> Self {
-        let membership_changes =
-            already_applied.iter().chain(&to_apply).filter(|event| event.operations().memberships().next().is_some()).cloned().collect();
-        Self { already_applied, to_apply, dag_from_meet, membership_changes }
+        Self { already_applied, to_apply, dag_from_meet }
     }
-
-    /// See the field of the same name.
-    pub(crate) fn membership_changes(&self) -> &[Event] { &self.membership_changes }
 
     /// Check whether an event_id is present in the accumulated DAG.
     /// Used by LWW's causal fallback when generations have saturated.
@@ -435,7 +404,7 @@ mod tests {
         dag.insert(b.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
         dag.insert(c.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
 
-        let layer = EventLayer::new(vec![], vec![], Arc::new(dag));
+        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag_from_meet: Arc::new(dag) };
 
         assert_eq!(layer.compare(&b, &a), CausalRelation::Descends);
         assert_eq!(layer.compare(&a, &b), CausalRelation::Ascends);
@@ -453,7 +422,7 @@ mod tests {
         dag.insert(a.clone(), Clock::default());
         dag.insert(b.clone(), Clock::new(vec![(1, a.clone())]).unwrap());
 
-        let layer = EventLayer::new(vec![], vec![], Arc::new(dag));
+        let layer = EventLayer { to_apply: vec![], already_applied: vec![], dag_from_meet: Arc::new(dag) };
 
         assert!(layer.dag_contains(&a));
         assert!(layer.dag_contains(&b));

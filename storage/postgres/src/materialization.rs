@@ -13,9 +13,7 @@ use std::{
 use tokio_postgres::{types::ToSql, GenericClient};
 use tracing::{debug, error, info, warn};
 
-use super::{
-    acquire_ddl_lock, error_kind, release_ddl_lock, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES, MODEL_REGISTRATION_TABLE,
-};
+use super::{acquire_ddl_lock, error_kind, release_ddl_lock, ErrorKind, Postgres, COLUMN_MAP_TABLE, IDENTIFIER_MAX_BYTES};
 use crate::value::PGValue;
 
 #[derive(Clone, Debug)]
@@ -84,27 +82,6 @@ impl PreparedMaterialization {
         client.execute(&query, params.as_slice()).await.map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
         Ok(())
     }
-}
-
-/// Delete an entity's row from `model`'s materialization table, when the model has one.
-pub(super) async fn remove_materialized_entity<C>(client: &C, model: &ModelId, entity_id: &EntityId) -> Result<(), MutationError>
-where C: GenericClient + Sync {
-    let model_key = bincode::serialize(model)?;
-    let registration = client
-        .query_opt(
-            &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_REGISTRATION_TABLE}" WHERE "model_key" = $1"#),
-            &[&model_key],
-        )
-        .await
-        .map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
-    if let Some(registration) = registration {
-        let table: String = registration.get(0);
-        client
-            .execute(&format!(r#"DELETE FROM "{table}" WHERE "id" = $1"#), &[entity_id])
-            .await
-            .map_err(|e| MutationError::UpdateFailed(Box::new(e)))?;
-    }
-    Ok(())
 }
 
 /// Fixed columns of every materialization table: reserved, never assignable to

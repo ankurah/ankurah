@@ -5,11 +5,11 @@ use ankurah_core::{
 };
 use ankurah_proto::{Attested, EntityState, ModelId, PropertyId};
 use ankurah_storage_common::naming;
-use rusqlite::{params_from_iter, Connection, OptionalExtension};
+use rusqlite::{params_from_iter, Connection};
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::debug;
 
-use super::{SqliteStorageEngine, COLUMN_MAP_TABLE, MODEL_MAP_TABLE};
+use super::{SqliteStorageEngine, COLUMN_MAP_TABLE};
 use crate::{
     connection::{PooledConnection, SqliteConnectionManager},
     error::SqliteError,
@@ -112,26 +112,6 @@ impl PreparedMaterialization {
         transaction.execute(&query, params_from_iter(values.iter()))?;
         Ok(())
     }
-}
-
-/// Delete an entity's row from `model`'s materialization table, when the model has one.
-pub(super) fn remove_materialized_entity(
-    transaction: &rusqlite::Transaction<'_>,
-    model: &ModelId,
-    entity_key: &str,
-) -> Result<(), SqliteError> {
-    let model_key = bincode::serialize(model)?;
-    let table = transaction
-        .query_row(
-            &format!(r#"SELECT "materialization_table_name" FROM "{MODEL_MAP_TABLE}" WHERE "model_key" = ?"#),
-            rusqlite::params![model_key],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-    if let Some(table) = table {
-        transaction.execute(&format!(r#"DELETE FROM "{table}" WHERE "id" = ?"#), [entity_key])?;
-    }
-    Ok(())
 }
 
 /// Fixed columns of every materialization table.

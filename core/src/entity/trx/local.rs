@@ -29,9 +29,8 @@ pub(in crate::entity) struct LocalTrxEntityInner {
     data: TrxEntityData,
     /// Cleared when the transaction commits or rolls back; local writes check it.
     alive: Arc<AtomicBool>,
-    /// The memberships this entity's events record so far: the forked entity's, or none for a
-    /// creation. The next generated event adds and removes whatever the working state differs by.
-    recorded_memberships: Mutex<BTreeSet<ModelId>>,
+    /// Memberships added to the working state but not yet written into an event.
+    staged_memberships: Mutex<BTreeSet<ModelId>>,
 }
 
 #[derive(Debug)]
@@ -53,15 +52,14 @@ impl LocalTrxEntity {
             origin: Origin::Pending { genesis: OnceLock::new(), minter },
             data: TrxEntityData::new(EntityState::empty(), epoch),
             alive,
-            recorded_memberships: Mutex::new(BTreeSet::new()),
+            staged_memberships: Mutex::default(),
         }))
     }
 
     pub(crate) fn edit(entity: &Entity, alive: Arc<AtomicBool>) -> Result<Self, PropertyError> {
         let upstream = entity.resident()?;
         let data = TrxEntityData::new(upstream.state.fork(), upstream.system_epoch());
-        let recorded_memberships = Mutex::new(data.state.memberships());
-        Ok(Self(Arc::new(LocalTrxEntityInner { origin: Origin::Mut { upstream }, data, alive, recorded_memberships })))
+        Ok(Self(Arc::new(LocalTrxEntityInner { origin: Origin::Mut { upstream }, data, alive, staged_memberships: Mutex::default() })))
     }
 
     /// Freeze the genesis on first demand, including all mutations made so far.
@@ -81,18 +79,11 @@ impl LocalTrxEntity {
     /// Add a membership now; the next generated event records it.
     pub fn add_membership(&self, model: ModelId) -> Result<(), PropertyError> {
         self.check_open()?;
-        // Holding the recorded set keeps event generation from reading the working state mid-change.
-        let _recorded = self.0.recorded_memberships.lock().unwrap();
-        self.0.data.state.add_membership(model);
-        Ok(())
-    }
-
-    /// Remove a membership now; the next generated event records it. The entity stays
-    /// addressable by id even when this removes its last membership.
-    pub fn remove_membership(&self, model: &ModelId) -> Result<(), PropertyError> {
-        self.check_open()?;
-        let _recorded = self.0.recorded_memberships.lock().unwrap();
-        self.0.data.state.remove_membership(model);
+        // Holding the staged set keeps event generation from seeing the addition in only one place.
+        let mut staged = self.0.staged_memberships.lock().unwrap();
+        if self.0.data.state.add_membership(model) {
+            staged.insert(model);
+        }
         Ok(())
     }
 
@@ -182,18 +173,12 @@ impl LocalTrxEntityInner {
         }
     }
 
-    /// Drain pending property operations, and the membership changes since the last event, into one event's operations.
+    /// Drain pending property operations and staged memberships into one event's operations.
     fn take_operations(&self) -> Result<OperationSet, MutationError> {
         let mut operations = self.data.state.extract_backend_operations()?;
-        let mut recorded = self.recorded_memberships.lock().unwrap();
-        let current = self.data.state.memberships();
-        for model in current.difference(&recorded) {
-            operations.push(Operation::Membership(Membership::Add(*model)));
+        for model in std::mem::take(&mut *self.staged_memberships.lock().unwrap()) {
+            operations.push(Operation::Membership(Membership::Add(model)));
         }
-        for model in recorded.difference(&current) {
-            operations.push(Operation::Membership(Membership::Remove(*model)));
-        }
-        *recorded = current;
         Ok(operations)
     }
 }

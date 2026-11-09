@@ -151,14 +151,10 @@ impl StorageTransaction for SqliteTransaction<'_> {
                 let entity_id = write.entity_id;
                 let entity_key = entity_id.to_base64();
                 let target = &write.memberships;
-                if let Some(stored) = &observed[&entity_id] {
-                    for model in stored.payload.state.memberships.difference(target) {
-                        tx.execute(
-                            &format!(r#"DELETE FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ? AND "model_key" = ?"#),
-                            rusqlite::params![&entity_key, bincode::serialize(model)?],
-                        )?;
-                        materialization::remove_materialized_entity(&tx, model, &entity_key)?;
-                    }
+                if observed[&entity_id].as_ref().is_some_and(|state| !state.payload.state.memberships.is_subset(target)) {
+                    return Err(SqliteError::CorruptRecord(format!(
+                        "canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported"
+                    )));
                 }
                 for model in target {
                     tx.execute(

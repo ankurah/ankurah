@@ -161,17 +161,11 @@ impl StorageTransaction for PostgresTransaction<'_> {
         for (_, write) in &ordered {
             let entity_id = write.entity_id;
             let target = &write.memberships;
-            if let Some(stored) = &observed[&entity_id] {
-                for model in stored.payload.state.memberships.difference(target) {
-                    transaction
-                        .execute(
-                            &format!(r#"DELETE FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = $1 AND "model_key" = $2"#),
-                            &[&entity_id, &bincode::serialize(model)?],
-                        )
-                        .await
-                        .map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;
-                    materialization::remove_materialized_entity(&transaction, model, &entity_id).await?;
-                }
+            if observed[&entity_id].as_ref().is_some_and(|state| !state.payload.state.memberships.is_subset(target)) {
+                return Err(MutationError::General(
+                    format!("canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported")
+                        .into(),
+                ));
             }
             for model in target {
                 let model_key = bincode::serialize(model)?;
