@@ -130,8 +130,9 @@ impl fmt::Display for Identity {
     }
 }
 
+/// The full text form, also under `{:#?}`, whose alternate flag would otherwise select the short form.
 impl fmt::Debug for Identity {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { fmt::Display::fmt(self, f) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.to_string()) }
 }
 
 impl fmt::Display for NodeId {
@@ -262,6 +263,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&identity).unwrap(), format!("\"{text}\""));
         assert_eq!(serde_json::from_str::<Identity>(&format!("\"{text}\"")).unwrap(), identity);
         assert_eq!(format!("{identity:#}"), "BwcHBw", "the short diagnostic form names no scheme");
+        assert_eq!(format!("{identity:#?}"), text, "pretty debug output keeps the full form");
 
         let node = NodeId::from(identity);
         assert_eq!(node.to_string(), text, "a node id prints as its identity");
