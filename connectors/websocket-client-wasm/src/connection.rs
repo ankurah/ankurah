@@ -2,8 +2,10 @@ use crate::client::ClientInner;
 use crate::connection_state::ConnectionState;
 use ankurah::signals::Wait;
 use ankurah_core::action_info;
+use ankurah_core::connector::IssuedChallenge;
 use ankurah_core::connector::NodeComms;
 use ankurah_core::connector::PeerConnectionError;
+use ankurah_core::connector::PeerProvenance;
 use ankurah_core::connector::PeerSender;
 use ankurah_proto::{self as proto};
 use anyhow::anyhow;
@@ -11,7 +13,7 @@ use async_trait::async_trait;
 use futures::{channel::mpsc, future::RemoteHandle, Future, FutureExt, StreamExt};
 use js_sys::Uint8Array;
 use send_wrapper::SendWrapper;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::{Arc, Weak};
 use std::sync::{Mutex, RwLock};
@@ -31,7 +33,11 @@ pub struct ConnectionInner {
     state: RwLock<ConnectionState>,
     node: Box<dyn NodeComms>,
     client: Weak<ClientInner>,
-    registered_peer: Cell<Option<proto::EntityId>>,
+    /// Ours, which the server's presence must answer; taken when that presence arrives.
+    challenge: RefCell<Option<IssuedChallenge>>,
+    /// The server's, which our presence answers.
+    server_challenge: Cell<Option<proto::HandshakeChallenge>>,
+    registered_peer: Cell<Option<proto::NodeId>>,
     receive_task: Cell<Option<RemoteHandle<()>>>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
@@ -54,12 +60,15 @@ impl Connection {
         let state = RwLock::new(ConnectionState::Connecting { url: url.clone() });
         let (mut incoming, mut messages) = mpsc::channel(MAX_QUEUED_MESSAGES);
 
+        let challenge = RefCell::new(Some(node.issue_challenge()));
         let me = Connection(Arc::new(SendWrapper::new(ConnectionInner {
             ws: Arc::new(ws),
             url,
             state,
             node,
             client,
+            challenge,
+            server_challenge: Cell::new(None),
             registered_peer: Cell::new(None),
             receive_task: Cell::new(None),
             _callbacks: Mutex::new(None),
@@ -180,6 +189,20 @@ impl Connection {
 
         if let Ok(message) = bincode::deserialize::<proto::Message>(&data) {
             match message {
+                proto::Message::Challenge(server_challenge) => {
+                    let ours = self.challenge.borrow().as_ref().map(IssuedChallenge::challenge);
+                    let Some(ours) = ours.filter(|_| self.server_challenge.get().is_none()) else {
+                        warn!("Ignoring repeated handshake challenge from {}", self.url);
+                        return None;
+                    };
+                    self.server_challenge.set(Some(server_challenge));
+                    // The server opens with its challenge, so the socket is open for ours.
+                    if let Err(error) = self.send_message(proto::Message::Challenge(ours)) {
+                        self.disconnect();
+                        self.set_state(ConnectionState::Error { message: format!("Failed to send challenge: {error:?}"), cause: None });
+                        return None;
+                    }
+                }
                 proto::Message::Presence(server_presence) => {
                     // Pre-check the version so the server learns why we are
                     // leaving; register_peer re-enforces this for every transport.
@@ -196,6 +219,15 @@ impl Connection {
                     match state {
                         ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
                         ConnectionState::Connecting { .. } => {
+                            let (Some(challenge), Some(server_challenge)) =
+                                (self.challenge.borrow_mut().take(), self.server_challenge.get())
+                            else {
+                                let message = format!("Server {} sent its presence before its handshake challenge", self.url);
+                                error!("{}", message);
+                                self.disconnect();
+                                self.set_state(ConnectionState::Error { message, cause: None });
+                                return None;
+                            };
                             // Register BEFORE publishing Connected: observers of the
                             // state must never see a connection whose peer is not
                             // registered (or that registration is about to refuse).
@@ -206,7 +238,10 @@ impl Connection {
                                 ws: SendWrapper::new(self.ws.clone()),
                             });
                             return Some(async move {
-                                let presence = match node.register_peer(server_presence.clone(), sender).await {
+                                let presence = match node
+                                    .register_peer(server_presence.clone(), challenge, PeerProvenance::Configured, sender)
+                                    .await
+                                {
                                     Ok(()) => {
                                         if let Some(connection) = weak.upgrade().map(Connection) {
                                             connection.registered_peer.set(Some(server_presence.node_id));
@@ -214,7 +249,7 @@ impl Connection {
                                             node.deregister_peer(server_presence.node_id);
                                             return;
                                         }
-                                        node.presence().await.map_err(PeerConnectionError::from)
+                                        node.presence(server_challenge).await.map_err(PeerConnectionError::from)
                                     }
                                     Err(error) => Err(error),
                                 };
@@ -263,6 +298,14 @@ impl Connection {
                     self.set_state(ConnectionState::Error { message: rejection.to_string(), cause: Some(rejection.into()) });
                 }
                 proto::Message::PeerMessage(msg) => {
+                    if self.registered_peer.get().is_none() {
+                        // As the native client: nothing an unregistered server says may reach the node.
+                        let message = format!("Server {} sent application traffic before its presence registered; closing", self.url);
+                        error!("{}", message);
+                        self.disconnect();
+                        self.set_state(ConnectionState::Error { message, cause: None });
+                        return None;
+                    }
                     let node = self.node.cloned();
                     // TODO: determine the performance implications of spawning a new task for each message
                     // versus using a channel to send messages to the node.
@@ -330,7 +373,7 @@ impl PartialEq for Connection {
 
 #[derive(Clone)]
 struct WebSocketPeerSender {
-    recipient_node_id: proto::EntityId,
+    recipient_node_id: proto::NodeId,
     ws: SendWrapper<Arc<WebSocket>>,
 }
 
@@ -354,7 +397,7 @@ impl PeerSender for WebSocketPeerSender {
         }
     }
 
-    fn recipient_node_id(&self) -> proto::EntityId { self.recipient_node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

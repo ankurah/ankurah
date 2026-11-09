@@ -160,6 +160,8 @@ pub enum RequestError {
     NodeHalted(#[from] NodeHaltReason),
     #[error("Peer not connected")]
     PeerNotConnected,
+    #[error("peer {0} is not trusted as durable")]
+    NotTrustedAsDurable(ankurah_proto::NodeId),
     #[error("Connection lost")]
     ConnectionLost,
     #[error("System not ready")]

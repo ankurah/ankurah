@@ -12,6 +12,7 @@
 //! on the node's id, which is random and would leak entropy into the
 //! schedule.
 
+use ankurah::core::connector::PeerProvenance;
 use ankurah::core::test_helpers::commit_transaction;
 use ankurah::proto::{self, Attested};
 use ankurah::storage::StorageEngine;
@@ -32,24 +33,19 @@ pub struct SimNode {
 }
 
 impl SimNode {
-    pub fn id(&self) -> proto::EntityId { self.node.id }
+    pub fn id(&self) -> proto::NodeId { self.node.id }
 
     /// Register `peer` as a connected peer of this node, installing a
     /// `SimSender` so anything this node sends *to* `peer` is captured for the
     /// scheduler. Mirrors `Node::register_peer` as `LocalProcessConnection`
     /// would, including initial system adoption from a durable peer.
-    pub async fn connect_to(&self, peer: &SimNode) {
+    /// `provenance` is this node's side of the connection: `Configured` if it dialed.
+    pub async fn connect_to(&self, peer: &SimNode, provenance: PeerProvenance) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
+        let challenge = self.node.issue_challenge();
+        let presence = peer.node.presence(challenge.challenge()).await.expect("sim peers do not halt during setup");
         self.node
-            .register_peer(
-                proto::Presence {
-                    node_id: peer.id(),
-                    durable: peer.durable,
-                    system_root: peer.node.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
-                Box::new(sender),
-            )
+            .register_peer(presence, challenge, provenance, Box::new(sender))
             .await
             .expect("sim peers share this build's protocol version");
     }

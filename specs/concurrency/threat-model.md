@@ -50,10 +50,21 @@ nodes** have non-definitive storage (`storage_is_definitive()` defaults to `fals
 and fall back to a durable peer: `CachedEventGetter::get_event` checks staging, then
 local storage, then `node.get_durable_peer_random()`.
 
-Peer class is **self-asserted, not authenticated**: `node.rs` `register_peer` inserts
-into `durable_peers` when `presence.durable` is true, with no signature. Any peer can
-advertise durable and be selected by `get_durable_peer_random`, which an ephemeral
-node then trusts for fetches (C4-16, gap G-8).
+Peer identity is **authenticated at the handshake, and peer class follows
+provenance**: each side answers the other's fresh challenge with a `Presence` signed
+by its node key, and `node.rs` `register_peer` refuses a presence that does not
+answer the challenge issued for that connection, whose signature does not verify, or
+that names the node itself. A durable claim counts only when `PolicyAgent::peer_trust`
+grants it; the default grants it to a peer this node dialed from its own
+configuration and never to a peer that connected to it. Only a granted peer enters
+`durable_peers`, from which `get_durable_peer_random` picks the peer an ephemeral node
+trusts for fetches (C4-16, gap G-8). An id's latest registration decides its trust: a
+durable id that registers again without the grant is dropped from durable routing at that
+moment, and every request to a peer chosen as durable re-checks that its current
+connection holds the grant. The one exception is the relay's unsubscribe notice, sent to
+the id's current connection without that check because it carries no credentials and no
+reply is applied. Frames after the handshake are unsigned: a peer authenticated on its own
+connection can still name another registered peer in a message's `from` field (G-8).
 
 ### 1.2 What peers are trusted with today
 
@@ -439,22 +450,46 @@ cites for the "no unvalidated event touches state" class. Its original code name
 refactor; the gap now lives at `CachedEventGetter::get_event`. Nil impact under
 PermissiveAgent, critical under a real agent. Gap G-1.
 
-**C4-16. Durable-peer selection is unauthenticated (OPEN GAP).**
+**C4-16. Durable-peer selection follows provenance (PARTIAL).**
 Invariant (desired): the peer an ephemeral node fetches authoritative events from is
 authenticated as genuinely durable, not merely self-asserting.
-Trust tier: currently trusted-peer.
-Enforcing seam: **none today.** `node.rs` `register_peer` inserts into
-`durable_peers` from `presence.durable` (self-asserted, no signature);
-`get_durable_peer_random` picks from it; `CachedEventGetter::get_event` fetches
-there.
+Trust tier: trusted-peer, for a peer this node was configured to dial.
+Enforcing seam: `node.rs` `register_peer` verifies the signed presence against the
+challenge this node issued for the connection (`IssuedChallenge::authenticate` in
+`connector.rs`), then asks `PolicyAgent::peer_trust` whether the peer is durable. By
+default only a peer reached as `PeerProvenance::Configured` may be; an `Inbound`
+peer's durable claim is ignored. Only a durable-trusted peer enters `durable_peers`,
+where `get_durable_peer_random` picks the fetch source and the commit relay finds its
+targets. An id's latest registration decides, and registrations of one id apply one at
+a time: anyone can relay this node's fresh challenge to a durable peer's server and
+register the answer inbound, so a durable-trusted id that registers again without
+durable trust is dropped from `durable_peers` and the subscription relay at that
+moment. Every request to a peer chosen as durable (`Node::request_durable`) re-checks the
+trust of the connection it is about to use and is refused with
+`RequestError::NotTrustedAsDurable` when that connection lacks it. The one exception is the
+relay's unsubscribe notice, sent to the id's current connection without that check because
+it carries no credentials and no reply is applied.
 Falsifying attack (T1): advertise `durable: true` in a `Presence` to become the fetch
-source, then chain with C4-15 to inject events.
-Planned test arm: rogue-durable arm (a peer self-advertises durable and answers
-fetches) asserting authentication rejects it once presence/identity gains
-attestation.
-Status: open gap, a PolicyAgent/presence-authentication concern adjacent to #274 and
-phase 3 (durable-tier story). Gap G-8. Note: the *serving* side is better off, since
-the `GetEvents` handler does run `can_access_collection` + `check_read_event` (C4-18).
+source or a commit relay target, then chain with C4-15 to inject events. Refused for
+a peer that connects to the node; a configured peer is still trusted on its claim.
+Test arm: `peer_trust_tests::inbound_durable_claim_is_not_a_relay_target`
+(jwt-auth: an inbound durable claimant receives no local commit and cannot fail a
+root context commit) and `node::tests::identity` (core: forged signature, replayed
+presence, reflected self-connection, provenance trust, a durable id registered again
+inbound, concurrent registrations of one id) and
+`client_relay::tests::a_subscription_send_refuses_a_peer_whose_connection_lost_durable_trust`
+(core: a send whose peer lost durable trust while it waited is refused).
+Status: partial. Which keys are a system's durable members is not recorded, so a
+configured peer's durable claim is accepted without a membership check (#459). Frames
+after the handshake are not signed, so a peer that authenticated its own connection
+can still name another registered peer in a message's `from` field: it can answer a
+request this node is waiting on from that peer if it knows the request id, remove that
+peer's query, and inject updates attributed to that peer. TLS does not prevent this, since the sender is
+a legitimate endpoint of its own connection; without TLS an active relay that forwards
+a genuine presence can also inject frames under that identity. Signing frames after the
+handshake is deferred to a follow-up node identity change. Gap G-8 narrows to these.
+Note: the *serving* side is better off, since the `GetEvents` handler does run
+`can_access_collection` + `check_read_event` (C4-18).
 
 **C4-17. No size or count limit on incoming event messages (OPEN GAP).**
 Invariant (desired): a single peer message cannot carry unbounded events or payload;
@@ -631,7 +666,7 @@ PermissiveAgent every security gap is moot, which is itself meta-gap G-0.
 | G-5 | Deep-divergence rejection is error-shaped, not policy-shaped: a stale-but-honest branch and a forged deep branch both terminate in `BudgetExceeded` (C4-09) | Medium: no deterministic horizon; budget is the only backstop and its outcome is an anomaly, not a decision. The convergence risk is bounded because verdicts are grounded (C4-08), but the DoS/thrash surface is open. | #271 (rejection horizon) + #266 (generation distance) |
 | G-6 | `commit_remote_transaction` applies creation events to the real entity before the policy check (C4-19) | Medium with a real agent: a rejected creation event poisons in-memory state; policy sees no genuine before-state. No impact under PermissiveAgent. | #243, design answered by #274/#242 |
 | G-7 | `ValidatedEvent` (future) risks implying "globally valid"; only I-confluent, before(u)-local invariants are convergently enforceable (C4-21) | Documentation/design: if #274 lets validated ingress promise cross-entity uniqueness or referential integrity, it promises something no convergent rule can deliver (lit review Finding 3). | #274 (state the I-confluence boundary) |
-| G-8 | Durable-peer role is self-asserted, not authenticated (C4-16) | High when chained with G-1: a rogue "durable" peer becomes the fetch source and injects events. | #274 + phase 3 durable-tier story |
+| G-8 | Durable-peer role rests on provenance, not on a recorded membership, and frames after the handshake are unsigned (C4-16) | Medium when chained with G-1: a configured peer is trusted as durable on its claim. A peer authenticated on its own connection can name another registered peer in a message's `from` field and so answer a request this node is waiting on from that peer (given its request id), remove its query, or inject updates attributed to it; TLS does not prevent this. Without TLS, an active relay holding a genuine presence can inject frames under that identity. A peer that connects to the node can no longer claim the role; a durable id that registers again without the grant loses it at that moment, and requests to peers chosen as durable re-check the grant first, except the relay's unsubscribe notice, which carries no credentials and has no reply applied. | #459 (durable membership) + signed frames after the handshake, deferred to a follow-up node identity change |
 | G-9 | The `CausalAssertion` attestation surface is defined but has no consumer; `validate_causal_assertion` is never called (Section 4) | Low today (unused), Medium latent: if a future optimization trusts a peer's asserted lineage relation without re-deriving it, a lying peer substitutes a false relation. | whichever workstream introduces relation-assertion shortcuts; must re-derive, not trust |
 
 ---
@@ -668,7 +703,7 @@ assertion, not a wire arm, per the claim body).
 | C4-13 | TOCTOU atomicity is a concurrent-writer scenario owned by the C1 simulation; not a single-node wire arm | design-boundary |
 | C4-14 | `bridge_policy::test_event_bridge_events_are_policy_validated_on_receive`; `commit_atomicity` (check_event denial) | existing-suite |
 | C4-15 | `adversarial_wire::bfs_fetched_events_are_policy_validated` | gap-red-ignored (G-1, #244/#274) |
-| C4-16 | none (durable-peer authentication is gap G-8; no seam to assert against, adjacent to #274/phase 3) | design-boundary |
+| C4-16 | `peer_trust_tests::inbound_durable_claim_is_not_a_relay_target` (jwt-auth); `node::tests::identity` and `client_relay::tests::a_subscription_send_refuses_a_peer_whose_connection_lost_durable_trust` (core) | enforced-pass for the handshake and durable routing; frames after the handshake are unsigned (G-8) |
 | C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |
 | C4-18 | `bridge_policy::test_event_bridge_respects_read_policy_on_send` | existing-suite |
 | C4-19 | none here (creation-event fork asymmetry is gap G-6; the remote-transaction path with a rejecting agent is owned by #243) | design-boundary |
@@ -680,12 +715,13 @@ assertion, not a wire arm, per the claim body).
 Coverage summary: of the twenty-two claims, the Byzantine-safe structural and
 containment claims that a single-node wire delivery can falsify are pinned by
 green arms (C4-01, C4-03, C4-04, C4-05, C4-06, C4-07, C4-09 partial, C4-11,
-C4-12); the three open ingress gaps are pinned by red-ignored arms (C4-15/G-1,
-C4-17/G-3, plus G-4); the attestation-dependent admission/read claims are
-already pinned by the existing policy suite (C4-14, C4-18); and the remaining
+C4-12, and C4-16 for the handshake and durable routing but not the unsigned frames
+after it); the three open ingress gaps are pinned by red-ignored arms
+(C4-15/G-1, C4-17/G-3, plus G-4); the attestation-dependent admission/read claims
+are already pinned by the existing policy suite (C4-14, C4-18); and the remaining
 claims are documented boundaries a wire arm cannot cheaply or meaningfully add
-here (C4-02, C4-08, C4-10, C4-13, C4-16, C4-19, C4-20, C4-21, C4-22), each with
-its owning issue or workstream named above.
+here (C4-02, C4-08, C4-10, C4-13, C4-19, C4-20, C4-21, C4-22), each with its
+owning issue or workstream named above.
 
 No arm contradicted a claim. One behavior warranted a precise assertion choice:
 on an ephemeral node a rejected second genesis (C4-06) still causes BFS to pull

@@ -1,3 +1,4 @@
+use crate::connector::PeerProvenance;
 use crate::error::{NodeDropped, ValidationError};
 use crate::internal::prelude::*;
 use crate::util::Iterable;
@@ -52,6 +53,14 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 
 impl AccessDenied {}
 
+/// What this node grants a connected peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerTrust {
+    /// Whether this node treats the peer as durable: a relay target for local commits, a source for
+    /// durable reads, and the source an ephemeral node adopts its system from.
+    pub durable: bool,
+}
+
 // The registration plan vocabulary (RegistrationPlan and friends) lives
 // with its builder in crate::schema::registration and is re-exported here
 // because it is part of this trait's surface.
@@ -62,6 +71,7 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - checking access for requests. If approved, yield a ContextData
 /// - attesting events for requests that were approved
 /// - validating attestations for events
+/// - deciding what a connected peer is trusted with
 ///
 /// Read checks may receive several credentials, one, or none. Implementations
 /// must decide the empty case explicitly and authorize actual entity memberships,
@@ -150,7 +160,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityId,
+        received_from_node: &proto::NodeId,
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
@@ -160,7 +170,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityId,
+        received_from_node: &proto::NodeId,
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
@@ -203,9 +213,19 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        peer_id: &proto::EntityId,
+        peer_id: &proto::NodeId,
         head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied>;
+
+    /// Decide what this node grants a peer whose handshake it verified, from how the peer was
+    /// reached and whether it claims to be durable. By default only a peer this node dialed from
+    /// its own configuration is trusted as durable; a peer that connected to this node is not.
+    fn peer_trust(&self, _peer: &proto::NodeId, provenance: PeerProvenance, claimed_durable: bool) -> PeerTrust {
+        match provenance {
+            PeerProvenance::Configured => PeerTrust { durable: claimed_durable },
+            PeerProvenance::Inbound => PeerTrust { durable: false },
+        }
+    }
 
     // // For checking if a context can subscribe to changes
     // fn can_subscribe(&self, data: &Self::ContextData, collection: &ModelId, predicate: &Predicate) -> AccessResult;
@@ -274,7 +294,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -289,7 +309,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         // This PolicyAgent does not require validation, so we return Ok
@@ -304,7 +324,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         // PermissiveAgent trusts all causal assertions

@@ -35,6 +35,54 @@ this matters.
 For details on the event-getter implementations that back this behavior, see
 the [Event Retrieval and Staging](retrieval.md) document.
 
+## Node Identity and Peer Trust
+
+A node's identity is an ed25519 key: its `NodeId` is the `Identity` of the
+node's verifying key.
+The node holds the signing key (`NodeKey`) privately and does all of its own
+signing; policy agents never see it. A node built without a key draws a fresh
+one, so its identity lasts only as long as the process. A durable deployment
+passes a persisted key to `Node::new_durable_with_key`; `NodeKey::load_or_create`
+keeps the 32-byte seed in a file the embedder chooses.
+
+When a connection opens, each side sends the other a fresh `HandshakeChallenge`
+and answers the one it receives with a signed `Presence`: its `NodeId`, whether
+it claims to be durable, the challenge, an advisory timestamp and the protocol
+version, signed under the tag `ankurah.presence.v1`. `register_peer` accepts a
+presence only if it answers the challenge this node issued for that connection,
+its signature verifies under the key it names, and it does not name this node
+itself. A presence copied from another connection answers a different challenge
+and is refused.
+
+Whether a peer counts as durable follows from how it was reached, not from its
+claim. Each connector states a `PeerProvenance`: a node that dialed the peer from
+its own configuration registers it as `Configured`, and a node that accepted the
+connection registers it as `Inbound`. `PolicyAgent::peer_trust` turns the
+provenance and the claim into a `PeerTrust`. The default trusts a durable claim
+only from a configured peer, and a policy agent may override it, for example to
+trust peers listed by key. Only a peer trusted as durable becomes a relay target
+for local commits and a source for durable reads; an inbound peer's durable
+claim is logged and otherwise ignored. A node id's latest registration decides
+its trust, and registrations of one id apply one at a time. Anyone can get a node's presence for a fresh challenge by
+relaying that challenge to the node's server, so an id trusted as durable can be
+registered again over a connection that is not. Durable routing for that id is
+dropped at that moment, and every request to a peer chosen because it is durable
+re-checks, as it is sent, that the peer's current connection is trusted as
+durable; a request that fails the check is refused, so neither its credentials
+nor its reply cross the new connection. The one exception is the subscription
+relay's unsubscribe notice, sent to the id's current connection without that
+check because it carries no credentials and no reply is applied.
+
+The signed presence authenticates the handshake only; frames after it are not
+signed. A peer that authenticated its own connection can still name another
+registered peer in a message's `from` field, and so answer a request this node
+is waiting on from that peer if it knows the request id, remove that peer's
+query, or inject updates attributed to that peer. TLS does not prevent this, because the sender is a
+legitimate endpoint of its own connection. Over a transport without TLS, an
+active relay that forwards a genuine presence can also inject frames under that
+identity. Signing every frame after the handshake is deferred to a follow-up
+node identity change.
+
 
 ## The Replication Protocol
 

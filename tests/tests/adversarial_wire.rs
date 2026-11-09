@@ -81,7 +81,7 @@ fn event_only_multi(entity_id: proto::EntityId, events: Vec<proto::Event>) -> pr
     }
 }
 
-fn deliver(from: proto::EntityId, to: proto::EntityId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
+fn deliver(from: proto::NodeId, to: proto::NodeId, items: Vec<proto::SubscriptionUpdateItem>) -> proto::NodeMessage {
     proto::NodeMessage::Update(proto::NodeUpdate {
         id: proto::UpdateId::new(),
         from,

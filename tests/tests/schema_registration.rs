@@ -704,7 +704,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_received_event<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
@@ -721,7 +721,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_received_state<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &proto::Attested<proto::EntityState>,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())
@@ -744,7 +744,7 @@ impl ankurah::policy::PolicyAgent for ProbeAgent {
     fn validate_causal_assertion<SE: ankurah::core::storage::StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), ankurah::policy::AccessDenied> {
         Ok(())

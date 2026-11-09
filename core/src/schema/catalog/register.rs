@@ -274,7 +274,7 @@ where
         return Err(RegistrationError::NoDurablePeer(registrant.label().to_string()));
     };
     let body = proto::NodeRequestBody::RegisterSchema { model: declaration(registrant) };
-    let response = node.request(peer, cdata, body).await.map_err(RetrievalError::from)?;
+    let response = node.request_durable(peer, cdata, body).await.map_err(RetrievalError::from)?;
     let registered = match response {
         proto::NodeResponseBody::SchemaRegistered { model } => model,
         proto::NodeResponseBody::Error(error) => return Err(RetrievalError::Other(error).into()),

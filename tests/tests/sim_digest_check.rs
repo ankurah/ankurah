@@ -15,8 +15,8 @@ fn event_only_message(entity: proto::EntityId, ev: Attested<proto::Event>) -> pr
     let frag: proto::EventFragment = ev.into();
     proto::NodeMessage::Update(proto::NodeUpdate {
         id: proto::UpdateId::new(),
-        from: entity,
-        to: entity,
+        from: proto::NodeId::from(proto::Identity::Ed25519([1; 32])),
+        to: proto::NodeId::from(proto::Identity::Ed25519([2; 32])),
         body: proto::NodeUpdateBody::SubscriptionUpdate {
             items: vec![proto::SubscriptionUpdateItem {
                 entity_id: entity,

@@ -8,6 +8,7 @@
 //! scenario). The driver runs everything on a single-threaded tokio runtime so
 //! intra-node task poll order is deterministic.
 
+use ankurah::core::connector::PeerProvenance;
 use ankurah::proto::{self, Attested};
 
 use super::faults::FaultConfig;
@@ -260,7 +261,7 @@ impl<'a> Workload<'a> {
 
         let origin_id = self.nodes[origin].id();
         let node_indices: Vec<usize> = self.nodes.iter().map(|n| n.index).filter(|&i| i != origin).collect();
-        let node_ids: Vec<proto::EntityId> = self.nodes.iter().map(|n| n.id()).collect();
+        let node_ids: Vec<proto::NodeId> = self.nodes.iter().map(|n| n.id()).collect();
 
         for event in &events {
             let event_id = event.payload.id();
@@ -386,15 +387,15 @@ where
 
         let durable = nodes.iter().find(|node| node.durable).expect("the simulation has a durable node");
 
-        let node_ids: Vec<proto::EntityId> = nodes.iter().map(|n| n.id()).collect();
+        let node_ids: Vec<proto::NodeId> = nodes.iter().map(|n| n.id()).collect();
         let mut scheduler = Scheduler::new(captured.clone(), faults, node_ids);
         let mut trace = Trace::new();
 
         // Bring ephemerals up serially so startup scheduling cannot change the trace.
         for node in &nodes {
             if !node.durable {
-                node.connect_to(durable).await;
-                durable.connect_to(node).await;
+                node.connect_to(durable, PeerProvenance::Configured).await;
+                durable.connect_to(node, PeerProvenance::Inbound).await;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
                 let ready = node.node.system.wait_system_ready();
                 tokio::pin!(ready);
@@ -428,7 +429,9 @@ where
         for a in &nodes {
             for b in &nodes {
                 if a.index != b.index && !a.durable && !b.durable {
-                    a.connect_to(b).await;
+                    // One connection per pair: the lower index dials.
+                    let provenance = if a.index < b.index { PeerProvenance::Configured } else { PeerProvenance::Inbound };
+                    a.connect_to(b, provenance).await;
                 }
             }
         }

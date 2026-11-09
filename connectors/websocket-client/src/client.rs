@@ -1,6 +1,6 @@
 use crate::sender::WebsocketPeerSender;
 use ankurah_core::{
-    connector::{PeerConnectionError, PeerSender},
+    connector::{IssuedChallenge, PeerConnectionError, PeerProvenance, PeerSender},
     policy::PolicyAgent,
     storage::StorageEngine,
     Node, NodeState,
@@ -99,6 +99,12 @@ pub enum ConnectionError {
     Peer(#[from] PeerConnectionError),
     #[error("General connection error: {0}")]
     General(String),
+}
+
+/// One connection attempt's challenges: ours, which the server's presence must answer, and the server's, which ours answers.
+struct Challenges {
+    ours: Option<IssuedChallenge>,
+    server: Option<proto::HandshakeChallenge>,
 }
 
 const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -219,7 +225,7 @@ where
     }
 
     /// Get the node ID of the connected server (if connected)
-    pub fn server_node_id(&self) -> Option<proto::EntityId> {
+    pub fn server_node_id(&self) -> Option<proto::NodeId> {
         match self.state().get() {
             ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id),
             _ => None,
@@ -275,6 +281,9 @@ where
 
         let mut peer_sender: Option<WebsocketPeerSender> = None;
         let mut outgoing_rx: Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>> = None;
+        let ours = inner.node.issue_challenge();
+        let opening = proto::Message::Challenge(ours.challenge());
+        let mut challenges = Challenges { ours: Some(ours), server: None };
         let connection = async {
             let request = inner.server_url.as_str().into_client_request()?;
             let (ws_stream, _) = connect_async_tls_with_config(request, inner.config, inner.disable_nagle, inner.connector.clone()).await?;
@@ -282,6 +291,7 @@ where
 
             let (mut sink, mut stream) = ws_stream.split();
             debug!("Starting connection handling");
+            sink.send(Message::Binary(bincode::serialize(&opening)?.into())).await?;
 
             loop {
                 select! {
@@ -296,7 +306,7 @@ where
                         }
                     }
                     msg = stream.next() => {
-                        match Self::handle_incoming_message(inner, msg, &mut peer_sender, &mut outgoing_rx, &mut sink).await? {
+                        match Self::handle_incoming_message(inner, msg, &mut challenges, &mut peer_sender, &mut outgoing_rx, &mut sink).await? {
                             MessageResult::Continue => continue,
                             MessageResult::Break => break,
                         }
@@ -342,6 +352,7 @@ where
     async fn handle_incoming_message(
         inner: &Arc<Inner<SE, PA>>,
         msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+        challenges: &mut Challenges,
         peer_sender: &mut Option<WebsocketPeerSender>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
         sink: &mut futures_util::stream::SplitSink<
@@ -351,8 +362,16 @@ where
     ) -> Result<MessageResult> {
         match msg {
             Some(Ok(Message::Binary(data))) => match bincode::deserialize(&data) {
+                Ok(proto::Message::Challenge(challenge)) => {
+                    if challenges.server.is_some() || peer_sender.is_some() {
+                        warn!("Ignoring repeated handshake challenge from {}", inner.server_url);
+                    } else {
+                        challenges.server = Some(challenge);
+                    }
+                    Ok(MessageResult::Continue)
+                }
                 Ok(proto::Message::Presence(server_presence)) => {
-                    match Self::handle_server_presence(inner, server_presence, peer_sender, outgoing_rx, sink).await {
+                    match Self::handle_server_presence(inner, server_presence, challenges, peer_sender, outgoing_rx, sink).await {
                         Ok(()) => Ok(MessageResult::Continue),
                         Err(rejection) => {
                             // Only protocol mismatches have a wire rejection.
@@ -425,6 +444,7 @@ where
     async fn handle_server_presence(
         inner: &Arc<Inner<SE, PA>>,
         server_presence: proto::Presence,
+        challenges: &mut Challenges,
         peer_sender: &mut Option<WebsocketPeerSender>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
         sink: &mut futures_util::stream::SplitSink<
@@ -438,15 +458,18 @@ where
             warn!("Ignoring duplicate server presence");
             return Ok(());
         }
+        let (Some(challenge), Some(server_challenge)) = (challenges.ours.take(), challenges.server) else {
+            return Err(anyhow!("server {} sent its presence before its handshake challenge", inner.server_url));
+        };
 
         let (sender, rx) = WebsocketPeerSender::new(server_presence.node_id);
-        inner.node.register_peer(server_presence.clone(), Box::new(sender.clone())).await?;
+        inner.node.register_peer(server_presence.clone(), challenge, PeerProvenance::Configured, Box::new(sender.clone())).await?;
 
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
 
         // Advertise our system only after admission, so an old cached root cannot preempt adoption.
-        let presence = proto::Message::Presence(inner.node.presence().await.map_err(PeerConnectionError::from)?);
+        let presence = proto::Message::Presence(inner.node.presence(server_challenge).await.map_err(PeerConnectionError::from)?);
         sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
 
         inner.connected.store(true, Ordering::Release);

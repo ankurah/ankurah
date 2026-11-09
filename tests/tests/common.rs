@@ -57,13 +57,13 @@ pub struct Record {
 // crate so the shipped connector keeps its minimal API.
 // ---------------------------------------------------------------------------
 
-use ankurah::core::connector::{PeerSender, SendError};
+use ankurah::core::connector::{PeerProvenance, PeerSender, SendError};
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
 struct GatedSender {
     sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::EntityId,
+    node_id: proto::NodeId,
 }
 
 #[async_trait::async_trait]
@@ -72,7 +72,7 @@ impl PeerSender for GatedSender {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
-    fn recipient_node_id(&self) -> proto::EntityId { self.node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -153,35 +153,30 @@ impl GatedConnection {
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
         other.system.wait_loaded().await.unwrap();
         gated.system.wait_loaded().await.unwrap();
+        // As LocalProcessConnection: an ephemeral node dials a durable one, otherwise `other` dials.
+        let gated_dials = other.durable && !gated.durable;
+        let (other_provenance, gated_provenance) = if gated_dials {
+            (PeerProvenance::Inbound, PeerProvenance::Configured)
+        } else {
+            (PeerProvenance::Configured, PeerProvenance::Inbound)
+        };
         let register_other = async {
+            let challenge = other.issue_challenge();
+            let presence = gated.presence(challenge.challenge()).await.expect("the gated node is loaded");
             other
-                .register_peer(
-                    proto::Presence {
-                        node_id: gated.id,
-                        durable: gated.durable,
-                        system_root: gated.system.root(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                    },
-                    Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
-                )
+                .register_peer(presence, challenge, other_provenance, Box::new(GatedSender { sender: gated_tx, node_id: gated.id }))
                 .await
                 .expect("gated peers use the current protocol version");
         };
         let register_gated = async {
+            let challenge = gated.issue_challenge();
+            let presence = other.presence(challenge.challenge()).await.expect("the other node is loaded");
             gated
-                .register_peer(
-                    proto::Presence {
-                        node_id: other.id,
-                        durable: other.durable,
-                        system_root: other.system.root(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                    },
-                    Box::new(GatedSender { sender: other_tx, node_id: other.id }),
-                )
+                .register_peer(presence, challenge, gated_provenance, Box::new(GatedSender { sender: other_tx, node_id: other.id }))
                 .await
                 .expect("gated peers use the current protocol version");
         };
-        if other.durable && !gated.durable {
+        if gated_dials {
             register_gated.await;
             register_other.await;
         } else {

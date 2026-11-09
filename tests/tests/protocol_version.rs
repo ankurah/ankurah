@@ -4,7 +4,8 @@
 //! server against unreadable and mismatched handshakes, and the websocket
 //! client against a mismatched server.
 
-use ankurah::core::connector::{PeerConnectionError, PeerSender, SendError};
+use ankurah::core::connector::{PeerConnectionError, PeerProvenance, PeerSender, SendError};
+use ankurah::core::node::NodeKey;
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use ankurah_websocket_client::WebsocketClient;
@@ -18,17 +19,22 @@ mod common;
 use common::{proto, start_test_server};
 
 #[derive(Clone)]
-struct NullSender(proto::EntityId);
+struct NullSender(proto::NodeId);
 
 #[async_trait::async_trait]
 impl PeerSender for NullSender {
     fn send_message(&self, _message: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
+    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
+/// A presence advertising `protocol_version`, signed by a fresh key for some
+/// other node's challenge. A version other than the current one breaks the
+/// signature, which the version check never reaches.
 fn presence(protocol_version: u32) -> proto::Presence {
-    proto::Presence { node_id: proto::EntityId::random(), durable: false, system_root: None, protocol_version }
+    let mut presence = NodeKey::generate().sign_presence(false, proto::HandshakeChallenge::new(NodeKey::generate().node_id()));
+    presence.protocol_version = protocol_version;
+    presence
 }
 
 /// The core enforcement point: register_peer refuses incompatible versions
@@ -36,20 +42,25 @@ fn presence(protocol_version: u32) -> proto::Presence {
 #[tokio::test]
 async fn register_peer_refuses_incompatible_version() -> Result<()> {
     let node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let key = NodeKey::generate();
 
     for bad_version in [0, proto::PROTOCOL_VERSION + 1] {
-        let p = presence(bad_version);
-        let peer_id = p.node_id;
-        let err = node.register_peer(p, Box::new(NullSender(peer_id))).await.expect_err("must refuse");
+        let challenge = node.issue_challenge();
+        let mut p = key.sign_presence(false, challenge.challenge());
+        p.protocol_version = bad_version;
+        let err =
+            node.register_peer(p, challenge, PeerProvenance::Inbound, Box::new(NullSender(key.node_id()))).await.expect_err("must refuse");
         assert_eq!(
             err,
             PeerConnectionError::Protocol(proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: bad_version })
         );
     }
 
-    let p = presence(proto::PROTOCOL_VERSION);
-    let peer_id = p.node_id;
-    node.register_peer(p, Box::new(NullSender(peer_id))).await.expect("current version must be accepted");
+    let challenge = node.issue_challenge();
+    let p = key.sign_presence(false, challenge.challenge());
+    node.register_peer(p, challenge, PeerProvenance::Inbound, Box::new(NullSender(key.node_id())))
+        .await
+        .expect("current version must be accepted");
     Ok(())
 }
 
@@ -112,28 +123,27 @@ async fn server_refuses_mismatched_version() -> Result<()> {
     Ok(())
 }
 
-/// A legacy browser client waits for the server Presence before sending its
-/// own. A durable versioned Presence is undecodable by that client, so it remains
-/// silent; the server must still bound the incomplete handshake.
+/// A client that cannot decode the server's opening challenge (a legacy
+/// client expects a Presence first) remains silent; the server must still
+/// bound the incomplete handshake.
 #[tokio::test(start_paused = true)]
-async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
-    let (_server_node, server_url, server_task) = start_test_server().await?;
+async fn server_closes_silent_client_after_its_challenge() -> Result<()> {
+    let (server_node, server_url, server_task) = start_test_server().await?;
     let (ws, _) = tokio_tungstenite::connect_async(format!("{}/ws", server_url)).await?;
     let (_sink, mut stream) = ws.split();
 
-    let server_presence = loop {
+    let challenge = loop {
         match stream.next().await {
             Some(Ok(WsMessage::Binary(data))) => match bincode::deserialize::<proto::Message>(&data)? {
-                proto::Message::Presence(presence) => break presence,
-                other => panic!("server sent {other:?} before its presence"),
+                proto::Message::Challenge(challenge) => break challenge,
+                other => panic!("server sent {other:?} before its challenge"),
             },
-            Some(Ok(other)) => panic!("server sent {other:?} before its presence"),
+            Some(Ok(other)) => panic!("server sent {other:?} before its challenge"),
             Some(Err(e)) => return Err(e.into()),
-            None => panic!("server closed before sending its presence"),
+            None => panic!("server closed before sending its challenge"),
         }
     };
-    assert!(server_presence.durable, "test server must reproduce the durable Presence shape");
-    assert!(server_presence.system_root.is_some(), "durable Presence must carry the versioned system-root state");
+    assert_eq!(challenge.issuer(), server_node.id, "the server opens with its own challenge");
 
     // Send nothing. Advancing beyond the production deadline keeps this test
     // deterministic and avoids adding ten seconds to the native test suite.
@@ -158,6 +168,36 @@ async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
     Ok(())
 }
 
+/// The server answers one challenge per connection: a second challenge before
+/// the client's presence closes the connection.
+#[tokio::test]
+async fn server_closes_a_connection_that_sends_a_second_challenge() -> Result<()> {
+    let (_server_node, server_url, server_task) = start_test_server().await?;
+    let (ws, _) = tokio_tungstenite::connect_async(format!("{}/ws", server_url)).await?;
+    let (mut sink, mut stream) = ws.split();
+    let challenge = proto::Message::Challenge(proto::HandshakeChallenge::new(NodeKey::generate().node_id()));
+    sink.send(WsMessage::Binary(bincode::serialize(&challenge)?.into())).await?;
+    sink.send(WsMessage::Binary(bincode::serialize(&challenge)?.into())).await?;
+
+    let mut presences = 0;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+            Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) => break,
+            Ok(Some(Ok(WsMessage::Binary(data)))) => {
+                if let Ok(proto::Message::Presence(_)) = bincode::deserialize::<proto::Message>(&data) {
+                    presences += 1;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            Err(_) => panic!("server left the connection open after a second challenge"),
+        }
+    }
+    assert_eq!(presences, 1, "the server answers one challenge per connection");
+
+    server_task.abort();
+    Ok(())
+}
+
 /// Application traffic before Presence is refused: a server that skips the
 /// handshake and leads with a PeerMessage must not reach the node, and the
 /// client must drop the connection rather than continue.
@@ -176,7 +216,7 @@ async fn client_refuses_peer_message_before_presence() -> Result<()> {
         let (mut sink, mut stream) = ws.split();
 
         let early = proto::Message::PeerMessage(proto::NodeMessage::UnsubscribeQuery {
-            from: proto::EntityId::random(),
+            from: NodeKey::generate().node_id(),
             query_id: proto::QueryId::new(),
         });
         sink.send(WsMessage::Binary(bincode::serialize(&early).unwrap().into())).await.expect("send");
@@ -188,10 +228,12 @@ async fn client_refuses_peer_message_before_presence() -> Result<()> {
             match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
                 Ok(None) | Ok(Some(Ok(WsMessage::Close(_)))) | Ok(Some(Err(_))) => break true,
                 Ok(Some(Ok(WsMessage::Binary(data)))) => {
-                    // The client's own Presence (and a possible rejection
-                    // notice) are handshake chatter, not session traffic.
+                    // The client's own challenge and Presence (and a possible
+                    // rejection notice) are handshake chatter, not session traffic.
                     match bincode::deserialize::<proto::Message>(&data) {
-                        Ok(proto::Message::Presence(_)) | Ok(proto::Message::PresenceRejected(_)) => continue,
+                        Ok(proto::Message::Challenge(_)) | Ok(proto::Message::Presence(_)) | Ok(proto::Message::PresenceRejected(_)) => {
+                            continue
+                        }
                         other => {
                             eprintln!("client continued the session instead of closing: {other:?}");
                             break false;
@@ -229,15 +271,18 @@ async fn client_refuses_mismatched_server_without_hot_loop() -> Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
 
-    // Fake server: sends a doctored Presence, records whether the client
-    // explains itself with a PresenceRejected, and keeps listening long
-    // enough to catch an immediate reconnect.
+    // Fake server: opens with its challenge, then sends a doctored Presence,
+    // records whether the client explains itself with a PresenceRejected, and
+    // keeps listening long enough to catch an immediate reconnect.
     let fake_server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.expect("accept");
         let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
         let (mut sink, mut stream) = ws.split();
 
-        let doctored = proto::Presence { node_id: proto::EntityId::random(), durable: true, system_root: None, protocol_version: 999 };
+        let key = NodeKey::generate();
+        let challenge = proto::Message::Challenge(proto::HandshakeChallenge::new(key.node_id()));
+        sink.send(WsMessage::Binary(bincode::serialize(&challenge).unwrap().into())).await.expect("send");
+        let doctored = presence(999);
         sink.send(WsMessage::Binary(bincode::serialize(&proto::Message::Presence(doctored)).unwrap().into())).await.expect("send");
 
         let mut saw_rejection = None;

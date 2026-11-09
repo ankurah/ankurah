@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{id::EntityId, Attested, EntityState};
+use crate::{
+    identity::{NodeId, Signature},
+    Attested, EntityState,
+};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -27,13 +30,80 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// to a range without touching the handshake again.
 pub fn protocol_compatible(remote: u32) -> bool { remote == PROTOCOL_VERSION }
 
+/// Domain tag that precedes a presence's claims in the bytes its signature covers.
+pub const PRESENCE_TAG: &[u8] = b"ankurah.presence.v1";
+
+/// A fresh nonce a node sends the peer on a new connection. The peer's presence
+/// must answer it, so a presence signed for one connection does not
+/// authenticate another.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct HandshakeChallenge {
+    issuer: NodeId,
+    nonce: [u8; 32],
+}
+
+impl HandshakeChallenge {
+    /// A challenge from `issuer` with a freshly drawn nonce.
+    pub fn new(issuer: NodeId) -> Self {
+        let mut nonce = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rng(), &mut nonce);
+        Self { issuer, nonce }
+    }
+
+    /// The node that issued this challenge and expects the answer.
+    pub fn issuer(&self) -> NodeId { self.issuer }
+}
+
+/// A node's signed claims about itself, answering one connection's challenge.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Presence {
-    pub node_id: EntityId,
+    pub node_id: NodeId,
     pub durable: bool,
     pub system_root: Option<Attested<EntityState>>,
+    /// The challenge this presence answers.
+    pub challenge: HandshakeChallenge,
+    /// Unix ms when the presence was signed. Advisory: nothing checks it.
+    pub timestamp: u64,
+    /// `node_id`'s signature over [`PresenceClaims::signable_bytes`].
+    pub signature: Signature,
     /// See [`PROTOCOL_VERSION`].
     pub protocol_version: u32,
+}
+
+/// The part of a [`Presence`] its signature covers.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct PresenceClaims {
+    pub node_id: NodeId,
+    pub durable: bool,
+    pub challenge: HandshakeChallenge,
+    pub timestamp: u64,
+    pub protocol_version: u32,
+}
+
+impl PresenceClaims {
+    /// The bytes a presence signature covers: [`PRESENCE_TAG`], then the bincode claims.
+    pub fn signable_bytes(&self) -> Vec<u8> {
+        let mut bytes = PRESENCE_TAG.to_vec();
+        // Cannot fail: every field is a fixed-shape value bincode can encode.
+        bytes.extend(bincode::serialize(self).expect("presence claims serialize"));
+        bytes
+    }
+}
+
+impl Presence {
+    /// The claims this presence's signature covers.
+    pub fn claims(&self) -> PresenceClaims {
+        PresenceClaims {
+            node_id: self.node_id,
+            durable: self.durable,
+            challenge: self.challenge,
+            timestamp: self.timestamp,
+            protocol_version: self.protocol_version,
+        }
+    }
+
+    /// Whether `signature` is `node_id`'s signature over this presence's claims.
+    pub fn signature_is_valid(&self) -> bool { self.node_id.verify(&self.claims().signable_bytes(), &self.signature) }
 }
 
 impl std::fmt::Display for Presence {
@@ -77,9 +147,30 @@ impl std::error::Error for PresenceRejection {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Identity;
+    use ed25519_dalek::Signer;
+
+    fn key(byte: u8) -> ed25519_dalek::SigningKey { ed25519_dalek::SigningKey::from_bytes(&[byte; 32]) }
+
+    fn node_id(key: &ed25519_dalek::SigningKey) -> NodeId { Identity::Ed25519(key.verifying_key().to_bytes()).into() }
+
+    /// `presence`, signed by `signer` over its claims.
+    fn signed(mut presence: Presence, signer: &ed25519_dalek::SigningKey) -> Presence {
+        presence.signature = Signature::Ed25519(signer.sign(&presence.claims().signable_bytes()).to_bytes());
+        presence
+    }
 
     fn presence() -> Presence {
-        Presence { node_id: EntityId::random(), durable: true, system_root: None, protocol_version: PROTOCOL_VERSION }
+        let unsigned = Presence {
+            node_id: node_id(&key(42)),
+            durable: true,
+            system_root: None,
+            challenge: HandshakeChallenge::new(node_id(&key(41))),
+            timestamp: 1_720_000_000_000,
+            signature: Signature::Ed25519([0; 64]),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        signed(unsigned, &key(42))
     }
 
     #[test]
@@ -90,6 +181,46 @@ mod tests {
             crate::Message::Presence(q) => assert_eq!(p, q),
             other => panic!("expected Presence, got {other}"),
         }
+    }
+
+    #[test]
+    fn the_signed_bytes_are_the_tag_then_the_claims() {
+        let claims = presence().claims();
+        assert_eq!(PRESENCE_TAG, b"ankurah.presence.v1");
+        let fields = (claims.node_id, claims.durable, claims.challenge, claims.timestamp, claims.protocol_version);
+        assert_eq!(claims.signable_bytes(), [PRESENCE_TAG, &bincode::serialize(&fields).unwrap()].concat());
+    }
+
+    #[test]
+    fn changing_any_claim_invalidates_the_signature() {
+        let p = presence();
+        assert!(p.signature_is_valid());
+
+        let mut forged = p.clone();
+        forged.durable = false;
+        assert!(!forged.signature_is_valid());
+
+        let mut forged = p.clone();
+        forged.timestamp += 1;
+        assert!(!forged.signature_is_valid());
+
+        let mut forged = p.clone();
+        forged.protocol_version += 1;
+        assert!(!forged.signature_is_valid());
+
+        let mut forged = p.clone();
+        forged.challenge = HandshakeChallenge::new(p.challenge.issuer());
+        assert!(!forged.signature_is_valid());
+
+        let mut forged = p.clone();
+        forged.node_id = node_id(&key(43));
+        assert!(!forged.signature_is_valid());
+    }
+
+    #[test]
+    fn each_challenge_draws_a_fresh_nonce() {
+        let issuer = node_id(&key(1));
+        assert_ne!(HandshakeChallenge::new(issuer), HandshakeChallenge::new(issuer));
     }
 
     #[test]

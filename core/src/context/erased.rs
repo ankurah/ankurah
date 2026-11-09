@@ -23,7 +23,7 @@ pub(crate) trait DynContextInner: LocalEntitySource {
     fn schema_resolver(&self) -> &dyn SchemaResolver;
 
     /// Return the node's identity, even if its weak handle can no longer upgrade.
-    fn node_id(&self) -> proto::EntityId;
+    fn node_id(&self) -> proto::NodeId;
 
     /// This node's system root entity id, which every non-root genesis binds
     /// into its own id. `None` before the node has created or adopted a system.

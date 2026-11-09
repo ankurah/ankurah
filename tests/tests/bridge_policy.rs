@@ -174,7 +174,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         self.validate_calls.fetch_add(1, Ordering::SeqCst);
@@ -188,7 +188,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -230,7 +230,7 @@ impl PolicyAgent for BridgePolicyAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &NodeAlias<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _assertion: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())

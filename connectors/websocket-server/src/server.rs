@@ -1,5 +1,8 @@
 use ankurah_core::storage::StorageEngine;
-use ankurah_core::{connector::PeerConnectionError, signals::Wait};
+use ankurah_core::{
+    connector::{PeerConnectionError, PeerProvenance},
+    signals::Wait,
+};
 use ankurah_proto as proto;
 use anyhow::Result;
 use axum::{
@@ -28,7 +31,7 @@ use crate::{client_ip::SmartClientIp, OptionalUserAgent};
 
 use super::state::Connection;
 
-// A peer that cannot decode our Presence will never send its own, so the
+// A peer that cannot decode our handshake will never send its Presence, so the
 // pre-establishment state must not be allowed to live for the socket lifetime.
 const INITIAL_PRESENCE_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -118,28 +121,29 @@ where
 {
     info!("Websocket server connected to {}", client_ip);
 
-    let presence = match node.presence().await {
-        Ok(presence) => presence,
-        Err(error) => {
-            warn!("Cannot admit websocket peer at {client_ip}: {error}");
-            return;
-        }
-    };
-
     let (sender, mut receiver) = socket.split();
-    let mut conn = Connection::Initial(Some(sender));
+    let challenge = node.issue_challenge();
+    let challenge_value = challenge.challenge();
+    let mut conn = Connection::Initial { sender: Some(sender), challenge: Some(challenge), answered: false };
     let initial_presence_deadline = tokio::time::Instant::now() + INITIAL_PRESENCE_TIMEOUT;
 
-    // Immediately send server presence after connection
-    if let Err(e) = conn.send(proto::Message::Presence(presence)).await {
-        debug!("Error sending presence to {client_ip}: {:?}", e);
-        return;
+    // The client's presence must answer this; ours answers the client's challenge.
+    match tokio::time::timeout_at(initial_presence_deadline, conn.send(proto::Message::Challenge(challenge_value))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            debug!("Error sending handshake challenge to {client_ip}: {:?}", e);
+            return;
+        }
+        Err(_) => {
+            warn!("Peer at {client_ip} did not take our handshake challenge within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+            return;
+        }
     }
 
     let node_state = node.state();
     let receive = async {
         loop {
-            let next = if matches!(conn, Connection::Initial(_)) {
+            let next = if matches!(conn, Connection::Initial { .. }) {
                 match tokio::time::timeout_at(initial_presence_deadline, receiver.next()).await {
                     Ok(next) => next,
                     Err(_) => {
@@ -153,7 +157,7 @@ where
             let Some(msg) = next else { break };
 
             if let Ok(msg) = msg {
-                if process_message(msg, client_ip, &mut conn, node.clone()).await.is_break() {
+                if process_message(msg, client_ip, &mut conn, node.clone(), initial_presence_deadline).await.is_break() {
                     break;
                 }
             } else {
@@ -183,6 +187,7 @@ async fn process_message<SE, PA>(
     client_ip: IpAddr,
     state: &mut Connection,
     node: Node<SE, PA>,
+    handshake_deadline: tokio::time::Instant,
 ) -> ControlFlow<(), ()>
 where
     SE: StorageEngine + Send + Sync + 'static,
@@ -202,19 +207,35 @@ where
                             let rejection =
                                 proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: presence.protocol_version };
                             warn!("Refusing peer at {client_ip}: {rejection}");
-                            let _ = state.send(proto::Message::PresenceRejected(rejection)).await;
+                            // Best effort, and bounded by the handshake deadline like the presence answer.
+                            let _ =
+                                tokio::time::timeout_at(handshake_deadline, state.send(proto::Message::PresenceRejected(rejection))).await;
                             return ControlFlow::Break(());
                         }
                         match state {
-                            Connection::Initial(sender) => {
-                                if let Some(sender) = sender.take() {
+                            Connection::Initial { sender, challenge, .. } => {
+                                // Local system storage within the deadline: on a durable node it is
+                                // all that registration waits for.
+                                match tokio::time::timeout_at(handshake_deadline, node.system.wait_loaded()).await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => {
+                                        warn!("Cannot admit websocket peer at {client_ip}: {error}");
+                                        return ControlFlow::Break(());
+                                    }
+                                    Err(_) => {
+                                        warn!("Storage did not load within {INITIAL_PRESENCE_TIMEOUT:?}; closing peer at {client_ip}");
+                                        return ControlFlow::Break(());
+                                    }
+                                }
+                                if let (Some(sender), Some(challenge)) = (sender.take(), challenge.take()) {
                                     debug!("Received client presence from {}", client_ip);
 
                                     use super::sender::WebSocketClientSender;
                                     // Register peer sender for this client
                                     let sender = WebSocketClientSender::new(presence.node_id, sender);
 
-                                    match node.register_peer(presence, Box::new(sender.clone())).await {
+                                    // Outside the deadline: cancelling registration partway could leave the peer registered.
+                                    match node.register_peer(presence, challenge, PeerProvenance::Inbound, Box::new(sender.clone())).await {
                                         Ok(()) => *state = Connection::Established(sender),
                                         Err(rejection) => {
                                             warn!("Refusing peer at {client_ip}: {rejection}");
@@ -244,8 +265,37 @@ where
                         warn!("Peer at {} refused our presence: {}", client_ip, rejection);
                         return ControlFlow::Break(());
                     }
+                    proto::Message::Challenge(peer_challenge) => {
+                        let Connection::Initial { answered, .. } = state else {
+                            warn!("Received handshake challenge from {} after its presence - ignoring", client_ip);
+                            return ControlFlow::Continue(());
+                        };
+                        if std::mem::replace(answered, true) {
+                            warn!("Peer at {client_ip} sent a second handshake challenge; closing");
+                            return ControlFlow::Break(());
+                        }
+                        // Within the handshake deadline, so a peer that stops reading cannot hold the connection open.
+                        let answer = async {
+                            let presence = node.presence(peer_challenge).await.map_err(|error| format!("cannot admit peer: {error}"))?;
+                            state
+                                .send(proto::Message::Presence(presence))
+                                .await
+                                .map_err(|error| format!("failed to send presence: {error:?}"))
+                        };
+                        match tokio::time::timeout_at(handshake_deadline, answer).await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                warn!("Closing websocket peer at {client_ip}: {error}");
+                                return ControlFlow::Break(());
+                            }
+                            Err(_) => {
+                                warn!("Peer at {client_ip} did not take our presence within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+                                return ControlFlow::Break(());
+                            }
+                        }
+                    }
                 }
-            } else if let Connection::Initial(_) = state {
+            } else if let Connection::Initial { .. } = state {
                 // A peer whose handshake we cannot read will never establish;
                 // close instead of leaving the connection dangling.
                 error!("Failed to deserialize handshake message from {client_ip}; closing");

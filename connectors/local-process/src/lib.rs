@@ -6,14 +6,14 @@ use ankurah_proto as proto;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use ankurah_core::connector::{PeerSender, SendError};
+use ankurah_core::connector::{PeerProvenance, PeerSender, SendError};
 use ankurah_core::node::{Node, WeakNode};
 
 #[derive(Clone)]
 /// Sender for local process connection
 pub struct LocalProcessSender {
     sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::EntityId,
+    node_id: proto::NodeId,
 }
 
 #[async_trait]
@@ -23,7 +23,7 @@ impl PeerSender for LocalProcessSender {
         Ok(())
     }
 
-    fn recipient_node_id(&self) -> proto::EntityId { self.node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
@@ -40,8 +40,8 @@ where
     receiver2_task: tokio::task::JoinHandle<()>,
     node1: WeakNode<SE1, PA1>,
     node2: WeakNode<SE2, PA2>,
-    node1_id: proto::EntityId,
-    node2_id: proto::EntityId,
+    node1_id: proto::NodeId,
+    node2_id: proto::NodeId,
 }
 
 impl<SE1, PA1, SE2, PA2> LocalProcessConnection<SE1, PA1, SE2, PA2>
@@ -51,19 +51,34 @@ where
     SE2: StorageEngine + Send + Sync + 'static,
     PA2: PolicyAgent + Send + Sync + 'static,
 {
-    /// Create a new LocalConnector and establish connection between the nodes
+    /// Connect the two nodes as if one had dialed the other: an ephemeral node dials a durable
+    /// one, and between nodes of the same class `node1` dials `node2`. The dialing side registers
+    /// its peer as configured, the accepting side as inbound.
     pub async fn new(node1: &Node<SE1, PA1>, node2: &Node<SE2, PA2>) -> anyhow::Result<Self> {
         let (node1_tx, node1_rx) = mpsc::channel(1024);
         let (node2_tx, node2_rx) = mpsc::channel(1024);
 
+        let node2_dials = node1.durable && !node2.durable;
+        let (provenance1, provenance2) = if node2_dials {
+            (PeerProvenance::Inbound, PeerProvenance::Configured)
+        } else {
+            (PeerProvenance::Configured, PeerProvenance::Inbound)
+        };
+        let (challenge1, challenge2) = (node1.issue_challenge(), node2.issue_challenge());
         let register_node1 = async {
-            node1.register_peer(node2.presence().await?, Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id })).await
+            let presence = node2.presence(challenge1.challenge()).await?;
+            node1
+                .register_peer(presence, challenge1, provenance1, Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id }))
+                .await
         };
         let register_node2 = async {
-            node2.register_peer(node1.presence().await?, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id })).await
+            let presence = node1.presence(challenge2.challenge()).await?;
+            node2
+                .register_peer(presence, challenge2, provenance2, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }))
+                .await
         };
-        // Let an ephemeral node adopt before advertising its own system to the durable node.
-        if node1.durable && !node2.durable {
+        // The dialing side registers first, so an ephemeral node adopts before advertising its own system.
+        if node2_dials {
             register_node2.await?;
             if let Err(error) = register_node1.await {
                 node2.deregister_peer(node1.id);
@@ -85,7 +100,7 @@ where
 
     fn setup_receiver<SE, PA>(
         node: Node<SE, PA>,
-        peer_id: proto::EntityId,
+        peer_id: proto::NodeId,
         peer_state: Read<NodeState>,
         mut rx: mpsc::Receiver<proto::NodeMessage>,
     ) -> tokio::task::JoinHandle<()>

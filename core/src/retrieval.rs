@@ -185,7 +185,8 @@ where
             return Err(RetrievalError::EventNotFound(event_id.clone()));
         };
 
-        match self.node.request(peer_id, self.cdata, proto::NodeRequestBody::GetEvents { event_ids: vec![event_id.clone()] }).await? {
+        let body = proto::NodeRequestBody::GetEvents { event_ids: vec![event_id.clone()] };
+        match self.node.request_durable(peer_id, self.cdata, body).await? {
             proto::NodeResponseBody::GetEvents(peer_events) => {
                 // Deliberately not checked here: the policy hook
                 // (validate_received_event) that the other three peer-event

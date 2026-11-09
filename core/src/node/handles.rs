@@ -22,7 +22,7 @@ where PA: PolicyAgent
         }
     }
 
-    pub fn node_id(&self) -> proto::EntityId {
+    pub fn node_id(&self) -> proto::NodeId {
         match self {
             Self::Weak(node) => node.node_id(),
             Self::Strong(node) => node.id,

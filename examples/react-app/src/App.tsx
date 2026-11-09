@@ -652,7 +652,7 @@ const App: React.FC = signalObserver(() => {
         level: "Info",
         message: "Test log entry created from React",
         source: "react-app",
-        node_id: ctx().node_id().to_base64(),
+        node_id: ctx().node_id(),
         payload: { Text: "Manual test entry" },
       });
       await transaction.commit();
