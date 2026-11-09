@@ -34,7 +34,7 @@ pub enum RegistrationError {
     ),
     /// A descriptor attempted to claim the protected system namespace.
     #[error(
-        "collection '{0}' starts with the reserved prefix '{prefix}'; the system and catalog collections are never registered through this executor",
+        "collection '{0}' starts with the reserved prefix '{prefix}'; the catalog collections are never registered through this executor",
         prefix = crate::schema::RESERVED_COLLECTION_PREFIX
     )]
     ReservedCollection(

@@ -31,7 +31,6 @@ const MODEL_REGISTRATIONS_STORE: &str = "model_registrations";
 
 fn system_label(model: SystemModel) -> &'static str {
     match model {
-        SystemModel::System => "_ankurah_system",
         SystemModel::Model => "_ankurah_model",
         SystemModel::Property => "_ankurah_property",
         SystemModel::ModelProperty => "_ankurah_model_property",
@@ -184,7 +183,7 @@ impl IndexedDBStorageEngine {
                 }
                 cursor.continue_().require("advance model-name registration cursor")?;
             }
-            for system in [SystemModel::System, SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty] {
+            for system in [SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty] {
                 taken.insert(naming::sanitize(system_label(system)));
             }
 

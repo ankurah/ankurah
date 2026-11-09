@@ -10,8 +10,6 @@ pub use crate::node::event_admissibility::InadmissibleEvent;
 /// Why this node permanently stopped accepting work, not a rejected connection or operation.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum NodeHaltReason {
-    #[error("failed to reconstruct the local system: {0}")]
-    SystemLoad(String),
     #[error("failed to reconstruct the local catalog: {0}")]
     CatalogLoad(String),
     #[error("failed to initialize policy: {0}")]

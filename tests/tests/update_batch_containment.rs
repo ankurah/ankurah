@@ -41,7 +41,6 @@ async fn test_event_only_multi_event_wire_order_is_untrusted() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context_async(c).await?;
     let ctx_c = client.context_async(c).await?;
@@ -115,7 +114,6 @@ async fn test_event_only_unknown_entity_does_not_poison_batch() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context_async(c).await?;
     let ctx_c = client.context_async(c).await?;

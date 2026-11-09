@@ -68,7 +68,6 @@ async fn resolution_binds_names_and_fails_closed() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     let ids = register_and_map(&client, server.id, register("album", &[("name", "yrs", "string"), ("payload", "lww", "json")])).await?;
     let name_id = ids["name"];
@@ -124,7 +123,6 @@ async fn resolution_follows_renames_to_the_same_id() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     register_and_map(&client, server.id, register("album", &[("name", "yrs", "string")])).await?;
     let collection = server.catalog.model_id_for("album").unwrap().expect("album model registered");
@@ -181,7 +179,6 @@ async fn order_by_resolves_fail_closed() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
     register_and_map(&client, server.id, register("album", &[("name", "yrs", "string")])).await?;
     let collection = server.catalog.model_id_for("album").unwrap().expect("album model registered");
 
@@ -214,7 +211,6 @@ async fn subpath_order_keys_and_id_subpaths_are_refused() -> anyhow::Result<()> 
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
     register_and_map(&client, server.id, register("album", &[("payload", "lww", "json")])).await?;
     let collection = server.catalog.model_id_for("album").unwrap().expect("album model registered");
 

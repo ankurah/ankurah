@@ -12,10 +12,11 @@ use async_trait::async_trait;
 use common::*;
 use std::sync::{Arc, Mutex};
 
-/// Neither store holds anything in the `_ankurah_system` collection.
-async fn assert_no_system_entities(storage: &SledStorageEngine) -> anyhow::Result<()> {
-    let system = Predicate::MemberOf(proto::ModelId::System(proto::SystemModel::System));
-    assert!(storage.fetch_states(&system.into()).await?.is_empty(), "no system entity anywhere");
+/// The store materializes no built-in model but the catalog's: there is no system collection to hold a root.
+async fn assert_no_system_collection(storage: &SledStorageEngine) -> anyhow::Result<()> {
+    for model in storage.list_materializations().await? {
+        assert!(matches!(model, proto::ModelId::EntityId(_)) || ankurah::core::schema::is_catalog_model(&model), "{model}");
+    }
     Ok(())
 }
 
@@ -38,8 +39,8 @@ async fn a_durable_and_an_ephemeral_node_exchange_entities_with_no_system_root()
 
     assert_eq!(server_context.get::<AlbumView>(from_client).await?.name()?, "minted by the client");
     assert_eq!(client_context.get::<AlbumView>(from_server).await?.name()?, "minted by the server");
-    assert_no_system_entities(&server_storage).await?;
-    assert_no_system_entities(&client_storage).await?;
+    assert_no_system_collection(&server_storage).await?;
+    assert_no_system_collection(&client_storage).await?;
     Ok(())
 }
 
@@ -155,7 +156,7 @@ async fn two_independently_created_durable_stores_exchange_when_configured_to_tr
             assert!(storage.get_state(*id).await.is_ok(), "each store holds both entities");
             assert!(!storage.dump_entity_events(*id).await?.is_empty());
         }
-        assert_no_system_entities(storage).await?;
+        assert_no_system_collection(storage).await?;
     }
     Ok(())
 }

@@ -38,7 +38,7 @@ async fn peer_get_preserves_denial_and_absence_even_with_a_cached_entity() -> Re
     let retained = reader.get::<PetView>(id).await?;
     agent.deny_read_states.lock().unwrap().insert(id);
 
-    let model = *Pet::descriptor().bind_local(&server.catalog, server.system.system_epoch().unwrap())?.as_entity_id().unwrap();
+    let model = *Pet::descriptor().bind_local(&server.catalog, server.system_epoch().unwrap())?.as_entity_id().unwrap();
     let missing = proto::EntityId::random();
     let response = client.request(server.id, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id, missing, model] }).await?;
     // Exercise the actual wire shape, including a successful catalog bootstrap read in the same batch.
@@ -245,7 +245,6 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
 
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
     let credentials = Vec::<&'static DefaultContext>::new();
 
     for label in [MODEL_COLLECTION_ID, PROPERTY_COLLECTION_ID, MODEL_PROPERTY_COLLECTION_ID] {
@@ -299,11 +298,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         }
     }
 
-    for model in [
-        context.resolve_model_id::<Pet>().await?,
-        proto::ModelId::System(proto::SystemModel::System),
-        proto::ModelId::EntityId(proto::EntityId::random()),
-    ] {
+    for model in [context.resolve_model_id::<Pet>().await?, proto::ModelId::EntityId(proto::EntityId::random())] {
         let response = client
             .request(
                 server.id,
@@ -326,7 +321,6 @@ async fn test_event_bridge_events_are_policy_validated_on_receive() -> Result<()
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), client_agent.clone());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context_async(DEFAULT_CONTEXT).await?;
     let ctx_c = client.context_async(DEFAULT_CONTEXT).await?;
@@ -378,7 +372,6 @@ async fn test_event_bridge_respects_read_policy_on_send() -> Result<()> {
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     let ctx_s = server.context_async(DEFAULT_CONTEXT).await?;
     let ctx_c = client.context_async(DEFAULT_CONTEXT).await?;
@@ -439,7 +432,6 @@ async fn get_events_retrieves_identities_across_model_memberships() -> Result<()
     server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
-    client.system.wait_system_ready().await?;
 
     let ctx = server.context_async(DEFAULT_CONTEXT).await?;
     let pet_event = {
@@ -474,7 +466,7 @@ async fn get_events_retrieves_identities_across_model_memberships() -> Result<()
         "event-specific denial still applies"
     );
 
-    let model = *Pet::descriptor().bind_local(&server.catalog, server.system.system_epoch().unwrap())?.as_entity_id().unwrap();
+    let model = *Pet::descriptor().bind_local(&server.catalog, server.system_epoch().unwrap())?.as_entity_id().unwrap();
     let catalog_event = server.storage.dump_entity_events(model).await?.into_iter().next().unwrap();
     agent.deny_read_events.lock().unwrap().insert(catalog_event.payload.id());
     agent.deny_reads.store(true, Ordering::SeqCst);

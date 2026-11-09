@@ -26,7 +26,7 @@ where
     C: Iterable<PA::ContextData>,
 {
     let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for CommitTransaction"))?;
-    node.system.require_system_ready()?;
+    node.lifecycle.check_not_halted()?;
 
     debug!("{node} commiting transaction {id} with {} events", events.len());
     let policy = ContextPolicy::from_credentials(&node.policy_agent, cdata);

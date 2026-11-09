@@ -168,7 +168,6 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
         })
         .await
     };
-    client.system.wait_system_ready().await.unwrap();
     let client_ctx = client.context_async(c).await.unwrap();
 
     let trx = client_ctx.begin();

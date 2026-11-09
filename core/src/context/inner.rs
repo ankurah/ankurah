@@ -67,7 +67,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Retrieve an entity and enforce this context's read policy.
     async fn get_entity(&self, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
+        node.lifecycle.check_not_halted()?;
         debug!("Node({}).get_entity {:?}", node.id, id);
         let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
         let cdata = policy.credentials();
@@ -111,7 +111,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Shared by `Context::fetch` and livequery gap filling.
     async fn fetch_entities(&self, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
+        node.lifecycle.check_not_halted()?;
         let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
         let cdata = policy.credentials();
         args.selection.predicate = policy.filter_predicate(args.selection.predicate)?;

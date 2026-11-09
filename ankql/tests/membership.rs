@@ -4,7 +4,6 @@ use ankql::ast::{EntityId, ModelId, Predicate, Resolved, Selection, SystemModel}
 fn membership_identities_round_trip() {
     for model in [
         ModelId::EntityId(EntityId::from_bytes([0xff; 32])),
-        ModelId::System(SystemModel::System),
         ModelId::System(SystemModel::Model),
         ModelId::System(SystemModel::Property),
         ModelId::System(SystemModel::ModelProperty),

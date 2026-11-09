@@ -401,7 +401,7 @@ mod tests {
         assert!(query.loaded());
 
         let notify = node.reactor.0.notify_lock.lock().await;
-        node.system.halt(crate::error::NodeHaltReason::SystemLoad("fixture".into()));
+        node.lifecycle.halt(crate::error::NodeHaltReason::CatalogLoad("fixture".into()));
         assert!(node.state().value().halt_reason().is_some());
         assert!(node.check_ready().is_err());
         assert!(query.loaded(), "clearing must wait for the publication lock");

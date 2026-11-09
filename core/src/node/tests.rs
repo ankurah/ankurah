@@ -59,7 +59,7 @@ async fn presence_signs_this_nodes_claims_and_a_halted_node_has_none() {
     assert!(presence.signature_is_valid());
     assert_eq!(presence.protocol_version, proto::PROTOCOL_VERSION);
 
-    let halt_reason = node.system.halt(NodeHaltReason::SystemLoad("test failure".into()));
+    let halt_reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("test failure".into()));
     assert_eq!(node.state().value(), NodeState::Halted(halt_reason.clone()));
     assert_eq!(node.presence(foreign_challenge()).await.unwrap_err(), halt_reason);
 }
@@ -75,23 +75,22 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
         let state = node.state();
         let run = node.run.clone();
         assert!(run.get());
-        assert_eq!(state.value(), NodeState::Uninitialized);
+        assert_eq!(state.value(), NodeState::Startup);
         assert_eq!(node.check_ready(), Err(NodeReadinessError::NotReady));
         let mut ready = Box::pin(node.wait_ready());
         assert!(futures::poll!(&mut ready).is_pending());
         let (changes, observed) = std::sync::mpsc::channel();
         let _subscription = state.subscribe(changes);
-        node.system.wait_system_ready().await.unwrap();
         entered_rx.await.unwrap();
         assert_eq!(state.value(), NodeState::Startup);
         assert!(run.get());
         assert_eq!(node.check_ready(), Err(NodeReadinessError::NotReady));
         assert!(futures::poll!(&mut ready).is_pending());
-        assert_eq!(observed.try_recv().unwrap(), NodeState::Startup);
+        assert!(observed.try_recv().is_err(), "the node stays in startup while its catalog loads");
 
-        let reason = NodeHaltReason::SystemLoad("first reason".into());
+        let reason = NodeHaltReason::PolicyAgentStartFailed("first reason".into());
         if halt_during_startup {
-            node.system.halt(reason.clone());
+            node.lifecycle.halt(reason.clone());
             assert_eq!(ready.await, Err(NodeReadinessError::Halted(reason.clone())));
             release.send(()).unwrap();
         } else {
@@ -100,11 +99,11 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
             assert_eq!(node.check_ready(), Ok(()));
             assert!(run.get());
             assert_eq!(observed.try_recv().unwrap(), NodeState::Running);
-            node.system.halt(reason.clone());
+            node.lifecycle.halt(reason.clone());
         }
         assert_eq!(observed.try_recv().unwrap(), NodeState::Halted(reason.clone()));
-        assert_eq!(node.system.halt(NodeHaltReason::CatalogLoad("later reason".into())), reason);
-        node.system.mark_running();
+        assert_eq!(node.lifecycle.halt(NodeHaltReason::CatalogLoad("later reason".into())), reason);
+        node.lifecycle.mark_running();
         assert_eq!(node.check_ready(), Err(NodeReadinessError::Halted(reason.clone())));
         assert_eq!(node.wait_ready().await, Err(NodeReadinessError::Halted(reason.clone())));
         assert_eq!(state.value(), NodeState::Halted(reason));
@@ -113,11 +112,10 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
 }
 
 #[tokio::test]
-async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
+async fn dropping_a_starting_node_cancels_its_readiness_wait() {
     let storage = Arc::new(TestStorage::default());
     let weak_storage = Arc::downgrade(&storage);
     let node = Node::new(storage, PermissiveAgent::new());
-    node.system.wait_system_ready().await.unwrap();
     let weak = node.weak();
     let run = node.run.clone();
     drop(node);
@@ -132,19 +130,20 @@ async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
     .unwrap();
 }
 
+/// A node answers a peer's challenge while its catalog is still loading: startup gates no connection.
 #[tokio::test]
-async fn presence_waits_for_the_local_system_to_load() {
+async fn presence_does_not_wait_for_startup() {
     let storage = Arc::new(TestStorage::default());
     let (entered, entered_rx) = oneshot::channel();
-    let (release, release_rx) = oneshot::channel();
-    storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::System), (entered, release_rx));
+    let (_release, release_rx) = oneshot::channel();
+    storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
+    assert_eq!(node.state().value(), NodeState::Startup);
     let presence = node.presence(foreign_challenge());
     tokio::pin!(presence);
-    assert!(futures::poll!(&mut presence).is_pending());
-    release.send(()).unwrap();
-    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), presence).await.unwrap().unwrap();
+    let std::task::Poll::Ready(presence) = futures::poll!(&mut presence) else { panic!("presence waited for startup") };
+    let presence = presence.unwrap();
     assert_eq!(presence.node_id, node.id);
     assert!(presence.durable);
 }
@@ -186,7 +185,7 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     assert!(futures::poll!(&mut read).is_pending());
     entered_rx.await.unwrap();
 
-    let reason = node.system.halt(NodeHaltReason::SystemLoad("fixture".into()));
+    let reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
     release.send(()).unwrap();
     assert_eq!(read.await.unwrap().iter().map(Entity::id).collect::<Vec<_>>(), vec![id]);
     assert!(matches!(node.fetch_entities_from_local(&selection).await, Err(RetrievalError::NodeHalted(error)) if error == reason));

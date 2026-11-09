@@ -46,8 +46,8 @@ order, and index entities used through that model. It is derived data:
   the entity.
 
 The canonical catalog entities use the same machinery. Their materializations
-are the built-in models `_ankurah_system`, `_ankurah_model`,
-`_ankurah_property`, and `_ankurah_model_property`.
+are the built-in models `_ankurah_model`, `_ankurah_property`, and
+`_ankurah_model_property`.
 
 ### 1.3 Entity-model association
 

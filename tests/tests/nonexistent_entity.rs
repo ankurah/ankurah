@@ -35,7 +35,6 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     let client = ephemeral_sled_setup().await?;
     let _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent> =
         LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     let album_model = server.context(DEFAULT_CONTEXT)?.resolve_model_id::<Album>().await?;
 
     // A synthetic genesis parent keeps the update structurally valid; its entity is unknown.
@@ -74,7 +73,6 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     // Create an entity on the server first
     let ctx = server.context(DEFAULT_CONTEXT)?;

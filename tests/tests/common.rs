@@ -151,8 +151,6 @@ impl GatedConnection {
     {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
-        other.system.wait_system_ready().await.unwrap();
-        gated.system.wait_system_ready().await.unwrap();
         // As LocalProcessConnection: an ephemeral node dials a durable one, otherwise `other` dials.
         let gated_dials = other.durable && !gated.durable;
         let (other_provenance, gated_provenance) = if gated_dials {
@@ -716,6 +714,6 @@ where
     SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
     PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
 {
-    let epoch = node.system.system_epoch().expect("a ready system");
+    let epoch = node.system_epoch().expect("a node that has not halted");
     schema.field_by_name(name).expect("a compiled field").resolved.get(epoch).expect("field resolved under the current epoch")
 }

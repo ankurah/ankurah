@@ -572,7 +572,7 @@ where
         version: u32,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
-        node.system.require_system_ready().map_err(RequestError::from)?;
+        node.lifecycle.check_not_halted().map_err(RequestError::from)?;
 
         // 1. Pre-fetch known_matches from local storage
         let known_matches: Vec<ankurah_proto::KnownEntity> = node

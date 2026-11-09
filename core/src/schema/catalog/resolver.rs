@@ -50,7 +50,6 @@ pub trait ModelResolver {
 /// Canonical types for the bootstrap system properties, which have no catalog rows.
 pub(crate) fn system_property_value_type(property: SystemProperty) -> ValueType {
     match property {
-        SystemProperty::Item => ValueType::String,
         SystemProperty::Label => ValueType::String,
         SystemProperty::Name => ValueType::String,
         SystemProperty::MintedFor => ValueType::EntityId,
@@ -65,7 +64,6 @@ pub(crate) fn system_property_value_type(property: SystemProperty) -> ValueType 
 
 pub(crate) fn resolve_system_property(model: SystemModel, name: &str) -> Option<SystemProperty> {
     match (model, name) {
-        (SystemModel::System, "item") => Some(SystemProperty::Item),
         (SystemModel::Model, "label") => Some(SystemProperty::Label),
         (SystemModel::Model, "name") => Some(SystemProperty::Name),
         (SystemModel::Property, "name") => Some(SystemProperty::Name),
@@ -479,14 +477,13 @@ mod tests {
     #[test]
     fn system_properties_are_model_scoped() {
         let cases = [
-            (SystemModel::System, "item", Some(SystemProperty::Item)),
             (SystemModel::Model, "label", Some(SystemProperty::Label)),
             (SystemModel::Model, "name", Some(SystemProperty::Name)),
             (SystemModel::Property, "backend", Some(SystemProperty::Backend)),
             (SystemModel::ModelProperty, "optional", Some(SystemProperty::Optional)),
             (SystemModel::Model, "optional", None),
             (SystemModel::Property, "label", None),
-            (SystemModel::System, "name", None),
+            (SystemModel::ModelProperty, "name", None),
         ];
         for (model, name, expected) in cases {
             assert_eq!(resolve_system_property(model, name), expected, "{model}.{name}");

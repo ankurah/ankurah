@@ -91,7 +91,7 @@ pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::NodeId;
     /// Issue a fresh challenge for one new connection.
     fn issue_challenge(&self) -> IssuedChallenge;
-    /// Sign this node's presence answering a peer's challenge, after its local system loads.
+    /// Sign this node's presence answering a peer's challenge; a halted node signs none.
     async fn presence(&self, challenge: proto::HandshakeChallenge) -> Result<proto::Presence, crate::error::NodeHaltReason>;
     async fn register_peer(
         &self,

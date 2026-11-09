@@ -86,7 +86,6 @@ async fn enduser_scoped_cached_fetch_over_relay() -> anyhow::Result<()> {
     let client_agent = JwtAgent::new_ephemeral();
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), client_agent.clone());
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
     let mut synced = false;
     for _ in 0..100 {
         if !client_agent.config().roles.is_empty() {

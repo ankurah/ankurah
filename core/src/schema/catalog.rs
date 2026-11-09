@@ -372,7 +372,6 @@ mod tests {
                 SystemModel::Model => transaction.get::<SysModelRow>(&model).await?.entity().clone(),
                 SystemModel::Property => transaction.get::<SysPropertyRow>(&property).await?.entity().clone(),
                 SystemModel::ModelProperty => transaction.get::<SysModelPropertyRow>(&membership).await?.entity().clone(),
-                _ => unreachable!(),
             };
             entity.get_backend::<LWWBackend>()?.set(PropertyId::System(field), None);
             transaction.commit().await?;
@@ -388,7 +387,6 @@ mod tests {
                     SystemModel::Model => node.catalog.model_by_id(&model)?.is_none(),
                     SystemModel::Property => node.catalog.property_by_id(&property)?.is_none(),
                     SystemModel::ModelProperty => node.catalog.membership(&model, &property)?.is_none(),
-                    _ => unreachable!(),
                 };
                 assert!(missing, "{table:?}.{field:?}, restored={restored}");
                 assert_eq!(node.catalog.model_id_for(MissingPublicationModel::descriptor().label)?, Some(healthy));
@@ -419,7 +417,6 @@ mod tests {
             let (release, release_rx) = tokio::sync::oneshot::channel();
             storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
             let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-            node.system.wait_system_ready().await?;
             // A context built directly skips the readiness check, so this query waits on the catalog.
             let query = Context::new(node.clone(), DEFAULT_CONTEXT).query::<PublicationModelView>(CACHED_TRUE)?;
             entered_rx.await?;
@@ -444,7 +441,6 @@ mod tests {
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let node = Node::new(storage, PermissiveAgent::new());
-            node.system.wait_system_ready().await?;
             while node.catalog.counts() != (1, 1, 1) {
                 tokio::task::yield_now().await;
             }

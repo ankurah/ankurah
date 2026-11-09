@@ -9,9 +9,6 @@ pub struct SystemEpoch(u32);
 static NEXT_SYSTEM_EPOCH: AtomicU32 = AtomicU32::new(1);
 
 impl SystemEpoch {
-    /// Reserved for temporary entities and pinned schema lookups before system readiness.
-    pub const BOOTSTRAP: SystemEpoch = SystemEpoch(0);
-
     pub(crate) fn allocate() -> Self {
         let raw = NEXT_SYSTEM_EPOCH.fetch_add(1, Ordering::Relaxed);
         assert!(raw != 0, "system epoch allocator exhausted (u32 wrapped)");

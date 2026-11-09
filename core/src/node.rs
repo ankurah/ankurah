@@ -3,7 +3,6 @@ use ankql::ast::Resolved;
 use ankurah_proto::Attested;
 use ankurah_signals::{Calculated, Get, Mut, Wait};
 use anyhow::anyhow;
-use futures::TryFutureExt;
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -23,7 +22,6 @@ use crate::policy::{ContextPolicy, PeerTrust};
 use crate::reactor::Reactor;
 use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter};
 use crate::schema::catalog::register::RegistrationAuth;
-use crate::system::SystemManager;
 use crate::util::safemap::SafeMap;
 use crate::util::safeset::SafeSet;
 use crate::util::Iterable;
@@ -41,6 +39,7 @@ pub(crate) mod event_admissibility;
 pub(crate) mod handler;
 pub mod handles;
 mod key;
+mod lifecycle;
 mod match_args;
 mod peer_state;
 mod schema_registration;
@@ -51,6 +50,7 @@ mod tests;
 pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
 pub use key::NodeKey;
+use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
 use schema_registration::WireRegistrant;
@@ -138,7 +138,7 @@ where PA: PolicyAgent
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
-    pub system: SystemManager<SE>,
+    pub(crate) lifecycle: NodeLifecycle<SE>,
 
     pub catalog: Arc<CatalogManager>,
     alive: Mut<bool>,
@@ -156,7 +156,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn check_not_halted(&self) -> Result<(), NodeHaltReason> { self.system.check_not_halted() }
+    fn check_not_halted(&self) -> Result<(), NodeHaltReason> { self.lifecycle.check_not_halted() }
 
     fn reactor(&self) -> &Reactor { &self.reactor }
     fn live_queries(&self) -> &crate::livequery::LiveQueryRegistry { &self.live_queries }
@@ -191,15 +191,21 @@ where
     /// Halt this node with [`NodeHaltReason::Reset`], then delete everything in its storage.
     /// The wipe finishes even if the caller drops the returned future. The host then discards this
     /// node with its contexts and live queries, and builds a fresh node on the wiped store.
-    pub async fn reset(&self) -> anyhow::Result<()> { self.system.reset().await }
+    pub async fn reset(&self) -> Result<(), MutationError> { self.lifecycle.reset().await }
 
     /// Initialization and terminal halt state; independent of peer connectivity.
-    pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }
+    pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.lifecycle.node_state() }
 
-    /// Require completed system, catalog, and policy initialization, or return why the node is unavailable.
+    /// This node's system epoch, or the reason it halted: a halted node, reset or not, yields no epoch.
+    pub fn system_epoch(&self) -> Result<SystemEpoch, NodeHaltReason> {
+        self.lifecycle.check_not_halted()?;
+        Ok(self.entities.system_epoch())
+    }
+
+    /// Require completed catalog and policy initialization, or return why the node is unavailable.
     pub fn check_ready(&self) -> Result<(), NodeReadinessError> { self.state().value().check_ready() }
 
-    /// Wait for system, catalog, and policy initialization without retaining the node; return an error if it halts.
+    /// Wait for catalog and policy initialization without retaining the node; return an error if it halts.
     pub fn wait_ready(&self) -> impl std::future::Future<Output = Result<(), NodeReadinessError>> + Send + 'static {
         let state = self.state();
         async move {
@@ -234,9 +240,9 @@ where
             key
         });
         let id = key.node_id();
-        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
+        let lifecycle = NodeLifecycle::new(engine.clone());
         let alive = Mut::new(true);
-        let state = system_manager.node_state();
+        let state = lifecycle.node_state();
         let run = {
             let alive = alive.read();
             let state = state.clone();
@@ -263,7 +269,7 @@ where
             reactor,
             durable,
             policy_agent,
-            system: system_manager,
+            lifecycle,
             catalog: Arc::new(CatalogManager::default()),
             alive,
             run,
@@ -284,21 +290,20 @@ where
 
         let catalog = node.catalog.clone();
         let weak_node = node.weak();
-        let system = node.system.clone();
+        let lifecycle = node.lifecycle.clone();
         let run = node.run.clone();
         let agent = node.policy_agent.clone();
         crate::task::spawn(async move {
-            let initialized = futures::future::try_join(system.wait_system_ready(), catalog.start(weak_node.clone()).err_into());
             let initialized = async move {
-                initialized.await?;
+                catalog.start(weak_node.clone()).await?;
                 agent.start(weak_node).await.map_err(|error| NodeHaltReason::PolicyAgentStartFailed(error.to_string()))
             };
             tokio::select! {
                 biased;
                 _ = run.wait_value(false) => {},
                 result = initialized => match result {
-                    Ok(_) => system.mark_running(),
-                    Err(reason) => { system.halt(reason); }
+                    Ok(_) => lifecycle.mark_running(),
+                    Err(reason) => { lifecycle.halt(reason); }
                 },
             }
         });
@@ -314,9 +319,9 @@ where
     /// [`Node::register_peer`] with the peer's presence.
     pub fn issue_challenge(&self) -> IssuedChallenge { IssuedChallenge::new(self.id) }
 
-    /// Sign this node's presence answering a peer's challenge, after its local system loads.
+    /// Sign this node's presence answering a peer's challenge; a halted node signs none.
     pub async fn presence(&self, challenge: proto::HandshakeChallenge) -> Result<proto::Presence, NodeHaltReason> {
-        self.system.wait_system_ready().await?;
+        self.lifecycle.check_not_halted()?;
         Ok(self.key.sign_presence(self.durable, challenge))
     }
 
@@ -347,7 +352,7 @@ where
             info!("Node({}) serves {:?} peer {} as not durable despite its durable claim", self.id, provenance, presence.node_id);
         }
 
-        self.system.wait_system_ready().await?;
+        self.lifecycle.check_not_halted()?;
         let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
         let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // The latest registration decides trust: an id registering again without durable trust
@@ -423,7 +428,7 @@ where
     where
         C: Iterable<PA::ContextData>,
     {
-        self.system.check_not_halted()?;
+        self.lifecycle.check_not_halted()?;
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
@@ -458,7 +463,7 @@ where
 
     // TODO LATER: rework this to be retried in the background some number of times
     pub fn send_update(&self, node_id: proto::NodeId, notification: proto::NodeUpdateBody) {
-        if self.system.check_not_halted().is_err() {
+        if self.lifecycle.check_not_halted().is_err() {
             return;
         }
         // same as request, minus cdata and the sign_request step
@@ -492,7 +497,7 @@ where
     // Not if its signed by a node key.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
     pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
-        self.system.check_not_halted()?;
+        self.lifecycle.check_not_halted()?;
         match message {
             proto::NodeMessage::Update(update) => {
                 debug!("Node({}) received update {}", self.id, update);
@@ -663,7 +668,7 @@ where
         match notification.body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, notification.from);
-                self.system.require_system_ready()?;
+                self.lifecycle.check_not_halted()?;
                 crate::node::applier::NodeApplier::apply_updates(self, &notification.from, items).await?;
                 Ok(())
             }
@@ -857,7 +862,7 @@ where
 
     /// Retrieve peer states and persist them in this node.
     pub(crate) async fn get_from_peer(&self, ids: Vec<proto::EntityId>, cdata: &Vec<PA::ContextData>) -> Result<(), RetrievalError> {
-        self.system.require_system_ready().map_err(MutationError::from)?;
+        self.lifecycle.check_not_halted().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self.request_durable(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
@@ -888,7 +893,7 @@ where
         selection: ankql::ast::Selection<Resolved>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        self.system.require_system_ready().map_err(MutationError::from)?;
+        self.lifecycle.check_not_halted().map_err(MutationError::from)?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         let known_matched_entities = self.fetch_entities_from_local(&selection).await?;
@@ -1027,7 +1032,7 @@ where
 
     /// Load matching states from local storage into resident entities; does not apply read policy.
     pub async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
-        self.system.check_not_halted()?;
+        self.lifecycle.check_not_halted()?;
         let initial_states = self.storage.fetch_states(selection).await?;
         let state_getter = LocalStateGetter::new(self.storage.clone());
         let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);

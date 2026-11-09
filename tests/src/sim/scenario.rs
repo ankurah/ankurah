@@ -397,19 +397,7 @@ where
                 node.connect_to(durable, PeerProvenance::Configured).await;
                 durable.connect_to(node, PeerProvenance::Inbound).await;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-                let ready = node.node.system.wait_system_ready();
-                tokio::pin!(ready);
-                while !futures_util::poll!(ready.as_mut()).is_ready() {
-                    scheduler.drain(&nodes, &mut rng, &mut trace).await;
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "node {} never became ready (system_ready={}, catalog_counts={:?})",
-                        node.index,
-                        node.node.system.is_system_ready(),
-                        node.node.catalog.counts()
-                    );
-                }
-                super::node::seed_sim_schema(node).expect("sim schema seeds on a ready node");
+                super::node::seed_sim_schema(node).expect("sim schema seeds on a node that has not halted");
                 let synced = node.node.wait_ready();
                 tokio::pin!(synced);
                 loop {

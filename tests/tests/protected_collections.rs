@@ -1,13 +1,12 @@
-//! The system collection and the metadata catalog are not
-//! mutable through ordinary transactions, and the `_ankurah_` collection
-//! prefix is reserved.
+//! The metadata catalog is not mutable through ordinary transactions, and
+//! the `_ankurah_` collection prefix is reserved.
 
 mod common;
 use ankurah::core::error::{InadmissibleEvent, RetrievalError};
 use ankurah::core::test_helpers::commit_transaction;
 use common::*;
 
-const PROTECTED: [&str; 4] = ["_ankurah_system", "_ankurah_model", "_ankurah_property", "_ankurah_model_property"];
+const PROTECTED: [&str; 3] = ["_ankurah_model", "_ankurah_property", "_ankurah_model_property"];
 
 /// A durable node refuses CommitTransaction events targeting any protected
 /// collection outright, regardless of what the sender claims.
@@ -16,7 +15,6 @@ async fn server_refuses_commits_into_protected_collections() -> anyhow::Result<(
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     for collection in PROTECTED {
         let model = ankurah::core::schema::system_model_id(collection).expect("protected collection has a system model");

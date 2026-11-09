@@ -39,7 +39,6 @@ async fn connected_pair(
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     Ok((server, client, conn))
 }
 
@@ -144,7 +143,6 @@ async fn an_answered_ephemeral_carries_the_catalog_it_never_registered() -> anyh
 
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     client.wait_ready().await?;
 
     assert_eq!(client.catalog.model_id_for("album").unwrap(), Some(model), "an answered catalog carries what the durable holds");
@@ -208,10 +206,6 @@ async fn catalog_projection_does_not_retain_node() -> anyhow::Result<()> {
 async fn a_starting_durable_node_is_not_retained_by_catalog_startup() -> anyhow::Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
-    tokio::time::timeout(Duration::from_secs(1), node.system.wait_system_ready())
-        .await
-        .expect("empty durable storage must finish loading")?;
-
     let weak = node.weak();
     drop(node);
     tokio::time::timeout(Duration::from_secs(1), async {

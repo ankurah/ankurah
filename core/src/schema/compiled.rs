@@ -104,14 +104,9 @@ impl ModelStructDescriptor {
     pub(crate) fn resolve_selection(
         &'static self,
         catalog: &CatalogManager,
-        epoch: Option<SystemEpoch>,
+        epoch: SystemEpoch,
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
-        let epoch = match (self.system, epoch) {
-            (Some(_), None) => SystemEpoch::BOOTSTRAP,
-            (_, Some(epoch)) => epoch,
-            (None, None) => return Err(RetrievalError::UnboundDeclaration { label: self.label.to_string() }),
-        };
         let model = self.bind_local(catalog, epoch)?;
         let resolver = DescriptorResolver { schema: self, epoch, catalog };
         Ok(resolve_selection(&model, &resolver, selection)?.and_member_of(model))

@@ -214,18 +214,6 @@ where
                         }
                         match state {
                             Connection::Initial { sender, challenge, .. } => {
-                                // The local system load within the deadline: it is all that registration waits for.
-                                match tokio::time::timeout_at(handshake_deadline, node.system.wait_system_ready()).await {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(error)) => {
-                                        warn!("Cannot admit websocket peer at {client_ip}: {error}");
-                                        return ControlFlow::Break(());
-                                    }
-                                    Err(_) => {
-                                        warn!("Storage did not load within {INITIAL_PRESENCE_TIMEOUT:?}; closing peer at {client_ip}");
-                                        return ControlFlow::Break(());
-                                    }
-                                }
                                 if let (Some(sender), Some(challenge)) = (sender.take(), challenge.take()) {
                                     debug!("Received client presence from {}", client_ip);
 

@@ -1,5 +1,5 @@
-//! A node's local system: readiness from its own storage, a fresh epoch per
-//! Node, and the reset primitive that wipes a store for a new node.
+//! A fresh epoch per Node, and the reset primitive that halts a node and wipes
+//! its store for a new node.
 
 mod common;
 
@@ -16,14 +16,14 @@ async fn a_restarted_durable_node_keeps_its_entities_under_a_new_epoch() -> anyh
             let transaction = node.context_async(DEFAULT_CONTEXT).await?.begin();
             let id = transaction.create(&Pet { name: "Fido".into(), age: "3".into() }).await?.id();
             transaction.commit().await?;
-            (id, node.system.system_epoch())
+            (id, node.system_epoch())
         };
 
         let node = Node::new_durable(engine, PermissiveAgent::new());
         let context = node.context_async(DEFAULT_CONTEXT).await?;
         assert_eq!(context.get::<PetView>(id).await?.name()?, "Fido");
-        assert!(node.system.system_epoch().is_some());
-        assert_ne!(node.system.system_epoch(), epoch, "each Node owns its own epoch");
+        assert!(node.system_epoch().is_ok());
+        assert_ne!(node.system_epoch(), epoch, "each Node owns its own epoch");
         Ok(())
     })
     .await?
@@ -47,19 +47,15 @@ async fn reset_halts_the_node_and_wipes_its_store_and_a_fresh_node_starts_clean(
         client.reset().await?;
         let halt_reason = NodeHaltReason::Reset;
         assert_eq!(client.state().peek(), NodeState::Halted(halt_reason.clone()));
-        assert!(!client.system.is_system_ready());
-        assert!(client.system.system_epoch().is_none());
+        assert_eq!(client.system_epoch(), Err(halt_reason.clone()));
         assert!(engine.get_state(id).await.is_err(), "the reset wiped the entity's state");
         assert!(engine.dump_entity_events(id).await?.is_empty(), "and its events");
         assert!(engine.list_materializations().await?.is_empty());
         assert_eq!(retained.name()?, "preserved", "a retained view keeps what it read");
-        assert_eq!(client.system.wait_system_ready().await, Err(halt_reason.clone()));
         assert_eq!(client.context_async(DEFAULT_CONTEXT).await.err(), Some(halt_reason.into()));
 
         let fresh = Node::new(engine.clone(), PermissiveAgent::new());
-        fresh.system.wait_system_ready().await?;
         assert!(fresh.state().peek().halt_reason().is_none(), "the halt reason belongs to the old Node, not its store");
-        assert!(fresh.system.items().is_empty());
         assert!(engine.get_state(id).await.is_err(), "the fresh node starts from the wiped store");
         let _reconnection = LocalProcessConnection::new(&server, &fresh).await?;
         let context = fresh.context_async(DEFAULT_CONTEXT).await?;

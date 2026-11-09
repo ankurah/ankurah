@@ -133,7 +133,7 @@ async fn first_use_fetch_registers_schema_without_granting_write_access() -> any
     let token = keys.sign(&member_claims, Duration::from_hours(1))?;
     let member_ctx = node.context_async(JwtContext::from_claims(member_claims, token)).await?;
 
-    let epoch = node.system.system_epoch().unwrap();
+    let epoch = node.system_epoch().unwrap();
     assert!(ScopeItem::descriptor().bind_local(&node.catalog, epoch).is_err());
     assert!(member_ctx.fetch::<ScopeItemView>("label = 'x'").await?.is_empty());
     assert!(ScopeItem::descriptor().bind_local(&node.catalog, epoch).is_ok());
@@ -167,7 +167,7 @@ async fn first_use_live_query_grants_nothing_for_an_invalid_scope_claim() -> any
     let token = keys.sign(&member_claims, Duration::from_hours(1))?;
     let member_ctx = node.context_async(JwtContext::from_claims(member_claims, token)).await?;
 
-    assert!(ScopeItem::descriptor().bind_local(&node.catalog, node.system.system_epoch().unwrap()).is_err());
+    assert!(ScopeItem::descriptor().bind_local(&node.catalog, node.system_epoch().unwrap()).is_err());
     let query = member_ctx.query::<ScopeItemView>("label = 'x'")?;
     query.wait_initialized().await?;
 

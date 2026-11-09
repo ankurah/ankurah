@@ -129,7 +129,6 @@ async fn check_request_error_returns_to_client() -> Result<()> {
 
     // Connect client to server
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     let client_ctx = client.context_async(DEFAULT_CONTEXT).await?;
 

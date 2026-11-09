@@ -40,7 +40,7 @@ mod tests {
 
     #[wasm_bindgen_test::wasm_bindgen_test]
     fn builtin_property_columns_are_unchanged() {
-        for property in [PropertyId::Id, PropertyId::System(SystemProperty::Item), PropertyId::System(SystemProperty::Name)] {
+        for property in [PropertyId::Id, PropertyId::System(SystemProperty::Label), PropertyId::System(SystemProperty::Name)] {
             let selection = Selection::<Resolved> {
                 predicate: Predicate::True,
                 order_by: Some(vec![OrderByItem { path: property.into(), direction: OrderDirection::Asc }]),
