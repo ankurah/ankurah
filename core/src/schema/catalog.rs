@@ -62,6 +62,8 @@ struct CatalogIndex {
 
 pub struct CatalogManager {
     index: OnceLock<Calculated<CatalogIndex>>,
+    /// The index holds the definitions this node stores; `ready` waits for a durable answer too.
+    loaded: Mut<bool>,
     ready: Mut<bool>,
     /// Hold declaration lookup through commit so concurrent registrations reuse identities
     /// rather than both seeing a missing declaration and allocating different IDs.
@@ -69,7 +71,9 @@ pub struct CatalogManager {
 }
 
 impl Default for CatalogManager {
-    fn default() -> Self { Self { index: OnceLock::new(), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) } }
+    fn default() -> Self {
+        Self { index: OnceLock::new(), loaded: Mut::new(false), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) }
+    }
 }
 
 fn rows<R: View + Clone + 'static>(query: &LiveQuery<R>) -> Vec<(EntityId, R::Model)> {
@@ -97,6 +101,9 @@ impl CatalogManager {
     pub(crate) fn is_ready(&self) -> bool { self.ready.value() }
 
     pub(crate) async fn wait_ready(&self) { self.ready.wait_value(true).await; }
+
+    /// Wait until the index holds the definitions this node stores, which a durable answer may still extend.
+    pub(crate) async fn wait_loaded(&self) { self.loaded.wait_value(true).await; }
 
     /// Observe catalog changes without copying catalog rows into the notification.
     pub fn subscribe_changes(&self, listener: impl Fn() + Send + Sync + 'static) -> Option<SubscriptionGuard> {
@@ -163,6 +170,11 @@ impl CatalogManager {
         let models = ctx.query::<SysModelRowView>(CACHED_TRUE)?;
         let properties = ctx.query::<SysPropertyRowView>(CACHED_TRUE)?;
         let memberships = ctx.query::<SysModelPropertyRowView>(CACHED_TRUE)?;
+        let loaded = futures::future::try_join_all([
+            models.wait_initialized().boxed(),
+            properties.wait_initialized().boxed(),
+            memberships.wait_initialized().boxed(),
+        ]);
         let ready = futures::future::try_join_all([
             models.wait_durable_answered().boxed(),
             properties.wait_durable_answered().boxed(),
@@ -205,6 +217,8 @@ impl CatalogManager {
 
         self.index.set(index).map_err(|_| RetrievalError::Other("catalog already initialized".into()))?;
         drop(node);
+        loaded.await?;
+        self.loaded.set(true);
         ready.await?;
         self.ready.set(true);
         Ok(())

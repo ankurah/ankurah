@@ -130,6 +130,44 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
     }
 }
 
+/// An ephemeral node's catalog is ready only once a durable peer answers, but what it stores is
+/// readable before that: a plugin reads it while the node's first peer registers.
+#[tokio::test]
+async fn the_catalog_holds_the_stored_definitions_before_a_durable_peer_answers() {
+    let storage = Arc::new(TestStorage::default());
+    {
+        let durable = Node::new_durable(storage.clone(), PermissiveAgent::new());
+        durable.wait_ready().await.unwrap();
+        let transaction = durable.privileged_context().begin();
+        transaction.create(&crate::schema::catalog::SysModelRow { label: "stored".into(), name: "Stored".into() }).await.unwrap();
+        transaction.commit().await.unwrap();
+    }
+    let hold = |storage: &TestStorage| {
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
+        (entered_rx, release)
+    };
+
+    let (entered, release) = hold(&storage);
+    let node = Node::new(storage.clone(), PermissiveAgent::new());
+    let loaded = node.wait_catalog_loaded();
+    tokio::pin!(loaded);
+    entered.await.unwrap();
+    assert!(futures::poll!(&mut loaded).is_pending(), "the stored definitions are still being read");
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), loaded).await.unwrap().unwrap();
+    assert!(node.catalog.model_by_label("stored").unwrap().is_some());
+    assert_eq!(node.state().value(), NodeState::Startup, "no durable peer has answered");
+
+    let (entered, _release) = hold(&storage);
+    let halting = Node::new(storage, PermissiveAgent::new());
+    entered.await.unwrap();
+    let reason = halting.lifecycle.halt(NodeHaltReason::CatalogLoad("test failure".into()));
+    let halted = tokio::time::timeout(std::time::Duration::from_secs(2), halting.wait_catalog_loaded()).await;
+    assert_eq!(halted, Ok(Err(reason)), "a node halted while its catalog loads stops the wait");
+}
+
 #[tokio::test]
 async fn dropping_a_starting_node_cancels_its_readiness_wait() {
     let storage = Arc::new(TestStorage::default());

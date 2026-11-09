@@ -221,6 +221,17 @@ where
         }
     }
 
+    /// Wait until the catalog holds the definitions this node stores, without waiting for a durable
+    /// peer as [`Node::wait_ready`] does; return the halt reason if the node halts first. Lets a
+    /// plugin read stored entities of a model before the node's first durable answer.
+    pub async fn wait_catalog_loaded(&self) -> Result<(), NodeHaltReason> {
+        tokio::select! {
+            biased;
+            reason = self.lifecycle.wait_halted() => Err(reason),
+            () = self.catalog.wait_loaded() => Ok(()),
+        }
+    }
+
     /// Construct an ephemeral node whose peer-selection RNG is seeded explicitly.
     /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new`].
     pub fn new_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
