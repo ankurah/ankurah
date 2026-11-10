@@ -46,6 +46,9 @@ struct TestCase {
 struct TestEntity {
     label: String,
     data: serde_json::Value,
+    /// The optional `nickname` property; a case leaves it out to test a missing property.
+    #[serde(default)]
+    nickname: Option<String>,
 }
 #[derive(Debug, Deserialize)]
 struct Expectation {
@@ -70,6 +73,12 @@ impl MockFilterable {
     fn new(collection: &str) -> Self { Self { collection: collection.to_string(), values: HashMap::new() } }
     fn with_json(mut self, name: &str, json: serde_json::Value) -> Self {
         self.values.insert(fixture_prop(name), Value::Json(json));
+        self
+    }
+    fn with_text(mut self, name: &str, text: Option<String>) -> Self {
+        if let Some(text) = text {
+            self.values.insert(fixture_prop(name), Value::String(text));
+        }
         self
     }
 }
@@ -98,7 +107,7 @@ impl ModelResolver for FixtureResolver {
 fn verify_filterable(case: &TestCase) {
     let model = ankurah::proto::ModelId::EntityId(ankurah::proto::EntityId::from_bytes([0x77; 32]));
     for entity in &case.entities {
-        let f = MockFilterable::new("QueryTest").with_json("data", entity.data.clone());
+        let f = MockFilterable::new("QueryTest").with_json("data", entity.data.clone()).with_text("nickname", entity.nickname.clone());
         for exp in &case.expectations {
             let sel = ankql::parser::parse_selection(&exp.query).expect("parse");
             // Bind names and canonicalize literals for JSON path comparisons
@@ -118,6 +127,7 @@ fn verify_filterable(case: &TestCase) {
 pub struct QueryTest {
     pub label: String,
     pub data: Json,
+    pub nickname: Option<String>,
 }
 
 // =============================================================================
@@ -139,7 +149,8 @@ async fn test_indexeddb_predicate_checks() -> Result<(), anyhow::Error> {
 
         let trx = ctx.begin();
         for entity in &case.entities {
-            trx.create(&QueryTest { label: entity.label.clone(), data: Json::new(entity.data.clone()) }).await?;
+            trx.create(&QueryTest { label: entity.label.clone(), data: Json::new(entity.data.clone()), nickname: entity.nickname.clone() })
+                .await?;
         }
         trx.commit().await?;
 

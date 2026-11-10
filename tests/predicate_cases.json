@@ -131,6 +131,86 @@
                     ]
                 }
             ]
+        },
+        {
+            "name": "missing_values",
+            "description": "A missing property or JSON path is NULL: IS NULL holds for it and IS NOT NULL does not",
+            "cases": [
+                {
+                    "name": "missing_property",
+                    "entities": [
+                        {
+                            "label": "nicknamed",
+                            "data": {
+                                "suite": "missing_property"
+                            },
+                            "nickname": "Al"
+                        },
+                        {
+                            "label": "unnamed",
+                            "data": {
+                                "suite": "missing_property"
+                            }
+                        }
+                    ],
+                    "expectations": [
+                        {
+                            "query": "data.suite = 'missing_property' AND nickname IS NULL",
+                            "matches": [
+                                "unnamed"
+                            ]
+                        },
+                        {
+                            "query": "data.suite = 'missing_property' AND nickname IS NOT NULL",
+                            "matches": [
+                                "nicknamed"
+                            ]
+                        }
+                    ]
+                },
+                {
+                    "name": "missing_json_path",
+                    "entities": [
+                        {
+                            "label": "with_city",
+                            "data": {
+                                "suite": "missing_json_path",
+                                "profile": {
+                                    "city": "Oslo"
+                                }
+                            }
+                        },
+                        {
+                            "label": "without_city",
+                            "data": {
+                                "suite": "missing_json_path",
+                                "profile": {}
+                            }
+                        },
+                        {
+                            "label": "without_profile",
+                            "data": {
+                                "suite": "missing_json_path"
+                            }
+                        }
+                    ],
+                    "expectations": [
+                        {
+                            "query": "data.suite = 'missing_json_path' AND data.profile.city IS NULL",
+                            "matches": [
+                                "without_city",
+                                "without_profile"
+                            ]
+                        },
+                        {
+                            "query": "data.suite = 'missing_json_path' AND data.profile.city IS NOT NULL",
+                            "matches": [
+                                "with_city"
+                            ]
+                        }
+                    ]
+                }
+            ]
         }
     ]
 }
