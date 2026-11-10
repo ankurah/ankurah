@@ -79,11 +79,11 @@ not signed (G-8).
 
 `PolicyAgent` (`core/src/policy.rs`) is the single authority surface, carrying the
 hooks that make peer input trustworthy: `validate_received_event`,
-`validate_received_state`, `check_event`, `check_read_event`,
+`validate_received_state`, `check_write_event`, `check_read_event`,
 `validate_causal_assertion`, `request_state_attestation`, and the read/write/collection gates.
 The **default agent is `PermissiveAgent`**, which trusts everything: the two
 `validate_received_*` and `validate_causal_assertion` return `Ok(())`,
-`check_event` and `request_state_attestation` return `None`, and every read/write check returns
+`check_write_event` returns `Ok(None)` and `request_state_attestation` returns `None`, and every read/write check returns
 `Ok(())`. Under PermissiveAgent, **every attestation-dependent and trusted-peer
 claim below provides no guarantee**; only the Byzantine-safe structural ones
 survive. Real PolicyAgents exist (jwt-auth ships `adversarial_tests.rs` and
@@ -165,7 +165,7 @@ Receive-side arms and the policy hook each gets (verified in
 | `StateAndRelation` | `apply_delta_inner` | unimpl | unimpl | n/a | returns `InvalidUpdate` |
 | `GetEvents` resp, mid-BFS | `CachedEventGetter::get_event` | **NO** (#244) | n/a | n/a | stored via `add_event` unvalidated |
 | `GetEvents` req, served | `node/inbound/handler.rs` `get_events` | n/a | n/a | n/a | serve side DOES `can_access_collection` + `check_read_event` |
-| `commit_remote_transaction` | `node.rs` same | via `check_event` | via `request_state_attestation` | n/a | creation-event fork asymmetry (#243) |
+| remote transaction | `transaction/remote.rs` `RemoteTransaction::add_event` | via `check_write_event` | via `request_state_attestation` | n/a | creation-event fork asymmetry (#243) |
 
 ("yes" = via `validate_and_stage`.) The key asymmetry: **every `apply_*` arm
 validates before staging, but the BFS-time remote fetch does not** (#244). Section 3
@@ -558,11 +558,11 @@ before/after pair produced on a throwaway fork, so a rejected event never touche
 the canonical entity or storage.
 Trust tier: attestation-dependent.
 Enforcing seam: `core/src/context.rs` `commit_local_trx` forks (`entity.snapshot`),
-applies the event to the fork, and calls `check_event(&entity_before, &forked, ..)`
+applies the event to the fork, and calls `check_write_event(&entity_before, &forked, ..)`
 before real application, for all events. `core/src/node.rs`
 `commit_remote_transaction` does this **only for update events**: creation events
 (`event.is_entity_create() && entity.head().is_empty()`) are applied directly to the
-real entity and passed to `check_event` as both `entity_before` and `entity_after`,
+real entity and passed to `check_write_event` as both `entity_before` and `entity_after`,
 so a rejected creation event has already mutated the in-memory entity and the policy
 sees no genuine before-state.
 Falsifying attack (T2): send a creation event via the remote-transaction path that a
@@ -733,7 +733,7 @@ assertion, not a wire arm, per the claim body).
 | C4-11 | `adversarial_wire::{forged_dangling_parent_is_contained, phantom_entity_is_evicted_on_failed_apply}`; `update_batch_containment::test_event_only_unknown_entity_does_not_poison_batch` | enforced-pass |
 | C4-12 | `adversarial_wire::phantom_entity_is_evicted_on_failed_apply` | enforced-pass |
 | C4-13 | TOCTOU atomicity is a concurrent-writer scenario owned by the C1 simulation; not a single-node wire arm | design-boundary |
-| C4-14 | `bridge_policy::test_event_bridge_events_are_policy_validated_on_receive`; `commit_atomicity` (check_event denial) | existing-suite |
+| C4-14 | `bridge_policy::test_event_bridge_events_are_policy_validated_on_receive`; `commit_atomicity` (check_write_event denial) | existing-suite |
 | C4-15 | `adversarial_wire::bfs_fetched_events_are_policy_validated` | gap-red-ignored (G-1, #244/#274) |
 | C4-16 | `peer_trust_tests::inbound_durable_claim_is_not_a_relay_target` (jwt-auth); `node::tests::identity` and `client_relay::tests::a_subscription_send_refuses_a_peer_whose_connection_lost_durable_trust` (core) | enforced-pass for the handshake and durable routing; frames after the handshake are unsigned (G-8) |
 | C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |

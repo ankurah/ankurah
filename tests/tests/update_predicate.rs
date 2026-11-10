@@ -8,9 +8,6 @@ async fn test_predicate_update() -> Result<()> {
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
 
-    // Initialize the node's system catalog
-
-    // Get context after system is ready
     let context = node.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // Create some test albums

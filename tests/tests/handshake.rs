@@ -256,8 +256,9 @@ async fn the_server_closes_a_connection_whose_opening_it_cannot_read() -> Result
     Ok(())
 }
 
-/// A client that cannot read the server's opening (a legacy client expects a Presence first)
-/// stays silent; the server must still bound the incomplete handshake.
+/// A client that cannot read the server's opening (a client of the earlier protocol, which
+/// expects the server's presence first) stays silent; the server must still bound the incomplete
+/// handshake.
 #[tokio::test(start_paused = true)]
 async fn the_server_closes_a_silent_client_after_its_opening() -> Result<()> {
     let (server_node, server_url, server_task) = start_test_server().await?;

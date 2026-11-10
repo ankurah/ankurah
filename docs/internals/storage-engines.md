@@ -199,14 +199,16 @@ See [Event Retrieval and Staging](retrieval.md) and
 
 Each engine records the format version of the stores it writes, its own
 `STORE_FORMAT_VERSION` at the root of its crate, separately from the protocol
-version, so a change to the wire or to one engine's layout never discards
-another engine's stores. The record is checked on every engine open: a store
-recording another format, a record that names no version, and a recognizable
-Ankurah store with no record are each refused the same way by every engine,
-its constructor failing with a `StoreFormatError` (downcast from its
-`anyhow::Error`) naming the version found and the version the engine reads.
-Unrelated tables in a shared SQL database do not make that database an
-Ankurah store.
+version, so a change to one engine's layout, or to a wire type it does not
+store, never discards another engine's stores. Every engine stores proto's
+encodings of an event's body and its attestation set, so a change to either
+changes every engine's stored bytes and bumps every engine's version. The
+record is checked on every engine open: a store recording another format, a
+record that names no version, and a recognizable Ankurah store with no record
+are each refused the same way by every engine, its constructor failing with a
+`StoreFormatError` (downcast from its `anyhow::Error`) naming the version
+found and the version the engine reads. Unrelated tables in a shared SQL
+database do not make that database an Ankurah store.
 
 `delete_all` is an Ankurah reset, not a database reset. PostgreSQL and SQLite
 delete their fixed internal tables plus dynamic tables recorded in their model

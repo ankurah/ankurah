@@ -13,9 +13,6 @@ async fn test_sled() -> Result<()> {
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
 
-    // Initialize the node's system catalog
-
-    // Get context after system is ready
     let context = node.context_async(c).await.unwrap();
 
     let album_id;

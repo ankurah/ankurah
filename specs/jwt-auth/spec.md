@@ -206,7 +206,7 @@ let node = Node::new(storage, agent.clone());
 
 #### `start`
 
-Core calls `start` after the catalog has loaded, and the node does not report ready (`Node::wait_ready`, `context_async`) until it returns; an error halts the node. `JwtAgent::start` spawns `start_policy_sync` (see Loading under Stored Policy) and returns once the first policy load completes. The livequeries live as long as the agent; dropping the last `JwtAgent` clone cancels the task.
+Core calls `start` after the catalog has its durable answer, and the node does not report ready (`Node::wait_ready`, `context_async`) until it returns; an error halts the node. `JwtAgent::start` spawns `start_policy_sync` (see Loading under Stored Policy) and returns once the first policy load completes. The livequeries live as long as the agent; dropping the last `JwtAgent` clone cancels the task.
 
 #### `preflight`
 
