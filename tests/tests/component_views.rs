@@ -445,3 +445,38 @@ async fn a_dot_in_a_tuple_query_starts_a_subpath_and_never_names_a_component() -
     dotted_paths(on_sled().await?).await?;
     dotted_paths(on_sqlite().await?).await
 }
+
+async fn names_checked_before_ready<SE: StorageEngine + Send + Sync + 'static>(engine: &str, storage: SE) -> anyhow::Result<()> {
+    let forged = ankurah_tests::catalog_forge::forge_catalog("task", "Task", &[("project", "lww", "string")], b"component-views");
+    ankurah_tests::catalog_forge::plant(&storage, &forged).await?;
+    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    let ctx = Context::new(node.clone(), DEFAULT_CONTEXT);
+
+    let pair = || vec!["Task".to_owned(), "Assignment".to_owned()];
+    for (selection, expected) in [
+        ("Task::nope = 'x'", ComponentScopeError::Undeclared { name: "nope".into(), components: vec!["Task".into()] }),
+        ("task.assignee = 'ada'", ComponentScopeError::Undeclared { name: "task".into(), components: pair() }),
+        ("nope = 'x'", ComponentScopeError::Undeclared { name: "nope".into(), components: pair() }),
+        (
+            "true ORDER BY Nobody::closed_at",
+            ComponentScopeError::SortKeyOutsideQuery { component: "Nobody".into(), name: "closed_at".into() },
+        ),
+    ] {
+        let refused = ctx.query::<(TaskView, AssignmentView)>(selection).map(|_| ());
+        assert!(matches!(&refused, Err(RetrievalError::ComponentScope(error)) if *error == expected), "{engine}: {selection}: {refused:?}");
+    }
+
+    let open = ctx.query::<(TaskView, AssignmentView)>("status = 'open'")?;
+    node.system.create().await?;
+    open.wait_initialized().await?;
+    assert!(open.ids().is_empty(), "{engine}");
+    Ok(())
+}
+
+/// A tuple live query made before its node is ready is refused at once when a name cannot resolve, and
+/// otherwise waits for the node and answers.
+#[tokio::test]
+async fn a_tuple_live_query_made_before_its_node_is_ready_checks_its_names_at_once() -> anyhow::Result<()> {
+    names_checked_before_ready("sled", SledStorageEngine::new_test()?).await?;
+    names_checked_before_ready("sqlite", SqliteStorageEngine::open_in_memory().await?).await
+}

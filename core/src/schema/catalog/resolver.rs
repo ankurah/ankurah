@@ -8,8 +8,9 @@ use crate::internal::prelude::*;
 use crate::value::ValueType;
 
 mod component_scope;
+pub(crate) use component_scope::validate_selection_names;
 pub use component_scope::ComponentScopeError;
-use component_scope::{locate_property, locate_sort_key, QueryComponent};
+use component_scope::{locate_property, locate_sort_key, ComponentNames, QueryComponent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedProperty {
@@ -148,88 +149,11 @@ pub(crate) fn resolve_component_selection(
     };
     let components = schemas
         .iter()
-        .map(|schema| Ok(QueryComponent { model: schema.bind_local(catalog, epoch)?, name: Some(schema.name) }))
+        .map(|schema| Ok(QueryComponent { model: schema.bind_local(catalog, epoch)?, names: Some(ComponentNames::from(*schema)) }))
         .collect::<Result<Vec<_>, RetrievalError>>()?;
     let resolver = DescriptorResolver { schemas, epoch, catalog };
     let selection = resolve_selection_across(&components, &resolver, selection)?;
     Ok(components.iter().rev().fold(selection, |selection, component| selection.and_member_of(component.model)))
-}
-
-/// Check declared names without requiring their durable identities. A qualifier naming a component outside
-/// `schemas` is left to resolution, which finds that component through the catalog.
-pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selection: &Selection<Parsed>) -> Result<(), RetrievalError> {
-    let declares = |schema: &&ModelStructDescriptor, name: &str| name == "id" || schema.field_by_name(name).is_some();
-    let check = |path: &PathExpr| {
-        if let Some(qualifier) = &path.component {
-            let name = path.steps.first().map(String::as_str).unwrap_or("");
-            return match schemas.iter().find(|schema| schema.name == qualifier || schema.label == qualifier) {
-                Some(schema) if !declares(schema, name) => {
-                    Err(ComponentScopeError::Undeclared { name: name.to_owned(), components: vec![qualifier.clone()] }.into())
-                }
-                _ => Ok(()),
-            };
-        }
-        let head = usize::from(path.steps.len() > 1 && matches!(schemas, [only] if path.steps[0] == only.label));
-        let name = path.steps.get(head).map(String::as_str).unwrap_or("");
-        if schemas.iter().any(|schema| declares(schema, name)) {
-            return Ok(());
-        }
-        Err(match schemas {
-            [only] => RetrievalError::Other(format!("unknown property '{name}' in model '{}'", only.label)),
-            _ => ComponentScopeError::Undeclared {
-                name: name.to_owned(),
-                components: schemas.iter().map(|schema| schema.name.to_owned()).collect(),
-            }
-            .into(),
-        })
-    };
-    check_predicate_names(&selection.predicate, &check)?;
-    for item in selection.order_by.iter().flatten() {
-        if let Some(qualifier) = &item.path.component {
-            if !schemas.iter().any(|schema| schema.name == qualifier || schema.label == qualifier) {
-                let name = item.path.steps.first().cloned().unwrap_or_default();
-                return Err(ComponentScopeError::SortKeyOutsideQuery { component: qualifier.clone(), name }.into());
-            }
-        }
-        check(&item.path)?;
-    }
-    Ok(())
-}
-
-fn check_predicate_names(
-    predicate: &Predicate<Parsed>,
-    check: &impl Fn(&PathExpr) -> Result<(), RetrievalError>,
-) -> Result<(), RetrievalError> {
-    predicate.walk(Ok(()), &mut |result, predicate| {
-        result?;
-        match predicate {
-            Predicate::Comparison { left, right, .. } => {
-                check_expr_names(left, check)?;
-                check_expr_names(right, check)
-            }
-            Predicate::IsNull(expr) => check_expr_names(expr, check),
-            Predicate::And(..)
-            | Predicate::Or(..)
-            | Predicate::Not(_)
-            | Predicate::MemberOf(_)
-            | Predicate::True
-            | Predicate::False
-            | Predicate::Placeholder => Ok(()),
-        }
-    })
-}
-
-fn check_expr_names(expr: &Expr<Parsed>, check: &impl Fn(&PathExpr) -> Result<(), RetrievalError>) -> Result<(), RetrievalError> {
-    match expr {
-        Expr::Path(path) => check(path),
-        Expr::Predicate(predicate) => check_predicate_names(predicate, check),
-        Expr::InfixExpr { left, right, .. } => {
-            check_expr_names(left, check)?;
-            check_expr_names(right, check)
-        }
-        Expr::ExprList(items) => items.iter().try_for_each(|item| check_expr_names(item, check)),
-        Expr::Literal(_) | Expr::Placeholder => Ok(()),
-    }
 }
 
 /// Resolve model labels and property paths against one model, and canonicalize comparison literals.
@@ -238,7 +162,7 @@ pub fn resolve_selection<R: ModelResolver + ?Sized>(
     resolver: &R,
     selection: Selection<Parsed>,
 ) -> Result<Selection<Resolved>, ModelResolutionError> {
-    resolve_selection_across(&[QueryComponent { model: *model, name: None }], resolver, selection)
+    resolve_selection_across(&[QueryComponent { model: *model, names: None }], resolver, selection)
 }
 
 /// Resolve model labels and property paths across `components`, and canonicalize comparison literals.
