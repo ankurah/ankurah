@@ -23,6 +23,13 @@ pub struct Assignment {
 
 fn scope_ops_config_path() -> String { format!("{}/tests/fixtures/scope_ops.json", env!("CARGO_MANIFEST_DIR")) }
 
+#[derive(Model, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Badge {
+    #[active_type(LWW)]
+    pub label: String,
+    pub revoked_by: Option<String>,
+}
+
 #[test]
 fn applies_to_defaults_to_read_write_and_parses() {
     let rule: ankurah_jwt_auth::ScopeRule = serde_json::from_str(r#"{"filter": "a = $jwt.sub", "unless_privilege": null}"#).unwrap();
@@ -134,5 +141,39 @@ async fn a_scope_filter_with_a_component_qualifier_is_refused_when_the_policy_is
     let expected =
         PolicyAuthoringError::QualifiedScopeProperty { model: "assignment".into(), filter: filter.into(), component: "Other".into() };
     assert_eq!(error.downcast_ref::<PolicyAuthoringError>(), Some(&expected), "{error:#}");
+    Ok(())
+}
+
+/// A missing property is NULL to a write scope as to a query: the write-only scope `revoked_by IS NULL` lets a
+/// member create a badge without `revoked_by`, and refuses one that has it.
+#[tokio::test]
+async fn a_write_scope_that_a_property_is_null_grants_a_write_to_an_entity_without_it() -> anyhow::Result<()> {
+    let keys = common::test_keys();
+    let agent = JwtAgent::new_durable(keys.clone(), format!("{}/tests/fixtures/scope_is_null.json", env!("CARGO_MANIFEST_DIR")))?;
+    let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    node1.system.create().await?;
+    agent.set_policy(&node1, &agent.config()).await?;
+    let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
+    let _conn = LocalProcessConnection::new(&node1, &node2).await?;
+    node2.system.wait_system_ready().await.unwrap();
+
+    let claims = make_claims("member-1", &["Member"], "member@scope.test");
+    let token = sign_token(&keys, &claims);
+    let member = node2.context_async(JwtContext::from_claims(claims, token)).await?;
+
+    let trx = member.begin();
+    trx.create(&Badge { label: "active".into(), revoked_by: None }).await?;
+    trx.commit().await.expect("a badge without revoked_by is inside the write scope");
+
+    // The denial may surface at create time (local check) or at commit (relay).
+    let trx = member.begin();
+    let denied = match trx.create(&Badge { label: "revoked".into(), revoked_by: Some("steward".into()) }).await {
+        Err(_) => true,
+        Ok(badge) => {
+            drop(badge);
+            trx.commit().await.is_err()
+        }
+    };
+    assert!(denied, "a badge with revoked_by is outside the write scope");
     Ok(())
 }

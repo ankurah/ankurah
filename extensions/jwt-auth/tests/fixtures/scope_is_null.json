@@ -1,0 +1,18 @@
+{
+  "roles": {
+    "Member": ["badge:read", "badge:write"]
+  },
+  "collections": {
+    "badge": {
+      "read": "badge:read",
+      "write": "badge:write",
+      "scope": [
+        {
+          "filter": "revoked_by IS NULL",
+          "unless_privilege": "badge:revoke",
+          "applies_to": "write"
+        }
+      ]
+    }
+  }
+}
