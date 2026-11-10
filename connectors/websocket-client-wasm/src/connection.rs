@@ -31,7 +31,7 @@ pub struct ConnectionInner {
     state: RwLock<ConnectionState>,
     node: Box<dyn NodeComms>,
     client: Weak<ClientInner>,
-    registered_peer: Cell<Option<proto::EntityId>>,
+    registered_peer: Cell<Option<proto::NodeId>>,
     receive_task: Cell<Option<RemoteHandle<()>>>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
@@ -330,7 +330,7 @@ impl PartialEq for Connection {
 
 #[derive(Clone)]
 struct WebSocketPeerSender {
-    recipient_node_id: proto::EntityId,
+    recipient_node_id: proto::NodeId,
     ws: SendWrapper<Arc<WebSocket>>,
 }
 
@@ -354,7 +354,7 @@ impl PeerSender for WebSocketPeerSender {
         }
     }
 
-    fn recipient_node_id(&self) -> proto::EntityId { self.recipient_node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

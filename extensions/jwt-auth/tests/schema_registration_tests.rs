@@ -4,13 +4,14 @@ use ankurah::{Model, Node, Ref};
 use ankurah_core::{
     connector::{PeerSender, SendError},
     error::{MutationError, RetrievalError},
+    node::NodeKey,
     policy::AccessDenied,
     schema::catalog::SysModelRowView,
     signals::Get,
     storage::StorageEngine,
 };
 use ankurah_jwt_auth::{JwtAgent, JwtContext, Role};
-use ankurah_proto::{self as proto, EntityId};
+use ankurah_proto as proto;
 use ankurah_storage_sled::SledStorageEngine;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -49,7 +50,7 @@ async fn catalog_states(node: &TestNode) -> anyhow::Result<Vec<proto::Attested<p
 
 #[derive(Clone)]
 struct ReplySender {
-    peer: EntityId,
+    peer: proto::NodeId,
     tx: mpsc::UnboundedSender<proto::NodeMessage>,
 }
 
@@ -57,13 +58,13 @@ impl PeerSender for ReplySender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         self.tx.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> EntityId { self.peer }
+    fn recipient_node_id(&self) -> proto::NodeId { self.peer }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 async fn wire_register(
     node: &TestNode,
-    peer: EntityId,
+    peer: proto::NodeId,
     replies: &mut mpsc::UnboundedReceiver<proto::NodeMessage>,
     auth: proto::AuthData,
     model: proto::RegisterModel,
@@ -93,7 +94,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     assert!(error.to_string().contains("Anonymous contexts cannot change the catalog"), "{error}");
     assert_eq!(catalog_states(&node).await?, before, "no model, reference target, property, or membership may be persisted");
 
-    let peer = EntityId::random();
+    let peer = NodeKey::generate().node_id();
     let (tx, mut replies) = mpsc::unbounded_channel();
     node.register_peer(
         proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },
@@ -143,7 +144,7 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
 async fn signed_registration_cannot_change_policy_membership_optionality() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(20), async {
         let node = setup().await?;
-        let peer = EntityId::random();
+        let peer = NodeKey::generate().node_id();
         let (tx, mut replies) = mpsc::unbounded_channel();
         node.register_peer(
             proto::Presence { node_id: peer, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION },

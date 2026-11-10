@@ -5,12 +5,16 @@ pub enum DecodeError {
     NotStringValue,
     /// The input was not valid URL-safe base64.
     InvalidBase64(base64::DecodeError),
-    /// The decoded representation did not contain exactly 32 bytes.
+    /// The decoded representation did not hold the number of bytes its type holds.
     InvalidLength,
     /// A compatibility fallback could not decode the input.
     InvalidFallback,
     /// The input used an unsupported identity format.
     InvalidFormat,
+    /// A key or signature's text form named no scheme before its `:`.
+    MissingScheme,
+    /// A key or signature's text form named a scheme this build does not know.
+    UnknownScheme(String),
     /// Another decoder failure.
     Other(anyhow::Error),
 }
@@ -23,6 +27,8 @@ impl std::fmt::Display for DecodeError {
             Self::InvalidLength => write!(f, "Invalid Length"),
             Self::InvalidFallback => write!(f, "Invalid Fallback"),
             Self::InvalidFormat => write!(f, "Invalid Format"),
+            Self::MissingScheme => write!(f, "Missing scheme: expected a scheme such as `ed25519:` before the key or signature"),
+            Self::UnknownScheme(scheme) => write!(f, "Unknown scheme `{scheme}`"),
             Self::Other(error) => write!(f, "Other: {error}"),
         }
     }

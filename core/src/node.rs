@@ -27,9 +27,11 @@ use tracing::instrument;
 
 use tracing::{debug, warn};
 
+mod builder;
 mod erased;
 pub(crate) mod event_admissibility;
 pub mod handles;
+pub(crate) mod identity;
 pub(crate) mod inbound;
 mod lifecycle;
 mod match_args;
@@ -37,8 +39,10 @@ mod peers;
 #[cfg(test)]
 mod tests;
 
+pub use builder::NodeBuilder;
 pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
+pub use identity::key::NodeKey;
 pub use lifecycle::state::NodeState;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub(crate) use peers::durable_peer;
@@ -59,7 +63,7 @@ pub struct WeakNode<SE, PA>
 where PA: PolicyAgent
 {
     node: Weak<NodeInner<SE, PA>>,
-    node_id: proto::EntityId,
+    node_id: proto::NodeId,
 }
 impl<SE, PA> Clone for WeakNode<SE, PA>
 where PA: PolicyAgent
@@ -71,7 +75,7 @@ impl<SE, PA> WeakNode<SE, PA>
 where PA: PolicyAgent
 {
     pub fn upgrade(&self) -> Option<Node<SE, PA>> { self.node.upgrade().map(Node) }
-    pub fn node_id(&self) -> proto::EntityId { self.node_id }
+    pub fn node_id(&self) -> proto::NodeId { self.node_id }
 }
 
 impl<SE, PA> Deref for Node<SE, PA>
@@ -86,7 +90,7 @@ pub use crate::session::ContextData;
 pub struct NodeInner<SE, PA>
 where PA: PolicyAgent
 {
-    pub id: proto::EntityId,
+    pub id: proto::NodeId,
     pub durable: bool,
     pub storage: Arc<SE>,
 
@@ -141,8 +145,15 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, false, SmallRng::from_entropy()) }
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self { Self::build(engine, policy_agent, true, SmallRng::from_entropy()) }
+    /// Construct an ephemeral node with a fresh identity.
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::start(engine, policy_agent, false, SmallRng::from_entropy(), None) }
+    /// Construct a durable node with a fresh identity, which does not survive a restart;
+    /// [`Node::builder`] gives a node a key.
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
+        Self::start(engine, policy_agent, true, SmallRng::from_entropy(), None)
+    }
+    /// Configure a node's role and key before it starts.
+    pub fn builder(engine: Arc<SE>, policy_agent: PA) -> NodeBuilder<SE, PA> { NodeBuilder::new(engine, policy_agent) }
 
     /// Wipe local storage when a different system is offered, so a new node can adopt it.
     /// Disabled by default. A different system always halts this node; it never recovers in place.
@@ -170,18 +181,25 @@ where
     /// Construct an ephemeral node whose peer-selection RNG is seeded explicitly.
     /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new`].
     pub fn new_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
-        Self::build(engine, policy_agent, false, SmallRng::seed_from_u64(rng_seed))
+        Self::start(engine, policy_agent, false, SmallRng::seed_from_u64(rng_seed), None)
     }
 
     /// Construct a durable node whose peer-selection RNG is seeded explicitly.
     /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new_durable`].
     pub fn new_durable_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
-        Self::build(engine, policy_agent, true, SmallRng::seed_from_u64(rng_seed))
+        Self::start(engine, policy_agent, true, SmallRng::seed_from_u64(rng_seed), None)
     }
 
-    fn build(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng) -> Self {
+    fn start(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng, key: Option<NodeKey>) -> Self {
         let entityset = WeakEntitySet::new(CatalogEpoch::allocate());
-        let id = proto::EntityId::random();
+        let key = key.unwrap_or_else(|| {
+            let key = NodeKey::generate();
+            if durable {
+                notice_info!("Durable node {:#} was given no persisted key; its identity will not survive a restart", key.node_id());
+            }
+            key
+        });
+        let id = key.node_id();
         let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
         let alive = Mut::new(true);
         let state = system_manager.node_state();
@@ -293,7 +311,7 @@ where
         Ok(())
     }
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %node_id.to_base64_short())))]
-    pub fn deregister_peer(&self, node_id: proto::EntityId) {
+    pub fn deregister_peer(&self, node_id: proto::NodeId) {
         notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
 
         self.peers.durable.remove(&node_id);
@@ -312,7 +330,7 @@ where
     #[cfg_attr(feature = "instrument", instrument(skip_all, fields(node_id = %node_id, request_body = %request_body)))]
     pub async fn request<'a, C>(
         &self,
-        node_id: proto::EntityId,
+        node_id: proto::NodeId,
         cdata: &C,
         request_body: proto::NodeRequestBody,
     ) -> Result<proto::NodeResponseBody, RequestError>
@@ -343,7 +361,7 @@ where
     }
 
     // TODO LATER: rework this to be retried in the background some number of times
-    pub fn send_update(&self, node_id: proto::EntityId, notification: proto::NodeUpdateBody) {
+    pub fn send_update(&self, node_id: proto::NodeId, notification: proto::NodeUpdateBody) {
         if self.system.check_not_halted().is_err() {
             return;
         }
@@ -407,12 +425,12 @@ where
     /// Draws from the node's seeded RNG (not `thread_rng`) so the simulation harness can reproduce
     /// selections. The candidate slice is sorted first: `choose` indexes by position, so a stable
     /// candidate order is required for a given seed to yield a given peer.
-    pub fn get_durable_peer_random(&self) -> Option<proto::EntityId> { self.peers.random_durable() }
+    pub fn get_durable_peer_random(&self) -> Option<proto::NodeId> { self.peers.random_durable() }
 
     /// Get all durable peer node IDs, sorted by id for a stable fan-out order.
     /// The underlying set is unordered; callers that emit per peer (relay, random selection)
     /// depend on this stable order for the C1 determinism audit.
-    pub fn get_durable_peers(&self) -> Vec<proto::EntityId> { self.peers.durable_peers() }
+    pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.peers.durable_peers() }
 
     /// TEST ONLY: Create a phantom entity with a specific ID.
     ///
@@ -435,7 +453,7 @@ where
     ///
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
-    pub fn insert_durable_peer_for_test(&self, peer_id: proto::EntityId) { self.peers.insert_durable_for_test(peer_id); }
+    pub fn insert_durable_peer_for_test(&self, peer_id: proto::NodeId) { self.peers.insert_durable_for_test(peer_id); }
 
     /// TEST ONLY: Observe the session registry — the current credential
     /// of every session backing a context on this node, in the
@@ -456,7 +474,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::EntityId>) -> anyhow::Result<()> {
+    pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::NodeId>) -> anyhow::Result<()> {
         for (peer_id, item) in self.peers.connections.get_list(peers) {
             if let Some(connection) = item {
                 connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: self.id, query_id })?;

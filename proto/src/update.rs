@@ -1,4 +1,4 @@
-use crate::{auth::Attested, id::EntityId, state::EntityState, subscription::QueryId, EventFragment, StateFragment};
+use crate::{auth::Attested, id::EntityId, identity::NodeId, state::EntityState, subscription::QueryId, EventFragment, StateFragment};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -65,8 +65,8 @@ impl TryFrom<SubscriptionUpdateItem> for Attested<EntityState> {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdate {
     pub id: UpdateId,
-    pub from: EntityId,
-    pub to: EntityId,
+    pub from: NodeId,
+    pub to: NodeId,
     pub body: NodeUpdateBody,
 }
 
@@ -74,8 +74,8 @@ pub struct NodeUpdate {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeUpdateAck {
     pub id: UpdateId,
-    pub from: EntityId,
-    pub to: EntityId,
+    pub from: NodeId,
+    pub to: NodeId,
     pub body: NodeUpdateAckBody,
 }
 

@@ -63,7 +63,7 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 struct GatedSender {
     sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::EntityId,
+    node_id: proto::NodeId,
 }
 
 #[async_trait::async_trait]
@@ -72,7 +72,7 @@ impl PeerSender for GatedSender {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
-    fn recipient_node_id(&self) -> proto::EntityId { self.node_id }
+    fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 

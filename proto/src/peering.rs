@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{id::EntityId, Attested, EntityState};
+use crate::{identity::NodeId, Attested, EntityState};
 
 /// The wire protocol version this binary speaks.
 ///
@@ -29,7 +29,7 @@ pub fn protocol_compatible(remote: u32) -> bool { remote == PROTOCOL_VERSION }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Presence {
-    pub node_id: EntityId,
+    pub node_id: NodeId,
     pub durable: bool,
     pub system_root: Option<Attested<EntityState>>,
     /// See [`PROTOCOL_VERSION`].
@@ -79,7 +79,7 @@ mod tests {
     use super::*;
 
     fn presence() -> Presence {
-        Presence { node_id: EntityId::random(), durable: true, system_root: None, protocol_version: PROTOCOL_VERSION }
+        Presence { node_id: crate::Identity::Ed25519([7; 32]).into(), durable: true, system_root: None, protocol_version: PROTOCOL_VERSION }
     }
 
     #[test]

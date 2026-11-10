@@ -27,6 +27,7 @@ base64             = { version = "0.22" }
 ankql              = { path = "../ankql", version = "=0.10.0" }
 ankurah-core-types = { path = "../core-types", version = "=0.10.0" }
 sha2               = "0.10.8"
+ed25519-dalek      = "2"
 rand               = "0.9"
 postgres-types     = { version = "0.2", optional = true }
 
@@ -47,4 +48,5 @@ web-time = "1.1"
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
+hex        = "0.4"
 serde_json = "1.0"

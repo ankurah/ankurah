@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::{
-    auth::Attested, clock::Clock, event::Event, id::EntityId, subscription::QueryId, transaction::TransactionId, EntityState,
-    EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
+    auth::Attested, clock::Clock, event::Event, id::EntityId, identity::NodeId, subscription::QueryId, transaction::TransactionId,
+    EntityState, EventFragment, EventId, RegisterModel, RegisteredModel, StateFragment,
 };
 
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize, Hash, Default)]
@@ -25,8 +25,8 @@ impl RequestId {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeRequest {
     pub id: RequestId,
-    pub to: EntityId,
-    pub from: EntityId,
+    pub to: NodeId,
+    pub from: NodeId,
     pub body: NodeRequestBody,
 }
 
@@ -157,8 +157,8 @@ pub enum NodeRequestBody {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeResponse {
     pub request_id: RequestId,
-    pub from: EntityId,
-    pub to: EntityId,
+    pub from: NodeId,
+    pub to: NodeId,
     pub body: NodeResponseBody,
 }
 

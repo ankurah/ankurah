@@ -5,7 +5,7 @@
 //! client against a mismatched server.
 
 use ankurah::core::connector::{PeerConnectionError, PeerSender, SendError};
-use ankurah::{Node, PermissiveAgent};
+use ankurah::{Node, NodeKey, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use ankurah_websocket_client::WebsocketClient;
 use anyhow::Result;
@@ -18,17 +18,17 @@ mod common;
 use common::{proto, start_test_server};
 
 #[derive(Clone)]
-struct NullSender(proto::EntityId);
+struct NullSender(proto::NodeId);
 
 #[async_trait::async_trait]
 impl PeerSender for NullSender {
     fn send_message(&self, _message: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
+    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 fn presence(protocol_version: u32) -> proto::Presence {
-    proto::Presence { node_id: proto::EntityId::random(), durable: false, system_root: None, protocol_version }
+    proto::Presence { node_id: NodeKey::generate().node_id(), durable: false, system_root: None, protocol_version }
 }
 
 /// The core enforcement point: register_peer refuses incompatible versions
@@ -176,7 +176,7 @@ async fn client_refuses_peer_message_before_presence() -> Result<()> {
         let (mut sink, mut stream) = ws.split();
 
         let early = proto::Message::PeerMessage(proto::NodeMessage::UnsubscribeQuery {
-            from: proto::EntityId::random(),
+            from: NodeKey::generate().node_id(),
             query_id: proto::QueryId::new(),
         });
         sink.send(WsMessage::Binary(bincode::serialize(&early).unwrap().into())).await.expect("send");
@@ -237,7 +237,7 @@ async fn client_refuses_mismatched_server_without_hot_loop() -> Result<()> {
         let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
         let (mut sink, mut stream) = ws.split();
 
-        let doctored = proto::Presence { node_id: proto::EntityId::random(), durable: true, system_root: None, protocol_version: 999 };
+        let doctored = proto::Presence { node_id: NodeKey::generate().node_id(), durable: true, system_root: None, protocol_version: 999 };
         sink.send(WsMessage::Binary(bincode::serialize(&proto::Message::Presence(doctored)).unwrap().into())).await.expect("send");
 
         let mut saw_rejection = None;

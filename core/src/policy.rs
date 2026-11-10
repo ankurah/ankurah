@@ -150,7 +150,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityId,
+        received_from_node: &proto::NodeId,
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
@@ -160,7 +160,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        received_from_node: &proto::EntityId,
+        received_from_node: &proto::NodeId,
         state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied>;
 
@@ -203,7 +203,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
-        peer_id: &proto::EntityId,
+        peer_id: &proto::NodeId,
         head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied>;
 
@@ -274,7 +274,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -289,7 +289,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         // This PolicyAgent does not require validation, so we return Ok
@@ -304,7 +304,7 @@ impl PolicyAgent for PermissiveAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         // PermissiveAgent trusts all causal assertions

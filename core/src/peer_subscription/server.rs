@@ -19,7 +19,7 @@ use std::collections::HashMap;
 
 /// Owns one peer's reactor subscription and per-query credential sources.
 pub struct SubscriptionHandler<CD: ContextData> {
-    _peer_id: proto::EntityId,
+    _peer_id: proto::NodeId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
     /// Tracks each standing query's version and the credential source shared with its gap fetcher.
@@ -35,7 +35,7 @@ struct StandingQuery<CD: ContextData> {
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub fn new<SE, PA>(peer_id: proto::EntityId, node: &Node<SE, PA>) -> Self
+    pub fn new<SE, PA>(peer_id: proto::NodeId, node: &Node<SE, PA>) -> Self
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
@@ -191,7 +191,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
 /// Convert a single ReactorUpdateItem to a SubscriptionUpdateItem.
 fn convert_item<SE, PA>(
     node: &Node<SE, PA>,
-    peer_id: proto::EntityId,
+    peer_id: proto::NodeId,
     item: crate::reactor::ReactorUpdateItem,
 ) -> Option<proto::SubscriptionUpdateItem>
 where

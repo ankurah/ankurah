@@ -4,7 +4,7 @@ use ankurah_proto as proto;
 use ankurah_signals::{Peek, Subscribe, SubscriptionGuard};
 use anyhow::anyhow;
 use async_trait::async_trait;
-use proto::EntityId;
+use proto::NodeId;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, warn};
@@ -28,9 +28,9 @@ pub trait RemoteQuerySubscriber: Clone + Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub enum Status {
     PendingRemote,
-    Requested(proto::EntityId, u32),     // peer_id, version
-    Established(proto::EntityId, u32),   // peer_id, version
-    PendingUpdate(proto::EntityId, u32), // peer_id, version
+    Requested(proto::NodeId, u32),     // peer_id, version
+    Established(proto::NodeId, u32),   // peer_id, version
+    PendingUpdate(proto::NodeId, u32), // peer_id, version
     /// Non-retryable
     Failed,
 }
@@ -55,7 +55,7 @@ struct SubscriptionRelayInner<CD: ContextData, Q: RemoteQuerySubscriber> {
     // All subscription information in one place
     subscriptions: std::sync::Mutex<HashMap<proto::QueryId, RemoteQueryState<CD, Q>>>,
     // Track connected durable peers
-    connected_peers: SafeSet<proto::EntityId>,
+    connected_peers: SafeSet<proto::NodeId>,
     // Node for communicating with remote peers
     node: OnceLock<Arc<dyn TNode<CD>>>,
     // Wake the retry task on close; dropping the relay also closes its channel.
@@ -229,7 +229,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
     fn update_query_on_peer(
         &self,
-        peer_id: proto::EntityId,
+        peer_id: proto::NodeId,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         version: u32,
@@ -307,7 +307,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     /// This should be called when a durable peer disconnects. All predicates registered
     /// with that peer will be marked as pending and will be automatically re-registered
     /// when the peer reconnects or another suitable peer becomes available.
-    pub fn notify_peer_disconnected(&self, peer_id: proto::EntityId) {
+    pub fn notify_peer_disconnected(&self, peer_id: proto::NodeId) {
         debug!("Peer {} disconnected, orphaning predicate registrations", peer_id);
 
         // Remove from connected peers
@@ -332,7 +332,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     ///
     /// This should be called when a new durable peer connects. The relay will automatically
     /// attempt to register any pending predicates on the newly connected peer's subscription.
-    pub fn notify_peer_connected(&self, peer_id: proto::EntityId) {
+    pub fn notify_peer_connected(&self, peer_id: proto::NodeId) {
         debug!("SubscriptionRelay.notify_peer_connected() - Peer {} connected, registering predicates on peer subscription", peer_id);
 
         // Add to connected peers
@@ -343,7 +343,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     }
 
     /// Whether a query is established with, or being sent to, this peer.
-    pub(crate) fn has_subscription_with_peer(&self, peer_id: &proto::EntityId) -> bool {
+    pub(crate) fn has_subscription_with_peer(&self, peer_id: &proto::NodeId) -> bool {
         self.inner
             .subscriptions
             .lock()
@@ -360,7 +360,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
     /// Get all unique contexts for predicates established or requested with a specific peer
     /// TODO: update the data structure to do this via a direct lookup rather than having to scan the entire map
-    pub fn get_contexts_for_peer(&self, peer_id: &proto::EntityId) -> std::collections::HashSet<CD> {
+    pub fn get_contexts_for_peer(&self, peer_id: &proto::NodeId) -> std::collections::HashSet<CD> {
         let subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
         let mut contexts = std::collections::HashSet::new();
 
@@ -427,7 +427,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         }
     }
 
-    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: EntityId, content: Arc<Content<CD>>, cancel: CancelFlag) {
+    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: NodeId, content: Arc<Content<CD>>, cancel: CancelFlag) {
         let query_id = content.query_id;
         let predicate = content.selection.clone();
         // Credentials read at send time from the live source.
@@ -486,7 +486,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
     }
 
     /// Handle errors with retry logic
-    fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::EntityId, error: RetrievalError, cancel: &CancelFlag) {
+    fn handle_error(&self, query_id: proto::QueryId, target_peer: proto::NodeId, error: RetrievalError, cancel: &CancelFlag) {
         let error_msg = error.to_string();
 
         // Evaluate retriability at failure time
@@ -538,7 +538,7 @@ pub trait TNode<CD: ContextData>: Send + Sync {
     /// Returns Ok(()) if subscription was established and deltas applied successfully.
     async fn remote_subscribe(
         &self,
-        peer_id: proto::EntityId,
+        peer_id: proto::NodeId,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
@@ -547,7 +547,7 @@ pub trait TNode<CD: ContextData>: Send + Sync {
 
     /// Send a predicate unregistration message to a remote peer
     /// This is a one-way message, no response expected
-    async fn peer_unsubscribe(&self, peer_id: proto::EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error>;
+    async fn peer_unsubscribe(&self, peer_id: proto::NodeId, query_id: proto::QueryId) -> Result<(), anyhow::Error>;
 }
 
 /// Implementation of TNode for WeakNode
@@ -559,7 +559,7 @@ where
 {
     async fn remote_subscribe(
         &self,
-        peer_id: proto::EntityId,
+        peer_id: proto::NodeId,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
@@ -599,7 +599,7 @@ where
         Ok(())
     }
 
-    async fn peer_unsubscribe(&self, peer_id: proto::EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
+    async fn peer_unsubscribe(&self, peer_id: proto::NodeId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
         let node = self.upgrade().ok_or(NodeDropped)?;
 
         // Use the existing request_remote_unsubscribe method
@@ -612,7 +612,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ankurah_proto::{EntityId, ModelId};
+    use crate::node::NodeKey;
+    use ankurah_proto::{EntityId, ModelId, NodeId};
     use ankurah_signals::Mut;
     use std::sync::{Arc, Mutex};
 
@@ -629,7 +630,7 @@ mod tests {
     #[derive(Debug)]
     struct MockMessageSender<CD: ContextData> {
         next_error: Arc<Mutex<Option<RequestError>>>,
-        sent_requests: Arc<Mutex<Vec<(EntityId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)>>>,
+        sent_requests: Arc<Mutex<Vec<(NodeId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)>>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
         held_reply: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), RequestError>>>>,
@@ -650,7 +651,7 @@ mod tests {
 
         fn set_fail_next(&self, error: RequestError) { *self.next_error.lock().unwrap() = Some(error); }
 
-        fn get_sent_requests(&self) -> Vec<(EntityId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)> {
+        fn get_sent_requests(&self) -> Vec<(NodeId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)> {
             self.sent_requests.lock().unwrap().clone()
         }
 
@@ -668,7 +669,7 @@ mod tests {
     impl<CD: ContextData> TNode<CD> for MockMessageSender<CD> {
         async fn remote_subscribe(
             &self,
-            peer_id: EntityId,
+            peer_id: NodeId,
             query_id: proto::QueryId,
             selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
@@ -689,7 +690,7 @@ mod tests {
             }
         }
 
-        async fn peer_unsubscribe(&self, peer_id: EntityId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
+        async fn peer_unsubscribe(&self, peer_id: NodeId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
             self.sent_requests.lock().unwrap().push((peer_id, query_id, None));
 
             // Check if there's an error to fail with
@@ -741,11 +742,11 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(2), relay.inner.shutdown_tx.closed()).await.unwrap();
     }
 
-    fn connected_relay() -> (SubscriptionRelay<ModelId, MockLiveQuery>, Arc<MockMessageSender<ModelId>>, EntityId) {
+    fn connected_relay() -> (SubscriptionRelay<ModelId, MockLiveQuery>, Arc<MockMessageSender<ModelId>>, NodeId) {
         let relay = SubscriptionRelay::new_test();
         let mock_sender = Arc::new(MockMessageSender::<ModelId>::new());
         relay.set_node(mock_sender.clone()).expect("Failed to set message sender");
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
         relay.notify_peer_connected(peer_id);
         (relay, mock_sender, peer_id)
     }
@@ -772,7 +773,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let model_id = create_test_model_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
 
         // Connect the peer first
         relay.notify_peer_connected(peer_id);
@@ -807,7 +808,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let model_id = create_test_model_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
 
         // Connect the peer first
         relay.notify_peer_connected(peer_id);
@@ -836,7 +837,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let model_id = create_test_model_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
 
         // Add pending subscription (no peers connected yet)
         relay.subscribe_query(query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
@@ -870,7 +871,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let model_id = create_test_model_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
 
         // Connect peer and add subscription (should succeed initially)
         relay.notify_peer_connected(peer_id);
@@ -917,7 +918,7 @@ mod tests {
         let non_retryable_query_id = proto::QueryId::new();
         let model_id = create_test_model_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
 
         // Add subscriptions
         relay.subscribe_query(retryable_query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
@@ -961,7 +962,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let model_id = create_test_model_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
 
         // Connect peer and setup established subscription
         relay.notify_peer_connected(peer_id);
@@ -999,7 +1000,7 @@ mod tests {
         let query_id = proto::QueryId::new();
         let model_id = create_test_model_id();
         let predicate = create_test_selection();
-        let peer_id = EntityId::random();
+        let peer_id = NodeKey::generate().node_id();
 
         // Test setup without message sender - should not crash
         relay.subscribe_query(query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
@@ -1087,7 +1088,7 @@ mod tests {
         subscribe(&relay, query_id);
         settle().await;
         relay.inner.connected_peers.remove(&peer);
-        relay.notify_peer_connected(EntityId::random());
+        relay.notify_peer_connected(NodeKey::generate().node_id());
 
         relay.subscribe_query(query_id, create_test_selection(), create_test_model_id().into(), 2, MockLiveQuery);
         settle().await;
@@ -1129,7 +1130,7 @@ mod tests {
         settle().await;
         // Leave only another peer in the connected set, so the generic setup path would not pick the recorded one
         relay.inner.connected_peers.remove(&peer_id);
-        relay.notify_peer_connected(EntityId::random());
+        relay.notify_peer_connected(NodeKey::generate().node_id());
 
         let _second_in_flight = mock_sender.hold_next_reply();
         relay.update_query(query_id, create_test_selection(), 2).unwrap();

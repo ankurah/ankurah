@@ -149,7 +149,7 @@ pub use ankurah_core::{
     model,
     model::View,
     model::{Model, Mutable},
-    node::{CachePolicy, MatchArgs, Node, NodeState},
+    node::{CachePolicy, MatchArgs, Node, NodeKey, NodeState},
     policy::{self, PermissiveAgent},
     property::{self, Property, Ref},
     query_value::QueryValue,
