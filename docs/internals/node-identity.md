@@ -99,11 +99,11 @@ inbound peer's durable claim is logged and otherwise ignored.
 A node id's latest registration decides its trust, and registrations of one
 id apply one at a time. A node that dials an address presents to whoever
 answers there, so an id trusted as durable can be registered again over a
-connection that is not. Durable routing for
-that id is dropped at that moment, and every request to a peer chosen because
-it is durable re-checks, as it is sent, that the peer's current connection is
-trusted as durable; a request that fails the check is refused, so neither its
-credentials nor its reply cross the new connection.
+connection that is not. Durable routing for that id is dropped at that moment,
+and every request to a peer chosen because it is durable re-checks, as it is
+sent, that the peer's current connection is trusted as durable; a request that
+fails the check is refused, so neither its credentials nor its reply cross the
+new connection.
 
 ## Who Minted an Entity
 
@@ -179,11 +179,13 @@ with its own.
 ## Resetting a Node
 
 `Node::reset` halts the node with `NodeHaltReason::Reset` and then wipes its
-storage through `StorageEngine::delete_all`; the wipe finishes even if the
-caller stops waiting. The host then discards the halted node with its contexts
-and live queries, and builds a fresh node on the wiped store. Wipes of one node
-run one at a time, so a host that finds its node halted by a reset it did not
-await, such as a plugin's, calls `Node::reset` itself to wait for that wipe
+storage through `StorageEngine::delete_all`, once the storage commits in
+flight have finished; no commit begins after the halt, and the wipe finishes
+even if the caller stops waiting. The host then discards the halted node with
+its contexts and live queries, and builds a fresh node on the wiped store. A
+call during or after another reset waits for that reset's wipe rather than
+wiping again, so a host that finds its node halted by a reset it did not
+await, such as a plugin's, calls `Node::reset` itself to wait for the wipe
 before it builds the fresh node.
 
 Core never decides when to reset. A node in a client role that should discard
