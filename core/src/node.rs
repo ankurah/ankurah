@@ -713,7 +713,6 @@ where
         match body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, from);
-                self.lifecycle.check_not_halted()?;
                 crate::node::applier::NodeApplier::apply_updates(self, &from, items).await?;
                 Ok(())
             }
@@ -907,7 +906,7 @@ where
 
     /// Retrieve peer states and persist them in this node.
     pub(crate) async fn get_from_peer(&self, ids: Vec<proto::EntityId>, cdata: &Vec<PA::ContextData>) -> Result<(), RetrievalError> {
-        self.lifecycle.check_not_halted().map_err(MutationError::from)?;
+        self.lifecycle.check_not_halted()?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         match self.request_durable(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
@@ -938,7 +937,7 @@ where
         selection: ankql::ast::Selection<Resolved>,
         cdata: &Vec<PA::ContextData>,
     ) -> Result<Vec<Entity>, RetrievalError> {
-        self.lifecycle.check_not_halted().map_err(MutationError::from)?;
+        self.lifecycle.check_not_halted()?;
         let peer_id = self.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
         let known_matched_entities = self.fetch_entities_from_local(&selection).await?;

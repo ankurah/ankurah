@@ -255,6 +255,26 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     assert!(node.handle_message(proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() }).await.is_err());
 }
 
+/// Each read that asks a durable peer reports a halt as the halt, as local reads do.
+#[tokio::test]
+async fn a_halted_node_asked_to_read_from_a_peer_reports_its_halt() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let key = NodeKey::generate();
+    let (sent, _) = std::sync::mpsc::channel();
+    register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await.unwrap();
+    let reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
+    let cdata = vec![DEFAULT_CONTEXT];
+    let selection = ankql::ast::Selection::<Resolved> {
+        predicate: ankql::ast::Predicate::MemberOf(ModelId::System(proto::SystemModel::Model)),
+        order_by: None,
+        limit: None,
+    };
+    assert!(
+        matches!(node.get_from_peer(vec![proto::EntityId::random()], &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
+    );
+    assert!(matches!(node.fetch_from_peer(selection, &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason));
+}
+
 #[tokio::test]
 async fn remote_creations_are_not_registered_or_published_before_storage_succeeds() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
