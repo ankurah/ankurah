@@ -77,9 +77,13 @@ pub enum ComponentScopeError {
     /// A qualifier naming neither a component of the query by display name nor any component by label.
     #[error("unknown component '{0}': a qualifier names one of the query's components by name, or any component by its label")]
     UnknownComponent(String),
-    /// An ORDER BY key on a component outside the query. An entity without that component has no value
-    /// to sort by, and some engines take sort candidates only from entities that have one.
-    #[error("ORDER BY {component}::{name} sorts by a component outside the query; add {component} to the query's tuple")]
+    /// An ORDER BY key whose qualifier names no component in the query's tuple, whether a component outside it
+    /// or none at all. An entity without that component has no value to sort by, and some engines take sort
+    /// candidates only from entities that have one.
+    #[error(
+        "ORDER BY {}::{name} names a component that is not in the query's tuple; sort by a property of a component the query returns, or add that component's view to the tuple",
+        identifier_spelling(.component)
+    )]
     SortKeyOutsideQuery { component: String, name: String },
     /// A name that none of these components declares.
     #[error("no property '{name}' in {}", describe_components(.components))]
@@ -366,6 +370,11 @@ mod tests {
         assert_eq!(locate(&[task(), assignment()], &outside).unwrap(), (model(3), property(30)));
         let error = locate_sort_key(&[task(), assignment()], &Catalog, &outside).map(|_| ()).unwrap_err();
         assert!(matches!(error, ModelResolutionError::ComponentScope(ComponentScopeError::SortKeyOutsideQuery { .. })));
+        assert_eq!(
+            error.to_string(),
+            "ORDER BY \"records.closure\"::closed_at names a component that is not in the query's tuple; sort by a property of a \
+             component the query returns, or add that component's view to the tuple"
+        );
         let unknown = locate(&[task(), assignment()], &path(Some("Closure"), &["closed_at"])).unwrap_err();
         assert!(
             matches!(unknown, ModelResolutionError::ComponentScope(ComponentScopeError::UnknownComponent(found)) if found == "Closure")
