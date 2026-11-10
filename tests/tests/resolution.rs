@@ -34,7 +34,7 @@ fn register(collection: &str, props: &[(&str, &str, &str)]) -> proto::NodeReques
 /// Register a schema and index its allocated property ids by name.
 async fn register_and_map(
     client: &Node<SledStorageEngine, PermissiveAgent>,
-    server_id: EntityId,
+    server_id: proto::NodeId,
     request: proto::NodeRequestBody,
 ) -> anyhow::Result<BTreeMap<String, EntityId>> {
     match client.request(server_id, &DEFAULT_CONTEXT, request).await? {

@@ -304,7 +304,7 @@ impl PolicyAgent for JwtAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -315,7 +315,7 @@ impl PolicyAgent for JwtAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _from_node: &proto::EntityId,
+        _from_node: &proto::NodeId,
         _state: &Attested<proto::EntityState>,
     ) -> Result<(), AccessDenied> {
         Ok(())
@@ -341,7 +341,7 @@ impl PolicyAgent for JwtAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> Result<(), AccessDenied> {
         Ok(())

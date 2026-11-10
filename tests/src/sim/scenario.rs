@@ -260,7 +260,7 @@ impl<'a> Workload<'a> {
 
         let origin_id = self.nodes[origin].id();
         let node_indices: Vec<usize> = self.nodes.iter().map(|n| n.index).filter(|&i| i != origin).collect();
-        let node_ids: Vec<proto::EntityId> = self.nodes.iter().map(|n| n.id()).collect();
+        let node_ids: Vec<proto::NodeId> = self.nodes.iter().map(|n| n.id()).collect();
 
         for event in &events {
             let event_id = event.payload.id();
@@ -382,11 +382,11 @@ where
     runtime.block_on(async move {
         let mut rng = SimRng::new(seed);
         let captured = Captured::new();
-        let nodes = build_nodes(node_count, captured.clone()).await.expect("nodes build");
+        let nodes = build_nodes(node_count, seed, captured.clone()).await.expect("nodes build");
 
         let durable = nodes.iter().find(|node| node.durable).expect("the simulation has a durable node");
 
-        let node_ids: Vec<proto::EntityId> = nodes.iter().map(|n| n.id()).collect();
+        let node_ids: Vec<proto::NodeId> = nodes.iter().map(|n| n.id()).collect();
         let mut scheduler = Scheduler::new(captured.clone(), faults, node_ids);
         let mut trace = Trace::new();
 

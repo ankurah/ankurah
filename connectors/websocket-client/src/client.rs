@@ -219,7 +219,7 @@ where
     }
 
     /// Get the node ID of the connected server (if connected)
-    pub fn server_node_id(&self) -> Option<proto::EntityId> {
+    pub fn server_node_id(&self) -> Option<proto::NodeId> {
         match self.state().get() {
             ConnectionState::Connected { server_presence, .. } => Some(server_presence.node_id),
             _ => None,

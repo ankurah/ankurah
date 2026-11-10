@@ -41,6 +41,7 @@ ankurah-proto      = { path = "../proto", version = "=0.10.0" }
 ankurah-signals    = { path = "../signals", version = "=0.10.0" }
 
 rand                 = { version = "0.8", features = ["small_rng"] }
+ed25519-dalek        = "2"
 anyhow               = "1.0"
 thiserror            = "2"
 chrono               = { version = "0.4", default-features = false }

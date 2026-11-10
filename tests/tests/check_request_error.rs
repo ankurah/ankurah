@@ -75,7 +75,7 @@ impl PolicyAgent for RejectingAgent {
     fn validate_received_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _received_from_node: &proto::EntityId,
+        _received_from_node: &proto::NodeId,
         _event: &proto::Attested<proto::Event>,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())
@@ -86,7 +86,7 @@ impl PolicyAgent for RejectingAgent {
     fn validate_received_state<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _received_from_node: &proto::EntityId,
+        _received_from_node: &proto::NodeId,
         _state: &proto::Attested<proto::EntityState>,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())
@@ -109,7 +109,7 @@ impl PolicyAgent for RejectingAgent {
     fn validate_causal_assertion<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
-        _peer_id: &proto::EntityId,
+        _peer_id: &proto::NodeId,
         _head_relation: &proto::CausalAssertion,
     ) -> std::result::Result<(), AccessDenied> {
         Ok(())

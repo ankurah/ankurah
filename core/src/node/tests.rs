@@ -7,28 +7,29 @@ use ankurah_proto::Attested;
 use ankurah_signals::Subscribe;
 
 mod commit;
+mod identity;
 
 #[derive(Clone)]
-struct ClosedSender(proto::EntityId);
+struct ClosedSender(proto::NodeId);
 
 impl PeerSender for ClosedSender {
     fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Err(SendError::ConnectionClosed) }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
+    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 #[derive(Clone)]
-struct RecordingSender(proto::EntityId, std::sync::mpsc::Sender<proto::NodeMessage>);
+struct RecordingSender(proto::NodeId, std::sync::mpsc::Sender<proto::NodeMessage>);
 
 impl PeerSender for RecordingSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         self.1.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> proto::EntityId { self.0 }
+    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
-fn presence(id: proto::EntityId) -> proto::Presence {
+fn presence(id: proto::NodeId) -> proto::Presence {
     proto::Presence { node_id: id, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION }
 }
 
@@ -142,7 +143,7 @@ async fn presence_waits_for_the_persisted_system_root() {
 #[tokio::test]
 async fn disconnect_releases_pending_requests() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-    let peer = proto::EntityId::random();
+    let peer = NodeKey::generate().node_id();
     let (sent, _messages) = std::sync::mpsc::channel();
     node.register_peer(presence(peer), Box::new(RecordingSender(peer, sent))).await.unwrap();
     let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
@@ -162,7 +163,7 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let transaction = node.privileged_context().begin();
     let id = transaction.create(&crate::schema::catalog::SysModelRow { label: "test".into(), name: "Test".into() }).await.unwrap().id();
     transaction.commit().await.unwrap();
-    let peer = proto::EntityId::random();
+    let peer = NodeKey::generate().node_id();
     node.register_peer(presence(peer), Box::new(ClosedSender(peer))).await.unwrap();
 
     let model = ModelId::System(proto::SystemModel::Model);

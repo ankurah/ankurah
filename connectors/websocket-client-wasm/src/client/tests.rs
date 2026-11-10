@@ -66,7 +66,7 @@ struct AdmissionState {
 
 #[async_trait]
 impl NodeComms for HeldAdmission {
-    fn id(&self) -> proto::EntityId { proto::EntityId::from_bytes([1; 32]) }
+    fn id(&self) -> proto::NodeId { proto::NodeId::from(proto::Identity::Ed25519([1; 32])) }
     async fn presence(&self) -> Result<proto::Presence, NodeHaltReason> {
         let release = self.0.release_presence.lock().unwrap().take().unwrap();
         self.0.presence_started.set(true);
@@ -81,7 +81,7 @@ impl NodeComms for HeldAdmission {
         Ok(())
     }
     fn state(&self) -> Read<NodeState> { self.0.node_state.read() }
-    fn deregister_peer(&self, _: proto::EntityId) { self.0.published.set(false); }
+    fn deregister_peer(&self, _: proto::NodeId) { self.0.published.set(false); }
     async fn handle_message(&self, _: proto::NodeMessage) -> anyhow::Result<()> {
         self.0.handled.set(self.0.handled.value() + 1);
         Ok(())
@@ -157,7 +157,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
             client.connect().unwrap();
             client.state.set(ConnectionState::Error { message: "transient transport error".into(), cause: None });
             assert!(futures::poll!(&mut ready).is_pending());
-            let peer = proto::EntityId::from_bytes([2; 32]);
+            let peer = proto::NodeId::from(proto::Identity::Ed25519([2; 32]));
             deliver(
                 socket,
                 &bincode::serialize(&proto::Message::Presence(proto::Presence {

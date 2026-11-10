@@ -29,7 +29,7 @@ pub enum PeerConnectionError {
 pub trait PeerSender: Send + Sync {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
     /// The node ID of the recipient of this message
-    fn recipient_node_id(&self) -> proto::EntityId;
+    fn recipient_node_id(&self) -> proto::NodeId;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }
 
@@ -51,25 +51,25 @@ impl From<anyhow::Error> for SendError {
 
 #[async_trait]
 pub trait NodeComms: Send + Sync {
-    fn id(&self) -> proto::EntityId;
+    fn id(&self) -> proto::NodeId;
     /// Build our handshake identity after local system storage loads; an unadopted node has no root.
     async fn presence(&self) -> Result<proto::Presence, crate::error::NodeHaltReason>;
     async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError>;
     fn state(&self) -> ankurah_signals::Read<NodeState>;
-    fn deregister_peer(&self, node_id: proto::EntityId);
+    fn deregister_peer(&self, node_id: proto::NodeId);
     async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
 
 #[async_trait]
 impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 'static> NodeComms for Node<SE, PA> {
-    fn id(&self) -> proto::EntityId { self.id }
+    fn id(&self) -> proto::NodeId { self.id }
     async fn presence(&self) -> Result<proto::Presence, crate::error::NodeHaltReason> { self.presence().await }
     async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError> {
         self.register_peer(presence, sender).await
     }
     fn state(&self) -> ankurah_signals::Read<NodeState> { self.state() }
-    fn deregister_peer(&self, node_id: proto::EntityId) {
+    fn deregister_peer(&self, node_id: proto::NodeId) {
         //
         self.deregister_peer(node_id);
     }
