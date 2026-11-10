@@ -218,6 +218,46 @@ async fn a_plugin_that_cannot_announce_fails_the_presence() {
     assert_eq!(node.presence(&handshake).await, Err(PeerConnectionError::AnnouncementFailed(failure)));
 }
 
+/// A plugin that halts its node with a reset, then accepts the peer.
+struct ResetThenAccept;
+
+#[async_trait]
+impl<SE, PA> NodePlugin<SE, PA> for ResetThenAccept
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn name(&self) -> &'static str { "reset-then-accept" }
+
+    async fn register_peer(&self, node: &Node<SE, PA>, _: &PeerRegistration<'_>) -> Result<(), PeerRefusal> {
+        node.reset().await.unwrap();
+        Ok(())
+    }
+}
+
+/// A halted node registers no peer: not one presented after the halt, and not one whose
+/// plugins halted the node while it was asked about.
+#[tokio::test]
+async fn a_peer_is_not_registered_on_a_node_halted_before_or_while_its_plugins_are_asked() {
+    let asked = AskedLog::default();
+    let halted = node_with([probe("probe", Answer::Accept, &asked)]);
+    let reason = halted.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
+    let key = NodeKey::generate();
+    let (sent, _) = mpsc::channel();
+    let refused =
+        register_keyed_peer(&halted, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
+    assert_eq!(refused, Err(PeerConnectionError::NodeHalted(reason)));
+    assert!(asked.plugins().is_empty(), "no plugin is asked on a halted node");
+
+    let resetting = Node::builder(Arc::new(TestStorage::default()), PermissiveAgent::new()).plug(ResetThenAccept).build().unwrap();
+    let (sent, messages) = mpsc::channel();
+    let refused =
+        register_keyed_peer(&resetting, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
+    assert_eq!(refused, Err(PeerConnectionError::NodeHalted(NodeHaltReason::Reset)));
+    assert_eq!(resetting.granted_trust(&key.node_id()), None);
+    assert_eq!(messages.try_iter().count(), 0, "nothing was sent to the peer");
+}
+
 #[test]
 fn two_plugins_under_one_name_fail_build() {
     let asked = AskedLog::default();
