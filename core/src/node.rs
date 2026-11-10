@@ -319,7 +319,8 @@ where
     /// once per handshake. How the connection was reached decides, through the policy agent's
     /// [`PolicyAgent::peer_trust`], whether the peer is durable. Then each plugin is asked, in the
     /// order plugged, and the first refusal leaves the peer unregistered. The connector holds the
-    /// registration returned while the connection is open.
+    /// registration returned while the connection is open. `sender` holds the frames it is given
+    /// until the connector has written this node's presence.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.claims.node_id.to_base64_short(), durable = %presence.claims.durable)))]
     pub async fn register_peer(
         &self,
