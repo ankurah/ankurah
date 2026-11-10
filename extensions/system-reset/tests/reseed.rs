@@ -1,16 +1,23 @@
-//! A node meets a durable peer through each real connector, and its System reset plugin decides
-//! from the seeding the peer announces whether the node registers the peer.
+//! A node meets a durable peer through each real connector, or one holding only a key, and its
+//! System reset plugin decides from the seeding the peer announces whether the node registers the
+//! peer.
 
 use std::{sync::Arc, time::Duration};
 
 use ankurah::{
-    core::{connector::PeerConnectionError, error::NodeHaltReason, node::PeerRefusal, storage::StorageEngine},
-    policy::DEFAULT_CONTEXT,
-    EntityId, Model, Node, NodeState, PermissiveAgent,
+    core::{
+        connector::{PeerConnectionError, PeerProvenance, PeerSender, SendError},
+        error::NodeHaltReason,
+        node::{NodeKey, NodePlugin, PeerRefusal},
+        storage::StorageEngine,
+        test_helpers::keyed_peer_claims,
+    },
+    policy::{PeerTrust, DEFAULT_CONTEXT},
+    proto, EntityId, Model, Node, NodeState, PermissiveAgent,
 };
 use ankurah_connector_local_process::LocalProcessConnection;
 use ankurah_storage_sled::SledStorageEngine;
-use ankurah_system_reset::{OnReseed, SystemReset, NAME};
+use ankurah_system_reset::{OnReseed, SystemReset, PLUGIN_NAME};
 use ankurah_websocket_client::{ConnectionError, WebsocketClient};
 use ankurah_websocket_server::WebsocketServer;
 use serde::{Deserialize, Serialize};
@@ -211,7 +218,7 @@ async fn a_client_meeting_a_server_seeded_again_resets_and_refuses_and_a_fresh_n
         let refused = connect(transport, &returning, &reseeded).await.err().expect("the returning client refuses the reseeded server");
         let expected = match transport {
             Transport::LocalProcess => PeerConnectionError::Refused(PeerRefusal {
-                plugin: NAME,
+                plugin: PLUGIN_NAME,
                 reason: "the peer holds another seeding of the System model; this node reset".into(),
             }),
             Transport::Websocket => PeerConnectionError::NodeHalted(NodeHaltReason::Reset),
@@ -280,7 +287,7 @@ async fn a_durable_node_configured_only_to_refuse_refuses_another_seeding_and_ke
         let (other, _) = server(Some("another")).await?;
 
         let refused = connect(transport, &refuser, &other).await.err().expect("the node refuses a peer of another seeding");
-        let refusal = PeerRefusal { plugin: NAME, reason: "the peer holds another seeding of the System model".into() };
+        let refusal = PeerRefusal { plugin: PLUGIN_NAME, reason: "the peer holds another seeding of the System model".into() };
         assert_eq!(refused, PeerConnectionError::Refused(refusal), "{transport:?}");
         assert_eq!(refuser.state().value(), NodeState::Running);
         wait_until_unregistered(&refuser, &other.node).await;
@@ -304,5 +311,48 @@ async fn a_peer_not_trusted_as_durable_speaks_for_no_seeding() -> anyhow::Result
         assert!(dialing.state().value().halt_reason().is_none());
         assert!(ephemeral_peer.node.state().value().halt_reason().is_none());
     }
+    Ok(())
+}
+
+/// A connection that drops every frame, for a peer with no node behind it.
+#[derive(Clone)]
+struct Discard;
+
+impl PeerSender for Discard {
+    fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Ok(()) }
+    fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+}
+
+/// An announcement the plugin cannot read, as a later build of a plugin under the same name might
+/// make, is no verdict: the durable peer registers and the node keeps its data.
+#[tokio::test]
+async fn a_durable_peer_whose_announcement_cannot_be_read_registers_and_the_node_keeps_its_data() -> anyhow::Result<()> {
+    let engine = Arc::new(SledStorageEngine::new_test()?);
+    let node = Node::builder(engine.clone(), PermissiveAgent::new())
+        .durable()
+        .plug(SystemReset::<System, _>::new(OnReseed::Reset, DEFAULT_CONTEXT))
+        .build()?;
+    let own = create_system(&node, Some("its own")).await?.unwrap();
+
+    let key = NodeKey::generate();
+    let (handshake, mut claims) = keyed_peer_claims(node.id, &key, true);
+    claims.announcements.insert(PLUGIN_NAME.into(), vec![7; 33]);
+    node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Configured, Box::new(Discard)).await?;
+    assert_eq!(node.granted_trust(&key.node_id()), Some(PeerTrust { durable: true }));
+    assert_eq!(node.state().value(), NodeState::Running);
+    assert!(engine.get_state(own).await.is_ok());
+    Ok(())
+}
+
+/// A node halted while a handshake is in flight cannot read its System entities, and its
+/// announcement fails with the reason rather than announcing none.
+#[tokio::test]
+async fn a_node_that_cannot_read_its_system_entities_fails_its_announcement() -> anyhow::Result<()> {
+    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    node.reset().await?;
+    let plugin = SystemReset::<System, _>::new(OnReseed::Refuse, DEFAULT_CONTEXT);
+    let failure = plugin.announce(&node).await.expect_err("a halted node reads none of its entities");
+    assert_eq!(failure.plugin, PLUGIN_NAME);
+    assert!(failure.reason.starts_with("reading this node's System entities failed"), "{}", failure.reason);
     Ok(())
 }

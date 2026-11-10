@@ -15,7 +15,7 @@ thiserror    = "2"
 tracing      = "0.1"
 
 [dev-dependencies]
-ankurah                         = { path = "../../ankurah", features = ["derive"], version = "=0.10.0" }
+ankurah                         = { path = "../../ankurah", features = ["derive", "test-helpers"], version = "=0.10.0" }
 ankurah-storage-sled            = { path = "../../storage/sled", version = "=0.10.0" }
 ankurah-connector-local-process = { path = "../../connectors/local-process", version = "=0.10.0" }
 ankurah-websocket-client        = { path = "../../connectors/websocket-client", version = "=0.10.0" }

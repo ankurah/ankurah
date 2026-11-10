@@ -7,8 +7,10 @@
 //! peer, after resetting the node if the application chose [`OnReseed::Reset`], and the host
 //! builds a fresh node on the wiped store. Either side holding none is no verdict, so a first
 //! connection, a peer that announces nothing and a peer of the same seeding all register. An
-//! ephemeral node that registers a durable peer comes to hold the System entities the peer
-//! announced, so its first connection leaves it holding the seeding later ones are compared with.
+//! announcement the plugin cannot read is no verdict either: the peer registers, and the plugin
+//! logs a warning. An ephemeral node that registers a durable peer comes to hold the System
+//! entities the peer announced, so its first connection leaves it holding the seeding later ones
+//! are compared with.
 
 mod announcement;
 
@@ -27,9 +29,10 @@ use ankurah_core::{
     EntityId,
 };
 use async_trait::async_trait;
+use tracing::warn;
 
-/// The name a [`SystemReset`] announces under.
-pub const NAME: &str = "system-reset";
+/// The name a [`SystemReset`] announces under, which a peer's plugin of the same name reads.
+pub const PLUGIN_NAME: &str = "ankurah-system-reset";
 
 /// What a node does on meeting a durable peer that holds another seeding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,7 +51,10 @@ pub struct SystemReset<M, CD> {
     context_data: CD,
     /// Brings the node the System entities its durable peer announced and it lacked. A query
     /// rather than a single read, because the peer registers only after the hook returns and a
-    /// query waits for a durable peer; the next durable peer this plugin accepts replaces it.
+    /// query waits for a durable peer. It stands until this plugin decides the next durable
+    /// peer's registration, whatever that peer announces, or until the node halts and closes its
+    /// queries. Nothing tells a plugin that a later plugin refused a peer it accepted, so the
+    /// query then waits for the next durable peer.
     fetch: Mutex<Option<EntityLiveQuery>>,
     model: PhantomData<fn() -> M>,
 }
@@ -66,18 +72,17 @@ impl<M: Model, CD: ContextData> SystemReset<M, CD> {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
-        let query = if lacking.is_empty() || node.durable {
-            None
-        } else {
-            let ids = Expr::ExprList(lacking.iter().map(Expr::from).collect());
-            let predicate = Predicate::Comparison {
-                left: Box::new(Expr::Path(PathExpr::simple("id"))),
-                operator: ComparisonOperator::In,
-                right: Box::new(ids),
-            };
-            Some(Context::new_weak(node, self.context_data.clone()).query::<M::View>(Selection::from(predicate))?.into())
+        if lacking.is_empty() || node.durable {
+            return Ok(());
+        }
+        let ids = Expr::ExprList(lacking.iter().map(Expr::from).collect());
+        let predicate = Predicate::Comparison {
+            left: Box::new(Expr::Path(PathExpr::simple("id"))),
+            operator: ComparisonOperator::In,
+            right: Box::new(ids),
         };
-        *self.fetch.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = query;
+        let query = Context::new_weak(node, self.context_data.clone()).query::<M::View>(Selection::from(predicate))?;
+        *self.fetch.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(query.into());
         Ok(())
     }
 }
@@ -89,11 +94,11 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
     M: Model + 'static,
 {
-    fn name(&self) -> &'static str { NAME }
+    fn name(&self) -> &'static str { PLUGIN_NAME }
 
     async fn announce(&self, node: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> {
         let held = held::<M, _, _>(node).await.map_err(|error| AnnouncementFailure {
-            plugin: NAME,
+            plugin: PLUGIN_NAME,
             reason: format!("reading this node's System entities failed: {error}"),
         })?;
         Ok((!held.is_empty()).then(|| announcement::encode(&held)))
@@ -104,8 +109,16 @@ where
         if !peer.trust.durable {
             return Ok(());
         }
+        // This durable peer's registration decides afresh what the node fetches.
+        drop(self.fetch.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take());
         let Some(announcement) = peer.announcement else { return Ok(()) };
-        let announced = announcement::decode(announcement).map_err(refusal)?;
+        let announced = match announcement::decode(announcement) {
+            Ok(announced) => announced,
+            Err(unreadable) => {
+                warn!("Durable peer {} announced no seeding this plugin can read, so it gives no verdict: {unreadable}", peer.node_id);
+                return Ok(());
+            }
+        };
         let held = held::<M, _, _>(node).await.map_err(|error| refusal(format!("reading this node's System entities failed: {error}")))?;
         if holds_another_seeding(&held, &announced) {
             let reason = "the peer holds another seeding of the System model";
@@ -141,13 +154,44 @@ where
     Ok(stored.into_iter().map(|state| state.payload.entity_id).collect())
 }
 
-fn refusal(reason: impl ToString) -> PeerRefusal { PeerRefusal { plugin: NAME, reason: reason.to_string() } }
+fn refusal(reason: impl ToString) -> PeerRefusal { PeerRefusal { plugin: PLUGIN_NAME, reason: reason.to_string() } }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ankurah::{
+        core::connector::PeerProvenance,
+        core::node::NodeKey,
+        policy::{PeerTrust, DEFAULT_CONTEXT},
+        PermissiveAgent,
+    };
+    use ankurah_storage_sled::SledStorageEngine;
+    use std::sync::Arc;
+
+    /// The application's System model.
+    #[derive(ankurah::Model, Debug, serde::Serialize, serde::Deserialize)]
+    pub struct System {
+        pub seeding: String,
+    }
 
     fn ids(bytes: &[u8]) -> BTreeSet<EntityId> { bytes.iter().map(|byte| EntityId::from_bytes([*byte; 32])).collect() }
+
+    #[tokio::test]
+    async fn the_next_durable_peers_registration_drops_the_standing_fetch_whatever_it_announced() {
+        let node = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
+        let plugin = SystemReset::<System, _>::new(OnReseed::Reset, DEFAULT_CONTEXT);
+        let durable = |announcement| PeerRegistration {
+            node_id: NodeKey::generate().node_id(),
+            provenance: PeerProvenance::Configured,
+            trust: PeerTrust { durable: true },
+            announcement,
+        };
+        let announced = announcement::encode(&ids(&[1]));
+        plugin.register_peer(&node, &durable(Some(&announced))).await.unwrap();
+        assert!(plugin.fetch.lock().unwrap().is_some(), "the node fetches the System entity it lacks");
+        plugin.register_peer(&node, &durable(None)).await.unwrap();
+        assert!(plugin.fetch.lock().unwrap().is_none(), "a durable peer announcing nothing drops the fetch");
+    }
 
     #[test]
     fn only_two_nonempty_sets_that_share_no_entity_are_another_seeding() {

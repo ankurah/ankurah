@@ -198,14 +198,17 @@ The `ankurah-system-reset` crate makes that decision as a node plugin. The
 application designates one of its models as its System model, its server
 creates one entity of that model for each seeding of its data (the example
 server creates one when it starts on an empty store), and the server and its
-clients plug `SystemReset` over that model. The plugin announces the ids of the
-System entities its node holds. When a peer trusted as durable announces some,
-the node holds some, and the two share none, the peer holds another seeding:
+clients plug `SystemReset` over that model. The plugin announces, under the
+name `ankurah-system-reset`, the ids of the System entities its node holds.
+When a peer trusted as durable announces some, the node holds some, and the
+two share none, the peer holds another seeding:
 the plugin refuses the peer, after resetting the node if the application built
 the plugin with `OnReseed::Reset` (`OnReseed::Refuse` only refuses). Either
-side holding none is no verdict. An ephemeral node that registers a durable
-peer comes to hold the System entities the peer announced, so its first
-connection leaves it holding the seeding later connections are compared with.
+side holding none is no verdict, and so is an announcement the plugin cannot
+read: the peer registers and the plugin logs a warning. An ephemeral node that
+registers a durable peer comes to hold the System entities the peer announced,
+so its first connection leaves it holding the seeding later connections are
+compared with.
 
 A websocket client stops when its node halts, so after a reset it reports
 `NodeHalted(Reset)` rather than the plugin's refusal; the host reacts to that
