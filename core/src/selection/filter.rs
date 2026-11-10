@@ -163,7 +163,9 @@ pub fn evaluate_predicate<S: Stage, I: ValueLookup<S>>(item: &I, predicate: &Pre
             },
         },
         Predicate::Not(pred) => Ok(!evaluate_predicate(item, pred)?),
-        // An absent property is NULL, as in the SQL engines; a comparison with it stays unknown (an error), even beneath NOT.
+        // A missing property or JSON path is NULL: IS NULL holds, and a comparison with it is unknown (an error)
+        // and never true, even beneath NOT. This is SQL's NULL, which the SQL engines answer, as
+        // specs/unified-refs-edges-json/phase-1c-structured-queries.md ("Handle Missing Paths Gracefully") requires.
         Predicate::IsNull(expr) => match &**expr {
             Expr::Path(path) => Ok(item.value_at(path).is_none()),
             expr => Ok(evaluate_expr(item, expr)?.is_none()),
