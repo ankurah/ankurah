@@ -145,11 +145,12 @@ where
         }
         proto::NodeRequestBody::Get { ids } => {
             let policy = ContextPolicy::from_credentials(&node.policy_agent, cdata);
-            let mut results = node.storage.get_states(ids, &policy.retrieval_predicate()).await?;
-            policy.check_reads(&mut results);
+            let results = node.storage.get_states(ids, &policy.retrieval_predicate()).await?;
+            let denied = policy.check_reads(&results);
             let results = results
                 .into_iter()
                 .map(|result| match result {
+                    GetStateResult::Found(state) if denied.contains(&state.entity_id) => proto::GetResult::AccessDenied(state.entity_id),
                     GetStateResult::Found(state) => proto::GetResult::Found(crate::node::identity::attestation::served_state(node, state)),
                     GetStateResult::NotFound(id) => proto::GetResult::NotFound(id),
                     GetStateResult::PredicateMismatch(id) => proto::GetResult::AccessDenied(id),

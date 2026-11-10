@@ -9,6 +9,7 @@ use crate::util::Iterable;
 use ankql::ast::{Predicate, Resolved};
 use ankurah_proto::{Attested, EntityId, Event, ModelId, State};
 use ankurah_signals::{ListenerGuard, Mut, Peek, Signal};
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -146,11 +147,11 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
         Ok(())
     }
 
-    /// Apply additional checks to a batch that has already passed the storage predicate: a state
-    /// the agent denies becomes a predicate mismatch.
-    pub(crate) fn check_reads(&self, results: &mut [GetStateResult]) {
+    /// The ids of the states found in `results`, a batch that has already passed the storage
+    /// predicate, that the agent's additional checks deny.
+    pub(crate) fn check_reads(&self, results: &[GetStateResult]) -> HashSet<EntityId> {
         if matches!(&self.auth, ContextAuth::Privileged) {
-            return;
+            return HashSet::new();
         }
         let states: Vec<_> = results
             .iter()
@@ -160,13 +161,7 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
             })
             .collect();
         let denied = self.agent.check_reads(&self.credentials(), &states);
-        for result in results {
-            if let GetStateResult::Found(state) = result {
-                if denied.contains_key(&state.entity_id) && !state.state.memberships.iter().any(crate::schema::reads_bypass_policy) {
-                    *result = GetStateResult::PredicateMismatch(state.entity_id);
-                }
-            }
-        }
+        states.into_iter().map(|(id, _)| *id).filter(|id| denied.contains_key(id)).collect()
     }
 
     /// Require entity visibility and any additional event-specific permission.
