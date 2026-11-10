@@ -10,4 +10,5 @@ pub mod planner_integration;
 pub mod property;
 pub mod scan_index;
 mod scan_model;
+pub use database::STORE_FORMAT_VERSION;
 pub use engine::*;

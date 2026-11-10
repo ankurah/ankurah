@@ -11,8 +11,9 @@ use crate::{
 /// The newest wire protocol version this build speaks.
 ///
 /// Versions number RELEASES, not development steps: one bump per published
-/// release whose wire or persisted formats changed incompatibly, regardless
-/// of how many changes that release accumulated.
+/// release whose wire format changed incompatibly, regardless of how many
+/// changes that release accumulated. Each storage engine versions its stored
+/// format on its own.
 ///
 /// History:
 /// - absent: 0.9.x and earlier carried no version and are unsupported.

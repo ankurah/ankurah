@@ -1,5 +1,5 @@
-use ankurah_core::error::RetrievalError;
-use ankurah_proto::{EntityId, ModelId, SystemModel, PROTOCOL_VERSION};
+use ankurah_core::{error::RetrievalError, storage::StoreFormatError};
+use ankurah_proto::{EntityId, ModelId, SystemModel};
 use sled::Db;
 use std::collections::BTreeSet;
 
@@ -9,8 +9,12 @@ use crate::property::PropertyManager;
 /// The sled tree holding engine-level metadata (not a user collection, not one
 /// of the durable maps). Excluded from the "existing data" check below.
 pub(crate) const META_TREE: &str = "_ankurah_meta";
-/// The `_ankurah_meta` key under which the storage protocol version is recorded.
-const PROTOCOL_VERSION_KEY: &str = "protocol_version";
+/// The format of the stores this engine writes, recorded in each store and checked on every open.
+/// Bump it when this engine's stored layout, or the encoding of anything it stores, changes
+/// incompatibly.
+pub const STORE_FORMAT_VERSION: u32 = 1;
+/// The `_ankurah_meta` key under which a store's format version is recorded.
+const STORE_FORMAT_VERSION_KEY: &str = "store_format_version";
 /// sled's built-in default tree, present on every db including a fresh one, so
 /// it never counts as pre-existing ankurah data.
 const SLED_DEFAULT_TREE: &[u8] = b"__sled__default";
@@ -53,11 +57,11 @@ pub struct Database {
 
 impl Database {
     pub fn open(db: Db) -> anyhow::Result<Self> {
-        // Gate on the storage protocol version BEFORE opening any data tree, so
+        // Gate on the store format version BEFORE opening any data tree, so
         // the pre-existing tree set still reflects what a prior session
         // persisted (opening a data tree here would create it and defeat the
         // "existing data" check).
-        check_protocol_version(&db)?;
+        check_store_format(&db)?;
 
         // Open trees. Engine-owned durable registries carry the `_ankurah_`
         // prefix; sled separately namespaces materialized model trees under
@@ -101,41 +105,34 @@ impl Database {
     pub fn open_tree<V: AsRef<[u8]>>(&self, name: V) -> Result<sled::Tree, sled::Error> { self.db.open_tree(name) }
 }
 
-/// Record the storage protocol version on first initialization and refuse to
-/// open a store written by a different version.
+/// Record the store format version on first initialization and refuse to
+/// open a store of another format.
 ///
 /// - no record and no existing ankurah data: write the record and proceed;
 /// - matching record: proceed;
-/// - different record: refuse;
-/// - existing ankurah data but no record: refuse as a store predating version records.
+/// - different or unreadable record: refuse;
+/// - existing ankurah data but no record: refuse as a store predating format records.
 ///
 /// "Existing ankurah data" is any tree other than `_ankurah_meta` and sled's
 /// default tree, or any key already in the default tree.
-fn check_protocol_version(db: &Db) -> anyhow::Result<()> {
+fn check_store_format(db: &Db) -> anyhow::Result<()> {
     let meta = db.open_tree(META_TREE)?;
-    let expected = PROTOCOL_VERSION;
+    let expected = STORE_FORMAT_VERSION;
 
-    match meta.get(PROTOCOL_VERSION_KEY)? {
+    match meta.get(STORE_FORMAT_VERSION_KEY)? {
         Some(bytes) => {
-            let found = <[u8; 4]>::try_from(bytes.as_ref()).map(u32::from_be_bytes).map_err(|_| {
-                anyhow::anyhow!(
-                    "sled store protocol version record is unreadable ({} bytes); expected version {expected}; reset the development database",
-                    bytes.len()
-                )
-            })?;
+            let found = <[u8; 4]>::try_from(bytes.as_ref())
+                .map(u32::from_be_bytes)
+                .map_err(|_| StoreFormatError::UnreadableRecord { record: format!("{:?}", bytes.as_ref()), expected })?;
             if found != expected {
-                anyhow::bail!(
-                    "sled store was written with protocol version {found} but this build expects version {expected}; reset the development database"
-                );
+                return Err(StoreFormatError::Mismatch { found, expected }.into());
             }
         }
         None => {
             if store_has_data(db) {
-                anyhow::bail!(
-                    "sled store predates protocol version records (existing data present, no recorded version); this build expects version {expected}; reset the development database"
-                );
+                return Err(StoreFormatError::Unversioned { expected }.into());
             }
-            meta.insert(PROTOCOL_VERSION_KEY, &expected.to_be_bytes())?;
+            meta.insert(STORE_FORMAT_VERSION_KEY, &expected.to_be_bytes())?;
         }
     }
     Ok(())
@@ -155,33 +152,40 @@ mod tests {
 
     fn fresh_db() -> Db { sled::Config::new().temporary(true).flush_every_ms(None).open().unwrap() }
 
+    /// The refusal `db` meets on open, as the typed store format error.
+    fn refusal(db: Db) -> StoreFormatError {
+        let error = Database::open(db).err().expect("the store is refused");
+        error.downcast_ref::<StoreFormatError>().cloned().unwrap_or_else(|| panic!("not a store format refusal: {error}"))
+    }
+
     #[test]
-    fn fresh_store_records_protocol_version_and_reopens() {
+    fn a_fresh_store_records_its_format_version_and_reopens() {
         let db = fresh_db();
         // First open records the current version.
         let database = Database::open(db.clone()).unwrap();
-        let recorded = db.open_tree(META_TREE).unwrap().get(PROTOCOL_VERSION_KEY).unwrap().expect("version recorded on init");
-        assert_eq!(recorded.as_ref(), PROTOCOL_VERSION.to_be_bytes());
+        let recorded = db.open_tree(META_TREE).unwrap().get(STORE_FORMAT_VERSION_KEY).unwrap().expect("version recorded on init");
+        assert_eq!(recorded.as_ref(), STORE_FORMAT_VERSION.to_be_bytes());
         drop(database);
         // Reopen: record present and equal, so it opens again.
         Database::open(db).unwrap();
     }
 
     #[test]
-    fn store_with_data_but_no_version_refuses() {
+    fn a_store_with_data_but_no_format_version_is_refused() {
         let db = fresh_db();
-        // A data tree with a key, but no meta record: a store predating version records.
+        // A data tree with a key, but no meta record: a store predating format records.
         db.open_tree("entities").unwrap().insert(b"k", b"v").unwrap();
-        let err = Database::open(db).err().unwrap().to_string();
-        assert!(err.contains("reset the development database"), "should refuse loudly: {err}");
+        assert_eq!(refusal(db), StoreFormatError::Unversioned { expected: STORE_FORMAT_VERSION });
     }
 
     #[test]
-    fn store_with_wrong_version_refuses() {
+    fn a_store_of_another_format_is_refused_naming_both_versions() {
         let db = fresh_db();
-        db.open_tree(META_TREE).unwrap().insert(PROTOCOL_VERSION_KEY, &(PROTOCOL_VERSION + 1).to_be_bytes()).unwrap();
-        let err = Database::open(db).err().unwrap().to_string();
-        assert!(err.contains(&PROTOCOL_VERSION.to_string()), "should name the expected version: {err}");
-        assert!(err.contains(&(PROTOCOL_VERSION + 1).to_string()), "should name the found version: {err}");
+        db.open_tree(META_TREE).unwrap().insert(STORE_FORMAT_VERSION_KEY, &(STORE_FORMAT_VERSION + 1).to_be_bytes()).unwrap();
+        assert_eq!(refusal(db), StoreFormatError::Mismatch { found: STORE_FORMAT_VERSION + 1, expected: STORE_FORMAT_VERSION });
+
+        let db = fresh_db();
+        db.open_tree(META_TREE).unwrap().insert(STORE_FORMAT_VERSION_KEY, &[1, 2]).unwrap();
+        assert_eq!(refusal(db), StoreFormatError::UnreadableRecord { record: "[1, 2]".into(), expected: STORE_FORMAT_VERSION });
     }
 }
