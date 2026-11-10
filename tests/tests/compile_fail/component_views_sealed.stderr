@@ -1,0 +1,34 @@
+error[E0277]: the trait bound `NotAView: model::component_views::sealed::Sealed` is not satisfied
+  --> tests/compile_fail/component_views_sealed.rs:11:25
+   |
+11 | impl ComponentViews for NotAView {
+   |                         ^^^^^^^^ unsatisfied trait bound
+   |
+help: the trait `View` is not implemented for `NotAView`
+  --> tests/compile_fail/component_views_sealed.rs:9:1
+   |
+ 9 | pub struct NotAView;
+   | ^^^^^^^^^^^^^^^^^^^
+help: the following other types implement trait `View`
+  --> $WORKSPACE/core/src/schema/catalog/model.rs
+   |
+   | #[derive(Model, Debug, Clone)]
+   |          ^^^^^ `SysModelRowView`
+...
+   | #[derive(Model, Debug, Clone)]
+   |          ^^^^^ `SysPropertyRowView`
+...
+   | #[derive(Model, Debug, Clone)]
+   |          ^^^^^ `SysModelPropertyRowView`
+   = note: required for `NotAView` to implement `model::component_views::sealed::Sealed`
+note: required by a bound in `ComponentViews`
+  --> $WORKSPACE/core/src/model/component_views.rs
+   |
+   | pub trait ComponentViews: sealed::Sealed + Sized {
+   |                           ^^^^^^^^^^^^^^ required by this bound in `ComponentViews`
+   = note: `ComponentViews` is a "sealed trait", because to implement it you also need to implement `ankurah::model::component_views::sealed::Sealed`, which is not accessible; this is usually done to force you to use one of the provided types that already implement it
+   = help: the following types implement the trait:
+             V
+             (A, B)
+             (A, B, C)
+   = note: this error originates in the derive macro `Model` (in Nightly builds, run with -Z macro-backtrace for more info)
