@@ -123,7 +123,7 @@ async fn a_refused_peer_is_in_no_peer_map_and_receives_nothing() {
 }
 
 #[tokio::test]
-async fn an_accepted_peer_registers_as_before_and_each_plugin_sees_its_registration() {
+async fn a_peer_every_plugin_accepts_is_registered_and_each_plugin_sees_its_registration() {
     let asked = AskedLog::default();
     let node = node_with([probe("first", Answer::Accept, &asked), probe("second", Answer::Accept, &asked)]);
     let key = NodeKey::generate();
