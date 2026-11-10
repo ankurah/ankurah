@@ -109,7 +109,7 @@ async fn test_stateandvent_divergence_subscription() -> Result<()> {
 
     // Head should have both concurrent events
     let state = durable.storage.get_state(record_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     Ok(())
 }

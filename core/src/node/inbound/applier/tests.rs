@@ -121,7 +121,7 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
     let source = Fixture::new().await?;
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    let state = source.storage.get_state(source.entity.id()).await?.payload.state;
+    let state = source.storage.get_state(source.entity.id()).await?.state;
     assert!(!state.head.is_empty());
     let delta = proto::EntityDelta {
         entity_id: source.entity.id(),
@@ -153,7 +153,7 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
     .expect("the first snapshot initializes the entity");
     let (entity, _) = change.into_parts();
     assert_eq!(entity.to_state()?, state);
-    assert_eq!(storage.get_state(entity.id()).await?.payload.state, state);
+    assert_eq!(storage.get_state(entity.id()).await?.state, state);
     assert_eq!(node.entities.get(&entity.id()), Some(entity));
     Ok(())
 }
@@ -189,7 +189,7 @@ async fn adopted_snapshot_rejects_false_parent_generations_without_changing_the_
             "{error}"
         );
         assert_eq!(fixture.entity.to_state()?, before);
-        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
+        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, before);
         assert!(fixture.storage.get_events(vec![forged.id()]).await?.is_empty());
     }
 
@@ -198,7 +198,7 @@ async fn adopted_snapshot_rejects_false_parent_generations_without_changing_the_
     snapshot.head = Clock::singleton(&honest);
     fixture.apply_snapshot(SnapshotIngress::StateAndEvent, snapshot.clone(), honest.clone()).await?;
     assert_eq!(fixture.entity.to_state()?, snapshot);
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, snapshot);
     assert_eq!(fixture.storage.get_events(vec![honest.id()]).await?.len(), 1);
     Ok(())
 }
@@ -231,7 +231,7 @@ async fn first_snapshot_checks_cargo_against_local_or_carried_parents_but_allows
         let result = NodeApplier::apply_update(&node, &peer(), update, &NoEventReads, &LocalStateGetter::new(storage.clone())).await;
         if parent_source == "missing" {
             result?;
-            assert_eq!(storage.get_state(source.entity.id()).await?.payload.state, snapshot);
+            assert_eq!(storage.get_state(source.entity.id()).await?.state, snapshot);
             assert_eq!(storage.get_events(vec![forged.id()]).await?.len(), 1);
         } else {
             let error = result.unwrap_err();
@@ -300,7 +300,7 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
         assert!(storage.get_events(vec![first.id(), tip.id(), stray.id()]).await?.is_empty());
         if let Some(resident) = &resident {
             assert_eq!(resident.to_state()?, initial);
-            assert_eq!(storage.get_state(source.entity.id()).await?.payload.state, initial);
+            assert_eq!(storage.get_state(source.entity.id()).await?.state, initial);
             assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
         } else {
             assert!(node.entities.get(&source.entity.id()).is_none());
@@ -313,7 +313,7 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
             .expect("the snapshot was adopted");
         assert_eq!(change.events(), &[Attested::from(first.clone()), Attested::from(tip.clone())]);
         assert_eq!(change.entity().to_state()?, snapshot);
-        assert_eq!(storage.get_state(source.entity.id()).await?.payload.state, snapshot);
+        assert_eq!(storage.get_state(source.entity.id()).await?.state, snapshot);
     }
     Ok(())
 }
@@ -366,7 +366,7 @@ async fn assert_failed_snapshot_keeps_resident(ingress: SnapshotIngress) -> anyh
     assert_eq!(retained.to_state()?, before);
     assert_eq!(retained.values()?, before_values);
     assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    assert_eq!(fixture.storage.get_state(retained.id()).await?.payload.state, before);
+    assert_eq!(fixture.storage.get_state(retained.id()).await?.state, before);
 
     release.send(()).unwrap();
     let error = applying.await.unwrap_err();
@@ -374,7 +374,7 @@ async fn assert_failed_snapshot_keeps_resident(ingress: SnapshotIngress) -> anyh
     assert_eq!(retained.to_state()?, before);
     assert_eq!(retained.values()?, before_values);
     assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    assert_eq!(fixture.storage.get_state(retained.id()).await?.payload.state, before);
+    assert_eq!(fixture.storage.get_state(retained.id()).await?.state, before);
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
     assert!(!fixture.storage.list_materializations().await?.contains(&model_b()));
 
@@ -384,7 +384,7 @@ async fn assert_failed_snapshot_keeps_resident(ingress: SnapshotIngress) -> anyh
     assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
     assert!(retained.has_membership(&model_b()));
     assert_eq!(retained.values()?, vec![(property(), Some(Value::String("incoming".into())))]);
-    assert_eq!(fixture.storage.get_state(retained.id()).await?.payload.state, retained.to_state()?);
+    assert_eq!(fixture.storage.get_state(retained.id()).await?.state, retained.to_state()?);
     Ok(())
 }
 
@@ -443,7 +443,7 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
     assert_eq!(fixture.entity.head(), Clock::from_events([&local, &last]));
     assert_eq!(fixture.entity.values()?, vec![(property(), Some(Value::String("incoming".into())))]);
     assert!(fixture.entity.has_membership(&model_b()));
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, fixture.entity.to_state()?);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, fixture.entity.to_state()?);
     assert_eq!(fixture.storage.get_events(events.iter().map(|event| event.payload.id()).collect()).await?.len(), 3);
     assert_eq!(change.events(), events);
     assert_eq!(observed.try_recv()?, ());
@@ -482,7 +482,7 @@ async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_a
 
     assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
     assert_eq!(fixture.entity.to_state()?, snapshot);
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, snapshot);
     assert_eq!(fixture.storage.get_events(vec![incoming.id()]).await?, vec![Attested::from(incoming)]);
     Ok(())
 }
@@ -518,7 +518,7 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     // An initially divergent bare snapshot is ignored too: a retry must make the same decision.
     assert!(applying.await?.is_none());
     assert_eq!(fixture.entity.to_state()?, before);
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, before);
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
     assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
     Ok(())
@@ -550,7 +550,7 @@ async fn unchanged_bare_snapshots_do_not_write_storage() -> anyhow::Result<()> {
             .await?
             .is_none());
         assert_eq!(fixture.entity.to_state()?, current);
-        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, current);
+        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, current);
     }
     Ok(())
 }
@@ -571,7 +571,7 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
     fixture.deliver(EventIngress::StateAndEvent, vec![incoming.clone()]).await?;
     assert_eq!(fixture.storage.get_events(vec![incoming.id()]).await?, vec![Attested::from(incoming)]);
     assert_eq!(fixture.entity.to_state()?, snapshot);
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, snapshot);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, snapshot);
     assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)));
     Ok(())
 }
@@ -595,7 +595,7 @@ async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyho
         let error = fixture.deliver(ingress, vec![valid.clone(), disjoint.clone()]).await.unwrap_err();
         assert!(matches!(error, MutationError::LineageError(LineageError::Disjoint)), "{ingress:?}: {error}");
         assert_eq!(fixture.entity.to_state()?, before, "{ingress:?}");
-        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before, "{ingress:?}");
+        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, before, "{ingress:?}");
         assert!(fixture.storage.get_events(vec![valid.id(), disjoint.id()]).await?.is_empty(), "{ingress:?}");
         assert!(!fixture.storage.list_materializations().await?.contains(&model_b()), "{ingress:?}");
         assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{ingress:?}");
@@ -649,7 +649,7 @@ async fn event_only_discards_the_batch_without_partial_failed_operations() -> an
     assert!(matches!(error, MutationError::StateError(_)), "{error}");
     assert_eq!(getter.tip_reads.load(std::sync::atomic::Ordering::Relaxed), 0, "the chain must not fetch the head");
     assert_eq!(fixture.entity.to_state()?, before);
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, before);
     assert!(fixture.storage.get_events(vec![accepted.id(), failed.id(), later.id()]).await?.is_empty());
     assert!(!fixture.storage.list_materializations().await?.contains(&model_b()));
     let selection = ankql::ast::Selection::<ankql::ast::Resolved> {
@@ -681,7 +681,7 @@ async fn state_and_event_bridges_discard_the_batch_on_operation_failure() -> any
         let error = fixture.deliver(ingress, vec![first.clone(), failed.clone()]).await.unwrap_err();
         assert!(matches!(error, MutationError::StateError(_)), "{ingress:?}: {error}");
         assert_eq!(fixture.entity.to_state()?, before, "{ingress:?}");
-        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, before, "{ingress:?}");
+        assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, before, "{ingress:?}");
         assert!(fixture.storage.get_events(vec![first.id(), failed.id()]).await?.is_empty(), "{ingress:?}");
         assert!(matches!(observed.try_recv(), Err(mpsc::TryRecvError::Empty)), "{ingress:?}");
     }
@@ -867,9 +867,7 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
     }
     let prepared = candidate.to_state()?;
     let mut transaction = fixture.storage.transaction();
-    transaction
-        .set_state(&before.head, &Attested::from(proto::EntityState { entity_id: fixture.entity.id(), state: prepared.clone() }))
-        .await?;
+    transaction.set_state(&before.head, &proto::EntityState { entity_id: fixture.entity.id(), state: prepared.clone() }).await?;
     transaction.add_events(&applied).await?;
     transaction.commit().await?.committed()?;
     assert_eq!(fixture.entity.to_state()?, before);
@@ -907,9 +905,7 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
         .await?;
     let prepared = candidate.to_state()?;
     let mut transaction = fixture.storage.transaction();
-    transaction
-        .set_state(&fixture.entity.head(), &Attested::from(proto::EntityState { entity_id: fixture.entity.id(), state: prepared.clone() }))
-        .await?;
+    transaction.set_state(&fixture.entity.head(), &proto::EntityState { entity_id: fixture.entity.id(), state: prepared.clone() }).await?;
     transaction.add_events(&[incoming.clone().into()]).await?;
     transaction.commit().await?.committed()?;
 
@@ -924,7 +920,7 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
     let change = candidate.commit(&fixture.node.entities, &fixture.events, false).await?;
     assert!(change.events().is_empty(), "the reader's newer state already includes this event");
     assert_eq!(fixture.entity.to_state()?, latest);
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, latest);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, latest);
     assert!(matches!(received.try_recv(), Err(mpsc::TryRecvError::Empty)));
     Ok(())
 }
@@ -968,7 +964,7 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
         matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: 1, known: 2, .. })),
         "{error}"
     );
-    assert_eq!(storage.get_state(genesis.entity_id).await?.payload.state, before);
+    assert_eq!(storage.get_state(genesis.entity_id).await?.state, before);
     assert_eq!(entity.to_state()?, before);
     assert!(storage.get_events(vec![update.id()]).await?.is_empty());
     Ok(())
@@ -1004,9 +1000,7 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
         candidate.apply_events(&events, std::slice::from_mut(&mut admitted), &AdmittedOperations::new(), |_| Ok(None)).await?;
         let prepared = candidate.to_state()?;
         let mut transaction = storage.transaction();
-        transaction
-            .set_state(&entity.head(), &Attested::from(proto::EntityState { entity_id: entity.id(), state: prepared.clone() }))
-            .await?;
+        transaction.set_state(&entity.head(), &proto::EntityState { entity_id: entity.id(), state: prepared.clone() }).await?;
         transaction.add_events(&[admitted.clone()]).await?;
         transaction.commit().await?.committed()?;
         cache(&storage, &[&parent]).await?;
@@ -1026,7 +1020,7 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
         }
         assert_eq!(entity.head(), admitted_head);
         assert_eq!(entity.to_state()?, prepared);
-        assert_eq!(storage.get_state(entity.id()).await?.payload.state, prepared);
+        assert_eq!(storage.get_state(entity.id()).await?.state, prepared);
     }
     Ok(())
 }
@@ -1088,7 +1082,7 @@ async fn batch_policy_checks_intermediate_states_and_stops_at_first_failure() ->
     assert!(events[2].attestations.is_empty());
     assert_eq!(getter.tip_reads.load(std::sync::atomic::Ordering::Relaxed), 1, "the batch uses one comparison");
     assert_eq!(fixture.entity.head(), Clock::singleton(&resident), "the failed fork was not published");
-    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.payload.state, fixture.entity.to_state()?);
+    assert_eq!(fixture.storage.get_state(fixture.entity.id()).await?.state, fixture.entity.to_state()?);
     assert!(fixture.storage.get_events(vec![accepted.id(), denied.id(), later.id()]).await?.is_empty());
     Ok(())
 }

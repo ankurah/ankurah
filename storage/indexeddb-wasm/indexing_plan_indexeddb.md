@@ -32,7 +32,6 @@ Extract ALL fields from state_buffer during `set_state`, similar to Postgres:
   __collection: "albums",    // Special field (prefixed)
   __state_buffer: {...},     // Special field (prefixed)
   __head: {...},            // Special field (prefixed)
-  __attestations: [...],    // Special field (prefixed)
   // Regular extracted fields (no prefix)
   name: "The Dark Side of the Moon",
   year: 1973,

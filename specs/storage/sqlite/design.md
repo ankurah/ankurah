@@ -18,8 +18,7 @@ names. Durable model/property naming registries are always checked first.
 
 SQLite keeps canonical and derived data separate:
 
-- `_ankurah_entity`: one canonical state, head, and attestation record per
-  `EntityId`;
+- `_ankurah_entity`: one canonical state and head record per `EntityId`;
 - `_ankurah_event`: one canonical event per `EventId`, indexed by
   `entity_id`;
 - `_ankurah_entity_model`: the engine-private durable association between an

@@ -3,7 +3,7 @@ use ankurah_core::{
     property::backend::backend_from_string,
     schema::CatalogResolver,
 };
-use ankurah_proto::{Attested, EntityId, EntityState, ModelId, PropertyId};
+use ankurah_proto::{EntityId, EntityState, ModelId, PropertyId};
 use ankurah_storage_common::naming;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use std::{
@@ -490,9 +490,9 @@ impl Materialization {
     /// Durable table/column assignments and empty schema may be created here;
     /// the returned DML remains suitable for the caller's canonical-state
     /// transaction.
-    pub(super) async fn prepare_state(&self, state: &Attested<EntityState>) -> Result<PreparedMaterialization, MutationError> {
+    pub(super) async fn prepare_state(&self, state: &EntityState) -> Result<PreparedMaterialization, MutationError> {
         let mut values = BTreeMap::new();
-        for (name, state_buffer) in state.payload.state.state_buffers.iter() {
+        for (name, state_buffer) in state.state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(state_buffer))?;
             for (property_id, value) in backend.property_values() {
                 values.entry(property_id).or_insert(value);
@@ -512,7 +512,7 @@ impl Materialization {
         }
         let mut client = self.pool.get().await.map_err(|err| MutationError::General(err.into()))?;
         self.add_missing_columns(&mut client, missing).await?;
-        Ok(PreparedMaterialization { entity_id: state.payload.entity_id, table: self.table().to_owned(), materialized })
+        Ok(PreparedMaterialization { entity_id: state.entity_id, table: self.table().to_owned(), materialized })
     }
 
     /// Resolve the query's properties through this table's persistent column assignments.

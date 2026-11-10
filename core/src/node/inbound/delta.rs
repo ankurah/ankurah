@@ -1,5 +1,7 @@
+//! What a node serves a peer that knows an older head of an entity.
+
 use crate::internal::prelude::*;
-use crate::node::Node;
+use crate::node::{identity::attestation, Node};
 use crate::policy::ContextPolicy;
 use anyhow::anyhow;
 
@@ -8,7 +10,7 @@ use anyhow::anyhow;
 pub(crate) async fn generate_entity_delta<SE, PA, C>(
     node: &Node<SE, PA>,
     known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
-    entity_state: proto::Attested<proto::EntityState>,
+    entity_state: proto::EntityState,
     cdata: &C,
 ) -> anyhow::Result<Option<proto::EntityDelta>>
 where
@@ -17,7 +19,7 @@ where
     C: crate::util::Iterable<PA::ContextData>,
 {
     // Destructure to take ownership and avoid clones
-    let proto::Attested { payload: proto::EntityState { entity_id, state }, attestations } = entity_state;
+    let proto::EntityState { entity_id, state } = entity_state;
     let current_head = &state.head;
 
     // Entity is in known_matches - try to optimize the response
@@ -43,7 +45,7 @@ where
     }
 
     // Case 3: Entity not in known_matches OR bridge building failed → send full StateSnapshot ✓
-    let state_fragment = proto::StateFragment { state, attestations };
+    let state_fragment = attestation::served_state(node, proto::EntityState { entity_id, state }).into();
     Ok(Some(proto::EntityDelta { entity_id, content: proto::DeltaContent::StateSnapshot { state: state_fragment } }))
 }
 

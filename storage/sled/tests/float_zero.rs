@@ -6,7 +6,7 @@ use ankurah_core::{
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::Value,
 };
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers};
+use ankurah_proto::{Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers};
 use ankurah_storage_sled::SledStorageEngine;
 
 #[tokio::test]
@@ -42,7 +42,7 @@ async fn signed_zeros_share_equality_and_range_matches() -> anyhow::Result<()> {
             for predicate in predicates {
                 let selection = query(predicate);
                 let states = engine.fetch_states(&selection).await?;
-                let ids: BTreeSet<_> = states.iter().map(|state| state.payload.entity_id).collect();
+                let ids: BTreeSet<_> = states.iter().map(|state| state.entity_id).collect();
                 assert_eq!(ids, expected, "{selection:?}, after_insert={after_insert}");
                 assert_eq!(states.len(), expected.len(), "each matching entity appears once");
             }
@@ -55,17 +55,14 @@ async fn insert(engine: &SledStorageEngine, model: ModelId, property: PropertyId
     let backend = LWWBackend::new();
     backend.set(property, Some(Value::F64(value)));
     let event = ankurah_core::test_helpers::commit_backend(&backend, byte)?;
-    let state = Attested::opt(
-        EntityState {
-            entity_id: EntityId::from_bytes([byte; 32]),
-            state: State {
-                state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
-                memberships: BTreeSet::from([model]),
-                head: Clock::singleton(&event),
-            },
+    let state = EntityState {
+        entity_id: EntityId::from_bytes([byte; 32]),
+        state: State {
+            state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
+            memberships: BTreeSet::from([model]),
+            head: Clock::singleton(&event),
         },
-        None,
-    );
+    };
     let mut transaction = engine.transaction();
     transaction.set_state(&Clock::default(), &state).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));

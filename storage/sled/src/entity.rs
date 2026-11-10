@@ -1,10 +1,19 @@
 use ankurah_core::selection::filter::ValueLookup;
+use ankurah_proto::{EntityId, EntityState, State};
 use ankurah_storage_common::filtering::{HasEntityId, ValueSetStream};
 use ankurah_storage_common::traits::EntityIdStream;
 use ankurah_storage_common::EngineColumns;
 use futures::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+
+/// The bytes sled stores for an entity's state.
+pub(crate) fn encode_state(state: &State) -> bincode::Result<Vec<u8>> { bincode::serialize(state) }
+
+/// The state of `entity_id` that sled stored as `bytes`.
+pub(crate) fn decode_state(entity_id: EntityId, bytes: &[u8]) -> bincode::Result<EntityState> {
+    Ok(EntityState { entity_id, state: bincode::deserialize(bytes)? })
+}
 
 /// Sled-specific entity state lookup that hydrates EntityIds into full EntityStates
 pub struct SledEntityLookup<S> {
@@ -19,7 +28,7 @@ impl<S: EntityIdStream> SledEntityLookup<S> {
 impl<S: Unpin> Unpin for SledEntityLookup<S> {}
 
 impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
-    type Item = Result<ankurah_proto::Attested<ankurah_proto::EntityState>, ankurah_core::error::RetrievalError>;
+    type Item = Result<EntityState, ankurah_core::error::RetrievalError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Get next EntityId from upstream stream
@@ -38,18 +47,11 @@ impl<S: EntityIdStream> Stream for SledEntityLookup<S> {
             Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::storage(e)))),
         };
 
-        let state_fragment: ankurah_proto::StateFragment = match bincode::deserialize(&value_bytes) {
-            Ok(fragment) => fragment,
-            Err(e) => return Poll::Ready(Some(Err(ankurah_core::error::RetrievalError::storage(e)))),
-        };
-
-        let attested = ankurah_proto::Attested::<ankurah_proto::EntityState>::from_parts(entity_id, state_fragment);
-
-        Poll::Ready(Some(Ok(attested)))
+        Poll::Ready(Some(decode_state(entity_id, &value_bytes).map_err(ankurah_core::error::RetrievalError::storage)))
     }
 }
 
-// EntityStateStream is automatically implemented via blanket impl since SledEntityLookup emits Result<Attested<EntityState>, RetrievalError>
+// EntityStateStream is automatically implemented via blanket impl since SledEntityLookup emits Result<EntityState, RetrievalError>
 
 /// Trait that provides a convenient `.entities()` combinator for EntityId streams
 pub trait SledEntityExt: EntityIdStream + Sized {

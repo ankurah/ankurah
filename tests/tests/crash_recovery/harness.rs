@@ -184,12 +184,9 @@ impl<E: StorageEngine + CrashFlushable + 'static> StorageEngine for CrashStorage
 
     fn transaction(&self) -> Self::Transaction<'_> { CrashStorageTransaction { engine: self, inner: self.inner.transaction() } }
 
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { self.inner.get_state(id).await }
+    async fn get_state(&self, id: EntityId) -> Result<EntityState, RetrievalError> { self.inner.get_state(id).await }
 
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<ankql::ast::Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         self.inner.fetch_states(selection).await
     }
 
@@ -222,7 +219,7 @@ pub struct CrashStorageTransaction<'a, E: StorageEngine + CrashFlushable + 'a> {
 impl<E: StorageEngine + CrashFlushable> StorageTransaction for CrashStorageTransaction<'_, E> {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError> { self.inner.add_events(events).await }
 
-    async fn set_state(&mut self, expected_head: &proto::Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
+    async fn set_state(&mut self, expected_head: &proto::Clock, state: &EntityState) -> Result<(), MutationError> {
         self.inner.set_state(expected_head, state).await
     }
 
@@ -423,7 +420,7 @@ pub async fn assert_state_heads_resolvable<E: StorageEngine + ?Sized>(engine: &E
             Err(RetrievalError::EntityNotFound(_)) => continue, // no persisted state: nothing to check
             Err(e) => return Err(e.into()),
         };
-        let head = state.payload.state.head.clone();
+        let head = state.state.head.clone();
         let head_ids: Vec<EventId> = head.ids().cloned().collect();
         if head_ids.is_empty() {
             continue;
@@ -460,7 +457,7 @@ pub async fn event_present<E: StorageEngine + ?Sized>(engine: &E, id: EventId) -
 /// Fetch a persisted state's head clock, or None if no state is persisted.
 pub async fn persisted_head<E: StorageEngine + ?Sized>(engine: &E, id: EntityId) -> Result<Option<proto::Clock>> {
     match engine.get_state(id).await {
-        Ok(state) => Ok(Some(state.payload.state.head)),
+        Ok(state) => Ok(Some(state.state.head)),
         Err(RetrievalError::EntityNotFound(_)) => Ok(None),
         Err(e) => Err(e.into()),
     }

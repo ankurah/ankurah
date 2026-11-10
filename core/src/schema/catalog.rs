@@ -425,7 +425,7 @@ mod tests {
                 seed.catalog.model_by_label(PublicationModel::descriptor().label)?.unwrap().0
             };
             let mut state = storage.get_state(model).await?;
-            state.payload.state.state_buffers.0.insert(backend.into(), buffer);
+            state.state.state_buffers.0.insert(backend.into(), buffer);
             storage.set_state(state);
             let (entered, entered_rx) = tokio::sync::oneshot::channel();
             let (release, release_rx) = tokio::sync::oneshot::channel();

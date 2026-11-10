@@ -40,7 +40,7 @@ async fn test_linear_history_structure() -> Result<()> {
 
     // Head should be single event (D)
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [D]);
+    clock_eq!(dag, state.state.head, [D]);
 
     Ok(())
 }
@@ -89,7 +89,7 @@ async fn test_simple_diamond_structure() -> Result<()> {
 
     // Head should have both concurrent events
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     Ok(())
 }
@@ -147,7 +147,7 @@ async fn test_diamond_with_merge_structure() -> Result<()> {
 
     // Head should be single event (D - the merge)
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [D]);
+    clock_eq!(dag, state.state.head, [D]);
 
     Ok(())
 }
@@ -196,7 +196,7 @@ async fn test_complex_multi_merge_structure() -> Result<()> {
     });
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C, D]);
+    clock_eq!(dag, state.state.head, [B, C, D]);
 
     // Now do a final merge by editing from current state
     let album = ctx.get::<AlbumView>(album_id).await?;
@@ -222,7 +222,7 @@ async fn test_complex_multi_merge_structure() -> Result<()> {
     });
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [E]);
+    clock_eq!(dag, state.state.head, [E]);
 
     Ok(())
 }
@@ -245,7 +245,7 @@ async fn test_head_evolution() -> Result<()> {
     };
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [A]);
+    clock_eq!(dag, state.state.head, [A]);
 
     // Step 2: Commit B → head=[B]
     let album = ctx.get::<AlbumView>(album_id).await?;
@@ -256,7 +256,7 @@ async fn test_head_evolution() -> Result<()> {
     }
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B]);
+    clock_eq!(dag, state.state.head, [B]);
 
     // Step 3: Commit C concurrent with B → head=[B, C]
     // We need to fork from A, not from B
@@ -280,7 +280,7 @@ async fn test_head_evolution() -> Result<()> {
     dag.enumerate(trx_d.commit_and_return_events().await?); // D
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [C, D]);
+    clock_eq!(dag, state.state.head, [C, D]);
 
     // Step 4: Commit E (extends C) → head=[D, E] (D still there, E replaces C)
     // Get album at current head (C, D)
@@ -292,7 +292,7 @@ async fn test_head_evolution() -> Result<()> {
     }
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [E]);
+    clock_eq!(dag, state.state.head, [E]);
 
     // Verify final structure
     let events = node.storage.dump_entity_events(album_id).await?;

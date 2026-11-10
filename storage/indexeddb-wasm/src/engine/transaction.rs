@@ -60,14 +60,14 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
         Ok(())
     }
 
-    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
-        let entity_id = state.payload.entity_id;
+    async fn set_state(&mut self, expected_head: &Clock, state: &EntityState) -> Result<(), MutationError> {
+        let entity_id = state.entity_id;
         let index = self.entities.iter().position(|write| write.entity_id == entity_id);
         if index.is_some_and(|index| self.entities[index].head != *expected_head) {
             return Err(MutationError::InvalidUpdate("state does not follow the preceding transaction write"));
         }
         let mut materializations = Vec::new();
-        for model in &state.payload.state.memberships {
+        for model in &state.state.memberships {
             let projection = self
                 .engine
                 .materialization(model)
@@ -79,16 +79,15 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
         }
         let object = Object::new(js_sys::Object::new().into());
         object.set(&*ID_KEY, entity_id.to_base64())?;
-        object.set(&*STATE_BUFFER_KEY, &state.payload.state.state_buffers)?;
-        let memberships = serde_json::to_string(&state.payload.state.memberships).map_err(RetrievalError::storage)?;
+        object.set(&*STATE_BUFFER_KEY, &state.state.state_buffers)?;
+        let memberships = serde_json::to_string(&state.state.memberships).map_err(RetrievalError::storage)?;
         object.set(&*MEMBERSHIPS_KEY, memberships)?;
-        object.set(&*HEAD_KEY, &state.payload.state.head)?;
-        object.set(&*ATTESTATIONS_KEY, &state.attestations)?;
+        object.set(&*HEAD_KEY, &state.state.head)?;
         let mut write = EntityRow {
             entity_id,
             expected_head: expected_head.clone(),
-            head: state.payload.state.head.clone(),
-            memberships: state.payload.state.memberships.clone(),
+            head: state.state.head.clone(),
+            memberships: state.state.memberships.clone(),
             object,
             materializations,
         };
@@ -134,7 +133,7 @@ impl StorageTransaction for IndexedDbTransaction<'_> {
                 } else {
                     Some(entity_state_from_object(entity_id, &Object::new(value))?)
                 };
-                let current_head = current.as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default();
+                let current_head = current.as_ref().map(|state| state.state.head.clone()).unwrap_or_default();
                 if current_head != write.expected_head {
                     conflict = true;
                 }

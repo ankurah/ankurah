@@ -84,7 +84,7 @@ async fn entity_states<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgen
     }
     for result in node.storage.get_states(unloaded, &Predicate::True).await? {
         if let GetStateResult::Found(state) = result {
-            states.insert(state.payload.entity_id, state.payload.state);
+            states.insert(state.entity_id, state.state);
         }
     }
     Ok(states)
@@ -133,7 +133,7 @@ where
 
             let mut deltas = Vec::new();
             for state in expanded_states {
-                if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
+                if policy.check_read(&state.entity_id, &state.state).is_err() {
                     continue;
                 }
 
@@ -145,9 +145,17 @@ where
         }
         proto::NodeRequestBody::Get { ids } => {
             let policy = ContextPolicy::from_credentials(&node.policy_agent, cdata);
-            let mut results: Vec<_> =
-                node.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().map(Into::into).collect();
-            policy.check_reads(&mut results);
+            let results = node.storage.get_states(ids, &policy.retrieval_predicate()).await?;
+            let denied = policy.check_reads(&results);
+            let results = results
+                .into_iter()
+                .map(|result| match result {
+                    GetStateResult::Found(state) if denied.contains(&state.entity_id) => proto::GetResult::AccessDenied(state.entity_id),
+                    GetStateResult::Found(state) => proto::GetResult::Found(crate::node::identity::attestation::served_state(node, state)),
+                    GetStateResult::NotFound(id) => proto::GetResult::NotFound(id),
+                    GetStateResult::PredicateMismatch(id) => proto::GetResult::AccessDenied(id),
+                })
+                .collect();
             Ok(proto::NodeResponseBody::Get(results))
         }
         proto::NodeRequestBody::GetEvents { event_ids } => Ok(get_events(node, cdata, event_ids).await?),

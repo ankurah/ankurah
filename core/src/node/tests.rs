@@ -354,7 +354,7 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
     assert!(futures::poll!(&mut winner).is_pending());
     entered_rx.await?;
 
-    assert_eq!(storage.get_state(id).await?.payload.state.memberships, [a, b].into_iter().collect());
+    assert_eq!(storage.get_state(id).await?.state.memberships, [a, b].into_iter().collect());
     assert_eq!(entity.memberships(), [a].into_iter().collect());
     let pending = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(ours, None)]);
     tokio::pin!(pending);
@@ -367,7 +367,7 @@ async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::R
     pending.await?;
 
     assert_eq!(entity.memberships(), [a, b, c].into_iter().collect());
-    assert_eq!(entity.to_state()?, storage.get_state(id).await?.payload.state);
+    assert_eq!(entity.to_state()?, storage.get_state(id).await?.state);
     let notified: Vec<_> =
         received.try_iter().flat_map(|update| update.items).flat_map(|item| item.events).map(|event| event.payload.id()).collect();
     assert_eq!(notified, expected_events);

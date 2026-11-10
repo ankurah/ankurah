@@ -6,9 +6,7 @@ use ankurah_core::{
     error::RetrievalError,
     storage::{StorageDump, StorageDumpItem},
 };
-use ankurah_proto::{
-    Attestation, AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, ModelId, State, StateBuffers,
-};
+use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, ModelId, State, StateBuffers};
 use async_trait::async_trait;
 use bb8_postgres::{tokio_postgres::NoTls, PostgresConnectionManager};
 use futures_util::{stream, Stream};
@@ -80,7 +78,7 @@ impl PostgresDumpCursor {
                 }
                 DumpPhase::States => {
                     if let Some(StorageDumpItem::State(state)) = page.last() {
-                        self.after_state = Some(state.payload.entity_id);
+                        self.after_state = Some(state.entity_id);
                     }
                 }
                 DumpPhase::Done => {}
@@ -137,7 +135,7 @@ async fn state_page(client: &tokio_postgres::Client, after: Option<&EntityId>) -
         client
             .query(
                 &format!(
-                    r#"SELECT "id", "state_buffer", "head", "attestations"
+                    r#"SELECT "id", "state_buffer", "head"
                        FROM "{ENTITY_TABLE}" WHERE "id" > $1 ORDER BY "id" LIMIT $2"#
                 ),
                 &[after, &PAGE_SIZE],
@@ -147,7 +145,7 @@ async fn state_page(client: &tokio_postgres::Client, after: Option<&EntityId>) -
         client
             .query(
                 &format!(
-                    r#"SELECT "id", "state_buffer", "head", "attestations"
+                    r#"SELECT "id", "state_buffer", "head"
                        FROM "{ENTITY_TABLE}" ORDER BY "id" LIMIT $1"#
                 ),
                 &[&PAGE_SIZE],
@@ -162,9 +160,6 @@ async fn state_page(client: &tokio_postgres::Client, after: Option<&EntityId>) -
         let state_buffers =
             bincode::deserialize::<StateBuffers>(&row.try_get::<_, Vec<u8>>("state_buffer").map_err(RetrievalError::storage)?)?;
         let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
-        let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-        let attestations =
-            attestation_bytes.into_iter().map(|bytes| bincode::deserialize::<Attestation>(&bytes)).collect::<Result<Vec<_>, _>>()?;
         let memberships = client
             .query(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = $1 ORDER BY "model_key""#), &[&entity_id])
             .await
@@ -176,10 +171,7 @@ async fn state_page(client: &tokio_postgres::Client, after: Option<&EntityId>) -
             })
             .collect::<Result<_, _>>()?;
         let state = State { state_buffers, memberships, head };
-        page.push(StorageDumpItem::State(Attested {
-            payload: EntityState { entity_id, state },
-            attestations: AttestationSet(attestations),
-        }));
+        page.push(StorageDumpItem::State(EntityState { entity_id, state }));
     }
     Ok(page)
 }
@@ -208,13 +200,10 @@ mod tests {
         for _ in 0..RECORDS {
             let event = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
             let entity_id = event.entity_id;
-            let state = Attested::opt(
-                EntityState {
-                    entity_id,
-                    state: State { state_buffers: StateBuffers::default(), memberships: BTreeSet::new(), head: Clock::singleton(&event) },
-                },
-                None,
-            );
+            let state = EntityState {
+                entity_id,
+                state: State { state_buffers: StateBuffers::default(), memberships: BTreeSet::new(), head: Clock::singleton(&event) },
+            };
             let mut transaction = storage.transaction();
             transaction.add_events(&[Attested::opt(event, None)]).await?;
             transaction.set_state(&Clock::default(), &state).await?;
@@ -235,7 +224,7 @@ mod tests {
                 }
                 StorageDumpItem::State(state) => {
                     saw_state = true;
-                    states.insert(state.payload.entity_id);
+                    states.insert(state.entity_id);
                 }
             }
         }

@@ -129,7 +129,7 @@ async fn local_creation_commits_after_its_events_arrive_remotely() -> anyhow::Re
         trx.commit().await?;
 
         assert_eq!(view.memberships(), [a, b].into_iter().collect());
-        assert_eq!(storage.get_state(id).await?.payload.state.head, proto::Clock::singleton(&events[1].payload));
+        assert_eq!(storage.get_state(id).await?.state.head, proto::Clock::singleton(&events[1].payload));
         assert_eq!(storage.dump_entity_events(id).await?.len(), 2);
     }
     Ok(())
@@ -233,7 +233,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
         .apply_events(&events, std::slice::from_mut(&mut Attested::from(genesis.clone())), &AdmittedOperations::new(), |_| Ok(None))
         .await?;
     let mut transaction = storage.transaction();
-    transaction.set_state(&proto::Clock::default(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
+    transaction.set_state(&proto::Clock::default(), &candidate.read().to_entity_state()?).await?;
     transaction.add_events(&[Attested::opt(genesis.clone(), None)]).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
     let (entity, _) = candidate.commit(&node.entities, &events, false).await?.into_parts();
@@ -256,7 +256,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
         .apply_events(&events, std::slice::from_mut(&mut Attested::from(transfer.clone())), &AdmittedOperations::new(), |_| Ok(None))
         .await?;
     let mut transaction = storage.transaction();
-    transaction.set_state(&entity.head(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
+    transaction.set_state(&entity.head(), &candidate.read().to_entity_state()?).await?;
     transaction.add_events(&[Attested::opt(transfer.clone(), None)]).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
     candidate.commit(&node.entities, &events, false).await?;
@@ -266,7 +266,7 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
         Some(MutationError::AccessDenied(AccessDenied::ByPolicy(_)))
     ));
     assert_eq!(*agent.checked_owners.lock().unwrap(), vec![Some(Value::String("Alice".into())), Some(Value::String("Bob".into()))]);
-    assert_eq!(storage.get_state(entity.id()).await?.payload.state.head, proto::Clock::singleton(&transfer));
+    assert_eq!(storage.get_state(entity.id()).await?.state.head, proto::Clock::singleton(&transfer));
     assert!(storage.get_events(vec![edit.id()]).await?.is_empty());
     assert_eq!(entity.value(&owner), Some(Value::String("Bob".into())));
     assert_eq!(entity.value(&title), None);
@@ -300,12 +300,12 @@ async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_requi
             "claimed {claimed}, head {head}: {error}"
         );
         assert!(storage.get_events(events.iter().map(Event::id).collect()).await?.is_empty());
-        let stored = storage.get_state(genesis.entity_id).await?.payload.state;
+        let stored = storage.get_state(genesis.entity_id).await?.state;
         assert_eq!(stored.head, proto::Clock::singleton(&genesis));
     }
 
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![honest.clone().into()]).await?;
-    let stored = storage.get_state(genesis.entity_id).await?.payload.state;
+    let stored = storage.get_state(genesis.entity_id).await?.state;
     assert_eq!(stored.head, proto::Clock::singleton(&honest));
     Ok(())
 }
@@ -332,7 +332,7 @@ async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> any
         "{error}"
     );
     assert!(storage.get_events(vec![child.id()]).await?.is_empty());
-    let stored = storage.get_state(genesis.entity_id).await?.payload.state;
+    let stored = storage.get_state(genesis.entity_id).await?.state;
     assert_eq!(stored.head, proto::Clock::singleton(&genesis));
     Ok(())
 }
@@ -371,6 +371,6 @@ async fn a_durable_node_refuses_a_remote_commit_holding_an_operation_it_cannot_r
     let stored: Vec<_> =
         storage.get_events(vec![committed.id(), unknown_kind.id()]).await?.into_iter().map(|event| event.payload).collect();
     assert_eq!(stored, vec![committed.clone()], "the committed update keeps its bytes and the unknown kind is not stored");
-    assert_eq!(storage.get_state(genesis.entity_id).await?.payload.state.head, proto::Clock::singleton(&committed));
+    assert_eq!(storage.get_state(genesis.entity_id).await?.state.head, proto::Clock::singleton(&committed));
     Ok(())
 }

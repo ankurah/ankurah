@@ -6,7 +6,7 @@ use ankurah_core::{
     error::RetrievalError,
     storage::{StorageDump, StorageDumpItem},
 };
-use ankurah_proto::{Attested, EntityId, EntityState, Event, StateFragment};
+use ankurah_proto::{Attested, EntityId, Event};
 use async_trait::async_trait;
 use futures::{stream, Stream};
 
@@ -100,9 +100,7 @@ fn state_page(mut entries: sled::Iter) -> Result<(sled::Iter, Vec<StorageDumpIte
     for entry in entries.by_ref().take(PAGE_SIZE) {
         let (key, bytes) = entry.map_err(sled_error)?;
         let entity_id = EntityId::try_from(key.to_vec()).map_err(RetrievalError::storage)?;
-        let fragment = bincode::deserialize::<StateFragment>(&bytes)?;
-        let state = Attested::<EntityState>::from_parts(entity_id, fragment);
-        page.push(StorageDumpItem::State(state));
+        page.push(StorageDumpItem::State(crate::entity::decode_state(entity_id, &bytes)?));
     }
     Ok((entries, page))
 }
@@ -162,11 +160,8 @@ mod tests {
                     attestations: AttestationSet::default(),
                 };
                 let entity_id = event.payload.entity_id;
-                let state =
-                    Attested { payload: EntityState { entity_id, state: State::default() }, attestations: AttestationSet::default() };
                 database.events_tree.insert(event.payload.id().as_bytes(), event.encode())?;
-                let (_, fragment) = state.to_parts();
-                database.entities_tree.insert(entity_id.to_bytes(), bincode::serialize(&fragment)?)?;
+                database.entities_tree.insert(entity_id.to_bytes(), crate::entity::encode_state(&State::default())?)?;
                 expected_events.insert(event.payload.id());
                 expected_states.insert(entity_id);
             }
@@ -185,7 +180,7 @@ mod tests {
                 }
                 StorageDumpItem::State(state) => {
                     saw_state = true;
-                    states.insert(state.payload.entity_id);
+                    states.insert(state.entity_id);
                 }
             }
         }

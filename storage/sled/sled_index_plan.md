@@ -7,7 +7,7 @@
 
 ## Goals
 
-- Single `entities` tree holds canonical `StateFragment` for all entities (graph-ready)
+- Single `entities` tree holds canonical `State` for all entities (graph-ready)
 - Per-collection materialization trees store `PropertyValue`s for indexing
 - Auto-create indexes on demand; first query blocks until index exists
 - Maintain per-collection indexes on writes (insert/update/delete)
@@ -29,7 +29,7 @@
 
 - `entities` (single, all collections)
   - key: `EntityId.to_bytes()`
-  - val: `StateFragment` (bincode)
+  - val: `State` (bincode)
 - `index_config` (metadata registry)
   - key: `u32` index id (big-endian)
   - val: `IndexRecord` (bincode)
@@ -143,7 +143,7 @@ Reverse scans:
 
 On `set_state` for a collection:
 
-- Upsert `entities`: write canonical `StateFragment`
+- Upsert `entities`: write canonical `State`
 - Upsert `collection_{collection}`: recompute materialized `Vec<(SledPropertyId, PropertyValue)>`
 - For each index in `indexes` for this collection:
   - If old materialization exists: compute old composite key; if changed, delete old key `old_tuple || 0x00 || entity_id`
@@ -169,7 +169,7 @@ Notes:
 - Pipeline is composed from engine-specific scanners and generic combinators:
   - EntityIdStream: iterates `EntityId`s
   - GetPropertyValueStream: iterates materialized rows (`MatRow = { id, mat }`), where `mat` implements `Filterable` (later renamed `GetPropertyValue`)
-  - EntityStateStream: iterates hydrated `Attested<EntityState>`
+  - EntityStateStream: iterates hydrated `EntityState`
 - Sled concrete stream producers:
   - `SledIndexEntityIdScanner` → EntityIdStream
   - `SledCollectionEntityIdScanner` → EntityIdStream (table scan for IDs-only)

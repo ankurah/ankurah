@@ -161,7 +161,7 @@ async fn test_multi_property_determinism() -> Result<()> {
 
     // Verify head has both concurrent events
     let state = node.storage.get_state(record_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     Ok(())
 }
@@ -211,7 +211,7 @@ async fn test_three_way_concurrent_determinism() -> Result<()> {
 
     // Head should have all three concurrent events
     let state = node.storage.get_state(record_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C, D]);
+    clock_eq!(dag, state.state.head, [B, C, D]);
 
     // Winner is determined by lexicographic EventId (all same depth)
     let final_record = ctx.get::<RecordView>(record_id).await?;

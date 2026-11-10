@@ -21,7 +21,7 @@ async fn test_single_event_entity() -> Result<()> {
     };
     // Verify initial state: head=[A]
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [A]);
+    clock_eq!(dag, state.state.head, [A]);
 
     // The degenerate base case: a single-event entity reads back its genesis
     // write. Forking from genesis is covered by
@@ -217,7 +217,7 @@ async fn test_multiple_merge_cycles() -> Result<()> {
 
     // Verify head is single (G)
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [G]);
+    clock_eq!(dag, state.state.head, [G]);
 
     // Verify DAG structure
     assert_dag!(dag, events, {
@@ -314,7 +314,7 @@ async fn test_apply_state_diverged_since() -> Result<()> {
 
     // Verify head has both concurrent events
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     // Both concurrent changes should be reflected in the final state
     let final_album = ctx.get::<AlbumView>(album_id).await?;
@@ -342,7 +342,7 @@ async fn test_apply_state_strict_ascends() -> Result<()> {
 
     // Capture state at A
     let state_at_a = node.storage.get_state(album_id).await?;
-    let old_head = state_at_a.payload.state.head.clone();
+    let old_head = state_at_a.state.head.clone();
 
     // Advance: A → B → C
     {
@@ -360,7 +360,7 @@ async fn test_apply_state_strict_ascends() -> Result<()> {
 
     // Verify head has advanced
     let state_at_c = node.storage.get_state(album_id).await?;
-    let new_head = state_at_c.payload.state.head.clone();
+    let new_head = state_at_c.state.head.clone();
     assert_ne!(old_head, new_head, "Head should have advanced");
 
     // The current entity has head [C], old state has head [A]
@@ -409,7 +409,7 @@ async fn test_empty_clock_handling() -> Result<()> {
 
     // Get entity and its head
     let state = node.storage.get_state(album_id).await?;
-    let head = state.payload.state.head;
+    let head = state.state.head;
 
     // Head should not be empty after creation
     assert!(!head.is_empty(), "Head should not be empty after entity creation");
@@ -446,16 +446,16 @@ async fn test_state_buffer_round_trip() -> Result<()> {
     let state_after_b = node.storage.get_state(album_id).await?;
 
     // Serialize state to bytes
-    let serialized = serde_json::to_vec(&state_after_b.payload.state)?;
+    let serialized = serde_json::to_vec(&state_after_b.state)?;
 
     // Deserialize state from bytes
     let deserialized: ankurah::proto::State = serde_json::from_slice(&serialized)?;
 
     // Verify head is preserved
-    assert_eq!(state_after_b.payload.state.head, deserialized.head, "Head should be preserved through serialization");
+    assert_eq!(state_after_b.state.head, deserialized.head, "Head should be preserved through serialization");
 
     // Verify state buffers are preserved
-    assert_eq!(state_after_b.payload.state.state_buffers.len(), deserialized.state_buffers.len(), "State buffer count should be preserved");
+    assert_eq!(state_after_b.state.state_buffers.len(), deserialized.state_buffers.len(), "State buffer count should be preserved");
 
     // Apply concurrent event C on the original entity
     {
@@ -508,10 +508,10 @@ async fn test_backend_error_handling() -> Result<()> {
 
     // Verify that the valid entity works correctly
     let valid_state = node.storage.get_state(album_id).await?;
-    assert!(!valid_state.payload.state.state_buffers.is_empty(), "Valid state should have buffers");
+    assert!(!valid_state.state.state_buffers.is_empty(), "Valid state should have buffers");
 
     // Verify that known backend types work
-    for (name, _buffer) in valid_state.payload.state.state_buffers.iter() {
+    for (name, _buffer) in valid_state.state.state_buffers.iter() {
         // All backends in a valid Album entity should be "yrs" (the default for String fields)
         assert!(name == "yrs" || name == "lww", "Expected known backend type, got: {}", name);
     }
@@ -555,7 +555,7 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
 
     // Head should be [B, C]
     let state = node.storage.get_state(record_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     // Determine which of B or C has higher EventId (LWW winner)
     let b_id = dag.id('B').unwrap();
@@ -585,7 +585,7 @@ async fn test_multi_head_extend_single_tip_lww() -> Result<()> {
     // Since trx_e saw head [B, C], its event D has parent [B, C], so it should replace both
     let state = node.storage.get_state(record_id).await?;
     // D's parent is [B, C], so D strictly descends from both - head becomes [D]
-    clock_eq!(dag, state.payload.state.head, [D]);
+    clock_eq!(dag, state.state.head, [D]);
 
     Ok(())
 }
@@ -651,7 +651,7 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
 
     // 4. Verify durable has multi-head [B, C]
     let state = durable.storage.get_state(record_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     // Determine LWW winner between B and C
     let b_id = dag.id('B').unwrap();
@@ -690,7 +690,7 @@ async fn test_multi_head_single_tip_extension_cross_node() -> Result<()> {
 
     // 7. Verify head is properly maintained (should be [D] since D extends [B, C])
     let state = durable.storage.get_state(record_id).await?;
-    clock_eq!(dag, state.payload.state.head, [D]);
+    clock_eq!(dag, state.state.head, [D]);
 
     Ok(())
 }
@@ -722,7 +722,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
     let album_model = node.catalog.model_id_for("album")?.expect("Album registered by create");
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [A]);
+    clock_eq!(dag, state.state.head, [A]);
 
     // Step 2: Commit event B with parent A, head=[B]
     let events_b;
@@ -735,7 +735,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
     }
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B]);
+    clock_eq!(dag, state.state.head, [B]);
 
     // Step 3: Commit event C with parent B, head=[C]
     {
@@ -746,7 +746,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
     }
 
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [C]);
+    clock_eq!(dag, state.state.head, [C]);
 
     // Snapshot the album state before re-delivery
     let album_before = ctx.get::<AlbumView>(album_id).await?;
@@ -763,7 +763,7 @@ async fn test_redelivery_of_ancestor_event_is_noop() -> Result<()> {
 
     // Step 5: Assert head is still [C] — B is an ancestor of C, so re-delivery is a no-op
     let state = node.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [C]);
+    clock_eq!(dag, state.state.head, [C]);
 
     // Also verify the entity state was not corrupted
     let album_after = ctx.get::<AlbumView>(album_id).await?;

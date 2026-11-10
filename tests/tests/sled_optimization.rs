@@ -49,7 +49,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     assert_eq!(results_asc.len(), 5, "Should return exactly 5 results due to LIMIT");
 
     // Results should be in ascending ID order
-    let result_ids_asc: Vec<EntityId> = results_asc.iter().map(|r| r.payload.entity_id).collect();
+    let result_ids_asc: Vec<EntityId> = results_asc.iter().map(|r| r.entity_id).collect();
     for i in 1..result_ids_asc.len() {
         assert!(result_ids_asc[i] > result_ids_asc[i - 1], "Results should be in ascending order");
     }
@@ -66,7 +66,7 @@ async fn test_id_range_optimization_integration() -> Result<()> {
     // Validate descending results
     assert_eq!(results_desc.len(), 3, "Should return exactly 3 results due to LIMIT");
 
-    let result_ids_desc: Vec<EntityId> = results_desc.iter().map(|r| r.payload.entity_id).collect();
+    let result_ids_desc: Vec<EntityId> = results_desc.iter().map(|r| r.entity_id).collect();
     for i in 1..result_ids_desc.len() {
         assert!(result_ids_desc[i] < result_ids_desc[i - 1], "Results should be in descending order");
     }
@@ -131,7 +131,7 @@ async fn test_id_range_with_where_clause() -> Result<()> {
     assert_eq!(results.len(), 3, "Should return exactly 3 results due to LIMIT");
 
     // Results should be in ascending order and all >= start_id
-    let result_ids: Vec<EntityId> = results.iter().map(|r| r.payload.entity_id).collect();
+    let result_ids: Vec<EntityId> = results.iter().map(|r| r.entity_id).collect();
 
     // Verify ordering
     for i in 1..result_ids.len() {
@@ -174,7 +174,7 @@ async fn test_negated_residual_is_filtered_before_limit() -> Result<()> {
         .and_member_of(model_id);
         // Read storage directly so subsequent core filtering cannot hide an incorrect result.
         let results = node.storage.fetch_states(&selection).await?;
-        assert_eq!(results.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![expected], "{parsed}");
+        assert_eq!(results.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![expected], "{parsed}");
     }
 
     Ok(())

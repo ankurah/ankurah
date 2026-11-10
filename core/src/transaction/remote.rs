@@ -81,8 +81,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
             .await?;
         self.storage.add_events(std::slice::from_ref(&event)).await?;
         let state = EntityState { entity_id: entity.id(), state: entity.to_state()? };
-        let attestation = self.policy.attest_state(self.node, &state);
-        self.storage.set_state(&expected_head, &Attested::opt(state, attestation)).await?;
+        self.storage.set_state(&expected_head, &state).await?;
         self.failed = false;
         Ok(())
     }

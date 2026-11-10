@@ -9,7 +9,7 @@ use ankurah_core::{
     error::{MutationError, RetrievalError},
     storage::StorageEngine,
 };
-use ankurah_proto::{Attested, EntityId, EntityState, Event, EventId, ModelId, StateFragment};
+use ankurah_proto::{Attested, EntityId, EntityState, Event, EventId, ModelId};
 use async_trait::async_trait;
 use sled::transaction::{TransactionError, Transactional};
 use sled::Config;
@@ -106,22 +106,16 @@ impl StorageEngine for SledStorageEngine {
 
     async fn list_materializations(&self) -> Result<Vec<ModelId>, RetrievalError> { SledStorageEngine::list_models(self) }
 
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+    async fn get_state(&self, id: EntityId) -> Result<EntityState, RetrievalError> {
         let database = self.database.lock().unwrap().clone();
         tokio::task::spawn_blocking(move || match database.entities_tree.get(id.to_bytes()).map_err(crate::error::sled_error)? {
-            Some(bytes) => {
-                let fragment: StateFragment = bincode::deserialize(bytes.as_ref())?;
-                Ok(Attested::<EntityState>::from_parts(id, fragment))
-            }
+            Some(bytes) => Ok(crate::entity::decode_state(id, bytes.as_ref())?),
             None => Err(RetrievalError::EntityNotFound(id)),
         })
         .await?
     }
 
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<ankql::ast::Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         let plan = ankurah_storage_common::materialization_plan::MaterializationPlan::new(selection);
         if let Some((model, selection)) = plan.indexed_materialization() {
             return match self.materialization(&model)? {

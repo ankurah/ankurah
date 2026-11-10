@@ -155,10 +155,10 @@ async fn existing_membership_authorizes_addition_but_new_membership_cannot_autho
     assert!(trx.get::<Document>(&local).await.is_err(), "read access is insufficient to add a membership");
     drop(trx);
 
-    let add_attachment = |state: proto::Attested<proto::EntityState>| {
+    let add_attachment = |state: proto::EntityState| {
         proto::Attested::from(proto::Event::update(
-            state.payload.entity_id,
-            state.payload.state.head,
+            state.entity_id,
+            state.state.head,
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(attachment))]),
         ))
     };
@@ -185,7 +185,7 @@ async fn existing_membership_authorizes_addition_but_new_membership_cannot_autho
     commit_transaction(&node, &credential("editor"), proto::TransactionId::new(), vec![add_attachment(storage.get_state(remote).await?)])
         .await?;
     for id in [local, remote] {
-        assert!(storage.get_state(id).await?.payload.state.memberships.contains(&attachment));
+        assert!(storage.get_state(id).await?.state.memberships.contains(&attachment));
         assert_eq!(editor.get::<AttachmentView>(id).await?.id(), id, "read authorization uses ANY actual membership");
     }
     let mut ids: Vec<_> = editor.fetch::<AttachmentView>("true").await?.iter().map(View::id).collect();
