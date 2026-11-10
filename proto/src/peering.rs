@@ -142,7 +142,7 @@ impl std::fmt::Display for Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::encoding::{decode_exact, encode};
+
     use crate::{Identity, Message};
     use ed25519_dalek::Signer;
 
@@ -171,8 +171,7 @@ mod tests {
     #[test]
     fn presence_round_trip() {
         let p = claims().sign(sign_as(&key(42)));
-        let bytes = encode(&Message::Presence(p.clone()));
-        match decode_exact::<Message>(&bytes).unwrap() {
+        match Message::decode(&Message::Presence(p.clone()).encode()).unwrap() {
             Message::Presence(q) => assert_eq!(p, q),
             other => panic!("expected Presence, got {other}"),
         }

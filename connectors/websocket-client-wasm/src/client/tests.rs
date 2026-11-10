@@ -109,10 +109,7 @@ fn server_handshake(server: &NodeKey) -> (Vec<u8>, Vec<u8>) {
     let mut handshake = Handshake::new(server.node_id());
     handshake.receive_opening(Handshake::new(NodeKey::generate().node_id()).opening()).unwrap();
     let presence = server.sign_presence(handshake.presence_claims(server.node_id(), true).unwrap());
-    (
-        bincode::serialize(&proto::Message::Open(handshake.opening())).unwrap(),
-        bincode::serialize(&proto::Message::Presence(presence)).unwrap(),
-    )
+    (proto::Message::Open(handshake.opening()).encode(), proto::Message::Presence(presence).encode())
 }
 
 #[wasm_bindgen_test]
@@ -152,7 +149,7 @@ async fn application_traffic_before_the_server_registers_closes_the_connection()
             to: node.id(),
             body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
         };
-        deliver(socket, &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(response))).unwrap());
+        deliver(socket, &proto::Message::PeerMessage(proto::NodeMessage::Response(response)).encode());
         client.state.read().wait_for(|state| matches!(state, ConnectionState::Error { .. })).await;
         sleep(Duration::ZERO).await;
 
@@ -241,17 +238,17 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 sleep(Duration::ZERO).await;
             }
             assert_eq!(sent_count(socket), 1, "the server's opening is answered with ours");
-            assert!(matches!(bincode::deserialize(&sent_frame(socket, 0)).unwrap(), proto::Message::Open(_)));
+            assert!(matches!(proto::Message::decode(&sent_frame(socket, 0)).unwrap(), proto::Message::Open(_)));
             deliver(socket, &presence);
             deliver(
                 socket,
-                &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(proto::NodeResponse {
+                &proto::Message::PeerMessage(proto::NodeMessage::Response(proto::NodeResponse {
                     request_id: proto::RequestId::new(),
                     from: peer,
                     to: node.id(),
                     body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
-                })))
-                .unwrap(),
+                }))
+                .encode(),
             );
             // The client signs its presence before registration spends the handshake.
             node.0.presence_started.read().wait_for(|started| *started).await;
@@ -381,7 +378,7 @@ fn admitting_client() -> (HeldAdmission, Arc<ClientInner>) {
 
 fn open_frame(versions: proto::ProtocolVersions) -> Vec<u8> {
     let challenge = proto::HandshakeChallenge::new(NodeKey::from_seed([2; 32]).node_id());
-    bincode::serialize(&proto::Message::Open(proto::Opening { versions, challenge })).unwrap()
+    proto::Message::Open(proto::Opening { versions, challenge }).encode()
 }
 
 #[wasm_bindgen_test]
@@ -397,7 +394,7 @@ async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this
             sleep(Duration::ZERO).await;
         }
         sleep(Duration::ZERO).await;
-        match bincode::deserialize(&sent_frame(socket, 0)).unwrap() {
+        match proto::Message::decode(&sent_frame(socket, 0)).unwrap() {
             proto::Message::Open(opening) => assert_eq!(opening.versions, proto::ProtocolVersions::SPOKEN),
             other => panic!("the client answered a wider opening with {other}"),
         }
@@ -420,7 +417,7 @@ async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this
         assert!(matches!(client.state.value(), ConnectionState::Error { cause: Some(cause), .. } if cause == refusal));
         assert_eq!(sent_count(socket), 2, "the client's opening, then its refusal");
         assert!(matches!(
-            bincode::deserialize(&sent_frame(socket, 1)).unwrap(),
+            proto::Message::decode(&sent_frame(socket, 1)).unwrap(),
             proto::Message::NoCommonVersion(versions) if versions == proto::ProtocolVersions::SPOKEN
         ));
         assert!(is_closed(socket));
@@ -454,7 +451,7 @@ async fn a_message_of_an_unknown_kind_after_the_handshake_is_ignored() {
             to: node.id(),
             body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
         };
-        deliver(socket, &bincode::serialize(&proto::Message::PeerMessage(proto::NodeMessage::Response(response))).unwrap());
+        deliver(socket, &proto::Message::PeerMessage(proto::NodeMessage::Response(response)).encode());
         node.0.handled.read().wait_for(|count| *count == 1).await;
         assert!(matches!(client.state.value(), ConnectionState::Connected { .. }));
         assert!(!is_closed(socket));

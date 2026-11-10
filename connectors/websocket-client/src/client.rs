@@ -286,7 +286,7 @@ where
 
             let (mut sink, mut stream) = ws_stream.split();
             debug!("Starting connection handling");
-            sink.send(Message::Binary(bincode::serialize(&opening)?.into())).await?;
+            sink.send(Message::Binary(opening.encode().into())).await?;
 
             loop {
                 select! {
@@ -333,13 +333,7 @@ where
         msg: Option<proto::NodeMessage>,
     ) -> Result<()> {
         if let Some(node_message) = msg {
-            let proto_message = proto::Message::PeerMessage(node_message);
-            match bincode::serialize(&proto_message) {
-                Ok(data) => {
-                    sink.send(Message::Binary(data.into())).await?;
-                }
-                Err(e) => error!("Failed to serialize outgoing message: {}", e),
-            }
+            sink.send(Message::Binary(proto::Message::PeerMessage(node_message).encode().into())).await?;
         }
         Ok(())
     }
@@ -364,7 +358,7 @@ where
                         Err(refusal) => {
                             error!("Refusing server {}: {}", inner.server_url, refusal);
                             if let PeerConnectionError::NoCommonVersion { ours, .. } = refusal {
-                                let refusal_frame = bincode::serialize(&proto::Message::NoCommonVersion(ours))?;
+                                let refusal_frame = proto::Message::NoCommonVersion(ours).encode();
                                 // Best effort: the connection closes either way.
                                 let _ = sink.send(Message::Binary(refusal_frame.into())).await;
                             }
@@ -421,7 +415,7 @@ where
             Message,
         >,
     ) -> Result<MessageResult> {
-        match bincode::deserialize(data) {
+        match proto::Message::decode(data) {
             Ok(proto::Message::Open(_)) => {
                 warn!("Ignoring repeated opening from {}", inner.server_url);
                 Ok(MessageResult::Continue)
@@ -487,7 +481,7 @@ where
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
 
-        sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
+        sink.send(Message::Binary(presence.encode().into())).await?;
 
         inner.connected.store(true, Ordering::Release);
         inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });

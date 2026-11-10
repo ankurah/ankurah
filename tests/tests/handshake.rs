@@ -24,7 +24,7 @@ fn versions(lowest: u32, highest: u32) -> proto::ProtocolVersions { proto::Proto
 const SPOKEN: proto::ProtocolVersions = proto::ProtocolVersions::SPOKEN;
 
 /// The frame bytes of `message`.
-fn frame(message: &proto::Message) -> WsMessage { WsMessage::Binary(bincode::serialize(message).unwrap().into()) }
+fn frame(message: &proto::Message) -> WsMessage { WsMessage::Binary(message.encode().into()) }
 
 /// What a peer holding only `key` claims answering `opening`, after offering `offered`.
 fn claims_answering(key: &NodeKey, opening: &proto::Opening, offered: proto::ProtocolVersions, durable: bool) -> proto::PresenceClaims {
@@ -49,7 +49,7 @@ where S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
     loop {
         match tokio::time::timeout(Duration::from_secs(10), socket.next()).await.expect("the other side neither sent nor closed") {
             None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => return None,
-            Some(Ok(WsMessage::Binary(data))) => return Some(bincode::deserialize(&data).expect("a frame this build reads")),
+            Some(Ok(WsMessage::Binary(data))) => return Some(proto::Message::decode(&data).expect("a frame this build reads")),
             Some(Ok(_)) => continue,
         }
     }
@@ -140,7 +140,7 @@ async fn an_opening_sharing_no_version_is_refused_with_the_servers_versions_befo
     let (_server_node, server_url, server_task) = start_test_server().await?;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("{server_url}/ws")).await?;
     let opening = proto::Opening { versions: versions(2, 3), challenge: proto::HandshakeChallenge::new(NodeKey::generate().node_id()) };
-    let mut bytes = bincode::serialize(&proto::Message::Open(opening))?;
+    let mut bytes = proto::Message::Open(opening).encode();
     bytes.extend_from_slice(b"bytes a version-1 reader rejects");
     socket.send(WsMessage::Binary(bytes.into())).await?;
 
@@ -239,7 +239,7 @@ async fn the_server_closes_a_connection_whose_opening_it_cannot_read() -> Result
     let (_server_node, server_url, server_task) = start_test_server().await?;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("{server_url}/ws")).await?;
     let opening = proto::Opening { versions: SPOKEN, challenge: proto::HandshakeChallenge::new(NodeKey::generate().node_id()) };
-    let mut bytes = bincode::serialize(&proto::Message::Open(opening))?;
+    let mut bytes = proto::Message::Open(opening).encode();
     bytes.pop();
     socket.send(WsMessage::Binary(bytes.into())).await?;
 
@@ -259,7 +259,7 @@ async fn the_server_closes_a_silent_client_after_its_opening() -> Result<()> {
 
     let opening = loop {
         match stream.next().await {
-            Some(Ok(WsMessage::Binary(data))) => match bincode::deserialize::<proto::Message>(&data)? {
+            Some(Ok(WsMessage::Binary(data))) => match proto::Message::decode(&data)? {
                 proto::Message::Open(opening) => break opening,
                 other => panic!("server sent {other:?} before its opening"),
             },
@@ -328,7 +328,7 @@ async fn accept_client(listener: &tokio::net::TcpListener, server_opening: Vec<u
 /// The bytes of an opening from `server` offering `versions`.
 fn opening_from(server: &NodeKey, versions: proto::ProtocolVersions) -> (proto::Opening, Vec<u8>) {
     let opening = proto::Opening { versions, challenge: proto::HandshakeChallenge::new(server.node_id()) };
-    (opening, bincode::serialize(&proto::Message::Open(opening)).unwrap())
+    (opening, proto::Message::Open(opening).encode())
 }
 
 /// A real client connecting to a raw server on a fresh port.

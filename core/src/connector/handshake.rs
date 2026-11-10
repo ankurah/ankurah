@@ -132,7 +132,7 @@ mod tests {
         );
         assert!(!handshake.opened());
 
-        let mut frame = bincode::serialize(&proto::Message::Open(opening(versions(2, 3)))).unwrap();
+        let mut frame = proto::Message::Open(opening(versions(2, 3))).encode();
         frame.extend_from_slice(b"bytes a version-1 reader rejects");
         assert_eq!(
             handshake.read_opening(&frame),
@@ -145,7 +145,7 @@ mod tests {
         let mut handshake = Handshake::new(NodeKey::generate().node_id());
         let node = NodeKey::generate().node_id();
         assert_eq!(handshake.presence_claims(node, false), Err(PeerConnectionError::NoOpening));
-        handshake.read_opening(&bincode::serialize(&proto::Message::Open(opening(versions(1, 1)))).unwrap()).unwrap();
+        handshake.read_opening(&proto::Message::Open(opening(versions(1, 1))).encode()).unwrap();
         assert!(handshake.opened());
         assert_eq!(handshake.receive_opening(opening(versions(1, 1))), Err(PeerConnectionError::RepeatedOpening));
     }

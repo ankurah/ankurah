@@ -8,7 +8,7 @@ use ankurah_core::connector::PeerConnectionError;
 use ankurah_core::connector::PeerProvenance;
 use ankurah_core::connector::PeerSender;
 use ankurah_proto::{self as proto};
-use anyhow::anyhow;
+
 use async_trait::async_trait;
 use futures::{channel::mpsc, future::RemoteHandle, Future, FutureExt, StreamExt};
 use js_sys::Uint8Array;
@@ -190,7 +190,7 @@ impl Connection {
             return None;
         }
 
-        if let Ok(message) = bincode::deserialize::<proto::Message>(&data) {
+        if let Ok(message) = proto::Message::decode(&data) {
             match message {
                 proto::Message::Open(_) => warn!("Ignoring repeated opening from {}", self.url),
                 proto::Message::NoCommonVersion(theirs) => {
@@ -336,11 +336,7 @@ impl Connection {
     }
 
     fn send_message(&self, message: proto::Message) -> Result<(), JsValue> {
-        let data = bincode::serialize(&message).map_err(|e| {
-            info!("Failed to serialize client message: {:?}", e);
-            JsValue::from_str("Serialization error")
-        })?;
-
+        let data = message.encode();
         let array = Uint8Array::new_with_length(data.len() as u32);
         array.copy_from(&data);
         self.ws.send_with_array_buffer(&array.buffer())?;
@@ -383,12 +379,7 @@ struct WebSocketPeerSender {
 #[async_trait]
 impl PeerSender for WebSocketPeerSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
-        let message = proto::Message::PeerMessage(message);
-        let data = bincode::serialize(&message).map_err(|e| {
-            info!("Failed to serialize client message: {:?}", e);
-            ankurah_core::connector::SendError::from(anyhow!("Serialization error"))
-        })?;
-
+        let data = proto::Message::PeerMessage(message).encode();
         let array = Uint8Array::new_with_length(data.len() as u32);
         array.copy_from(&data);
         match self.ws.send_with_array_buffer(&array.buffer()) {

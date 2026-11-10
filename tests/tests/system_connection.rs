@@ -18,13 +18,13 @@ type Socket = WebSocketStream<TcpStream>;
 /// Play the server's half of the handshake: open, then answer the client's opening.
 async fn advertise(socket: &mut Socket, server: &Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<()> {
     let mut handshake = server.begin_handshake();
-    socket.send(Message::Binary(bincode::serialize(&proto::Message::Open(handshake.opening()))?.into())).await?;
+    socket.send(Message::Binary(proto::Message::Open(handshake.opening()).encode().into())).await?;
     match socket.next().await.transpose()? {
         Some(Message::Binary(bytes)) => handshake.read_opening(&bytes)?,
         other => anyhow::bail!("expected the client's opening frame, got {other:?}"),
     }
     let presence = server.presence(&handshake).await?;
-    socket.send(Message::Binary(bincode::serialize(&proto::Message::Presence(presence))?.into())).await?;
+    socket.send(Message::Binary(proto::Message::Presence(presence).encode().into())).await?;
     Ok(())
 }
 

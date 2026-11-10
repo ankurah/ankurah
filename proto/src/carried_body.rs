@@ -84,8 +84,8 @@ mod tests {
     fn a_frame_whose_body_this_build_cannot_read_still_decodes() {
         let (from, to) = (Identity::Ed25519([1; 32]).into(), Identity::Ed25519([2; 32]).into());
         let request = NodeRequest { id: RequestId::new(), to, from, body: unknown_kind() };
-        let frame = encode(&Message::PeerMessage(NodeMessage::Request { auth: vec![], request }));
-        let Message::PeerMessage(NodeMessage::Request { request: decoded, .. }) = decode_exact(&frame).unwrap() else {
+        let frame = Message::PeerMessage(NodeMessage::Request { auth: vec![], request }).encode();
+        let Message::PeerMessage(NodeMessage::Request { request: decoded, .. }) = Message::decode(&frame).unwrap() else {
             panic!("the frame decodes as the request it carries")
         };
         assert_eq!((decoded.from, decoded.to), (from, to));

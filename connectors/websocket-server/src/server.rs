@@ -15,7 +15,7 @@ use axum::{
     Router,
 };
 use axum_extra::{headers, TypedHeader};
-use bincode::deserialize;
+
 use futures_util::StreamExt;
 use std::net::IpAddr;
 use std::{future::Future, net::SocketAddr, ops::ControlFlow, pin::Pin, time::Duration};
@@ -247,7 +247,7 @@ where
             if let Some(outcome) = answer_opening(&d, client_ip, state, &node, handshake_deadline).await {
                 return outcome;
             }
-            if let Ok(message) = deserialize::<proto::Message>(&d) {
+            if let Ok(message) = proto::Message::decode(&d) {
                 match message {
                     proto::Message::Presence(presence) => {
                         match state {
