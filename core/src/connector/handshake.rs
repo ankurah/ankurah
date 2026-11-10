@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn an_opening_sharing_no_version_is_refused_with_both_ranges() {
+    fn an_opening_sharing_no_version_yields_no_common_version_with_both_ranges() {
         let mut handshake = Handshake::new(NodeKey::generate().node_id(), PeerProvenance::Configured);
         assert_eq!(
             handshake.receive_opening(opening(versions(2, 3))),

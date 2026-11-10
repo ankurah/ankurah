@@ -129,12 +129,12 @@ async fn the_client_refuses_a_peer_message_before_the_servers_presence() -> Resu
     Ok(())
 }
 
-/// The client side of a refusal: a server speaking no version the client speaks is answered with
-/// the client's versions, never treated as connected, and not dialed again before the backoff. A
-/// version-1 reader rejects the bytes after the server's challenge, so the refusal shows the client
-/// read no further than the versions.
+/// A server speaking no version the client speaks is answered with the client's versions, never
+/// treated as connected, and not dialed again before the backoff. A version-1 reader rejects the
+/// bytes after the server's challenge, so the answer shows the client read no further than the
+/// versions.
 #[tokio::test]
-async fn the_client_refuses_a_server_sharing_no_version_without_a_hot_loop() -> Result<()> {
+async fn the_client_answers_a_server_sharing_no_version_without_a_hot_loop() -> Result<()> {
     let (listener, _node, client) = client_of_raw_server().await?;
     let (_, mut server_frame) = opening_from(&NodeKey::generate(), versions(2, 3));
     server_frame.extend_from_slice(b"bytes a version-1 reader rejects");
@@ -145,8 +145,8 @@ async fn the_client_refuses_a_server_sharing_no_version_without_a_hot_loop() -> 
     assert!(matches!(receive(&mut socket).await, Some(proto::Message::NoCommonVersion(spoken)) if spoken == SPOKEN));
     assert!(receive(&mut socket).await.is_none(), "then the client closes");
 
-    // INITIAL_BACKOFF is one second. A second TCP accept inside this shorter window would mean a
-    // permanent refusal is hot-looping.
+    // INITIAL_BACKOFF is one second. A second TCP accept inside this shorter window would mean the
+    // client redials a server it shares no version with in a hot loop.
     assert!(tokio::time::timeout(Duration::from_millis(500), listener.accept()).await.is_err(), "the client retried without backoff");
     client.shutdown().await?;
     Ok(())

@@ -76,10 +76,10 @@ async fn a_wider_opening_settles_on_the_version_the_server_speaks() -> Result<()
     Ok(())
 }
 
-/// A version-1 reader rejects the bytes after this opening's challenge, so the refusal shows the
+/// A version-1 reader rejects the bytes after this opening's challenge, so the answer shows the
 /// server read no further than the versions.
 #[tokio::test]
-async fn an_opening_sharing_no_version_is_refused_with_the_servers_versions_before_the_rest_is_read() -> Result<()> {
+async fn an_opening_sharing_no_version_is_answered_with_the_servers_versions_before_the_rest_is_read() -> Result<()> {
     let (_server_node, server_url, server_task) = start_test_server().await?;
     let (mut socket, _) = tokio_tungstenite::connect_async(format!("{server_url}/ws")).await?;
     let opening = proto::Opening { versions: versions(2, 3), challenge: proto::HandshakeChallenge::new(NodeKey::generate().node_id()) };

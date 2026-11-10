@@ -388,7 +388,7 @@ fn open_frame(versions: proto::ProtocolVersions) -> Vec<u8> {
 }
 
 #[wasm_bindgen_test]
-async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this_nodes_versions() {
+async fn a_wider_opening_settles_and_one_sharing_no_version_is_answered_with_this_nodes_versions() {
     mock_websockets();
     let _restore = RestoreWebSockets;
     let run = async {
@@ -415,17 +415,17 @@ async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this
         let (_node, client) = admitting_client();
         let socket = socket_count();
         client.connect().unwrap();
-        // A version-1 reader would reject these trailing bytes, so the refusal shows they were never read.
+        // A version-1 reader would reject these trailing bytes, so the answer shows they were never read.
         let mut frame = open_frame(proto::ProtocolVersions { lowest: 2, highest: 3 });
         frame.extend_from_slice(b"bytes a version-1 reader rejects");
         deliver(socket, &frame);
         client.state.read().wait_for(|state| matches!(state, ConnectionState::Error { .. })).await;
-        let refusal = PeerConnectionError::NoCommonVersion {
+        let no_common_version = PeerConnectionError::NoCommonVersion {
             ours: proto::ProtocolVersions::SPOKEN,
             theirs: proto::ProtocolVersions { lowest: 2, highest: 3 },
         };
-        assert!(matches!(client.state.value(), ConnectionState::Error { cause: Some(cause), .. } if cause == refusal));
-        assert_eq!(sent_count(socket), 2, "the client's opening, then its refusal");
+        assert!(matches!(client.state.value(), ConnectionState::Error { cause: Some(cause), .. } if cause == no_common_version));
+        assert_eq!(sent_count(socket), 2, "the client's opening, then its answer");
         assert!(matches!(
             proto::Message::decode(&sent_frame(socket, 1)).unwrap(),
             proto::Message::NoCommonVersion(versions) if versions == proto::ProtocolVersions::SPOKEN

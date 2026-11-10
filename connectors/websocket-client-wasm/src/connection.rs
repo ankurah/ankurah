@@ -200,10 +200,10 @@ impl Connection {
             Ok(message) => match message {
                 proto::Message::Open(_) => warn!("Ignoring repeated opening from {}", self.url),
                 proto::Message::NoCommonVersion(theirs) => {
-                    let refusal = PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs };
-                    error!("Server {} refused connection: {}", self.url, refusal);
+                    let no_common_version = PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs };
+                    error!("Server {} refused connection: {}", self.url, no_common_version);
                     self.disconnect();
-                    self.set_state(ConnectionState::Error { message: refusal.to_string(), cause: Some(refusal) });
+                    self.set_state(ConnectionState::Error { message: no_common_version.to_string(), cause: Some(no_common_version) });
                 }
                 proto::Message::Refused(reason) => {
                     error!("Server {} refused this node: {}", self.url, reason);

@@ -387,9 +387,9 @@ where
                         Err(refusal) => {
                             error!("Refusing server {}: {}", inner.server_url, refusal);
                             if let PeerConnectionError::NoCommonVersion { ours, .. } = refusal {
-                                let refusal_frame = proto::Message::NoCommonVersion(ours).encode();
+                                let no_common_version = proto::Message::NoCommonVersion(ours).encode();
                                 // Best effort: the connection closes either way.
-                                let _ = sink.send(Message::Binary(refusal_frame.into())).await;
+                                let _ = sink.send(Message::Binary(no_common_version.into())).await;
                             }
                             Err(refusal.into())
                         }
