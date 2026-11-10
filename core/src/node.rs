@@ -610,8 +610,12 @@ where
                 debug!("Node {} received response {}", self.id, response);
                 let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
                 if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
-                    tx.send(response.body.decode().map_err(RequestError::UnreadableResponse))
-                        .map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                    let body = match response.body.decode() {
+                        Ok(proto::NodeResponseBody::Unsupported) => Err(RequestError::UnsupportedByPeer(response.from)),
+                        Ok(body) => Ok(body),
+                        Err(unreadable) => Err(RequestError::UnreadableResponse(unreadable)),
+                    };
+                    tx.send(body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {

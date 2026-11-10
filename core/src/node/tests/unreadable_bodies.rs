@@ -47,6 +47,21 @@ async fn an_update_whose_body_this_build_cannot_read_is_acknowledged_unsupported
 }
 
 #[tokio::test]
+async fn a_peer_answering_that_it_cannot_read_a_request_fails_that_request_with_a_typed_error() {
+    let (node, peer, messages) = node_with_peer().await;
+    let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    let proto::NodeMessage::Request { request: sent, .. } = messages.try_recv().unwrap() else { panic!("the request was not sent") };
+
+    let body = proto::CarriedBody::encode(&proto::NodeResponseBody::Unsupported);
+    node.handle_message(proto::NodeMessage::Response(proto::NodeResponse { request_id: sent.id, from: peer, to: node.id, body }))
+        .await
+        .unwrap();
+    assert!(matches!(request.await, Err(RequestError::UnsupportedByPeer(from)) if from == peer));
+}
+
+#[tokio::test]
 async fn a_response_whose_body_this_build_cannot_read_fails_the_waiting_request() {
     let (node, peer, messages) = node_with_peer().await;
     let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
