@@ -25,7 +25,7 @@ async fn connect_recording_event_requests(
     let recorder = requested.clone();
     let (connection, gate) = GatedConnection::new(client, server, move |message: &proto::NodeMessage| {
         if let proto::NodeMessage::Request { request, .. } = message {
-            if let proto::NodeRequestBody::GetEvents { event_ids } = &request.body {
+            if let Ok(proto::NodeRequestBody::GetEvents { event_ids }) = request.body.decode() {
                 recorder.lock().unwrap().extend(event_ids.iter().cloned());
             }
         }
@@ -151,7 +151,7 @@ async fn an_ephemeral_node_admits_an_honest_update_over_parents_it_does_not_hold
         content: proto::UpdateContent::EventOnly(vec![proto::Attested::opt(update, None).into()]),
         predicate_relevance: vec![],
     };
-    let body = proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] };
+    let body = proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate { items: vec![item] });
     client
         .handle_message(proto::NodeMessage::Update(proto::NodeUpdate { id: proto::UpdateId::new(), from: server.id, to: client.id, body }))
         .await?;

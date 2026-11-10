@@ -1,4 +1,7 @@
-use crate::{auth::Attested, id::EntityId, identity::NodeId, state::EntityState, subscription::QueryId, EventFragment, StateFragment};
+use crate::{
+    auth::Attested, carried_body::CarriedBody, id::EntityId, identity::NodeId, state::EntityState, subscription::QueryId, EventFragment,
+    StateFragment,
+};
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -67,7 +70,7 @@ pub struct NodeUpdate {
     pub id: UpdateId,
     pub from: NodeId,
     pub to: NodeId,
-    pub body: NodeUpdateBody,
+    pub body: CarriedBody<NodeUpdateBody>,
 }
 
 /// An acknowledgement of an update from one node to another
@@ -83,6 +86,8 @@ pub struct NodeUpdateAck {
 pub enum NodeUpdateAckBody {
     Success,
     Error(String),
+    /// The acknowledgement of an update whose body the receiver cannot read.
+    Unsupported,
 }
 
 impl std::fmt::Display for UpdateId {
@@ -140,6 +145,36 @@ impl std::fmt::Display for NodeUpdateAckBody {
         match self {
             NodeUpdateAckBody::Success => write!(f, "Success"),
             NodeUpdateAckBody::Error(e) => write!(f, "Error: {e}"),
+            NodeUpdateAckBody::Unsupported => write!(f, "Unsupported"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::encoding::encode;
+    use crate::State;
+
+    fn index(value: &impl Serialize) -> [u8; 4] { encode(value)[..4].try_into().unwrap() }
+
+    /// Each update enum's first four bytes are its variant index, which the receiving peer reads to decode it.
+    #[test]
+    fn update_variant_order_is_pinned() {
+        assert_eq!(index(&NodeUpdateBody::SubscriptionUpdate { items: vec![] }), [0, 0, 0, 0]);
+        assert_eq!(
+            [NodeUpdateAckBody::Success, NodeUpdateAckBody::Error("e".into()), NodeUpdateAckBody::Unsupported]
+                .iter()
+                .map(index)
+                .collect::<Vec<_>>(),
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]
+        );
+
+        let state = StateFragment { state: State::default(), attestations: Default::default() };
+        let contents = [UpdateContent::EventOnly(vec![]), UpdateContent::StateAndEvent(state, vec![])];
+        assert_eq!(contents.iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0]]);
+
+        let changes = [MembershipChange::Initial, MembershipChange::Add, MembershipChange::Remove];
+        assert_eq!(changes.iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0]]);
     }
 }

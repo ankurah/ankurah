@@ -81,7 +81,7 @@ fn deliver(from: proto::NodeId, to: proto::NodeId, items: Vec<proto::Subscriptio
         id: proto::UpdateId::new(),
         from,
         to,
-        body: proto::NodeUpdateBody::SubscriptionUpdate { items },
+        body: proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate { items }),
     })
 }
 

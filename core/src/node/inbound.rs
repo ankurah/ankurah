@@ -33,9 +33,15 @@ where
                 let from = node.id;
 
                 // TODO - validate the from node id is the one we're connected to
-                let body = match handle_update(node, update).await {
-                    Ok(_) => proto::NodeUpdateAckBody::Success,
-                    Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                let body = match update.body.decode() {
+                    Ok(body) => match handle_update(node, update.from, body).await {
+                        Ok(_) => proto::NodeUpdateAckBody::Success,
+                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                    },
+                    Err(unreadable) => {
+                        debug!("Node({}) cannot read update {} from {}: {}", node.id, id, update.from, unreadable);
+                        proto::NodeUpdateAckBody::Unsupported
+                    }
                 };
 
                 sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
@@ -64,29 +70,46 @@ where
                     return Ok(());
                 }
 
-                // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
-                // follow-on uses #426's node session union for catalog queries.
-                let cdata = if crate::schema::request_bypasses_policy(&request.body) {
-                    Ok(Vec::new())
-                } else {
-                    node.policy_agent.check_request(node, &auth, &request).await
+                let body = match request.body.decode() {
+                    Ok(body) => {
+                        // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
+                        // follow-on uses #426's node session union for catalog queries.
+                        let cdata = if crate::schema::request_bypasses_policy(&body) {
+                            Ok(Vec::new())
+                        } else {
+                            node.policy_agent.check_request(node, &auth, &request).await
+                        };
+                        match cdata {
+                            Ok(cdata) => match handler::handle_request(node, &cdata, from, body).await {
+                                Ok(result) => result,
+                                Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                            },
+                            Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                        }
+                    }
+                    Err(unreadable) => {
+                        debug!("Node({}) cannot read request {} from {}: {}", node.id, request_id, from, unreadable);
+                        proto::NodeResponseBody::Unsupported
+                    }
                 };
-                let body = match cdata {
-                    Ok(cdata) => match handler::handle_request(node, &cdata, request).await {
-                        Ok(result) => result,
-                        Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                    },
-                    Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                };
-                let _result =
-                    sender.send_message(proto::NodeMessage::Response(proto::NodeResponse { request_id, from: node.id, to: from, body }));
+                let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                    request_id,
+                    from: node.id,
+                    to: from,
+                    body: proto::CarriedBody::encode(&body),
+                }));
             }
         }
         proto::NodeMessage::Response(response) => {
             debug!("Node {} received response {}", node.id, response);
             let connection = node.peers.connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
             if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
-                tx.send(Ok(response.body)).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
+                let body = match response.body.decode() {
+                    Ok(proto::NodeResponseBody::Unsupported) => Err(RequestError::UnsupportedByPeer(response.from)),
+                    Ok(body) => Ok(body),
+                    Err(unreadable) => Err(RequestError::UnreadableResponse(unreadable)),
+                };
+                tx.send(body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
             }
         }
         proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
@@ -99,19 +122,19 @@ where
     Ok(())
 }
 
-async fn handle_update<SE, PA>(node: &Node<SE, PA>, notification: proto::NodeUpdate) -> anyhow::Result<()>
+async fn handle_update<SE, PA>(node: &Node<SE, PA>, from: proto::NodeId, body: proto::NodeUpdateBody) -> anyhow::Result<()>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let Some(_connection) = node.peers.connections.get(&notification.from) else {
-        return Err(anyhow!("Rejected notification from unknown node {}", notification.from));
+    let Some(_connection) = node.peers.connections.get(&from) else {
+        return Err(anyhow!("Rejected notification from unknown node {}", from));
     };
 
-    match notification.body {
+    match body {
         proto::NodeUpdateBody::SubscriptionUpdate { items } => {
-            tracing::debug!("Node({}) received subscription update from peer {}", node.id, notification.from);
-            applier::NodeApplier::apply_updates(node, &notification.from, items).await?;
+            tracing::debug!("Node({}) received subscription update from peer {}", node.id, from);
+            applier::NodeApplier::apply_updates(node, &from, items).await?;
             Ok(())
         }
     }

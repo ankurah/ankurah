@@ -171,7 +171,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                     request_id: proto::RequestId::new(),
                     from: peer,
                     to: node.id(),
-                    body: proto::NodeResponseBody::Success,
+                    body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
                 })))
                 .unwrap(),
             );

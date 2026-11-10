@@ -90,18 +90,19 @@ async fn entity_states<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgen
     Ok(states)
 }
 
-#[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(request = %request)))]
+#[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(body = %body)))]
 pub(super) async fn handle_request<SE, PA, C>(
     node: &Node<SE, PA>,
     cdata: &C,
-    request: proto::NodeRequest,
+    from: proto::NodeId,
+    body: proto::NodeRequestBody,
 ) -> anyhow::Result<proto::NodeResponseBody>
 where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
     C: Iterable<PA::ContextData>,
 {
-    match request.body {
+    match body {
         proto::NodeRequestBody::CommitTransaction { id, events } => commit_transaction(node, cdata, id, events).await,
         proto::NodeRequestBody::RegisterSchema { model } => {
             let cdata = cdata.iterable().exactly_one().map_err(|_| anyhow!("Only one cdata is permitted for RegisterSchema"))?;
@@ -150,7 +151,7 @@ where
         }
         proto::NodeRequestBody::GetEvents { event_ids } => Ok(get_events(node, cdata, event_ids).await?),
         proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
-            let peer_state = node.peers.connections.get(&request.from).ok_or_else(|| anyhow!("Peer {} not connected", request.from))?;
+            let peer_state = node.peers.connections.get(&from).ok_or_else(|| anyhow!("Peer {} not connected", from))?;
             // Catalog subscriptions carry no credential; others carry exactly one.
             let cdata = match cdata.iterable().at_most_one() {
                 Ok(cdata) => cdata,

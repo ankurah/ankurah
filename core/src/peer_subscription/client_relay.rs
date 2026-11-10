@@ -498,7 +498,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
                 RequestError::ServerError(_) => false,
-                RequestError::UnexpectedResponse(_) => false,
+                RequestError::UnexpectedResponse(_) | RequestError::UnreadableResponse(_) | RequestError::UnsupportedByPeer(_) => false,
                 RequestError::AccessDenied(_) => false,
                 RequestError::NodeNotReady | RequestError::NodeHalted(_) => false,
             },
