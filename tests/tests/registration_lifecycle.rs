@@ -880,10 +880,8 @@ async fn catalog_lookup_waits_for_subscription_delivery() -> anyhow::Result<()> 
     let (_connection, gate) = GatedConnection::new(&server, &client, move |message| {
         if matches!(
             message,
-            proto::NodeMessage::Response(proto::NodeResponse {
-                body: proto::NodeResponseBody::Get(_) | proto::NodeResponseBody::Fetch(_),
-                ..
-            })
+            proto::NodeMessage::Response(response)
+                if matches!(response.body.decode(), Ok(proto::NodeResponseBody::Get(_) | proto::NodeResponseBody::Fetch(_)))
         ) {
             observed_reads.fetch_add(1, Ordering::Relaxed);
         }

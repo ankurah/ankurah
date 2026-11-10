@@ -2,6 +2,7 @@
 uniffi::setup_scaffolding!();
 
 pub mod auth;
+pub mod carried_body;
 pub mod clock;
 pub mod domain_tag;
 mod encoding;
@@ -31,6 +32,7 @@ pub mod wasm;
 pub use ankurah_core_types::{ModelId, PropertyId, SystemModel, SystemProperty};
 
 pub use auth::*;
+pub use carried_body::*;
 pub use clock::*;
 pub use domain_tag::*;
 pub use encoding::UndecodableBytes;

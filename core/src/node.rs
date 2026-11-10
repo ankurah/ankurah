@@ -350,15 +350,12 @@ where
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
-        let request = proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: request_body };
-
         // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
         // follow-on uses #426's node session union for catalog queries.
-        let auth = if crate::schema::request_bypasses_policy(&request.body) {
-            Vec::new()
-        } else {
-            self.policy_agent.sign_request(self, cdata, &request)?
-        };
+        let bypasses_policy = crate::schema::request_bypasses_policy(&request_body);
+        let request =
+            proto::NodeRequest { id: request_id.clone(), to: node_id, from: self.id, body: proto::CarriedBody::encode(&request_body) };
+        let auth = if bypasses_policy { Vec::new() } else { self.policy_agent.sign_request(self, cdata, &request)? };
 
         {
             let connection = self.peers.connections.get(&node_id).ok_or(RequestError::PeerNotConnected)?;
@@ -388,7 +385,8 @@ where
         // Store the response channel
         connection.pending_updates.insert(id.clone(), response_tx);
 
-        let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body: notification });
+        let body = proto::CarriedBody::encode(&notification);
+        let notification = proto::NodeMessage::Update(proto::NodeUpdate { id, from: self.id, to: node_id, body });
 
         match connection.send_message(notification) {
             Ok(_) => {}

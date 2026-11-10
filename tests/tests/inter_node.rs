@@ -165,8 +165,8 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let (_conn, gate) = {
         let gate_query_id = gate_query_id.clone();
         GatedConnection::new(&server, &client, move |msg: &proto::NodeMessage| match msg {
-            proto::NodeMessage::Response(resp) => match &resp.body {
-                proto::NodeResponseBody::QuerySubscribed { query_id, .. } => Some(*query_id) == *gate_query_id.lock().unwrap(),
+            proto::NodeMessage::Response(resp) => match resp.body.decode() {
+                Ok(proto::NodeResponseBody::QuerySubscribed { query_id, .. }) => Some(query_id) == *gate_query_id.lock().unwrap(),
                 _ => false,
             },
             _ => false,

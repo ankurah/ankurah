@@ -94,10 +94,10 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
         id: ankurah_proto::RequestId::new(),
         to: node.id,
         from: ankurah_core::node::NodeKey::generate().node_id(),
-        body: ankurah_proto::NodeRequestBody::Fetch {
+        body: ankurah_proto::CarriedBody::encode(&ankurah_proto::NodeRequestBody::Fetch {
             selection: ankql::ast::Predicate::MemberOf(ankurah::ModelId::EntityId(ankurah::EntityId::random())).into(),
             known_matches: vec![],
-        },
+        }),
     };
 
     let result = agent.check_request(&node, &garbage_auth, &request).await;
