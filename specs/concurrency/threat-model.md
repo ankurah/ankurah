@@ -108,7 +108,7 @@ It does **not** buy (each on a named gap or agent responsibility):
   Attribution is partly structural, though not by the hash alone: a genesis hashes
   its minter's `Identity` into the entity id. Who committed or admitted an update is
   a signed fact only when the application's policy agent has the node attest it
-  (`proto/src/auth.rs`); core checks no attestation, and an agent opens the ones it
+  (`proto/src/attestation.rs`); core checks no attestation, and an agent opens the ones it
   cares about (C4-20).
 - **Equivocation resistance / DoS bound**: every forged concurrent event is a
   distinct genuine hash, so de-dup stops identical replays but not flooding of
@@ -186,7 +186,7 @@ bytes)` (byte for byte in specs/protocol/bytes.md section 4); recomputed from
 contents on every use, never read from the wire; a peer cannot present an event
 under an id its contents do not hash to.
 Trust tier: Byzantine-safe.
-Enforcing seam: `proto/src/data.rs` `EventId::from_genesis_parts` and
+Enforcing seam: `proto/src/event_id.rs` `EventId::from_genesis_parts` and
 `EventId::from_update_parts` (the hash) and `Event::id()`
 (recomputes on every call; no id field is stored or deserialized). `accumulator.rs`
 `accumulate` keys the DAG by `event.id()` and `retrieval.rs` `stage_event` keys
@@ -205,7 +205,7 @@ may project an event through any Model in the entity's canonical membership set
 without changing its `EventId`.
 Trust tier: Byzantine-safe as a hashing fact; the receiver validates the carried
 Model projection against canonical membership before using it for policy.
-Enforcing seam: `proto/src/data.rs` hashes the event body itself; it contains no
+Enforcing seam: `proto/src/event.rs` hashes the event body itself; it contains no
 Model field. `EntityDelta`, `SubscriptionUpdateItem`, and commit requests carry
 their `ModelId` projection separately.
 Falsifying attack (T1): deliver an event for entity E through Model X when E is
@@ -573,7 +573,7 @@ named ancestors; it does not prove *who* committed it or *whether they were allo
 genesis names its minter inside its id; any other fact about who committed, admitted
 or served something is a statement a node signs when its policy agent requests one.
 Trust tier: attestation-dependent by construction.
-Enforcing seam: `proto/src/auth.rs` defines the sealed attestation: a `Statement`
+Enforcing seam: `proto/src/attestation.rs` defines the sealed attestation: a `Statement`
 (attester `Identity`, subject naming the event or the state, kind, payload) carried as
 its exact bytes with the attester's signature over `ankurah.attestation.v1` and those
 bytes. `SealedAttestation::open` yields the statement only if the bytes decode and the
@@ -588,7 +588,7 @@ requires a recognised attester rejects it; a peer can always omit attestations o
 events that carry none. PermissiveAgent and JwtAgent request and check none.
 Test arm: `attestation::each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests`,
 `attestation::a_relaying_node_keeps_every_attestation_on_an_event_unchanged`, and in
-`ankurah-proto` `auth::tests::{a_changed_attester_subject_kind_or_payload_fails_the_signature,
+`ankurah-proto` `attestation::tests::{a_changed_attester_subject_kind_or_payload_fails_the_signature,
 an_event_subject_names_only_its_event}`.
 Status: enforced-by-design boundary: core seals and opens attestations, and an agent
 decides which to make and which to require (Finding 6, 274-B). Frames after the
@@ -621,7 +621,7 @@ hashes only; no peer-claimed monotone distance (depth or generation) is read fro
 wire and trusted.
 Trust tier: Byzantine-safe.
 Enforcing seam: structural absence. The comparison engine and LWW resolution read only
-parent edges and event ids; `Event` (`proto/src/data.rs`) carries no depth/generation
+parent edges and event ids; `Event` (`proto/src/event.rs`) carries no depth/generation
 field to trust. When #266 adds generations they must be "local, derived, never trusted
 from the wire"; this claim is the standing audit obligation for that work.
 Falsifying attack (T1): the Matrix depth CVE analogue (Finding 11): inject an event
@@ -730,7 +730,7 @@ assertion, not a wire arm, per the claim body).
 | C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |
 | C4-18 | `bridge_policy::test_event_bridge_respects_read_policy_on_send` | existing-suite |
 | C4-19 | none here (creation-event fork asymmetry is gap G-6; the remote-transaction path with a rejecting agent is owned by #243) | design-boundary |
-| C4-20 | `attestation::{each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests, a_relaying_node_keeps_every_attestation_on_an_event_unchanged}`; `ankurah-proto` `auth::tests` (a changed statement fails its signature, a moved one its subject check) | design-boundary: the arms pin the ability to seal, carry and open; requiring an attestation is the agent's |
+| C4-20 | `attestation::{each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests, a_relaying_node_keeps_every_attestation_on_an_event_unchanged}`; `ankurah-proto` `attestation::tests` (a changed statement fails its signature, a moved one its subject check) | design-boundary: the arms pin the ability to seal, carry and open; requiring an attestation is the agent's |
 | C4-21 | I-confluence boundary is a design assertion for #274 and a C3 conformance audit, not a wire arm (per the claim body) | design-boundary |
 | C4-22 | enforced by absence: `Event` carries no depth/generation field to forge; the forged-generation arm activates when #266 lands | design-boundary |
 | G-4 | `adversarial_wire::equivocation_flood_antichain_is_bounded` | gap-red-ignored (G-4, #246 / signature layer) |
