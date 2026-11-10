@@ -79,7 +79,7 @@ not signed (G-8).
 
 `PolicyAgent` (`core/src/policy.rs`) is the single authority surface, carrying the
 hooks that make peer input trustworthy: `validate_received_event`,
-`validate_received_state`, `check_event`, `check_read_event`,
+`validate_received_state`, `check_write_event`, `check_read_event`,
 `validate_causal_assertion`, `request_state_attestation`, and the read/write/collection gates.
 The **default agent is `PermissiveAgent`**, which trusts everything: the two
 `validate_received_*` and `validate_causal_assertion` return `Ok(())`,
@@ -550,30 +550,26 @@ Status: enforced as call sites. Note the DoS interaction: `collect_event_bridge`
 filters *after* the unbounded walk (C4-17), so a read-denied bridge still costs the
 full traversal.
 
-### 3.5 Local-commit policy claims
+### 3.5 Commit policy claims
 
-**C4-19. Local commit previews policy on a fork; remote creation events do not
-(PARTIAL / OPEN GAP).**
-Invariant (desired): before an event is committed, the PolicyAgent sees a clean
-before/after pair produced on a throwaway fork, so a rejected event never touches
-the canonical entity or storage.
+**C4-19. Every commit previews policy on a transaction-local fork.**
+Invariant: before an event is committed, the PolicyAgent sees a clean before/after pair
+produced on a throwaway fork, so a rejected event never touches the canonical entity or
+storage.
 Trust tier: attestation-dependent.
-Enforcing seam: `core/src/context.rs` `commit_local_trx` forks (`entity.snapshot`),
-applies the event to the fork, and calls `check_event(&entity_before, &forked, ..)`
-before real application, for all events. `core/src/node.rs`
-`commit_remote_transaction` does this **only for update events**: creation events
-(`event.is_entity_create() && entity.head().is_empty()`) are applied directly to the
-real entity and passed to `check_event` as both `entity_before` and `entity_after`,
-so a rejected creation event has already mutated the in-memory entity and the policy
-sees no genuine before-state.
+Enforcing seam: `transaction/local.rs` `Transaction::commit_with` and
+`transaction/remote.rs` `RemoteTransaction::add_event` each apply every event, a creation
+included, to a transaction-local fork from `RemoteTrxEntity::for_event`, which starts a
+creation with no resident entity registered until it commits, and call
+`check_write_event` with the entity as the transaction found it as `entity_before` and
+the fork after the event as `entity_after`. A refusal fails the commit, and poisons a
+remote transaction; a fork that is not committed changes no resident entity, and its
+storage transaction is dropped uncommitted.
 Falsifying attack (T2): send a creation event via the remote-transaction path that a
-real agent rejects, leaving the entity in a poisoned in-memory state (rejected but
-applied).
-Planned test arm: creation-rejection arm on the remote-transaction path asserting the
-entity is not mutated on rejection (currently fails; pins the #243 fix).
-Status: **partial. Open gap, issue #243** (interacting with #242, the fork-preview
-questions). Nil impact under PermissiveAgent; #274 answers the fork-preview design at
-the ingress seam. Gap G-6.
+real agent rejects, leaving the entity applied in memory or stored.
+Planned test arm: none yet: a remote creation a refusing agent rejects leaves no
+resident entity and stores nothing.
+Status: **enforced.** Nil impact under PermissiveAgent.
 
 ### 3.6 Convergence-boundary claims (what no ingress can enforce)
 
@@ -650,11 +646,11 @@ body):
 
 - **Byzantine-safe (13):** C4-01, C4-03, C4-04, C4-05, C4-06 (durable path), C4-07,
   C4-08, C4-09, C4-10, C4-12, C4-13, C4-21 (within the I-confluent boundary), C4-22.
-- **Attestation-dependent (4):** C4-14, C4-18, C4-19 (partial), C4-20.
+- **Attestation-dependent (4):** C4-14, C4-18, C4-19, C4-20.
 - **Trusted-peer / open gap (5):** C4-02 (attribution), C4-11 (batch set), C4-15,
   C4-16, C4-17.
 
-Open-gap claims C4-15, C4-16, C4-17, and C4-19 each name their owning issue/RFC and
+Open-gap claims C4-15, C4-16 and C4-17 each name their owning issue/RFC and
 their status honestly (open gap, not aspirational enforcement).
 
 ---
@@ -697,7 +693,6 @@ PermissiveAgent every security gap is moot, which is itself meta-gap G-0.
 | G-3 | No size/count limit on incoming event messages, and no bound on the `collect_event_bridge` backward walk (C4-17) | Medium DoS: memory exhaustion on receive (#246) or forced full-history serialization on serve (#247). Rated low in the issues; genuine under an adversarial peer. | #246, #247, closed by #274 (ingress size limits) |
 | G-4 | Equivocation / concurrency flooding: content-hash de-dup stops identical replays but not unbounded distinct valid concurrent events (C4-13) | High DoS: an adversary inflates the antichain and forces unbounded staging and deep/wide merges with no finite-harm bound. Unsigned hash-DAG CRDTs have no structural cap (lit review Finding 7, Blocklace). | #246/#274 (rate/quantity cap) or a signature-attribution layer; cross-referenced from #271 horizon |
 | G-5 | Deep-divergence rejection is error-shaped, not policy-shaped: a stale-but-honest branch and a forged deep branch both terminate in `BudgetExceeded` (C4-09) | Medium: no deterministic horizon; budget is the only backstop and its outcome is an anomaly, not a decision. The convergence risk is bounded because verdicts are grounded (C4-08), but the DoS/thrash surface is open. | #271 (rejection horizon) + #266 (generation distance) |
-| G-6 | `commit_remote_transaction` applies creation events to the real entity before the policy check (C4-19) | Medium with a real agent: a rejected creation event poisons in-memory state; policy sees no genuine before-state. No impact under PermissiveAgent. | #243, design answered by #274/#242 |
 | G-7 | `ValidatedEvent` (future) risks implying "globally valid"; only I-confluent, before(u)-local invariants are convergently enforceable (C4-21) | Documentation/design: if #274 lets validated ingress promise cross-entity uniqueness or referential integrity, it promises something no convergent rule can deliver (lit review Finding 3). | #274 (state the I-confluence boundary) |
 | G-8 | Durable-peer role rests on provenance, not on a recorded membership, a dialer presents before it knows who answers, and frames after the handshake are unsigned (C4-16) | Medium when chained with G-1: a configured peer is trusted as durable on its claim. Whoever answers at an address a node dials can use that node's presence at one other accepting node, and so be registered there under its id, and can sit between the two and alter frames. A registered peer cannot pass frames off as another's: a node handles a frame only on the connection of the peer the frame names as its sender. A peer that connects to the node can no longer claim the role; a durable id that registers again without the grant loses it at that moment, and requests to peers chosen as durable re-check the grant first, except the relay's unsubscribe notice, which carries no credentials and has no reply applied. | #459 (durable membership) + a dialer naming the node it expects at an address + signed frames after the handshake, deferred to a follow-up node identity change |
 | G-9 | The `CausalAssertion` attestation surface is defined but has no consumer; `validate_causal_assertion` is never called (Section 4) | Low today (unused), Medium latent: if a future optimization trusts a peer's asserted lineage relation without re-deriving it, a lying peer substitutes a false relation. | whichever workstream introduces relation-assertion shortcuts; must re-derive, not trust |
@@ -716,7 +711,8 @@ carries a doc comment citing its claim id(s).
 Status legend: **enforced-pass** (a green test pins current behavior);
 **gap-red-ignored** (an `#[ignore]`d red test pins what SHOULD happen and
 un-ignores when the owning issue lands); **existing-suite** (pinned by a green
-test outside this file); **design-boundary** (a documented property or a design
+test outside this file); **enforced** (enforced at the seams the claim names, with
+no arm pinning it yet); **design-boundary** (a documented property or a design
 assertion, not a wire arm, per the claim body).
 
 | Claim | Test `path::name` | Status |
@@ -734,12 +730,12 @@ assertion, not a wire arm, per the claim body).
 | C4-11 | `adversarial_wire::{forged_dangling_parent_is_contained, phantom_entity_is_evicted_on_failed_apply}`; `update_batch_containment::test_event_only_unknown_entity_does_not_poison_batch` | enforced-pass |
 | C4-12 | `adversarial_wire::phantom_entity_is_evicted_on_failed_apply` | enforced-pass |
 | C4-13 | TOCTOU atomicity is a concurrent-writer scenario owned by the C1 simulation; not a single-node wire arm | design-boundary |
-| C4-14 | `bridge_policy::test_event_bridge_events_are_policy_validated_on_receive`; `commit_atomicity` (check_event denial) | existing-suite |
+| C4-14 | `bridge_policy::test_event_bridge_events_are_policy_validated_on_receive`; `commit_atomicity` (check_write_event denial) | existing-suite |
 | C4-15 | `adversarial_wire::bfs_fetched_events_are_policy_validated` | gap-red-ignored (G-1, #244/#274) |
 | C4-16 | `peer_trust_tests::inbound_durable_claim_is_not_a_relay_target` (jwt-auth); `node::tests::identity` and `client_relay::tests::a_subscription_send_refuses_a_peer_whose_connection_lost_durable_trust` (core) | enforced-pass for the handshake and durable routing; frames after the handshake are unsigned (G-8) |
 | C4-17 | `adversarial_wire::oversized_event_batch_is_rejected` | gap-red-ignored (G-3, #246/#247) |
 | C4-18 | `bridge_policy::test_event_bridge_respects_read_policy_on_send` | existing-suite |
-| C4-19 | none here (creation-event fork asymmetry is gap G-6; the remote-transaction path with a rejecting agent is owned by #243) | design-boundary |
+| C4-19 | none yet (a remote creation a refusing agent rejects leaves no resident entity and stores nothing) | enforced |
 | C4-20 | `attestation::{each_node_that_checks_an_event_attaches_exactly_the_attestation_its_agent_requests, a_relaying_node_keeps_every_attestation_on_an_event_unchanged}`; `ankurah-proto` `attestation::tests` (a changed statement fails its signature, a moved one its subject check) | design-boundary: the arms pin the ability to seal, carry and unseal; requiring an attestation is the agent's |
 | C4-21 | I-confluence boundary is a design assertion for #274 and a C3 conformance audit, not a wire arm (per the claim body) | design-boundary |
 | C4-22 | enforced by absence: `Event` carries no depth/generation field to forge; the forged-generation arm activates when #266 lands | design-boundary |
