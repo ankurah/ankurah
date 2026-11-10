@@ -6,7 +6,10 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{domain_tag::DomainTag, encoding};
+use crate::{
+    domain_tag::DomainTag,
+    encoding::{self, UndecodableVariant},
+};
 use ankurah_core_types::ModelId;
 
 /// Ordered top-level mutations that make up one event's content, decoded: what
@@ -138,7 +141,10 @@ impl CarriedOperation {
     /// The operation these bytes encode.
     pub fn decode(&self) -> Result<Operation, UnreadableOperation> {
         match self {
-            Self::Bytes(bytes) => encoding::decode_exact(bytes).map_err(|error| UnreadableOperation::Undecodable(error.to_string())),
+            Self::Bytes(bytes) => encoding::decode_variant(bytes).map_err(|undecodable| match undecodable {
+                UndecodableVariant::Unknown { index } => UnreadableOperation::UnknownKind { index },
+                UndecodableVariant::Malformed(error) => UnreadableOperation::Malformed(error.to_string()),
+            }),
             Self::Erased(_) => Err(UnreadableOperation::Erased),
         }
     }
@@ -147,10 +153,13 @@ impl CarriedOperation {
 /// Why this build cannot read an operation an event carries.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum UnreadableOperation {
-    /// The bytes are not an operation this build can decode: a kind a later
-    /// build added, or a malformed encoding.
-    #[error("an operation this build cannot decode: {0}")]
-    Undecodable(String),
+    /// Bytes of an operation kind a later build added: a variant of [`Operation`] this build does not have.
+    #[error("an operation of kind {index}, which this build does not know")]
+    UnknownKind { index: u32 },
+    /// Bytes that do not decode as the operation kind they name, as this build reads that kind; a
+    /// membership variant a later build adds is one of these, since its kind is one this build knows.
+    #[error("an operation whose bytes do not decode: {0}")]
+    Malformed(String),
     /// Only the digest of the operation's bytes remains.
     #[error("an operation whose bytes were erased")]
     Erased,
@@ -223,9 +232,17 @@ mod tests {
         assert_eq!(erased.decode(), Err(UnreadableOperation::Erased));
         // Variant index 2, which no build of `Operation` defines yet.
         let unknown = CarriedOperation::Bytes(vec![2, 0, 0, 0, 7]);
-        assert!(matches!(unknown.decode(), Err(UnreadableOperation::Undecodable(_))));
+        assert_eq!(unknown.decode(), Err(UnreadableOperation::UnknownKind { index: 2 }));
         let carried = CarriedOperations(vec![CarriedOperation::encode(&membership()), unknown]);
-        assert!(matches!(carried.decode(), Err(UnreadableOperation::Undecodable(_))), "one unreadable operation fails the event's");
+        assert_eq!(carried.decode(), Err(UnreadableOperation::UnknownKind { index: 2 }), "one unreadable operation fails the event's");
+    }
+
+    /// Bytes that name a kind this build knows, or name none, are malformed when they do not decode.
+    #[test]
+    fn bytes_that_do_not_decode_as_a_known_kind_are_malformed() {
+        for bytes in [vec![], vec![1, 0, 0], vec![0, 0, 0, 0, 7], vec![1, 0, 0, 0, 0, 0, 0, 0]] {
+            assert!(matches!(CarriedOperation::Bytes(bytes.clone()).decode(), Err(UnreadableOperation::Malformed(_))), "{bytes:?}");
+        }
     }
 
     /// `Membership` index 1 is reserved for the variant that removes a membership, which no build reads yet.
@@ -234,14 +251,14 @@ mod tests {
         let CarriedOperation::Bytes(mut bytes) = CarriedOperation::encode(&membership()) else { unreachable!("encoding yields bytes") };
         // The operation's variant index, then the membership's.
         bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
-        assert!(matches!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::Undecodable(_))));
+        assert!(matches!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::Malformed(_))));
     }
 
     #[test]
     fn bytes_left_over_after_the_operation_make_it_unreadable() {
         let CarriedOperation::Bytes(mut bytes) = CarriedOperation::encode(&membership()) else { unreachable!("encoding yields bytes") };
         bytes.push(0);
-        assert!(matches!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::Undecodable(_))));
+        assert!(matches!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::Malformed(_))));
     }
 
     /// Variant order is part of the bincode contract for event payloads:

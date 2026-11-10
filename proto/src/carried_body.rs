@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::encoding;
+use crate::encoding::{self, UndecodableVariant};
 
 /// A body of kind `T` as its sender encoded it: length-prefixed bytes, so the frame that carries
 /// it, with its ids and addresses, decodes even when this build cannot read the body.
@@ -16,10 +16,16 @@ pub struct CarriedBody<T> {
     kind: PhantomData<fn() -> T>,
 }
 
-/// A body this build cannot decode: one of a kind a later build added, or a malformed encoding.
+/// Why this build cannot read a body.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("a body this build cannot decode: {0}")]
-pub struct UnreadableBody(pub String);
+pub enum UnreadableBody {
+    /// A body of a kind a later build added: a variant this build's body type does not have.
+    #[error("a body of kind {index}, which this build does not know")]
+    UnknownKind { index: u32 },
+    /// Bytes that do not decode as the body kind they name.
+    #[error("a body whose bytes do not decode: {0}")]
+    Malformed(String),
+}
 
 impl<T: Serialize + DeserializeOwned> CarriedBody<T> {
     /// `body`, encoded once to be carried.
@@ -27,7 +33,10 @@ impl<T: Serialize + DeserializeOwned> CarriedBody<T> {
 
     /// The body these bytes encode; bytes left over after it make it unreadable.
     pub fn decode(&self) -> Result<T, UnreadableBody> {
-        encoding::decode_exact(&self.bytes).map_err(|error| UnreadableBody(error.to_string()))
+        encoding::decode_variant(&self.bytes).map_err(|undecodable| match undecodable {
+            UndecodableVariant::Unknown { index } => UnreadableBody::UnknownKind { index },
+            UndecodableVariant::Malformed(error) => UnreadableBody::Malformed(error.to_string()),
+        })
     }
 }
 
@@ -72,11 +81,11 @@ mod tests {
 
     #[test]
     fn a_body_of_an_unknown_kind_or_with_bytes_left_over_is_unreadable() {
-        assert!(unknown_kind::<NodeRequestBody>().decode().is_err());
+        assert!(matches!(unknown_kind::<NodeRequestBody>().decode(), Err(UnreadableBody::UnknownKind { index: 99 })));
         let mut bytes = encode(&NodeRequestBody::Get { ids: vec![] });
         bytes.push(0);
         let trailing: CarriedBody<NodeRequestBody> = decode_exact(&encode(&bytes)).unwrap();
-        assert!(trailing.decode().is_err());
+        assert!(matches!(trailing.decode(), Err(UnreadableBody::Malformed(_))));
     }
 
     /// The ids and addresses a node needs to answer a request sit outside its body.

@@ -24,3 +24,67 @@ pub(crate) fn encode_into<T: Serialize + ?Sized>(bytes: &mut Vec<u8>, value: &T)
 
 /// The value `bytes` hold; bytes left over after it make them undecodable.
 pub(crate) fn decode_exact<T: DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> { options().deserialize(bytes) }
+
+/// Why bytes do not hold a value of an enum whose variants a later build may append.
+pub(crate) enum UndecodableVariant {
+    /// The bytes open with a variant index the enum does not have in this build.
+    Unknown { index: u32 },
+    /// The bytes do not hold a value of the variant they name, or hold bytes after it.
+    Malformed(bincode::Error),
+}
+
+/// The value of enum `T` that `bytes` hold, telling bytes of a variant this build does not know
+/// from malformed bytes.
+pub(crate) fn decode_variant<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, UndecodableVariant> {
+    decode_exact(bytes).map_err(|error| match bytes.first_chunk().map(|index| u32::from_le_bytes(*index)) {
+        Some(index) if variant_count::<T>().is_some_and(|count| index >= count) => UndecodableVariant::Unknown { index },
+        _ => UndecodableVariant::Malformed(error),
+    })
+}
+
+/// The number of variants the `Deserialize` of enum `T` knows, or `None` when `T` reads no enum.
+/// An enum's `Deserialize` opens by naming its variants to the deserializer; this one counts them
+/// and reads nothing.
+fn variant_count<T: DeserializeOwned>() -> Option<u32> {
+    match T::deserialize(VariantCounter) {
+        Err(Counted(count)) => count,
+        Ok(_) => None,
+    }
+}
+
+/// A deserializer that refuses every read, with the number of variants when asked for an enum.
+struct VariantCounter;
+
+/// The refusal [`VariantCounter`] gives: the variant count of the enum it was asked for, if any.
+#[derive(Debug)]
+struct Counted(Option<u32>);
+
+impl std::fmt::Display for Counted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str("a deserializer that only counts variants") }
+}
+
+impl std::error::Error for Counted {}
+
+impl serde::de::Error for Counted {
+    fn custom<M: std::fmt::Display>(_: M) -> Self { Self(None) }
+}
+
+impl<'de> serde::Deserializer<'de> for VariantCounter {
+    type Error = Counted;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(self, _: V) -> Result<V::Value, Counted> { Err(Counted(None)) }
+
+    fn deserialize_enum<V: serde::de::Visitor<'de>>(
+        self,
+        _: &'static str,
+        variants: &'static [&'static str],
+        _: V,
+    ) -> Result<V::Value, Counted> {
+        Err(Counted(u32::try_from(variants.len()).ok()))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf option unit unit_struct
+        newtype_struct seq tuple tuple_struct map struct identifier ignored_any
+    }
+}
