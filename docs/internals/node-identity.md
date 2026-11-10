@@ -99,11 +99,11 @@ entity's id:
 ```text
 operation digest = SHA-256(tag(operation) || the operation's bytes)
 genesis id = SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n)
-update id  = SHA-256(tag(event) || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent)
+update id  = SHA-256(tag(update) || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent)
 ```
 
 Every string Ankurah hashes or signs opens with a domain tag naming what the
-string is for: `ankurah.genesis.v1`, `ankurah.event.v1`,
+string is for: `ankurah.genesis.v1`, `ankurah.update.v1`,
 `ankurah.operation.v1`, `ankurah.presence.v1`, `ankurah.attestation.v1` or
 `ankurah.state.v1`, written as one length byte followed by the tag's bytes, so
 that a string made for one purpose can never be read as another's. The

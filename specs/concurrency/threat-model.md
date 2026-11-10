@@ -178,7 +178,7 @@ arm** (the C4 part-2 test that pins it), and **Status** (enforced | open gap (ow
 ### 3.1 Structural integrity claims (content addressing)
 
 **C4-01. Event identity is a verifiable content hash.**
-Invariant: an update's id equals `SHA-256(tag(event) || entity_id || nonce ||
+Invariant: an update's id equals `SHA-256(tag(update) || entity_id || nonce ||
 timestamp || count || digest_1 .. digest_n || parent)` and a genesis's id equals
 `SHA-256(tag(genesis) || minter || nonce || timestamp || count || digest_1 ..
 digest_n)`, where each digest is `SHA-256(tag(operation) || the operation's

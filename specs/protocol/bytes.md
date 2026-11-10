@@ -37,7 +37,7 @@ derivation takes a new tag; an existing tag never takes a new meaning.
 | Name | Tag | Encoded, hex |
 |---|---|---|
 | genesis | `ankurah.genesis.v1` | `12616e6b757261682e67656e657369732e7631` |
-| event | `ankurah.event.v1` | `10616e6b757261682e6576656e742e7631` |
+| update | `ankurah.update.v1` | `11616e6b757261682e7570646174652e7631` |
 | operation | `ankurah.operation.v1` | `14616e6b757261682e6f7065726174696f6e2e7631` |
 | presence | `ankurah.presence.v1` | `13616e6b757261682e70726573656e63652e7631` |
 | attestation | `ankurah.attestation.v1` | `16616e6b757261682e6174746573746174696f6e2e7631` |
@@ -213,7 +213,7 @@ them. An entity's id is the id of its genesis.
 ### 4.3 Update id
 
 ```text
-update id = SHA-256( tag(event) || entity_id || nonce || timestamp || count || digest_1 || ... || digest_n || parent )
+update id = SHA-256( tag(update) || entity_id || nonce || timestamp || count || digest_1 || ... || digest_n || parent )
 ```
 
 `entity_id` is the `EntityId` of the entity the update extends and `parent` the
@@ -270,10 +270,10 @@ operation carried as `Erased` with its digest.
 
 | Operations | Genesis id | Update id |
 |---|---|---|
-| none | `133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649` | `ea0c549736a30f74f83fc27165938ccd17ac57c5b955fe4a1347f74b32372aa8` |
-| membership | `9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a` | `e865a554005226a6dc65c5a8dc039f7d40cd2e658833e741bb6d3a149c0dfe7c` |
-| membership, backend | `0395ecaf7e93f57b19cf2098a8161c6c0c72b182ff1f5dfc8a0525359cd927a3` | `76c6835c83eb2aba276df5ad184fca20075a513a9140db37cc00e43e6cb63623` |
-| erased membership | `9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a` | `e865a554005226a6dc65c5a8dc039f7d40cd2e658833e741bb6d3a149c0dfe7c` |
+| none | `133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649` | `036ff81f4ba2285f3ccd38e0ad3232855a466bb6c0b9d6f0fd254a202180364e` |
+| membership | `9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a` | `c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8` |
+| membership, backend | `0395ecaf7e93f57b19cf2098a8161c6c0c72b182ff1f5dfc8a0525359cd927a3` | `342304016d7452fae948903da6bb928e9b69b3c460d1bdb49d69fbcead6e1b43` |
+| erased membership | `9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a` | `c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8` |
 
 State digest of the entity `[0x55; 32]` whose state buffers map `"lww"` to
 `010203`, whose memberships are `{ System(Model) }`, and whose head has one

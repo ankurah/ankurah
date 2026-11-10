@@ -11,7 +11,7 @@ pub enum DomainTag {
     /// A genesis event's id.
     Genesis,
     /// An update event's id.
-    Event,
+    Update,
     /// The digest of one operation's bytes.
     Operation,
     /// The claims a presence signature covers.
@@ -26,7 +26,7 @@ impl DomainTag {
     fn bytes(self) -> &'static [u8] {
         match self {
             Self::Genesis => b"ankurah.genesis.v1",
-            Self::Event => b"ankurah.event.v1",
+            Self::Update => b"ankurah.update.v1",
             Self::Operation => b"ankurah.operation.v1",
             Self::Presence => b"ankurah.presence.v1",
             Self::Attestation => b"ankurah.attestation.v1",
@@ -50,12 +50,12 @@ mod tests {
     use super::*;
 
     const ALL: [DomainTag; 6] =
-        [DomainTag::Genesis, DomainTag::Event, DomainTag::Operation, DomainTag::Presence, DomainTag::Attestation, DomainTag::State];
+        [DomainTag::Genesis, DomainTag::Update, DomainTag::Operation, DomainTag::Presence, DomainTag::Attestation, DomainTag::State];
 
     #[test]
     fn each_tag_is_these_exact_bytes() {
         assert_eq!(DomainTag::Genesis.encoded(), b"\x12ankurah.genesis.v1");
-        assert_eq!(DomainTag::Event.encoded(), b"\x10ankurah.event.v1");
+        assert_eq!(DomainTag::Update.encoded(), b"\x11ankurah.update.v1");
         assert_eq!(DomainTag::Operation.encoded(), b"\x14ankurah.operation.v1");
         assert_eq!(DomainTag::Presence.encoded(), b"\x13ankurah.presence.v1");
         assert_eq!(DomainTag::Attestation.encoded(), b"\x16ankurah.attestation.v1");

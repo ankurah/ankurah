@@ -19,7 +19,7 @@ impl EventId {
         Self::from_preimage(DomainTag::Genesis, &(minter, nonce, timestamp, operations.digests()))
     }
 
-    /// The id of an update event: SHA-256 over [`DomainTag::Event`], then the
+    /// The id of an update event: SHA-256 over [`DomainTag::Update`], then the
     /// entity id, nonce and timestamp, the operation count and each operation's
     /// digest, and the parent clock. Model projections stay outside the
     /// canonical event and its identity. The nonce is what makes an event id
@@ -31,7 +31,7 @@ impl EventId {
         operations: &CarriedOperations,
         parent: &Clock,
     ) -> Self {
-        Self::from_preimage(DomainTag::Event, &(entity_id, nonce, timestamp, operations.digests(), parent))
+        Self::from_preimage(DomainTag::Update, &(entity_id, nonce, timestamp, operations.digests(), parent))
     }
 
     /// SHA-256 over `tag`, then the encoding of `fields`.
@@ -173,22 +173,22 @@ mod tests {
             (
                 vec![],
                 "133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649",
-                "ea0c549736a30f74f83fc27165938ccd17ac57c5b955fe4a1347f74b32372aa8",
+                "036ff81f4ba2285f3ccd38e0ad3232855a466bb6c0b9d6f0fd254a202180364e",
             ),
             (
                 vec![membership.clone()],
                 "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
-                "e865a554005226a6dc65c5a8dc039f7d40cd2e658833e741bb6d3a149c0dfe7c",
+                "c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8",
             ),
             (
                 vec![membership, backend],
                 "0395ecaf7e93f57b19cf2098a8161c6c0c72b182ff1f5dfc8a0525359cd927a3",
-                "76c6835c83eb2aba276df5ad184fca20075a513a9140db37cc00e43e6cb63623",
+                "342304016d7452fae948903da6bb928e9b69b3c460d1bdb49d69fbcead6e1b43",
             ),
             (
                 vec![erased],
                 "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
-                "e865a554005226a6dc65c5a8dc039f7d40cd2e658833e741bb6d3a149c0dfe7c",
+                "c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8",
             ),
         ] {
             let operations = CarriedOperations(operations);
