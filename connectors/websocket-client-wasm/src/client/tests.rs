@@ -437,38 +437,33 @@ async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this
     assert!(matches!(outcome, futures::future::Either::Left(_)), "the openings were not answered within five seconds");
 }
 
-/// A later build may send a message or a peer message this build has no kind for.
+/// A later version may define a message, or a peer message, this build has no kind for: the
+/// client closes a connection whose server sends one.
 #[wasm_bindgen_test]
-async fn a_message_of_an_unknown_kind_after_the_handshake_is_ignored() {
+async fn a_message_of_an_unknown_kind_after_the_handshake_closes_the_connection() {
     mock_websockets();
     let _restore = RestoreWebSockets;
     let run = async {
-        let (node, client) = admitting_client();
-        let socket = socket_count();
-        client.connect().unwrap();
-        let server = NodeKey::from_seed([2; 32]);
-        let (opening, presence) = server_handshake(&server);
-        deliver(socket, &opening);
-        deliver(socket, &presence);
-        client.state.read().wait_for(|state| matches!(state, ConnectionState::Connected { .. })).await;
-
         // Variant 99 of `Message`, then variant 99 of `NodeMessage` inside a peer message.
-        deliver(socket, &[99, 0, 0, 0]);
-        deliver(socket, &[3, 0, 0, 0, 99, 0, 0, 0]);
-        let response = proto::NodeResponse {
-            request_id: proto::RequestId::new(),
-            from: server.node_id(),
-            to: node.id(),
-            body: proto::CarriedBody::encode(&proto::NodeResponseBody::Success),
-        };
-        deliver(socket, &proto::Message::PeerMessage(proto::NodeMessage::Response(response)).encode());
-        node.0.handled.read().wait_for(|count| *count == 1).await;
-        assert!(matches!(client.state.value(), ConnectionState::Connected { .. }));
-        assert!(!is_closed(socket));
+        for unknown in [&[99, 0, 0, 0][..], &[3, 0, 0, 0, 99, 0, 0, 0][..]] {
+            let (node, client) = admitting_client();
+            let socket = socket_count();
+            client.connect().unwrap();
+            let server = NodeKey::from_seed([2; 32]);
+            let (opening, presence) = server_handshake(&server);
+            deliver(socket, &opening);
+            deliver(socket, &presence);
+            client.state.read().wait_for(|state| matches!(state, ConnectionState::Connected { .. })).await;
+
+            deliver(socket, unknown);
+            client.state.read().wait_for(|state| matches!(state, ConnectionState::Error { .. })).await;
+            assert!(is_closed(socket), "{unknown:?}");
+            assert!(!node.0.published.value(), "the client deregistered the server");
+        }
     };
     futures::pin_mut!(run);
     let outcome = futures::future::select(run, Box::pin(sleep(Duration::from_secs(5)))).await;
-    assert!(matches!(outcome, futures::future::Either::Left(_)), "the connection did not keep working within five seconds");
+    assert!(matches!(outcome, futures::future::Either::Left(_)), "the connections were not closed within five seconds");
 }
 
 /// A server's refusal in place of its presence: the client reports it with the server's reason,

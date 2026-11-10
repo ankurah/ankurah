@@ -471,13 +471,14 @@ where
                 Self::handle_peer_message(inner, registration, node_msg).await;
                 Ok(MessageResult::Continue)
             }
-            Err(e) => {
-                if registration.is_none() {
-                    // A handshake we cannot read will never establish; close
-                    // instead of idling on a dead connection.
-                    return Err(anyhow!("failed to deserialize handshake message from {}: {}", inner.server_url, e));
-                }
-                warn!("Failed to deserialize message: {}", e);
+            // A message of a kind this node's version does not define closes the connection, and so
+            // does a handshake frame it cannot read, since that handshake will never establish.
+            Err(unreadable) if registration.is_none() || matches!(unreadable, proto::UnreadableFrame::UnknownKind { .. }) => {
+                error!("Closing the connection to {}: the server sent {unreadable}", inner.server_url);
+                Err(unreadable.into())
+            }
+            Err(unreadable) => {
+                warn!("Dropping a frame from {}: {unreadable}", inner.server_url);
                 Ok(MessageResult::Continue)
             }
         }

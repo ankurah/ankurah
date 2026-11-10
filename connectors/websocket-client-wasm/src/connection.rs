@@ -196,8 +196,8 @@ impl Connection {
             return self.answer_opening(&data);
         }
 
-        if let Ok(message) = proto::Message::decode(&data) {
-            match message {
+        match proto::Message::decode(&data) {
+            Ok(message) => match message {
                 proto::Message::Open(_) => warn!("Ignoring repeated opening from {}", self.url),
                 proto::Message::NoCommonVersion(theirs) => {
                     let refusal = PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs };
@@ -285,19 +285,19 @@ impl Connection {
                         }
                     });
                 }
-            }
-        } else {
-            let connecting = matches!(&*self.state.read().unwrap(), ConnectionState::Connecting { .. });
-            if connecting {
-                // A handshake we cannot read will never establish; close instead
-                // of idling on a dead connection.
-                let message = format!("Failed to deserialize handshake message from {}; closing", self.url);
+            },
+            // A message of a kind this node's version does not define closes the connection, and
+            // so does a handshake frame it cannot read, since that handshake will never establish.
+            Err(unreadable)
+                if matches!(unreadable, proto::UnreadableFrame::UnknownKind { .. })
+                    || matches!(&*self.state.read().unwrap(), ConnectionState::Connecting { .. }) =>
+            {
+                let message = format!("Server {} sent {unreadable}; closing", self.url);
                 error!("{}", message);
                 self.disconnect();
                 self.set_state(ConnectionState::Error { message, cause: None });
-            } else {
-                warn!("Failed to deserialize message from server");
             }
+            Err(unreadable) => warn!("Dropping a frame from server {}: {unreadable}", self.url),
         }
         None
     }

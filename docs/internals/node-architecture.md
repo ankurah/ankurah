@@ -122,7 +122,8 @@ read with `NodeResponseBody::Unsupported`, acknowledges such an update with
 `NodeUpdateAckBody::Unsupported`, and fails a request whose response it cannot
 read with `RequestError::UnreadableResponse`. A request its peer answers with
 `Unsupported` fails with `RequestError::UnsupportedByPeer`. A message of a kind
-it does not know at all is dropped and the connection stays up.
+its protocol version does not define at all closes the connection, and the
+connector logs the kind (`proto::UnreadableFrame::UnknownKind`).
 
 
 ## Subscription Propagation

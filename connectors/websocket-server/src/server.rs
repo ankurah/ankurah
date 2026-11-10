@@ -304,8 +304,8 @@ where
             if let Some(outcome) = read_opening(&d, client_ip, state, handshake_deadline).await {
                 return outcome;
             }
-            if let Ok(message) = proto::Message::decode(&d) {
-                match message {
+            match proto::Message::decode(&d) {
+                Ok(message) => match message {
                     proto::Message::Presence(presence) => match state {
                         Connection::Initial { socket, handshake } => {
                             if let (Some(socket), Some(handshake)) = (socket.take(), handshake.take()) {
@@ -341,14 +341,17 @@ where
                         }
                         warn!("Received an opening from {} after its presence - ignoring", client_ip);
                     }
+                },
+                // A message of a kind this node's version does not define closes the connection,
+                // and so does a handshake frame it cannot read, since that handshake will never
+                // establish.
+                Err(unreadable)
+                    if matches!(unreadable, proto::UnreadableFrame::UnknownKind { .. }) || matches!(state, Connection::Initial { .. }) =>
+                {
+                    error!("Closing peer at {client_ip}: it sent {unreadable}");
+                    return ControlFlow::Break(());
                 }
-            } else if let Connection::Initial { .. } = state {
-                // A peer whose handshake we cannot read will never establish;
-                // close instead of leaving the connection dangling.
-                error!("Failed to deserialize handshake message from {client_ip}; closing");
-                return ControlFlow::Break(());
-            } else {
-                error!("Failed to deserialize message from {}", client_ip);
+                Err(unreadable) => error!("Dropping a frame from {client_ip}: {unreadable}"),
             }
         }
         axum::extract::ws::Message::Text(t) => {

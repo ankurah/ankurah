@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::AuthData,
-    encoding,
+    encoding::{self, UndecodableVariant},
     identity::NodeId,
     peering::{Opening, Presence, ProtocolVersions},
     request::{NodeRequest, NodeResponse},
@@ -39,17 +39,41 @@ pub enum OpeningError {
     Undecodable(String),
 }
 
+/// Why a frame holds no message this build reads.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UnreadableFrame {
+    /// A message of a kind a later protocol version defines: a variant of [`Message`], or of the
+    /// [`NodeMessage`] a peer message holds, that this build does not have. `indices` are the
+    /// variant indices that name the kind, the message's first: `[5]` names a message kind,
+    /// `[3, 5]` a peer message kind.
+    #[error("a message of kind {indices:?}, which this build does not know")]
+    UnknownKind { indices: Vec<u32> },
+    /// Bytes that do not decode as the message kind they name, or bytes left over after it.
+    #[error("a frame whose bytes do not decode: {0}")]
+    Malformed(String),
+}
+
 // The variant indices of `Message::Open` and `Message::NoCommonVersion`, which open their frames
-// in every protocol version; the tests below pin them.
+// in every protocol version, and of `Message::PeerMessage`, whose `NodeMessage` a later version
+// may extend; the tests below pin them.
 const OPEN_INDEX: u32 = 0;
 const NO_COMMON_VERSION_INDEX: u32 = 1;
+const PEER_MESSAGE_INDEX: u32 = 3;
 
 impl Message {
     /// This message as a frame.
     pub fn encode(&self) -> Vec<u8> { encoding::encode(self) }
 
-    /// The message `frame` holds; bytes left over after it make the frame undecodable.
-    pub fn decode(frame: &[u8]) -> bincode::Result<Self> { encoding::decode_exact(frame) }
+    /// The message `frame` holds; bytes left over after it make the frame unreadable.
+    pub fn decode(frame: &[u8]) -> Result<Self, UnreadableFrame> {
+        encoding::decode_variant(frame).map_err(|undecodable| match undecodable {
+            UndecodableVariant::Unknown { index } => UnreadableFrame::UnknownKind { indices: vec![index] },
+            UndecodableVariant::Malformed(error) => match encoding::unknown_variant_within::<NodeMessage>(frame, PEER_MESSAGE_INDEX) {
+                Some(peer_message) => UnreadableFrame::UnknownKind { indices: vec![PEER_MESSAGE_INDEX, peer_message] },
+                None => UnreadableFrame::Malformed(error.to_string()),
+            },
+        })
+    }
 
     /// The opening a connection's first frame holds, read as every build reads one: past its first
     /// twelve bytes only when the sender shares a version with `spoken` (specs/protocol/bytes.md section 6).
@@ -257,6 +281,19 @@ mod tests {
         other_kind[0] = 2;
         for frame in [&open[..11], &open[..40], &other_kind[..], &open[..0]] {
             assert!(matches!(Message::read_opening(frame, versions(1, 1)), Err(OpeningError::Undecodable(_))), "{frame:?}");
+        }
+    }
+
+    /// A later version may add a kind of message, or of peer message; this build tells either from
+    /// a frame whose bytes do not decode.
+    #[test]
+    fn a_message_of_a_kind_this_build_does_not_know_is_told_from_a_malformed_frame() {
+        assert_eq!(Message::decode(&[99, 0, 0, 0]).unwrap_err(), UnreadableFrame::UnknownKind { indices: vec![99] });
+        assert_eq!(Message::decode(&[3, 0, 0, 0, 99, 0, 0, 0]).unwrap_err(), UnreadableFrame::UnknownKind { indices: vec![3, 99] });
+        let mut trailing = Message::Refused("not today".into()).encode();
+        trailing.push(0);
+        for frame in [&[3, 0, 0, 0, 4, 0, 0, 0][..], &[2, 0, 0, 0][..], &trailing[..], &[][..]] {
+            assert!(matches!(Message::decode(frame), Err(UnreadableFrame::Malformed(_))), "{frame:?}");
         }
     }
 }

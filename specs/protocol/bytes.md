@@ -443,6 +443,7 @@ Once both openings are read, the frames of the handshake follow in this order:
    node so signs nothing for a dialer it has not authenticated. When it will
    not register the dialer, or cannot sign its own presence, it sends
    `Refused` in place of its presence, leaves nothing registered, and closes.
+   An accepting node that has itself halted closes without sending a frame.
 3. The dialing side checks that presence and registers the accepting side, and
    only then counts the connection open. On `Refused` it registers nothing,
    reports the refusal with its reason, and closes; a dialer that dials again
@@ -452,6 +453,13 @@ Each side sends frames of variant 3 only after its own presence, and the
 dialing side only once it has registered the accepting side. A dialer's
 presence leaves before it knows who answers, so whoever answers can use it at
 one other accepting node.
+
+A receiver that reads, after the first frame, a frame of a `Message` variant
+its chosen version does not define, or a variant 3 frame whose `NodeMessage`
+variant that version does not define, closes the connection, during the
+handshake or after it, and logs the kind it could not read. A node therefore
+sends a variant a later version adds only on a connection whose chosen
+version defines it.
 
 Vectors. The opening offering versions 1 to 3, with the challenge issued by
 `Ed25519([0x77; 32])` with nonce `[0x88; 32]`:

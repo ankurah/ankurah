@@ -1,8 +1,8 @@
 //! The connection handshake through the websocket connectors: each side opens with the versions
 //! it speaks and its challenge, the client presents, the server registers the client and only
-//! then presents, and each side refuses what it cannot take; once connected, it ignores a message
-//! of a kind it does not know. Each test drives a real server from a raw socket, or a real client
-//! from a raw server.
+//! then presents, and each side refuses what it cannot take; before or after the handshake, it
+//! closes on a message of a kind it does not know. Each test drives a real server from a raw
+//! socket, or a real client from a raw server.
 
 use ankurah::core::connector::PeerConnectionError;
 use ankurah::core::node::{AnnouncementFailure, NodeKey, NodePlugin, PeerRefusal, PeerRegistration};
@@ -196,17 +196,25 @@ async fn the_server_ignores_unknown_feature_numbers_and_announcement_names() -> 
     Ok(())
 }
 
-/// A later build may send a message, or a peer message, of a kind this build does not know.
-#[tokio::test]
-async fn the_server_ignores_a_message_of_an_unknown_kind_and_keeps_the_connection() -> Result<()> {
-    let (server_node, server_url, server_task) = start_test_server().await?;
-    let mut client = RawClient::open(&server_url, SPOKEN).await?;
-    client.connect().await?;
+/// Variant 99 of `Message`, then variant 99 of `NodeMessage` inside a peer message: kinds a later
+/// version may define.
+const UNKNOWN_KINDS: [&[u8]; 2] = [&[99, 0, 0, 0], &[3, 0, 0, 0, 99, 0, 0, 0]];
 
-    // Variant 99 of `Message`, then variant 99 of `NodeMessage` inside a peer message.
-    client.socket.send(WsMessage::Binary(vec![99, 0, 0, 0].into())).await?;
-    client.socket.send(WsMessage::Binary(vec![3, 0, 0, 0, 99, 0, 0, 0].into())).await?;
-    assert!(request_answered(&mut client.socket, client.key.node_id(), server_node.id).await.is_some(), "the server answers a request");
+/// A message of a kind the server's version does not define closes the connection, whether it
+/// arrives in place of the client's presence or once the client is connected.
+#[tokio::test]
+async fn the_server_closes_a_connection_that_sends_a_message_of_a_kind_it_does_not_know() -> Result<()> {
+    let (server_node, server_url, server_task) = start_test_server().await?;
+    for unknown in UNKNOWN_KINDS {
+        let mut client = RawClient::open(&server_url, SPOKEN).await?;
+        client.socket.send(WsMessage::Binary(unknown.to_vec().into())).await?;
+        assert!(receive(&mut client.socket).await.is_none(), "the server closes a handshake that sent {unknown:?}");
+
+        let mut client = RawClient::open(&server_url, SPOKEN).await?;
+        client.connect().await?;
+        client.socket.send(WsMessage::Binary(unknown.to_vec().into())).await?;
+        assert!(request_answered(&mut client.socket, client.key.node_id(), server_node.id).await.is_none(), "{unknown:?}");
+    }
     server_task.abort();
     Ok(())
 }
@@ -497,10 +505,10 @@ async fn the_client_refuses_a_server_presence_that_does_not_repeat_the_offers_an
     Ok(())
 }
 
-/// The client connects to a server that names features and announces what it has no plugin for,
-/// and stays connected through messages of kinds it does not know: it answers a request sent after them.
+/// The client connects to a server that names features and announces what it has no plugin for:
+/// it answers a request sent after the server's presence.
 #[tokio::test]
-async fn the_client_ignores_unknown_features_announcements_and_message_kinds() -> Result<()> {
+async fn the_client_ignores_unknown_features_and_announcements() -> Result<()> {
     let (listener, node, client) = client_of_raw_server().await?;
     let server = NodeKey::generate();
     let (server_opening, server_frame) = opening_from(&server, SPOKEN);
@@ -512,11 +520,37 @@ async fn the_client_ignores_unknown_features_announcements_and_message_kinds() -
     socket.send(frame(&proto::Message::Presence(server.sign_presence(claims)))).await?;
     tokio::time::timeout(Duration::from_secs(5), client.wait_connected()).await??;
 
-    socket.send(WsMessage::Binary(vec![99, 0, 0, 0].into())).await?;
-    socket.send(WsMessage::Binary(vec![3, 0, 0, 0, 99, 0, 0, 0].into())).await?;
     assert!(request_answered(&mut socket, server.node_id(), node.id).await.is_some(), "the client answers a request");
     assert!(client.is_connected());
     client.shutdown().await?;
+    Ok(())
+}
+
+/// A message of a kind the client's version does not define closes the connection, whether it
+/// arrives in place of the server's presence or once the client is connected.
+#[tokio::test]
+async fn the_client_closes_a_connection_whose_server_sends_a_message_of_a_kind_it_does_not_know() -> Result<()> {
+    for unknown in UNKNOWN_KINDS {
+        let server = NodeKey::generate();
+        let (_, server_frame) = opening_from(&server, SPOKEN);
+        let (listener, _node, client) = client_of_raw_server().await?;
+        let (mut socket, _) = accept_client(&listener, server_frame.clone()).await;
+        client_presence(&mut socket).await;
+        socket.send(WsMessage::Binary(unknown.to_vec().into())).await?;
+        assert!(receive(&mut socket).await.is_none(), "the client closes a handshake that sent {unknown:?}");
+        client.shutdown().await?;
+
+        let (listener, node, client) = client_of_raw_server().await?;
+        let (mut socket, client_opening) = accept_client(&listener, server_frame).await;
+        client_presence(&mut socket).await;
+        let claims = claims_answering(&server, &client_opening, SPOKEN, true);
+        socket.send(frame(&proto::Message::Presence(server.sign_presence(claims)))).await?;
+        tokio::time::timeout(Duration::from_secs(5), client.wait_connected()).await??;
+        socket.send(WsMessage::Binary(unknown.to_vec().into())).await?;
+        assert!(request_answered(&mut socket, server.node_id(), node.id).await.is_none(), "{unknown:?}");
+        assert!(!client.is_connected());
+        client.shutdown().await?;
+    }
     Ok(())
 }
 
