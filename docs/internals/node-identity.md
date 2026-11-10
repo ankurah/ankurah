@@ -28,7 +28,7 @@ its identity lasts only as long as the process; a durable node built that way
 logs a notice saying so. A deployment that wants a durable node to keep its
 identity gives it a key through `Node::builder(..).durable().key(..)`, and
 `NodeKey::load_or_create` keeps the 32-byte seed in a file the embedder
-chooses.
+chooses; the example server keeps it beside its store.
 
 ## The Handshake
 
@@ -212,5 +212,6 @@ compared with.
 
 A websocket client stops when its node halts, so after a reset it reports
 `NodeHalted(Reset)` rather than the plugin's refusal; the host reacts to that
-halt as described above. The example bindings do so at start-up: they reset
-the halted node to wait for its wipe and start a fresh one on the store.
+halt as described above. The example bindings watch their node for its whole
+life: when a reset halts it, at start-up or later, they wait for the wipe and
+reload the page, which starts a fresh node on the wiped store.

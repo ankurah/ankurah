@@ -1,5 +1,5 @@
 use ankurah::signals::Get;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
+use ankurah::{policy::DEFAULT_CONTEXT as c, Node, NodeKey, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use ankurah_system_reset::{OnReseed, SystemReset};
 use ankurah_websocket_server::WebsocketServer;
@@ -14,12 +14,15 @@ async fn main() -> Result<()> {
     // initialize tracing
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
-    // Initialize storage engine
-    let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
+    // The store, and beside it the node's key, so a restart is the same node.
+    let dir = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?.join(".ankurah_example");
+    let storage = SledStorageEngine::with_path(dir.clone())?;
+    let key = NodeKey::load_or_create(dir.join("node.key"))?;
     // The server announces its seeding to every browser. It dials no durable peer, so the plugin
     // never judges one here.
     let node = Node::builder(Arc::new(storage), PermissiveAgent::new())
         .durable()
+        .key(key)
         .plug(SystemReset::<System, _>::new(OnReseed::Refuse, c))
         .build()?;
 
