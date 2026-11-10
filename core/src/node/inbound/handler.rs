@@ -137,7 +137,7 @@ where
                     continue;
                 }
 
-                if let Some(delta) = crate::node::delta::generate_entity_delta(node, &known_map, state, cdata).await? {
+                if let Some(delta) = crate::node::inbound::delta::generate_entity_delta(node, &known_map, state, cdata).await? {
                     deltas.push(delta);
                 }
             }

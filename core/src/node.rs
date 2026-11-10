@@ -27,7 +27,6 @@ use tracing::instrument;
 use tracing::{debug, info, warn};
 
 mod builder;
-pub(crate) mod delta;
 pub(crate) mod durable_peer;
 mod erased;
 pub(crate) mod event_admissibility;

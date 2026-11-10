@@ -521,7 +521,7 @@ Trust tier: currently trusted-peer (no bound at all).
 Enforcing seam: **none today.** `node_applier.rs` `apply_update`/`apply_delta_inner`
 accept arbitrarily large `Vec<EventFragment>`; `proto/src/request.rs`
 `DeltaContent`/`UpdateContent` carry unbounded event vectors. `collect_event_bridge`
-(`node/delta.rs`) walks the DAG backward with no depth or count bound (the comparison
+(`node/inbound/delta.rs`) walks the DAG backward with no depth or count bound (the comparison
 sub-step is capped at 100000, the walk is not), so a peer with a very old or empty
 head forces the durable node to serialize an entire entity history.
 Falsifying attack (T1): a huge `EventBridge`/`EventOnly` list to exhaust receiver
@@ -668,7 +668,7 @@ for a real PolicyAgent.
 | `transaction/remote.rs` `RemoteTransaction::add_event` (`check_write_event`) | authorizes a remote transaction's event; an `AttestationRequest` it returns has the node seal a statement about the event, stored on it | `PolicyAgent::check_write_event` | an unauthorized remote transaction is admitted, attested and persisted |
 | `transaction/local.rs` `Transaction::commit_with` (`check_write_event`) | authorizes a locally generated event on a fork; an `AttestationRequest` it returns has the node seal a statement about the event | `PolicyAgent::check_write_event` | a local event that policy should reject is attested and committed |
 | `node/identity/attestation.rs` `served_state` (fetch responses, subscription deltas, direct gets) | a durable node seals the statement `request_state_attestation` requests about a state it serves; `None` attaches none | `PolicyAgent::request_state_attestation` (requests) / `validate_received_state` (consumes downstream) | a peer accepts a state the origin never legitimately held; state authority is only as strong as the agent's recognition of the attester |
-| `node/inbound/handler.rs` `get_events` + `node/delta.rs` `collect_event_bridge` (`check_read_event`) | read-filters served events | `PolicyAgent::check_read_event` | events leak to an unauthorized reader (C4-18) |
+| `node/inbound/handler.rs` `get_events` + `node/inbound/delta.rs` `collect_event_bridge` (`check_read_event`) | read-filters served events | `PolicyAgent::check_read_event` | events leak to an unauthorized reader (C4-18) |
 | `PolicyAgent::validate_causal_assertion` (`CausalAssertion`) | would validate a peer's *claim* about lineage between two heads | **no consumer today** | defined but unused: `validate_causal_assertion` has zero call sites in core; `CausalAssertion`/`CausalAssertionFragment` (`proto/src/request.rs`) carry a `CausalRelation` + `AttestationSet` that nothing in the applier or comparison path consumes. If a future path trusts an asserted relation without re-deriving it, a lying peer substitutes a false `StrictDescends`/`Disjoint` for a real divergence. Gap G-9. |
 | `#271` sealed-prefix checkpoint (future) | a durable-tier attestation that a history prefix is canonical, carrying a genesis attestation so identity survives pruning | future `PolicyAgent` seal-validation | a lying seal lets a T3 durable node rewrite or amputate history below the seal, or forge the genesis binding so Disjoint detection accepts a foreign lineage. This is why #271 must justify sealing by *authority scope*, not by "everyone has it" (lit review Finding 4). |
 

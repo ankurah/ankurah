@@ -172,7 +172,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
                 continue;
             }
 
-            if let Some(delta) = crate::node::delta::generate_entity_delta(node, &known_map, state, credentials).await? {
+            if let Some(delta) = crate::node::inbound::delta::generate_entity_delta(node, &known_map, state, credentials).await? {
                 deltas.push(delta);
             }
         }

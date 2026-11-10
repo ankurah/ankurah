@@ -1,6 +1,7 @@
 //! What a node does with a frame from a registered peer.
 
 pub mod applier;
+pub(crate) mod delta;
 pub(crate) mod handler;
 mod schema_registration;
 
