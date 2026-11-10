@@ -119,8 +119,7 @@ async fn an_event_fetched_from_a_peer_after_a_reset_is_not_stored() {
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (sent, messages) = mpsc::channel();
-    let registration =
-        register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(peer, sent))).await.unwrap();
+    let registration = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await.unwrap();
     let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]));
     let event = proto::Event::genesis(
         key.node_id().identity(),

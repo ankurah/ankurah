@@ -1172,12 +1172,11 @@ mod tests {
         use crate::test_utils::TestStorage;
 
         #[derive(Clone)]
-        struct Recorder(NodeId, std::sync::mpsc::Sender<proto::NodeMessage>);
+        struct Recorder(std::sync::mpsc::Sender<proto::NodeMessage>);
         impl PeerSender for Recorder {
             fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-                self.1.send(message).map_err(|_| SendError::ConnectionClosed)
+                self.0.send(message).map_err(|_| SendError::ConnectionClosed)
             }
-            fn recipient_node_id(&self) -> NodeId { self.0 }
             fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
         }
 
@@ -1187,7 +1186,7 @@ mod tests {
         let (handshake, theirs) = opened_handshakes(client.id, server.id);
         let presence = server.presence(&theirs).await.unwrap();
         let (sent, _messages) = std::sync::mpsc::channel();
-        client.register_peer(presence, &handshake, PeerProvenance::Configured, Box::new(Recorder(server.id, sent))).await.unwrap();
+        client.register_peer(presence, &handshake, PeerProvenance::Configured, Box::new(Recorder(sent))).await.unwrap();
 
         let model = ModelId::EntityId(EntityId::from_bytes([9; 32]));
         let (entered, entered_rx) = tokio::sync::oneshot::channel();
@@ -1208,7 +1207,7 @@ mod tests {
         let (handshake, theirs) = opened_handshakes(client.id, server.id);
         let relayed = server.presence(&theirs).await.unwrap();
         let (relayer_sent, relayer_messages) = std::sync::mpsc::channel();
-        let relayer = Box::new(Recorder(server.id, relayer_sent));
+        let relayer = Box::new(Recorder(relayer_sent));
         client.register_peer(relayed, &handshake, PeerProvenance::Inbound, relayer).await.unwrap();
 
         release.send(()).unwrap();

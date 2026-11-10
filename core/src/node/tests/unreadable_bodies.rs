@@ -19,8 +19,7 @@ async fn node_with_peer() -> (Node<TestStorage, PermissiveAgent>, ConnectionRegi
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let key = NodeKey::generate();
     let (sent, messages) = mpsc::channel();
-    let registration =
-        register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(key.node_id(), sent))).await.unwrap();
+    let registration = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(sent))).await.unwrap();
     (node, registration, messages)
 }
 

@@ -51,7 +51,6 @@ async fn catalog_states(node: &TestNode) -> anyhow::Result<Vec<proto::Attested<p
 
 #[derive(Clone)]
 struct ReplySender {
-    peer: proto::NodeId,
     tx: mpsc::UnboundedSender<proto::NodeMessage>,
 }
 
@@ -59,7 +58,6 @@ impl PeerSender for ReplySender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         self.tx.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.peer }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -104,11 +102,10 @@ async fn anonymous_registration_cannot_mutate_catalog_locally_or_over_wire() -> 
     assert_eq!(catalog_states(&node).await?, before, "no model, reference target, property, or membership may be persisted");
 
     let key = NodeKey::generate();
-    let peer = key.node_id();
     let (tx, mut replies) = mpsc::unbounded_channel();
     let (handshake, claims) = keyed_peer_claims(node.id, &key, false);
     let registration =
-        node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
+        node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(ReplySender { tx })).await?;
     let model = proto::RegisterModel::from(RegistrationRecord::descriptor());
     let response = wire_register(&node, registration, &mut replies, proto::AuthData::default(), model.clone()).await?;
     assert!(
@@ -153,11 +150,10 @@ async fn signed_registration_cannot_change_policy_membership_optionality() -> an
     tokio::time::timeout(Duration::from_secs(20), async {
         let node = setup().await?;
         let key = NodeKey::generate();
-        let peer = key.node_id();
         let (tx, mut replies) = mpsc::unbounded_channel();
         let (handshake, claims) = keyed_peer_claims(node.id, &key, false);
         let registration =
-            node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(ReplySender { peer, tx })).await?;
+            node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(ReplySender { tx })).await?;
         let claims = common::make_claims("editor", &["Editor"], "editor@example.com");
         let auth = proto::AuthData(common::sign_token(&common::test_keys(), &claims).into_bytes());
         let model = proto::RegisterModel::from(Role::descriptor());
@@ -244,8 +240,8 @@ async fn registration_completes_before_catalog_delivery() -> anyhow::Result<()> 
         let client = Node::new(Arc::new(SledStorageEngine::new_test()?), agent);
         let (server_tx, mut server_rx) = mpsc::unbounded_channel();
         let (client_tx, mut client_rx) = mpsc::unbounded_channel();
-        let to_server = Box::new(ReplySender { peer: server.id, tx: server_tx });
-        let to_client = Box::new(ReplySender { peer: client.id, tx: client_tx });
+        let to_server = Box::new(ReplySender { tx: server_tx });
+        let to_client = Box::new(ReplySender { tx: client_tx });
         let (server_registration, client_registration) = register_each_other(&client, &server, to_server, to_client).await?;
 
         let held = Arc::new(Mutex::new(None::<Vec<proto::NodeMessage>>));

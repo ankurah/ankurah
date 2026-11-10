@@ -44,8 +44,8 @@ impl SimNode {
     /// installing a `SimSender` on each side so anything one sends the other is captured for the
     /// scheduler.
     pub async fn connect(&self, peer: &SimNode) {
-        let to_peer = Box::new(SimSender::new(self.index, peer.id(), self.captured.clone()));
-        let to_self = Box::new(SimSender::new(peer.index, self.id(), peer.captured.clone()));
+        let to_peer = Box::new(SimSender::new(self.index, self.captured.clone()));
+        let to_self = Box::new(SimSender::new(peer.index, peer.captured.clone()));
         let (ours, theirs) = ankurah_connector_local_process::register_each_other(&self.node, &peer.node, to_peer, to_self)
             .await
             .expect("sim peers register each other");

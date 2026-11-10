@@ -60,7 +60,6 @@ impl PeerSender for WebSocketClientSender {
         let server_message = proto::Message::PeerMessage(message);
         self.send_message(server_message)
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.inner.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

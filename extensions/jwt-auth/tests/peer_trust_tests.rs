@@ -20,7 +20,6 @@ pub struct Post {
 
 #[derive(Clone)]
 struct RecordingSender {
-    peer: proto::NodeId,
     sent: mpsc::Sender<proto::NodeMessage>,
 }
 
@@ -28,7 +27,6 @@ impl PeerSender for RecordingSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
         self.sent.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.peer }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -64,10 +62,9 @@ async fn inbound_durable_claim_is_not_a_relay_target() -> anyhow::Result<()> {
     node.wait_ready().await?;
 
     let key = NodeKey::generate();
-    let peer = key.node_id();
     let (sent, relayed) = mpsc::channel();
     let (handshake, claims) = keyed_peer_claims(node.id, &key, true);
-    node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(RecordingSender { peer, sent })).await?;
+    node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(RecordingSender { sent })).await?;
     let durable_peers = node.get_durable_peers();
 
     let root = node.context_async(JwtContext::system()).await?;

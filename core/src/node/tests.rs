@@ -14,22 +14,20 @@ mod reset;
 mod unreadable_bodies;
 
 #[derive(Clone)]
-struct ClosedSender(proto::NodeId);
+struct ClosedSender;
 
 impl PeerSender for ClosedSender {
     fn send_message(&self, _: proto::NodeMessage) -> Result<(), SendError> { Err(SendError::ConnectionClosed) }
-    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
 #[derive(Clone)]
-struct RecordingSender(proto::NodeId, std::sync::mpsc::Sender<proto::NodeMessage>);
+struct RecordingSender(std::sync::mpsc::Sender<proto::NodeMessage>);
 
 impl PeerSender for RecordingSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
-        self.1.send(message).map_err(|_| SendError::ConnectionClosed)
+        self.0.send(message).map_err(|_| SendError::ConnectionClosed)
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.0 }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -214,8 +212,7 @@ async fn disconnect_releases_pending_requests() {
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (sent, _messages) = std::sync::mpsc::channel();
-    let registration =
-        register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent))).await.unwrap();
+    let registration = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(sent))).await.unwrap();
     let request = node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
     tokio::pin!(request);
     assert!(futures::poll!(&mut request).is_pending());
@@ -234,7 +231,7 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     transaction.commit().await.unwrap();
     let key = NodeKey::generate();
     let peer = key.node_id();
-    let registration = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(ClosedSender(peer))).await.unwrap();
+    let registration = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(ClosedSender)).await.unwrap();
 
     let model = ModelId::System(proto::SystemModel::Model);
     let (entered, entered_rx) = oneshot::channel();
@@ -264,7 +261,7 @@ async fn a_halted_node_asked_to_read_from_a_peer_reports_its_halt() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
     let key = NodeKey::generate();
     let (sent, _) = std::sync::mpsc::channel();
-    register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await.unwrap();
+    register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await.unwrap();
     let reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
     let cdata = vec![DEFAULT_CONTEXT];
     let selection = ankql::ast::Selection::<Resolved> {

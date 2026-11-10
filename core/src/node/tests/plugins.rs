@@ -94,7 +94,7 @@ async fn plugins_are_asked_in_the_order_plugged_and_the_first_refusal_stops_the_
     ]);
     let key = NodeKey::generate();
     let (sent, _) = mpsc::channel();
-    let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
+    let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await;
     let refusal = PeerRefusal { plugin: "second", reason: "the probe refuses".into() };
     assert_eq!(refused, Err(PeerConnectionError::Refused(refusal)));
     assert_eq!(asked.plugins(), ["first", "second"]);
@@ -106,7 +106,7 @@ async fn a_refused_peer_is_in_no_peer_map_and_receives_nothing() {
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (sent, messages) = mpsc::channel();
-    let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(peer, sent))).await;
+    let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await;
     assert!(matches!(refused, Err(PeerConnectionError::Refused(_))));
 
     assert_eq!(node.granted_trust(&peer), None);
@@ -129,7 +129,7 @@ async fn an_accepted_peer_registers_as_before_and_each_plugin_sees_its_registrat
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (sent, _) = mpsc::channel();
-    register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(peer, sent))).await.unwrap();
+    register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await.unwrap();
 
     assert_eq!(node.granted_trust(&peer), Some(PeerTrust { durable: true }));
     assert_eq!(node.get_durable_peers(), vec![peer]);
@@ -161,7 +161,7 @@ async fn an_announcement_reaches_the_peers_plugin_of_the_same_name_inside_the_si
     assert!(presence.signature_is_valid());
 
     let (sent, _) = mpsc::channel();
-    receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(announcer.id, sent))).await.unwrap();
+    receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(sent))).await.unwrap();
     let announcements: Vec<_> = asked.0.lock().unwrap().iter().map(|asked| (asked.plugin, asked.announcement.clone())).collect();
     assert_eq!(announcements, [("shared", Some(vec![1, 2, 3])), ("only-on-the-receiver", None)]);
 }
@@ -177,7 +177,7 @@ async fn an_announcement_changed_after_signing_fails_the_presence_signature_befo
     let mut presence = announcer.presence(&theirs).await.unwrap();
     presence.claims.announcements.insert("shared".into(), vec![4]);
     let (sent, _) = mpsc::channel();
-    let refused = receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(announcer.id, sent))).await;
+    let refused = receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::InvalidSignature(announcer.id)));
     assert!(asked.plugins().is_empty());
 }
@@ -189,7 +189,7 @@ async fn a_plugin_that_resets_its_node_and_refuses_returns_its_refusal() {
     let node = node_with([probe("resetter", Answer::ResetThenRefuse, &AskedLog::default())]);
     let key = NodeKey::generate();
     let (sent, _) = mpsc::channel();
-    let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
+    let refused = register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::Refused(PeerRefusal { plugin: "resetter", reason: "the probe refuses".into() })));
     assert_eq!(node.state().value(), NodeState::Halted(NodeHaltReason::Reset));
     assert_eq!(node.granted_trust(&key.node_id()), None);
@@ -245,15 +245,13 @@ async fn a_peer_is_not_registered_on_a_node_halted_before_or_while_its_plugins_a
     let reason = halted.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
     let key = NodeKey::generate();
     let (sent, _) = mpsc::channel();
-    let refused =
-        register_keyed_peer(&halted, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
+    let refused = register_keyed_peer(&halted, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::NodeHalted(reason)));
     assert!(asked.plugins().is_empty(), "no plugin is asked on a halted node");
 
     let resetting = Node::builder(Arc::new(TestStorage::default()), PermissiveAgent::new()).plug(ResetThenAccept).build().unwrap();
     let (sent, messages) = mpsc::channel();
-    let refused =
-        register_keyed_peer(&resetting, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
+    let refused = register_keyed_peer(&resetting, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::NodeHalted(NodeHaltReason::Reset)));
     assert_eq!(resetting.granted_trust(&key.node_id()), None);
     assert_eq!(messages.try_iter().count(), 0, "nothing was sent to the peer");

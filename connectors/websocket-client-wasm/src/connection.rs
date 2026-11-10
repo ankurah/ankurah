@@ -224,8 +224,7 @@ impl Connection {
                             // registered (or that registration is about to refuse).
                             let weak = Arc::downgrade(&self.0);
                             let node = self.node.cloned();
-                            let server = server_presence.claims.node_id;
-                            let sender = Box::new(WebSocketPeerSender { recipient_node_id: server, ws: SendWrapper::new(self.ws.clone()) });
+                            let sender = Box::new(WebSocketPeerSender { ws: SendWrapper::new(self.ws.clone()) });
                             return Some(
                                 async move {
                                     let registered =
@@ -399,7 +398,6 @@ impl PartialEq for Connection {
 
 #[derive(Clone)]
 struct WebSocketPeerSender {
-    recipient_node_id: proto::NodeId,
     ws: SendWrapper<Arc<WebSocket>>,
 }
 
@@ -417,8 +415,6 @@ impl PeerSender for WebSocketPeerSender {
             }
         }
     }
-
-    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

@@ -13,7 +13,6 @@ use ankurah_core::node::{ConnectionRegistration, Node, WeakNode};
 /// Sender for local process connection
 pub struct LocalProcessSender {
     sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::NodeId,
 }
 
 #[async_trait]
@@ -22,8 +21,6 @@ impl PeerSender for LocalProcessSender {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
-
-    fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
@@ -57,8 +54,8 @@ where
     pub async fn new(node1: &Node<SE1, PA1>, node2: &Node<SE2, PA2>) -> anyhow::Result<Self> {
         let (node1_tx, node1_rx) = mpsc::channel(1024);
         let (node2_tx, node2_rx) = mpsc::channel(1024);
-        let to_node2 = Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id });
-        let to_node1 = Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id });
+        let to_node2 = Box::new(LocalProcessSender { sender: node2_tx });
+        let to_node1 = Box::new(LocalProcessSender { sender: node1_tx });
         let (registration1, registration2) = register_each_other(node1, node2, to_node2, to_node1).await?;
 
         let receiver1_task = Self::setup_receiver(node1.clone(), registration1, node2.state(), node1_rx);

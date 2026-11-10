@@ -64,7 +64,6 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 struct GatedSender {
     sender: mpsc::Sender<proto::NodeMessage>,
-    node_id: proto::NodeId,
 }
 
 #[async_trait::async_trait]
@@ -73,7 +72,6 @@ impl PeerSender for GatedSender {
         self.sender.try_send(message).map_err(|_| SendError::ConnectionClosed)?;
         Ok(())
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.node_id }
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
 
@@ -157,8 +155,8 @@ impl GatedConnection {
     {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
-        let to_gated = Box::new(GatedSender { sender: gated_tx, node_id: gated.id });
-        let to_other = Box::new(GatedSender { sender: other_tx, node_id: other.id });
+        let to_gated = Box::new(GatedSender { sender: gated_tx });
+        let to_other = Box::new(GatedSender { sender: other_tx });
         let (other_registration, gated_registration) =
             ankurah_connector_local_process::register_each_other(other, gated, to_gated, to_other)
                 .await

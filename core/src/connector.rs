@@ -51,8 +51,6 @@ pub enum PeerProvenance {
 #[async_trait]
 pub trait PeerSender: Send + Sync {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError>;
-    /// The node ID of the recipient of this message
-    fn recipient_node_id(&self) -> proto::NodeId;
     fn cloned(&self) -> Box<dyn PeerSender>;
 }
 
