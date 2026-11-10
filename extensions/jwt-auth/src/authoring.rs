@@ -9,7 +9,7 @@ use ankurah_core::schema::registration::RegistrationPlan;
 use ankurah_core::schema::resolver::{resolve_selection, ModelResolutionError, ModelResolver, ResolvedProperty};
 use ankurah_core_types::ValueType;
 
-use crate::{bound_predicate::BoundPredicate, graph::PolicyGraph, model::*, PolicyCatalog, PolicyConfig};
+use crate::{bound_predicate::BoundPredicate, graph::PolicyGraph, model::*, PolicyAuthoringError, PolicyCatalog, PolicyConfig};
 
 /// Replace rule entities in one transaction, retaining role/privilege identities and retiring old rules.
 pub(crate) async fn set_policy(context: &Context, catalog: &CatalogManager, config: &PolicyConfig, pem: String) -> anyhow::Result<()> {
@@ -86,7 +86,9 @@ pub(crate) async fn set_policy(context: &Context, catalog: &CatalogManager, conf
         let mut property_labels = BTreeSet::new();
         for scope in &rule.scope {
             let (parsed, _) = crate::variables::parse_template(&scope.filter)?;
-            collect_property_labels(&parsed, label, &mut property_labels);
+            collect_property_labels(&parsed, label, &mut property_labels).map_err(|component| {
+                PolicyAuthoringError::QualifiedScopeProperty { model: label.clone(), filter: scope.filter.clone(), component }
+            })?;
             let row = PolicyScope {
                 policy: policy.into(),
                 filter: scope.filter.clone(),
@@ -300,36 +302,40 @@ impl PolicyCatalog for RegistrationCatalog<'_> {
     }
 }
 
-fn collect_property_labels(predicate: &Predicate<Parsed>, model: &str, labels: &mut BTreeSet<String>) {
-    predicate.walk((), &mut |(), predicate| match predicate {
-        Predicate::Comparison { left, right, .. } => {
-            collect_expr_labels(left, model, labels);
-            collect_expr_labels(right, model, labels);
+/// Collect the property names a scope filter reads, or the first `Component::` qualifier it writes.
+fn collect_property_labels(predicate: &Predicate<Parsed>, model: &str, labels: &mut BTreeSet<String>) -> Result<(), String> {
+    predicate.walk(Ok(()), &mut |result, predicate| {
+        result?;
+        match predicate {
+            Predicate::Comparison { left, right, .. } => {
+                collect_expr_labels(left, model, labels)?;
+                collect_expr_labels(right, model, labels)
+            }
+            Predicate::IsNull(expr) => collect_expr_labels(expr, model, labels),
+            _ => Ok(()),
         }
-        Predicate::IsNull(expr) => collect_expr_labels(expr, model, labels),
-        _ => {}
-    });
+    })
 }
 
-fn collect_expr_labels(expr: &Expr<Parsed>, model: &str, labels: &mut BTreeSet<String>) {
+fn collect_expr_labels(expr: &Expr<Parsed>, model: &str, labels: &mut BTreeSet<String>) -> Result<(), String> {
     match expr {
         Expr::Path(path) => {
+            if let Some(component) = &path.component {
+                return Err(component.clone());
+            }
             let index = usize::from(path.steps.len() > 1 && path.steps[0] == model);
             if let Some(name) = path.steps.get(index).filter(|name| *name != "id") {
                 labels.insert(name.clone());
             }
+            Ok(())
         }
-        Expr::ExprList(items) => {
-            for item in items {
-                collect_expr_labels(item, model, labels);
-            }
-        }
+        Expr::ExprList(items) => items.iter().try_for_each(|item| collect_expr_labels(item, model, labels)),
         Expr::InfixExpr { left, right, .. } => {
-            collect_expr_labels(left, model, labels);
-            collect_expr_labels(right, model, labels);
+            collect_expr_labels(left, model, labels)?;
+            collect_expr_labels(right, model, labels)
         }
         Expr::Predicate(predicate) => collect_property_labels(predicate, model, labels),
-        _ => {}
+        _ => Ok(()),
     }
 }
 

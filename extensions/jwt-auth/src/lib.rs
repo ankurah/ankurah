@@ -27,7 +27,7 @@ pub use catalog::PolicyCatalog;
 pub use claims::{parse_claims_unverified, JwtClaims};
 pub use config::{PolicyConfig, ScopeRule, ScopeRuleOp};
 pub use context::JwtContext;
-pub use error::AuthError;
+pub use error::{AuthError, PolicyAuthoringError};
 pub use jwt_simple::prelude::Duration;
 pub use keys::{JwtKeys, SigningKeys};
 pub use model::*;
