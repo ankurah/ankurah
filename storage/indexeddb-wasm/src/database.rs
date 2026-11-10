@@ -44,7 +44,8 @@ pub struct Connection {
 }
 
 impl Database {
-    pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
+    /// Open the database `db_name`, refusing one of another format with a [`StoreFormatError`].
+    pub async fn open(db_name: &str) -> anyhow::Result<Self> {
         let connection = Connection::open(db_name).await?;
 
         let database = Self(Arc::new(Inner {
@@ -53,7 +54,8 @@ impl Database {
             // _callbacks: SendWrapper::new(Vec::new()), // Callbacks are now stored in Connection
             index_cache: SafeSet::new(),
         }));
-        database.check_store_format().await?;
+        // A storage failure while checking, then the refusal of a store of another format.
+        database.check_store_format().await??;
         Ok(database)
     }
 
@@ -69,7 +71,7 @@ impl Database {
     ///   record existed).
     ///
     /// The refusal paths write nothing.
-    async fn check_store_format(&self) -> Result<(), RetrievalError> {
+    async fn check_store_format(&self) -> Result<Result<(), StoreFormatError>, RetrievalError> {
         let mut connection = self.0.connection.lock().await;
 
         // A database from before the `_ankurah_meta` store existed carries no record at
@@ -78,7 +80,7 @@ impl Database {
         // upgrade and falls through to be recorded below.
         if !connection.db.object_store_names().contains("_ankurah_meta") {
             if has_ankurah_data(&connection.db).await? {
-                return Err(self.store_format_refusal(None));
+                return Ok(Err(self.store_format_refusal(None)));
             }
             let current_version = connection.version();
             connection.close();
@@ -97,16 +99,16 @@ impl Database {
                 // No record. Existing ankurah data makes this a store from before format records;
                 // an empty database is recorded here and proceeds.
                 if has_ankurah_data(&db).await? {
-                    return Err(self.store_format_refusal(None));
+                    return Ok(Err(self.store_format_refusal(None)));
                 }
                 write_store_format_version(&db).await?;
-                return Ok(());
+                return Ok(Ok(()));
             }
 
-            match found.as_f64() {
+            Ok(match found.as_f64() {
                 Some(version) if version == f64::from(STORE_FORMAT_VERSION) => Ok(()),
                 _ => Err(self.store_format_refusal(Some(found))),
-            }
+            })
         })
         .await
     }
@@ -114,7 +116,7 @@ impl Database {
     /// The refusal of a store of another format. `found` is the raw stored
     /// record; `None` means the database carries ankurah data but no record at
     /// all (a store from before format records).
-    fn store_format_refusal(&self, found: Option<JsValue>) -> RetrievalError {
+    fn store_format_refusal(&self, found: Option<JsValue>) -> StoreFormatError {
         let expected = STORE_FORMAT_VERSION;
         let refusal = match found {
             None => StoreFormatError::Unversioned { expected },
@@ -129,7 +131,7 @@ impl Database {
             "Refusing IndexedDB database {:?} (delete it, e.g. via IndexedDBStorageEngine::cleanup, to proceed): {refusal}",
             self.0.db_name
         );
-        RetrievalError::storage(refusal)
+        refusal
     }
 
     /// Get a clone of the current database connection; lazily re-open if stale

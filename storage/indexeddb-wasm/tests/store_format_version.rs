@@ -2,8 +2,8 @@
 //! open; a store recording another format refuses to open with a `StoreFormatError`.
 
 mod common;
-use ankurah_core::{error::RetrievalError, storage::StoreFormatError};
-use ankurah_storage_indexeddb_wasm::{database::STORE_FORMAT_VERSION, IndexedDBStorageEngine};
+use ankurah_core::storage::StoreFormatError;
+use ankurah_storage_indexeddb_wasm::{IndexedDBStorageEngine, STORE_FORMAT_VERSION};
 use common::*;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_test::*;
@@ -24,11 +24,7 @@ async fn record_format(engine: &IndexedDBStorageEngine, record: JsValue) {
 /// The refusal opening the store `name` meets, as the typed store format error.
 async fn refusal(name: &str) -> StoreFormatError {
     let error = IndexedDBStorageEngine::open(name).await.err().expect("the store is refused");
-    match error.downcast_ref::<RetrievalError>() {
-        Some(RetrievalError::StorageError(source)) => source.downcast_ref::<StoreFormatError>().cloned(),
-        _ => None,
-    }
-    .unwrap_or_else(|| panic!("not a store format refusal: {error}"))
+    error.downcast_ref::<StoreFormatError>().cloned().unwrap_or_else(|| panic!("not a store format refusal: {error}"))
 }
 
 #[wasm_bindgen_test]

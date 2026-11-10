@@ -10,4 +10,5 @@ mod statics;
 mod util;
 
 pub use bucket::IndexedDBBucket;
+pub use database::STORE_FORMAT_VERSION;
 pub use engine::{IndexedDBStorageEngine, IndexedDbTransaction};
