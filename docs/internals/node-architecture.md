@@ -62,7 +62,11 @@ plugin's name, if any. The first plugin to refuse makes `register_peer` return
 `PeerConnectionError::Refused` naming it and its reason, and leaves the peer
 unregistered. No connector reads the peer's messages while the plugins are
 asked, so a plugin cannot ask the peer anything: it decides from what the
-handshake carried and from its own node's data.
+handshake carried and from its own node's data. An accepting node's plugins
+decide before the node signs its own presence; a dialing node's decide after
+the accepting node has registered it, so when one refuses, the dialing node
+closes the connection and the accepting node removes its registration as the
+connection ends.
 
 
 ## The Replication Protocol

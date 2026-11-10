@@ -57,7 +57,7 @@ pub struct Record {
 // crate so the shipped connector keeps its minimal API.
 // ---------------------------------------------------------------------------
 
-use ankurah::core::connector::{PeerProvenance, PeerSender, SendError};
+use ankurah::core::connector::{PeerSender, SendError};
 use ankurah::core::node::ConnectionRegistration;
 use tokio::sync::mpsc;
 
@@ -142,7 +142,8 @@ pub struct GatedConnection {
 }
 
 impl GatedConnection {
-    /// `other` <-> `gated`. Only messages arriving at `gated` are subject to the gate.
+    /// `other` <-> `gated`, registered with each other as `LocalProcessConnection` registers two
+    /// nodes. Only messages arriving at `gated` are subject to the gate.
     pub async fn new<SE1, PA1, SE2, PA2>(
         other: &Node<SE1, PA1>,
         gated: &Node<SE2, PA2>,
@@ -156,37 +157,12 @@ impl GatedConnection {
     {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
-        // As LocalProcessConnection: an ephemeral node dials a durable one, otherwise `other` dials.
-        let gated_dials = other.durable && !gated.durable;
-        let (other_provenance, gated_provenance) = if gated_dials {
-            (PeerProvenance::Inbound, PeerProvenance::Configured)
-        } else {
-            (PeerProvenance::Configured, PeerProvenance::Inbound)
-        };
-        let (mut other_side, mut gated_side) = (other.begin_handshake(), gated.begin_handshake());
-        other_side.receive_opening(gated_side.opening()).expect("both nodes speak this build's protocol versions");
-        gated_side.receive_opening(other_side.opening()).expect("both nodes speak this build's protocol versions");
-        let other_presence = other.presence(&other_side).await.expect("the other node is loaded");
-        let gated_presence = gated.presence(&gated_side).await.expect("the gated node is loaded");
-        let register_other = async {
-            other
-                .register_peer(gated_presence, other_side, other_provenance, Box::new(GatedSender { sender: gated_tx, node_id: gated.id }))
+        let to_gated = Box::new(GatedSender { sender: gated_tx, node_id: gated.id });
+        let to_other = Box::new(GatedSender { sender: other_tx, node_id: other.id });
+        let (other_registration, gated_registration) =
+            ankurah_connector_local_process::register_each_other(other, gated, to_gated, to_other)
                 .await
-                .expect("each presence answers the other side's handshake")
-        };
-        let register_gated = async {
-            gated
-                .register_peer(other_presence, gated_side, gated_provenance, Box::new(GatedSender { sender: other_tx, node_id: other.id }))
-                .await
-                .expect("each presence answers the other side's handshake")
-        };
-        let (other_registration, gated_registration) = if gated_dials {
-            let gated_registration = register_gated.await;
-            (register_other.await, gated_registration)
-        } else {
-            let other_registration = register_other.await;
-            (other_registration, register_gated.await)
-        };
+                .expect("each node registers the other");
 
         let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())), registration: gated_registration };
 

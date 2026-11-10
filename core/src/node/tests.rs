@@ -2,7 +2,8 @@ use super::*;
 use crate::connector::SendError;
 use crate::node::inbound::handler::commit_transaction;
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
-use crate::test_utils::{opened_handshakes, TestStorage};
+use crate::test_helpers::{keyed_peer_claims, opened_handshakes};
+use crate::test_utils::TestStorage;
 use ankurah_proto::Attested;
 use ankurah_signals::Subscribe;
 
@@ -46,10 +47,9 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    let (ours, theirs) = opened_handshakes(node.id, key.node_id());
-    let mut presence_claims = theirs.presence_claims(key.node_id(), durable)?;
+    let (ours, mut presence_claims) = keyed_peer_claims(node.id, key, durable);
     claims(&mut presence_claims);
-    node.register_peer(key.sign_presence(presence_claims), ours, provenance, sender).await
+    node.register_peer(key.sign_presence(presence_claims), &ours, provenance, sender).await
 }
 
 /// Register a peer with no node behind it: `key` signs a presence answering the node's side of a fresh handshake.

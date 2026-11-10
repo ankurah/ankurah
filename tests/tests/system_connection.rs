@@ -15,13 +15,17 @@ use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
 
 type Socket = WebSocketStream<TcpStream>;
 
-/// Play the server's half of the handshake: open, then answer the client's opening.
+/// Play the server's half of the handshake: open, read the client's opening and presence, then present.
 async fn advertise(socket: &mut Socket, server: &Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<()> {
     let mut handshake = server.begin_handshake();
     socket.send(Message::Binary(proto::Message::Open(handshake.opening()).encode().into())).await?;
     match socket.next().await.transpose()? {
         Some(Message::Binary(bytes)) => handshake.read_opening(&bytes)?,
         other => anyhow::bail!("expected the client's opening frame, got {other:?}"),
+    }
+    match socket.next().await.transpose()? {
+        Some(Message::Binary(bytes)) if matches!(proto::Message::decode(&bytes)?, proto::Message::Presence(_)) => {}
+        other => anyhow::bail!("expected the client's presence, got {other:?}"),
     }
     let presence = server.presence(&handshake).await?;
     socket.send(Message::Binary(proto::Message::Presence(presence).encode().into())).await?;

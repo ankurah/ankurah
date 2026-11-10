@@ -6,7 +6,7 @@ use ankurah_proto as proto;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use ankurah_core::connector::{PeerProvenance, PeerSender, SendError};
+use ankurah_core::connector::{PeerConnectionError, PeerProvenance, PeerSender, SendError};
 use ankurah_core::node::{ConnectionRegistration, Node, WeakNode};
 
 #[derive(Clone)]
@@ -53,49 +53,13 @@ where
     SE2: StorageEngine + Send + Sync + 'static,
     PA2: PolicyAgent + Send + Sync + 'static,
 {
-    /// Connect the two nodes as if one had dialed the other: an ephemeral node dials a durable
-    /// one, and between nodes of the same class `node1` dials `node2`. The dialing side registers
-    /// its peer as configured, the accepting side as inbound.
+    /// Connect the two nodes as [`register_each_other`] registers them.
     pub async fn new(node1: &Node<SE1, PA1>, node2: &Node<SE2, PA2>) -> anyhow::Result<Self> {
         let (node1_tx, node1_rx) = mpsc::channel(1024);
         let (node2_tx, node2_rx) = mpsc::channel(1024);
-
-        let node2_dials = node1.durable && !node2.durable;
-        let (provenance1, provenance2) = if node2_dials {
-            (PeerProvenance::Inbound, PeerProvenance::Configured)
-        } else {
-            (PeerProvenance::Configured, PeerProvenance::Inbound)
-        };
-        // Each opening goes to the other side as it is, and both presences are signed before the
-        // registrations spend the handshakes they were made from.
-        let (mut handshake1, mut handshake2) = (node1.begin_handshake(), node2.begin_handshake());
-        handshake1.receive_opening(handshake2.opening())?;
-        handshake2.receive_opening(handshake1.opening())?;
-        let (presence1, presence2) = (node1.presence(&handshake1).await?, node2.presence(&handshake2).await?);
-        let register_node1 =
-            node1.register_peer(presence2, handshake1, provenance1, Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id }));
-        let register_node2 =
-            node2.register_peer(presence1, handshake2, provenance2, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id }));
-        // The dialing side registers its peer first, as a websocket client registers the server before sending its presence.
-        let (registration1, registration2) = if node2_dials {
-            let registration2 = register_node2.await?;
-            match register_node1.await {
-                Ok(registration1) => (registration1, registration2),
-                Err(error) => {
-                    node2.deregister_peer(registration2);
-                    return Err(error.into());
-                }
-            }
-        } else {
-            let registration1 = register_node1.await?;
-            match register_node2.await {
-                Ok(registration2) => (registration1, registration2),
-                Err(error) => {
-                    node1.deregister_peer(registration1);
-                    return Err(error.into());
-                }
-            }
-        };
+        let to_node2 = Box::new(LocalProcessSender { sender: node2_tx, node_id: node2.id });
+        let to_node1 = Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id });
+        let (registration1, registration2) = register_each_other(node1, node2, to_node2, to_node1).await?;
 
         let receiver1_task = Self::setup_receiver(node1.clone(), registration1, node2.state(), node1_rx);
         let receiver2_task = Self::setup_receiver(node2.clone(), registration2, node1.state(), node2_rx);
@@ -157,6 +121,65 @@ where
         }
         if let Some(node2) = self.node2.upgrade() {
             node2.deregister_peer(self.registration2);
+        }
+    }
+}
+
+/// Register `node1` and `node2` with each other in one process, as if one had dialed the other:
+/// an ephemeral node dials a durable one, and between nodes of the same class `node1` dials
+/// `node2`. The dialing side registers its peer as `Configured`, the accepting side as
+/// `Inbound`. Returns `node1`'s registration of `node2`, which frames from `node2` arrive on, and
+/// `node2`'s of `node1`; a refusal by either side leaves neither registered.
+pub async fn register_each_other<SE1, PA1, SE2, PA2>(
+    node1: &Node<SE1, PA1>,
+    node2: &Node<SE2, PA2>,
+    to_node2: Box<dyn PeerSender>,
+    to_node1: Box<dyn PeerSender>,
+) -> Result<(ConnectionRegistration, ConnectionRegistration), PeerConnectionError>
+where
+    SE1: StorageEngine + Send + Sync + 'static,
+    PA1: PolicyAgent + Send + Sync + 'static,
+    SE2: StorageEngine + Send + Sync + 'static,
+    PA2: PolicyAgent + Send + Sync + 'static,
+{
+    if node1.durable && !node2.durable {
+        let (registration2, registration1) = dial(node2, node1, to_node1, to_node2).await?;
+        Ok((registration1, registration2))
+    } else {
+        dial(node1, node2, to_node2, to_node1).await
+    }
+}
+
+/// Walk the handshake from `dialer` to `acceptor` in the order every connector follows: each
+/// sends its opening, the dialer presents, the acceptor registers the dialer and only then
+/// presents, and the dialer registers the acceptor. Returns the dialer's registration, then the
+/// acceptor's.
+async fn dial<SE1, PA1, SE2, PA2>(
+    dialer: &Node<SE1, PA1>,
+    acceptor: &Node<SE2, PA2>,
+    to_acceptor: Box<dyn PeerSender>,
+    to_dialer: Box<dyn PeerSender>,
+) -> Result<(ConnectionRegistration, ConnectionRegistration), PeerConnectionError>
+where
+    SE1: StorageEngine + Send + Sync + 'static,
+    PA1: PolicyAgent + Send + Sync + 'static,
+    SE2: StorageEngine + Send + Sync + 'static,
+    PA2: PolicyAgent + Send + Sync + 'static,
+{
+    let (mut dialer_side, mut acceptor_side) = (dialer.begin_handshake(), acceptor.begin_handshake());
+    dialer_side.receive_opening(acceptor_side.opening())?;
+    acceptor_side.receive_opening(dialer_side.opening())?;
+    let dialer_presence = dialer.presence(&dialer_side).await?;
+    let acceptor_registration = acceptor.register_peer(dialer_presence, &acceptor_side, PeerProvenance::Inbound, to_dialer).await?;
+    let registered = match acceptor.presence(&acceptor_side).await {
+        Ok(acceptor_presence) => dialer.register_peer(acceptor_presence, &dialer_side, PeerProvenance::Configured, to_acceptor).await,
+        Err(refusal) => Err(refusal),
+    };
+    match registered {
+        Ok(dialer_registration) => Ok((dialer_registration, acceptor_registration)),
+        Err(refusal) => {
+            acceptor.deregister_peer(acceptor_registration);
+            Err(refusal)
         }
     }
 }

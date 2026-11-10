@@ -1,8 +1,9 @@
 mod common;
 
 use ankurah::{Model, Node};
-use ankurah_core::connector::{Handshake, PeerProvenance, PeerSender, SendError};
+use ankurah_core::connector::{PeerProvenance, PeerSender, SendError};
 use ankurah_core::node::NodeKey;
+use ankurah_core::test_helpers::keyed_peer_claims;
 use ankurah_jwt_auth::{JwtAgent, JwtContext};
 use ankurah_proto as proto;
 use ankurah_storage_sled::SledStorageEngine;
@@ -65,11 +66,8 @@ async fn inbound_durable_claim_is_not_a_relay_target() -> anyhow::Result<()> {
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (sent, relayed) = mpsc::channel();
-    let (mut handshake, mut peer_side) = (node.begin_handshake(), Handshake::new(peer));
-    handshake.receive_opening(peer_side.opening())?;
-    peer_side.receive_opening(handshake.opening())?;
-    let presence = key.sign_presence(peer_side.presence_claims(peer, true)?);
-    node.register_peer(presence, handshake, PeerProvenance::Inbound, Box::new(RecordingSender { peer, sent })).await?;
+    let (handshake, claims) = keyed_peer_claims(node.id, &key, true);
+    node.register_peer(key.sign_presence(claims), &handshake, PeerProvenance::Inbound, Box::new(RecordingSender { peer, sent })).await?;
     let durable_peers = node.get_durable_peers();
 
     let root = node.context_async(JwtContext::system()).await?;

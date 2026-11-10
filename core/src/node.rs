@@ -302,9 +302,11 @@ where
     /// The identity this node mints and signs under.
     pub fn identity(&self) -> proto::Identity { self.id.identity() }
 
-    /// Begin this node's side of one new connection's handshake. Send its opening to the peer
-    /// first, take the peer's opening into it, then pass it to [`Node::register_peer`] with the
-    /// peer's presence.
+    /// Begin this node's side of one new connection's handshake. Each side sends its opening and
+    /// takes the peer's into it. A dialing node then sends its presence ([`Node::presence`]) and
+    /// registers the accepting node on that node's presence ([`Node::register_peer`]); an
+    /// accepting node registers the dialer on its presence first and only then signs its own, so
+    /// it signs nothing for a dialer it has not authenticated and registered.
     pub fn begin_handshake(&self) -> Handshake { Handshake::new(self.id) }
 
     /// Sign this node's presence answering the peer on `handshake`'s connection, carrying each
@@ -326,7 +328,7 @@ where
     pub async fn register_peer(
         &self,
         presence: proto::Presence,
-        handshake: Handshake,
+        handshake: &Handshake,
         provenance: PeerProvenance,
         sender: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError> {

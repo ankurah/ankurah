@@ -52,12 +52,15 @@ local storage, then `node.get_durable_peer_random()`.
 
 Peer identity is **authenticated at the handshake, and peer class follows
 provenance**: each side opens with the protocol versions it speaks and a fresh
-challenge, and answers the other's challenge with a `Presence` signed by its node
-key. `node.rs` `register_peer` refuses a presence that does not answer the challenge
-issued for that connection, whose signature does not verify, that names the node
-itself, or that does not repeat the versions both openings offered and the version
-chosen, so a party that alters the unsigned openings to lower the version is found
-out. A durable claim counts only when `PolicyAgent::peer_trust`
+challenge; the dialing side answers the accepting side's challenge with a
+`Presence` signed by its node key, and the accepting side registers the dialer
+before it answers the dialer's challenge with its own, so an accepting node signs
+nothing for a dialer it has not authenticated. `node.rs` `register_peer` refuses a
+presence that does not answer the challenge issued for that connection, whose
+signature does not verify, that arrives on a connection whose opening carried
+another node's challenge, that names the node itself, or that does not repeat the
+versions both openings offered and the version chosen, so a party that alters the
+unsigned openings to lower the version is found out. A durable claim counts only when `PolicyAgent::peer_trust`
 grants it; the default grants it to a peer this node dialed from its own
 configuration and never to a peer that connected to it. Only a granted peer enters
 `durable_peers`, from which `get_durable_peer_random` picks the peer an ephemeral node
@@ -66,8 +69,11 @@ durable id that registers again without the grant is dropped from durable routin
 moment, and every request to a peer chosen as durable re-checks that its current
 connection holds the grant. The one exception is the relay's unsubscribe notice, sent to
 the id's current connection without that check because it carries no credentials and no
-reply is applied. Frames after the handshake are unsigned: a peer authenticated on its own
-connection can still name another registered peer in a message's `from` field (G-8).
+reply is applied. A node handles a frame only on the connection of the peer the frame
+names as its sender. What the handshake leaves open: a node that dials an address
+presents before it knows who answers there, so whoever answers can use that presence
+at one other accepting node, and can sit between the two and alter frames, which are
+not signed (G-8).
 
 ### 1.2 What peers are trusted with today
 
@@ -465,17 +471,19 @@ Invariant (desired): the peer an ephemeral node fetches authoritative events fro
 authenticated as genuinely durable, not merely self-asserting.
 Trust tier: trusted-peer, for a peer this node was configured to dial.
 Enforcing seam: `node.rs` `register_peer` verifies the signed presence against the
-challenge and the version offers of this node's side of the connection's handshake
-(`Handshake::authenticate` in `connector/handshake.rs`), then asks
-`PolicyAgent::peer_trust` whether the peer is durable. By
+challenge, the challenge issuer and the version offers of this node's side of the
+connection's handshake (`Handshake::authenticate` in `connector/handshake.rs`), then asks
+`PolicyAgent::peer_trust` whether the peer is durable. Every connector's accepting side
+registers the dialer before it signs its own presence, so it signs none for a dialer whose
+opening relayed another node's challenge. By
 default only a peer reached as `PeerProvenance::Configured` may be; an `Inbound`
 peer's durable claim is ignored. Only a durable-trusted peer enters `durable_peers`,
 where `get_durable_peer_random` picks the fetch source and the commit relay finds its
 targets. An id's latest registration decides, and registrations of one id apply one at
-a time: anyone can relay this node's fresh opening to a durable peer's server and
-register the answer inbound, so a durable-trusted id that registers again without
-durable trust is dropped from `durable_peers` and the subscription relay at that
-moment. Every request to a peer chosen as durable (`Node::request_durable`) re-checks the
+a time: a durable peer that dials an address presents to whoever answers there, who can
+register that presence inbound at this node, so a durable-trusted id that registers
+again without durable trust is dropped from `durable_peers` and the subscription relay
+at that moment. Every request to a peer chosen as durable (`Node::request_durable`) re-checks the
 trust of the connection it is about to use and is refused with
 `RequestError::NotTrustedAsDurable` when that connection lacks it. The one exception is the
 relay's unsubscribe notice, sent to the id's current connection without that check because
@@ -485,21 +493,23 @@ source or a commit relay target, then chain with C4-15 to inject events. Refused
 a peer that connects to the node; a configured peer is still trusted on its claim.
 Test arm: `peer_trust_tests::inbound_durable_claim_is_not_a_relay_target`
 (jwt-auth: an inbound durable claimant receives no local commit and cannot fail a
-root context commit) and `node::tests::identity` (core: forged signature, replayed
-presence, reflected self-connection, a presence that does not repeat the version
-offers, provenance trust, a durable id registered again inbound, concurrent
-registrations of one id) and
+root context commit), `handshake::a_stranger_relaying_one_servers_challenge_to_another_receives_no_presence_from_it`
+(tests: an accepting server signs nothing for a dialer whose opening carried another
+server's challenge), `node::tests::identity` (core: forged signature, replayed
+presence, a relayed challenge, reflected self-connection, a presence that does not
+repeat the version offers, provenance trust, a durable id registered again inbound,
+concurrent registrations of one id, a frame naming another peer as its sender) and
 `client_relay::tests::a_subscription_send_refuses_a_peer_whose_connection_lost_durable_trust`
 (core: a send whose peer lost durable trust while it waited is refused).
 Status: partial. Which keys are a deployment's durable members is not recorded, so a
-configured peer's durable claim is accepted without a membership check (#459). Frames
-after the handshake are not signed, so a peer that authenticated its own connection
-can still name another registered peer in a message's `from` field: it can answer a
-request this node is waiting on from that peer if it knows the request id, remove that
-peer's query, and inject updates attributed to that peer. TLS does not prevent this, since the sender is
-a legitimate endpoint of its own connection; without TLS an active relay that forwards
-a genuine presence can also inject frames under that identity. Signing frames after the
-handshake is deferred to a follow-up node identity change. Gap G-8 narrows to these.
+configured peer's durable claim is accepted without a membership check (#459). A node
+handles a frame only on the connection of the peer the frame names as its sender, so a
+registered peer cannot pass frames off as another's. But a node that dials an address
+presents before it knows who answers there, so whoever answers can use that presence at
+one other accepting node and be registered there under the dialer's id, and can sit
+between the two and alter frames, which are not signed. A dialer chooses its addresses;
+letting it name the node it expects at an address needs nothing on the wire and is
+later work, as is signing frames after the handshake. Gap G-8 narrows to these.
 Note: the *serving* side is better off, since the `GetEvents` handler does run
 `can_access_collection` + `check_read_event` (C4-18).
 
@@ -688,7 +698,7 @@ PermissiveAgent every security gap is moot, which is itself meta-gap G-0.
 | G-5 | Deep-divergence rejection is error-shaped, not policy-shaped: a stale-but-honest branch and a forged deep branch both terminate in `BudgetExceeded` (C4-09) | Medium: no deterministic horizon; budget is the only backstop and its outcome is an anomaly, not a decision. The convergence risk is bounded because verdicts are grounded (C4-08), but the DoS/thrash surface is open. | #271 (rejection horizon) + #266 (generation distance) |
 | G-6 | `commit_remote_transaction` applies creation events to the real entity before the policy check (C4-19) | Medium with a real agent: a rejected creation event poisons in-memory state; policy sees no genuine before-state. No impact under PermissiveAgent. | #243, design answered by #274/#242 |
 | G-7 | `ValidatedEvent` (future) risks implying "globally valid"; only I-confluent, before(u)-local invariants are convergently enforceable (C4-21) | Documentation/design: if #274 lets validated ingress promise cross-entity uniqueness or referential integrity, it promises something no convergent rule can deliver (lit review Finding 3). | #274 (state the I-confluence boundary) |
-| G-8 | Durable-peer role rests on provenance, not on a recorded membership, and frames after the handshake are unsigned (C4-16) | Medium when chained with G-1: a configured peer is trusted as durable on its claim. A peer authenticated on its own connection can name another registered peer in a message's `from` field and so answer a request this node is waiting on from that peer (given its request id), remove its query, or inject updates attributed to it; TLS does not prevent this. Without TLS, an active relay holding a genuine presence can inject frames under that identity. A peer that connects to the node can no longer claim the role; a durable id that registers again without the grant loses it at that moment, and requests to peers chosen as durable re-check the grant first, except the relay's unsubscribe notice, which carries no credentials and has no reply applied. | #459 (durable membership) + signed frames after the handshake, deferred to a follow-up node identity change |
+| G-8 | Durable-peer role rests on provenance, not on a recorded membership, a dialer presents before it knows who answers, and frames after the handshake are unsigned (C4-16) | Medium when chained with G-1: a configured peer is trusted as durable on its claim. Whoever answers at an address a node dials can use that node's presence at one other accepting node, and so be registered there under its id, and can sit between the two and alter frames. A registered peer cannot pass frames off as another's: a node handles a frame only on the connection of the peer the frame names as its sender. A peer that connects to the node can no longer claim the role; a durable id that registers again without the grant loses it at that moment, and requests to peers chosen as durable re-check the grant first, except the relay's unsubscribe notice, which carries no credentials and has no reply applied. | #459 (durable membership) + a dialer naming the node it expects at an address + signed frames after the handshake, deferred to a follow-up node identity change |
 | G-9 | The `CausalAssertion` attestation surface is defined but has no consumer; `validate_causal_assertion` is never called (Section 4) | Low today (unused), Medium latent: if a future optimization trusts a peer's asserted lineage relation without re-deriving it, a lying peer substitutes a false relation. | whichever workstream introduces relation-assertion shortcuts; must re-derive, not trust |
 
 ---

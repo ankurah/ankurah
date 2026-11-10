@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ankurah_core::connector::{PeerSender, SendError};
 use ankurah_proto as proto;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error};
 
 // PeerSender for sending messages to a websocket client
@@ -17,14 +17,18 @@ struct Inner {
     handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
+/// The sending half of a websocket.
+pub type Socket = futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
+
 impl WebSocketClientSender {
-    pub fn new(
-        node_id: proto::NodeId,
-        mut sender: futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
-    ) -> Self {
+    /// A sender of frames to `node_id`, and the slot its connection fills with the socket once it
+    /// has answered the peer's presence; frames sent before then wait, in order.
+    pub fn new(node_id: proto::NodeId) -> (Self, oneshot::Sender<Socket>) {
         let (tx, mut rx) = mpsc::channel(32);
+        let (socket_tx, socket_rx) = oneshot::channel::<Socket>();
         use futures_util::SinkExt;
         let handle = tokio::spawn(async move {
+            let Ok(mut sender) = socket_rx.await else { return };
             while let Some(msg) = rx.recv().await {
                 if sender.send(msg).await.is_err() {
                     error!("Failed to send message through websocket, breaking send loop");
@@ -33,7 +37,7 @@ impl WebSocketClientSender {
             }
             debug!("WebSocket sender task completed");
         });
-        Self { tx, inner: Arc::new(Inner { recipient_node_id: node_id, handle: Arc::new(handle) }) }
+        (Self { tx, inner: Arc::new(Inner { recipient_node_id: node_id, handle: Arc::new(handle) }) }, socket_tx)
     }
 
     #[tracing::instrument(skip(self, message), fields(recipient = %self.inner.recipient_node_id, msg = %message))]

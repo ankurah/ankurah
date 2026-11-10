@@ -131,6 +131,19 @@ async fn wait_until_held(engine: &SledStorageEngine, id: EntityId) {
     .expect("the node comes to hold the entity");
 }
 
+/// Wait until neither `client` nor `server` holds a registration of the other. A dialer's plugin
+/// decides after the accepting side has registered it, and the accepting side removes that
+/// registration when the refused connection ends.
+async fn wait_until_unregistered(client: &TestNode, server: &TestNode) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while client.granted_trust(&server.id).is_some() || server.granted_trust(&client.id).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("each side removes its registration of the other");
+}
+
 /// Close `connection` and wait until `node` is gone, so nothing of it writes to its store again.
 async fn close(node: TestNode, connection: Option<Connection>) {
     drop(connection);
@@ -193,7 +206,7 @@ async fn a_client_meeting_a_server_seeded_again_resets_and_refuses_and_a_fresh_n
         };
         assert_eq!(refused, expected, "{transport:?}");
         assert_eq!(returning.state().value(), NodeState::Halted(NodeHaltReason::Reset));
-        assert_eq!(reseeded.node.granted_trust(&returning.id), None, "the reseeded server never registered the client");
+        wait_until_unregistered(&returning, &reseeded.node).await;
 
         // The host waits for the wipe the plugin began, then builds a fresh node on the store.
         returning.reset().await?;
@@ -257,6 +270,7 @@ async fn a_durable_node_configured_only_to_refuse_refuses_another_seeding_and_ke
         let refusal = PeerRefusal { plugin: NAME, reason: "the peer holds another seeding of the System model".into() };
         assert_eq!(refused, PeerConnectionError::Refused(refusal), "{transport:?}");
         assert_eq!(refuser.state().value(), NodeState::Running);
+        wait_until_unregistered(&refuser, &other.node).await;
         assert!(engine.get_state(own).await.is_ok());
     }
     Ok(())

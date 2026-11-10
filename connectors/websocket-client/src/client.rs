@@ -353,10 +353,14 @@ where
     ) -> Result<MessageResult> {
         match msg {
             Some(Ok(Message::Binary(data))) => {
-                // The server's first frame is its opening.
+                // The server's first frame is its opening, which this node answers with its presence.
                 if let Some(handshake) = handshake.as_mut().filter(|handshake| !handshake.opened()) {
                     return match handshake.read_opening(&data) {
-                        Ok(()) => Ok(MessageResult::Continue),
+                        Ok(()) => {
+                            let presence = inner.node.presence(handshake).await?;
+                            sink.send(Message::Binary(proto::Message::Presence(presence).encode().into())).await?;
+                            Ok(MessageResult::Continue)
+                        }
                         Err(refusal) => {
                             error!("Refusing server {}: {}", inner.server_url, refusal);
                             if let PeerConnectionError::NoCommonVersion { ours, .. } = refusal {
@@ -368,7 +372,7 @@ where
                         }
                     };
                 }
-                Self::handle_server_message(inner, &data, handshake, registration, outgoing_rx, sink).await
+                Self::handle_server_message(inner, &data, handshake, registration, outgoing_rx).await
             }
             Some(Ok(Message::Close(_))) => {
                 info!("WebSocket connection closed by server");
@@ -412,10 +416,6 @@ where
         handshake: &mut Option<Handshake>,
         registration: &mut Option<ConnectionRegistration>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
-        sink: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-            Message,
-        >,
     ) -> Result<MessageResult> {
         match proto::Message::decode(data) {
             Ok(proto::Message::Open(_)) => {
@@ -426,7 +426,7 @@ where
                 Err(PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs }.into())
             }
             Ok(proto::Message::Presence(server_presence)) => {
-                match Self::handle_server_presence(inner, server_presence, handshake, registration, outgoing_rx, sink).await {
+                match Self::handle_server_presence(inner, server_presence, handshake, registration, outgoing_rx).await {
                     Ok(()) => Ok(MessageResult::Continue),
                     Err(rejection) => {
                         error!("Refusing server {}: {}", inner.server_url, rejection);
@@ -456,16 +456,13 @@ where
         }
     }
 
+    /// Register the server whose presence answers this node's, and only then report connected.
     async fn handle_server_presence(
         inner: &Arc<Inner<SE, PA>>,
         server_presence: proto::Presence,
         handshake: &mut Option<Handshake>,
         registration: &mut Option<ConnectionRegistration>,
         outgoing_rx: &mut Option<tokio::sync::mpsc::UnboundedReceiver<proto::NodeMessage>>,
-        sink: &mut futures_util::stream::SplitSink<
-            tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
-            Message,
-        >,
     ) -> Result<()> {
         info!("Received server presence: {}", server_presence.claims.node_id);
 
@@ -473,16 +470,10 @@ where
             warn!("Ignoring duplicate server presence");
             return Ok(());
         };
-        // Signed before registration spends the handshake, and sent only once the server is
-        // registered, so its frames never arrive first.
-        let presence = proto::Message::Presence(inner.node.presence(&handshake).await?);
-
         let (sender, rx) = WebsocketPeerSender::new(server_presence.claims.node_id);
         *registration =
-            Some(inner.node.register_peer(server_presence.clone(), handshake, PeerProvenance::Configured, Box::new(sender)).await?);
+            Some(inner.node.register_peer(server_presence.clone(), &handshake, PeerProvenance::Configured, Box::new(sender)).await?);
         *outgoing_rx = Some(rx);
-
-        sink.send(Message::Binary(presence.encode().into())).await?;
 
         inner.connected.store(true, Ordering::Release);
         inner.connection_state.set(ConnectionState::Connected { url: inner.server_url.to_string(), server_presence });

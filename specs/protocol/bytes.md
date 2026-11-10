@@ -430,8 +430,22 @@ else in it:
 
 A build that offers version 1 sends exactly the version-1 layout of the
 opening, since a receiver that speaks only version 1 reads the rest of the
-frame under it. Once both openings are read, each side answers the other's
-challenge with its presence.
+frame under it.
+
+Once both openings are read, the frames of the handshake follow in this order:
+
+1. The dialing side sends its presence, answering the accepting side's
+   challenge.
+2. The accepting side checks that presence and registers the dialer, and only
+   then sends its own presence, answering the dialer's challenge. An accepting
+   node so signs nothing for a dialer it has not authenticated.
+3. The dialing side checks that presence and registers the accepting side, and
+   only then counts the connection open.
+
+Each side sends frames of variant 3 only after its own presence, and the
+dialing side only once it has registered the accepting side. A dialer's
+presence leaves before it knows who answers, so whoever answers can use it at
+one other accepting node.
 
 Vectors. The opening offering versions 1 to 3, with the challenge issued by
 `Ed25519([0x77; 32])` with nonce `[0x88; 32]`:

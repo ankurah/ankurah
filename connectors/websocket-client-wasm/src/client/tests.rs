@@ -84,7 +84,7 @@ impl NodeComms for HeldAdmission {
     async fn register_peer(
         &self,
         presence: proto::Presence,
-        _: Handshake,
+        _: &Handshake,
         _: PeerProvenance,
         _: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError> {
@@ -103,8 +103,9 @@ impl NodeComms for HeldAdmission {
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }
 
-/// The frames a server sends to open a connection: its opening, and its presence answering a
-/// client's. The fixture's registration reads neither, so the presence answers a client of its own.
+/// The frames a server sends on a connection: its opening, and the presence it answers a client's
+/// presence with. The fixture's registration reads neither, so the presence answers a client of
+/// its own.
 fn server_handshake(server: &NodeKey) -> (Vec<u8>, Vec<u8>) {
     let mut handshake = Handshake::new(server.node_id());
     handshake.receive_opening(Handshake::new(NodeKey::generate().node_id()).opening()).unwrap();
@@ -118,7 +119,8 @@ async fn application_traffic_before_the_server_registers_closes_the_connection()
     let _restore = RestoreWebSockets;
     let run = async {
         let (_release, receiver) = oneshot::channel();
-        let (_release_presence, presence_receiver) = oneshot::channel();
+        let (release_presence, presence_receiver) = oneshot::channel();
+        release_presence.send(()).unwrap();
         let node = HeldAdmission(Arc::new(AdmissionState {
             started: Mut::new(false),
             published: Mut::new(false),
@@ -250,9 +252,9 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 }))
                 .encode(),
             );
-            // The client signs its presence before registration spends the handshake.
+            // The client presents on the server's opening, before it reads the server's presence.
             node.0.presence_started.read().wait_for(|started| *started).await;
-            assert!(!node.0.started.value(), "registration waits for the presence");
+            assert!(!node.0.started.value(), "registration waits for this node's presence");
             assert_eq!(node.0.handled.value(), 0, "the following frame must wait for presence");
             assert_eq!(sent_count(socket), 1);
 
@@ -263,9 +265,11 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 node.0.started.read().wait_for(|started| *started).await;
                 assert!(!node.0.published.value());
                 assert_eq!(node.0.handled.value(), 0, "the following frame must wait for admission");
-                assert_eq!(sent_count(socket), 1, "client presence must wait for admission");
+                assert_eq!(sent_count(socket), 2, "the client presents before it registers the server");
+                assert!(matches!(proto::Message::decode(&sent_frame(socket, 1)).unwrap(), proto::Message::Presence(_)));
                 release
             };
+            let sent = sent_count(socket);
 
             if close_before_admission || close_before_presence {
                 match stop {
@@ -281,7 +285,7 @@ async fn close_and_halt_cancel_admission_and_queued_frames() {
                 sleep(Duration::ZERO).await;
                 assert!(!node.0.published.value());
                 assert_eq!(node.0.handled.value(), 0);
-                assert_eq!(sent_count(socket), 1);
+                assert_eq!(sent_count(socket), sent);
                 assert_eq!(connected_notifications.load(Ordering::Relaxed), 0, "the old connection must never publish Connected");
                 if matches!(stop, Stop::Drop) {
                     assert!(is_closed(socket), "dropping the connection owner must close the socket");
@@ -390,7 +394,7 @@ async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this
         let socket = socket_count();
         client.connect().unwrap();
         deliver(socket, &open_frame(proto::ProtocolVersions { lowest: 1, highest: 3 }));
-        while sent_count(socket) == 0 {
+        while sent_count(socket) < 2 {
             sleep(Duration::ZERO).await;
         }
         sleep(Duration::ZERO).await;
@@ -398,7 +402,11 @@ async fn a_wider_opening_settles_and_one_sharing_no_version_is_refused_with_this
             proto::Message::Open(opening) => assert_eq!(opening.versions, proto::ProtocolVersions::SPOKEN),
             other => panic!("the client answered a wider opening with {other}"),
         }
-        assert_eq!(sent_count(socket), 1, "the client waits for the server's presence");
+        match proto::Message::decode(&sent_frame(socket, 1)).unwrap() {
+            proto::Message::Presence(presence) => assert_eq!(presence.claims.negotiation.chosen, 1),
+            other => panic!("the client presented with {other}"),
+        }
+        assert_eq!(sent_count(socket), 2, "the client waits for the server's presence");
         assert!(!is_closed(socket));
         assert!(matches!(client.state.value(), ConnectionState::Connecting { .. }));
 

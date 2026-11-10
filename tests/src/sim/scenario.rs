@@ -8,7 +8,6 @@
 //! scenario). The driver runs everything on a single-threaded tokio runtime so
 //! intra-node task poll order is deterministic.
 
-use ankurah::core::connector::PeerProvenance;
 use ankurah::proto::{self, Attested};
 
 use super::faults::FaultConfig;
@@ -395,8 +394,7 @@ where
         // Bring ephemerals up serially so startup scheduling cannot change the trace.
         for node in &nodes {
             if !node.durable {
-                node.connect_to(durable, PeerProvenance::Configured).await;
-                durable.connect_to(node, PeerProvenance::Inbound).await;
+                node.connect(durable).await;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
                 super::node::seed_sim_schema(node).expect("sim schema seeds on a node that has not halted");
                 let synced = node.node.wait_ready();
@@ -417,10 +415,9 @@ where
 
         for a in &nodes {
             for b in &nodes {
-                if a.index != b.index && !a.durable && !b.durable {
+                if a.index < b.index && !a.durable && !b.durable {
                     // One connection per pair: the lower index dials.
-                    let provenance = if a.index < b.index { PeerProvenance::Configured } else { PeerProvenance::Inbound };
-                    a.connect_to(b, provenance).await;
+                    a.connect(b).await;
                 }
             }
         }

@@ -4,7 +4,8 @@ use crate::error::NodeHaltReason;
 use crate::node::{AnnouncementFailure, DuplicatePluginName, Node, NodeKey, NodePlugin, NodeState, PeerRefusal, PeerRegistration};
 use crate::policy::{PeerTrust, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT};
 use crate::storage::StorageEngine;
-use crate::test_utils::{opened_handshakes, TestStorage};
+use crate::test_helpers::opened_handshakes;
+use crate::test_utils::TestStorage;
 use ankurah_proto as proto;
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -160,7 +161,7 @@ async fn an_announcement_reaches_the_peers_plugin_of_the_same_name_inside_the_si
     assert!(presence.signature_is_valid());
 
     let (sent, _) = mpsc::channel();
-    receiver.register_peer(presence, ours, PeerProvenance::Inbound, Box::new(RecordingSender(announcer.id, sent))).await.unwrap();
+    receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(announcer.id, sent))).await.unwrap();
     let announcements: Vec<_> = asked.0.lock().unwrap().iter().map(|asked| (asked.plugin, asked.announcement.clone())).collect();
     assert_eq!(announcements, [("shared", Some(vec![1, 2, 3])), ("only-on-the-receiver", None)]);
 }
@@ -176,7 +177,7 @@ async fn an_announcement_changed_after_signing_fails_the_presence_signature_befo
     let mut presence = announcer.presence(&theirs).await.unwrap();
     presence.claims.announcements.insert("shared".into(), vec![4]);
     let (sent, _) = mpsc::channel();
-    let refused = receiver.register_peer(presence, ours, PeerProvenance::Inbound, Box::new(RecordingSender(announcer.id, sent))).await;
+    let refused = receiver.register_peer(presence, &ours, PeerProvenance::Inbound, Box::new(RecordingSender(announcer.id, sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::InvalidSignature(announcer.id)));
     assert!(asked.plugins().is_empty());
 }

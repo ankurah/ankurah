@@ -1168,7 +1168,8 @@ mod tests {
         use crate::connector::{PeerProvenance, PeerSender, SendError};
         use crate::node::Node;
         use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
-        use crate::test_utils::{opened_handshakes, TestStorage};
+        use crate::test_helpers::opened_handshakes;
+        use crate::test_utils::TestStorage;
 
         #[derive(Clone)]
         struct Recorder(NodeId, std::sync::mpsc::Sender<proto::NodeMessage>);
@@ -1186,7 +1187,7 @@ mod tests {
         let (handshake, theirs) = opened_handshakes(client.id, server.id);
         let presence = server.presence(&theirs).await.unwrap();
         let (sent, _messages) = std::sync::mpsc::channel();
-        client.register_peer(presence, handshake, PeerProvenance::Configured, Box::new(Recorder(server.id, sent))).await.unwrap();
+        client.register_peer(presence, &handshake, PeerProvenance::Configured, Box::new(Recorder(server.id, sent))).await.unwrap();
 
         let model = ModelId::EntityId(EntityId::from_bytes([9; 32]));
         let (entered, entered_rx) = tokio::sync::oneshot::channel();
@@ -1202,12 +1203,13 @@ mod tests {
             _ = &mut subscribe => panic!("the subscription finished before its local read"),
         }
 
-        // Anyone can get the server's presence for the client's fresh opening by relaying it.
+        // A server that dials an address presents to whoever answers there, answering the challenge
+        // that answer carried: here the client's, relayed.
         let (handshake, theirs) = opened_handshakes(client.id, server.id);
         let relayed = server.presence(&theirs).await.unwrap();
         let (relayer_sent, relayer_messages) = std::sync::mpsc::channel();
         let relayer = Box::new(Recorder(server.id, relayer_sent));
-        client.register_peer(relayed, handshake, PeerProvenance::Inbound, relayer).await.unwrap();
+        client.register_peer(relayed, &handshake, PeerProvenance::Inbound, relayer).await.unwrap();
 
         release.send(()).unwrap();
         let outcome =

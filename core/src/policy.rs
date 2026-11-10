@@ -240,8 +240,9 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// reached and whether it claims to be durable. By default only a peer this node dialed from
     /// its own configuration is trusted as durable; a peer that connected to this node is not.
     /// A verified presence proves that the holder of `peer`'s key answered this connection's
-    /// challenge, not that it is the far end of the connection: frames are not bound to the
-    /// handshake, so grant nothing by node id alone.
+    /// challenge, not that it is the far end: a node that dials an address presents before it
+    /// knows who answers there, so whoever answers can use that presence at one other accepting
+    /// node, and can sit between the two and alter frames, which are not signed.
     fn peer_trust(&self, _peer: &proto::NodeId, provenance: PeerProvenance, claimed_durable: bool) -> PeerTrust {
         match provenance {
             PeerProvenance::Configured => PeerTrust { durable: claimed_durable },

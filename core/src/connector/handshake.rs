@@ -6,7 +6,7 @@ use super::PeerConnectionError;
 
 /// What this node knows about one connection's handshake: the opening it sends, then the peer's
 /// opening and the version the two chose. [`Node::register_peer`](crate::Node::register_peer)
-/// spends it with the peer's presence, so a presence registers only the connection it answers.
+/// checks the peer's presence against it, so a presence registers only the connection it answers.
 #[derive(Debug)]
 pub struct Handshake {
     ours: proto::Opening,
@@ -75,23 +75,23 @@ impl Handshake {
         })
     }
 
-    /// Spend this handshake on `presence`: check that it answers the challenge `receiver` issued
-    /// here under a valid signature from a node other than `receiver`, that the peer's opening
-    /// carried a challenge that node issued itself, and that it repeats the versions each side
-    /// offered on this connection and the version chosen, so a party between the two cannot
-    /// change the offers unnoticed.
-    pub(crate) fn authenticate(self, receiver: proto::NodeId, presence: &proto::Presence) -> Result<(), PeerConnectionError> {
+    /// Check that `presence` answers the challenge `receiver` issued here under a valid signature
+    /// from a node other than `receiver`, that the peer's opening carried a challenge that node
+    /// issued itself, and that it repeats the versions each side offered on this connection and
+    /// the version chosen, so a party between the two cannot change the offers unnoticed.
+    pub(crate) fn authenticate(&self, receiver: proto::NodeId, presence: &proto::Presence) -> Result<(), PeerConnectionError> {
         let claims = &presence.claims;
         let peer_id = claims.node_id;
-        let peer = self.peer.ok_or(PeerConnectionError::NoOpening)?;
+        let peer = self.peer.as_ref().ok_or(PeerConnectionError::NoOpening)?;
         if self.ours.challenge.issuer() != receiver || claims.challenge != self.ours.challenge {
             return Err(PeerConnectionError::ChallengeMismatch(peer_id));
         }
         if !presence.signature_is_valid() {
             return Err(PeerConnectionError::InvalidSignature(peer_id));
         }
-        // A node answering this connection's challenge while relaying a third node's opening could
-        // hand that node our presence answering its challenge, and be registered there as us.
+        // A peer whose opening carried a third node's challenge is relaying that node's handshake.
+        // An accepting node refuses it here, before it presents, so it never signs a presence the
+        // peer could take to the third node as ours; a dialing node has presented already.
         let issuer = peer.opening.challenge.issuer();
         if issuer != peer_id {
             return Err(PeerConnectionError::RelayedChallenge { peer: peer_id, issuer });

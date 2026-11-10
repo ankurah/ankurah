@@ -82,7 +82,7 @@ pub trait NodeComms: Send + Sync {
     async fn register_peer(
         &self,
         presence: proto::Presence,
-        handshake: Handshake,
+        handshake: &Handshake,
         provenance: PeerProvenance,
         sender: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError>;
@@ -101,7 +101,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     async fn register_peer(
         &self,
         presence: proto::Presence,
-        handshake: Handshake,
+        handshake: &Handshake,
         provenance: PeerProvenance,
         sender: Box<dyn PeerSender>,
     ) -> Result<ConnectionRegistration, PeerConnectionError> {

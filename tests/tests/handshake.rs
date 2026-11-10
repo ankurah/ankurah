@@ -1,7 +1,8 @@
 //! The connection handshake through the websocket connectors: each side opens with the versions
-//! it speaks and its challenge, answers the other's opening with a signed presence, and refuses
-//! what it cannot take; once connected, it ignores a message of a kind it does not know. Each test
-//! drives a real server from a raw socket, or a real client from a raw server.
+//! it speaks and its challenge, the client presents, the server registers the client and only
+//! then presents, and each side refuses what it cannot take; once connected, it ignores a message
+//! of a kind it does not know. Each test drives a real server from a raw socket, or a real client
+//! from a raw server.
 
 use ankurah::core::connector::PeerConnectionError;
 use ankurah::core::node::NodeKey;
@@ -87,32 +88,37 @@ async fn eventually(condition: impl Fn() -> bool) -> bool {
 struct RawClient {
     key: NodeKey,
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
-    offered: proto::ProtocolVersions,
+    opening: proto::Opening,
     server_opening: proto::Opening,
-    server_presence: proto::Presence,
 }
 
 impl RawClient {
-    /// Connect to `server_url`, open offering `offered`, and read the server's opening and presence.
+    /// Connect to `server_url`, open offering `offered`, and read the server's opening.
     async fn open(server_url: &str, offered: proto::ProtocolVersions) -> Result<Self> {
         let key = NodeKey::generate();
         let (mut socket, _) = tokio_tungstenite::connect_async(format!("{server_url}/ws")).await?;
         let opening = proto::Opening { versions: offered, challenge: proto::HandshakeChallenge::new(key.node_id()) };
         socket.send(frame(&proto::Message::Open(opening))).await?;
         let Some(proto::Message::Open(server_opening)) = receive(&mut socket).await else { anyhow::bail!("the server opened otherwise") };
-        let Some(proto::Message::Presence(server_presence)) = receive(&mut socket).await else {
-            anyhow::bail!("the server answered the opening otherwise")
-        };
-        anyhow::ensure!(server_presence.claims.challenge == opening.challenge, "the server's presence answers our challenge");
-        Ok(Self { key, socket, offered, server_opening, server_presence })
+        Ok(Self { key, socket, opening, server_opening })
     }
 
-    /// Answer the server with a presence making what `change` makes of the claims an honest client makes.
+    /// Present to the server with what `change` makes of the claims an honest client makes.
     async fn present(&mut self, change: impl FnOnce(&mut proto::PresenceClaims)) -> Result<()> {
-        let mut claims = claims_answering(&self.key, &self.server_opening, self.offered, false);
+        let mut claims = claims_answering(&self.key, &self.server_opening, self.opening.versions, false);
         change(&mut claims);
         self.socket.send(frame(&proto::Message::Presence(self.key.sign_presence(claims)))).await?;
         Ok(())
+    }
+
+    /// Present honestly and read the server's presence answering this client's.
+    async fn connect(&mut self) -> Result<proto::Presence> {
+        self.present(|_| {}).await?;
+        let Some(proto::Message::Presence(server_presence)) = receive(&mut self.socket).await else {
+            anyhow::bail!("the server answered the presence otherwise")
+        };
+        anyhow::ensure!(server_presence.claims.challenge == self.opening.challenge, "the server's presence answers our challenge");
+        Ok(server_presence)
     }
 }
 
@@ -121,14 +127,10 @@ async fn a_wider_opening_settles_on_the_version_the_server_speaks() -> Result<()
     let (server_node, server_url, server_task) = start_test_server().await?;
     let mut client = RawClient::open(&server_url, versions(1, 3)).await?;
     assert_eq!(client.server_opening.versions, SPOKEN);
-    assert!(client.server_presence.signature_is_valid());
-    assert_eq!(
-        client.server_presence.claims.negotiation,
-        proto::VersionNegotiation { offered: SPOKEN, peer_offered: versions(1, 3), chosen: 1 }
-    );
-
-    client.present(|_| {}).await?;
-    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
+    let server_presence = client.connect().await?;
+    assert!(server_presence.signature_is_valid());
+    assert_eq!(server_presence.claims.negotiation, proto::VersionNegotiation { offered: SPOKEN, peer_offered: versions(1, 3), chosen: 1 });
+    assert!(server_node.granted_trust(&client.key.node_id()).is_some(), "the server registered the client before presenting");
     server_task.abort();
     Ok(())
 }
@@ -164,7 +166,7 @@ async fn the_server_refuses_a_presence_that_does_not_repeat_the_offers_and_the_c
     for alter in alterations {
         let mut client = RawClient::open(&server_url, SPOKEN).await?;
         client.present(|claims| alter(&mut claims.negotiation)).await?;
-        assert!(receive(&mut client.socket).await.is_none(), "the server closes the connection");
+        assert!(receive(&mut client.socket).await.is_none(), "the server closes the connection without presenting");
         assert_eq!(server_node.granted_trust(&client.key.node_id()), None);
     }
     server_task.abort();
@@ -181,7 +183,8 @@ async fn the_server_ignores_unknown_feature_numbers_and_announcement_names() -> 
             claims.announcements.insert("a plugin the server does not have".into(), vec![1, 2, 3]);
         })
         .await?;
-    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
+    assert!(matches!(receive(&mut client.socket).await, Some(proto::Message::Presence(_))), "the server presents");
+    assert!(server_node.granted_trust(&client.key.node_id()).is_some(), "the server registers the client");
     server_task.abort();
     Ok(())
 }
@@ -191,8 +194,7 @@ async fn the_server_ignores_unknown_feature_numbers_and_announcement_names() -> 
 async fn the_server_ignores_a_message_of_an_unknown_kind_and_keeps_the_connection() -> Result<()> {
     let (server_node, server_url, server_task) = start_test_server().await?;
     let mut client = RawClient::open(&server_url, SPOKEN).await?;
-    client.present(|_| {}).await?;
-    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await);
+    client.connect().await?;
 
     // Variant 99 of `Message`, then variant 99 of `NodeMessage` inside a peer message.
     client.socket.send(WsMessage::Binary(vec![99, 0, 0, 0].into())).await?;
@@ -208,8 +210,7 @@ async fn the_server_ignores_a_message_of_an_unknown_kind_and_keeps_the_connectio
 async fn the_server_answers_a_request_whose_body_it_cannot_read_with_unsupported() -> Result<()> {
     let (server_node, server_url, server_task) = start_test_server().await?;
     let mut client = RawClient::open(&server_url, SPOKEN).await?;
-    client.present(|_| {}).await?;
-    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await);
+    client.connect().await?;
 
     // Variant 99 of the request body, carried as its bytes.
     let body = bincode::deserialize(&bincode::serialize(&vec![99u8, 0, 0, 0])?)?;
@@ -293,25 +294,52 @@ async fn the_server_closes_a_silent_client_after_its_opening() -> Result<()> {
     Ok(())
 }
 
-/// The server answers one opening per connection: a second opening before the client's presence
+/// The server reads one opening per connection: a second opening before the client's presence
 /// closes the connection.
 #[tokio::test]
 async fn the_server_closes_a_connection_that_sends_a_second_opening() -> Result<()> {
     let (_server_node, server_url, server_task) = start_test_server().await?;
-    let (mut socket, _) = tokio_tungstenite::connect_async(format!("{}/ws", server_url)).await?;
-    let opening = proto::Opening { versions: SPOKEN, challenge: proto::HandshakeChallenge::new(NodeKey::generate().node_id()) };
-    socket.send(frame(&proto::Message::Open(opening))).await?;
-    socket.send(frame(&proto::Message::Open(opening))).await?;
+    let mut client = RawClient::open(&server_url, SPOKEN).await?;
+    client.socket.send(frame(&proto::Message::Open(client.opening))).await?;
+    client.present(|_| {}).await?;
+    assert!(receive(&mut client.socket).await.is_none(), "the server closes without presenting");
+    server_task.abort();
+    Ok(())
+}
 
-    let mut presences = 0;
-    while let Some(message) = receive(&mut socket).await {
-        if let proto::Message::Presence(_) = message {
-            presences += 1;
+/// A stranger connects to one server, reads its challenge, and puts that challenge in its opening
+/// to a second server. Were the second to answer with its presence, the stranger could present it
+/// at the first and be registered there as the second.
+#[tokio::test]
+async fn a_stranger_relaying_one_servers_challenge_to_another_receives_no_presence_from_it() -> Result<()> {
+    let (target, target_url, target_task) = start_test_server().await?;
+    let (relayed, relayed_url, relayed_task) = start_test_server().await?;
+    let stranger = NodeKey::generate();
+
+    let (mut at_target, _) = tokio_tungstenite::connect_async(format!("{target_url}/ws")).await?;
+    let Some(proto::Message::Open(target_opening)) = receive(&mut at_target).await else { panic!("the target opened otherwise") };
+    let (mut at_relayed, _) = tokio_tungstenite::connect_async(format!("{relayed_url}/ws")).await?;
+    let Some(proto::Message::Open(relayed_opening)) = receive(&mut at_relayed).await else { panic!("the second server opened otherwise") };
+    at_relayed.send(frame(&proto::Message::Open(proto::Opening { versions: SPOKEN, challenge: target_opening.challenge }))).await?;
+    let own = stranger.sign_presence(claims_answering(&stranger, &relayed_opening, SPOKEN, false));
+    at_relayed.send(frame(&proto::Message::Presence(own))).await?;
+    let mut relayed_presence = None;
+    while let Some(message) = receive(&mut at_relayed).await {
+        if let proto::Message::Presence(presence) = message {
+            relayed_presence = Some(presence);
+            break;
         }
     }
-    assert_eq!(presences, 1, "the server answers one opening per connection");
 
-    server_task.abort();
+    if let Some(presence) = relayed_presence.clone() {
+        at_target.send(frame(&proto::Message::Open(proto::Opening { versions: SPOKEN, challenge: relayed_opening.challenge }))).await?;
+        at_target.send(frame(&proto::Message::Presence(presence))).await?;
+        eventually(|| target.granted_trust(&relayed.id).is_some()).await;
+    }
+    assert_eq!(target.granted_trust(&relayed.id), None, "the target registered the stranger's connection as the second server");
+    assert!(relayed_presence.is_none(), "the second server answered a challenge the stranger relayed");
+    target_task.abort();
+    relayed_task.abort();
     Ok(())
 }
 
@@ -323,6 +351,12 @@ async fn accept_client(listener: &tokio::net::TcpListener, server_opening: Vec<u
     let Some(proto::Message::Open(client_opening)) = receive(&mut socket).await else { panic!("the client opened otherwise") };
     socket.send(WsMessage::Binary(server_opening.into())).await.expect("send");
     (socket, client_opening)
+}
+
+/// The presence a real client sends on reading a server's opening, before the server presents.
+async fn client_presence(socket: &mut WebSocketStream<TcpStream>) -> proto::Presence {
+    let Some(proto::Message::Presence(presence)) = receive(socket).await else { panic!("the client did not present") };
+    presence
 }
 
 /// The bytes of an opening from `server` offering `versions`.
@@ -346,6 +380,7 @@ async fn the_client_refuses_a_server_presence_that_does_not_repeat_the_offers_an
     let server = NodeKey::generate();
     let (server_opening, server_frame) = opening_from(&server, SPOKEN);
     let (mut socket, client_opening) = accept_client(&listener, server_frame).await;
+    assert_eq!(client_presence(&mut socket).await.claims.challenge, server_opening.challenge);
     let mut claims = claims_answering(&server, &client_opening, SPOKEN, true);
     claims.negotiation.chosen = 2;
     socket.send(frame(&proto::Message::Presence(server.sign_presence(claims)))).await?;
@@ -364,13 +399,12 @@ async fn the_client_ignores_unknown_features_announcements_and_message_kinds() -
     let server = NodeKey::generate();
     let (server_opening, server_frame) = opening_from(&server, SPOKEN);
     let (mut socket, client_opening) = accept_client(&listener, server_frame).await;
+    assert_eq!(client_presence(&mut socket).await.claims.challenge, server_opening.challenge);
     let mut claims = claims_answering(&server, &client_opening, SPOKEN, true);
     claims.features = vec![7, u32::MAX];
     claims.announcements.insert("a plugin the client does not have".into(), vec![1, 2, 3]);
     socket.send(frame(&proto::Message::Presence(server.sign_presence(claims)))).await?;
     tokio::time::timeout(Duration::from_secs(5), client.wait_connected()).await??;
-    let Some(proto::Message::Presence(client_presence)) = receive(&mut socket).await else { panic!("the client did not present") };
-    assert_eq!(client_presence.claims.challenge, server_opening.challenge);
 
     socket.send(WsMessage::Binary(vec![99, 0, 0, 0].into())).await?;
     socket.send(WsMessage::Binary(vec![3, 0, 0, 0, 99, 0, 0, 0].into())).await?;
@@ -388,6 +422,7 @@ async fn the_client_refuses_a_peer_message_before_the_servers_presence() -> Resu
     let server = NodeKey::generate();
     let (_, server_frame) = opening_from(&server, SPOKEN);
     let (mut socket, _) = accept_client(&listener, server_frame).await;
+    client_presence(&mut socket).await;
     let early =
         proto::Message::PeerMessage(proto::NodeMessage::UnsubscribeQuery { from: server.node_id(), query_id: proto::QueryId::new() });
     socket.send(frame(&early)).await?;

@@ -42,33 +42,43 @@ speak. A node that speaks none of the versions its peer offers answers with
 the versions it does speak and closes, without reading the rest of the peer's
 opening.
 
-Each side then answers the other's challenge with a signed `Presence`: its
-`NodeId`, whether it claims to be durable, the challenge it answers, an
-advisory timestamp, the versions it offered, the versions it saw its peer
-offer and the version it chose, the feature numbers it has, and the bytes
-each of its [plugins](node-architecture.md#node-plugins) announces under the
-plugin's name, all signed under the tag `ankurah.presence.v1`. A node ignores
-a feature number it does not know, and an announcement under a name none of
-its plugins has; each of its plugins receives the announcement under its own
-name. This build assigns no feature numbers. Connectors hold each connection's
-side of the handshake in a `Handshake`, and `register_peer` spends it: it
-accepts the presence only if it answers the single-use challenge this node
-issued for that connection, its signature verifies under the key it names, it
-does not name this node itself, and it repeats the offers this node sent and
-saw and the version this node chose. Openings carry no signature, so a party between the two nodes
-could change the offers to lower the version chosen; the peer then signs
-offers that differ from this node's, and its presence is refused. A presence
-copied from another connection answers a different challenge and is refused.
-Nothing in the handshake compares datasets: two nodes that share no history
-connect as readily as two that share all of it.
+The dialing side then presents: it sends a signed `Presence` answering the
+accepting side's challenge, carrying its `NodeId`, whether it claims to be
+durable, the challenge it answers, an advisory timestamp, the versions it
+offered, the versions it saw its peer offer and the version it chose, the
+feature numbers it has, and the bytes each of its
+[plugins](node-architecture.md#node-plugins) announces under the plugin's
+name, all signed under the tag `ankurah.presence.v1`. The accepting side
+registers the dialer on that presence, and only then signs its own presence,
+answering the dialer's challenge, and sends it. The dialing side registers the
+accepting side on that presence, and only then counts itself connected. So an
+accepting node signs nothing, and runs no plugin's announcement, for a dialer
+it has not authenticated and registered.
 
-The signed presence authenticates the handshake only; frames after it are not
-signed. A peer that authenticated its own connection can still name another
-registered peer in a message's `from` field, and so answer a request this
-node is waiting on from that peer if it knows the request id, remove that
-peer's query, or inject updates attributed to that peer. TLS does not prevent
-this, because the sender is a legitimate endpoint of its own connection.
-Signing every frame after the handshake is left to a later change.
+A node ignores a feature number it does not know, and an announcement under a
+name none of its plugins has; each of its plugins receives the announcement
+under its own name. This build assigns no feature numbers. Connectors hold each
+connection's side of the handshake in a `Handshake`, and `register_peer`
+checks a presence against it: it accepts the presence only if it answers the
+single-use challenge this node issued for that connection, its signature
+verifies under the key it names, the peer's opening carried a challenge the
+peer issued itself, it does not name this node itself, and it repeats the
+offers this node sent and saw and the version this node chose. Openings carry
+no signature, so a party between the two nodes could change the offers to
+lower the version chosen; the peer then signs offers that differ from this
+node's, and its presence is refused. A presence copied from another connection
+answers a different challenge and is refused. Nothing in the handshake
+compares datasets: two nodes that share no history connect as readily as two
+that share all of it.
+
+What the handshake does not give: a node that dials an address sends its
+presence before it knows who answers there, so whoever answers can use that
+presence at one other accepting node, and can sit between the two and alter
+frames, which are not signed. A dialer chooses its addresses; letting it name
+the node it expects at an address needs nothing on the wire and is later
+work, as is signing frames after the handshake. A registered peer cannot pass
+its frames off as another peer's: a node handles a frame only on the
+connection of the peer the frame names as its sender.
 
 ## Peer Trust
 
@@ -83,9 +93,9 @@ becomes a relay target for local commits and a source for durable reads; an
 inbound peer's durable claim is logged and otherwise ignored.
 
 A node id's latest registration decides its trust, and registrations of one
-id apply one at a time. Anyone can get a node's presence for a fresh
-opening by relaying that opening to that node, so an id trusted as durable
-can be registered again over a connection that is not. Durable routing for
+id apply one at a time. A node that dials an address presents to whoever
+answers there, so an id trusted as durable can be registered again over a
+connection that is not. Durable routing for
 that id is dropped at that moment, and every request to a peer chosen because
 it is durable re-checks, as it is sent, that the peer's current connection is
 trusted as durable; a request that fails the check is refused, so neither its

@@ -2,7 +2,8 @@ use super::{register_keyed_peer, register_keyed_peer_claiming, RecordingSender};
 use crate::connector::{Handshake, PeerConnectionError, PeerProvenance};
 use crate::node::{Node, NodeKey};
 use crate::policy::{PeerTrust, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT};
-use crate::test_utils::{opened_handshakes, TestStorage};
+use crate::test_helpers::opened_handshakes;
+use crate::test_utils::TestStorage;
 use ankurah_proto as proto;
 use std::sync::{mpsc, Arc};
 
@@ -35,7 +36,7 @@ async fn a_presence_with_a_forged_signature_is_refused() {
     let mut presence = key.sign_presence(theirs.presence_claims(key.node_id(), false).unwrap());
     presence.claims.durable = true;
     let (sent, _) = mpsc::channel();
-    let refused = node.register_peer(presence, ours, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
+    let refused = node.register_peer(presence, &ours, PeerProvenance::Configured, Box::new(RecordingSender(key.node_id(), sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::InvalidSignature(key.node_id())), "a claim changed after signing");
 
     let impersonated = NodeKey::generate().node_id();
@@ -43,7 +44,7 @@ async fn a_presence_with_a_forged_signature_is_refused() {
     let mut presence = key.sign_presence(theirs.presence_claims(key.node_id(), false).unwrap());
     presence.claims.node_id = impersonated;
     let (sent, _) = mpsc::channel();
-    let refused = node.register_peer(presence, ours, PeerProvenance::Configured, Box::new(RecordingSender(impersonated, sent))).await;
+    let refused = node.register_peer(presence, &ours, PeerProvenance::Configured, Box::new(RecordingSender(impersonated, sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::InvalidSignature(impersonated)), "a signature by another node's key");
     assert_eq!((node.granted_trust(&key.node_id()), node.granted_trust(&impersonated)), (None, None));
 }
@@ -58,23 +59,25 @@ async fn a_presence_replayed_on_another_connection_is_refused() {
     let (first, theirs) = opened_handshakes(node.id, peer);
     let presence = key.sign_presence(theirs.presence_claims(peer, false).unwrap());
     let (sent, _) = mpsc::channel();
-    node.register_peer(presence.clone(), first, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent.clone()))).await.unwrap();
+    node.register_peer(presence.clone(), &first, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent.clone()))).await.unwrap();
 
     let (second, _) = opened_handshakes(node.id, peer);
     let replayed =
-        node.register_peer(presence.clone(), second, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent.clone()))).await;
+        node.register_peer(presence.clone(), &second, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent.clone()))).await;
     assert_eq!(replayed, Err(PeerConnectionError::ChallengeMismatch(peer)), "the same node, a new connection");
 
     let (elsewhere, _) = opened_handshakes(other.id, peer);
-    let replayed = other.register_peer(presence, elsewhere, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent))).await;
+    let replayed = other.register_peer(presence, &elsewhere, PeerProvenance::Inbound, Box::new(RecordingSender(peer, sent))).await;
     assert_eq!(replayed, Err(PeerConnectionError::ChallengeMismatch(peer)), "a presence signed for another node");
     assert_eq!(other.granted_trust(&peer), None);
 }
 
-/// A middle node that answers its dialer's challenge itself while handing it a third node's
-/// challenge is refused by the dialer, before the dialer sends a presence answering that
-/// challenge; and the third node refuses the dialer's presence arriving on the middle node's
-/// connection, in case the dialer had sent one.
+/// A middle node that opens to its dialer with a third node's challenge receives the dialer's
+/// presence answering that challenge, since a dialer presents before the node it dialed does. The
+/// dialer refuses the middle node's presence that follows, and the third node refuses the
+/// dialer's presence arriving on a connection whose opening carried the middle node's challenge.
+/// Had that opening carried the dialer's challenge instead, the third node would have registered
+/// the middle node's connection as the dialer: the handshake does not close that.
 #[tokio::test]
 async fn a_presence_on_a_connection_that_relayed_a_third_nodes_challenge_is_refused_on_both_sides() {
     let node = || Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
@@ -87,20 +90,20 @@ async fn a_presence_on_a_connection_that_relayed_a_third_nodes_challenge_is_refu
     middle_to_third.receive_opening(third_side.opening()).unwrap();
     third_side.receive_opening(middle_to_third.opening()).unwrap();
 
-    // The victim dials the middle node, which opens with the third node's challenge and answers
-    // the victim's challenge with its own presence.
+    // The victim dials the middle node, which opens with the third node's challenge; the victim
+    // presents, answering it.
     let (mut victim_side, mut middle_side) = (victim.begin_handshake(), middle.begin_handshake());
     victim_side.receive_opening(third_side.opening()).unwrap();
     middle_side.receive_opening(victim_side.opening()).unwrap();
-    let middle_presence = middle.presence(&middle_side).await.unwrap();
     let victim_answer = victim.presence(&victim_side).await.unwrap();
-    assert_eq!(victim_answer.claims.challenge, third_side.opening().challenge, "what the victim would sign answers the third node");
+    assert_eq!(victim_answer.claims.challenge, third_side.opening().challenge, "the victim's presence answers the third node");
 
-    let refused = victim.register_peer(middle_presence, victim_side, PeerProvenance::Configured, sender(middle.id)).await;
+    let middle_presence = middle.presence(&middle_side).await.unwrap();
+    let refused = victim.register_peer(middle_presence, &victim_side, PeerProvenance::Configured, sender(middle.id)).await;
     assert_eq!(refused, Err(PeerConnectionError::RelayedChallenge { peer: middle.id, issuer: third.id }));
     assert_eq!(victim.granted_trust(&middle.id), None);
 
-    let relayed = third.register_peer(victim_answer, third_side, PeerProvenance::Inbound, sender(victim.id)).await;
+    let relayed = third.register_peer(victim_answer, &third_side, PeerProvenance::Inbound, sender(victim.id)).await;
     assert_eq!(relayed, Err(PeerConnectionError::RelayedChallenge { peer: victim.id, issuer: middle.id }));
     assert_eq!(third.granted_trust(&victim.id), None);
 }
@@ -113,7 +116,7 @@ async fn a_reflected_self_connection_is_refused() {
     handshake.receive_opening(handshake.opening()).unwrap();
     let reflected = node.presence(&handshake).await.unwrap();
     let (sent, _) = mpsc::channel();
-    let refused = node.register_peer(reflected, handshake, PeerProvenance::Configured, Box::new(RecordingSender(node.id, sent))).await;
+    let refused = node.register_peer(reflected, &handshake, PeerProvenance::Configured, Box::new(RecordingSender(node.id, sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::SelfConnection(node.id)));
     assert_eq!(node.granted_trust(&node.id), None);
 }
@@ -160,7 +163,7 @@ async fn a_presence_before_the_peers_opening_is_refused() {
     let presence = key.sign_presence(theirs.presence_claims(key.node_id(), false).unwrap());
     let (sent, _) = mpsc::channel();
     let unopened = node.begin_handshake();
-    let refused = node.register_peer(presence, unopened, PeerProvenance::Inbound, Box::new(RecordingSender(key.node_id(), sent))).await;
+    let refused = node.register_peer(presence, &unopened, PeerProvenance::Inbound, Box::new(RecordingSender(key.node_id(), sent))).await;
     assert_eq!(refused, Err(PeerConnectionError::NoOpening));
     assert_eq!(node.granted_trust(&key.node_id()), None);
 }
@@ -205,15 +208,16 @@ async fn a_durable_peer_registering_again_inbound_leaves_durable_routing() {
 
     let (handshake, presence) = answered_handshake(&client, &server).await;
     let (sent, _) = mpsc::channel();
-    client.register_peer(presence, handshake, PeerProvenance::Configured, Box::new(RecordingSender(server.id, sent))).await.unwrap();
+    client.register_peer(presence, &handshake, PeerProvenance::Configured, Box::new(RecordingSender(server.id, sent))).await.unwrap();
     assert_eq!(client.get_durable_peers(), vec![server.id]);
     assert!(relay.is_connected(&server.id));
 
-    // Anyone can get the server's presence for the client's fresh opening by relaying the opening to it.
+    // A server that dials an address presents to whoever answers there, answering the challenge
+    // that answer carried: here the client's, relayed.
     let (handshake, relayed) = answered_handshake(&client, &server).await;
     let (relayer_sent, relayer_messages) = mpsc::channel();
     let relayer = Box::new(RecordingSender(server.id, relayer_sent));
-    client.register_peer(relayed, handshake, PeerProvenance::Inbound, relayer).await.unwrap();
+    client.register_peer(relayed, &handshake, PeerProvenance::Inbound, relayer).await.unwrap();
 
     assert_eq!(client.granted_trust(&server.id), Some(PeerTrust { durable: false }));
     assert!(client.get_durable_peers().is_empty());
@@ -234,7 +238,7 @@ async fn a_closing_connection_leaves_a_newer_registration_of_its_peer_in_place()
     let register = || async {
         let (handshake, presence) = answered_handshake(&client, &server).await;
         let (sent, _) = mpsc::channel();
-        client.register_peer(presence, handshake, PeerProvenance::Configured, Box::new(RecordingSender(server.id, sent))).await.unwrap()
+        client.register_peer(presence, &handshake, PeerProvenance::Configured, Box::new(RecordingSender(server.id, sent))).await.unwrap()
     };
     let (first, second) = (register().await, register().await);
     assert_ne!(first, second);
@@ -333,7 +337,7 @@ async fn concurrent_registrations_of_one_id_leave_durable_routing_matching_the_c
         tokio::spawn(async move {
             let (handshake, presence) = answered_handshake(&client, &server).await;
             let (sent, _) = mpsc::channel();
-            client.register_peer(presence, handshake, provenance, Box::new(RecordingSender(server.id, sent))).await.unwrap();
+            client.register_peer(presence, &handshake, provenance, Box::new(RecordingSender(server.id, sent))).await.unwrap();
         })
     };
     register(PeerProvenance::Configured).await.unwrap();

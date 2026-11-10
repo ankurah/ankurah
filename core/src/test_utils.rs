@@ -1,7 +1,6 @@
-use crate::connector::Handshake;
 use crate::error::{MutationError, RetrievalError};
 use crate::storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction};
-use ankurah_proto::{self as proto, Attested, Clock, EntityId, EntityState, Event, EventId, ModelId};
+use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, ModelId};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -213,14 +212,4 @@ impl StorageEngine for TestStorage {
             .into_iter()
             .collect())
     }
-}
-
-/// Two sides of a fresh handshake, `node`'s and `peer`'s, each holding the other's opening, as
-/// two connected nodes hold them once both openings have arrived.
-pub(crate) fn opened_handshakes(node: proto::NodeId, peer: proto::NodeId) -> (Handshake, Handshake) {
-    let (mut ours, mut theirs) = (Handshake::new(node), Handshake::new(peer));
-    // Cannot fail: each side receives one opening, and both offer the versions this build speaks.
-    ours.receive_opening(theirs.opening()).expect("the openings share a version");
-    theirs.receive_opening(ours.opening()).expect("the openings share a version");
-    (ours, theirs)
 }
