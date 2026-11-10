@@ -21,6 +21,10 @@ pub enum PeerConnectionError {
     ChallengeMismatch(proto::NodeId),
     #[error("presence signature is not valid for node {0}")]
     InvalidSignature(proto::NodeId),
+    /// The peer's opening carried another node's challenge, as a node relaying that node's
+    /// handshake would send it.
+    #[error("node {peer}'s opening carried a challenge issued by node {issuer}")]
+    RelayedChallenge { peer: proto::NodeId, issuer: proto::NodeId },
     #[error("node {0} refused a connection to itself")]
     SelfConnection(proto::NodeId),
     #[error("presence from node {0} does not repeat the versions offered and chosen on this connection")]

@@ -48,6 +48,7 @@ impl ConnectionStateEnum {
                 Some(PeerConnectionError::NoOpening) => "NoOpening",
                 Some(PeerConnectionError::ChallengeMismatch(_)) => "ChallengeMismatch",
                 Some(PeerConnectionError::InvalidSignature(_)) => "InvalidSignature",
+                Some(PeerConnectionError::RelayedChallenge { .. }) => "RelayedChallenge",
                 Some(PeerConnectionError::SelfConnection(_)) => "SelfConnection",
                 Some(PeerConnectionError::OfferMismatch(_)) => "OfferMismatch",
                 Some(PeerConnectionError::Refused(_)) => "Refused",

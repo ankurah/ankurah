@@ -71,6 +71,40 @@ async fn a_presence_replayed_on_another_connection_is_refused() {
     assert_eq!(other.peer_trust(&peer), None);
 }
 
+/// A middle node that answers its dialer's challenge itself while handing it a third node's
+/// challenge is refused by the dialer, before the dialer sends a presence answering that
+/// challenge; and the third node refuses the dialer's presence arriving on the middle node's
+/// connection, in case the dialer had sent one.
+#[tokio::test]
+async fn a_presence_on_a_connection_that_relayed_a_third_nodes_challenge_is_refused_on_both_sides() {
+    let node = || Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let (victim, middle, third) = (node(), node(), node());
+    let (sent, _) = mpsc::channel();
+    let sender = |peer| Box::new(RecordingSender(peer, sent.clone()));
+
+    // The middle node dials the third, which opens with its own challenge.
+    let (mut middle_to_third, mut third_side) = (middle.begin_handshake(), third.begin_handshake());
+    middle_to_third.receive_opening(third_side.opening()).unwrap();
+    third_side.receive_opening(middle_to_third.opening()).unwrap();
+
+    // The victim dials the middle node, which opens with the third node's challenge and answers
+    // the victim's challenge with its own presence.
+    let (mut victim_side, mut middle_side) = (victim.begin_handshake(), middle.begin_handshake());
+    victim_side.receive_opening(third_side.opening()).unwrap();
+    middle_side.receive_opening(victim_side.opening()).unwrap();
+    let middle_presence = middle.presence(&middle_side).await.unwrap();
+    let victim_answer = victim.presence(&victim_side).await.unwrap();
+    assert_eq!(victim_answer.claims.challenge, third_side.opening().challenge, "what the victim would sign answers the third node");
+
+    let refused = victim.register_peer(middle_presence, victim_side, PeerProvenance::Configured, sender(middle.id)).await;
+    assert_eq!(refused, Err(PeerConnectionError::RelayedChallenge { peer: middle.id, issuer: third.id }));
+    assert_eq!(victim.peer_trust(&middle.id), None);
+
+    let relayed = third.register_peer(victim_answer, third_side, PeerProvenance::Inbound, sender(victim.id)).await;
+    assert_eq!(relayed, Err(PeerConnectionError::RelayedChallenge { peer: victim.id, issuer: middle.id }));
+    assert_eq!(third.peer_trust(&victim.id), None);
+}
+
 #[tokio::test]
 async fn a_reflected_self_connection_is_refused() {
     let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());

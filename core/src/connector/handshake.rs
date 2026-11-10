@@ -76,9 +76,10 @@ impl Handshake {
     }
 
     /// Spend this handshake on `presence`: check that it answers the challenge `receiver` issued
-    /// here under a valid signature from a node other than `receiver`, and that it repeats the
-    /// versions each side offered on this connection and the version chosen, so a party between
-    /// the two cannot change the offers unnoticed.
+    /// here under a valid signature from a node other than `receiver`, that the peer's opening
+    /// carried a challenge that node issued itself, and that it repeats the versions each side
+    /// offered on this connection and the version chosen, so a party between the two cannot
+    /// change the offers unnoticed.
     pub(crate) fn authenticate(self, receiver: proto::NodeId, presence: &proto::Presence) -> Result<(), PeerConnectionError> {
         let claims = &presence.claims;
         let peer_id = claims.node_id;
@@ -88,6 +89,12 @@ impl Handshake {
         }
         if !presence.signature_is_valid() {
             return Err(PeerConnectionError::InvalidSignature(peer_id));
+        }
+        // A node answering this connection's challenge while relaying a third node's opening could
+        // hand that node our presence answering its challenge, and be registered there as us.
+        let issuer = peer.opening.challenge.issuer();
+        if issuer != peer_id {
+            return Err(PeerConnectionError::RelayedChallenge { peer: peer_id, issuer });
         }
         if peer_id == receiver {
             return Err(PeerConnectionError::SelfConnection(peer_id));
