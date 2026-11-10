@@ -25,7 +25,9 @@ where
 
     /// Asked once per registration, after the presence verifies and trust is decided and
     /// before the peer is registered. `Err` refuses the peer. No message from the peer is read
-    /// while this runs, so a plugin decides from what the handshake carried.
+    /// while this runs, so a plugin decides from what the handshake carried. The hook can be
+    /// dropped at any await, when the connection closes or the connector's handshake deadline
+    /// passes, and the peer is then not registered.
     async fn register_peer(&self, _node: &Node<SE, PA>, _peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> { Ok(()) }
 }
 

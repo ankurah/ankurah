@@ -5,7 +5,7 @@
 //! from a raw server.
 
 use ankurah::core::connector::PeerConnectionError;
-use ankurah::core::node::{AnnouncementFailure, NodeKey, NodePlugin};
+use ankurah::core::node::{AnnouncementFailure, NodeKey, NodePlugin, PeerRefusal, PeerRegistration};
 use ankurah::core::storage::StorageEngine;
 use ankurah::policy::PolicyAgent;
 use ankurah::{Node, PermissiveAgent};
@@ -14,6 +14,7 @@ use ankurah_websocket_client::{ConnectionError, WebsocketClient};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -338,6 +339,63 @@ async fn the_server_closes_a_connection_whose_answer_is_not_ready_within_the_han
         Some(Ok(other)) => panic!("the server sent {other:?} instead of closing"),
     }
     assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_none()).await, "the server removes the registration");
+    server_task.abort();
+    Ok(())
+}
+
+/// A plugin that never decides on a peer's registration, and records that its hook began and
+/// that it was dropped.
+struct UndecidedRegistrar {
+    began: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+/// Sets its flag when dropped.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+}
+
+#[async_trait::async_trait]
+impl<SE, PA> NodePlugin<SE, PA> for UndecidedRegistrar
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn name(&self) -> &'static str { "undecided-registrar" }
+
+    async fn register_peer(&self, _: &Node<SE, PA>, _: &PeerRegistration<'_>) -> Result<(), PeerRefusal> {
+        let _dropped = SetOnDrop(self.dropped.clone());
+        self.began.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Registering the dialer, every plugin's hook included, is bound by the handshake deadline: a
+/// server whose plugin never decides on the client drops the hook, registers nothing and closes
+/// the connection.
+#[tokio::test]
+async fn the_server_closes_a_connection_whose_registration_is_not_decided_within_the_handshake_deadline() -> Result<()> {
+    let (began, dropped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let registrar = UndecidedRegistrar { began: began.clone(), dropped: dropped.clone() };
+    let server_node = Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).durable().plug(registrar).build()?;
+    let (server_url, server_task) = serve(server_node.clone()).await?;
+    let mut client = RawClient::open(&server_url, SPOKEN).await?;
+    client.present(|_| {}).await?;
+    assert!(eventually(|| began.load(Ordering::SeqCst)).await, "the server asks its plugin about the client");
+
+    // The clock stays real until the hook has begun, so no earlier deadline fires early.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    match tokio::time::timeout(Duration::from_secs(1), client.socket.next()).await.expect("the server left the connection open") {
+        None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => {}
+        Some(Ok(other)) => panic!("the server sent {other:?} instead of closing"),
+    }
+    assert!(dropped.load(Ordering::SeqCst), "the server dropped the plugin's hook");
+    assert_eq!(server_node.granted_trust(&client.key.node_id()), None, "the server registered nothing");
     server_task.abort();
     Ok(())
 }

@@ -32,9 +32,11 @@ use crate::{client_ip::SmartClientIp, OptionalUserAgent};
 use super::sender::{Socket, WebSocketClientSender};
 use super::state::Connection;
 
-// The handshake, this node's own presence and every plugin's announcement included, finishes
-// within this, so neither a peer that never presents nor a slow announcement holds open a
-// connection that is not established.
+// From the connection's start, this bounds the whole accepting handshake: sending this node's
+// opening, reading the dialer's opening and presence, registering the dialer with every plugin's
+// hook, signing this node's presence with every plugin's announcement and sending it, or sending
+// the frame that refuses the dialer. A connection not established by then closes, so neither a
+// dialer that never presents nor a slow plugin holds it open.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebsocketServer<SE, PA>
@@ -231,11 +233,15 @@ where
 {
     debug!("Received client presence from {}", client_ip);
     let (sender, writer) = WebSocketClientSender::new(presence.claims.node_id);
-    // Outside the deadline, so no plugin's hook is cut off partway.
-    match node.register_peer(presence, &mut handshake, Box::new(sender.clone())).await {
+    match tokio::time::timeout_at(handshake_deadline, node.register_peer(presence, &mut handshake, Box::new(sender.clone()))).await {
         // Held by the connection from here, so the peer is deregistered however the connection ends.
-        Ok(registration) => *state = Connection::Established { sender, registration },
-        Err(refusal) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
+        Ok(Ok(registration)) => *state = Connection::Established { sender, registration },
+        Ok(Err(refusal)) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
+        // A registration cut off before it finished registered nothing.
+        Err(_) => {
+            warn!("Registering peer at {client_ip} did not finish within {HANDSHAKE_TIMEOUT:?}; closing");
+            return ControlFlow::Break(());
+        }
     }
     let answer = match tokio::time::timeout_at(handshake_deadline, node.presence(&handshake)).await {
         Ok(Ok(presence)) => proto::Message::Presence(presence),
