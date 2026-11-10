@@ -42,6 +42,9 @@ base64  = "0.22"
 tokio-tungstenite = "0.27"
 futures-util      = "0.3"
 
+# the test websocket server, served on a listener the test holds (common.rs)
+axum = "0.8.3"
+
 # derive-macro compile-fail fixtures (derive_compile_fail.rs)
 trybuild = "1.0"
 

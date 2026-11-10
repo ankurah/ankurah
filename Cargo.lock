@@ -533,6 +533,7 @@ dependencies = [
  "ankurah-websocket-server",
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "bb8",
  "bb8-postgres",

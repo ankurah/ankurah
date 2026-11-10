@@ -621,71 +621,22 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     Ok((server_node, server_url, server_task))
 }
 
-/// Serve websocket clients from `server_node` on a free local port, returning its URL and the serving task.
+/// Serve websocket clients from `server_node` on a port the system assigns, returning its URL and
+/// the serving task. The serving task holds the listener, bound before the URL is returned, so no
+/// other listener can hold that port.
 #[allow(unused)]
 pub async fn serve(server_node: Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     use ankurah_websocket_server::WebsocketServer;
-    use rand::Rng;
-    use tracing::info;
 
-    let mut rng = rand::thread_rng();
-
-    // Retry logic for port conflicts
-    const MAX_PORT_RETRIES: usize = 10;
-    let mut last_error = None;
-
-    for attempt in 0..MAX_PORT_RETRIES {
-        let port: u16 = rng.gen_range(20000..=65000);
-        let bind_addr = format!("127.0.0.1:{}", port);
-        let server_url = format!("ws://127.0.0.1:{}", port);
-
-        info!("Attempt {} - Starting websocket server on {}", attempt + 1, server_url);
-
-        // Start server in background task
-        let server_node_clone = server_node.clone();
-        let bind_addr_clone = bind_addr.clone();
-
-        let server_task = tokio::spawn(async move {
-            let mut server = WebsocketServer::new(server_node_clone);
-            if let Err(e) = server.run(&bind_addr_clone).await {
-                tracing::warn!("Test server error on {}: {}", bind_addr_clone, e);
-            }
-        });
-
-        // Positive readiness: probe until the listener accepts, failing fast
-        // if the server task already exited (a failed bind). A fixed sleep can
-        // pass before a slow bind is listening, handing back a URL the suite's
-        // immediate connect then flakes on.
-        let mut listening = false;
-        for _ in 0..100 {
-            if server_task.is_finished() {
-                break;
-            }
-            if tokio::net::TcpStream::connect(&bind_addr).await.is_ok() {
-                listening = true;
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(5)).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = axum::Router::new().route("/ws", axum::routing::get(WebsocketServer::new(server_node).route_handler()));
+    let server_task = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
+            tracing::warn!("Test server on {address} stopped: {error}");
         }
-        if !listening {
-            // Either the task exited (bind failure) or the listener never
-            // became reachable in time; retry on another port.
-            tracing::warn!("Failed to bind server on port {} (attempt {})", port, attempt + 1);
-            last_error = Some(anyhow::anyhow!("Port {} binding failed", port));
-
-            if attempt < MAX_PORT_RETRIES - 1 {
-                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            }
-            continue;
-        }
-
-        // Server task is still running, which means TcpListener::bind() succeeded
-        // The server is now listening and ready for connections
-        info!("Successfully started websocket server on {} (attempt {})", server_url, attempt + 1);
-        return Ok((server_url, server_task));
-    }
-
-    Err(anyhow::anyhow!("Failed to start test server after {} attempts. Last error: {:?}", MAX_PORT_RETRIES, last_error))
+    });
+    Ok((format!("ws://{address}"), server_task))
 }
 
 /// The durable identity `name` resolved to on `node`: the descriptor-cell
