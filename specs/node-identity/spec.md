@@ -77,8 +77,8 @@ pub struct NodeId(Identity);              // the peer layer's name for an identi
   encodings only, a small-order key or `R` refused, the equation without the cofactor) with
   vectors of signatures a reader must refuse.
 - In text an identity or a signature names its scheme: `ed25519:` followed by unpadded
-  URL-safe base64. `Display`, `FromStr`, human-readable serde, the trusted publishers file and
-  the wasm and uniffi surfaces all use that form.
+  URL-safe base64. `Display`, `FromStr`, human-readable serde and the wasm and uniffi surfaces
+  all use that form.
 
 ### 3.2 The node's key (core)
 
@@ -95,21 +95,6 @@ durable node is the same node after a restart.
 - Where the 32-byte seed is kept is the embedder's choice. `NodeKey::load_or_create(path)`
   reads or creates a seed file (owner-only permissions, created exclusively and linked into
   place) for embedders that want a file.
-
-### 3.3 Trusted publishers
-
-For: a node can later adopt the component and property definitions the Ankurah Commons publishes,
-knowing whose signature to expect on them.
-
-- `core/src/policy/trusted_publishers.txt` holds one identity per line in its text form, with
-  `#` comments. It is included at build time and parsed once; a line that does not parse fails
-  a test, not a running node. It ships empty until the Commons key exists.
-- `PolicyAgent::trusted_publishers` returns the shipped set by default; an application
-  overrides it with its own.
-- Nothing consumes the set yet. Adopting a published definition by its id is outside this
-  work (section 13).
-- A publisher key that is lost or compromised is replaced out of band: the publisher announces
-  a new key and publishes new signatures. The protocol has no rotation of its own (section 12).
 
 ## 4. Opening a connection
 
@@ -461,6 +446,7 @@ server holds one `M` entity per seeding.
 | Membership removal | A free `Membership` index. Its design must settle the shape of stored state before the freeze |
 | A signed tree root in place of a signature per served state | A new statement kind |
 | Key rotation, delegation, threshold identities | New statement kinds, and `Identity` or `Signature` variants announced as features |
+| Checking that a published definition comes from its publisher: a list of trusted publishers, and a publisher's statement about what it minted | The minter's identity inside every creation id (section 6) and the attestation of section 7. Nothing in a stored or exchanged byte changes |
 | Signed frames after the handshake; new requests | Features and carried bodies |
 | Replacing the serializer crate | The byte specification |
 | Merging an attestation that arrives after its event was stored | Attestations stored as separate elements |

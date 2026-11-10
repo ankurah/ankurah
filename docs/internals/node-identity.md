@@ -175,12 +175,6 @@ state in hand (`Subject::names_event`, `Subject::names_state`). Whether an
 attestation suffices, and whether its attester is a trusted durable peer or a
 trusted publisher, is the agent's decision.
 
-`PolicyAgent::trusted_publishers` names the identities whose published
-component and property definitions a node may adopt. By default it returns
-the list Ankurah ships in `core/src/policy/trusted_publishers.txt`, which is
-empty until the Commons publisher's key exists; an application overrides it
-with its own.
-
 ## Resetting a Node
 
 `Node::reset` halts the node with `NodeHaltReason::Reset` and then, once no

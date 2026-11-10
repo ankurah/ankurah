@@ -1,6 +1,0 @@
-# Publishers whose component and property definitions a node may adopt by
-# default: one Identity per line in its text form, `ed25519:` followed by the
-# unpadded URL-safe base64 of the key. `PolicyAgent::trusted_publishers`
-# returns this list unless an application overrides it.
-#
-# Empty until the Ankurah Commons publisher's key exists.

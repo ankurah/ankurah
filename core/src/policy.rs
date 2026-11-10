@@ -16,7 +16,6 @@ use thiserror::Error;
 use tracing::debug;
 
 mod context;
-mod trusted_publishers;
 pub use context::ContextPolicy;
 
 /// The result of a policy check. Currently just Allow/Deny, but will support Trace in the future
@@ -246,10 +245,6 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
             PeerProvenance::Inbound => PeerTrust { durable: false },
         }
     }
-
-    /// The identities whose published definitions this node may adopt. By default, the list
-    /// Ankurah ships in `trusted_publishers.txt`; an application overrides it with its own.
-    fn trusted_publishers(&self) -> Vec<proto::Identity> { trusted_publishers::shipped() }
 
     // // For checking if a context can subscribe to changes
     // fn can_subscribe(&self, data: &Self::ContextData, collection: &ModelId, predicate: &Predicate) -> AccessResult;
