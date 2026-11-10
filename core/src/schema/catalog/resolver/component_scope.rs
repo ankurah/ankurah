@@ -57,7 +57,8 @@ fn member_named<'a>(
     Ok(members.iter().position(|names| names.is_some_and(|names| names.label == qualifier)))
 }
 
-/// A property name that a query's components cannot place on exactly one property.
+/// A name in a selection that the query's components refuse: an ambiguous or unknown name or qualifier, or a sort
+/// key outside the query's tuple.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ComponentScopeError {
     /// A bare name two of the query's components declare as different properties.
