@@ -65,7 +65,6 @@ async fn ref_scope_rule_receives_live_updates() -> anyhow::Result<()> {
     agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let root = node.context_async(JwtContext::system()).await?;
@@ -122,7 +121,6 @@ async fn first_use_fetch_registers_schema_without_granting_write_access() -> any
     agent.update_config(serde_json::from_str::<PolicyConfig>(CONFIG_JSON)?);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let member_claims = JwtClaims {
@@ -135,7 +133,7 @@ async fn first_use_fetch_registers_schema_without_granting_write_access() -> any
     let token = keys.sign(&member_claims, Duration::from_hours(1))?;
     let member_ctx = node.context_async(JwtContext::from_claims(member_claims, token)).await?;
 
-    let epoch = node.system.catalog_epoch().unwrap();
+    let epoch = node.catalog_epoch().unwrap();
     assert!(ScopeItem::descriptor().bind_local(&node.catalog, epoch).is_err());
     assert!(member_ctx.fetch::<ScopeItemView>("label = 'x'").await?.is_empty());
     assert!(ScopeItem::descriptor().bind_local(&node.catalog, epoch).is_ok());
@@ -157,7 +155,6 @@ async fn first_use_live_query_grants_nothing_for_an_invalid_scope_claim() -> any
     agent.update_config(config);
     agent.set_keys(JwtKeys::Signing(keys.clone()));
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let member_claims = JwtClaims {
@@ -170,7 +167,7 @@ async fn first_use_live_query_grants_nothing_for_an_invalid_scope_claim() -> any
     let token = keys.sign(&member_claims, Duration::from_hours(1))?;
     let member_ctx = node.context_async(JwtContext::from_claims(member_claims, token)).await?;
 
-    assert!(ScopeItem::descriptor().bind_local(&node.catalog, node.system.catalog_epoch().unwrap()).is_err());
+    assert!(ScopeItem::descriptor().bind_local(&node.catalog, node.catalog_epoch().unwrap()).is_err());
     let query = member_ctx.query::<ScopeItemView>("label = 'x'")?;
     query.wait_initialized().await?;
 

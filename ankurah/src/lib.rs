@@ -87,16 +87,14 @@
 //! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     // Create server and client nodes
 //!     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
-//!     server.system.create().await?;
 //!     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), ankurah::policy::PermissiveAgent::new());
 //!
 //!     // Connect nodes using local process connection
 //!     let _conn = LocalProcessConnection::new(&server, &client).await?;
-//!     client.system.wait_system_ready().await; // Wait for the client to join the server "system"
 //!
 //!     // Get contexts for the server and client
-//!     let server = server.context(ankurah::policy::DEFAULT_CONTEXT)?;
-//!     let client = client.context(ankurah::policy::DEFAULT_CONTEXT)?;
+//!     let server = server.context_async(ankurah::policy::DEFAULT_CONTEXT).await?;
+//!     let client = client.context_async(ankurah::policy::DEFAULT_CONTEXT).await?;
 //!
 //!     // Create a LiveQuery and subscribe to changes on the client
 //!     let livequery = client.query::<AlbumView>("name = 'Origin of Symmetry'")?;

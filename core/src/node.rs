@@ -1,7 +1,6 @@
 use crate::internal::prelude::*;
 use ankql::ast::Resolved;
 use ankurah_signals::{Calculated, Get, Mut, Wait};
-use futures::TryFutureExt;
 
 use rand::prelude::*;
 use rand::rngs::SmallRng;
@@ -19,7 +18,6 @@ use crate::error::{NodeHaltReason, NodeReadinessError, RequestError};
 use crate::peer_subscription::{SubscriptionHandler, SubscriptionRelay};
 use crate::reactor::Reactor;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
-use crate::system::SystemManager;
 use crate::util::Iterable;
 use crate::{action_info, notice_info};
 #[cfg(feature = "instrument")]
@@ -44,6 +42,7 @@ pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
 pub use identity::key::NodeKey;
 pub use lifecycle::state::NodeState;
+use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub(crate) use peers::durable_peer;
 pub use peers::peer_state::PeerState;
@@ -110,7 +109,7 @@ where PA: PolicyAgent
     /// The reactor for handling subscriptions
     pub(crate) reactor: Reactor,
     pub(crate) policy_agent: PA,
-    pub system: SystemManager<SE>,
+    pub(crate) lifecycle: NodeLifecycle<SE>,
 
     pub catalog: Arc<CatalogManager>,
     alive: Mut<bool>,
@@ -128,7 +127,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    fn check_not_halted(&self) -> Result<(), NodeHaltReason> { self.system.check_not_halted() }
+    fn check_not_halted(&self) -> Result<(), NodeHaltReason> { self.lifecycle.check_not_halted() }
 
     fn reactor(&self) -> &Reactor { &self.reactor }
     fn live_queries(&self) -> &crate::livequery::LiveQueryRegistry { &self.live_queries }
@@ -155,17 +154,26 @@ where
     /// Configure a node's role and key before it starts.
     pub fn builder(engine: Arc<SE>, policy_agent: PA) -> NodeBuilder<SE, PA> { NodeBuilder::new(engine, policy_agent) }
 
-    /// Wipe local storage when a different system is offered, so a new node can adopt it.
-    /// Disabled by default. A different system always halts this node; it never recovers in place.
-    pub fn set_allow_system_replacement(&self, allow: bool) { self.system.set_allow_system_replacement(allow); }
+    /// Halt this node with [`NodeHaltReason::Reset`] (a node already halted keeps its reason) and wipe
+    /// its storage. The wipe starts on the first poll, waits for every storage commit still being
+    /// awaited, and finishes without the caller; no commit begins after the halt. A call during or
+    /// after another reset waits for that wipe rather than wiping again, and retries one that failed.
+    /// `Ok` means the store is wiped; the host then builds a fresh node on it.
+    pub async fn reset(&self) -> Result<(), MutationError> { self.lifecycle.reset().await }
 
     /// Initialization and terminal halt state; independent of peer connectivity.
-    pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.system.node_state() }
+    pub fn state(&self) -> ankurah_signals::Read<NodeState> { self.lifecycle.node_state() }
 
-    /// Require completed system, catalog, and policy initialization, or return why the node is unavailable.
+    /// This node's catalog epoch, or the reason it halted: a halted node, reset or not, yields no epoch.
+    pub fn catalog_epoch(&self) -> Result<CatalogEpoch, NodeHaltReason> {
+        self.lifecycle.check_not_halted()?;
+        Ok(self.entities.catalog_epoch())
+    }
+
+    /// Require completed catalog and policy initialization, or return why the node is unavailable.
     pub fn check_ready(&self) -> Result<(), NodeReadinessError> { self.state().value().check_ready() }
 
-    /// Wait for system, catalog, and policy initialization without retaining the node; return an error if it halts.
+    /// Wait for catalog and policy initialization without retaining the node; return an error if it halts.
     pub fn wait_ready(&self) -> impl std::future::Future<Output = Result<(), NodeReadinessError>> + Send + 'static {
         let state = self.state();
         async move {
@@ -175,6 +183,17 @@ where
                     result => Some(result),
                 })
                 .await
+        }
+    }
+
+    /// Wait until the catalog holds the definitions this node stores, without waiting for a durable
+    /// peer as [`Node::wait_ready`] does; return the halt reason if the node halts first. Lets a
+    /// caller read stored entities of a model before the node's first durable answer.
+    pub async fn wait_catalog_loaded(&self) -> Result<(), NodeHaltReason> {
+        tokio::select! {
+            biased;
+            reason = self.lifecycle.wait_halted() => Err(reason),
+            () = self.catalog.wait_loaded() => Ok(()),
         }
     }
 
@@ -200,9 +219,9 @@ where
             key
         });
         let id = key.node_id();
-        let system_manager = SystemManager::new(engine.clone(), entityset.clone(), durable);
+        let lifecycle = NodeLifecycle::new(engine.clone());
         let alive = Mut::new(true);
-        let state = system_manager.node_state();
+        let state = lifecycle.node_state();
         let run = {
             let alive = alive.read();
             let state = state.clone();
@@ -225,7 +244,7 @@ where
             reactor,
             durable,
             policy_agent,
-            system: system_manager,
+            lifecycle,
             catalog: Arc::new(CatalogManager::default()),
             alive,
             run,
@@ -246,21 +265,20 @@ where
 
         let catalog = node.catalog.clone();
         let weak_node = node.weak();
-        let system = node.system.clone();
+        let lifecycle = node.lifecycle.clone();
         let run = node.run.clone();
         let agent = node.policy_agent.clone();
         crate::task::spawn(async move {
-            let initialized = futures::future::try_join(system.wait_system_ready(), catalog.start(weak_node.clone()).err_into());
             let initialized = async move {
-                initialized.await?;
+                catalog.start(weak_node.clone()).await?;
                 agent.start(weak_node).await.map_err(|error| NodeHaltReason::PolicyAgentStartFailed(error.to_string()))
             };
             tokio::select! {
                 biased;
                 _ = run.wait_value(false) => {},
                 result = initialized => match result {
-                    Ok(_) => system.mark_running(),
-                    Err(reason) => { system.halt(reason); }
+                    Ok(_) => lifecycle.mark_running(),
+                    Err(reason) => { lifecycle.halt(reason); }
                 },
             }
         });
@@ -269,15 +287,10 @@ where
     }
     pub fn weak(&self) -> WeakNode<SE, PA> { WeakNode { node: Arc::downgrade(&self.0), node_id: self.0.id } }
 
-    /// Build our handshake identity after local system storage loads; an unadopted node has no root.
+    /// Build our handshake identity; a halted node has none.
     pub async fn presence(&self) -> Result<proto::Presence, NodeHaltReason> {
-        self.system.wait_loaded().await?;
-        Ok(proto::Presence {
-            node_id: self.id,
-            durable: self.durable,
-            system_root: self.system.root(),
-            protocol_version: proto::PROTOCOL_VERSION,
-        })
+        self.lifecycle.check_not_halted()?;
+        Ok(proto::Presence { node_id: self.id, durable: self.durable, protocol_version: proto::PROTOCOL_VERSION })
     }
 
     /// Register a peer connection after its Presence handshake.
@@ -291,14 +304,7 @@ where
             return Err(rejection.into());
         }
 
-        self.system.wait_loaded().await?;
-        if presence.durable && !self.durable {
-            self.system.adopt_system(presence.system_root.clone().ok_or(PeerConnectionError::MissingSystem)?).await?;
-        } else if let (Some(current), Some(offered)) = (self.system.root_id(), &presence.system_root) {
-            if current != offered.payload.entity_id {
-                return Err(PeerConnectionError::SystemMismatch { current, offered: offered.payload.entity_id });
-            }
-        }
+        self.lifecycle.check_not_halted()?;
         let subscription_handler = SubscriptionHandler::new(presence.node_id, self);
         self.peers.connections.insert(presence.node_id, Arc::new(PeerState::new(sender, presence.durable, subscription_handler)));
         if presence.durable {
@@ -337,7 +343,7 @@ where
     where
         C: Iterable<PA::ContextData>,
     {
-        self.system.check_not_halted()?;
+        self.lifecycle.check_not_halted()?;
         let (response_tx, response_rx) = oneshot::channel::<Result<proto::NodeResponseBody, RequestError>>();
         let request_id = proto::RequestId::new();
 
@@ -362,7 +368,7 @@ where
 
     // TODO LATER: rework this to be retried in the background some number of times
     pub fn send_update(&self, node_id: proto::NodeId, notification: proto::NodeUpdateBody) {
-        if self.system.check_not_halted().is_err() {
+        if self.lifecycle.check_not_halted().is_err() {
             return;
         }
         // same as request, minus cdata and the sign_request step
@@ -516,7 +522,7 @@ where
 
     /// Load matching states from local storage into resident entities; does not apply read policy.
     pub async fn fetch_entities_from_local(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
-        self.system.check_not_halted()?;
+        self.lifecycle.check_not_halted()?;
         let initial_states = self.storage.fetch_states(selection).await?;
         let state_getter = LocalStateGetter::new(self.storage.clone());
         let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);

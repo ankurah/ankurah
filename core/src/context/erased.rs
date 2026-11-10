@@ -25,10 +25,6 @@ pub(crate) trait DynContextInner: LocalEntitySource {
     /// Return the node's identity, even if its weak handle can no longer upgrade.
     fn node_id(&self) -> proto::NodeId;
 
-    /// This node's system root entity id, which every non-root genesis binds
-    /// into its own id. `None` before the node has created or adopted a system.
-    fn system_id(&self) -> Option<proto::EntityId>;
-
     /// Check whether this context may write the entity.
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied>;
 

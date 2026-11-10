@@ -9,8 +9,6 @@ use crate::{DecodeError, EntityId};
 /// bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::IntoStaticStr)]
 pub enum SystemProperty {
-    /// The system configuration item key.
-    Item,
     /// The registered model's source-level label.
     Label,
     /// A model or property's registered display name.
@@ -35,7 +33,6 @@ impl SystemProperty {
     /// Return the canonical source-level spelling of this property.
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Item => "item",
             Self::Label => "label",
             Self::Name => "name",
             Self::MintedFor => "minted_for",
@@ -51,7 +48,6 @@ impl SystemProperty {
     /// Parse a canonical system-property name.
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
-            "item" => Self::Item,
             "label" => Self::Label,
             "name" => Self::Name,
             "minted_for" => Self::MintedFor,
@@ -125,8 +121,7 @@ mod tests {
     use super::*;
 
     /// Every `SystemProperty`, in declaration order.
-    const ALL_SYSTEM_PROPERTIES: [SystemProperty; 10] = [
-        SystemProperty::Item,
+    const ALL_SYSTEM_PROPERTIES: [SystemProperty; 9] = [
         SystemProperty::Label,
         SystemProperty::Name,
         SystemProperty::MintedFor,

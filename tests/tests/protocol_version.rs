@@ -28,7 +28,7 @@ impl PeerSender for NullSender {
 }
 
 fn presence(protocol_version: u32) -> proto::Presence {
-    proto::Presence { node_id: NodeKey::generate().node_id(), durable: false, system_root: None, protocol_version }
+    proto::Presence { node_id: NodeKey::generate().node_id(), durable: false, protocol_version }
 }
 
 /// The core enforcement point: register_peer refuses incompatible versions
@@ -133,7 +133,6 @@ async fn server_closes_silent_client_after_durable_presence() -> Result<()> {
         }
     };
     assert!(server_presence.durable, "test server must reproduce the durable Presence shape");
-    assert!(server_presence.system_root.is_some(), "durable Presence must carry the versioned system-root state");
 
     // Send nothing. Advancing beyond the production deadline keeps this test
     // deterministic and avoids adding ten seconds to the native test suite.
@@ -237,7 +236,7 @@ async fn client_refuses_mismatched_server_without_hot_loop() -> Result<()> {
         let ws = tokio_tungstenite::accept_async(stream).await.expect("ws accept");
         let (mut sink, mut stream) = ws.split();
 
-        let doctored = proto::Presence { node_id: NodeKey::generate().node_id(), durable: true, system_root: None, protocol_version: 999 };
+        let doctored = proto::Presence { node_id: NodeKey::generate().node_id(), durable: true, protocol_version: 999 };
         sink.send(WsMessage::Binary(bincode::serialize(&proto::Message::Presence(doctored)).unwrap().into())).await.expect("send");
 
         let mut saw_rejection = None;

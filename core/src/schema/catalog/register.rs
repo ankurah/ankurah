@@ -81,9 +81,9 @@ where
     // A failed catalog load halts the node without ever marking the catalog ready.
     tokio::select! {
         () = catalog.wait_ready() => {}
-        reason = node.system.wait_halted() => return Err(reason.into()),
+        reason = node.lifecycle.wait_halted() => return Err(reason.into()),
     }
-    node.system.check_not_halted()?;
+    node.lifecycle.check_not_halted()?;
     match resolve_local(catalog, registrant) {
         Ok(()) => return Ok(()),
         Err(RegistrationError::Retrieval(RetrievalError::UnboundDeclaration { .. })) => {}

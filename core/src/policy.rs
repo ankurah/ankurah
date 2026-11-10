@@ -72,7 +72,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     /// This will typically represent a user or service account.
     type ContextData: ContextData;
 
-    /// Initialize policy after the system and catalog load, before ordinary contexts are issued.
+    /// Initialize policy after the catalog loads, before ordinary contexts are issued.
     /// Load existing policy; installing or updating shared policy is a separate bootstrap operation.
     /// Bootstrap work must not wait for the node to finish this startup step.
     async fn start<SE: StorageEngine + Send + Sync + 'static>(&self, _node: WeakNode<SE, Self>) -> anyhow::Result<()> { Ok(()) }

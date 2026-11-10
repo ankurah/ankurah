@@ -151,17 +151,10 @@ impl GatedConnection {
     {
         let (other_tx, mut other_rx) = mpsc::channel(1024);
         let (gated_tx, mut gated_rx) = mpsc::channel(1024);
-        other.system.wait_loaded().await.unwrap();
-        gated.system.wait_loaded().await.unwrap();
         let register_other = async {
             other
                 .register_peer(
-                    proto::Presence {
-                        node_id: gated.id,
-                        durable: gated.durable,
-                        system_root: gated.system.root(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                    },
+                    proto::Presence { node_id: gated.id, durable: gated.durable, protocol_version: proto::PROTOCOL_VERSION },
                     Box::new(GatedSender { sender: gated_tx, node_id: gated.id }),
                 )
                 .await
@@ -170,12 +163,7 @@ impl GatedConnection {
         let register_gated = async {
             gated
                 .register_peer(
-                    proto::Presence {
-                        node_id: other.id,
-                        durable: other.durable,
-                        system_root: other.system.root(),
-                        protocol_version: proto::PROTOCOL_VERSION,
-                    },
+                    proto::Presence { node_id: other.id, durable: other.durable, protocol_version: proto::PROTOCOL_VERSION },
                     Box::new(GatedSender { sender: other_tx, node_id: other.id }),
                 )
                 .await
@@ -471,7 +459,6 @@ pub fn years(query: &LiveQuery<AlbumView>) -> Vec<String> { query.peek().iter().
 #[allow(unused)]
 pub async fn durable_sled_setup() -> Result<Node<SledStorageEngine, PermissiveAgent>, anyhow::Error> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     Ok(node)
 }
@@ -647,7 +634,7 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
     // Create and initialize server node
     let server_storage = Arc::new(SledStorageEngine::new_test()?);
     let server_node = Node::new_durable(server_storage, PermissiveAgent::new());
-    server_node.system.create().await?;
+    server_node.wait_ready().await?;
 
     let mut rng = rand::thread_rng();
 
@@ -722,6 +709,6 @@ where
     SE: ankurah::storage::StorageEngine + Send + Sync + 'static,
     PA: ankurah::policy::PolicyAgent + Send + Sync + 'static,
 {
-    let epoch = node.system.catalog_epoch().expect("a ready system");
+    let epoch = node.catalog_epoch().expect("a node that has not halted");
     schema.field_by_name(name).expect("a compiled field").resolved.get(epoch).expect("field resolved under the current epoch")
 }

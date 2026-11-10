@@ -495,7 +495,6 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             RetrievalError::RequestError(req_err) => match req_err {
                 RequestError::PeerNotConnected => true,
                 RequestError::ConnectionLost => true,
-                RequestError::SystemNotReady => true,
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
                 RequestError::ServerError(_) => false,
@@ -566,7 +565,7 @@ where
         version: u32,
     ) -> Result<(), RetrievalError> {
         let node = self.upgrade().ok_or(NodeDropped)?;
-        node.system.catalog_epoch().ok_or(RequestError::SystemNotReady)?;
+        node.lifecycle.check_not_halted().map_err(RequestError::from)?;
 
         // 1. Pre-fetch known_matches from local storage
         let known_matches: Vec<ankurah_proto::KnownEntity> = node

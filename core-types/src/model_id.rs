@@ -7,8 +7,6 @@ use crate::EntityId;
 /// contract; append variants, never reorder them without a protocol bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, strum::IntoStaticStr)]
 pub enum SystemModel {
-    /// The singleton system-configuration model.
-    System,
     /// Catalog entities that define registered models.
     Model,
     /// Catalog entities that define registered properties.
@@ -21,7 +19,6 @@ impl SystemModel {
     /// Parse a Rust variant identifier.
     pub fn from_variant_name(name: &str) -> Option<Self> {
         Some(match name {
-            "System" => Self::System,
             "Model" => Self::Model,
             "Property" => Self::Property,
             "ModelProperty" => Self::ModelProperty,
@@ -33,7 +30,6 @@ impl SystemModel {
 impl fmt::Display for SystemModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::System => "system",
             Self::Model => "model",
             Self::Property => "property",
             Self::ModelProperty => "model-property",
@@ -138,7 +134,6 @@ impl std::str::FromStr for ModelId {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         Ok(match value {
-            "system:system" => Self::System(SystemModel::System),
             "system:model" => Self::System(SystemModel::Model),
             "system:property" => Self::System(SystemModel::Property),
             "system:model-property" => Self::System(SystemModel::ModelProperty),
@@ -156,7 +151,6 @@ mod tests {
         let id = EntityId::from_bytes([0; 32]);
         for (model, text) in [
             (ModelId::EntityId(id), "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-            (ModelId::System(SystemModel::System), "system:system"),
             (ModelId::System(SystemModel::Model), "system:model"),
             (ModelId::System(SystemModel::Property), "system:property"),
             (ModelId::System(SystemModel::ModelProperty), "system:model-property"),
@@ -191,7 +185,7 @@ mod tests {
         ]);
         assert_eq!(bincode::serialize(&ModelId::EntityId(id)).unwrap(), [0u32.to_le_bytes().to_vec(), id.to_bytes().to_vec()].concat());
 
-        let variants = [SystemModel::System, SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty];
+        let variants = [SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty];
         for (ordinal, variant) in variants.into_iter().enumerate() {
             assert_eq!(bincode::serialize(&variant).unwrap(), (ordinal as u32).to_le_bytes());
             assert_eq!(

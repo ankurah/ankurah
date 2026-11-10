@@ -16,7 +16,6 @@ pub mod peering;
 pub mod request;
 pub mod state;
 mod subscription;
-pub mod sys;
 pub mod time;
 pub mod transaction;
 pub mod update;

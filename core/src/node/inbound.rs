@@ -14,7 +14,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    node.system.check_not_halted()?;
+    node.lifecycle.check_not_halted()?;
     match message {
         proto::NodeMessage::Update(update) => {
             debug!("Node({}) received update {}", node.id, update);
@@ -111,7 +111,6 @@ where
     match notification.body {
         proto::NodeUpdateBody::SubscriptionUpdate { items } => {
             tracing::debug!("Node({}) received subscription update from peer {}", node.id, notification.from);
-            node.system.require_system_ready()?;
             applier::NodeApplier::apply_updates(node, &notification.from, items).await?;
             Ok(())
         }

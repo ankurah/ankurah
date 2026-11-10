@@ -93,7 +93,7 @@ fn row(
     let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), lww.clone())]));
     operations.push(proto::Operation::Membership(proto::Membership::Add(membership.clone())));
 
-    let system = Some(proto::EntityId::from_bytes([0x5A; 32]));
+    let system = None;
     let nonce = content_nonce(counter, &[b"catalog-row", namespace, collection.as_bytes()]);
     let author = proto::AuthorId::Unknown;
     let timestamp = 0u64;

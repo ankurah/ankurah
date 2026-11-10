@@ -35,7 +35,6 @@ async fn server_rejects_update_for_nonexistent() -> anyhow::Result<()> {
     let client = ephemeral_sled_setup().await?;
     let _conn: LocalProcessConnection<SledStorageEngine, PermissiveAgent, SledStorageEngine, PermissiveAgent> =
         LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     let album_model = server.context(DEFAULT_CONTEXT)?.resolve_model_id::<Album>().await?;
 
     // A synthetic genesis parent keeps the update structurally valid; its entity is unknown.
@@ -75,7 +74,6 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     // Create an entity on the server first
     let ctx = server.context(DEFAULT_CONTEXT)?;
@@ -88,7 +86,7 @@ async fn server_refuses_a_genesis_whose_content_derives_a_different_id() -> anyh
     // content no longer derives the id it names.
     let album_model = server.catalog.model_id_for("album")?.expect("Album registered by the create above");
     let mut fake_create = proto::Event::genesis(
-        server.system.root_id(),
+        None,
         proto::AuthorId::Unknown,
         proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(album_model))]),
     );

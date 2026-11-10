@@ -62,7 +62,6 @@ where
         let register_node2 = async {
             node2.register_peer(node1.presence().await?, Box::new(LocalProcessSender { sender: node1_tx, node_id: node1.id })).await
         };
-        // Let an ephemeral node adopt before advertising its own system to the durable node.
         if node1.durable && !node2.durable {
             register_node2.await?;
             if let Err(error) = register_node1.await {

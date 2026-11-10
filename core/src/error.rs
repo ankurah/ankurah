@@ -11,14 +11,14 @@ pub use crate::schema::resolver::ComponentScopeError;
 /// Why this node permanently stopped accepting work, not a rejected connection or operation.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]
 pub enum NodeHaltReason {
-    #[error("failed to reconstruct the local system: {0}")]
-    SystemLoad(String),
     #[error("failed to reconstruct the local catalog: {0}")]
     CatalogLoad(String),
     #[error("failed to initialize policy: {0}")]
     PolicyAgentStartFailed(String),
-    #[error("system replacement requires a new node (current {current}, proposed {proposed})")]
-    SystemReplacement { current: EntityId, proposed: EntityId },
+    /// Halted for [`crate::Node::reset`]; the storage is wiped once a reset returns `Ok`, and the host
+    /// then builds a new node on it.
+    #[error("the node was reset; a new node must be built on the wiped store")]
+    Reset,
 }
 
 #[derive(Error, Debug)]
@@ -165,8 +165,6 @@ pub enum RequestError {
     PeerNotConnected,
     #[error("Connection lost")]
     ConnectionLost,
-    #[error("System not ready")]
-    SystemNotReady,
     #[error("Server error: {0}")]
     ServerError(String),
     #[error("Send error: {0}")]
@@ -254,12 +252,6 @@ pub enum MutationError {
     EventStructure(ankurah_proto::EventStructureError),
     #[error("inadmissible event: {0}")]
     InadmissibleEvent(InadmissibleEvent),
-    /// The node does not know its system root, so it cannot derive an entity
-    /// id: a non-root genesis binds the root into its own id. A caller that
-    /// reaches this on an ephemeral node can retry once the handshake with a
-    /// durable peer has established the system.
-    #[error("the node does not know its system root yet")]
-    SystemNotReady,
     /// A commit-path invariant about an event's provenance, as opposed to
     /// [`MutationError::EventStructure`], which is about its shape. The string
     /// names which one.
@@ -284,6 +276,12 @@ pub enum MutationError {
     TOCTOUAttemptsExhausted,
     #[error("entity state changed before storage commit")]
     WriteConflict,
+    /// [`crate::Node::reset`] could not wipe the storage; the next reset tries again.
+    #[error("the reset could not wipe the storage: {0}")]
+    WipeFailed(Arc<MutationError>),
+    /// The reset's wipe ended without reporting whether it succeeded; the next reset tries again.
+    #[error("the reset's wipe of the storage ended without reporting")]
+    WipeAbandoned,
 }
 
 impl From<NodeReadinessError> for MutationError {

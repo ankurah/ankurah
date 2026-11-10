@@ -8,10 +8,6 @@ async fn test_predicate_update() -> Result<()> {
     let storage_engine = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
 
-    // Initialize the node's system catalog
-    node.system.create().await?;
-
-    // Get context after system is ready
     let context = node.context_async(DEFAULT_CONTEXT).await.unwrap();
 
     // Create some test albums
@@ -53,7 +49,7 @@ async fn test_predicate_update() -> Result<()> {
 async fn test_predicate_update_inter_node() -> Result<()> {
     // Create server (durable) and client (ephemeral) nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     // Connect the nodes

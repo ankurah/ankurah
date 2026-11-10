@@ -59,7 +59,6 @@ pub trait ModelResolver {
 /// Canonical types for the bootstrap system properties, which have no catalog rows.
 pub(crate) fn system_property_value_type(property: SystemProperty) -> ValueType {
     match property {
-        SystemProperty::Item => ValueType::String,
         SystemProperty::Label => ValueType::String,
         SystemProperty::Name => ValueType::String,
         SystemProperty::MintedFor => ValueType::EntityId,
@@ -74,7 +73,6 @@ pub(crate) fn system_property_value_type(property: SystemProperty) -> ValueType 
 
 pub(crate) fn resolve_system_property(model: SystemModel, name: &str) -> Option<SystemProperty> {
     match (model, name) {
-        (SystemModel::System, "item") => Some(SystemProperty::Item),
         (SystemModel::Model, "label") => Some(SystemProperty::Label),
         (SystemModel::Model, "name") => Some(SystemProperty::Name),
         (SystemModel::Property, "name") => Some(SystemProperty::Name),
@@ -141,15 +139,9 @@ impl ModelResolver for DescriptorResolver<'_> {
 pub(crate) fn resolve_component_selection(
     schemas: &[&'static ModelStructDescriptor],
     catalog: &CatalogManager,
-    epoch: Option<CatalogEpoch>,
+    epoch: CatalogEpoch,
     selection: Selection<Parsed>,
 ) -> Result<Selection<Resolved>, RetrievalError> {
-    // Before the node has a catalog epoch, only system models resolve, under the bootstrap epoch.
-    let epoch = match (epoch, schemas.iter().find(|schema| schema.system.is_none())) {
-        (Some(epoch), _) => epoch,
-        (None, None) => CatalogEpoch::BOOTSTRAP,
-        (None, Some(schema)) => return Err(RetrievalError::UnboundDeclaration { label: schema.label.to_string() }),
-    };
     let components = schemas
         .iter()
         .map(|schema| Ok(QueryComponent { model: schema.bind_local(catalog, epoch)?, names: Some(ComponentNames::from(*schema)) }))
@@ -474,14 +466,13 @@ mod tests {
     #[test]
     fn system_properties_are_model_scoped() {
         let cases = [
-            (SystemModel::System, "item", Some(SystemProperty::Item)),
             (SystemModel::Model, "label", Some(SystemProperty::Label)),
             (SystemModel::Model, "name", Some(SystemProperty::Name)),
             (SystemModel::Property, "backend", Some(SystemProperty::Backend)),
             (SystemModel::ModelProperty, "optional", Some(SystemProperty::Optional)),
             (SystemModel::Model, "optional", None),
             (SystemModel::Property, "label", None),
-            (SystemModel::System, "name", None),
+            (SystemModel::ModelProperty, "name", None),
         ];
         for (model, name, expected) in cases {
             assert_eq!(resolve_system_property(model, name), expected, "{model}.{name}");

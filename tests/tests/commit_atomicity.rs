@@ -122,7 +122,6 @@ impl PolicyAgent for DenySecondAlbumEventAgent {
 #[tokio::test]
 async fn test_multi_entity_commit_denial_leaves_nothing_durable() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), DenySecondAlbumEventAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(DEFAULT_CONTEXT).await?;
 
     let trx = ctx.begin();

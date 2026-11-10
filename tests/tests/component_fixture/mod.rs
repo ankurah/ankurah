@@ -14,14 +14,14 @@ use std::sync::Arc;
 
 /// The `project` property Task and Assignment share. An explicit id must name a property the catalog
 /// already holds, so each node is started on storage where a forged Task catalog minted it.
-pub const PROJECT: &str = "W1bfWXTa_DqEotxEr8dFtSdzk0GmEQv_ls3KXyxBujg";
+pub const PROJECT: &str = "dClMGkwHuxtl88wBO389aDt7I5ymNRcBkFkuU3UsJOU";
 
 #[derive(Model, Debug, Clone)]
 pub struct Task {
     pub status: String,
     pub title: String,
     #[active_type(LWW)]
-    #[property(id = "W1bfWXTa_DqEotxEr8dFtSdzk0GmEQv_ls3KXyxBujg")]
+    #[property(id = "dClMGkwHuxtl88wBO389aDt7I5ymNRcBkFkuU3UsJOU")]
     pub project: String,
     /// The same name as `Assignment::note`, but a different property.
     pub note: String,
@@ -31,7 +31,7 @@ pub struct Task {
 pub struct Assignment {
     pub assignee: String,
     #[active_type(LWW)]
-    #[property(id = "W1bfWXTa_DqEotxEr8dFtSdzk0GmEQv_ls3KXyxBujg")]
+    #[property(id = "dClMGkwHuxtl88wBO389aDt7I5ymNRcBkFkuU3UsJOU")]
     pub project: String,
     pub note: String,
 }
@@ -79,7 +79,6 @@ impl Fixture {
         assert_eq!(forged.properties[0].to_base64(), PROJECT);
         ankurah_tests::catalog_forge::plant(&storage, &forged).await?;
         let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-        node.system.create().await?;
         node.wait_ready().await?;
         let ctx = node.context_async(DEFAULT_CONTEXT).await?;
         ctx.resolve_model_id::<Closure>().await?;

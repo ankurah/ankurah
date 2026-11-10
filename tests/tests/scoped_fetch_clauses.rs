@@ -42,7 +42,7 @@ async fn eventually_count(lq: &ankurah::LiveQuery<ScopeCredView>, expected: usiz
 #[tokio::test]
 async fn relay_client_cached_fetch_with_composed_scope_clauses() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     let _conn = LocalProcessConnection::new(&server, &client).await?;

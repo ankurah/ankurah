@@ -42,7 +42,7 @@ pub struct DescRef {
 async fn reference_get_binds_target_lazily_and_reuses_the_binding() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let ctx = server.context(DEFAULT_CONTEXT)?;
-    let epoch = server.system.catalog_epoch().unwrap();
+    let epoch = server.catalog_epoch().unwrap();
     let missing = EntityId::random();
     let trx = ctx.begin();
     let source = trx.create(&DescRef { artist: Ref::new(missing) }).await?.id();
@@ -68,7 +68,6 @@ async fn reference_get_binds_target_lazily_and_reuses_the_binding() -> anyhow::R
     // Re-resolution would overwrite this catalog edit with the descriptor's original name.
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await?;
     let mut declaration = proto::RegisterModel::from(DescArtist::descriptor());
     declaration.name = "Edited catalog name".into();
     assert!(matches!(
@@ -273,7 +272,6 @@ async fn register_from_model_schema_end_to_end() -> anyhow::Result<()> {
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let _conn = LocalProcessConnection::new(&server, &client).await?;
-    client.system.wait_system_ready().await.unwrap();
 
     // The whole point: the request is built from the compiled schema, no
     // hand-written descriptors.

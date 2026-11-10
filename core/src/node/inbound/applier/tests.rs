@@ -38,7 +38,6 @@ impl Fixture {
     async fn new() -> anyhow::Result<Self> {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new(storage.clone(), PermissiveAgent::new());
-        node.system.wait_loaded().await?;
         let events = LocalEventGetter::new(storage.clone(), false);
         let genesis = Event::genesis(
             Some(EntityId::from_bytes([4; 32])),
@@ -120,7 +119,6 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
     let source = Fixture::new().await?;
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    node.system.wait_loaded().await?;
     let state = source.storage.get_state(source.entity.id()).await?.payload.state;
     assert!(!state.head.is_empty());
     let delta = proto::EntityDelta {
@@ -210,7 +208,6 @@ async fn first_snapshot_checks_cargo_against_local_or_carried_parents_but_allows
     for parent_source in ["local", "carried", "missing"] {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new(storage.clone(), PermissiveAgent::new());
-        node.system.wait_loaded().await?;
         if parent_source == "local" {
             cache(&storage, &[&source.genesis]).await?;
         }
@@ -264,7 +261,6 @@ async fn snapshot_event_consistency_is_checked_before_persistence_and_publicatio
     for existing in [false, true] {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new(storage.clone(), PermissiveAgent::new());
-        node.system.wait_loaded().await?;
         let events = LocalEventGetter::new(storage.clone(), false);
         events.stage_event(source.genesis.clone());
         let states = LocalStateGetter::new(storage.clone());
@@ -765,7 +761,6 @@ async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_
 async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_payload() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    node.system.wait_loaded().await?;
     let genesis = Event::genesis(
         Some(EntityId::from_bytes([4; 32])),
         AuthorId::Unknown,
@@ -916,7 +911,6 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
 async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    node.system.wait_loaded().await?;
     let genesis = Event::genesis(
         Some(EntityId::from_bytes([4; 32])),
         AuthorId::Unknown,
@@ -971,7 +965,6 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
     for reader_loads_snapshot in [false, true] {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new(storage.clone(), PermissiveAgent::new());
-        node.system.wait_loaded().await?;
         let genesis = Event::genesis(
             Some(EntityId::from_bytes([4; 32])),
             AuthorId::Unknown,

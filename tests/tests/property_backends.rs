@@ -30,7 +30,6 @@ pub struct Video {
 #[tokio::test]
 async fn property_backends() -> Result<()> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     let trx = ctx.begin();

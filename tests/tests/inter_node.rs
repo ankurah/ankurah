@@ -20,28 +20,10 @@ async fn inter_node_fetch() -> Result<()> {
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
-    info!("Node1 root: {:?}", node1.system.root());
-    info!("Node2 root: {:?}", node2.system.root());
-
-    // Initialize the system on the durable node
-    node1.system.create().await?;
-
-    info!("After initializing - Node1 root: {:?}", node1.system.root());
-    info!("After initializing - Node2 root: {:?}", node2.system.root());
-
-    // Verify node2 is not ready before connection
-    assert!(!node2.system.is_system_ready());
-
     // Create connection between nodes
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
 
-    // The connection has completed node2's initial system adoption.
-
-    // Now get context for durable node after system is ready
     let ctx1 = node1.context_async(c).await.unwrap();
-
-    info!("After context - Node1 root: {:?}", node1.system.root());
-    info!("After context - Node2 root: {:?}", node2.system.root());
 
     {
         let trx = ctx1.begin();
@@ -51,9 +33,6 @@ async fn inter_node_fetch() -> Result<()> {
         trx.create(&Album { name: "Ask That God".into(), year: "2024".into() }).await?;
         trx.commit().await?;
     };
-
-    info!("After transaction - Node1 root: {:?}", node1.system.root());
-    info!("After transaction - Node2 root: {:?}", node2.system.root());
 
     let p = "name = 'Walking on a Dream'";
     // Should already be on node1
@@ -65,9 +44,6 @@ async fn inter_node_fetch() -> Result<()> {
     // Now node2 should now successfully fetch the entity
     assert_eq!(names(ctx2.fetch::<AlbumView>(p).await?), ["Walking on a Dream"]);
 
-    info!("After fetch - Node1 root: {:?}", node1.system.root());
-    info!("After fetch - Node2 root: {:?}", node2.system.root());
-
     Ok(())
 }
 
@@ -75,7 +51,7 @@ async fn inter_node_fetch() -> Result<()> {
 async fn server_edits_subscription() -> Result<()> {
     // Create two nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes
@@ -177,7 +153,7 @@ async fn server_edits_subscription() -> Result<()> {
 #[tokio::test]
 async fn subscription_empty_events_from_noop_delta() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Query B's id is not known until we build it, but the gate closure needs to
@@ -257,7 +233,7 @@ async fn subscription_empty_events_from_noop_delta() -> Result<()> {
 async fn test_client_server_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
 
     let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
@@ -302,7 +278,7 @@ async fn test_client_server_propagation() -> Result<()> {
 async fn test_client_server_subscription_propagation() -> Result<()> {
     // Create server (durable) and two client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client_a = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let client_b = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
@@ -347,7 +323,7 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
 #[tokio::test]
 async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let _conn = LocalProcessConnection::new(&client, &server).await?;
     client.wait_ready().await?;
@@ -478,7 +454,7 @@ async fn test_lineage_event_bridge() -> Result<()> {
     // Tests that EventBridge efficiently handles cases where the client is missing many intermediate events.
     // The server sends all needed events in the EventBridge response rather than requiring recursive fetches.
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes
@@ -529,7 +505,7 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
     // discriminator is P's write: unordered application gap-jumps past it and
     // the write is silently lost while the head claims P is history.
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let writer = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
     let receiver = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
@@ -610,7 +586,7 @@ async fn test_event_bridge_uneven_diamond() -> Result<()> {
 async fn test_fetch_view_field_subscriptions_behavior() -> Result<()> {
     // Create server (durable) and client nodes
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());
 
     // Connect the nodes

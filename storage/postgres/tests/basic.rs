@@ -10,10 +10,6 @@ async fn test_postgres() -> Result<()> {
     let (_container, storage_engine) = create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage_engine), PermissiveAgent::new());
 
-    // Initialize the node's system catalog
-    node.system.create().await?;
-
-    // Get context after system is ready
     let context = node.context_async(c).await.unwrap();
 
     let trx = context.begin();

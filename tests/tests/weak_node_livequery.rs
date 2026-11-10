@@ -26,7 +26,7 @@ async fn pending_resolution_releases_node_and_storage() -> Result<()> {
             Context::new(node.clone(), DEFAULT_CONTEXT).query::<PetView>(args)?
         };
         tokio::task::yield_now().await;
-        assert!(query.selection().peek().is_none(), "resolution waits for the node to adopt a system");
+        assert!(query.selection().peek().is_none(), "resolution waits for the catalog, which an ephemeral node fills from a durable peer");
 
         drop(node);
         if weak {
@@ -56,7 +56,6 @@ async fn pending_resolution_releases_node_and_storage() -> Result<()> {
 async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine, PermissiveAgent::new());
-    node.system.create().await?;
     node.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<Pet>().await?;
 
     // Create a LiveQuery with a weak node binding
@@ -77,7 +76,6 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
     // Also verify explicitly with a weak node ref
     let engine2 = Arc::new(SledStorageEngine::new_test()?);
     let node2 = Node::new_durable(engine2, PermissiveAgent::new());
-    node2.system.create().await?;
     node2.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<Pet>().await?;
     let weak_node = node2.weak();
 
@@ -100,7 +98,6 @@ async fn test_weak_node_livequery_does_not_keep_node_alive() -> Result<()> {
 async fn test_entity_livequery_keeps_node_alive() -> Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
     let node = Node::new_durable(engine, PermissiveAgent::new());
-    node.system.create().await?;
     node.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<Pet>().await?;
 
     // Create a regular EntityLiveQuery

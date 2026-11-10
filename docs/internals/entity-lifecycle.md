@@ -100,9 +100,6 @@ Editing a committed entity forks its [backends](property-backends.md#the-propert
 memberships, and head into a `LocalTrxEntity` retaining the resident entity. New creations have no
 upstream entity to fork.
 
-System roots use the same preparation and publication machinery without a
-user transaction. They are registered only after their genesis and state persist.
-
 
 ## Local Transaction Commit
 

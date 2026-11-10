@@ -20,7 +20,6 @@ use std::sync::Arc;
 async fn test_sqlite_create_and_query() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create some albums
@@ -43,7 +42,6 @@ async fn test_sqlite_create_and_query() -> Result<()> {
 async fn test_sqlite_update_entity() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create an album
@@ -74,7 +72,6 @@ async fn test_sqlite_update_entity() -> Result<()> {
 async fn test_sqlite_state_change_detection() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create an album
@@ -103,7 +100,6 @@ async fn test_sqlite_state_change_detection() -> Result<()> {
 async fn test_sqlite_multiple_updates() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     // Create multiple albums
@@ -136,7 +132,6 @@ async fn test_sqlite_multiple_updates() -> Result<()> {
 async fn test_sqlite_query_with_subscription() -> Result<()> {
     let storage = SqliteStorageEngine::open_in_memory().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     let watcher = TestWatcher::changeset();

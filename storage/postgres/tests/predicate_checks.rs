@@ -124,7 +124,6 @@ async fn test_postgres_predicate_checks() -> Result<()> {
     let cases = all_test_cases();
     let (container, storage) = common::create_postgres_container().await?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await.unwrap();
 
     for case in &cases {

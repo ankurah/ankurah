@@ -7,9 +7,10 @@ use ankurah_core::storage::StorageEngine;
 use ankurah_proto::{ModelId, SystemModel, PROTOCOL_VERSION};
 use ankurah_storage_sqlite::SqliteStorageEngine;
 
-async fn touch_system_materialization(engine: &SqliteStorageEngine) -> anyhow::Result<()> {
+/// Create the model catalog's materialization, so the store holds Ankurah data beside its version record.
+async fn touch_catalog_materialization(engine: &SqliteStorageEngine) -> anyhow::Result<()> {
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    engine.fetch_states(&selection.clone().and_member_of(ModelId::System(SystemModel::System))).await?;
+    engine.fetch_states(&selection.clone().and_member_of(ModelId::System(SystemModel::Model))).await?;
     Ok(())
 }
 
@@ -38,7 +39,7 @@ async fn fresh_store_records_version_and_reopens() -> anyhow::Result<()> {
     // A fresh store records the version at engine construction.
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;
-        touch_system_materialization(&engine).await?;
+        touch_catalog_materialization(&engine).await?;
     }
 
     // The record carries the running protocol version.
@@ -64,7 +65,7 @@ async fn unrelated_tables_do_not_block_initialization_or_get_dropped() -> anyhow
     }
 
     let engine = SqliteStorageEngine::open(db.path()).await?;
-    touch_system_materialization(&engine).await?;
+    touch_catalog_materialization(&engine).await?;
     assert!(engine.delete_all().await?, "Ankurah-owned storage was deleted");
     assert!(!engine.delete_all().await?, "unrelated tables do not count as Ankurah storage");
 
@@ -100,7 +101,7 @@ async fn unversioned_store_with_data_refuses() -> anyhow::Result<()> {
     let db = TempDb::new("unversioned");
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;
-        touch_system_materialization(&engine).await?;
+        touch_catalog_materialization(&engine).await?;
     }
 
     // Remove the record while ankurah tables remain: the store now reads as an
@@ -123,7 +124,7 @@ async fn collection_wipe_preserves_the_version_record() -> anyhow::Result<()> {
     let db = TempDb::new("wipe");
     {
         let engine = SqliteStorageEngine::open(db.path()).await?;
-        touch_system_materialization(&engine).await?;
+        touch_catalog_materialization(&engine).await?;
         assert!(engine.delete_all().await?, "wiping existing storage reports true");
         // Only compatibility metadata remains.
         assert!(!engine.delete_all().await?, "nothing left to wipe reports false");

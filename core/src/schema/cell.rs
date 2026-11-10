@@ -1,17 +1,14 @@
 use append_only_vec::AppendOnlyVec;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-/// Identifies a node's system-scoped entities and descriptor bindings. Each node gets a fresh epoch;
-/// it never changes systems in place. Connections and disconnections retain the same epoch.
+/// Identifies one node's resident entities and the catalog bindings of its model descriptors. Each
+/// node gets a fresh epoch, which connections and disconnections keep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CatalogEpoch(u32);
 
 static NEXT_CATALOG_EPOCH: AtomicU32 = AtomicU32::new(1);
 
 impl CatalogEpoch {
-    /// Reserved for temporary entities and pinned schema lookups before system readiness.
-    pub const BOOTSTRAP: CatalogEpoch = CatalogEpoch(0);
-
     pub(crate) fn allocate() -> Self {
         let raw = NEXT_CATALOG_EPOCH.fetch_add(1, Ordering::Relaxed);
         assert!(raw != 0, "catalog epoch allocator exhausted (u32 wrapped)");
