@@ -251,6 +251,59 @@ async fn test_websocket_bidirectional_subscription_impl() -> Result<()> {
     Ok(())
 }
 
+/// Wait up to five seconds for `condition`.
+async fn eventually(condition: impl Fn() -> bool) -> bool {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// A client dropped without being shut down, which cancels its connection, deregisters the
+/// server it registered.
+#[tokio::test]
+async fn a_client_dropped_while_connected_deregisters_its_server() -> Result<()> {
+    let (server_node, server_url, server_task) = start_test_server().await?;
+    let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = WebsocketClient::new(client_node.clone(), &server_url).await?;
+    client.wait_connected().await?;
+    assert!(client_node.granted_trust(&server_node.id).is_some());
+
+    drop(client);
+    assert!(eventually(|| client_node.granted_trust(&server_node.id).is_none()).await, "the dropped client left its server registered");
+    server_task.abort();
+    Ok(())
+}
+
+/// A server whose connection is dropped mid-connection, as a runtime shutting down drops it,
+/// deregisters the client that connection registered.
+#[test]
+fn a_server_connection_dropped_with_its_runtime_deregisters_its_client() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let serving = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build()?;
+    let server_node = runtime.block_on(async {
+        let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+        node.wait_ready().await?;
+        anyhow::Ok(node)
+    })?;
+    let (server_url, _server_task) = serving.block_on(serve(server_node.clone()))?;
+    let (client_node, client) = runtime.block_on(async {
+        let client_node = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+        let client = WebsocketClient::new(client_node.clone(), &server_url).await?;
+        client.wait_connected().await?;
+        anyhow::Ok((client_node, client))
+    })?;
+    assert!(runtime.block_on(eventually(|| server_node.granted_trust(&client_node.id).is_some())));
+
+    serving.shutdown_timeout(Duration::from_secs(5));
+    assert_eq!(server_node.granted_trust(&client_node.id), None, "the dropped connection left its client registered");
+    runtime.block_on(client.shutdown())?;
+    Ok(())
+}
+
 /// Helper to extract names from album query results
 fn names(resultset: Vec<AlbumView>) -> Vec<String> { resultset.iter().map(|r| r.name().unwrap()).collect::<Vec<String>>() }
 
@@ -270,4 +323,4 @@ fn assert_expected_change(change: Vec<(EntityId, ChangeKind)>, expected: EntityI
         assert!(matches!(kind, ChangeKind::Add | ChangeKind::Update), "unexpected change kind {:?}", kind);
     }
 }
-// start_test_server lives in common.rs (shared with protocol_version.rs)
+// start_test_server lives in common.rs (shared with handshake/)

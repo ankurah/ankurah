@@ -394,8 +394,7 @@ where
         // Bring ephemerals up serially so startup scheduling cannot change the trace.
         for node in &nodes {
             if !node.durable {
-                node.connect_to(durable).await;
-                durable.connect_to(node).await;
+                node.connect(durable).await;
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
                 super::node::seed_sim_schema(node).expect("sim schema seeds on a node that has not halted");
                 let synced = node.node.wait_ready();
@@ -416,8 +415,9 @@ where
 
         for a in &nodes {
             for b in &nodes {
-                if a.index != b.index && !a.durable && !b.durable {
-                    a.connect_to(b).await;
+                if a.index < b.index && !a.durable && !b.durable {
+                    // One connection per pair: the lower index dials.
+                    a.connect(b).await;
                 }
             }
         }

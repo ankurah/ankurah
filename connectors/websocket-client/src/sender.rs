@@ -29,7 +29,5 @@ impl PeerSender for WebsocketPeerSender {
         })
     }
 
-    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
-
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

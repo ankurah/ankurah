@@ -73,6 +73,7 @@ impl WebsocketClient {
             .read()
             .wait_for(|state| match state {
                 ConnectionState::Connected { .. } => Some(Ok(())),
+                ConnectionState::RefusedByServer { reason, .. } => Some(Err(format!("the server refused this node: {reason}"))),
                 ConnectionState::Error { message, cause: Some(_) } => Some(Err(message.clone())),
                 _ => None,
             })
@@ -110,7 +111,7 @@ impl ClientInner {
             }
             ConnectionState::Connecting { .. } => (),
             ConnectionState::None => (),
-            ConnectionState::Closed | ConnectionState::Error { .. } => {
+            ConnectionState::Closed | ConnectionState::RefusedByServer { .. } | ConnectionState::Error { .. } => {
                 // Clear the existing connection before attempting to reconnect
                 {
                     *self.connection.borrow_mut() = None;
@@ -134,7 +135,7 @@ impl ClientInner {
         action_info!(self, "connecting to", "{}", &self.server_url);
         *self.connection.borrow_mut() = Some(connection);
         // Keep the last refusal visible during retries; successful admission clears it.
-        if !matches!(self.state.value(), ConnectionState::Error { .. }) {
+        if !matches!(self.state.value(), ConnectionState::Error { .. } | ConnectionState::RefusedByServer { .. }) {
             self.state.set(ConnectionState::Connecting { url: self.server_url.clone() });
         }
 

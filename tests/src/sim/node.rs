@@ -12,13 +12,14 @@
 //! node's key, and so its id and every identity it mints under, derives from
 //! the simulation seed and that index.
 
-use ankurah::core::node::NodeKey;
+use ankurah::core::node::{ConnectionRegistration, NodeKey};
 use ankurah::core::test_helpers::commit_transaction;
 use ankurah::proto::{self, Attested};
 use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use super::model::{Field, SimRecord};
 use super::transport::{Captured, SimSender};
@@ -30,24 +31,31 @@ pub struct SimNode {
     pub durable: bool,
     pub node: Node<SledStorageEngine, PermissiveAgent>,
     captured: Captured,
+    /// This node's registration of each peer it connected to, by the peer's index: the one a
+    /// frame from that peer arrives on.
+    registrations: Mutex<BTreeMap<usize, ConnectionRegistration>>,
 }
 
 impl SimNode {
     pub fn id(&self) -> proto::NodeId { self.node.id }
 
-    /// Register `peer` as a connected peer of this node, installing a
-    /// `SimSender` so anything this node sends *to* `peer` is captured for the
-    /// scheduler. Mirrors `Node::register_peer` as `LocalProcessConnection`
-    /// would.
-    pub async fn connect_to(&self, peer: &SimNode) {
-        let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
-        self.node
-            .register_peer(
-                proto::Presence { node_id: peer.id(), durable: peer.durable, protocol_version: proto::PROTOCOL_VERSION },
-                Box::new(sender),
-            )
+    /// Register this node and `peer` with each other as `LocalProcessConnection` registers two
+    /// nodes, an ephemeral node dialing a durable one and otherwise this node dialing `peer`,
+    /// installing a `SimSender` on each side so anything one sends the other is captured for the
+    /// scheduler.
+    pub async fn connect(&self, peer: &SimNode) {
+        let to_peer = Box::new(SimSender::new(self.index, self.captured.clone()));
+        let to_self = Box::new(SimSender::new(peer.index, peer.captured.clone()));
+        let (ours, theirs) = ankurah_connector_local_process::register_each_other(&self.node, &peer.node, to_peer, to_self)
             .await
-            .expect("sim peers share this build's protocol version");
+            .expect("sim peers register each other");
+        self.registrations.lock().unwrap().insert(peer.index, ours);
+        peer.registrations.lock().unwrap().insert(self.index, theirs);
+    }
+
+    /// This node's registration of the peer at `index`, if it connected to that peer.
+    pub fn registration_of(&self, index: usize) -> Option<ConnectionRegistration> {
+        self.registrations.lock().unwrap().get(&index).copied()
     }
 
     /// Ingest a forged batch of events directly through the production remote
@@ -133,12 +141,12 @@ pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Res
     crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
     let durable = Node::builder(durable_engine, PermissiveAgent::new()).durable().key(sim_node_key(seed, 0)).build();
     durable.wait_ready().await?;
-    nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
+    nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone(), registrations: Mutex::new(BTreeMap::new()) });
 
     // Nodes 1..n: ephemeral.
     for index in 1..n {
         let node = Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).key(sim_node_key(seed, index)).build();
-        nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
+        nodes.push(SimNode { index, durable: false, node, captured: captured.clone(), registrations: Mutex::new(BTreeMap::new()) });
     }
 
     // Ephemeral descriptors are seeded after those nodes become ready.

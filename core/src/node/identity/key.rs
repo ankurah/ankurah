@@ -28,6 +28,12 @@ impl NodeKey {
     /// This key's identity as the peer layer names a node.
     pub fn node_id(&self) -> proto::NodeId { self.identity().into() }
 
+    /// Sign `message` under this key.
+    fn sign(&self, message: &[u8]) -> proto::Signature {
+        use ed25519_dalek::Signer;
+        proto::Signature::Ed25519(self.0.sign(message).to_bytes())
+    }
+
     /// Load the key whose seed is stored at `path`, first writing a fresh seed there if the file does not exist.
     /// The file holds exactly the 32 seed bytes; anything else is refused. A fresh seed is written to a
     /// dot-prefixed staged file beside `path` and linked into place. Removing the staged file is then
@@ -74,6 +80,9 @@ impl NodeKey {
             Err(error) => Err(error),
         }
     }
+
+    /// Sign a presence making `claims`. It verifies only if the claims name this key's node.
+    pub fn sign_presence(&self, claims: proto::PresenceClaims) -> proto::Presence { claims.sign(|bytes| self.sign(bytes)) }
 }
 
 /// Persist the directory entry that names `path`, so a newly linked key survives power loss.
@@ -99,6 +108,13 @@ mod tests {
         let key = NodeKey::generate();
         assert_eq!(NodeKey::from_seed(key.to_seed()).identity(), key.identity());
         assert_ne!(NodeKey::generate().identity(), key.identity());
+    }
+
+    #[test]
+    fn a_signature_verifies_under_the_keys_identity() {
+        let key = NodeKey::from_seed([9; 32]);
+        assert!(key.identity().verify(b"message", &key.sign(b"message")));
+        assert!(!NodeKey::from_seed([8; 32]).identity().verify(b"message", &key.sign(b"message")));
     }
 
     #[test]

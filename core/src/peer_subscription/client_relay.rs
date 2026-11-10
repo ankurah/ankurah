@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock, Weak};
 use tracing::{debug, warn};
 
 use crate::error::{NodeDropped, RequestError, RetrievalError};
-use crate::node::ContextData;
+use crate::node::{ConnectionRegistration, ContextData};
 use crate::session::SessionSet;
 use crate::util::cancel_flag::CancelFlag;
 use crate::util::safeset::SafeSet;
@@ -28,8 +28,10 @@ pub trait RemoteQuerySubscriber: Clone + Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub enum Status {
     PendingRemote,
-    Requested(proto::NodeId, u32),     // peer_id, version
-    Established(proto::NodeId, u32),   // peer_id, version
+    /// Sent on the registration of a durable peer that holds it, at this version.
+    Requested(ConnectionRegistration, u32),
+    /// Held by the registration of a durable peer it was sent on, at this version.
+    Established(ConnectionRegistration, u32),
     PendingUpdate(proto::NodeId, u32), // peer_id, version
     /// Non-retryable
     Failed,
@@ -145,13 +147,13 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         debug!("SubscriptionRelay.subscribe_query() - Query {} needs remote registration", query_id);
         let content = Arc::new(Content { selection, sessions, query_id, version });
         let cancel = CancelFlag::default();
-        let peer = {
+        let registration = {
             let mut subscriptions = self.inner.subscriptions.lock().expect("poisoned lock");
             let previous = subscriptions.remove(&query_id);
-            let peer = previous.and_then(|state| {
+            let registration = previous.and_then(|state| {
                 state.cancel.cancel();
                 match state.status {
-                    Status::Established(peer, _) | Status::Requested(peer, _) => Some(peer),
+                    Status::Established(registration, _) | Status::Requested(registration, _) => Some(registration),
                     _ => None,
                 }
             });
@@ -159,16 +161,16 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 query_id,
                 RemoteQueryState {
                     content: content.clone(),
-                    status: peer.map_or(Status::PendingRemote, |peer| Status::Requested(peer, version)),
+                    status: registration.map_or(Status::PendingRemote, |registration| Status::Requested(registration, version)),
                     livequery,
                     cancel: cancel.clone(),
                 },
             );
-            peer
+            registration
         };
 
-        if let Some(peer) = peer {
-            self.update_query_on_peer(peer, query_id, content.selection.clone(), version, content.sessions.clone(), cancel);
+        if let Some(registration) = registration {
+            self.update_query_on_registration(registration, query_id, content.selection.clone(), version, content.sessions.clone(), cancel);
         } else if !self.inner.connected_peers.is_empty() {
             self.setup_remote_subscriptions();
         }
@@ -196,12 +198,11 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                     });
 
                     match state.status {
-                        Status::Established(peer_id, _) | Status::Requested(peer_id, _) => {
-                            // Update to new version, mark as requested for this peer
-                            state.status = Status::Requested(peer_id, version);
+                        Status::Established(registration, _) | Status::Requested(registration, _) => {
+                            // Update to new version, mark as requested on the registration holding it
+                            state.status = Status::Requested(registration, version);
                             state.cancel.cancel_and_swap();
-                            Some((peer_id, state.content.sessions.clone(), state.cancel.clone()))
-                            // Return the peer_id to send update to
+                            Some((registration, state.content.sessions.clone(), state.cancel.clone()))
                         }
                         _ => {
                             // Not established yet, just update to PendingRemote and setup
@@ -215,8 +216,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         };
 
         match update {
-            Some((peer_id, sessions, cancel)) => {
-                self.update_query_on_peer(peer_id, query_id, selection, version, sessions, cancel);
+            Some((registration, sessions, cancel)) => {
+                self.update_query_on_registration(registration, query_id, selection, version, sessions, cancel);
             }
             None => {
                 // Not established yet - use setup_remote_subscriptions for initial setup
@@ -227,9 +228,9 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         Ok(())
     }
 
-    fn update_query_on_peer(
+    fn update_query_on_registration(
         &self,
-        peer_id: proto::NodeId,
+        registration: ConnectionRegistration,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         version: u32,
@@ -246,7 +247,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
                 // Send the updated predicate to the peer, under the
                 // credentials current at send time.
-                match node.remote_subscribe(peer_id, query_id, selection, sessions.current(), version).await {
+                match node.remote_subscribe(registration, query_id, selection, sessions.current(), version).await {
                     _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
                     Ok(()) => {
                         // Deltas applied successfully, now activate the livequery
@@ -258,14 +259,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                         let mut subscriptions = me.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                         if !cancel.canceled() {
                             if let Some(info) = subscriptions.get_mut(&query_id) {
-                                info.status = Status::Established(peer_id, version);
+                                info.status = Status::Established(registration, version);
                             }
                         }
-                        debug!("Successfully updated predicate {} on peer {} subscription", query_id, peer_id);
+                        debug!("Successfully updated predicate {} on peer {} subscription", query_id, registration.peer());
                     }
                     Err(e) => {
                         // Handle error with retry logic
-                        me.handle_error(query_id, peer_id, e, &cancel);
+                        me.handle_error(query_id, registration.peer(), e, &cancel);
                     }
                 }
             }
@@ -284,13 +285,13 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(info) = subscriptions.remove(&query_id) {
                 info.cancel.cancel();
-                if let Status::Established(peer_id, _) | Status::Requested(peer_id, _) = &info.status {
+                if let Status::Established(registration, _) | Status::Requested(registration, _) = &info.status {
                     let node = self.inner.node.get();
                     if let Some(node) = node {
                         let node = node.clone();
-                        let peer_id = *peer_id;
+                        let registration = *registration;
                         crate::task::spawn(async move {
-                            if let Err(e) = node.peer_unsubscribe(peer_id, query_id).await {
+                            if let Err(e) = node.peer_unsubscribe(registration, query_id).await {
                                 warn!("Failed to send unsubscribe message for {}: {}", query_id, e);
                             } else {
                                 debug!("Successfully sent unsubscribe message for {}", query_id);
@@ -304,28 +305,42 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
     /// Handle peer disconnection - mark all predicates for that peer as needing re-registration
     ///
-    /// This should be called when a durable peer disconnects. All predicates registered
-    /// with that peer will be marked as pending and will be automatically re-registered
-    /// when the peer reconnects or another suitable peer becomes available.
+    /// This should be called when a durable peer loses its last registration trusted as durable.
+    /// All predicates registered with that peer will be marked as pending and will be
+    /// automatically re-registered when the peer reconnects or another suitable peer becomes
+    /// available.
     pub fn notify_peer_disconnected(&self, peer_id: proto::NodeId) {
         debug!("Peer {} disconnected, orphaning predicate registrations", peer_id);
 
         // Remove from connected peers
         self.inner.connected_peers.remove(&peer_id);
-
-        for info in self.inner.subscriptions.lock().expect("poisoned lock").values_mut() {
-            if let Status::Established(established_peer_id, _) | Status::Requested(established_peer_id, _) = &info.status {
-                if *established_peer_id == peer_id {
-                    // Update state to pending
-                    info.status = Status::PendingRemote;
-                    info.cancel.cancel();
-                    warn!("Predicate {} orphaned due to peer {} disconnect", info.content.query_id, peer_id);
-                }
-            }
-        }
+        self.orphan(|registration| registration.peer() == peer_id);
 
         // Resubscribe any orphaned subscriptions
         self.setup_remote_subscriptions();
+    }
+
+    /// Handle the removal of one registration of a durable peer that keeps another trusted as
+    /// durable: the queries held by `registration` are subscribed again on that peer's newest
+    /// such registration, since the peer dropped them with the connection.
+    pub fn notify_registration_closed(&self, registration: ConnectionRegistration) {
+        debug!("A registration of peer {} closed, orphaning the predicates it held", registration.peer());
+        self.orphan(|held_by| held_by == registration);
+        self.setup_remote_subscriptions_on(registration.peer());
+    }
+
+    /// Mark each query requested or established on a registration `orphaned` names as pending,
+    /// cancelling any reply still due for it.
+    fn orphan(&self, orphaned: impl Fn(ConnectionRegistration) -> bool) {
+        for info in self.inner.subscriptions.lock().expect("poisoned lock").values_mut() {
+            if let Status::Established(registration, _) | Status::Requested(registration, _) = info.status {
+                if orphaned(registration) {
+                    info.status = Status::PendingRemote;
+                    info.cancel.cancel();
+                    warn!("Predicate {} orphaned by the close of its registration of peer {}", info.content.query_id, registration.peer());
+                }
+            }
+        }
     }
 
     /// Handle peer connection - trigger predicate registration on the new peer subscription
@@ -342,6 +357,10 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         self.setup_remote_subscriptions();
     }
 
+    /// Whether the relay counts this peer as a connected durable source.
+    #[cfg(test)]
+    pub(crate) fn is_connected(&self, peer_id: &proto::NodeId) -> bool { self.inner.connected_peers.contains(peer_id) }
+
     /// Whether a query is established with, or being sent to, this peer.
     pub(crate) fn has_subscription_with_peer(&self, peer_id: &proto::NodeId) -> bool {
         self.inner
@@ -349,7 +368,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .values()
-            .any(|state| matches!(&state.status, Status::Established(peer, _) | Status::Requested(peer, _) if peer == peer_id))
+            .any(|state| matches!(&state.status, Status::Established(registration, _) | Status::Requested(registration, _) if registration.peer() == *peer_id))
     }
 
     /// Get the current state of a predicate registration
@@ -366,8 +385,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
         for (_, state) in subscriptions.iter() {
             match &state.status {
-                Status::Established(established_peer, _) | Status::Requested(established_peer, _) => {
-                    if established_peer == peer_id {
+                Status::Established(registration, _) | Status::Requested(registration, _) => {
+                    if registration.peer() == *peer_id {
                         contexts.extend(state.content.sessions.current());
                     }
                 }
@@ -380,6 +399,17 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 
     /// Register predicates on available durable peer subscriptions
     fn setup_remote_subscriptions(&self) {
+        // For now, use the first available peer (could be made smarter)
+        let Some(target_peer) = self.inner.connected_peers.to_vec().first().copied() else {
+            warn!("No durable peers available for remote subscription setup");
+            return;
+        };
+        self.setup_remote_subscriptions_on(target_peer);
+    }
+
+    /// Register the pending predicates on `target_peer`, through its newest registration trusted
+    /// as durable, which then holds them.
+    fn setup_remote_subscriptions_on(&self, target_peer: NodeId) {
         let node = match self.inner.node.get() {
             Some(node) => node,
             None => {
@@ -387,15 +417,11 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 return;
             }
         };
-
-        // For now, use the first available peer (could be made smarter)
-        let connected_peers = self.inner.connected_peers.to_vec();
-        if connected_peers.is_empty() {
-            warn!("No durable peers available for remote subscription setup");
+        // None once the peer's last durable registration has gone; its disconnect notice follows.
+        let Some(target) = node.durable_registration(&target_peer) else {
+            debug!("Peer {} has no durable registration left for remote subscription setup", target_peer);
             return;
-        }
-
-        let target_peer = connected_peers[0];
+        };
 
         // Atomically get pending subscriptions and mark them as requested
         let pending: Vec<_> = {
@@ -406,7 +432,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 .values_mut()
                 .filter_map(|info| {
                     if let Status::PendingRemote = info.status {
-                        info.status = Status::Requested(target_peer, info.content.version);
+                        info.status = Status::Requested(target, info.content.version);
                         info.cancel.cancel_and_swap();
                         Some((info.content.clone(), info.cancel.clone()))
                     } else {
@@ -423,11 +449,17 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
         debug!("Registering {} predicates on {} peer subscriptions", pending.len(), self.inner.connected_peers.len());
 
         for (content, cancel) in pending {
-            crate::task::spawn(self.clone().attempt_subscribe(node.clone(), target_peer, content, cancel));
+            crate::task::spawn(self.clone().attempt_subscribe(node.clone(), target, content, cancel));
         }
     }
 
-    async fn attempt_subscribe(self, node: Arc<dyn TNode<CD>>, target_peer: NodeId, content: Arc<Content<CD>>, cancel: CancelFlag) {
+    async fn attempt_subscribe(
+        self,
+        node: Arc<dyn TNode<CD>>,
+        target: ConnectionRegistration,
+        content: Arc<Content<CD>>,
+        cancel: CancelFlag,
+    ) {
         let query_id = content.query_id;
         let predicate = content.selection.clone();
         // Credentials read at send time from the live source.
@@ -439,7 +471,7 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             { self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner()).get(&query_id).map(|state| state.livequery.clone()) };
 
         // Call remote_subscribe which fetches known matches, subscribes, applies deltas, and stores events
-        match node.remote_subscribe(target_peer, query_id, predicate, cdatas, version).await {
+        match node.remote_subscribe(target, query_id, predicate, cdatas, version).await {
             _ if cancel.canceled() => debug!("Ignoring superseded reply for predicate {}", query_id),
             Ok(()) => {
                 // Deltas applied successfully, now activate the livequery
@@ -452,14 +484,14 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
                 let mut subscriptions = self.inner.subscriptions.lock().unwrap_or_else(|e| e.into_inner());
                 if !cancel.canceled() {
                     if let Some(info) = subscriptions.get_mut(&query_id) {
-                        info.status = Status::Established(target_peer, version);
+                        info.status = Status::Established(target, version);
                     }
                 }
-                debug!("Successfully registered predicate {} on peer {} subscription", query_id, target_peer);
+                debug!("Successfully registered predicate {} on peer {} subscription", query_id, target.peer());
             }
             Err(e) => {
                 // Handle error with retry logic
-                self.handle_error(query_id, target_peer, e, &cancel);
+                self.handle_error(query_id, target.peer(), e, &cancel);
             }
         }
     }
@@ -494,6 +526,8 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
             // Retrieval errors from fetching are generally not retryable
             RetrievalError::RequestError(req_err) => match req_err {
                 RequestError::PeerNotConnected => true,
+                // The peer stopped being durable; another one may serve the subscription.
+                RequestError::NotTrustedAsDurable(_) => true,
                 RequestError::ConnectionLost => true,
                 RequestError::SendError(_) => true,
                 RequestError::InternalChannelClosed => true,
@@ -532,21 +566,24 @@ impl<CD: ContextData, Q: RemoteQuerySubscriber> SubscriptionRelay<CD, Q> {
 /// Trait for communicating with remote peers (abstraction over WeakNode for testing)
 #[async_trait]
 pub trait TNode<CD: ContextData>: Send + Sync {
-    /// Send a predicate registration request to a remote peer, fetch known matches,
-    /// apply received deltas, and store used events.
+    /// The registration a subscription to `peer` goes out on: its newest one trusted as durable.
+    fn durable_registration(&self, peer: &proto::NodeId) -> Option<ConnectionRegistration>;
+
+    /// Send a predicate registration request on `registration`, which then holds the query, fetch
+    /// known matches, apply received deltas, and store used events.
     /// Returns Ok(()) if subscription was established and deltas applied successfully.
     async fn remote_subscribe(
         &self,
-        peer_id: proto::NodeId,
+        registration: ConnectionRegistration,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<CD>,
         version: u32,
     ) -> Result<(), RetrievalError>;
 
-    /// Send a predicate unregistration message to a remote peer
+    /// Send a predicate unregistration message on `registration`, which holds the query.
     /// This is a one-way message, no response expected
-    async fn peer_unsubscribe(&self, peer_id: proto::NodeId, query_id: proto::QueryId) -> Result<(), anyhow::Error>;
+    async fn peer_unsubscribe(&self, registration: ConnectionRegistration, query_id: proto::QueryId) -> Result<(), anyhow::Error>;
 }
 
 /// Implementation of TNode for WeakNode
@@ -556,9 +593,11 @@ where
     SE: crate::storage::StorageEngine + Send + Sync + 'static,
     PA: crate::policy::PolicyAgent + Send + Sync + 'static,
 {
+    fn durable_registration(&self, peer: &proto::NodeId) -> Option<ConnectionRegistration> { self.upgrade()?.durable_registration(peer) }
+
     async fn remote_subscribe(
         &self,
-        peer_id: proto::NodeId,
+        registration: ConnectionRegistration,
         query_id: proto::QueryId,
         selection: ankql::ast::Selection<Resolved>,
         context_data: Vec<PA::ContextData>,
@@ -577,8 +616,8 @@ where
 
         // 2. Send subscribe request with known_matches
         let response = node
-            .request(
-                peer_id,
+            .request_durable_on(
+                registration,
                 &context_data,
                 ankurah_proto::NodeRequestBody::SubscribeQuery { query_id, selection: selection.clone(), version, known_matches },
             )
@@ -593,16 +632,16 @@ where
         // 3. Apply deltas to local node using NodeApplier
         let event_getter = crate::retrieval::CachedEventGetter::new(&node, &context_data);
         let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
-        crate::node::inbound::applier::NodeApplier::apply_deltas(&node, &peer_id, deltas, &event_getter, &state_getter).await?;
+        crate::node::inbound::applier::NodeApplier::apply_deltas(&node, &registration.peer(), deltas, &event_getter, &state_getter).await?;
 
         Ok(())
     }
 
-    async fn peer_unsubscribe(&self, peer_id: proto::NodeId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
+    async fn peer_unsubscribe(&self, registration: ConnectionRegistration, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
         let node = self.upgrade().ok_or(NodeDropped)?;
 
         // Use the existing request_remote_unsubscribe method
-        node.request_remote_unsubscribe(query_id, vec![peer_id]).await?;
+        node.request_remote_unsubscribe(query_id, registration).await?;
 
         Ok(())
     }
@@ -629,7 +668,9 @@ mod tests {
     #[derive(Debug)]
     struct MockMessageSender<CD: ContextData> {
         next_error: Arc<Mutex<Option<RequestError>>>,
-        sent_requests: Arc<Mutex<Vec<(NodeId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)>>>,
+        sent_requests: Arc<Mutex<Vec<(ConnectionRegistration, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)>>>,
+        /// The registration each peer's subscriptions go out on: its first, until a test moves them.
+        durable_registrations: Mutex<std::collections::HashMap<NodeId, ConnectionRegistration>>,
         should_fail: Arc<Mutex<bool>>,
         failure_message: Arc<Mutex<String>>,
         held_reply: Mutex<Option<tokio::sync::oneshot::Receiver<Result<(), RequestError>>>>,
@@ -640,6 +681,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 sent_requests: Arc::new(Mutex::new(Vec::new())),
+                durable_registrations: Mutex::new(std::collections::HashMap::new()),
                 next_error: Arc::new(Mutex::new(None)),
                 should_fail: Arc::new(Mutex::new(false)),
                 failure_message: Arc::new(Mutex::new(String::new())),
@@ -650,11 +692,16 @@ mod tests {
 
         fn set_fail_next(&self, error: RequestError) { *self.next_error.lock().unwrap() = Some(error); }
 
-        fn get_sent_requests(&self) -> Vec<(NodeId, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)> {
+        fn get_sent_requests(&self) -> Vec<(ConnectionRegistration, proto::QueryId, Option<ankql::ast::Selection<Resolved>>)> {
             self.sent_requests.lock().unwrap().clone()
         }
 
         fn clear_sent_requests(&self) { self.sent_requests.lock().unwrap().clear(); }
+
+        /// Send the subscriptions to `registration`'s peer on `registration` from now on.
+        fn move_durable_registration(&self, registration: ConnectionRegistration) {
+            self.durable_registrations.lock().unwrap().insert(registration.peer(), registration);
+        }
 
         /// Parks the next remote_subscribe until the returned sender delivers its reply.
         fn hold_next_reply(&self) -> tokio::sync::oneshot::Sender<Result<(), RequestError>> {
@@ -666,15 +713,19 @@ mod tests {
 
     #[async_trait]
     impl<CD: ContextData> TNode<CD> for MockMessageSender<CD> {
+        fn durable_registration(&self, peer: &NodeId) -> Option<ConnectionRegistration> {
+            Some(*self.durable_registrations.lock().unwrap().entry(*peer).or_insert_with(|| ConnectionRegistration::for_test(*peer, 0)))
+        }
+
         async fn remote_subscribe(
             &self,
-            peer_id: NodeId,
+            registration: ConnectionRegistration,
             query_id: proto::QueryId,
             selection: ankql::ast::Selection<Resolved>,
             _context_data: Vec<CD>,
             _version: u32,
         ) -> Result<(), RetrievalError> {
-            self.sent_requests.lock().unwrap().push((peer_id, query_id, Some(selection.clone())));
+            self.sent_requests.lock().unwrap().push((registration, query_id, Some(selection.clone())));
 
             let held = self.held_reply.lock().unwrap().take();
             if let Some(reply) = held {
@@ -689,8 +740,8 @@ mod tests {
             }
         }
 
-        async fn peer_unsubscribe(&self, peer_id: NodeId, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
-            self.sent_requests.lock().unwrap().push((peer_id, query_id, None));
+        async fn peer_unsubscribe(&self, registration: ConnectionRegistration, query_id: proto::QueryId) -> Result<(), anyhow::Error> {
+            self.sent_requests.lock().unwrap().push((registration, query_id, None));
 
             // Check if there's an error to fail with
             if let Some(error) = self.next_error.lock().unwrap().take() {
@@ -782,19 +833,21 @@ mod tests {
         relay.subscribe_query(query_id, predicate.clone(), model_id.clone().into(), 0, MockLiveQuery);
 
         settle().await;
-        assert!(matches!(relay.get_status(query_id), Some(Status::Requested(peer, 0)) if peer == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Requested(peer, 0)) if peer.peer() == peer_id));
 
         // Verify request was sent
         let sent_requests = mock_sender.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
-        assert_eq!(sent_requests[0].0, peer_id);
+        assert_eq!(sent_requests[0].0.peer(), peer_id);
         assert_eq!(sent_requests[0].1, query_id);
         assert_eq!(sent_requests[0].2, Some(predicate));
 
         // Verify subscription is marked as established
         reply.send(Ok(())).unwrap();
         settle().await;
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id.peer() == peer_id)
+        );
     }
 
     #[tokio::test]
@@ -818,7 +871,9 @@ mod tests {
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id.peer() == peer_id)
+        );
 
         // Simulate peer disconnection
         relay.notify_peer_disconnected(peer_id);
@@ -854,11 +909,13 @@ mod tests {
         // Verify request was sent
         let sent_requests = mock_sender.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
-        assert_eq!(sent_requests[0].0, peer_id);
+        assert_eq!(sent_requests[0].0.peer(), peer_id);
         assert_eq!(sent_requests[0].1, query_id);
 
         // Verify subscription is established
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id.peer() == peer_id)
+        );
     }
 
     #[tokio::test]
@@ -880,7 +937,9 @@ mod tests {
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Verify subscription is marked as established (since no error was set)
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id.peer() == peer_id)
+        );
 
         // Now test the retry behavior by disconnecting the peer (puts subscription back to PendingRemote)
         // then setting up the mock to fail, and reconnecting to trigger the retry
@@ -947,7 +1006,7 @@ mod tests {
 
         // Verify states
         assert!(
-            matches!(relay.get_status(retryable_query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id)
+            matches!(relay.get_status(retryable_query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id.peer() == peer_id)
         );
         assert!(matches!(relay.get_status(non_retryable_query_id), Some(Status::Failed)));
     }
@@ -970,7 +1029,9 @@ mod tests {
         // Give async task time to complete
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id.peer() == peer_id)
+        );
 
         // Clear previous requests to focus on unsubscribe
         mock_sender.clear_sent_requests();
@@ -984,7 +1045,7 @@ mod tests {
         // Verify unsubscribe message was sent
         let sent_requests = mock_sender.get_sent_requests();
         assert_eq!(sent_requests.len(), 1);
-        assert_eq!(sent_requests[0].0, peer_id);
+        assert_eq!(sent_requests[0].0.peer(), peer_id);
         assert_eq!(sent_requests[0].1, query_id);
 
         // Verify subscription is gone
@@ -1023,7 +1084,9 @@ mod tests {
         futures_timer::Delay::new(std::time::Duration::from_millis(10)).await;
 
         // Should now be established
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id == peer_id));
+        assert!(
+            matches!(relay.get_status(query_id), Some(Status::Established(established_peer_id, _)) if established_peer_id.peer() == peer_id)
+        );
         assert_eq!(mock_sender.get_sent_requests().len(), 1);
     }
 
@@ -1069,7 +1132,7 @@ mod tests {
 
             relay.update_query(query_id, create_test_selection(), 2).unwrap();
             settle().await;
-            assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p == peer_id));
+            assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p.peer() == peer_id));
 
             ESTABLISHED.take();
             stale.send(stale_reply).unwrap();
@@ -1094,8 +1157,8 @@ mod tests {
         stale.send(Err(RequestError::ServerError("stale".into()))).unwrap();
         settle().await;
 
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p == peer));
-        assert!(sender.get_sent_requests().iter().all(|(p, _, _)| *p == peer));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 2)) if p.peer() == peer));
+        assert!(sender.get_sent_requests().iter().all(|(p, _, _)| p.peer() == peer));
     }
 
     /// After a disconnect and reconnect, the reply to the pre-disconnect request must not disturb the
@@ -1111,7 +1174,7 @@ mod tests {
         relay.notify_peer_disconnected(peer_id);
         relay.notify_peer_connected(peer_id);
         settle().await;
-        assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 1)) if p == peer_id));
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(p, 1)) if p.peer() == peer_id));
 
         stale.send(Err(RequestError::ConnectionLost)).unwrap();
         settle().await;
@@ -1134,14 +1197,45 @@ mod tests {
         let _second_in_flight = mock_sender.hold_next_reply();
         relay.update_query(query_id, create_test_selection(), 2).unwrap();
         settle().await;
-        assert!(matches!(relay.get_status(query_id), Some(Status::Requested(p, 2)) if p == peer_id), "{:?}", relay.get_status(query_id));
+        assert!(
+            matches!(relay.get_status(query_id), Some(Status::Requested(p, 2)) if p.peer() == peer_id),
+            "{:?}",
+            relay.get_status(query_id)
+        );
 
         relay.unsubscribe_predicate(query_id);
         settle().await;
         let sent = mock_sender.get_sent_requests();
         assert_eq!(sent.len(), 3, "{sent:?}");
-        assert!(sent.iter().all(|(peer, _, _)| *peer == peer_id), "{sent:?}");
+        assert!(sent.iter().all(|(registration, _, _)| registration.peer() == peer_id), "{sent:?}");
         assert!(sent[2].2.is_none(), "unsubscribe must reach the recorded peer");
+    }
+
+    /// A durable peer reached twice holds a query on the registration it was sent on. When that
+    /// registration closes and the peer keeps another, the query is sent again on the other; the
+    /// close of a registration that holds no query sends nothing.
+    #[tokio::test]
+    async fn a_query_moves_to_another_durable_registration_of_its_peer_when_its_own_closes() {
+        let (relay, sender, peer) = connected_relay();
+        let query_id = proto::QueryId::new();
+        subscribe(&relay, query_id);
+        settle().await;
+        let first = ConnectionRegistration::for_test(peer, 0);
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(held_by, 1)) if held_by == first));
+
+        let (second, unused) = (ConnectionRegistration::for_test(peer, 1), ConnectionRegistration::for_test(peer, 2));
+        sender.move_durable_registration(second);
+        relay.notify_registration_closed(unused);
+        settle().await;
+        assert_eq!(sender.get_sent_requests().len(), 1, "the close of a registration holding no query sends nothing");
+
+        relay.notify_registration_closed(first);
+        settle().await;
+        assert!(matches!(relay.get_status(query_id), Some(Status::Established(held_by, 1)) if held_by == second));
+        let sent = sender.get_sent_requests();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].0, second, "sent again on the registration that remains");
+        assert!(relay.is_connected(&peer), "the peer stays connected");
     }
 
     /// The retry task must not own the relay, or dropping the last handle could never stop it.
@@ -1151,5 +1245,66 @@ mod tests {
         let weak = relay.weak();
         drop(relay);
         assert!(weak.upgrade().is_none());
+    }
+
+    /// A subscription chose its durable peer's registration, then, while it read local storage,
+    /// that registration closed and an inbound one of the same id registered. The send is refused;
+    /// nothing reaches the inbound sender, which this node does not trust as durable.
+    #[tokio::test]
+    async fn a_subscription_send_refuses_a_registration_closed_while_it_read_local_storage() {
+        use crate::connector::{PeerProvenance, PeerSender, SendError};
+        use crate::node::Node;
+        use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
+        use crate::test_helpers::opened_handshakes;
+        use crate::test_utils::TestStorage;
+
+        #[derive(Clone)]
+        struct Recorder(std::sync::mpsc::Sender<proto::NodeMessage>);
+        impl PeerSender for Recorder {
+            fn send_message(&self, message: proto::NodeMessage) -> Result<(), SendError> {
+                self.0.send(message).map_err(|_| SendError::ConnectionClosed)
+            }
+            fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
+        }
+
+        let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());
+        let storage = Arc::new(TestStorage::default());
+        let client = Node::new(storage.clone(), PermissiveAgent::new());
+        let (mut handshake, mut theirs) = opened_handshakes(client.id, PeerProvenance::Configured, server.id);
+        let (sent, _) = std::sync::mpsc::channel();
+        server.register_peer(client.presence(&handshake).await.unwrap(), &mut theirs, Box::new(Recorder(sent))).await.unwrap();
+        let presence = server.presence(&theirs).await.unwrap();
+        let (sent, _messages) = std::sync::mpsc::channel();
+        let configured = client.register_peer(presence, &mut handshake, Box::new(Recorder(sent))).await.unwrap();
+
+        let model = ModelId::EntityId(EntityId::from_bytes([9; 32]));
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        storage.hold_fetch.lock().unwrap().insert(model, (entered, release_rx));
+        let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::MemberOf(model), order_by: None, limit: None };
+        let weak = client.weak();
+        assert_eq!(TNode::durable_registration(&weak, &server.id), Some(configured));
+        let subscribe = TNode::remote_subscribe(&weak, configured, proto::QueryId::new(), selection, vec![DEFAULT_CONTEXT], 0);
+        tokio::pin!(subscribe);
+        tokio::select! {
+            biased;
+            _ = entered_rx => {}
+            _ = &mut subscribe => panic!("the subscription finished before its local read"),
+        }
+
+        // A server that dials an address presents to whoever answers there, answering the challenge
+        // that answer carried: here the client's, relayed.
+        let (mut handshake, theirs) = opened_handshakes(client.id, PeerProvenance::Inbound, server.id);
+        let relayed = server.presence(&theirs).await.unwrap();
+        let (relayer_sent, relayer_messages) = std::sync::mpsc::channel();
+        let relayer = Box::new(Recorder(relayer_sent));
+        client.register_peer(relayed, &mut handshake, relayer).await.unwrap();
+        client.deregister_peer(configured);
+
+        release.send(()).unwrap();
+        let outcome =
+            tokio::time::timeout(std::time::Duration::from_secs(2), subscribe).await.expect("the send was refused, not left waiting");
+        assert!(matches!(outcome, Err(RetrievalError::RequestError(RequestError::PeerNotConnected))), "{outcome:?}");
+        assert_eq!(relayer_messages.try_iter().count(), 0, "no frame, and so no auth data, reached the inbound sender");
     }
 }

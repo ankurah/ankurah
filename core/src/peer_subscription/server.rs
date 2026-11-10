@@ -5,7 +5,7 @@ use tracing::warn;
 use crate::{
     entity::Entity,
     error::SubscriptionError,
-    node::Node,
+    node::{ConnectionRegistration, Node},
     policy::{ContextPolicy, PolicyAgent},
     reactor::{
         fetch_gap::{GapFetcher, QueryGapFetcher},
@@ -17,9 +17,9 @@ use crate::{
 use ankurah_signals::{Subscribe, SubscriptionGuard};
 use std::collections::HashMap;
 
-/// Owns one peer's reactor subscription and per-query credential sources.
+/// Owns the reactor subscription and per-query credential sources of the queries one peer
+/// registration installed. Their updates go out on that registration and no other.
 pub struct SubscriptionHandler<CD: ContextData> {
-    _peer_id: proto::NodeId,
     subscription: ReactorSubscription,
     _guard: SubscriptionGuard,
     /// Tracks each standing query's version and the credential source shared with its gap fetcher.
@@ -35,13 +35,15 @@ struct StandingQuery<CD: ContextData> {
 }
 
 impl<CD: ContextData> SubscriptionHandler<CD> {
-    pub fn new<SE, PA>(peer_id: proto::NodeId, node: &Node<SE, PA>) -> Self
+    /// The handler of the queries that `registration` installs on `node`.
+    pub fn new<SE, PA>(registration: ConnectionRegistration, node: &Node<SE, PA>) -> Self
     where
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent<ContextData = CD> + Send + Sync + 'static,
     {
         let subscription = node.reactor.subscribe();
         let weak_node = node.weak();
+        let peer_id = registration.peer();
 
         let guard = subscription.subscribe(move |update: ReactorUpdate| {
             tracing::info!("SubscriptionHandler[{}] received reactor update with {} items", peer_id, update.items.len());
@@ -49,7 +51,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             if let Some(node) = weak_node.upgrade() {
                 tracing::debug!("SubscriptionHandler[{}] sending update to peer {}", peer_id, peer_id);
                 node.send_update(
-                    peer_id,
+                    registration,
                     proto::NodeUpdateBody::SubscriptionUpdate {
                         items: update.items.into_iter().filter_map(|item| convert_item(&node, peer_id, item)).collect(),
                     },
@@ -57,7 +59,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
             }
         });
 
-        Self { _peer_id: peer_id, subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
+        Self { subscription, _guard: guard, queries: tokio::sync::Mutex::new(HashMap::new()) }
     }
 
     /// Get the subscription ID for this peer.

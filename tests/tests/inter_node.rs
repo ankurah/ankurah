@@ -320,6 +320,30 @@ async fn test_client_server_subscription_propagation() -> Result<()> {
     Ok(())
 }
 
+/// A client connected to its server twice holds a subscription on the connection it went out on.
+/// When that connection closes, the subscription moves to the other one, and the server's changes
+/// keep reaching the client.
+#[tokio::test]
+async fn a_subscription_moves_to_another_connection_of_its_server_when_its_own_closes() -> Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server.wait_ready().await?;
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let _first = LocalProcessConnection::new(&client, &server).await?;
+    let second = LocalProcessConnection::new(&client, &server).await?;
+    client.wait_ready().await?;
+    let (server, client) = (server.context(c)?, client.context(c)?);
+
+    let watcher = TestWatcher::changeset();
+    let _subscription = client.query_wait::<AlbumView>(nocache("name = 'Absolution'")?).await?.subscribe(&watcher);
+    drop(second);
+
+    let trx = server.begin();
+    let album_id = trx.create(&Album { name: "Absolution".into(), year: "2003".into() }).await?.id();
+    trx.commit().await?;
+    assert_eq!(watcher.take_one().await, vec![(album_id, ChangeKind::Add)]);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_view_field_subscriptions_with_query_lifecycle() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test().unwrap()), PermissiveAgent::new());

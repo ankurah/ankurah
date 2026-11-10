@@ -2,16 +2,24 @@ use crate::client::ClientInner;
 use crate::connection_state::ConnectionState;
 use ankurah::signals::Wait;
 use ankurah_core::action_info;
+use ankurah_core::connector::Handshake;
 use ankurah_core::connector::NodeComms;
 use ankurah_core::connector::PeerConnectionError;
+use ankurah_core::connector::PeerProvenance;
 use ankurah_core::connector::PeerSender;
+use ankurah_core::connector::RegistrationGuard;
+use ankurah_core::connector::{HANDSHAKE_FRAME_LIMIT, HANDSHAKE_TIMEOUT};
 use ankurah_proto::{self as proto};
-use anyhow::anyhow;
+
 use async_trait::async_trait;
-use futures::{channel::mpsc, future::RemoteHandle, Future, FutureExt, StreamExt};
+use futures::{
+    channel::mpsc,
+    future::{LocalBoxFuture, RemoteHandle},
+    FutureExt, StreamExt,
+};
 use js_sys::Uint8Array;
 use send_wrapper::SendWrapper;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 use std::sync::{Arc, Weak};
 use std::sync::{Mutex, RwLock};
@@ -31,7 +39,11 @@ pub struct ConnectionInner {
     state: RwLock<ConnectionState>,
     node: Box<dyn NodeComms>,
     client: Weak<ClientInner>,
-    registered_peer: Cell<Option<proto::NodeId>>,
+    /// This node's side of the handshake; taken when the server's presence arrives, and while
+    /// this node signs its own.
+    handshake: RefCell<Option<Handshake>>,
+    /// This node's registration of the server; dropping it, on disconnect, deregisters the server.
+    registration: RefCell<Option<RegistrationGuard>>,
     receive_task: Cell<Option<RemoteHandle<()>>>,
     _callbacks: Mutex<Option<Vec<Box<dyn std::any::Any>>>>,
 }
@@ -54,13 +66,15 @@ impl Connection {
         let state = RwLock::new(ConnectionState::Connecting { url: url.clone() });
         let (mut incoming, mut messages) = mpsc::channel(MAX_QUEUED_MESSAGES);
 
+        let handshake = RefCell::new(Some(node.begin_handshake(PeerProvenance::Configured)));
         let me = Connection(Arc::new(SendWrapper::new(ConnectionInner {
             ws: Arc::new(ws),
             url,
             state,
             node,
             client,
-            registered_peer: Cell::new(None),
+            handshake,
+            registration: RefCell::new(None),
             receive_task: Cell::new(None),
             _callbacks: Mutex::new(None),
         })));
@@ -133,6 +147,20 @@ impl Connection {
         me.receive_task.set(Some(handle));
         wasm_bindgen_futures::spawn_local(task);
 
+        let weak = Arc::downgrade(&me.0);
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::sleep(HANDSHAKE_TIMEOUT).await;
+            let Some(connection) = weak.upgrade().map(Connection) else { return };
+            let registered = connection.registration.borrow().is_some();
+            if registered || !connection.client.upgrade().is_some_and(|client| client.owns(&connection)) {
+                return;
+            }
+            let message = format!("Server {} did not register within {HANDSHAKE_TIMEOUT:?}; closing", connection.url);
+            error!("{}", message);
+            connection.disconnect();
+            connection.set_state(ConnectionState::Error { message, cause: None });
+        });
+
         Ok(me)
     }
 
@@ -165,8 +193,23 @@ impl Connection {
     }
 
     /// Dispatch a browser message, returning any handshake work for the receive loop to await.
-    fn receive_message(&self, e: MessageEvent) -> Option<impl Future<Output = ()> + 'static> {
-        let array_buffer = if let Ok(array_buffer) = e.data().dyn_into::<js_sys::ArrayBuffer>() {
+    fn receive_message(&self, e: MessageEvent) -> Option<LocalBoxFuture<'static, ()>> {
+        let data = e.data();
+        let length = match (data.dyn_ref::<js_sys::ArrayBuffer>(), data.dyn_ref::<js_sys::JsString>()) {
+            (Some(array_buffer), _) => array_buffer.byte_length() as usize,
+            (None, Some(text)) => text.length() as usize,
+            (None, None) => 0,
+        };
+        let registered = self.registration.borrow().is_some();
+        if length > HANDSHAKE_FRAME_LIMIT && !registered {
+            let message =
+                format!("Server {} sent a frame of {length} bytes before it registered, over the handshake limit; closing", self.url);
+            error!("{}", message);
+            self.disconnect();
+            self.set_state(ConnectionState::Error { message, cause: None });
+            return None;
+        }
+        let array_buffer = if let Ok(array_buffer) = data.dyn_into::<js_sys::ArrayBuffer>() {
             array_buffer
         } else if let Ok(text) = e.data().dyn_into::<js_sys::JsString>() {
             info!("Text message received (unexpected): {}", text);
@@ -178,73 +221,68 @@ impl Connection {
         let array = Uint8Array::new(&array_buffer);
         let data = array.to_vec();
 
-        if let Ok(message) = bincode::deserialize::<proto::Message>(&data) {
-            match message {
+        // The server's first frame is its opening.
+        if self.handshake.borrow().as_ref().is_some_and(|handshake| !handshake.opened()) {
+            return self.answer_opening(&data);
+        }
+
+        match proto::Message::decode(&data) {
+            Ok(message) => match message {
+                proto::Message::Open(_) => warn!("Ignoring repeated opening from {}", self.url),
+                proto::Message::NoCommonVersion(theirs) => {
+                    let no_common_version = PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs };
+                    error!("Server {} answered this node's opening: {}; closing", self.url, no_common_version);
+                    self.disconnect();
+                    self.set_state(ConnectionState::Error { message: no_common_version.to_string(), cause: Some(no_common_version) });
+                }
+                proto::Message::Refused(reason) => {
+                    error!("Server {} refused this node: {}", self.url, reason);
+                    self.disconnect();
+                    self.set_state(ConnectionState::RefusedByServer { url: self.url.clone(), reason });
+                }
                 proto::Message::Presence(server_presence) => {
-                    // Pre-check the version so the server learns why we are
-                    // leaving; register_peer re-enforces this for every transport.
-                    if !proto::protocol_compatible(server_presence.protocol_version) {
-                        let rejection =
-                            proto::PresenceRejection { expected: proto::PROTOCOL_VERSION, received: server_presence.protocol_version };
-                        error!("Refusing server {}: {}", self.url, rejection);
-                        let _ = self.send_message(proto::Message::PresenceRejected(rejection.clone()));
-                        self.disconnect();
-                        self.set_state(ConnectionState::Error { message: rejection.to_string(), cause: Some(rejection.into()) });
-                        return None;
-                    }
                     let state = { self.state.read().unwrap().clone() };
                     match state {
                         ConnectionState::Connected { .. } => warn!("Received duplicate server presence, ignoring"),
                         ConnectionState::Connecting { .. } => {
+                            let Some(mut handshake) = self.handshake.borrow_mut().take() else {
+                                warn!("Received duplicate server presence, ignoring");
+                                return None;
+                            };
                             // Register BEFORE publishing Connected: observers of the
                             // state must never see a connection whose peer is not
                             // registered (or that registration is about to refuse).
                             let weak = Arc::downgrade(&self.0);
                             let node = self.node.cloned();
-                            let sender = Box::new(WebSocketPeerSender {
-                                recipient_node_id: server_presence.node_id,
-                                ws: SendWrapper::new(self.ws.clone()),
-                            });
-                            return Some(async move {
-                                let presence = match node.register_peer(server_presence.clone(), sender).await {
-                                    Ok(()) => {
-                                        if let Some(connection) = weak.upgrade().map(Connection) {
-                                            connection.registered_peer.set(Some(server_presence.node_id));
-                                        } else {
-                                            node.deregister_peer(server_presence.node_id);
+                            let sender = Box::new(WebSocketPeerSender { ws: SendWrapper::new(self.ws.clone()) });
+                            return Some(
+                                async move {
+                                    let registered = node.register_peer(server_presence.clone(), &mut handshake, sender).await;
+                                    // Dropped with the connection gone, which deregisters the server.
+                                    let registered = registered.map(|registration| RegistrationGuard::new(node.cloned(), registration));
+                                    let Some(connection) = weak.upgrade().map(Connection) else { return };
+                                    match registered {
+                                        Ok(registration) => *connection.registration.borrow_mut() = Some(registration),
+                                        Err(rejection) => {
+                                            error!("Refusing server {}: {}", connection.url, rejection);
+                                            connection.disconnect();
+                                            connection.set_state(ConnectionState::Error {
+                                                message: rejection.to_string(),
+                                                cause: Some(rejection),
+                                            });
                                             return;
                                         }
-                                        node.presence().await.map_err(PeerConnectionError::from)
                                     }
-                                    Err(error) => Err(error),
-                                };
-                                let Some(connection) = weak.upgrade().map(Connection) else { return };
-                                let presence = match presence {
-                                    Ok(presence) => presence,
-                                    Err(rejection) => {
-                                        error!("Refusing server {}: {}", connection.url, rejection);
+                                    if !connection.is_current() {
                                         connection.disconnect();
-                                        connection
-                                            .set_state(ConnectionState::Error { message: rejection.to_string(), cause: Some(rejection) });
                                         return;
                                     }
-                                };
-                                if !connection.is_current() {
-                                    connection.disconnect();
-                                    return;
+                                    if !connection.set_state(ConnectionState::Connected { url: connection.url.clone(), server_presence }) {
+                                        connection.disconnect();
+                                    }
                                 }
-                                if let Err(error) = connection.send_message(proto::Message::Presence(presence)) {
-                                    connection.disconnect();
-                                    connection.set_state(ConnectionState::Error {
-                                        message: format!("Failed to send presence: {error:?}"),
-                                        cause: None,
-                                    });
-                                    return;
-                                }
-                                if !connection.set_state(ConnectionState::Connected { url: connection.url.clone(), server_presence }) {
-                                    connection.disconnect();
-                                }
-                            });
+                                .boxed_local(),
+                            );
                         }
                         _ => {
                             warn!("Sanity error: received server presence while not in connecting state");
@@ -256,44 +294,99 @@ impl Connection {
                         }
                     }
                 }
-                proto::Message::PresenceRejected(rejection) => {
-                    error!("Server {} refused connection: {}", self.url, rejection);
-                    self.disconnect();
-                    self.set_state(ConnectionState::Error { message: rejection.to_string(), cause: Some(rejection.into()) });
-                }
                 proto::Message::PeerMessage(msg) => {
+                    let registration = self.registration.borrow().as_ref().map(RegistrationGuard::registration);
+                    let Some(registration) = registration else {
+                        // As the native client: nothing an unregistered server says may reach the node.
+                        let message = format!("Server {} sent application traffic before its presence registered; closing", self.url);
+                        error!("{}", message);
+                        self.disconnect();
+                        self.set_state(ConnectionState::Error { message, cause: None });
+                        return None;
+                    };
                     let node = self.node.cloned();
                     // TODO: determine the performance implications of spawning a new task for each message
                     // versus using a channel to send messages to the node.
                     wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(e) = node.handle_message(msg).await {
+                        if let Err(e) = node.handle_message(registration, msg).await {
                             info!("Error handling message: {:?}", e);
                         }
                     });
                 }
-            }
-        } else {
-            let connecting = matches!(&*self.state.read().unwrap(), ConnectionState::Connecting { .. });
-            if connecting {
-                // A handshake we cannot read will never establish; close instead
-                // of idling on a dead connection.
-                let message = format!("Failed to deserialize handshake message from {}; closing", self.url);
+            },
+            Err(unreadable)
+                if unreadable.closes_connection(!matches!(&*self.state.read().unwrap(), ConnectionState::Connecting { .. })) =>
+            {
+                let message = format!("Server {} sent {unreadable}; closing", self.url);
                 error!("{}", message);
                 self.disconnect();
                 self.set_state(ConnectionState::Error { message, cause: None });
-            } else {
-                warn!("Failed to deserialize message from server");
             }
+            Err(unreadable) => warn!("Dropping a frame from server {}: {unreadable}", self.url),
         }
         None
     }
 
-    fn send_message(&self, message: proto::Message) -> Result<(), JsValue> {
-        let data = bincode::serialize(&message).map_err(|e| {
-            info!("Failed to serialize client message: {:?}", e);
-            JsValue::from_str("Serialization error")
-        })?;
+    /// Answer the server's first frame, its opening, which arrives once the socket is open: send
+    /// this node's opening, then read the server's and return the work of presenting this node,
+    /// or close with the versions this node speaks when the two share none.
+    fn answer_opening(&self, frame: &[u8]) -> Option<LocalBoxFuture<'static, ()>> {
+        let (opening, read) = self.handshake.borrow_mut().as_mut().map(|handshake| (handshake.opening(), handshake.read_opening(frame)))?;
+        let refusal = match self.send_message(proto::Message::Open(opening)) {
+            Ok(()) => match read {
+                Ok(()) => return Some(self.present().boxed_local()),
+                Err(refusal) => refusal,
+            },
+            Err(error) => {
+                self.disconnect();
+                self.set_state(ConnectionState::Error { message: format!("Failed to send opening: {error:?}"), cause: None });
+                return None;
+            }
+        };
+        error!("Refusing server {}: {}", self.url, refusal);
+        if let PeerConnectionError::NoCommonVersion { ours, .. } = refusal {
+            // Best effort: the connection closes either way.
+            let _ = self.send_message(proto::Message::NoCommonVersion(ours));
+        }
+        self.disconnect();
+        self.set_state(ConnectionState::Error { message: refusal.to_string(), cause: Some(refusal) });
+        None
+    }
 
+    /// Sign this node's presence answering the server's opening, and send it.
+    fn present(&self) -> impl std::future::Future<Output = ()> + 'static {
+        let weak = Arc::downgrade(&self.0);
+        let node = self.node.cloned();
+        // The receive loop reads no frame until this finishes, so the handshake is back in place
+        // before the server's presence is read.
+        let handshake = self.handshake.borrow_mut().take();
+        async move {
+            let Some(handshake) = handshake else { return };
+            let presence = node.presence(&handshake).await;
+            let Some(connection) = weak.upgrade().map(Connection) else { return };
+            *connection.handshake.borrow_mut() = Some(handshake);
+            if !connection.is_current() {
+                connection.disconnect();
+                return;
+            }
+            let sent = match presence {
+                Ok(presence) => connection.send_message(proto::Message::Presence(presence)),
+                Err(refusal) => {
+                    error!("Not presenting to server {}: {}", connection.url, refusal);
+                    connection.disconnect();
+                    connection.set_state(ConnectionState::Error { message: refusal.to_string(), cause: Some(refusal) });
+                    return;
+                }
+            };
+            if let Err(error) = sent {
+                connection.disconnect();
+                connection.set_state(ConnectionState::Error { message: format!("Failed to send presence: {error:?}"), cause: None });
+            }
+        }
+    }
+
+    fn send_message(&self, message: proto::Message) -> Result<(), JsValue> {
+        let data = message.encode();
         let array = Uint8Array::new_with_length(data.len() as u32);
         array.copy_from(&data);
         self.ws.send_with_array_buffer(&array.buffer())?;
@@ -311,9 +404,8 @@ impl ConnectionInner {
         // Close the WebSocket connection with a normal closure (code 1000)
         let _ = self.ws.close();
         self._callbacks.lock().unwrap().take();
-        if let Some(peer) = self.registered_peer.take() {
-            self.node.deregister_peer(peer);
-        }
+        // Dropping the guard deregisters the server.
+        self.registration.borrow_mut().take();
     }
 }
 impl Drop for ConnectionInner {
@@ -329,19 +421,13 @@ impl PartialEq for Connection {
 
 #[derive(Clone)]
 struct WebSocketPeerSender {
-    recipient_node_id: proto::NodeId,
     ws: SendWrapper<Arc<WebSocket>>,
 }
 
 #[async_trait]
 impl PeerSender for WebSocketPeerSender {
     fn send_message(&self, message: proto::NodeMessage) -> Result<(), ankurah_core::connector::SendError> {
-        let message = proto::Message::PeerMessage(message);
-        let data = bincode::serialize(&message).map_err(|e| {
-            info!("Failed to serialize client message: {:?}", e);
-            ankurah_core::connector::SendError::from(anyhow!("Serialization error"))
-        })?;
-
+        let data = proto::Message::PeerMessage(message).encode();
         let array = Uint8Array::new_with_length(data.len() as u32);
         array.copy_from(&data);
         match self.ws.send_with_array_buffer(&array.buffer()) {
@@ -352,8 +438,6 @@ impl PeerSender for WebSocketPeerSender {
             }
         }
     }
-
-    fn recipient_node_id(&self) -> proto::NodeId { self.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }

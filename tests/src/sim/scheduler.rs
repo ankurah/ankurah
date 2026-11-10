@@ -194,14 +194,19 @@ impl Scheduler {
         }
     }
 
-    /// Deliver one message to its recipient's real `handle_message`, recording
-    /// the delivery. `handle_message` errors are swallowed: a node rejecting a
-    /// message (a dangling parent, a V6 unknown-entity item) is a legitimate
-    /// outcome the invariants check for, not a harness error. Returns whether
-    /// the message's acceptance target (if any) is now satisfied.
+    /// Deliver one message to its recipient's real `handle_message`, on the
+    /// recipient's registration of the sender, recording the delivery. A
+    /// recipient that never registered the sender drops the message, as a
+    /// node drops a frame from no connection. `handle_message` errors are
+    /// swallowed: a node rejecting a message (a dangling parent, a V6
+    /// unknown-entity item) is a legitimate outcome the invariants check for,
+    /// not a harness error. Returns whether the message's acceptance target
+    /// (if any) is now satisfied.
     async fn deliver(&self, item: &InFlight, nodes: &[SimNode], trace: &mut Trace, duplicate: bool) -> bool {
         trace.record(TraceEvent::Deliver { src: item.src, dst: item.dst, digest: item.digest.clone(), duplicate });
-        let _ = nodes[item.dst].node.handle_message(clone_message(&item.message)).await;
+        if let Some(registration) = nodes[item.dst].registration_of(item.src) {
+            let _ = nodes[item.dst].node.handle_message(registration, clone_message(&item.message)).await;
+        }
         match &item.accept {
             None => true,
             Some((entity, event)) => nodes[item.dst].stored_event_ids(*entity).await.contains(event),

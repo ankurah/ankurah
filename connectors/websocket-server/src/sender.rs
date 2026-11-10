@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ankurah_core::connector::{PeerSender, SendError};
 use ankurah_proto as proto;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error};
 
 // PeerSender for sending messages to a websocket client
@@ -17,14 +17,21 @@ struct Inner {
     handle: Arc<tokio::task::JoinHandle<()>>,
 }
 
+/// The sending half of a websocket.
+pub type Socket = futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
+
+/// How many frames a sender holds that its socket has not yet taken; a send beyond them fails.
+const HELD_FRAMES: usize = 32;
+
 impl WebSocketClientSender {
-    pub fn new(
-        node_id: proto::NodeId,
-        mut sender: futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>,
-    ) -> Self {
-        let (tx, mut rx) = mpsc::channel(32);
+    /// A sender of frames to `node_id`, and the slot its connection fills with the socket once it
+    /// has answered the peer's presence; up to [`HELD_FRAMES`] frames sent before then wait, in order.
+    pub fn new(node_id: proto::NodeId) -> (Self, oneshot::Sender<Socket>) {
+        let (tx, mut rx) = mpsc::channel(HELD_FRAMES);
+        let (socket_tx, socket_rx) = oneshot::channel::<Socket>();
         use futures_util::SinkExt;
         let handle = tokio::spawn(async move {
+            let Ok(mut sender) = socket_rx.await else { return };
             while let Some(msg) = rx.recv().await {
                 if sender.send(msg).await.is_err() {
                     error!("Failed to send message through websocket, breaking send loop");
@@ -33,13 +40,13 @@ impl WebSocketClientSender {
             }
             debug!("WebSocket sender task completed");
         });
-        Self { tx, inner: Arc::new(Inner { recipient_node_id: node_id, handle: Arc::new(handle) }) }
+        (Self { tx, inner: Arc::new(Inner { recipient_node_id: node_id, handle: Arc::new(handle) }) }, socket_tx)
     }
 
     #[tracing::instrument(skip(self, message), fields(recipient = %self.inner.recipient_node_id, msg = %message))]
     pub fn send_message(&self, message: proto::Message) -> Result<(), SendError> {
         debug!("Serializing message");
-        let data = bincode::serialize(&message).map_err(|e| SendError::from(anyhow::anyhow!("Serialization error: {}", e)))?;
+        let data = message.encode();
 
         debug!(bytes = data.len(), "Sending message through channel");
         self.tx.try_send(axum::extract::ws::Message::Binary(data.into())).map_err(|_| SendError::Unknown)?;
@@ -56,7 +63,6 @@ impl PeerSender for WebSocketClientSender {
         let server_message = proto::Message::PeerMessage(message);
         self.send_message(server_message)
     }
-    fn recipient_node_id(&self) -> proto::NodeId { self.inner.recipient_node_id }
 
     fn cloned(&self) -> Box<dyn PeerSender> { Box::new(self.clone()) }
 }
