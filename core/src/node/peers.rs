@@ -2,6 +2,7 @@
 
 pub(crate) mod durable_peer;
 pub(super) mod peer_state;
+pub(super) mod plugin;
 
 use crate::connector::PeerSender;
 use crate::error::RequestError;

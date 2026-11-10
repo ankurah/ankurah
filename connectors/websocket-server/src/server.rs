@@ -33,9 +33,10 @@ use super::sender::{Socket, WebSocketClientSender};
 use super::state::Connection;
 
 // From the connection's start, this bounds the whole accepting handshake: sending this node's
-// opening, reading the dialer's opening and presence, registering the dialer, signing this
-// node's presence and sending it, or sending the frame that refuses the dialer. A connection not
-// established by then closes, so a dialer that never presents does not hold it open.
+// opening, reading the dialer's opening and presence, registering the dialer with every plugin's
+// hook, signing this node's presence with every plugin's announcement and sending it, or sending
+// the frame that refuses the dialer. A connection not established by then closes, so neither a
+// dialer that never presents nor a slow plugin holds it open.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebsocketServer<SE, PA>
