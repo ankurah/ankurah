@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(&backend[..4], [0, 0, 0, 0], "Operation::Backend must encode as variant 0");
 
         let membership = encode(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))));
-        assert_eq!(&membership[..4], MEMBERSHIP_INDEX.to_le_bytes(), "Operation::Membership must encode as variant 1");
+        assert_eq!(&membership[..4], [1, 0, 0, 0], "Operation::Membership must encode as variant 1");
         assert_eq!(&membership[4..8], [0, 0, 0, 0], "Membership::Add must encode as variant 0");
 
         for bytes in [backend, membership] {
