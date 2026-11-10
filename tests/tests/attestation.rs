@@ -134,8 +134,8 @@ fn statement_by(attester: proto::Identity, subject: Subject, request: &Attestati
 }
 
 /// The statements `attestations` seal, in order.
-fn opened(attestations: &[SealedAttestation]) -> Vec<Statement> {
-    attestations.iter().map(|attestation| attestation.open().expect("an attestation a node sealed opens")).collect()
+fn unsealed(attestations: &[SealedAttestation]) -> Vec<Statement> {
+    attestations.iter().map(|attestation| attestation.unseal().expect("an attestation a node sealed unseals")).collect()
 }
 
 /// The client seals what its agent requests on its local commit, and the durable server seals what
@@ -159,13 +159,13 @@ async fn each_node_that_checks_an_event_attaches_exactly_the_attestation_its_age
         let committed = client.storage.dump_entity_events(id).await?;
         assert!(!committed.is_empty());
         for event in committed {
-            assert_eq!(opened(&event.attestations), Vec::from_iter(by_client(&event.payload)), "the client's commit");
+            assert_eq!(unsealed(&event.attestations), Vec::from_iter(by_client(&event.payload)), "the client's commit");
         }
         let admitted = server.storage.dump_entity_events(id).await?;
         assert!(!admitted.is_empty());
         for event in admitted {
             let expected = Vec::from_iter(by_client(&event.payload).into_iter().chain(by_server(&event.payload)));
-            assert_eq!(opened(&event.attestations), expected, "the server's admission of the client's commit");
+            assert_eq!(unsealed(&event.attestations), expected, "the server's admission of the client's commit");
         }
     }
     Ok(())
@@ -197,7 +197,7 @@ async fn a_served_state_carries_the_attestation_a_durable_nodes_agent_requests()
 
         assert!(from_client.attestations.is_empty(), "an ephemeral node attests no state it serves");
         let expected = state_request.map(|request| statement_by(server.identity(), Subject::state(&from_server.payload), &request));
-        assert_eq!(opened(&from_server.attestations), Vec::from_iter(expected));
+        assert_eq!(unsealed(&from_server.attestations), Vec::from_iter(expected));
     }
     Ok(())
 }

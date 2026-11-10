@@ -22,7 +22,7 @@ impl CatalogResolver for Labels {
 fn model() -> ModelId { ModelId::EntityId(EntityId::from_bytes([111; 32])) }
 
 /// Attestations about `subject`: bytes that do not parse, no bytes at all, and a genuine
-/// statement of a kind nobody defines, which opens but which no build can interpret.
+/// statement of a kind nobody defines, which unseals but which no build can interpret.
 fn attestations(subject: Subject) -> AttestationSet {
     let unknown_kind = NodeKey::from_seed([31; 32]).attest(subject, EntityId::from_bytes([32; 32]), b"read by no build".to_vec());
     AttestationSet(vec![SealedAttestation(b"not an attestation".to_vec()), SealedAttestation(Vec::new()), unknown_kind])
