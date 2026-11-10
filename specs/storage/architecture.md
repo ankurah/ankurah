@@ -46,8 +46,8 @@ order, and index entities used through that model. It is derived data:
   the entity.
 
 The canonical catalog entities use the same machinery. Their materializations
-are the built-in models `_ankurah_system`, `_ankurah_model`,
-`_ankurah_property`, and `_ankurah_model_property`.
+are the built-in models `_ankurah_model`, `_ankurah_property`, and
+`_ankurah_model_property`.
 
 ### 1.3 Entity-model association
 
@@ -100,14 +100,14 @@ pub trait StorageEngine: Send + Sync {
     fn set_catalog_resolver(&self, resolver: Weak<dyn CatalogResolver>);
 
     async fn get_state(&self, id: EntityId)
-        -> Result<Attested<EntityState>, RetrievalError>;
-    async fn get_states(&self, ids: Vec<EntityId>)
-        -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+        -> Result<EntityState, RetrievalError>;
+    async fn get_states(&self, ids: Vec<EntityId>, predicate: &Predicate<Resolved>)
+        -> Result<Vec<GetStateResult>, RetrievalError>;
 
     async fn fetch_states(
         &self,
         selection: &Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    ) -> Result<Vec<EntityState>, RetrievalError>;
 
     async fn get_events(&self, ids: Vec<EventId>)
         -> Result<Vec<Attested<Event>>, RetrievalError>;
@@ -141,7 +141,7 @@ in its batch. A failed batch publishes neither its new events nor its states.
 #[async_trait]
 pub trait StorageTransaction: Send {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError>;
-    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>)
+    async fn set_state(&mut self, expected_head: &Clock, state: &EntityState)
         -> Result<(), MutationError>;
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError>;
 }
@@ -150,7 +150,7 @@ pub enum StorageCommitOutcome {
     Committed(StorageCommitResult),
     Conflict {
         /// Canonical states observed while checking this attempt.
-        observed: BTreeMap<EntityId, Option<Attested<EntityState>>>,
+        observed: BTreeMap<EntityId, Option<EntityState>>,
     },
 }
 ```
@@ -274,7 +274,7 @@ The following names describe responsibilities, not mandatory identifiers:
 
 | Logical store | Contents |
 |---|---|
-| entity store | One canonical state/head/attestation record per `EntityId` |
+| entity store | One canonical state/head record per `EntityId`, stored without attestations |
 | event store | One canonical event/attestation record per `EventId` |
 | association store | Durable set of `(EntityId, ModelId)` |
 | model materialization | Projected values and indexes for one `ModelId` |

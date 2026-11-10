@@ -6,6 +6,7 @@
 - [Storage Engine Layer](storage-engines.md)
 - [Entity Lifecycle](entity-lifecycle.md)
 - [Node Architecture and Replication](node-architecture.md)
+- [Node Identity, Peer Trust and Attestation](node-identity.md)
 - [Property Backends](property-backends.md)
 - [Canonical Value Types and Casting](value-casting.md)
 - [LWW Merge Resolution](lww-merge.md)

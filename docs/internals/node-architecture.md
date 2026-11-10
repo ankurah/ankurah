@@ -35,6 +35,40 @@ this matters.
 For details on the event-getter implementations that back this behavior, see
 the [Event Retrieval and Staging](retrieval.md) document.
 
+## Node Identity and Peer Trust
+
+Each node has an ed25519 key. Connections open with a challenge-signed
+handshake, whether a peer counts as durable follows from how it was reached,
+and a node signs attestations on events and states when its application's
+policy asks for them. See [Node Identity, Peer Trust and Attestation](node-identity.md).
+
+## Node Plugins
+
+A node plugin attaches behaviour that only some applications want to a node,
+from outside core, and one node can carry several. The policy agent is not the
+place for such behaviour: a node has one agent, and its subject is access.
+Plugins are given when the node is built, with
+`Node::builder(engine, agent).plug(..)`, so each sees every peer registration
+of its node; two plugins under one name fail `build()` with a
+`DuplicatePluginName`.
+
+A plugin takes part in every handshake twice. When its node signs a presence,
+the plugin may announce bytes, which the presence carries under the plugin's
+name and its signature covers. When a peer's presence arrives, after it
+verifies and the policy agent decides the peer's trust, and before anything
+about the peer is registered, each plugin is asked in the order plugged, with
+the peer's id, provenance and trust and the bytes the peer announced under that
+plugin's name, if any. The first plugin to refuse makes `register_peer` return
+`PeerConnectionError::Refused` naming it and its reason, and leaves the peer
+unregistered; an accepting websocket server then sends the dialer that reason
+in a `Refused` frame. No connector reads the peer's messages while the plugins are
+asked, so a plugin cannot ask the peer anything: it decides from what the
+handshake carried and from its own node's data. An accepting node's plugins
+decide before the node signs its own presence; a dialing node's decide after
+the accepting node has registered it, so when one refuses, the dialing node
+closes the connection and the accepting node removes its registration as the
+connection ends.
+
 
 ## The Replication Protocol
 
@@ -78,6 +112,18 @@ collected events into causal (oldest-first) order.
 > stale or malicious `known_head` could trigger unbounded event collection.
 > Chunked bridge framing, size limits, and resource governance are tracked in
 > the phase-2 spec (`specs/concurrency/phase-2.md`).
+
+### What a node cannot read
+
+A request, a response and an update each carry their body as length-prefixed
+bytes, so the message, its ids and its addresses decode even when the body is
+of a kind a later build added. A node answers a request whose body it cannot
+read with `NodeResponseBody::Unsupported`, acknowledges such an update with
+`NodeUpdateAckBody::Unsupported`, and fails a request whose response it cannot
+read with `RequestError::UnreadableResponse`. A request its peer answers with
+`Unsupported` fails with `RequestError::UnsupportedByPeer`. A message of a kind
+its protocol version does not define at all closes the connection, and the
+connector logs the kind (`proto::UnreadableFrame::UnknownKind`).
 
 
 ## Subscription Propagation
