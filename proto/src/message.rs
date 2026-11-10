@@ -46,10 +46,8 @@ impl Message {
     /// The message `frame` holds; bytes left over after it make the frame undecodable.
     pub fn decode(frame: &[u8]) -> bincode::Result<Self> { encoding::decode_exact(frame) }
 
-    /// Read a connection's first frame the way every build reads it. Its first twelve bytes, the
-    /// message's variant index and the versions its sender speaks, come first. The rest is read
-    /// only when the sender shares a version with `spoken`, and must hold the challenge and
-    /// nothing after it. A refusal in place of an opening names the versions its sender speaks.
+    /// The opening a connection's first frame holds, read as every build reads one: past its first
+    /// twelve bytes only when the sender shares a version with `spoken` (specs/protocol/bytes.md section 6).
     pub fn read_opening(frame: &[u8], spoken: ProtocolVersions) -> Result<Opening, OpeningError> {
         let word = |at: usize| frame.get(at..at + 4).and_then(|bytes| bytes.try_into().ok()).map(u32::from_le_bytes);
         let (Some(index), Some(lowest), Some(highest)) = (word(0), word(4), word(8)) else {

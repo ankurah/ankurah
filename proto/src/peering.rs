@@ -65,11 +65,6 @@ impl HandshakeChallenge {
 
 /// The first frame each side of a connection sends: the versions its sender speaks, then the
 /// challenge the receiver's presence must answer.
-///
-/// Sent as [`Message::Open`](crate::Message::Open), its first twelve bytes are the message's
-/// variant index and then `versions`. Those bytes keep their place and meaning in every
-/// protocol version, so any build can tell whether it shares a version with the sender before
-/// it reads anything else.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct Opening {
     pub versions: ProtocolVersions,

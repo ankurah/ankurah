@@ -1,9 +1,5 @@
-//! The domain tags: one for each kind of string Ankurah hashes or signs, written first in that
-//! string so that a string made for one purpose can never be taken for another's.
-//!
-//! Every tag is `ankurah.<name>.v1` and enters a string as one length byte followed by its
-//! bytes, so no tag's encoded form is a prefix of another's. A new derivation is a new variant
-//! with a new tag, never a new meaning for an existing one.
+//! The domain tags: each opens one kind of string Ankurah hashes or signs, so a string made for one
+//! purpose is never taken for another's. A new derivation takes a new tag; a tag never changes meaning.
 
 /// The kind of string a hash or a signature covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

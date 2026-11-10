@@ -11,18 +11,13 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// The id of a genesis event: SHA-256 over [`DomainTag::Genesis`], then the
-    /// minter, nonce and timestamp, the operation count and each operation's
-    /// digest. The minter and the memberships carried in the operations are
-    /// part of the entity's identity.
+    /// The id of a genesis event (specs/protocol/bytes.md section 4.2). The minter and the
+    /// memberships its operations carry are part of the entity's identity.
     pub fn from_genesis_parts(minter: &Identity, nonce: &[u8; 32], timestamp: u64, operations: &CarriedOperations) -> Self {
         Self::from_preimage(DomainTag::Genesis, &(minter, nonce, timestamp, operations.digests()))
     }
 
-    /// The id of an update event: SHA-256 over [`DomainTag::Update`], then the
-    /// entity id, nonce and timestamp, the operation count and each operation's
-    /// digest, and the parent clock. Model projections stay outside the
-    /// canonical event and its identity. The nonce is what makes an event id
+    /// The id of an update event (specs/protocol/bytes.md section 4.3). Its nonce makes the id
     /// unguessable to anyone who was not sent the event.
     pub fn from_update_parts(
         entity_id: &EntityId,

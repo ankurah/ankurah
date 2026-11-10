@@ -4,18 +4,8 @@ use std::{fmt, str::FromStr};
 
 use crate::DecodeError;
 
-/// A cryptographic identity: a public verifying key. It names who minted a
-/// genesis and who signed a presence or an attestation. Core records the key
-/// and nothing about what it denotes.
-///
-/// The variant names the signature scheme. Binary encodings write the variant
-/// index before the key bytes, and every genesis hashes its minter, so the
-/// index is part of every entity id: variants append and never reorder.
-///
-/// The text form names the scheme, then the unpadded URL-safe base64 of the
-/// key bytes: `ed25519:` followed by 43 characters. Human-readable serializers
-/// receive the text form; binary serializers receive the variant index, then
-/// the bytes.
+/// A public verifying key, of the signature scheme its variant names: who minted a genesis, or
+/// signed a presence or an attestation. specs/protocol/bytes.md section 3.1 gives its encoding.
 #[derive(PartialEq, Eq, Hash, Clone, Copy, Ord, PartialOrd)]
 pub enum Identity {
     /// An ed25519 verifying key in its 32-byte compressed encoding.
