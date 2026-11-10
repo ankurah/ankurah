@@ -205,6 +205,11 @@ impl Connection {
                     self.disconnect();
                     self.set_state(ConnectionState::Error { message: refusal.to_string(), cause: Some(refusal) });
                 }
+                proto::Message::Refused(reason) => {
+                    error!("Server {} refused this node: {}", self.url, reason);
+                    self.disconnect();
+                    self.set_state(ConnectionState::Refused { url: self.url.clone(), reason });
+                }
                 proto::Message::Presence(server_presence) => {
                     let state = { self.state.read().unwrap().clone() };
                     match state {

@@ -20,6 +20,10 @@ pub enum Message {
     NoCommonVersion(ProtocolVersions),
     Presence(Presence),
     PeerMessage(NodeMessage),
+    /// The accepting side's answer to a dialer's presence in place of its own: it will not
+    /// register the dialer, for the reason given, written for a person to read. The connection
+    /// closes right after.
+    Refused(String),
     // TODO RPC messages
 }
 
@@ -81,6 +85,7 @@ impl std::fmt::Display for Message {
             Message::NoCommonVersion(versions) => write!(f, "NoCommonVersion: speaks {versions}"),
             Message::Presence(presence) => write!(f, "Presence: {}", presence),
             Message::PeerMessage(node_message) => write!(f, "PeerMessage: {}", node_message),
+            Message::Refused(reason) => write!(f, "Refused: {reason}"),
         }
     }
 }
@@ -133,6 +138,7 @@ mod tests {
             (Message::NoCommonVersion(versions), [1, 0, 0, 0]),
             (Message::Presence(presence), [2, 0, 0, 0]),
             (Message::PeerMessage(unsubscribe), [3, 0, 0, 0]),
+            (Message::Refused("not today".into()), [4, 0, 0, 0]),
         ] {
             assert_eq!(message.encode()[..4], index, "{message}");
         }
@@ -165,7 +171,7 @@ mod tests {
         Opening { versions, challenge }
     }
 
-    /// The opening and refusal vectors of specs/protocol/bytes.md section 6: each frame's bytes.
+    /// The vectors of specs/protocol/bytes.md section 6 for an opening and its refusal: each frame's bytes.
     #[test]
     fn the_opening_and_refusal_frames_match_the_byte_specification_vectors() {
         let open = Message::Open(opening(versions(1, 3))).encode();
@@ -184,6 +190,15 @@ mod tests {
 
         let refusal = Message::NoCommonVersion(versions(1, 1)).encode();
         assert_eq!(hex::encode(&refusal), "010000000100000001000000");
+    }
+
+    /// The refusal vector of specs/protocol/bytes.md section 6: an accepting side's answer to a
+    /// presence it will not register.
+    #[test]
+    fn the_refused_frame_matches_the_byte_specification_vector() {
+        let refused = Message::Refused("not today".into()).encode();
+        assert_eq!(hex::encode(&refused), concat!("04000000", "0900000000000000", "6e6f7420746f646179"));
+        assert!(matches!(Message::decode(&refused), Ok(Message::Refused(reason)) if reason == "not today"));
     }
 
     /// A version-1 reader rejects bytes after the challenge, so reaching the refusal below shows

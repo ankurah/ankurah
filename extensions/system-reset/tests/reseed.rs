@@ -114,6 +114,7 @@ async fn connect(transport: Transport, client: &TestNode, server: &Server) -> Re
                     connection.shutdown().await.expect("the websocket client shuts down");
                     Err(error)
                 }
+                Err(ConnectionError::Refused(reason)) => panic!("the server refused the client: {reason}"),
                 Err(ConnectionError::General(error)) => panic!("the websocket connection failed: {error}"),
             }
         }

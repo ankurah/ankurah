@@ -8,6 +8,7 @@ pub enum ConnectionState {
     None,
     Connecting { url: String },
     Connected { url: String, server_presence: proto::Presence },
+    Refused { url: String, reason: String },
     Closed,
     Error { message: String, cause: Option<ankurah_core::connector::PeerConnectionError> },
 }
@@ -32,6 +33,15 @@ impl ConnectionStateEnum {
     pub fn error_message(&self) -> Option<String> {
         match &self.0 {
             ConnectionState::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        }
+    }
+
+    /// The reason the server gave for refusing this node, in the `Refused` state.
+    #[wasm_bindgen(getter)]
+    pub fn refusal_reason(&self) -> Option<String> {
+        match &self.0 {
+            ConnectionState::Refused { reason, .. } => Some(reason.clone()),
             _ => None,
         }
     }
@@ -65,6 +75,7 @@ impl ConnectionStateEnum {
             ConnectionState::None => "None",
             ConnectionState::Connecting { .. } => "Connecting",
             ConnectionState::Connected { .. } => "Connected",
+            ConnectionState::Refused { .. } => "Refused",
             ConnectionState::Closed => "Closed",
             ConnectionState::Error { .. } => "Error",
         }

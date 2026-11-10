@@ -157,7 +157,8 @@ async fn an_opening_sharing_no_version_is_refused_with_the_servers_versions_befo
 }
 
 /// A party between the two sides can change the openings, which nothing signs; the client then
-/// signs the offers it saw, which differ from the ones the server sent or the version it chose.
+/// signs the offers it saw, which differ from the ones the server sent or the version it chose,
+/// and the server answers with its refusal in place of its presence.
 #[tokio::test]
 async fn the_server_refuses_a_presence_that_does_not_repeat_the_offers_and_the_chosen_version() -> Result<()> {
     let (server_node, server_url, server_task) = start_test_server().await?;
@@ -166,7 +167,10 @@ async fn the_server_refuses_a_presence_that_does_not_repeat_the_offers_and_the_c
     for alter in alterations {
         let mut client = RawClient::open(&server_url, SPOKEN).await?;
         client.present(|claims| alter(&mut claims.negotiation)).await?;
-        assert!(receive(&mut client.socket).await.is_none(), "the server closes the connection without presenting");
+        let refusal = PeerConnectionError::OfferMismatch(client.key.node_id()).to_string();
+        let answer = receive(&mut client.socket).await;
+        assert!(matches!(answer, Some(proto::Message::Refused(ref reason)) if *reason == refusal), "the server refuses: {answer:?}");
+        assert!(receive(&mut client.socket).await.is_none(), "then closes");
         assert_eq!(server_node.granted_trust(&client.key.node_id()), None);
     }
     server_task.abort();

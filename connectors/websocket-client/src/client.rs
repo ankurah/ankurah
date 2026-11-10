@@ -90,6 +90,12 @@ pub enum ConnectionState {
         url: String,
         server_presence: proto::Presence,
     },
+    /// The server refused this node, for the reason it gave; the client dials again after its backoff.
+    #[strum(serialize = "Refused")]
+    Refused {
+        url: String,
+        reason: String,
+    },
     #[strum(serialize = "Error")]
     Error(ConnectionError),
 }
@@ -98,6 +104,9 @@ pub enum ConnectionState {
 pub enum ConnectionError {
     #[error("{0}")]
     Peer(#[from] PeerConnectionError),
+    /// The server refused this node, for the reason it gave.
+    #[error("the server refused this node: {0}")]
+    Refused(String),
     #[error("General connection error: {0}")]
     General(String),
 }
@@ -207,12 +216,13 @@ where
         Ok(())
     }
 
-    /// Wait for the client to establish a connection to the server (signal-based)
+    /// Wait for the client to establish a connection to the server (signal-based), or to fail
+    /// to: a refusal by the server is [`ConnectionError::Refused`] with its reason.
     pub async fn wait_connected(&self) -> Result<(), ConnectionError> {
-        // Wait for either Connected or Error state, returning appropriate Result
         self.state()
             .wait_for(|state| match state {
                 ConnectionState::Connected { .. } => Some(Ok(())),
+                ConnectionState::Refused { reason, .. } => Some(Err(ConnectionError::Refused(reason.clone()))),
                 ConnectionState::Error(e) => Some(Err(e.clone())),
                 _ => None, // Continue waiting for Connecting/Disconnected states
             })
@@ -237,19 +247,26 @@ where
             if !inner.run.peek() {
                 break;
             }
-            let error = match result {
+            let state = match result {
+                // The server was registered before the connection closed, so the next dial need not wait long.
                 Ok(()) => {
                     backoff = INITIAL_BACKOFF;
-                    ConnectionError::General("Connection closed".into())
+                    ConnectionState::Error(ConnectionError::General("Connection closed".into()))
                 }
-                Err(error) => error
-                    .downcast_ref::<PeerConnectionError>()
-                    .cloned()
-                    .map(ConnectionError::Peer)
-                    .unwrap_or_else(|| ConnectionError::General(error.to_string())),
+                Err(error) => match error.downcast::<ConnectionError>() {
+                    Ok(ConnectionError::Refused(reason)) => ConnectionState::Refused { url: inner.server_url.clone(), reason },
+                    Ok(error) => ConnectionState::Error(error),
+                    Err(error) => ConnectionState::Error(
+                        error
+                            .downcast_ref::<PeerConnectionError>()
+                            .cloned()
+                            .map(ConnectionError::Peer)
+                            .unwrap_or_else(|| ConnectionError::General(error.to_string())),
+                    ),
+                },
             };
-            error!("Connection to {} failed: {}", inner.server_url, error);
-            inner.connection_state.set(ConnectionState::Error(error));
+            error!("Connection to {} failed: {:?}", inner.server_url, state);
+            inner.connection_state.set(state);
 
             select! {
                 _ = inner.run.wait_value(false) => break,
@@ -269,8 +286,8 @@ where
     /// Attempt a single connection
     async fn connect_once(inner: &Arc<Inner<SE, PA>>) -> Result<()> {
         info!("Attempting to connect to {}", inner.server_url);
-        // Retain the last connection error throughout retries, until admission succeeds.
-        if !matches!(inner.connection_state.value(), ConnectionState::Error(_)) {
+        // Retain the last connection error or refusal throughout retries, until admission succeeds.
+        if !matches!(inner.connection_state.value(), ConnectionState::Error(_) | ConnectionState::Refused { .. }) {
             inner.connection_state.set(ConnectionState::Connecting { url: inner.server_url.clone() });
         }
 
@@ -320,11 +337,15 @@ where
 
         // Cleanup
         inner.connected.store(false, Ordering::Release);
+        let registered = registration.is_some();
         if let Some(registration) = registration {
             inner.node.deregister_peer(registration);
             debug!("Deregistered peer {}", registration.peer());
         }
-        result
+        match result {
+            Ok(()) if !registered => Err(anyhow!("server {} closed the connection before presenting", inner.server_url)),
+            result => result,
+        }
     }
 
     async fn handle_outgoing_message(
@@ -424,6 +445,10 @@ where
             }
             Ok(proto::Message::NoCommonVersion(theirs)) => {
                 Err(PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs }.into())
+            }
+            Ok(proto::Message::Refused(reason)) => {
+                error!("Server {} refused this node: {}", inner.server_url, reason);
+                Err(ConnectionError::Refused(reason).into())
             }
             Ok(proto::Message::Presence(server_presence)) => {
                 match Self::handle_server_presence(inner, server_presence, handshake, registration, outgoing_rx).await {

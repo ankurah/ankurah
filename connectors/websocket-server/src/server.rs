@@ -234,17 +234,11 @@ where
     match node.register_peer(presence, &handshake, PeerProvenance::Inbound, Box::new(sender.clone())).await {
         // Held by the connection from here, so the peer is deregistered however the connection ends.
         Ok(registration) => *state = Connection::Established { sender, registration },
-        Err(refusal) => {
-            warn!("Refusing peer at {client_ip}: {refusal}");
-            return ControlFlow::Break(());
-        }
+        Err(refusal) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
     }
     let answer = match node.presence(&handshake).await {
         Ok(presence) => proto::Message::Presence(presence),
-        Err(error) => {
-            warn!("Closing websocket peer at {client_ip}: this node cannot present to it: {error}");
-            return ControlFlow::Break(());
-        }
+        Err(refusal) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
     };
     // Within the handshake deadline, so a peer that stops reading cannot hold the connection open.
     match tokio::time::timeout_at(handshake_deadline, socket.send(axum::extract::ws::Message::Binary(answer.encode().into()))).await {
@@ -262,6 +256,24 @@ where
             ControlFlow::Break(())
         }
     }
+}
+
+/// Close a connection whose dialer this node will not register, or cannot present to, for
+/// `refusal`. Unless this node itself has halted, it first tells the dialer why, best effort and
+/// within the handshake deadline.
+async fn refuse(
+    socket: &mut Socket,
+    refusal: PeerConnectionError,
+    client_ip: IpAddr,
+    handshake_deadline: tokio::time::Instant,
+) -> ControlFlow<(), ()> {
+    warn!("Refusing peer at {client_ip}: {refusal}");
+    if !matches!(refusal, PeerConnectionError::NodeHalted(_)) {
+        let frame = axum::extract::ws::Message::Binary(proto::Message::Refused(refusal.to_string()).encode().into());
+        // Best effort: the connection closes either way.
+        let _ = tokio::time::timeout_at(handshake_deadline, socket.send(frame)).await;
+    }
+    ControlFlow::Break(())
 }
 
 #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(client_ip = %client_ip)))]
@@ -307,6 +319,10 @@ where
                     }
                     proto::Message::NoCommonVersion(versions) => {
                         warn!("Peer at {client_ip} speaks protocol versions {versions}, none of which this node speaks; closing");
+                        return ControlFlow::Break(());
+                    }
+                    proto::Message::Refused(reason) => {
+                        warn!("Peer at {client_ip} refused this node: {reason}; closing");
                         return ControlFlow::Break(());
                     }
                     proto::Message::Open(_) => {

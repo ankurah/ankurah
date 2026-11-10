@@ -414,7 +414,9 @@ The first twelve bytes of either frame are the variant index, then the lowest
 and the highest version, each a `u32`. Variant 2 is the presence of 3.6, and
 variant 3 carries every message after the handshake. A request, a response or
 an update there carries its body as a byte string, so the message decodes even
-when its body is of a kind the receiver does not know.
+when its body is of a kind the receiver does not know. Variant 4, `Refused`,
+carries a `String`: the reason, written for a person to read, that the
+accepting side will not register the dialer.
 
 A receiver reads the twelve bytes of the peer's first frame before anything
 else in it:
@@ -424,8 +426,8 @@ else in it:
   frame. In version 1 the rest is the challenge and nothing after it. When they
   share none, the receiver does not read the rest: it answers with
   `NoCommonVersion` carrying its own versions, and closes.
-- Index 1, a refusal: the peer speaks the versions it carries. The receiver
-  closes.
+- Index 1, a refusal of the opening: the peer speaks the versions it carries.
+  The receiver closes.
 - Any other index, or fewer than twelve bytes: the receiver closes.
 
 A build that offers version 1 sends exactly the version-1 layout of the
@@ -438,9 +440,13 @@ Once both openings are read, the frames of the handshake follow in this order:
    challenge.
 2. The accepting side checks that presence and registers the dialer, and only
    then sends its own presence, answering the dialer's challenge. An accepting
-   node so signs nothing for a dialer it has not authenticated.
+   node so signs nothing for a dialer it has not authenticated. When it will
+   not register the dialer, or cannot sign its own presence, it sends
+   `Refused` in place of its presence, leaves nothing registered, and closes.
 3. The dialing side checks that presence and registers the accepting side, and
-   only then counts the connection open.
+   only then counts the connection open. On `Refused` it registers nothing,
+   reports the refusal with its reason, and closes; a dialer that dials again
+   keeps backing off, since nothing about it has changed.
 
 Each side sends frames of variant 3 only after its own presence, and the
 dialing side only once it has registered the accepting side. A dialer's
@@ -456,10 +462,16 @@ Vectors. The opening offering versions 1 to 3, with the challenge issued by
 8888888888888888888888888888888888888888888888888888888888888888
 ```
 
-The refusal from a node that speaks versions 1 to 1:
+The refusal of an opening from a node that speaks versions 1 to 1:
 
 ```text
 01000000 01000000 01000000
+```
+
+`Refused` with the reason `not today`:
+
+```text
+04000000 0900000000000000 6e6f7420746f646179
 ```
 
 As in section 5, the line breaks and spaces separate fields.

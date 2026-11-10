@@ -75,10 +75,13 @@ struct AdmissionState {
 impl NodeComms for HeldAdmission {
     fn id(&self) -> proto::NodeId { self.0.key.node_id() }
     fn begin_handshake(&self) -> Handshake { Handshake::new(self.id()) }
+    /// The first presence waits for `release_presence`; any later one, on a later connection, does not.
     async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
-        let release = self.0.release_presence.lock().unwrap().take().unwrap();
+        let release = self.0.release_presence.lock().unwrap().take();
         self.0.presence_started.set(true);
-        release.await.map_err(|_| NodeHaltReason::CatalogLoad("presence cancelled".into()))?;
+        if let Some(release) = release {
+            release.await.map_err(|_| NodeHaltReason::CatalogLoad("presence cancelled".into()))?;
+        }
         Ok(self.0.key.sign_presence(handshake.presence_claims(self.id(), false)?))
     }
     async fn register_peer(
@@ -467,4 +470,52 @@ async fn a_message_of_an_unknown_kind_after_the_handshake_is_ignored() {
     futures::pin_mut!(run);
     let outcome = futures::future::select(run, Box::pin(sleep(Duration::from_secs(5)))).await;
     assert!(matches!(outcome, futures::future::Either::Left(_)), "the connection did not keep working within five seconds");
+}
+
+/// A server's refusal in place of its presence: the client reports it with the server's reason,
+/// never counts itself connected, closes, and waits longer before each dial that follows.
+#[wasm_bindgen_test]
+async fn a_refusal_is_reported_with_its_reason_and_the_client_waits_longer_before_each_dial() {
+    mock_websockets();
+    let _restore = RestoreWebSockets;
+    let run = async {
+        let (node, client) = admitting_client();
+        let handle = WebsocketClient { inner: client.clone() };
+        let connected = Arc::new(AtomicUsize::new(0));
+        let state = client.state.read();
+        let _listener = state.listen(Arc::new({
+            let (state, connected) = (state.clone(), connected.clone());
+            move |_| {
+                if matches!(state.value(), ConnectionState::Connected { .. }) {
+                    connected.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+        let first = socket_count();
+        client.connect().unwrap();
+        let server = NodeKey::from_seed([2; 32]);
+        for (socket, delay) in [(first, 500), (first + 1, 1000)] {
+            while socket_count() <= socket {
+                sleep(Duration::from_millis(10)).await;
+            }
+            deliver(socket, &server_handshake(&server).0);
+            // The client opens, then presents.
+            while sent_count(socket) < 2 {
+                sleep(Duration::ZERO).await;
+            }
+            deliver(socket, &proto::Message::Refused("not today".into()).encode());
+            // A refusal stays visible while the client retries, so wait for this connection to close.
+            while !is_closed(socket) {
+                sleep(Duration::ZERO).await;
+            }
+            assert!(matches!(client.state.value(), ConnectionState::Refused { reason, .. } if reason == "not today"));
+            assert_eq!(*client.reconnect_delay.borrow(), delay, "the client waits longer before each dial");
+        }
+        assert_eq!(connected.load(Ordering::Relaxed), 0, "the client never counted itself connected");
+        assert!(!node.0.published.value(), "the client registered nothing");
+        assert_eq!(handle.ready().await, Err("the server refused this node: not today".to_string()));
+    };
+    futures::pin_mut!(run);
+    let outcome = futures::future::select(run, Box::pin(sleep(Duration::from_secs(5)))).await;
+    assert!(matches!(outcome, futures::future::Either::Left(_)), "the refusals were not reported within five seconds");
 }

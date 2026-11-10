@@ -617,14 +617,18 @@ macro_rules! clock_eq {
 /// Start a test websocket server and return the server node, URL, and task handle
 #[allow(unused)]
 pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, PermissiveAgent>, String, tokio::task::JoinHandle<()>)> {
+    let server_node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    server_node.wait_ready().await?;
+    let (server_url, server_task) = serve(server_node.clone()).await?;
+    Ok((server_node, server_url, server_task))
+}
+
+/// Serve websocket clients from `server_node` on a free local port, returning its URL and the serving task.
+#[allow(unused)]
+pub async fn serve(server_node: Node<SledStorageEngine, PermissiveAgent>) -> anyhow::Result<(String, tokio::task::JoinHandle<()>)> {
     use ankurah_websocket_server::WebsocketServer;
     use rand::Rng;
     use tracing::info;
-
-    // Create and initialize server node
-    let server_storage = Arc::new(SledStorageEngine::new_test()?);
-    let server_node = Node::new_durable(server_storage, PermissiveAgent::new());
-    server_node.wait_ready().await?;
 
     let mut rng = rand::thread_rng();
 
@@ -680,7 +684,7 @@ pub async fn start_test_server() -> anyhow::Result<(Node<SledStorageEngine, Perm
         // Server task is still running, which means TcpListener::bind() succeeded
         // The server is now listening and ready for connections
         info!("Successfully started websocket server on {} (attempt {})", server_url, attempt + 1);
-        return Ok((server_node, server_url, server_task));
+        return Ok((server_url, server_task));
     }
 
     Err(anyhow::anyhow!("Failed to start test server after {} attempts. Last error: {:?}", MAX_PORT_RETRIES, last_error))

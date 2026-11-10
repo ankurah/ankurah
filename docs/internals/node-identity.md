@@ -53,7 +53,11 @@ registers the dialer on that presence, and only then signs its own presence,
 answering the dialer's challenge, and sends it. The dialing side registers the
 accepting side on that presence, and only then counts itself connected. So an
 accepting node signs nothing, and runs no plugin's announcement, for a dialer
-it has not authenticated and registered.
+it has not authenticated and registered. An accepting node that will not
+register the dialer, or cannot sign its own presence, sends `Refused` with a
+reason a person can read in place of its presence, and closes; a websocket
+client reports that as a refused connection state carrying the reason, and
+keeps backing off before it dials again.
 
 A node ignores a feature number it does not know, and an announcement under a
 name none of its plugins has; each of its plugins receives the announcement
