@@ -76,44 +76,6 @@ pub struct Opening {
     pub challenge: HandshakeChallenge,
 }
 
-/// Why a connection's first frame opens no connection this build can take.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum OpeningError {
-    /// The sender speaks only versions the reader does not; the rest of the frame was not read.
-    #[error("the peer speaks protocol versions {0}, none of which this node speaks")]
-    NoCommonVersion(ProtocolVersions),
-    /// Neither an opening nor a refusal, or an opening whose challenge does not decode.
-    #[error("not an opening frame this build can read: {0}")]
-    Undecodable(String),
-}
-
-// The variant indices of `Message::Open` and `Message::NoCommonVersion`, which open their frames
-// in every protocol version; message.rs pins them.
-const OPEN_INDEX: u32 = 0;
-const NO_COMMON_VERSION_INDEX: u32 = 1;
-
-impl Opening {
-    /// Read a connection's first frame the way every build reads it. Its first twelve bytes, the
-    /// message's variant index and the versions its sender speaks, come first. The rest is read
-    /// only when the sender shares a version with `spoken`, and must hold the challenge and
-    /// nothing after it. A refusal in place of an opening names the versions its sender speaks.
-    pub fn read(frame: &[u8], spoken: ProtocolVersions) -> Result<Self, OpeningError> {
-        let word = |at: usize| frame.get(at..at + 4).and_then(|bytes| bytes.try_into().ok()).map(u32::from_le_bytes);
-        let (Some(index), Some(lowest), Some(highest)) = (word(0), word(4), word(8)) else {
-            return Err(OpeningError::Undecodable(format!("a frame of {} bytes", frame.len())));
-        };
-        let versions = ProtocolVersions { lowest, highest };
-        match index {
-            OPEN_INDEX if spoken.highest_shared(versions).is_some() => {
-                let challenge = encoding::decode_exact(&frame[12..]).map_err(|error| OpeningError::Undecodable(error.to_string()))?;
-                Ok(Self { versions, challenge })
-            }
-            OPEN_INDEX | NO_COMMON_VERSION_INDEX => Err(OpeningError::NoCommonVersion(versions)),
-            other => Err(OpeningError::Undecodable(format!("a message of kind {other} where an opening belongs"))),
-        }
-    }
-}
-
 /// The version negotiation of one connection as one side saw it: the versions it offered, the
 /// versions it saw the peer offer, and the version it chose from the two.
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -295,59 +257,5 @@ mod tests {
         assert_eq!(versions(1, 1).highest_shared(versions(2, 3)), None);
         assert_eq!(versions(2, 3).highest_shared(versions(1, 1)), None);
         assert_eq!(versions(1, 5).highest_shared(versions(4, 3)), None, "an offer whose lowest exceeds its highest includes nothing");
-    }
-
-    fn opening(versions: ProtocolVersions) -> Opening {
-        Opening { versions, challenge: HandshakeChallenge { issuer: Identity::Ed25519([0x77; 32]).into(), nonce: [0x88; 32] } }
-    }
-
-    /// The opening and refusal vectors of specs/protocol/bytes.md section 6: each frame's bytes.
-    #[test]
-    fn the_opening_and_refusal_frames_match_the_byte_specification_vectors() {
-        let open = encode(&Message::Open(opening(versions(1, 3))));
-        assert_eq!(
-            hex::encode(&open),
-            concat!(
-                "00000000",
-                "01000000",
-                "03000000",
-                "00000000",
-                "7777777777777777777777777777777777777777777777777777777777777777",
-                "8888888888888888888888888888888888888888888888888888888888888888",
-            )
-        );
-        assert_eq!(Opening::read(&open, ProtocolVersions::SPOKEN), Ok(opening(versions(1, 3))));
-
-        let refusal = encode(&Message::NoCommonVersion(versions(1, 1)));
-        assert_eq!(hex::encode(&refusal), "010000000100000001000000");
-    }
-
-    /// A version-1 reader rejects bytes after the challenge, so reaching the refusal below shows
-    /// the rest of the frame was never read.
-    #[test]
-    fn an_opening_sharing_no_version_is_refused_before_the_rest_is_read() {
-        let mut frame = encode(&Message::Open(opening(versions(2, 3))));
-        frame.extend_from_slice(b"bytes a version-1 reader rejects");
-        assert_eq!(Opening::read(&frame, versions(1, 1)), Err(OpeningError::NoCommonVersion(versions(2, 3))));
-
-        let mut shared = encode(&Message::Open(opening(versions(1, 3))));
-        shared.extend_from_slice(b"bytes a version-1 reader rejects");
-        assert!(matches!(Opening::read(&shared, versions(1, 1)), Err(OpeningError::Undecodable(_))), "shared versions read the rest");
-    }
-
-    #[test]
-    fn a_refusal_in_place_of_an_opening_names_the_versions_its_sender_speaks() {
-        let refusal = encode(&Message::NoCommonVersion(versions(4, 6)));
-        assert_eq!(Opening::read(&refusal, versions(1, 1)), Err(OpeningError::NoCommonVersion(versions(4, 6))));
-    }
-
-    #[test]
-    fn a_frame_that_opens_with_neither_an_opening_nor_a_refusal_is_undecodable() {
-        let open = encode(&Message::Open(opening(versions(1, 1))));
-        let mut other_kind = open.clone();
-        other_kind[0] = 2;
-        for frame in [&open[..11], &open[..40], &other_kind[..], &open[..0]] {
-            assert!(matches!(Opening::read(frame, versions(1, 1)), Err(OpeningError::Undecodable(_))), "{frame:?}");
-        }
     }
 }

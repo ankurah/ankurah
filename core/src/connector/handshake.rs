@@ -33,9 +33,9 @@ impl Handshake {
     /// Whether the peer's opening has been received.
     pub fn opened(&self) -> bool { self.peer.is_some() }
 
-    /// Read the peer's first frame as its opening, as [`proto::Opening::read`] reads it.
+    /// Read the peer's first frame as its opening, as [`proto::Message::read_opening`] reads it.
     pub fn read_opening(&mut self, frame: &[u8]) -> Result<(), PeerConnectionError> {
-        let opening = proto::Opening::read(frame, self.ours.versions).map_err(|error| match error {
+        let opening = proto::Message::read_opening(frame, self.ours.versions).map_err(|error| match error {
             proto::OpeningError::NoCommonVersion(theirs) => PeerConnectionError::NoCommonVersion { ours: self.ours.versions, theirs },
             proto::OpeningError::Undecodable(reason) => PeerConnectionError::UnreadableOpening(reason),
         })?;
