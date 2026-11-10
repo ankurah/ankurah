@@ -33,13 +33,25 @@ impl<'a> From<&'a ModelStructDescriptor> for ComponentNames<'a> {
     fn from(schema: &'a ModelStructDescriptor) -> Self { Self { name: schema.name, label: schema.label } }
 }
 
-/// Which of `members` a `Component::` qualifier names: the one with that display name, else the one with that label.
-fn member_named<'a>(members: impl IntoIterator<Item = Option<ComponentNames<'a>>>, qualifier: &str) -> Option<usize> {
+/// Which of `members` a `Component::` qualifier names: the one with that display name, else the one with that
+/// label. A display name that two different components share names neither.
+fn member_named<'a>(
+    members: impl IntoIterator<Item = Option<ComponentNames<'a>>>,
+    qualifier: &str,
+) -> Result<Option<usize>, ComponentScopeError> {
     let members: Vec<_> = members.into_iter().collect();
-    members
-        .iter()
-        .position(|names| names.is_some_and(|names| names.name == qualifier))
-        .or_else(|| members.iter().position(|names| names.is_some_and(|names| names.label == qualifier)))
+    let mut by_name = members.iter().enumerate().filter_map(|(index, names)| Some((index, names.filter(|names| names.name == qualifier)?)));
+    if let Some((index, first)) = by_name.next() {
+        if let Some((_, second)) = by_name.find(|(_, other)| other.label != first.label) {
+            return Err(ComponentScopeError::AmbiguousQualifier {
+                qualifier: qualifier.to_owned(),
+                first: first.label.to_owned(),
+                second: second.label.to_owned(),
+            });
+        }
+        return Ok(Some(index));
+    }
+    Ok(members.iter().position(|names| names.is_some_and(|names| names.label == qualifier)))
 }
 
 /// A property name that a query's components cannot place on exactly one property.
@@ -47,9 +59,18 @@ fn member_named<'a>(members: impl IntoIterator<Item = Option<ComponentNames<'a>>
 pub enum ComponentScopeError {
     /// A bare name two of the query's components declare as different properties.
     #[error(
-        "'{name}' names different properties in components '{first}' and '{second}'; qualify it as {first}::{name} or {second}::{name}"
+        "'{name}' names different properties in components '{first}' and '{second}'; qualify it as {}::{name} or {}::{name}",
+        qualifier_spelling(.first),
+        qualifier_spelling(.second)
     )]
     Ambiguous { name: String, first: String, second: String },
+    /// A display name two different components of the query share; only their labels tell them apart.
+    #[error(
+        "'{qualifier}' is the display name of components '{first}' and '{second}'; qualify by label, as {}:: or {}::",
+        qualifier_spelling(.first),
+        qualifier_spelling(.second)
+    )]
+    AmbiguousQualifier { qualifier: String, first: String, second: String },
     /// A qualifier naming neither a component of the query by display name nor any component by label.
     #[error("unknown component '{0}': a qualifier names one of the query's components by name, or any component by its label")]
     UnknownComponent(String),
@@ -60,6 +81,17 @@ pub enum ComponentScopeError {
     /// A name that none of these components declares.
     #[error("no property '{name}' in {}", describe_components(.components))]
     Undeclared { name: String, components: Vec<String> },
+}
+
+/// How a qualifier writes `name`: bare when the grammar reads it as one identifier, double-quoted otherwise.
+fn qualifier_spelling(name: &str) -> String {
+    let plain = name.chars().next().is_some_and(|first| !first.is_ascii_digit())
+        && name.chars().all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-');
+    if plain {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
 }
 
 fn describe_components(components: &[String]) -> String {
@@ -92,7 +124,7 @@ pub(super) fn locate_property<'p, R: ModelResolver + ?Sized>(
         return Err(undeclared(components, ""));
     };
     if let Some(qualifier) = &path.component {
-        let model = match member_named(components.iter().map(|component| component.names), qualifier) {
+        let model = match member_named(components.iter().map(|component| component.names), qualifier)? {
             Some(index) => components[index].model,
             None => resolver.resolve_model(qualifier)?.ok_or_else(|| ComponentScopeError::UnknownComponent(qualifier.clone()))?,
         };
@@ -112,12 +144,12 @@ pub(super) fn locate_property<'p, R: ModelResolver + ?Sized>(
         match found {
             None => found = Some((component, property)),
             Some((earlier, earlier_property)) if earlier_property.id != property.id => {
-                return Err(ComponentScopeError::Ambiguous {
-                    name: first.clone(),
-                    first: earlier.describe(),
-                    second: component.describe(),
-                }
-                .into());
+                // Components that share a display name are told apart by label.
+                let (first_component, second_component) = match (earlier.names, component.names) {
+                    (Some(earlier), Some(later)) if earlier.name == later.name => (earlier.label.to_owned(), later.label.to_owned()),
+                    _ => (earlier.describe(), component.describe()),
+                };
+                return Err(ComponentScopeError::Ambiguous { name: first.clone(), first: first_component, second: second_component }.into());
             }
             Some(_) => {}
         }
@@ -133,7 +165,7 @@ pub(super) fn locate_sort_key<'p, R: ModelResolver + ?Sized>(
     path: &'p PathExpr,
 ) -> Result<LocatedProperty<'p>, ModelResolutionError> {
     if let Some(qualifier) = &path.component {
-        let in_query = member_named(components.iter().map(|component| component.names), qualifier).is_some()
+        let in_query = member_named(components.iter().map(|component| component.names), qualifier)?.is_some()
             || resolver.resolve_model(qualifier)?.is_some_and(|model| components.iter().any(|component| component.model == model));
         if !in_query {
             let name = path.steps.first().cloned().unwrap_or_default();
@@ -180,7 +212,7 @@ pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selec
     let check = |path: &PathExpr, sort_key: bool| -> Result<(), RetrievalError> {
         let Some((first, rest)) = path.steps.split_first() else { return Ok(()) };
         if let Some(qualifier) = &path.component {
-            return match member_named(members.iter().copied().map(Some), qualifier) {
+            return match member_named(members.iter().copied().map(Some), qualifier)? {
                 Some(index) if !declares(schemas[index], first) => {
                     Err(ComponentScopeError::Undeclared { name: first.clone(), components: vec![qualifier.clone()] }.into())
                 }
@@ -345,6 +377,37 @@ mod tests {
         let unknown = locate(&[task(), assignment()], &path(Some("Closure"), &["closed_at"])).unwrap_err();
         assert!(
             matches!(unknown, ModelResolutionError::ComponentScope(ComponentScopeError::UnknownComponent(found)) if found == "Closure")
+        );
+    }
+
+    #[test]
+    fn two_components_with_one_display_name_are_told_apart_by_label() {
+        let components = [task(), component(4, "Task", "other.task")];
+        let qualified = locate(&components, &path(Some("Task"), &["note"])).unwrap_err();
+        let expected =
+            ComponentScopeError::AmbiguousQualifier { qualifier: "Task".into(), first: "task".into(), second: "other.task".into() };
+        assert!(matches!(qualified, ModelResolutionError::ComponentScope(ref found) if *found == expected));
+        assert_eq!(
+            qualified.to_string(),
+            "'Task' is the display name of components 'task' and 'other.task'; qualify by label, as task:: or \"other.task\"::"
+        );
+        assert_eq!(locate(&components, &path(Some("task"), &["note"])).unwrap(), (model(1), property(11)));
+    }
+
+    #[test]
+    fn a_bare_name_ambiguous_between_components_with_one_display_name_names_their_labels() {
+        struct Shadowed;
+        impl ModelResolver for Shadowed {
+            fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
+                let ModelId::EntityId(model) = model else { return Ok(None) };
+                Ok((name == "note").then(|| ResolvedProperty { id: property(model.to_bytes()[0]), value_type: ValueType::String }))
+            }
+        }
+        let components = [task(), component(4, "Task", "other.task")];
+        let error = locate_property(&components, &Shadowed, &path(None, &["note"])).map(|_| ()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "'note' names different properties in components 'task' and 'other.task'; qualify it as task::note or \"other.task\"::note"
         );
     }
 
