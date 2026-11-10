@@ -90,12 +90,14 @@ fn fixture_prop(name: &str) -> PropertyId {
     PropertyId::EntityId(ankurah::proto::EntityId::from_bytes(bytes))
 }
 
-/// Bind a case query's names to the fixture identities: every fixture field
-/// is the Json-typed `data` property.
+/// Bind a case query's names to the fixture identities: `nickname` is the String-typed optional property,
+/// and every other name is the Json-typed `data` property.
 struct FixtureResolver;
 impl ModelResolver for FixtureResolver {
     fn resolve_property(&self, _model: &ankurah::proto::ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
-        Ok(Some(ResolvedProperty { id: fixture_prop(name), value_type: ankurah::core::value::ValueType::Json }))
+        use ankurah::core::value::ValueType;
+        let value_type = if name == "nickname" { ValueType::String } else { ValueType::Json };
+        Ok(Some(ResolvedProperty { id: fixture_prop(name), value_type }))
     }
 }
 
