@@ -1,8 +1,10 @@
 use std::{panic, sync::Arc};
 
 use ankurah::core::context::Context;
+use ankurah::error::{NodeHaltReason, NodeReadinessError};
 use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
 pub use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
+use ankurah_system_reset::{OnReseed, SystemReset};
 pub use ankurah_websocket_client_wasm::WebsocketClient;
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
@@ -31,10 +33,23 @@ pub async fn start() -> Result<(), JsValue> {
     );
     panic::set_hook(Box::new(console_error_panic_hook::hook));
 
-    let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
-    let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797").map_err(|e| JsValue::from_str(&e.to_string()))?;
-    node.wait_ready().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let storage_engine =
+        Arc::new(IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?);
+    let (node, connector) = loop {
+        let node = Node::builder(storage_engine.clone(), PermissiveAgent::new())
+            .plug(SystemReset::<System, _>::new(OnReseed::Reset, c))
+            .build()
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797").map_err(|e| JsValue::from_str(&e.to_string()))?;
+        match node.wait_ready().await {
+            // The server was seeded again: wait for the wipe the plugin began, then start over on the wiped store.
+            Err(NodeReadinessError::Halted(NodeHaltReason::Reset)) => node.reset().await.map_err(|e| JsValue::from_str(&e.to_string()))?,
+            ready => {
+                ready.map_err(|e| JsValue::from_str(&e.to_string()))?;
+                break (node, connector);
+            }
+        }
+    };
     if let Err(_) = NODE.set(node) {
         error!("Failed to set node");
     }

@@ -45,10 +45,12 @@ opening.
 Each side then answers the other's challenge with a signed `Presence`: its
 `NodeId`, whether it claims to be durable, the challenge it answers, an
 advisory timestamp, the versions it offered, the versions it saw its peer
-offer and the version it chose, the feature numbers it has, and its plugins'
-announcements, all signed under the tag `ankurah.presence.v1`. A node ignores
-a feature number or an announcement name it does not know; this build assigns
-no feature numbers. Connectors hold each connection's side of the handshake
+offer and the version it chose, the feature numbers it has, and the bytes
+each of its [plugins](node-architecture.md#node-plugins) announces under the
+plugin's name, all signed under the tag `ankurah.presence.v1`. A node ignores
+a feature number it does not know, and an announcement under a name none of
+its plugins has; each of its plugins receives the announcement under its own
+name. This build assigns no feature numbers. Connectors hold each connection's side of the handshake
 in a `Handshake`, and `register_peer` spends it: it accepts the presence only
 if it answers the single-use challenge this node issued for that connection,
 its signature verifies under the key it names, it does not name this node
@@ -165,11 +167,33 @@ with its own.
 `Node::reset` halts the node with `NodeHaltReason::Reset` and then wipes its
 storage through `StorageEngine::delete_all`; the wipe finishes even if the
 caller stops waiting. The host then discards the halted node with its contexts
-and live queries, and builds a fresh node on the wiped store.
+and live queries, and builds a fresh node on the wiped store. Wipes of one node
+run one at a time, so a host that finds its node halted by a reset it did not
+await, such as a plugin's, calls `Node::reset` itself to wait for that wipe
+before it builds the fresh node.
 
 Core never decides when to reset. A node in a client role that should discard
 stale data after a development reseed does so because the application, from
-its own data, decides it should: for example, a client that remembers the id
-of the application's own system entity and sees a different one. The role is
-the application's, and a production node that moves between durable nodes
-has no reason to reset at all.
+its own data, decides it should. The role is the application's, and a
+production node that moves between durable nodes has no reason to reset at
+all.
+
+### Resetting After a Development Reseed
+
+The `ankurah-system-reset` crate makes that decision as a node plugin. The
+application designates one of its models as its System model, its server
+creates one entity of that model for each seeding of its data (the example
+server creates one when it starts on an empty store), and the server and its
+clients plug `SystemReset` over that model. The plugin announces the ids of the
+System entities its node holds. When a peer trusted as durable announces some,
+the node holds some, and the two share none, the peer holds another seeding:
+the plugin refuses the peer, after resetting the node if the application built
+the plugin with `OnReseed::Reset` (`OnReseed::Refuse` only refuses). Either
+side holding none is no verdict. An ephemeral node that registers a durable
+peer comes to hold the System entities the peer announced, so its first
+connection leaves it holding the seeding later connections are compared with.
+
+A websocket client stops when its node halts, so after a reset it reports
+`NodeHalted(Reset)` rather than the plugin's refusal; the host reacts to that
+halt as described above. The example bindings do so at start-up: they reset
+the halted node to wait for its wipe and start a fresh one on the store.

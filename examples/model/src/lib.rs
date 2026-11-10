@@ -8,6 +8,13 @@ pub struct Flags {
     pub value: bool,
 }
 
+/// One seeding of the example's data. The server creates one when it starts on an empty store,
+/// and the browser's node resets when the server it returns to holds another (`ankurah-system-reset`).
+#[derive(Model, Debug, Serialize, Deserialize)]
+pub struct System {
+    pub seeded_at: String,
+}
+
 use ankurah::Property;
 #[cfg(feature = "wasm")]
 use tsify::Tsify;

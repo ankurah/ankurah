@@ -279,6 +279,7 @@ version = "0.10.0"
 dependencies = [
  "ankurah",
  "ankurah-storage-sled",
+ "ankurah-system-reset",
  "ankurah-websocket-server",
  "anyhow",
  "chrono",
@@ -1884,6 +1885,7 @@ dependencies = [
  "ankurah",
  "ankurah-signals",
  "ankurah-storage-indexeddb-wasm",
+ "ankurah-system-reset",
  "ankurah-websocket-client-wasm",
  "console_error_panic_hook",
  "example-model",
