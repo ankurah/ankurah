@@ -1,4 +1,4 @@
-//! The peers registered with one node.
+//! The peers registered with one node, and what the node asks of the durable ones.
 
 pub(crate) mod durable_peer;
 pub(super) mod peer_state;
