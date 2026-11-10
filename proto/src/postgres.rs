@@ -64,7 +64,7 @@ impl ToSql for EventBody {
         if ty.name() != "bytea" {
             return Err("expected bytea type".into());
         }
-        out.put_slice(&encoding::encode(self));
+        out.put_slice(&self.encode());
         Ok(IsNull::No)
     }
 
@@ -84,8 +84,7 @@ impl<'a> FromSql<'a> for EventBody {
         if ty.name() != "bytea" {
             return Err("expected bytea type".into());
         }
-        let body: EventBody = encoding::decode_exact(raw).map_err(|_| DecodeError::InvalidFormat)?;
-        Ok(body)
+        Ok(EventBody::decode(raw).map_err(|_| DecodeError::InvalidFormat)?)
     }
 
     fn accepts(ty: &Type) -> bool {

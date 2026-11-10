@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     attestation::{AttestationSet, Attested},
     clock::Clock,
+    encoding,
     event_id::EventId,
     id::EntityId,
     identity::Identity,
@@ -59,6 +60,14 @@ pub enum EventBody {
         timestamp: u64,
         operations: CarriedOperations,
     },
+}
+
+impl EventBody {
+    /// The bytes a store keeps for this body.
+    pub fn encode(&self) -> Vec<u8> { encoding::encode(self) }
+
+    /// The body `bytes` hold; bytes left over after it make them undecodable.
+    pub fn decode(bytes: &[u8]) -> bincode::Result<Self> { encoding::decode_exact(bytes) }
 }
 
 /// Invalid event structure or a generation claim contradicted by known history.

@@ -137,6 +137,12 @@ impl std::ops::Deref for AttestationSet {
 
 impl AttestationSet {
     pub fn push(&mut self, attestation: SealedAttestation) { self.0.push(attestation); }
+
+    /// The bytes a store keeps for this set: each attestation's bytes, unchanged.
+    pub fn encode(&self) -> Vec<u8> { encoding::encode(self) }
+
+    /// The set `bytes` hold; bytes left over after it make them undecodable.
+    pub fn decode(bytes: &[u8]) -> bincode::Result<Self> { encoding::decode_exact(bytes) }
 }
 
 impl<T> AsRef<T> for Attested<T> {
@@ -170,6 +176,12 @@ impl Attested<Event> {
     pub fn from_parts(entity_id: EntityId, frag: EventFragment) -> Self {
         Self { payload: Event { entity_id, body: frag.body, parent: frag.parent }, attestations: frag.attestations }
     }
+
+    /// The bytes a store keeps for this event and its attestations.
+    pub fn encode(&self) -> Vec<u8> { encoding::encode(self) }
+
+    /// The event and attestations `bytes` hold; bytes left over after them make them undecodable.
+    pub fn decode(bytes: &[u8]) -> bincode::Result<Self> { encoding::decode_exact(bytes) }
 }
 
 #[cfg(test)]

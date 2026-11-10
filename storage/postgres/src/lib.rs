@@ -606,10 +606,10 @@ async fn load_states(client: &tokio_postgres::Transaction<'_>, ids: &[EntityId])
 fn event_from_row(row: tokio_postgres::Row) -> Result<Attested<Event>, RetrievalError> {
     let entity_id: EntityId = row.try_get("entity_id").map_err(RetrievalError::storage)?;
     let body_bytes: Vec<u8> = row.try_get("body").map_err(RetrievalError::storage)?;
-    let body: EventBody = bincode::deserialize(&body_bytes).map_err(RetrievalError::storage)?;
+    let body = EventBody::decode(&body_bytes).map_err(RetrievalError::storage)?;
     let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
     let attestations_bytes: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-    let attestations: AttestationSet = bincode::deserialize(&attestations_bytes).map_err(RetrievalError::storage)?;
+    let attestations = AttestationSet::decode(&attestations_bytes).map_err(RetrievalError::storage)?;
     Ok(Attested { payload: Event { entity_id, body, parent }, attestations })
 }
 

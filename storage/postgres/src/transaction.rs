@@ -25,17 +25,15 @@ pub(super) struct EventRow {
     attestations: Vec<u8>,
 }
 
-pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<EventRow>, MutationError> {
+pub(super) fn encode_events(events: &[Attested<Event>]) -> Vec<EventRow> {
     events
         .iter()
-        .map(|event| {
-            Ok(EventRow {
-                id: event.payload.id(),
-                entity_id: event.payload.entity_id,
-                body: bincode::serialize(&event.payload.body)?,
-                parent: event.payload.parent.clone(),
-                attestations: bincode::serialize(&event.attestations)?,
-            })
+        .map(|event| EventRow {
+            id: event.payload.id(),
+            entity_id: event.payload.entity_id,
+            body: event.payload.body.encode(),
+            parent: event.payload.parent.clone(),
+            attestations: event.attestations.encode(),
         })
         .collect()
 }
@@ -63,7 +61,7 @@ impl<'a> PostgresTransaction<'a> {
 #[async_trait]
 impl StorageTransaction for PostgresTransaction<'_> {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError> {
-        self.events.extend(encode_events(events)?);
+        self.events.extend(encode_events(events));
         Ok(())
     }
 

@@ -100,9 +100,9 @@ fn event_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
         let stored_id: String = row.get(0)?;
         let declared_id = EventId::from_base64(&stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let entity_id = EntityId::from_base64(row.get::<_, String>(1)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
-        let body = bincode::deserialize::<EventBody>(&row.get::<_, Vec<u8>>(2)?)?;
+        let body = EventBody::decode(&row.get::<_, Vec<u8>>(2)?)?;
         let parent = serde_json::from_str::<Clock>(&row.get::<_, String>(3)?)?;
-        let attestations = bincode::deserialize::<AttestationSet>(&row.get::<_, Vec<u8>>(4)?)?;
+        let attestations = AttestationSet::decode(&row.get::<_, Vec<u8>>(4)?)?;
         let event = Attested { payload: Event { entity_id, body, parent }, attestations };
         if event.payload.id() != declared_id {
             return Err(SqliteError::Dump(format!("stored event id does not match payload for {declared_id}")));
@@ -140,7 +140,7 @@ fn state_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
         let entity_id = EntityId::from_base64(&stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let state_buffers = bincode::deserialize::<StateBuffers>(&row.get::<_, Vec<u8>>(1)?)?;
         let head = serde_json::from_str::<Clock>(&row.get::<_, String>(2)?)?;
-        let attestations = bincode::deserialize::<AttestationSet>(&row.get::<_, Vec<u8>>(3)?)?;
+        let attestations = AttestationSet::decode(&row.get::<_, Vec<u8>>(3)?)?;
         let mut memberships = std::collections::BTreeSet::new();
         let mut membership_statement =
             conn.prepare(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ? ORDER BY "model_key""#))?;

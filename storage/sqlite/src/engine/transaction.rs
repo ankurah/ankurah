@@ -33,9 +33,9 @@ pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<EventRow>,
             Ok(EventRow {
                 id: event.payload.id().to_base64(),
                 entity_id: event.payload.entity_id.to_base64(),
-                body: bincode::serialize(&event.payload.body)?,
+                body: event.payload.body.encode(),
                 parent: serde_json::to_string(&event.payload.parent)?,
-                attestations: bincode::serialize(&event.attestations)?,
+                attestations: event.attestations.encode(),
             })
         })
         .collect()
@@ -89,7 +89,7 @@ impl StorageTransaction for SqliteTransaction<'_> {
             head: state.payload.state.head.clone(),
             memberships: state.payload.state.memberships.clone(),
             state_buffers: bincode::serialize(&state.payload.state.state_buffers)?,
-            attestations: bincode::serialize(&state.attestations)?,
+            attestations: state.attestations.encode(),
             materializations,
         };
         if let Some(index) = index {

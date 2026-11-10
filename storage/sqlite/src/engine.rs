@@ -14,7 +14,7 @@ use ankurah_core::schema::CatalogResolver;
 use ankurah_core::storage::{
     CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction, StoreFormatError,
 };
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers};
+use ankurah_proto::{AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers};
 use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, Connection, OptionalExtension, TransactionBehavior};
@@ -484,7 +484,7 @@ fn decode_state_row(
                 head: serde_json::from_str(&head)?,
             },
         },
-        attestations: bincode::deserialize(&attestations)?,
+        attestations: AttestationSet::decode(&attestations)?,
     })
 }
 
@@ -535,10 +535,10 @@ fn decode_event_row((entity_id, body, parent, attestations): RawEventRow) -> Res
     Ok(Attested {
         payload: Event {
             entity_id,
-            body: bincode::deserialize::<EventBody>(&body).map_err(RetrievalError::storage)?,
+            body: EventBody::decode(&body).map_err(RetrievalError::storage)?,
             parent: serde_json::from_str(&parent).map_err(RetrievalError::storage)?,
         },
-        attestations: bincode::deserialize(&attestations).map_err(RetrievalError::storage)?,
+        attestations: AttestationSet::decode(&attestations).map_err(RetrievalError::storage)?,
     })
 }
 
