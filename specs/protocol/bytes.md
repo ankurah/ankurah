@@ -27,6 +27,12 @@ crate.
 Variant indices count from 0 in declaration order. A variant is only ever
 appended; an index never changes meaning.
 
+A reader refuses a clock whose entries are out of order (3.2). A reader of any
+other map or set accepts its entries in any order, holds them in ascending key
+order and keeps the last of a repeated key. The state digest (4.4) and the
+presence signature (4.5) are taken over the reader's own encoding of what it
+holds, never over the bytes it received.
+
 ## 2. Domain tags
 
 Every hashed or signed string opens with a domain tag naming what the string
@@ -65,6 +71,11 @@ string it signs.
 The entry count as a `u64`, then each entry in ascending order of its event id
 (compared as bytes): the generation as a `u32`, then the `EventId`. No two
 entries share an event id, and no generation is 0.
+
+A reader refuses a clock whose entries are not in strictly ascending order of
+event id, which also refuses an event id given twice, and one with a generation
+of 0. An update's id covers its parent clock (4.3), so a clock has exactly one
+encoding.
 
 ### 3.3 `ModelId` and `PropertyId`
 
@@ -182,9 +193,9 @@ cannot read, and keeps and relays each attestation's bytes unchanged.
 A sealed attestation unseals only if its bytes hold that struct and nothing after
 it, the statement bytes hold one `Statement` and nothing after it, and the
 signature verifies under the statement's attester over the signed bytes of 4.6,
-taken from the statement bytes as carried. A statement whose bytes decode but
-would encode differently, such as a head whose entries are out of order, is
-checked against the bytes it carries, never against a re-encoding.
+taken from the statement bytes as carried. A statement whose head is not in
+ascending order does not decode (3.2), so a statement that decodes encodes back
+to the bytes it was read from.
 
 ## 4. The strings
 
@@ -225,6 +236,9 @@ update's parent `Clock`; the other fields are as in 4.2.
 state digest = SHA-256( tag(state) || EntityState )
 ```
 
+`EntityState` is the state as the digesting node holds it, in its own encoding;
+a digest is never taken over state bytes as carried.
+
 ### 4.5 Presence signature
 
 ```text
@@ -232,7 +246,10 @@ signed bytes = tag(presence) || PresenceClaims
 ```
 
 The signature is the ed25519 signature of `node_id`'s key over the signed
-bytes.
+bytes. A receiver checks it over its own encoding of the claims it decoded, not
+over the bytes it received: claims whose announcements the signer wrote out of
+key order, or with a name repeated, decode to claims that encode otherwise, and
+their signature fails.
 
 ### 4.6 Attestation signature
 

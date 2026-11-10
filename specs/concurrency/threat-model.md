@@ -214,25 +214,24 @@ Planned test arm: cross-Model projection rejection plus a plural-membership arm
 showing that either legitimate projection preserves one canonical event id.
 Status: enforced at request and update ingress.
 
-**C4-03. Clock deserialization normalizes to sorted, deduplicated order.**
-Invariant: any `Clock` reconstructed from the wire is sorted and deduplicated before
-use; wire order is never trusted for the binary-search membership tests
+**C4-03. Clock deserialization refuses entries out of ascending order.**
+Invariant: any `Clock` decoded from the wire or a store holds its entries in strictly
+ascending order of event id, names no event twice and has no generation 0; bytes that
+do not are refused, because an update's id covers its parent clock as carried. Wire
+order is never trusted for the binary-search membership tests
 (`contains`/`insert`/`remove`) the head-antichain maintenance depends on.
 Trust tier: Byzantine-safe.
-Enforcing seam: `proto/src/clock.rs` `Clock` derives `#[serde(from = "Vec<EventId>")]`,
-routing deserialization through `From<Vec<EventId>>` -> `normalized()`
-(`ids.sort(); ids.dedup();`); `Clock::new` uses the same path.
+Enforcing seam: `proto/src/clock.rs`: `Clock`'s `Deserialize` refuses such entries with
+a `ClockError`, and `Clock::new`, the constructor in-process callers use, sorts and
+deduplicates what it is given.
 Falsifying attack (T0/T1): an unsorted or duplicate-bearing parent clock so a
 binary-search membership test silently returns the wrong answer, leaving a redundant
-non-antichain tip after a merge.
-Planned test arm: malformed-clock arm (unsorted, duplicated, reversed) asserting
-normalization and correct head maintenance.
+non-antichain tip after a merge, or so two relays derive two ids for one update.
+Test arm: malformed-clock arm (unsorted, duplicated, reversed) asserting refusal on
+decode, normalization on construction, and correct head maintenance.
 Status: enforced. **This contradicts the July verification review**, which listed
 V5 ("clock sortedness is an unenforced load-bearing invariant") as an open MEDIUM;
-the `#[serde(from ...)]` normalization now closes V5 at the type boundary for
-deserialization. Residual: an in-process caller wrapping an unsorted `Vec` via a
-non-normalizing path bypasses this, so #274 is asked to make clock validation an
-explicit ingress check, not solely a serde attribute (V5 belongs at that seam).
+the strict `Deserialize` closes V5 at the type boundary for every decode.
 
 **C4-04. Event batches are acyclic or rejected.**
 Invariant: a multi-event batch is applied parents-first (topological order); a batch
@@ -713,7 +712,7 @@ assertion, not a wire arm, per the claim body).
 |---|---|---|
 | C4-01 | `adversarial_wire::malformed_clock_identity_is_order_independent_end_to_end` (id recomputed from contents, order-independent) | enforced-pass |
 | C4-02 | none (collection-attribution is gap G-2, deferred to #274; the hashing fact is exercised transitively by every event build) | design-boundary |
-| C4-03 | `adversarial_wire::{malformed_clock_deserialization_normalizes, no_public_non_normalizing_clock_constructor, malformed_clock_identity_is_order_independent_end_to_end}` | enforced-pass |
+| C4-03 | `adversarial_wire::{malformed_clock_deserialization_is_refused, no_public_non_normalizing_clock_constructor, malformed_clock_identity_is_order_independent_end_to_end}` | enforced-pass |
 | C4-04 | `adversarial_wire::{declared_cycle_is_unconstructible_content_addressing, fabricated_cycle_batch_is_contained}` | enforced-pass |
 | C4-05 | `adversarial_wire::replay_flood_is_idempotent` | enforced-pass |
 | C4-06 | `adversarial_wire::{forged_second_genesis_rejected_on_durable_node, forged_second_genesis_rejected_on_ephemeral_node}` | enforced-pass |
@@ -766,8 +765,7 @@ July 2026 verification review (V1 through V7) on archive/201-concurrent-updates-
 
 Two places the code contradicts a prior description, noted at their claims: (1) the
 verification review lists **V5 (clock sortedness) as unenforced MEDIUM**, but the tree
-now normalizes at the deserialization boundary via `#[serde(from = "Vec<EventId>")]`
--> `normalized()` (C4-03); #274 is still asked to make it an explicit ingress check.
+now refuses an unsorted clock at the deserialization boundary (C4-03).
 (2) Issue **#244 names symbols that predate the refactor**; the gap is real and
 unchanged, now at `CachedEventGetter::get_event` (C4-15).
 

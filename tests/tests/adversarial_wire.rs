@@ -136,29 +136,31 @@ async fn committed_event_ids(node: &Node<SledStorageEngine, PermissiveAgent>, id
 // Malformed clocks (C4-03)
 // ===========================================================================
 
-/// Wire clocks normalize complete annotations before hashing or head maintenance.
+/// A wire clock whose entries are out of order or repeated is refused, since an update's id
+/// covers its parent clock; one in ascending order decodes to a clock that maintains heads.
 #[test]
-fn malformed_clock_deserialization_normalizes() {
+fn malformed_clock_deserialization_is_refused() {
     let id = |b: u8| proto::EventId::from_bytes([b; 32]);
     let raw = vec![(1u32, id(4)), (4, id(1)), (1, id(4)), (2, id(2)), (4, id(1))];
-    let bytes = bincode::serialize(&raw).unwrap();
-    let mut clock: proto::Clock = bincode::deserialize(&bytes).unwrap();
-    assert_eq!(clock.entries(), &[(4, id(1)), (2, id(2)), (1, id(4))]);
+    assert!(bincode::deserialize::<proto::Clock>(&bincode::serialize(&raw).unwrap()).is_err());
+    let ascending = vec![(4u32, id(1)), (2, id(2)), (1, id(4))];
+    let mut clock: proto::Clock = bincode::deserialize(&bincode::serialize(&ascending).unwrap()).unwrap();
+    assert_eq!(clock.entries(), &ascending[..]);
     assert!(clock.contains(&id(1)) && clock.contains(&id(4)));
     assert!(!clock.contains(&id(3)));
     assert!(clock.remove(&id(2)));
     assert_eq!(clock.entries(), &[(4, id(1)), (1, id(4))]);
 }
 
-/// Public construction and decoding normalize complete annotations before they are hashed.
+/// Public construction normalizes complete annotations before they are hashed, and decoding
+/// refuses annotations that are not normalized.
 #[test]
 fn no_public_non_normalizing_clock_constructor() {
     let id = |b: u8| proto::EventId::from_bytes([b; 32]);
     let unsorted = vec![(1u32, id(3)), (3, id(1)), (2, id(2)), (3, id(1))];
     let expected = [(3, id(1)), (2, id(2)), (1, id(3))];
     assert_eq!(proto::Clock::new(unsorted.clone()).unwrap().entries(), &expected);
-    let decoded: proto::Clock = bincode::deserialize(&bincode::serialize(&unsorted).unwrap()).unwrap();
-    assert_eq!(decoded.entries(), &expected);
+    assert!(bincode::deserialize::<proto::Clock>(&bincode::serialize(&unsorted).unwrap()).is_err());
 }
 
 /// C4-03 end to end: because every clock is normalized before it is hashed, a

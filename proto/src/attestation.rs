@@ -188,7 +188,7 @@ impl Attested<Event> {
 mod tests {
     use super::*;
     use crate::encoding::encode;
-    use crate::{ModelId, OperationSet, State, StateBuffers, SystemModel};
+    use crate::{ClockError, ModelId, OperationSet, State, StateBuffers, SystemModel};
     use ed25519_dalek::Signer;
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -301,10 +301,10 @@ mod tests {
         }
     }
 
-    /// A head decodes from entries in any order and re-encodes sorted, so a verifier that
-    /// re-encoded the statement would reject this signature.
+    /// A head's bytes hold its entries in one order only, so a statement signed over a head whose
+    /// entries were swapped does not unseal, though its signature covers the bytes it carries.
     #[test]
-    fn the_signature_is_checked_against_the_statement_bytes_as_carried() {
+    fn a_statement_whose_head_is_out_of_order_does_not_unseal() {
         let key = attester_key();
         let (low, high) = (EventId::from_bytes([1; 32]), EventId::from_bytes([2; 32]));
         let statement = statement_by(
@@ -326,7 +326,10 @@ mod tests {
         assert_ne!(carried, canonical);
 
         let sealed = SealedAttestation(encode(&Sealed { statement: carried.clone(), signature: sign_as(&key)(&signed_bytes(&carried)) }));
-        assert_eq!(sealed.unseal(), Ok(statement));
+        assert_eq!(sealed.unseal(), Err(AttestationError::Undecodable(ClockError::OutOfOrder.to_string())));
+        let sealed =
+            SealedAttestation(encode(&Sealed { statement: canonical.clone(), signature: sign_as(&key)(&signed_bytes(&canonical)) }));
+        assert_eq!(sealed.unseal(), Ok(statement), "the same statement with its head in order");
     }
 
     #[test]

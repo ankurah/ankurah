@@ -142,6 +142,7 @@ impl std::fmt::Display for Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
 
     use crate::{Identity, Message};
     use ed25519_dalek::Signer;
@@ -240,6 +241,26 @@ mod tests {
             change(&mut forged.claims);
             assert!(!forged.signature_is_valid(), "change {index}");
         }
+    }
+
+    /// A receiver checks a presence over its own encoding of the claims it decoded, so claims
+    /// signed with their announcements out of key order decode to the same claims and fail.
+    #[test]
+    fn claims_signed_with_their_announcements_out_of_order_fail_their_signature() {
+        let mut claims = claims();
+        claims.announcements = BTreeMap::from([("a".to_owned(), vec![1]), ("b".to_owned(), vec![2])]);
+        let in_order = encode(&claims);
+        // The announcements close the claims: each a one-byte name and a one-byte value, each with its length.
+        let entry = (8 + 1) + (8 + 1);
+        let at = in_order.len() - 2 * entry;
+        let mut swapped = in_order.clone();
+        swapped[at..].copy_from_slice(&[&in_order[at + entry..], &in_order[at..at + entry]].concat());
+
+        let decoded: PresenceClaims = decode_exact(&swapped).unwrap();
+        assert_eq!(decoded, claims);
+        let signature = Signature::Ed25519(key(42).sign(&[&DomainTag::Presence.encoded()[..], &swapped].concat()).to_bytes());
+        assert!(!Presence { claims: decoded, signature }.signature_is_valid());
+        assert!(claims.sign(sign_as(&key(42))).signature_is_valid(), "the same claims signed in order");
     }
 
     #[test]
