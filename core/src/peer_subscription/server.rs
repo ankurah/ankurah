@@ -199,7 +199,7 @@ where
         }
     };
 
-    let attested_state = crate::node::attestation::served_state(node, entity_state);
+    let attested_state = crate::node::identity::attestation::served_state(node, entity_state);
 
     // Events should already be attested
     let attested_events = item.events;

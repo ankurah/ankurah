@@ -1,5 +1,5 @@
 use crate::node::event_admissibility::AdmittedOperations;
-use crate::node::handler::commit_transaction;
+use crate::node::inbound::handler::commit_transaction;
 use crate::{
     entity::{Entity, LocalTrxEntity, RemoteTrxEntity},
     error::{LineageError, MutationError, ValidationError},

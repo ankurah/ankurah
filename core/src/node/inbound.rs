@@ -1,6 +1,10 @@
 //! What a node does with a frame from a registered peer.
 
-use super::{handler, ConnectionRegistration, Node};
+pub mod applier;
+pub(crate) mod handler;
+mod schema_registration;
+
+use super::{ConnectionRegistration, Node};
 use crate::error::RequestError;
 use crate::internal::prelude::*;
 use anyhow::anyhow;
@@ -129,7 +133,7 @@ where
     match body {
         proto::NodeUpdateBody::SubscriptionUpdate { items } => {
             tracing::debug!("Node({}) received subscription update from peer {}", node.id, from);
-            crate::node::applier::NodeApplier::apply_updates(node, &from, items).await?;
+            applier::NodeApplier::apply_updates(node, &from, items).await?;
             Ok(())
         }
     }

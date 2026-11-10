@@ -1,6 +1,6 @@
 //! The work a node asks a durable peer to do.
 
-use super::{applier, Node};
+use super::{inbound::applier, Node};
 use crate::internal::prelude::*;
 use crate::retrieval::{CachedEventGetter, LocalStateGetter};
 use ankql::ast::Resolved;

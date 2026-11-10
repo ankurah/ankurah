@@ -1,4 +1,5 @@
-use super::{schema_registration::WireRegistrant, Node};
+use super::schema_registration::WireRegistrant;
+use crate::node::Node;
 use crate::{
     error::{MutationError, RetrievalError},
     policy::{AccessDenied, ContextPolicy, PolicyAgent},
@@ -135,7 +136,7 @@ where
                     continue;
                 }
 
-                if let Some(delta) = super::delta::generate_entity_delta(node, &known_map, state, cdata).await? {
+                if let Some(delta) = crate::node::delta::generate_entity_delta(node, &known_map, state, cdata).await? {
                     deltas.push(delta);
                 }
             }
@@ -149,7 +150,9 @@ where
             let results = results
                 .into_iter()
                 .map(|result| match result {
-                    proto::GetResult::Found(state) => proto::GetResult::Found(super::attestation::served_state(node, state.payload)),
+                    proto::GetResult::Found(state) => {
+                        proto::GetResult::Found(crate::node::identity::attestation::served_state(node, state.payload))
+                    }
                     unserved => unserved,
                 })
                 .collect();

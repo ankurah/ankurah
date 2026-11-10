@@ -26,39 +26,32 @@ use tracing::instrument;
 
 use tracing::{debug, info, warn};
 
-pub mod applier;
-pub(crate) mod attestation;
 mod builder;
 pub(crate) mod delta;
 pub(crate) mod durable_peer;
 mod erased;
 pub(crate) mod event_admissibility;
-pub(crate) mod handler;
 pub mod handles;
-mod inbound;
-mod key;
+pub(crate) mod identity;
+pub(crate) mod inbound;
 mod lifecycle;
 mod match_args;
-mod peer_state;
 mod peers;
-mod plugin;
-mod schema_registration;
-mod state;
 #[cfg(test)]
 mod tests;
 
 pub use builder::NodeBuilder;
 pub(crate) use erased::NodeErased;
 pub use handles::{NodeHandle, NodeRef};
-pub use key::NodeKey;
+pub use identity::key::NodeKey;
+pub use lifecycle::state::NodeState;
 use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
-pub use peer_state::PeerState;
+pub use peers::peer_state::PeerState;
+use peers::plugin::NodePlugins;
+pub use peers::plugin::{AnnouncementFailure, DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};
 pub use peers::ConnectionRegistration;
 use peers::{PeerRegistry, RequiredTrust};
-use plugin::NodePlugins;
-pub use plugin::{AnnouncementFailure, DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};
-pub use state::NodeState;
 
 /// A participant in the Ankurah network, and primary place where queries are initiated
 

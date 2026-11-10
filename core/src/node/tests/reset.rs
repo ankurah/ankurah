@@ -1,7 +1,7 @@
 use super::{register_keyed_peer, RecordingSender};
 use crate::connector::PeerProvenance;
 use crate::error::{MutationError, NodeHaltReason, RetrievalError};
-use crate::node::handler::commit_transaction;
+use crate::node::inbound::handler::commit_transaction;
 use crate::node::{Node, NodeKey, NodeState};
 use crate::policy::{PermissiveAgent, DEFAULT_CONTEXT};
 use crate::retrieval::{CachedEventGetter, GetEvents};

@@ -12,7 +12,7 @@ pub enum NodeState {
 }
 
 impl NodeState {
-    pub(super) fn check_ready(&self) -> Result<(), NodeReadinessError> {
+    pub(in crate::node) fn check_ready(&self) -> Result<(), NodeReadinessError> {
         match self {
             Self::Startup => Err(NodeReadinessError::NotReady),
             Self::Running => Ok(()),

@@ -1,6 +1,8 @@
 //! The peers registered with one node.
 
-use super::PeerState;
+pub(super) mod peer_state;
+pub(super) mod plugin;
+
 use crate::connector::PeerSender;
 use crate::error::RequestError;
 use crate::livequery::WeakEntityLiveQuery;
@@ -10,6 +12,7 @@ use crate::session::ContextData;
 use crate::util::safemap::SafeMap;
 use crate::util::safeset::SafeSet;
 use ankurah_proto as proto;
+use peer_state::PeerState;
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use std::sync::atomic::{AtomicU64, Ordering};

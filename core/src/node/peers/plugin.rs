@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use ankurah_proto as proto;
 use async_trait::async_trait;
 
-use super::Node;
 use crate::connector::PeerProvenance;
+use crate::node::Node;
 use crate::policy::{PeerTrust, PolicyAgent};
 use crate::storage::StorageEngine;
 

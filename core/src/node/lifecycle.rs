@@ -1,7 +1,9 @@
-use super::NodeState;
+pub(super) mod state;
+
 use crate::error::{MutationError, NodeHaltReason};
 use crate::storage::{StorageCommitOutcome, StorageEngine, StorageTransaction};
 use ankurah_signals::{Mut, Read, Wait};
+use state::NodeState;
 use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::{watch, Notify};
 

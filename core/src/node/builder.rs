@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use rand::{rngs::SmallRng, SeedableRng};
 
-use super::plugin::{DuplicatePluginName, NodePlugin, NodePlugins};
+use super::peers::plugin::{DuplicatePluginName, NodePlugin, NodePlugins};
 use super::{Node, NodeKey};
 use crate::policy::PolicyAgent;
 use crate::storage::StorageEngine;

@@ -11,12 +11,12 @@ use crate::{
 use tokio::sync::oneshot;
 
 pub struct PeerState<CD: ContextData> {
-    pub(super) registration: ConnectionRegistration,
-    pub(super) sender: Box<dyn PeerSender>,
-    pub(super) trust: PeerTrust,
-    pub(super) subscription_handler: SubscriptionHandler<CD>,
-    pub(super) pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
-    pub(super) pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    pub(in crate::node) registration: ConnectionRegistration,
+    pub(in crate::node) sender: Box<dyn PeerSender>,
+    pub(in crate::node) trust: PeerTrust,
+    pub(in crate::node) subscription_handler: SubscriptionHandler<CD>,
+    pub(in crate::node) pending_requests: SafeMap<proto::RequestId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
+    pub(in crate::node) pending_updates: SafeMap<proto::UpdateId, oneshot::Sender<Result<proto::NodeResponseBody, RequestError>>>,
 }
 
 impl<CD: ContextData> PeerState<CD> {

@@ -1,6 +1,6 @@
 //! What a node serves a peer that knows an older head of an entity.
 
-use super::{attestation, Node};
+use super::{identity::attestation, Node};
 use crate::internal::prelude::*;
 use crate::policy::ContextPolicy;
 use anyhow::anyhow;

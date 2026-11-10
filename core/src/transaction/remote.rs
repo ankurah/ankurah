@@ -1,6 +1,6 @@
 use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
-use crate::node::{attestation, event_admissibility::AdmittedOperations};
+use crate::node::{event_admissibility::AdmittedOperations, identity::attestation};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};

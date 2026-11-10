@@ -7,7 +7,7 @@ use ankurah_proto::{EntityId, EntityState, Event};
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::{attestation, durable_peer, event_admissibility::AdmittedOperations};
+use crate::node::{durable_peer, event_admissibility::AdmittedOperations, identity::attestation};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
