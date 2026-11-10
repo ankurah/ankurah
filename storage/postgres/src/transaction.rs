@@ -13,7 +13,6 @@ struct EntityRow {
     head: Clock,
     memberships: BTreeSet<ModelId>,
     state_buffers: Vec<u8>,
-    attestations: Vec<Vec<u8>>,
     materializations: Vec<PreparedMaterialization>,
 }
 
@@ -65,14 +64,14 @@ impl StorageTransaction for PostgresTransaction<'_> {
         Ok(())
     }
 
-    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
-        let entity_id = state.payload.entity_id;
+    async fn set_state(&mut self, expected_head: &Clock, state: &EntityState) -> Result<(), MutationError> {
+        let entity_id = state.entity_id;
         let index = self.entities.iter().position(|write| write.entity_id == entity_id);
         if index.is_some_and(|index| self.entities[index].head != *expected_head) {
             return Err(MutationError::InvalidUpdate("state does not follow the preceding transaction write"));
         }
         let mut materializations = Vec::new();
-        for model in &state.payload.state.memberships {
+        for model in &state.state.memberships {
             let projection = self
                 .engine
                 .materialization(model)
@@ -85,10 +84,9 @@ impl StorageTransaction for PostgresTransaction<'_> {
         let mut write = EntityRow {
             entity_id,
             expected_head: expected_head.clone(),
-            head: state.payload.state.head.clone(),
-            memberships: state.payload.state.memberships.clone(),
-            state_buffers: bincode::serialize(&state.payload.state.state_buffers)?,
-            attestations: state.attestations.iter().map(bincode::serialize).collect::<Result<_, _>>()?,
+            head: state.state.head.clone(),
+            memberships: state.state.memberships.clone(),
+            state_buffers: bincode::serialize(&state.state.state_buffers)?,
             materializations,
         };
         if let Some(index) = index {
@@ -125,7 +123,7 @@ impl StorageTransaction for PostgresTransaction<'_> {
             let current_row = transaction
                 .query_opt(
                     &format!(
-                        r#"SELECT "id", "state_buffer", "head", "attestations"
+                        r#"SELECT "id", "state_buffer", "head"
                            FROM "{ENTITY_TABLE}" WHERE "id" = $1 FOR UPDATE"#
                     ),
                     &[&entity_id],
@@ -144,7 +142,7 @@ impl StorageTransaction for PostgresTransaction<'_> {
             } else {
                 None
             };
-            let current_head = current.as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default();
+            let current_head = current.as_ref().map(|state| state.state.head.clone()).unwrap_or_default();
             if current_head != write.expected_head {
                 conflict = true;
             }
@@ -159,7 +157,7 @@ impl StorageTransaction for PostgresTransaction<'_> {
         for (_, write) in &ordered {
             let entity_id = write.entity_id;
             let target = &write.memberships;
-            if observed[&entity_id].as_ref().is_some_and(|state| !state.payload.state.memberships.is_subset(target)) {
+            if observed[&entity_id].as_ref().is_some_and(|state| !state.state.memberships.is_subset(target)) {
                 return Err(MutationError::General(
                     format!("canonical state for entity {entity_id} would remove durable memberships; membership removal is not supported")
                         .into(),
@@ -187,14 +185,13 @@ impl StorageTransaction for PostgresTransaction<'_> {
             transaction
                 .execute(
                     &format!(
-                        r#"INSERT INTO "{ENTITY_TABLE}" ("id", "state_buffer", "head", "attestations")
-                           VALUES ($1, $2, $3, $4)
+                        r#"INSERT INTO "{ENTITY_TABLE}" ("id", "state_buffer", "head")
+                           VALUES ($1, $2, $3)
                            ON CONFLICT ("id") DO UPDATE SET
                                "state_buffer" = EXCLUDED."state_buffer",
-                               "head" = EXCLUDED."head",
-                               "attestations" = EXCLUDED."attestations""#
+                               "head" = EXCLUDED."head""#
                     ),
-                    &[&entity_id, &write.state_buffers, &write.head, &write.attestations],
+                    &[&entity_id, &write.state_buffers, &write.head],
                 )
                 .await
                 .map_err(|error| MutationError::UpdateFailed(Box::new(error)))?;

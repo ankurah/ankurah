@@ -117,7 +117,7 @@ fn state_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
     let (query, arguments): (String, Vec<rusqlite::types::Value>) = if let Some(after) = after {
         (
             format!(
-                r#"SELECT "id", "state_buffer", "head", "attestations"
+                r#"SELECT "id", "state_buffer", "head"
                    FROM "{ENTITY_TABLE}" WHERE "id" > ? ORDER BY "id" LIMIT ?"#
             ),
             vec![after.to_owned().into(), PAGE_SIZE.into()],
@@ -125,7 +125,7 @@ fn state_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
     } else {
         (
             format!(
-                r#"SELECT "id", "state_buffer", "head", "attestations"
+                r#"SELECT "id", "state_buffer", "head"
                    FROM "{ENTITY_TABLE}" ORDER BY "id" LIMIT ?"#
             ),
             vec![PAGE_SIZE.into()],
@@ -140,7 +140,6 @@ fn state_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
         let entity_id = EntityId::from_base64(&stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let state_buffers = bincode::deserialize::<StateBuffers>(&row.get::<_, Vec<u8>>(1)?)?;
         let head = serde_json::from_str::<Clock>(&row.get::<_, String>(2)?)?;
-        let attestations = AttestationSet::decode(&row.get::<_, Vec<u8>>(3)?)?;
         let mut memberships = std::collections::BTreeSet::new();
         let mut membership_statement =
             conn.prepare(&format!(r#"SELECT "model_key" FROM "{ENTITY_MODEL_TABLE}" WHERE "entity_id" = ? ORDER BY "model_key""#))?;
@@ -149,7 +148,7 @@ fn state_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
             memberships.insert(bincode::deserialize::<ModelId>(&key)?);
         }
         let state = State { state_buffers, memberships, head };
-        page.push(StorageDumpItem::State(Attested { payload: EntityState { entity_id, state }, attestations }));
+        page.push(StorageDumpItem::State(EntityState { entity_id, state }));
         last = Some(stored_id);
     }
     Ok((last, page))
@@ -174,13 +173,10 @@ mod tests {
         for _ in 0..RECORDS {
             let event = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
             let entity_id = event.entity_id;
-            let state = Attested::opt(
-                EntityState {
-                    entity_id,
-                    state: State { state_buffers: StateBuffers::default(), memberships: BTreeSet::new(), head: Clock::singleton(&event) },
-                },
-                None,
-            );
+            let state = EntityState {
+                entity_id,
+                state: State { state_buffers: StateBuffers::default(), memberships: BTreeSet::new(), head: Clock::singleton(&event) },
+            };
             let mut transaction = storage.transaction();
             transaction.add_events(&[Attested::opt(event, None)]).await?;
             transaction.set_state(&Clock::default(), &state).await?;
@@ -201,7 +197,7 @@ mod tests {
                 }
                 StorageDumpItem::State(state) => {
                     saw_state = true;
-                    states.insert(state.payload.entity_id);
+                    states.insert(state.entity_id);
                 }
             }
         }

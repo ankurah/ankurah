@@ -70,7 +70,7 @@ async fn typed_residuals_survive_reopen() -> anyhow::Result<()> {
         ankql::parser::parse_selection("rank = 0 AND value != 9007199254740991 ORDER BY rank ASC, value DESC LIMIT 1")?,
     )?;
     let rows = engine.fetch_states(&selection.and_member_of(model)).await?;
-    assert_eq!(rows.iter().map(|row| row.payload.entity_id).collect::<Vec<_>>(), vec![EntityId::from_bytes([2; 32])]);
+    assert_eq!(rows.iter().map(|row| row.entity_id).collect::<Vec<_>>(), vec![EntityId::from_bytes([2; 32])]);
 
     // A property cannot silently acquire a new decoding type on a later write.
     let error = commit(&engine, state(&model, 3, value_id, Some(Value::String("9007199254740992".into())), 0)?).await.unwrap_err();
@@ -128,7 +128,7 @@ async fn invalid_display_names_use_valid_native_indexes() -> anyhow::Result<()> 
             |query: &str| resolve_selection(&model_id, resolver.as_ref(), ankql::parser::parse_selection(query).unwrap()).unwrap();
         // The assigned column must support a native index, including with an invalid key-path seed.
         let matches = engine.fetch_states(&resolve("value = 'match'").and_member_of(model_id)).await?;
-        let ids: std::collections::BTreeSet<_> = matches.iter().map(|row| row.payload.entity_id).collect();
+        let ids: std::collections::BTreeSet<_> = matches.iter().map(|row| row.entity_id).collect();
         assert_eq!(ids, [EntityId::from_bytes([1; 32]), EntityId::from_bytes([2; 32])].into());
         {
             let transaction = engine.db.get_connection().await.transaction_with_str("materializations").unwrap();
@@ -143,10 +143,10 @@ async fn invalid_display_names_use_valid_native_indexes() -> anyhow::Result<()> 
         // Compound indexes use the same assignment and apply LIMIT after filtering.
         let first = engine.fetch_states(&resolve("value = 'match' ORDER BY rank ASC LIMIT 1").and_member_of(model_id)).await?;
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].payload.entity_id, EntityId::from_bytes([2; 32]));
+        assert_eq!(first[0].entity_id, EntityId::from_bytes([2; 32]));
         let last = engine.fetch_states(&resolve("value = 'match' ORDER BY rank DESC LIMIT 1").and_member_of(model_id)).await?;
         assert_eq!(last.len(), 1);
-        assert_eq!(last[0].payload.entity_id, EntityId::from_bytes([1; 32]));
+        assert_eq!(last[0].entity_id, EntityId::from_bytes([1; 32]));
 
         engine.db.close().await;
         drop(engine);

@@ -168,7 +168,7 @@ impl<CD: ContextData> SubscriptionHandler<CD> {
         let mut deltas = Vec::with_capacity(expanded_states.len());
         for state in expanded_states {
             // `known_matches` may resurface rows outside the current policy.
-            if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
+            if policy.check_read(&state.entity_id, &state.state).is_err() {
                 continue;
             }
 

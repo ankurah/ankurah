@@ -11,7 +11,7 @@ use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventId, Mode
 #[derive(Debug)]
 pub enum StorageDumpItem {
     Event(Attested<Event>),
-    State(Attested<EntityState>),
+    State(EntityState),
 }
 
 /// Raw logical export implemented by storage engines that support portable
@@ -45,7 +45,7 @@ pub trait StorageTransaction: Send {
     /// Replace an entity's state, including its memberships and materializations.
     /// `expected_head` is the state this update was derived from, including prior writes in this transaction.
     /// A missing entity has an empty head. Repeated calls for an entity replace its preceding state.
-    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError>;
+    async fn set_state(&mut self, expected_head: &Clock, state: &EntityState) -> Result<(), MutationError>;
 
     /// Compare every expected head, then atomically persist events, canonical
     /// states, memberships, and materializations. Any conflict publishes none
@@ -78,7 +78,7 @@ pub enum StorageCommitOutcome {
     /// At least one expectation differed, so the engine rolled back the
     /// complete batch. Values are canonical states observed while checking
     /// this attempt; `None` means no canonical entity existed when checked.
-    Conflict { observed: BTreeMap<EntityId, Option<Attested<EntityState>>> },
+    Conflict { observed: BTreeMap<EntityId, Option<EntityState>> },
 }
 
 impl StorageCommitOutcome {
@@ -95,6 +95,9 @@ impl StorageCommitOutcome {
 /// Semantic persistence boundary for canonical entity data, events,
 /// and model-specific query materializations.
 ///
+/// Events are stored with their attestations; states are stored without any,
+/// since a statement about a state is made by the node that serves it.
+///
 /// Physical tables, object stores, trees, naming registries, and
 /// entity-to-model association layouts remain private to each implementation.
 pub trait StorageEngine: Send + Sync {
@@ -109,10 +112,10 @@ pub trait StorageEngine: Send + Sync {
     fn transaction(&self) -> Self::Transaction<'_>;
 
     /// Retrieve canonical state by entity identity.
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError>;
+    async fn get_state(&self, id: EntityId) -> Result<EntityState, RetrievalError>;
 
     /// Fetch entities matching the selection, including its model-membership predicates.
-    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<EntityState>, RetrievalError>;
 
     /// Retrieve one outcome per requested identity, in input order, distinguishing absence from predicate mismatch.
     /// Engines may batch reads or join materializations; existence and predicate checks must use the same state.

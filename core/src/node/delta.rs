@@ -10,7 +10,7 @@ use anyhow::anyhow;
 pub(crate) async fn generate_entity_delta<SE, PA, C>(
     node: &Node<SE, PA>,
     known_map: &std::collections::HashMap<proto::EntityId, proto::Clock>,
-    entity_state: proto::Attested<proto::EntityState>,
+    entity_state: proto::EntityState,
     cdata: &C,
 ) -> anyhow::Result<Option<proto::EntityDelta>>
 where
@@ -19,7 +19,7 @@ where
     C: crate::util::Iterable<PA::ContextData>,
 {
     // Destructure to take ownership and avoid clones
-    let proto::EntityState { entity_id, state } = entity_state.payload;
+    let proto::EntityState { entity_id, state } = entity_state;
     let current_head = &state.head;
 
     // Entity is in known_matches - try to optimize the response

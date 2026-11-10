@@ -16,7 +16,7 @@ use ankurah_core::{
     schema::CatalogResolver,
     storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction, StoreFormatError},
 };
-use ankurah_proto::{AttestationSet, Attested, EntityState, EventBody, EventId, SealedAttestation, State, StateBuffers};
+use ankurah_proto::{AttestationSet, Attested, EntityState, EventBody, EventId, State, StateBuffers};
 use ankurah_proto::{ModelId, SystemModel};
 
 pub mod sql_builder;
@@ -256,8 +256,7 @@ impl Postgres {
                         r#"CREATE TABLE IF NOT EXISTS "{ENTITY_TABLE}" (
                             "id" character(43) PRIMARY KEY,
                             "state_buffer" bytea NOT NULL,
-                            "head" bytea NOT NULL,
-                            "attestations" bytea[] NOT NULL
+                            "head" bytea NOT NULL
                         )"#
                     ),
                     &[],
@@ -413,14 +412,14 @@ impl StorageEngine for Postgres {
 
     fn transaction(&self) -> Self::Transaction<'_> { PostgresTransaction::new(self) }
 
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+    async fn get_state(&self, id: EntityId) -> Result<EntityState, RetrievalError> {
         let mut client = self.pool.get().await.map_err(RetrievalError::storage)?;
         self.ensure_shared_tables(&client).await.map_err(RetrievalError::storage)?;
         let snapshot = read_snapshot(&mut client).await?;
         load_states(&snapshot, &[id]).await?.into_iter().next().ok_or(RetrievalError::EntityNotFound(id))
     }
 
-    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         query::Query::prepare(self, selection).await?.states(self).await
     }
 
@@ -541,21 +540,12 @@ impl StorageEngine for Postgres {
     }
 }
 
-fn state_from_row(row: &tokio_postgres::Row, memberships: BTreeSet<ModelId>) -> Result<Attested<EntityState>, RetrievalError> {
+fn state_from_row(row: &tokio_postgres::Row, memberships: BTreeSet<ModelId>) -> Result<EntityState, RetrievalError> {
     let entity_id: EntityId = row.try_get("id").map_err(RetrievalError::storage)?;
     let serialized_buffers: Vec<u8> = row.try_get("state_buffer").map_err(RetrievalError::storage)?;
     let state_buffers: BTreeMap<String, Vec<u8>> = bincode::deserialize(&serialized_buffers).map_err(RetrievalError::storage)?;
     let head: Clock = row.try_get("head").map_err(RetrievalError::storage)?;
-    let attestation_bytes: Vec<Vec<u8>> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-    let attestations = attestation_bytes
-        .into_iter()
-        .map(|bytes| bincode::deserialize(&bytes))
-        .collect::<Result<Vec<SealedAttestation>, _>>()
-        .map_err(RetrievalError::storage)?;
-    Ok(Attested {
-        payload: EntityState { entity_id, state: State { state_buffers: StateBuffers(state_buffers), memberships, head } },
-        attestations: AttestationSet(attestations),
-    })
+    Ok(EntityState { entity_id, state: State { state_buffers: StateBuffers(state_buffers), memberships, head } })
 }
 
 /// Keep canonical state and membership reads on the same committed version.
@@ -569,7 +559,7 @@ async fn read_snapshot(client: &mut tokio_postgres::Client) -> Result<tokio_post
         .map_err(RetrievalError::storage)
 }
 
-async fn load_states(client: &tokio_postgres::Transaction<'_>, ids: &[EntityId]) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+async fn load_states(client: &tokio_postgres::Transaction<'_>, ids: &[EntityId]) -> Result<Vec<EntityState>, RetrievalError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -577,7 +567,7 @@ async fn load_states(client: &tokio_postgres::Transaction<'_>, ids: &[EntityId])
     let rows = client
         .query(
             &format!(
-                r#"SELECT "id", "state_buffer", "head", "attestations"
+                r#"SELECT "id", "state_buffer", "head"
                    FROM "{ENTITY_TABLE}" WHERE "id" = ANY($1)"#
             ),
             &[&ids_param],
@@ -598,7 +588,7 @@ async fn load_states(client: &tokio_postgres::Transaction<'_>, ids: &[EntityId])
             })
             .collect::<Result<BTreeSet<_>, _>>()?;
         let state = state_from_row(&row, memberships)?;
-        by_id.insert(state.payload.entity_id, state);
+        by_id.insert(state.entity_id, state);
     }
     Ok(ids.iter().filter_map(|id| by_id.remove(id)).collect())
 }
@@ -712,17 +702,14 @@ mod tests {
         );
         let engine = Postgres::open(&uri).await?;
         let id = EntityId::from_bytes([0xd2; EntityId::BYTE_LEN]);
-        let before = Attested::opt(
-            EntityState {
-                entity_id: id,
-                state: State {
-                    state_buffers: StateBuffers::default(),
-                    memberships: [ModelId::System(SystemModel::Model)].into(),
-                    head: Clock::genesis(EventId::from_bytes([1; 32])),
-                },
+        let before = EntityState {
+            entity_id: id,
+            state: State {
+                state_buffers: StateBuffers::default(),
+                memberships: [ModelId::System(SystemModel::Model)].into(),
+                head: Clock::genesis(EventId::from_bytes([1; 32])),
             },
-            None,
-        );
+        };
         let mut transaction = engine.transaction();
         transaction.set_state(&Clock::default(), &before).await?;
         let result = transaction.commit().await?;
@@ -732,10 +719,10 @@ mod tests {
         let snapshot = read_snapshot(&mut reader).await?;
         let selected = snapshot.query_one("SELECT id FROM _ankurah_model", &[]).await?.get(0);
         let mut after = before.clone();
-        after.payload.state.head = Clock::new(vec![(2, EventId::from_bytes([2; 32]))]).unwrap();
-        after.payload.state.memberships.insert(ModelId::System(SystemModel::Property));
+        after.state.head = Clock::new(vec![(2, EventId::from_bytes([2; 32]))]).unwrap();
+        after.state.memberships.insert(ModelId::System(SystemModel::Property));
         let mut transaction = engine.transaction();
-        transaction.set_state(&before.payload.state.head, &after).await?;
+        transaction.set_state(&before.state.head, &after).await?;
         let result = transaction.commit().await?;
         assert!(matches!(result, StorageCommitOutcome::Committed(_)));
 
@@ -757,12 +744,12 @@ mod tests {
         let id = EntityId::from_bytes([0xd3; EntityId::BYTE_LEN]);
         // Synthetic tips with distinct generations: the engine must retain each association.
         let head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
-        let state = Attested::opt(EntityState { entity_id: id, state: State { head, ..State::default() } }, None);
+        let state = EntityState { entity_id: id, state: State { head, ..State::default() } };
         let mut transaction = engine.transaction();
         transaction.set_state(&Clock::default(), &state).await?;
         assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
-        let stored = engine.get_state(id).await?.payload.state;
-        assert_eq!(stored.head, state.payload.state.head);
+        let stored = engine.get_state(id).await?.state;
+        assert_eq!(stored.head, state.state.head);
         Ok(())
     }
 }

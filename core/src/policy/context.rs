@@ -4,10 +4,10 @@ use crate::entity::{Entity, TemporaryEntity};
 use crate::error::{InadmissibleEvent, MutationError};
 use crate::node::Node;
 use crate::selection::filter::evaluate_predicate;
-use crate::storage::StorageEngine;
+use crate::storage::{GetStateResult, StorageEngine};
 use crate::util::Iterable;
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{Attested, EntityId, Event, GetResult, ModelId, State};
+use ankurah_proto::{Attested, EntityId, Event, ModelId, State};
 use ankurah_signals::{ListenerGuard, Mut, Peek, Signal};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -146,26 +146,24 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
         Ok(())
     }
 
-    /// Apply additional checks to a batch that has already passed the storage predicate.
-    pub(crate) fn check_reads(&self, results: &mut [GetResult]) {
+    /// Apply additional checks to a batch that has already passed the storage predicate: a state
+    /// the agent denies becomes a predicate mismatch.
+    pub(crate) fn check_reads(&self, results: &mut [GetStateResult]) {
         if matches!(&self.auth, ContextAuth::Privileged) {
             return;
         }
         let states: Vec<_> = results
             .iter()
             .filter_map(|result| {
-                let GetResult::Found(state) = result else { return None };
-                (!state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy))
-                    .then_some((&state.payload.entity_id, &state.payload.state))
+                let GetStateResult::Found(state) = result else { return None };
+                (!state.state.memberships.iter().any(crate::schema::reads_bypass_policy)).then_some((&state.entity_id, &state.state))
             })
             .collect();
         let denied = self.agent.check_reads(&self.credentials(), &states);
         for result in results {
-            if let GetResult::Found(state) = result {
-                if denied.contains_key(&state.payload.entity_id)
-                    && !state.payload.state.memberships.iter().any(crate::schema::reads_bypass_policy)
-                {
-                    *result = GetResult::AccessDenied(state.payload.entity_id);
+            if let GetStateResult::Found(state) = result {
+                if denied.contains_key(&state.entity_id) && !state.state.memberships.iter().any(crate::schema::reads_bypass_policy) {
+                    *result = GetStateResult::PredicateMismatch(state.entity_id);
                 }
             }
         }

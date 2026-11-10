@@ -591,7 +591,7 @@ where
         let event_getter = LocalEventGetter::new(self.storage.clone(), self.durable);
         let mut entities = Vec::with_capacity(initial_states.len());
         for state in initial_states {
-            let (_, entity) = self.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state).await?;
+            let (_, entity) = self.entities.with_state(&state_getter, &event_getter, state.entity_id, state.state).await?;
             entities.push(entity);
         }
         Ok(entities)

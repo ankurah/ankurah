@@ -23,7 +23,7 @@ async fn policy_is_written_explicitly_and_loaded_on_restart() -> anyhow::Result<
         let context = node.context_async(JwtContext::system()).await?;
         context.fetch::<ModelPolicyView>("true").await?[0].id()
     };
-    let head = storage.get_state(policy_id).await?.payload.state.head;
+    let head = storage.get_state(policy_id).await?.state.head;
 
     // A different local file is not an instruction to replace this system's policy.
     let path = format!("{}/tests/fixtures/simple_minimal.json", env!("CARGO_MANIFEST_DIR"));
@@ -34,7 +34,7 @@ async fn policy_is_written_explicitly_and_loaded_on_restart() -> anyhow::Result<
     let context = node.context_async(JwtContext::system()).await?;
     let policies = context.fetch::<ModelPolicyView>("true").await?;
     assert!(policies.iter().any(|policy| policy.id() == policy_id));
-    assert_eq!(storage.get_state(policy_id).await?.payload.state.head, head);
+    assert_eq!(storage.get_state(policy_id).await?.state.head, head);
     drop(context);
     drop(node);
     drop(policy);
@@ -44,12 +44,12 @@ async fn policy_is_written_explicitly_and_loaded_on_restart() -> anyhow::Result<
     let node = Node::new_durable(storage.clone(), policy.clone());
     node.wait_ready().await?;
     assert!(policy.config().collections.contains_key("post"));
-    assert_eq!(storage.get_state(policy_id).await?.payload.state.head, head);
+    assert_eq!(storage.get_state(policy_id).await?.state.head, head);
 
     // A bad file must leave the stored policy untouched.
     let invalid = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
     assert!(policy.set_policy_from_file(&node, invalid).await.is_err());
-    assert_eq!(storage.get_state(policy_id).await?.payload.state.head, head);
+    assert_eq!(storage.get_state(policy_id).await?.state.head, head);
 
     let replacement = common::load_minimal_config();
     policy.set_policy(&node, &replacement).await?;

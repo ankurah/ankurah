@@ -40,12 +40,12 @@ async fn setup() -> anyhow::Result<TestNode> {
     Ok(node)
 }
 
-async fn catalog_states(node: &TestNode) -> anyhow::Result<Vec<proto::Attested<proto::EntityState>>> {
+async fn catalog_states(node: &TestNode) -> anyhow::Result<Vec<proto::EntityState>> {
     let mut states = Vec::new();
     for model in [proto::SystemModel::Model, proto::SystemModel::Property, proto::SystemModel::ModelProperty] {
         states.extend(node.storage.fetch_states(&ankql::ast::Predicate::MemberOf(proto::ModelId::System(model)).into()).await?);
     }
-    states.sort_by_key(|state| state.payload.entity_id);
+    states.sort_by_key(|state| state.entity_id);
     Ok(states)
 }
 

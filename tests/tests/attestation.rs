@@ -228,7 +228,7 @@ async fn relay_keeps_attestations<SE: StorageEngine + Send + Sync + 'static>([or
     assert_eq!(genesis.attestations.len(), 1);
 
     // A commit the origin sends as it is, carrying bytes that do not parse beside another key's attestation of the unknown kind.
-    let update = proto::Event::update(id, relay.storage.get_state(id).await?.payload.state.head, proto::OperationSet::default());
+    let update = proto::Event::update(id, relay.storage.get_state(id).await?.state.head, proto::OperationSet::default());
     let foreign = NodeKey::from_seed([5; 32]).attest(Subject::event(&update), unknown_kind.kind, unknown_kind.payload);
     let update =
         Attested { attestations: AttestationSet(vec![SealedAttestation(b"not an attestation".to_vec()), foreign]), payload: update };

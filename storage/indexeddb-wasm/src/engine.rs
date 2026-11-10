@@ -259,12 +259,9 @@ impl StorageEngine for IndexedDBStorageEngine {
 
     fn transaction(&self) -> Self::Transaction<'_> { IndexedDbTransaction::new(self) }
 
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> { load_state(&self.db, id).await }
+    async fn get_state(&self, id: EntityId) -> Result<EntityState, RetrievalError> { load_state(&self.db, id).await }
 
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<ankql::ast::Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         let plan = ankurah_storage_common::materialization_plan::MaterializationPlan::new(selection);
         if let Some((model, selection)) = plan.indexed_materialization() {
             if registered_materialization_name(&self.db, &model).await?.is_none() {
@@ -380,19 +377,16 @@ impl StorageEngine for IndexedDBStorageEngine {
     }
 }
 
-fn entity_state_from_object(id: EntityId, entity: &Object) -> Result<Attested<EntityState>, RetrievalError> {
+fn entity_state_from_object(id: EntityId, entity: &Object) -> Result<EntityState, RetrievalError> {
     let memberships = serde_json::from_str(&entity.get::<String>(&MEMBERSHIPS_KEY)?).map_err(RetrievalError::storage)?;
-    Ok(Attested {
-        payload: EntityState {
-            entity_id: id,
-            state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?, memberships, head: entity.get(&HEAD_KEY)? },
-        },
-        attestations: entity.get(&ATTESTATIONS_KEY)?,
+    Ok(EntityState {
+        entity_id: id,
+        state: State { state_buffers: entity.get(&STATE_BUFFER_KEY)?, memberships, head: entity.get(&HEAD_KEY)? },
     })
 }
 
 /// Load one canonical entity state from the IndexedDB entity store.
-pub(crate) async fn load_state(db: &Database, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+pub(crate) async fn load_state(db: &Database, id: EntityId) -> Result<EntityState, RetrievalError> {
     let db_connection = db.get_connection().await;
     SendWrapper::new(async move {
         let transaction = db_connection.transaction_with_str("entities").require("create canonical entity read transaction")?;
@@ -403,7 +397,7 @@ pub(crate) async fn load_state(db: &Database, id: EntityId) -> Result<Attested<E
 }
 
 /// Read an entity without leaving the caller's IndexedDB transaction.
-pub(crate) async fn load_state_in_store(store: &web_sys::IdbObjectStore, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+pub(crate) async fn load_state_in_store(store: &web_sys::IdbObjectStore, id: EntityId) -> Result<EntityState, RetrievalError> {
     let request = store.get(&JsValue::from_str(&id.to_base64())).require("get canonical entity")?;
     cb_future(&request, "success", "error").await.require("await canonical entity")?;
     let value = request.result().require("get canonical entity result")?;

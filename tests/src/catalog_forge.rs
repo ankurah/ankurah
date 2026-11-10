@@ -15,7 +15,7 @@ pub struct ForgedCatalog {
     pub model: proto::EntityId,
     pub properties: Vec<proto::EntityId>,
     pub memberships: Vec<proto::EntityId>,
-    pub rows: Vec<(Attested<proto::EntityState>, Attested<proto::Event>)>,
+    pub rows: Vec<(proto::EntityState, Attested<proto::Event>)>,
 }
 
 pub fn forge_catalog(label: &str, display: &str, properties: &[(&str, &str, &str)], namespace: &[u8]) -> ForgedCatalog {
@@ -88,7 +88,7 @@ fn row(
     counter: u64,
     membership: ModelId,
     values: Vec<(SystemProperty, Option<Value>)>,
-) -> (proto::EntityId, (Attested<proto::EntityState>, Attested<proto::Event>)) {
+) -> (proto::EntityId, (proto::EntityState, Attested<proto::Event>)) {
     let staged = LWWBackend::new();
     for (property, value) in &values {
         staged.set(PropertyId::System(*property), value.clone());
@@ -117,7 +117,7 @@ fn row(
         head: proto::Clock::singleton(&event),
     };
     let entity_state = proto::EntityState { entity_id, state };
-    (entity_id, (entity_state.into(), Attested::opt(event, None)))
+    (entity_id, (entity_state, Attested::opt(event, None)))
 }
 
 fn content_nonce(counter: u64, parts: &[&[u8]]) -> [u8; 32] {

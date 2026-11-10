@@ -1,38 +1,28 @@
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{Attested, EntityId, EntityState, GetResult};
+use ankurah_proto::{EntityId, EntityState};
 
 use crate::{entity::TemporaryEntity, error::RetrievalError, policy::AccessDenied, selection::filter::evaluate_predicate};
 
 /// One requested entity's state, absence, or failed predicate check.
 #[derive(Debug)]
 pub enum GetStateResult {
-    Found(Attested<EntityState>),
+    Found(EntityState),
     NotFound(EntityId),
     PredicateMismatch(EntityId),
 }
 
 impl GetStateResult {
-    pub fn matching(state: Attested<EntityState>, predicate: &Predicate<Resolved>) -> Result<Self, RetrievalError> {
+    pub fn matching(state: EntityState, predicate: &Predicate<Resolved>) -> Result<Self, RetrievalError> {
         let matches = match predicate {
             Predicate::True => true,
             Predicate::False => false,
-            _ => evaluate_predicate(&TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?, predicate).unwrap_or(false),
+            _ => evaluate_predicate(&TemporaryEntity::new(state.entity_id, &state.state)?, predicate).unwrap_or(false),
         };
-        Ok(if matches { Self::Found(state) } else { Self::PredicateMismatch(state.payload.entity_id) })
+        Ok(if matches { Self::Found(state) } else { Self::PredicateMismatch(state.entity_id) })
     }
 }
 
-impl From<GetStateResult> for GetResult {
-    fn from(result: GetStateResult) -> Self {
-        match result {
-            GetStateResult::Found(state) => Self::Found(state),
-            GetStateResult::NotFound(id) => Self::NotFound(id),
-            GetStateResult::PredicateMismatch(id) => Self::AccessDenied(id),
-        }
-    }
-}
-
-impl TryFrom<GetStateResult> for Attested<EntityState> {
+impl TryFrom<GetStateResult> for EntityState {
     type Error = RetrievalError;
 
     fn try_from(result: GetStateResult) -> Result<Self, Self::Error> {

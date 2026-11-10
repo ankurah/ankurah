@@ -92,7 +92,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
         }
         debug!("{}.get_entity fetching from storage", node.as_ref());
 
-        let entity_state: proto::Attested<proto::EntityState> = node
+        let entity_state: proto::EntityState = node
             .storage
             .get_states(vec![id], &policy.retrieval_predicate())
             .await?
@@ -100,10 +100,10 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             .next()
             .ok_or(RetrievalError::EntityNotFound(id))?
             .try_into()?;
-        policy.check_read_state(&id, &entity_state.payload.state)?;
+        policy.check_read_state(&id, &entity_state.state)?;
         let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
         let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
-        let (_changed, entity) = node.entities.with_state(&state_getter, &event_getter, id, entity_state.payload.state).await?;
+        let (_changed, entity) = node.entities.with_state(&state_getter, &event_getter, id, entity_state.state).await?;
         Ok(entity)
     }
 
@@ -126,8 +126,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
             let state_getter = crate::retrieval::LocalStateGetter::new(node.storage.clone());
             let event_getter = CachedEventGetter::new(node.as_ref(), &cdata);
             for state in states {
-                let (_, entity) =
-                    node.entities.with_state(&state_getter, &event_getter, state.payload.entity_id, state.payload.state).await?;
+                let (_, entity) = node.entities.with_state(&state_getter, &event_getter, state.entity_id, state.state).await?;
                 entities.push(entity);
             }
             Ok(entities)

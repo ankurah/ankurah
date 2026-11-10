@@ -63,7 +63,7 @@ async fn membership_rejection_does_not_read_entity_state() -> anyhow::Result<()>
     .and_member_of(b)
     .and_member_of(a);
     let states = engine.fetch_states(&selection).await?;
-    assert_eq!(states.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![id(2)]);
+    assert_eq!(states.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![id(2)]);
     assert!(engine.get_state(id(1)).await.is_err(), "the excluded state really is unreadable");
     engine.db.close().await;
     IndexedDBStorageEngine::cleanup(&name).await?;

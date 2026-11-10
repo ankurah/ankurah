@@ -39,7 +39,7 @@ pub trait GetEvents {
 /// Retrieve entity state snapshots.
 #[async_trait]
 pub trait GetState {
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<proto::EntityState>>, RetrievalError>;
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<proto::EntityState>, RetrievalError>;
 }
 
 /// Extends GetEvents with temporary staging for causal comparison.
@@ -63,7 +63,7 @@ impl<R: GetEvents + Send + Sync + ?Sized> GetEvents for &R {
 
 #[async_trait]
 impl<SE: StorageEngine> GetState for SE {
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<proto::EntityState>>, RetrievalError> {
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<proto::EntityState>, RetrievalError> {
         match StorageEngine::get_state(self, entity_id).await {
             Ok(state) => Ok(Some(state)),
             Err(RetrievalError::EntityNotFound(_)) => Ok(None),
@@ -248,7 +248,7 @@ impl<SE: StorageEngine> LocalStateGetter<SE> {
 
 #[async_trait]
 impl<SE: StorageEngine> GetState for LocalStateGetter<SE> {
-    async fn get_state(&self, entity_id: EntityId) -> Result<Option<Attested<proto::EntityState>>, RetrievalError> {
+    async fn get_state(&self, entity_id: EntityId) -> Result<Option<proto::EntityState>, RetrievalError> {
         GetState::get_state(self.storage.as_ref(), entity_id).await
     }
 }

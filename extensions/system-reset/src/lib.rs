@@ -151,7 +151,7 @@ where
     node.wait_catalog_loaded().await?;
     let Some(model) = node.catalog.model_id_for(M::descriptor().label)? else { return Ok(BTreeSet::new()) };
     let stored = node.storage.fetch_states(&Selection::from(Predicate::True).and_member_of(model)).await?;
-    Ok(stored.into_iter().map(|state| state.payload.entity_id).collect())
+    Ok(stored.into_iter().map(|state| state.entity_id).collect())
 }
 
 fn refusal(reason: impl ToString) -> PeerRefusal { PeerRefusal { plugin: PLUGIN_NAME, reason: reason.to_string() } }

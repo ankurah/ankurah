@@ -1,6 +1,6 @@
 use ankql::ast::{Predicate, Resolved, Selection};
 use ankurah_core::{error::RetrievalError, storage::StorageEngine};
-use ankurah_proto::{Attested, EntityId, EntityState, PropertyId};
+use ankurah_proto::{EntityId, EntityState, PropertyId};
 use ankurah_storage_common::{
     materialization_join::{MaterializationJoin, MaterializationTable},
     materialization_plan::MaterializationPlan,
@@ -68,7 +68,7 @@ impl Query {
         rows.map(|row| EntityId::from_base64(&row?).map_err(|error| SqliteError::CorruptRecord(error.to_string()))).collect()
     }
 
-    pub async fn states(self, engine: &SqliteStorageEngine) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    pub async fn states(self, engine: &SqliteStorageEngine) -> Result<Vec<EntityState>, RetrievalError> {
         let conn = engine.pool.get().await.map_err(|error| SqliteError::Pool(error.to_string()))?;
         engine.ensure_shared_tables(&conn).await?;
         let states = conn

@@ -215,7 +215,7 @@ impl NodeApplier {
         crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
         Self::check_snapshot_events(node, state, &proto::Clock::default(), events, event_getter).await?;
         let mut storage_trx = node.storage.transaction();
-        storage_trx.set_state(&proto::Clock::default(), &state.clone().into()).await?;
+        storage_trx.set_state(&proto::Clock::default(), state).await?;
         storage_trx.add_events(events).await?;
         let _publication = node.commit_publication_lock.lock().await;
         match node.lifecycle.begin_storage_write()?.commit(storage_trx).await? {
@@ -255,17 +255,15 @@ impl NodeApplier {
             } else {
                 candidate.apply_events(event_getter, &mut events, admitted, |_| Ok(None)).await?;
             }
-            let state: Attested<proto::EntityState> = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? }.into();
+            let state = proto::EntityState { entity_id: entity.id(), state: candidate.to_state()? };
             let mut storage_trx = node.storage.transaction();
             storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
             node.lifecycle.begin_storage_write()?.commit(storage_trx).await?.committed()?;
             if adopted {
-                let (_, entity) = node
-                    .entities
-                    .with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.payload.state)
-                    .await?;
+                let (_, entity) =
+                    node.entities.with_state(&LocalStateGetter::new(node.storage.clone()), event_getter, entity.id(), state.state).await?;
                 Ok(Some(EntityChange::new(entity, events)))
             } else {
                 let change = candidate.commit(&node.entities, event_getter, false).await?;
@@ -297,7 +295,7 @@ impl NodeApplier {
             candidate.apply_events(event_getter, &mut events, admitted, |_| Ok(None)).await?;
             let state = proto::EntityState { entity_id, state: candidate.to_state()? };
             let mut storage_trx = node.storage.transaction();
-            storage_trx.set_state(&expected_head, &state.into()).await?;
+            storage_trx.set_state(&expected_head, &state).await?;
             storage_trx.add_events(&events).await?;
             let _publication = node.commit_publication_lock.lock().await;
             node.lifecycle.begin_storage_write()?.commit(storage_trx).await?.committed()?;

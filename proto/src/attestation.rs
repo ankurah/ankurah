@@ -9,7 +9,7 @@ use crate::{
     event_id::EventId,
     id::EntityId,
     identity::{Identity, Signature},
-    state::{EntityState, StateFragment},
+    state::EntityState,
 };
 
 /// One attestation as it travels and is stored: the bytes of a [`Statement`] and its attester's
@@ -161,15 +161,6 @@ impl<T: std::fmt::Display> std::fmt::Display for Attested<T> {
 
 impl<T: Clone> Clone for Attested<T> {
     fn clone(&self) -> Self { Self { payload: self.payload.clone(), attestations: AttestationSet(self.attestations.0.clone()) } }
-}
-
-impl Attested<EntityState> {
-    pub fn to_parts(self) -> (EntityId, StateFragment) {
-        (self.payload.entity_id, StateFragment { state: self.payload.state, attestations: self.attestations })
-    }
-    pub fn from_parts(entity_id: EntityId, fragment: StateFragment) -> Self {
-        Self { payload: EntityState { entity_id, state: fragment.state }, attestations: fragment.attestations }
-    }
 }
 
 impl Attested<Event> {

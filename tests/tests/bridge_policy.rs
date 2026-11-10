@@ -259,8 +259,8 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
         let states = storage.fetch_states(&Predicate::MemberOf(model).into()).await?;
         assert!(!states.is_empty(), "registration must populate {label}");
         let mut state = states[0].clone();
-        let entity_id = state.payload.entity_id;
-        let known_head = state.payload.state.head.clone();
+        let entity_id = state.entity_id;
+        let known_head = state.state.head.clone();
         // Advance the stored row with an idempotent membership event to exercise a real bridge.
         let update = proto::Event::update(
             entity_id,
@@ -269,7 +269,7 @@ async fn catalog_reads_bypass_policy_including_event_bridges() -> Result<()> {
                 ankurah::core::schema::system_model_id(label).unwrap(),
             ))]),
         );
-        state.payload.state.head = proto::Clock::singleton(&update);
+        state.state.head = proto::Clock::singleton(&update);
         let mut transaction = storage.transaction();
         transaction.set_state(&known_head, &state).await?;
         transaction.add_events(&[Attested::opt(update, None)]).await?;

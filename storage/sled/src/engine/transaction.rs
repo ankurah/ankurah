@@ -5,7 +5,7 @@ use ankurah_core::{
     storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageTransaction},
     value::Value,
 };
-use ankurah_proto::{AttestationSet, Clock, PropertyId, State};
+use ankurah_proto::{Clock, PropertyId};
 use sled::{transaction::ConflictableTransactionError, IVec};
 
 /// Sled encodings and property values for one atomic commit.
@@ -34,15 +34,8 @@ struct PreparedMaterialization {
     encoded: IVec,
 }
 
-// Preserve StateFragment's field order without cloning its owned State.
-#[derive(serde::Serialize)]
-struct StateFragmentRef<'a> {
-    state: &'a State,
-    attestations: &'a AttestationSet,
-}
-
 enum SledCommitAbort {
-    Conflict(BTreeMap<EntityId, Option<Attested<EntityState>>>),
+    Conflict(BTreeMap<EntityId, Option<EntityState>>),
     Invalid(String),
 }
 
@@ -65,14 +58,14 @@ impl StorageTransaction for SledTransaction<'_> {
         Ok(())
     }
 
-    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
-        let entity_id = state.payload.entity_id;
+    async fn set_state(&mut self, expected_head: &Clock, state: &EntityState) -> Result<(), MutationError> {
+        let entity_id = state.entity_id;
         let index = self.entities.iter().position(|write| write.entity_id == entity_id);
         if index.is_some_and(|index| self.entities[index].head != *expected_head) {
             return Err(MutationError::InvalidUpdate("state does not follow the preceding transaction write"));
         }
         let mut values = Vec::new();
-        for (name, buffer) in state.payload.state.state_buffers.iter() {
+        for (name, buffer) in state.state.state_buffers.iter() {
             let backend = backend_from_string(name, Some(buffer))?;
             values.extend(backend.property_values());
         }
@@ -80,10 +73,10 @@ impl StorageTransaction for SledTransaction<'_> {
             original_index: index.unwrap_or(self.entities.len()),
             entity_id,
             expected_head: expected_head.clone(),
-            head: state.payload.state.head.clone(),
-            memberships: state.payload.state.memberships.clone(),
-            encoded_state: bincode::serialize(&StateFragmentRef { state: &state.payload.state, attestations: &state.attestations })?.into(),
-            encoded_memberships: bincode::serialize(&state.payload.state.memberships)?.into(),
+            head: state.state.head.clone(),
+            memberships: state.state.memberships.clone(),
+            encoded_state: crate::entity::encode_state(&state.state)?.into(),
+            encoded_memberships: bincode::serialize(&state.state.memberships)?.into(),
             values,
             materializations: Vec::new(),
         };
@@ -159,15 +152,9 @@ fn commit_staged(
         for prepared in &entities {
             let entity_id = prepared.entity_id;
             let key = entity_id.to_bytes();
-            let current = canonical
-                .get(key)?
-                .map(|bytes| {
-                    bincode::deserialize::<StateFragment>(bytes.as_ref())
-                        .map(|fragment| Attested::<EntityState>::from_parts(entity_id, fragment))
-                        .map_err(sled_abort)
-                })
-                .transpose()?;
-            let current_head = current.as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default();
+            let current =
+                canonical.get(key)?.map(|bytes| crate::entity::decode_state(entity_id, bytes.as_ref()).map_err(sled_abort)).transpose()?;
+            let current_head = current.as_ref().map(|state| state.state.head.clone()).unwrap_or_default();
             if current_head != prepared.expected_head {
                 conflict = true;
             }

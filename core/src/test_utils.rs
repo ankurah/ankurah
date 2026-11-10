@@ -28,13 +28,13 @@ pub(crate) struct TestStorage {
 
 #[derive(Default)]
 struct TestData {
-    states: BTreeMap<EntityId, Attested<EntityState>>,
+    states: BTreeMap<EntityId, EntityState>,
     events: BTreeMap<EventId, Attested<Event>>,
 }
 
 impl TestStorage {
     /// Replace fixture data directly, including intentionally corrupt state.
-    pub fn set_state(&self, state: Attested<EntityState>) { self.data.lock().unwrap().states.insert(state.payload.entity_id, state); }
+    pub fn set_state(&self, state: EntityState) { self.data.lock().unwrap().states.insert(state.entity_id, state); }
 
     pub fn fail_next_commit(&self) { self.fail_next_commit.store(true, Ordering::SeqCst); }
 
@@ -46,7 +46,7 @@ impl TestStorage {
 
 pub(crate) struct TestStorageTransaction<'a> {
     storage: &'a TestStorage,
-    states: Vec<(Clock, Attested<EntityState>)>,
+    states: Vec<(Clock, EntityState)>,
     events: Vec<Attested<Event>>,
 }
 
@@ -57,14 +57,14 @@ impl StorageTransaction for TestStorageTransaction<'_> {
         Ok(())
     }
 
-    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>) -> Result<(), MutationError> {
+    async fn set_state(&mut self, expected_head: &Clock, state: &EntityState) -> Result<(), MutationError> {
         let hold = self.storage.hold_set_state.lock().unwrap().take();
         if let Some((entered, release)) = hold {
             entered.send(()).unwrap();
             release.await.unwrap();
         }
-        if let Some((_, previous)) = self.states.iter_mut().find(|(_, previous)| previous.payload.entity_id == state.payload.entity_id) {
-            if previous.payload.state.head != *expected_head {
+        if let Some((_, previous)) = self.states.iter_mut().find(|(_, previous)| previous.entity_id == state.entity_id) {
+            if previous.state.head != *expected_head {
                 return Err(MutationError::InvalidUpdate("state does not follow the preceding transaction write"));
             }
             *previous = state.clone();
@@ -101,25 +101,24 @@ impl TestStorageTransaction<'_> {
             .states
             .iter()
             .map(|(_, state)| {
-                let id = state.payload.entity_id;
+                let id = state.entity_id;
                 (id, data.states.get(&id).cloned())
             })
             .collect();
         if self.states.iter().any(|(expected_head, state)| {
-            observed[&state.payload.entity_id].as_ref().map(|state| state.payload.state.head.clone()).unwrap_or_default() != *expected_head
+            observed[&state.entity_id].as_ref().map(|state| state.state.head.clone()).unwrap_or_default() != *expected_head
         }) {
             return Ok(StorageCommitOutcome::Conflict { observed });
         }
         let mut entities = Vec::new();
-        for (_, attested_state) in self.states {
-            let entity_id = attested_state.payload.entity_id;
+        for (_, state) in self.states {
+            let entity_id = state.entity_id;
             let previous = observed[&entity_id].as_ref();
-            let state = &attested_state.payload.state;
             entities.push(CommittedEntityWrite {
                 entity_id,
-                canonical_changed: previous.is_none_or(|previous| previous.payload.state.head != state.head),
+                canonical_changed: previous.is_none_or(|previous| previous.state.head != state.state.head),
             });
-            data.states.insert(entity_id, attested_state);
+            data.states.insert(entity_id, state);
         }
         for event in self.events {
             data.events.insert(event.payload.id(), event);
@@ -135,17 +134,14 @@ impl StorageEngine for TestStorage {
 
     fn transaction(&self) -> Self::Transaction<'_> { TestStorageTransaction { storage: self, states: Vec::new(), events: Vec::new() } }
 
-    async fn get_state(&self, id: EntityId) -> Result<Attested<EntityState>, RetrievalError> {
+    async fn get_state(&self, id: EntityId) -> Result<EntityState, RetrievalError> {
         if *self.reject_state_read.lock().unwrap() == Some(id) {
             return Err(RetrievalError::Other("unexpected state reload".into()));
         }
         self.data.lock().unwrap().states.get(&id).cloned().ok_or(RetrievalError::EntityNotFound(id))
     }
 
-    async fn fetch_states(
-        &self,
-        selection: &ankql::ast::Selection<ankql::ast::Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError> {
+    async fn fetch_states(&self, selection: &ankql::ast::Selection<ankql::ast::Resolved>) -> Result<Vec<EntityState>, RetrievalError> {
         assert!(selection.order_by.is_none() && selection.limit.is_none());
         let predicate = selection.predicate.assume_null(&[]);
         let models = selection.predicate.referenced_models();
@@ -162,12 +158,12 @@ impl StorageEngine for TestStorage {
         for state in states {
             // Membership-only scans do not decode unrelated property backends.
             if let ankql::ast::Predicate::MemberOf(model) = &predicate {
-                if state.payload.state.memberships.contains(model) {
+                if state.state.memberships.contains(model) {
                     matching.push(state);
                 }
                 continue;
             }
-            let entity = crate::entity::TemporaryEntity::new(state.payload.entity_id, &state.payload.state)?;
+            let entity = crate::entity::TemporaryEntity::new(state.entity_id, &state.state)?;
             if crate::selection::filter::evaluate_predicate(&entity, &predicate)
                 .map_err(|error| RetrievalError::Other(error.to_string()))?
             {
@@ -207,7 +203,7 @@ impl StorageEngine for TestStorage {
             .unwrap()
             .states
             .values()
-            .flat_map(|state| state.payload.state.memberships.iter().copied())
+            .flat_map(|state| state.state.memberships.iter().copied())
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
             .collect())

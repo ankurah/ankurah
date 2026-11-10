@@ -255,7 +255,7 @@ async fn catalog_values(
 ) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
     use ankurah::core::property::backend::{LWWBackend, PropertyBackend};
     let state = node.storage.get_state(id).await?;
-    let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
+    let buffer = state.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
     // Catalog fields are closed system properties; their id renderings ARE
     // their registered names, so rendering the keys gives the name map the
     // assertions read.

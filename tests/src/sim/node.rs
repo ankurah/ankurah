@@ -97,7 +97,7 @@ impl SimNode {
             }
         }
         match self.node.storage.get_state(entity).await {
-            Ok(state) => Some(state.payload.state),
+            Ok(state) => Some(state.state),
             Err(_) => None,
         }
     }
@@ -108,7 +108,7 @@ impl SimNode {
         let model = proto::ModelId::EntityId(super::model::sim_model_id());
         let selection = ankql::ast::Predicate::MemberOf(model).into();
         match self.node.storage.fetch_states(&selection).await {
-            Ok(states) => states.into_iter().map(|s| s.payload.entity_id).collect(),
+            Ok(states) => states.into_iter().map(|s| s.entity_id).collect(),
             Err(_) => Vec::new(),
         }
     }

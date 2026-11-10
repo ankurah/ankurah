@@ -28,37 +28,34 @@ impl CatalogResolver for TestResolver {
 
 fn entity_id(byte: u8) -> EntityId { EntityId::from_bytes([byte; EntityId::BYTE_LEN]) }
 
-fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId, &str)]) -> Attested<EntityState> {
+fn state_with_strings(entity_id: EntityId, event_byte: u8, values: &[(PropertyId, &str)]) -> EntityState {
     let backend = LWWBackend::new();
     for (property, value) in values {
         backend.set(*property, Some(Value::String((*value).to_owned())));
     }
     let event = ankurah_core::test_helpers::commit_backend(&backend, event_byte).unwrap();
-    Attested::opt(
-        EntityState {
-            entity_id,
-            state: State {
-                state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
-                memberships: BTreeSet::new(),
-                // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
-                head: Clock::singleton(&event),
-            },
+    EntityState {
+        entity_id,
+        state: State {
+            state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), backend.to_state_buffer().unwrap())])),
+            memberships: BTreeSet::new(),
+            // A synthetic first-generation state: the engine stores what it is given, and stamping is not exercised here.
+            head: Clock::singleton(&event),
         },
-        None,
-    )
+    }
 }
 
-fn state_for_model(mut state: Attested<EntityState>, model: ModelId) -> Attested<EntityState> {
-    state.payload.state.memberships = [model].into();
+fn state_for_model(mut state: EntityState, model: ModelId) -> EntityState {
+    state.state.memberships = [model].into();
     state
 }
 
-fn state_for_models(mut state: Attested<EntityState>, models: impl IntoIterator<Item = ModelId>) -> Attested<EntityState> {
-    state.payload.state.memberships = models.into_iter().collect();
+fn state_for_models(mut state: EntityState, models: impl IntoIterator<Item = ModelId>) -> EntityState {
+    state.state.memberships = models.into_iter().collect();
     state
 }
 
-async fn commit_canonical_state(engine: &IndexedDBStorageEngine, expected_head: Clock, state: Attested<EntityState>) -> anyhow::Result<()> {
+async fn commit_canonical_state(engine: &IndexedDBStorageEngine, expected_head: Clock, state: EntityState) -> anyhow::Result<()> {
     let mut transaction = engine.transaction();
     transaction.set_state(&expected_head, &state).await?;
     let outcome = transaction.commit().await?;
@@ -66,12 +63,7 @@ async fn commit_canonical_state(engine: &IndexedDBStorageEngine, expected_head: 
     Ok(())
 }
 
-async fn commit_state(
-    engine: &IndexedDBStorageEngine,
-    expected_head: Clock,
-    model: ModelId,
-    state: Attested<EntityState>,
-) -> anyhow::Result<()> {
+async fn commit_state(engine: &IndexedDBStorageEngine, expected_head: Clock, model: ModelId, state: EntityState) -> anyhow::Result<()> {
     commit_canonical_state(engine, expected_head, state_for_model(state, model)).await
 }
 
@@ -100,8 +92,8 @@ async fn colliding_model_and_property_labels_remain_isolated() -> anyhow::Result
     let all = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
     let found_a = engine.fetch_states(&all.clone().and_member_of(model_a)).await?;
     let found_b = engine.fetch_states(&all.clone().and_member_of(model_b)).await?;
-    assert_eq!(found_a.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity_a]);
-    assert_eq!(found_b.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity_b]);
+    assert_eq!(found_a.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity_a]);
+    assert_eq!(found_b.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity_b]);
 
     // Both properties seed from the same label inside model A. Address each
     // by durable identity to prove their physical fields were deconflicted
@@ -118,7 +110,7 @@ async fn colliding_model_and_property_labels_remain_isolated() -> anyhow::Result
             limit: None,
         };
         let found = engine.fetch_states(&selection.clone().and_member_of(model_a)).await?;
-        assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity_a]);
+        assert_eq!(found.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity_a]);
     }
 
     engine.db.close().await;
@@ -145,7 +137,7 @@ async fn write_refreshes_every_canonical_membership_materialization() -> anyhow:
     let initial = state_for_models(state_with_strings(entity, 1, &[(property_a, "a1"), (property_b, "b1")]), [model_a, model_b]);
     commit_canonical_state(&engine, Clock::default(), initial.clone()).await?;
     let updated = state_for_models(state_with_strings(entity, 2, &[(property_a, "a2"), (property_b, "b2")]), [model_a, model_b]);
-    commit_canonical_state(&engine, initial.payload.state.head, updated).await?;
+    commit_canonical_state(&engine, initial.state.head, updated).await?;
 
     let selection = ankql::ast::Selection {
         predicate: ankql::ast::Predicate::Comparison {
@@ -158,7 +150,7 @@ async fn write_refreshes_every_canonical_membership_materialization() -> anyhow:
     };
     let found = engine.fetch_states(&selection.clone().and_member_of(model_b)).await?;
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].payload.entity_id, entity);
+    assert_eq!(found[0].entity_id, entity);
 
     engine.db.close().await;
     IndexedDBStorageEngine::cleanup(&db_name).await?;
@@ -180,7 +172,7 @@ async fn reader_reloads_property_fields_assigned_by_another_engine() -> anyhow::
     // Populate the reader's field cache before the writer adds another property.
     let all = ankql::ast::Selection::from(ankql::ast::Predicate::True).and_member_of(model);
     assert_eq!(reader.fetch_states(&all).await?.len(), 1);
-    commit_state(&writer, first.payload.state.head, model, state_with_strings(entity, 2, &[(existing, "old"), (added, "new")])).await?;
+    commit_state(&writer, first.state.head, model, state_with_strings(entity, 2, &[(existing, "old"), (added, "new")])).await?;
 
     let selection = ankql::ast::Selection::from(ankql::ast::Predicate::Comparison {
         left: Box::new(ankql::ast::Expr::Path(added.into())),
@@ -189,7 +181,7 @@ async fn reader_reloads_property_fields_assigned_by_another_engine() -> anyhow::
     })
     .and_member_of(model);
     let found = reader.fetch_states(&selection).await?;
-    assert_eq!(found.iter().map(|state| state.payload.entity_id).collect::<Vec<_>>(), vec![entity]);
+    assert_eq!(found.iter().map(|state| state.entity_id).collect::<Vec<_>>(), vec![entity]);
 
     reader.db.close().await;
     writer.db.close().await;
@@ -218,7 +210,7 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
 
     let mut transaction = engine.transaction();
     transaction
-        .set_state(&first.payload.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
+        .set_state(&first.state.head, &state_for_model(state_with_strings(first_id, 3, &[(property, "first-new")]), model_b))
         .await?;
     transaction
         .set_state(&Clock::default(), &state_for_model(state_with_strings(second_id, 4, &[(property, "second-new")]), model_b))
@@ -227,10 +219,10 @@ async fn stale_head_rolls_back_the_complete_batch() -> anyhow::Result<()> {
     let StorageCommitOutcome::Conflict { observed } = outcome else {
         anyhow::bail!("one stale expected head must reject the complete batch");
     };
-    assert_eq!(observed[&first_id].as_ref().unwrap().payload.state.head, first.payload.state.head);
-    assert_eq!(observed[&second_id].as_ref().unwrap().payload.state.head, second.payload.state.head);
-    assert_eq!(engine.get_state(first_id).await?.payload.state.head, first.payload.state.head);
-    assert_eq!(engine.get_state(second_id).await?.payload.state.head, second.payload.state.head);
+    assert_eq!(observed[&first_id].as_ref().unwrap().state.head, first.state.head);
+    assert_eq!(observed[&second_id].as_ref().unwrap().state.head, second.state.head);
+    assert_eq!(engine.get_state(first_id).await?.state.head, first.state.head);
+    assert_eq!(engine.get_state(second_id).await?.state.head, second.state.head);
 
     let all = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
     assert!(
@@ -267,10 +259,10 @@ async fn distinct_tip_generations_survive_a_write_and_a_read() -> anyhow::Result
     let engine = IndexedDBStorageEngine::open(&db_name).await?;
     let mut state = state_with_strings(entity_id(0x51), 1, &[(PropertyId::EntityId(entity_id(0x52)), "value")]);
     // Synthetic tips with distinct generations: the engine must retain each association.
-    state.payload.state.head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
+    state.state.head = Clock::new(vec![(7, EventId::from_bytes([1; 32])), (2, EventId::from_bytes([2; 32]))]).unwrap();
     commit_canonical_state(&engine, Clock::default(), state.clone()).await?;
-    let stored = engine.get_state(entity_id(0x51)).await?.payload.state;
-    assert_eq!(stored.head, state.payload.state.head);
+    let stored = engine.get_state(entity_id(0x51)).await?.state;
+    assert_eq!(stored.head, state.state.head);
 
     engine.db.close().await;
     IndexedDBStorageEngine::cleanup(&db_name).await?;

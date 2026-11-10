@@ -111,7 +111,7 @@ fn resolve_by_collection(node: &TestNode, collection: &str, name: &str) -> Optio
 /// The stored catalog head for an entity (head-comparison helper; mirrors
 /// schema_registration.rs).
 async fn catalog_head(node: &TestNode, _collection: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
-    Ok(node.storage.get_state(id).await?.payload.state.head)
+    Ok(node.storage.get_state(id).await?.state.head)
 }
 
 // (a) Auto-assert: create on the ephemeral; the durable executes the

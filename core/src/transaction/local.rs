@@ -219,7 +219,7 @@ impl Transaction {
                     .await?;
                 storage_trx.add_events(&events).await?;
                 let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };
-                storage_trx.set_state(&expected_head, &state.into()).await?;
+                storage_trx.set_state(&expected_head, &state).await?;
                 attested_events.extend(events);
                 forks.push((entity, entity_after));
             }

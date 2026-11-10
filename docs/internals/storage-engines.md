@@ -153,9 +153,10 @@ the canonical entity, association, and materialization stores.
 ## Query execution
 
 `fetch_states(model, selection)` queries the model's materialized surface but
-returns canonical attested states. Model projections contain the fields and
-indexes needed to select entity ids; canonical buffers, heads, and
-attestations remain in the shared entity store.
+returns canonical states. Model projections contain the fields and indexes
+needed to select entity ids; canonical buffers and heads remain in the shared
+entity store. States are stored without attestations: a statement about a
+state is made by the node that serves it.
 
 `storage/common` carries the shared planning and residual-evaluation machinery:
 

@@ -61,13 +61,13 @@ async fn local_and_remote_commits_preserve_plural_membership() -> anyhow::Result
     pets.update_selection_wait("name = 'Nori' AND age = '3'").await?;
 
     let plural = storage.get_state(entity_id).await?;
-    assert_eq!(plural.payload.state.memberships, [album_model, pet_model].into());
-    let update = proto::Event::update(entity_id, plural.payload.state.head, proto::OperationSet::default());
+    assert_eq!(plural.state.memberships, [album_model, pet_model].into());
+    let update = proto::Event::update(entity_id, plural.state.head, proto::OperationSet::default());
     let events = vec![proto::Attested::opt(update, None)];
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), events).await?;
 
     let canonical = storage.get_state(entity_id).await?;
-    assert_eq!(canonical.payload.state.memberships, [album_model, pet_model].into());
+    assert_eq!(canonical.state.memberships, [album_model, pet_model].into());
     // An identity lookup checks the complete membership set, not one model's projection.
     use ankql::ast::Predicate;
     use ankurah::core::storage::GetStateResult;

@@ -4,7 +4,7 @@ use crate::{
     sorting::{LimitedStream, SortedStream, TopKStream},
 };
 use ankurah_core::{EntityId, error::RetrievalError};
-use ankurah_proto::{Attested, EntityState};
+use ankurah_proto::EntityState;
 use futures::Stream;
 
 /// Stream of entity IDs - generic over any storage engine
@@ -14,9 +14,9 @@ pub trait EntityIdStream: Stream<Item = Result<EntityId, RetrievalError>> + Unpi
 }
 
 /// Stream of entity states - generic over any storage engine
-pub trait EntityStateStream: Stream<Item = Result<Attested<EntityState>, RetrievalError>> + Unpin {
+pub trait EntityStateStream: Stream<Item = Result<EntityState, RetrievalError>> + Unpin {
     /// Collect states, failing fast on first error (async version)
-    fn collect_states(self) -> impl std::future::Future<Output = Result<Vec<Attested<EntityState>>, RetrievalError>>
+    fn collect_states(self) -> impl std::future::Future<Output = Result<Vec<EntityState>, RetrievalError>>
     where Self: Sized {
         use futures::StreamExt;
         async move {
@@ -46,7 +46,7 @@ pub trait ScanExt: Sized {
 
 // Blanket implementations for common stream types
 impl<S> EntityIdStream for S where S: Stream<Item = Result<EntityId, RetrievalError>> + Unpin {}
-impl<S> EntityStateStream for S where S: Stream<Item = Result<Attested<EntityState>, RetrievalError>> + Unpin {}
+impl<S> EntityStateStream for S where S: Stream<Item = Result<EntityState, RetrievalError>> + Unpin {}
 
 /// GetPropertyValueStream: default combinators that construct wrapper streams
 pub trait GetPropertyValueStream: Stream + Unpin + Sized {

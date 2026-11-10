@@ -6,7 +6,7 @@ use ankurah_core::{
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     value::Value,
 };
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers};
+use ankurah_proto::{Clock, EntityId, EntityState, ModelId, PropertyId, State, StateBuffers};
 
 /// The stored integers in numeric order, spanning zero and both ends of `i64`.
 const ASCENDING: [i64; 9] = [i64::MIN, -1_000_000_000_000, -5, -1, 0, 3, 10, 1_000_000_000_000, i64::MAX];
@@ -79,7 +79,7 @@ async fn fetch(
 ) -> anyhow::Result<Vec<i64>> {
     let order_by = direction.map(|direction| vec![OrderByItem { path: property().into(), direction }]);
     let selection = Selection { predicate: predicate.clone(), order_by, limit }.and_member_of(model());
-    Ok(engine.fetch_states(&selection).await?.iter().map(|state| values[&state.payload.entity_id]).collect())
+    Ok(engine.fetch_states(&selection).await?.iter().map(|state| values[&state.entity_id]).collect())
 }
 
 /// Store each integer of `ASCENDING` as one LWW property of its own `model()` entity.
@@ -90,17 +90,14 @@ async fn write_values(engine: &impl StorageEngine) -> anyhow::Result<HashMap<Ent
         backend.set(property(), Some(Value::I64(value)));
         let event = ankurah_core::test_helpers::commit_backend(&backend, byte)?;
         let entity_id = EntityId::from_bytes([byte; 32]);
-        let state = Attested::opt(
-            EntityState {
-                entity_id,
-                state: State {
-                    state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
-                    memberships: BTreeSet::from([model()]),
-                    head: Clock::singleton(&event),
-                },
+        let state = EntityState {
+            entity_id,
+            state: State {
+                state_buffers: StateBuffers(BTreeMap::from([("lww".into(), backend.to_state_buffer()?)])),
+                memberships: BTreeSet::from([model()]),
+                head: Clock::singleton(&event),
             },
-            None,
-        );
+        };
         let mut transaction = engine.transaction();
         transaction.set_state(&Clock::default(), &state).await?;
         assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));

@@ -274,7 +274,7 @@ The following names describe responsibilities, not mandatory identifiers:
 
 | Logical store | Contents |
 |---|---|
-| entity store | One canonical state/head/attestation record per `EntityId` |
+| entity store | One canonical state/head record per `EntityId`, stored without attestations |
 | event store | One canonical event/attestation record per `EventId` |
 | association store | Durable set of `(EntityId, ModelId)` |
 | model materialization | Projected values and indexes for one `ModelId` |

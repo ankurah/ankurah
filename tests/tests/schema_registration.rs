@@ -43,14 +43,14 @@ fn album_request() -> proto::NodeRequestBody {
 
 async fn catalog_values(node: &TestNode, _model: &str, id: EntityId) -> anyhow::Result<BTreeMap<String, Option<Value>>> {
     let state = node.storage.get_state(id).await?;
-    let buffer = state.payload.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
+    let buffer = state.state.state_buffers.0.get("lww").expect("catalog entities are LWW").clone();
     // Catalog collections are name-keyed at the backend layer (the bootstrap
     // exemption), so the values are already keyed by their registered names.
     Ok(LWWBackend::from_state_buffer(&buffer)?.property_values().into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
 async fn catalog_head(node: &TestNode, _model: &str, id: EntityId) -> anyhow::Result<proto::Clock> {
-    Ok(node.storage.get_state(id).await?.payload.state.head)
+    Ok(node.storage.get_state(id).await?.state.head)
 }
 
 async fn connected_pair(

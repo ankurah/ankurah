@@ -58,7 +58,7 @@ async fn test_ephemeral_writes_durable_receives() -> Result<()> {
     });
     // Verify head has 2 members
     let state = durable.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     // Verify both changes applied
     let final_album = ctx_d.get::<AlbumView>(album_id).await?;
@@ -189,7 +189,7 @@ async fn test_durable_vs_ephemeral_concurrent_write() -> Result<()> {
     });
 
     let state = durable.storage.get_state(album_id).await?;
-    clock_eq!(dag, state.payload.state.head, [B, C]);
+    clock_eq!(dag, state.state.head, [B, C]);
 
     Ok(())
 }

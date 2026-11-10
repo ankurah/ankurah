@@ -84,7 +84,7 @@ async fn entity_states<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgen
     }
     for result in node.storage.get_states(unloaded, &Predicate::True).await? {
         if let GetStateResult::Found(state) = result {
-            states.insert(state.payload.entity_id, state.payload.state);
+            states.insert(state.entity_id, state.state);
         }
     }
     Ok(states)
@@ -132,7 +132,7 @@ where
 
             let mut deltas = Vec::new();
             for state in expanded_states {
-                if policy.check_read(&state.payload.entity_id, &state.payload.state).is_err() {
+                if policy.check_read(&state.entity_id, &state.state).is_err() {
                     continue;
                 }
 
@@ -144,16 +144,14 @@ where
         }
         proto::NodeRequestBody::Get { ids } => {
             let policy = ContextPolicy::from_credentials(&node.policy_agent, cdata);
-            let mut results: Vec<_> =
-                node.storage.get_states(ids, &policy.retrieval_predicate()).await?.into_iter().map(Into::into).collect();
+            let mut results = node.storage.get_states(ids, &policy.retrieval_predicate()).await?;
             policy.check_reads(&mut results);
             let results = results
                 .into_iter()
                 .map(|result| match result {
-                    proto::GetResult::Found(state) => {
-                        proto::GetResult::Found(crate::node::identity::attestation::served_state(node, state.payload))
-                    }
-                    unserved => unserved,
+                    GetStateResult::Found(state) => proto::GetResult::Found(crate::node::identity::attestation::served_state(node, state)),
+                    GetStateResult::NotFound(id) => proto::GetResult::NotFound(id),
+                    GetStateResult::PredicateMismatch(id) => proto::GetResult::AccessDenied(id),
                 })
                 .collect();
             Ok(proto::NodeResponseBody::Get(results))
