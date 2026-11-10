@@ -1,4 +1,4 @@
-use super::{AccessDenied, PolicyAgent};
+use super::{AccessDenied, AttestationRequest, PolicyAgent};
 use crate::context::ContextAuth;
 use crate::entity::{Entity, TemporaryEntity};
 use crate::error::{InadmissibleEvent, MutationError};
@@ -7,7 +7,7 @@ use crate::selection::filter::evaluate_predicate;
 use crate::storage::{GetStateResult, StorageEngine};
 use crate::util::Iterable;
 use ankql::ast::{Predicate, Resolved};
-use ankurah_proto::{Attestation, Attested, EntityId, Event, ModelId, State};
+use ankurah_proto::{Attested, EntityId, Event, ModelId, State};
 use ankurah_signals::{ListenerGuard, Mut, Peek, Signal};
 use std::collections::HashSet;
 use std::sync::{
@@ -214,7 +214,7 @@ impl<'a, PA: PolicyAgent, C: Signal + Peek<Vec<PA::ContextData>>> ContextPolicy<
         before: &Entity,
         after: &Entity,
         event: &Event,
-    ) -> Result<Option<Attestation>, MutationError> {
+    ) -> Result<Option<AttestationRequest>, MutationError> {
         self.check_models(after.memberships())?;
         match &self.auth {
             ContextAuth::Sessions(_) => Ok(self.agent.check_write_event(node, &self.write_credential()?, before, after, event)?),

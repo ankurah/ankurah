@@ -5,7 +5,7 @@ use ankurah::core::{
     entity::Entity,
     error::ValidationError,
     node::{Node as NodeAlias, NodeInner},
-    policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
+    policy::{AccessDenied, AttestationRequest, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     storage::{StorageCommitOutcome, StorageEngine, StorageTransaction},
     util::Iterable,
 };
@@ -165,7 +165,7 @@ impl PolicyAgent for BridgePolicyAgent {
         _entity_before: &Entity,
         _entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
         Ok(None)
     }
 
@@ -179,7 +179,11 @@ impl PolicyAgent for BridgePolicyAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &NodeAlias<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
+    fn request_state_attestation<SE: StorageEngine>(
+        &self,
+        _node: &NodeAlias<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<AttestationRequest> {
         None
     }
 

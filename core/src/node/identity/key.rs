@@ -81,6 +81,11 @@ impl NodeKey {
         }
     }
 
+    /// Seal this key's statement about `subject`: of `kind`, saying `payload`.
+    pub fn attest(&self, subject: proto::Subject, kind: proto::EntityId, payload: Vec<u8>) -> proto::SealedAttestation {
+        proto::Statement { attester: self.identity(), subject, kind, payload }.seal(|bytes| self.sign(bytes))
+    }
+
     /// Sign a presence making `claims`. It verifies only if the claims name this key's node.
     pub fn sign_presence(&self, claims: proto::PresenceClaims) -> proto::Presence { claims.sign(|bytes| self.sign(bytes)) }
 }

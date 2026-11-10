@@ -50,9 +50,7 @@ impl TryFrom<JsValue> for AttestationSet {
         let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
         let mut buffer = vec![0; array.length() as usize];
         array.copy_to(&mut buffer);
-        let set: AttestationSet = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
-
-        Ok(set)
+        AttestationSet::decode(&buffer).map_err(|_| DecodeError::InvalidFormat)
     }
 }
 
@@ -60,7 +58,7 @@ impl TryFrom<&AttestationSet> for JsValue {
     type Error = DecodeError;
 
     fn try_from(val: &AttestationSet) -> Result<Self, Self::Error> {
-        let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
+        let buffer = val.encode();
         let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
         array.copy_from(&buffer);
         Ok(array.into())

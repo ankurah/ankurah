@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth::{AttestationSet, Attested},
+    attestation::{AttestationSet, Attested},
     clock::Clock,
     encoding::{self, UndecodableBytes},
     event_id::EventId,
@@ -240,18 +240,6 @@ impl std::fmt::Display for EventFragment {
 
 impl From<Event> for Attested<Event> {
     fn from(val: Event) -> Self { Attested { payload: val, attestations: AttestationSet::default() } }
-}
-
-impl Attested<Event> {
-    pub fn from_parts(entity_id: EntityId, frag: EventFragment) -> Self {
-        Self { payload: Event { entity_id, body: frag.body, parent: frag.parent }, attestations: frag.attestations }
-    }
-
-    /// The bytes a store keeps for this event and its attestations.
-    pub fn encode(&self) -> Vec<u8> { encoding::encode(self) }
-
-    /// The event and attestations `bytes` hold; bytes left over after them make them undecodable.
-    pub fn decode(bytes: &[u8]) -> Result<Self, UndecodableBytes> { encoding::decode_exact(bytes).map_err(UndecodableBytes::of) }
 }
 
 #[cfg(test)]

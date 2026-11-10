@@ -12,7 +12,9 @@ use std::sync::Arc;
 use ankurah_core::error::{MutationError, RetrievalError};
 use ankurah_core::schema::CatalogResolver;
 use ankurah_core::storage::{CommittedEntityWrite, StorageCommitOutcome, StorageCommitResult, StorageEngine, StorageTransaction};
-use ankurah_proto::{Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION};
+use ankurah_proto::{
+    AttestationSet, Attested, Clock, EntityId, EntityState, Event, EventBody, EventId, State, StateBuffers, PROTOCOL_VERSION,
+};
 use ankurah_proto::{ModelId, SystemModel};
 use async_trait::async_trait;
 use rusqlite::{params_from_iter, Connection, OptionalExtension, TransactionBehavior};
@@ -521,7 +523,7 @@ fn decode_event_row((entity_id, body, parent, attestations): RawEventRow) -> Res
             body: EventBody::decode(&body).map_err(RetrievalError::storage)?,
             parent: serde_json::from_str(&parent).map_err(RetrievalError::storage)?,
         },
-        attestations: bincode::deserialize(&attestations).map_err(RetrievalError::storage)?,
+        attestations: AttestationSet::decode(&attestations).map_err(RetrievalError::storage)?,
     })
 }
 

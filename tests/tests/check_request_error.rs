@@ -9,7 +9,7 @@ use ankql::ast::Predicate;
 use ankurah::core::node::ContextData;
 use ankurah::core::util::Iterable;
 use ankurah::error::ValidationError;
-use ankurah::policy::{AccessDenied, PolicyAgent, DEFAULT_CONTEXT};
+use ankurah::policy::{AccessDenied, AttestationRequest, PolicyAgent, DEFAULT_CONTEXT};
 use ankurah::proto::{self, AuthData};
 use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
@@ -68,7 +68,7 @@ impl PolicyAgent for RejectingAgent {
         _entity_before: &ankurah::core::entity::Entity,
         _entity_after: &ankurah::core::entity::Entity,
         _event: &proto::Event,
-    ) -> std::result::Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> std::result::Result<Option<AttestationRequest>, AccessDenied> {
         Ok(None)
     }
 
@@ -81,7 +81,13 @@ impl PolicyAgent for RejectingAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn request_state_attestation<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<AttestationRequest> {
+        None
+    }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

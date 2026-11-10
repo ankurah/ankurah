@@ -1,7 +1,7 @@
 mod common;
 
 use ankurah::core::{entity::Entity, error::ValidationError, node::NodeInner, storage::StorageEngine, util::Iterable};
-use ankurah::policy::{AccessDenied, DefaultContext, PolicyAgent};
+use ankurah::policy::{AccessDenied, AttestationRequest, DefaultContext, PolicyAgent};
 use ankurah::{error::RetrievalError, Mutable};
 use anyhow::Result;
 use common::*;
@@ -49,7 +49,7 @@ impl PolicyAgent for WriteProbe {
         _entity_before: &Entity,
         _entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
         Ok(None)
     }
 
@@ -62,7 +62,13 @@ impl PolicyAgent for WriteProbe {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn request_state_attestation<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<AttestationRequest> {
+        None
+    }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

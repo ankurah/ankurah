@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth::{AttestationSet, Attested},
+    attestation::{AttestationSet, Attested},
     clock::Clock,
     id::EntityId,
 };
