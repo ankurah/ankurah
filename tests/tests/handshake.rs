@@ -5,7 +5,9 @@
 //! from a raw server.
 
 use ankurah::core::connector::PeerConnectionError;
-use ankurah::core::node::NodeKey;
+use ankurah::core::node::{AnnouncementFailure, NodeKey, NodePlugin};
+use ankurah::core::storage::StorageEngine;
+use ankurah::policy::PolicyAgent;
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
 use ankurah_websocket_client::{ConnectionError, WebsocketClient};
@@ -18,7 +20,7 @@ use tokio::net::TcpStream;
 use tokio_tungstenite::{tungstenite::Message as WsMessage, MaybeTlsStream, WebSocketStream};
 
 mod common;
-use common::{proto, start_test_server};
+use common::{proto, serve, start_test_server};
 
 fn versions(lowest: u32, highest: u32) -> proto::ProtocolVersions { proto::ProtocolVersions { lowest, highest } }
 
@@ -294,6 +296,59 @@ async fn the_server_closes_a_silent_client_after_its_opening() -> Result<()> {
         Some(Ok(other)) => panic!("server left the silent handshake open and sent {other:?}"),
     }
 
+    server_task.abort();
+    Ok(())
+}
+
+/// A plugin whose announcement never comes.
+struct SilentAnnouncer;
+
+#[async_trait::async_trait]
+impl<SE, PA> NodePlugin<SE, PA> for SilentAnnouncer
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn name(&self) -> &'static str { "silent-announcer" }
+
+    async fn announce(&self, _: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> { std::future::pending().await }
+}
+
+/// The server's own presence, its plugins' announcements included, is bound by the handshake
+/// deadline: a server whose plugin never announces closes the connection of the client it
+/// registered, and removes that registration.
+#[tokio::test(start_paused = true)]
+async fn the_server_closes_a_connection_whose_answer_is_not_ready_within_the_handshake_deadline() -> Result<()> {
+    let server_node =
+        Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).durable().plug(SilentAnnouncer).build()?;
+    let (server_url, server_task) = serve(server_node.clone()).await?;
+    let key = NodeKey::generate();
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!("{server_url}/ws")).await?;
+    let opening = proto::Opening { versions: SPOKEN, challenge: proto::HandshakeChallenge::new(key.node_id()) };
+    socket.send(frame(&proto::Message::Open(opening))).await?;
+    let server_opening = match socket.next().await {
+        Some(Ok(WsMessage::Binary(data))) => match proto::Message::decode(&data)? {
+            proto::Message::Open(opening) => opening,
+            other => panic!("the server opened with {other}"),
+        },
+        other => panic!("the server opened with {other:?}"),
+    };
+    let claims = claims_answering(&key, &server_opening, SPOKEN, false);
+    socket.send(frame(&proto::Message::Presence(key.sign_presence(claims)))).await?;
+    // Yield rather than sleep, so the paused clock stays put until the server is presenting.
+    while server_node.granted_trust(&key.node_id()).is_none() {
+        tokio::task::yield_now().await;
+    }
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    // As in the silent client's test: resume before bounding the read on the clock.
+    tokio::time::resume();
+    match tokio::time::timeout(Duration::from_secs(1), socket.next()).await.expect("the server left the connection open") {
+        None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => {}
+        Some(Ok(other)) => panic!("the server sent {other:?} instead of closing"),
+    }
+    assert!(eventually(|| server_node.granted_trust(&key.node_id()).is_none()).await, "the server removes the registration");
     server_task.abort();
     Ok(())
 }

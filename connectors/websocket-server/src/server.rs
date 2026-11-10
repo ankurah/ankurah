@@ -32,9 +32,10 @@ use crate::{client_ip::SmartClientIp, OptionalUserAgent};
 use super::sender::{Socket, WebSocketClientSender};
 use super::state::Connection;
 
-// A peer that cannot decode our handshake will never send its Presence, so the
-// pre-establishment state must not be allowed to live for the socket lifetime.
-const INITIAL_PRESENCE_TIMEOUT: Duration = Duration::from_secs(10);
+// The handshake, this node's own presence and every plugin's announcement included, finishes
+// within this, so neither a peer that never presents nor a slow announcement holds open a
+// connection that is not established.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct WebsocketServer<SE, PA>
 where
@@ -126,17 +127,17 @@ where
     let handshake = node.begin_handshake();
     let opening = proto::Message::Open(handshake.opening());
     let mut conn = Connection::Initial { socket: Some(socket), handshake: Some(handshake) };
-    let initial_presence_deadline = tokio::time::Instant::now() + INITIAL_PRESENCE_TIMEOUT;
+    let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
     // The dialer's presence must answer our challenge, and ours answers the dialer's.
-    match tokio::time::timeout_at(initial_presence_deadline, conn.send(opening)).await {
+    match tokio::time::timeout_at(handshake_deadline, conn.send(opening)).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
             debug!("Error sending opening to {client_ip}: {:?}", e);
             return;
         }
         Err(_) => {
-            warn!("Peer at {client_ip} did not take our opening within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+            warn!("Peer at {client_ip} did not take our opening within {HANDSHAKE_TIMEOUT:?}; closing");
             return;
         }
     }
@@ -145,10 +146,10 @@ where
     let receive = async {
         loop {
             let next = if matches!(conn, Connection::Initial { .. }) {
-                match tokio::time::timeout_at(initial_presence_deadline, receiver.next()).await {
+                match tokio::time::timeout_at(handshake_deadline, receiver.next()).await {
                     Ok(next) => next,
                     Err(_) => {
-                        warn!("Peer at {client_ip} did not send presence within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+                        warn!("Peer at {client_ip} did not send presence within {HANDSHAKE_TIMEOUT:?}; closing");
                         break;
                     }
                 }
@@ -158,7 +159,7 @@ where
             let Some(msg) = next else { break };
 
             if let Ok(msg) = msg {
-                if process_message(msg, client_ip, &mut conn, node.clone(), initial_presence_deadline).await.is_break() {
+                if process_message(msg, client_ip, &mut conn, node.clone(), handshake_deadline).await.is_break() {
                     break;
                 }
             } else {
@@ -208,7 +209,7 @@ async fn read_opening(
     match tokio::time::timeout_at(handshake_deadline, state.send(proto::Message::NoCommonVersion(ours))).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("Failed to send peer at {client_ip} the versions this node speaks: {error:?}"),
-        Err(_) => warn!("Peer at {client_ip} did not take the versions this node speaks within {INITIAL_PRESENCE_TIMEOUT:?}"),
+        Err(_) => warn!("Peer at {client_ip} did not take the versions this node speaks within {HANDSHAKE_TIMEOUT:?}"),
     }
     Some(ControlFlow::Break(()))
 }
@@ -230,17 +231,20 @@ where
 {
     debug!("Received client presence from {}", client_ip);
     let (sender, writer) = WebSocketClientSender::new(presence.claims.node_id);
-    // Outside the deadline: cancelling registration partway could leave the peer registered.
+    // Outside the deadline, so no plugin's hook is cut off partway.
     match node.register_peer(presence, &handshake, PeerProvenance::Inbound, Box::new(sender.clone())).await {
         // Held by the connection from here, so the peer is deregistered however the connection ends.
         Ok(registration) => *state = Connection::Established { sender, registration },
         Err(refusal) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
     }
-    let answer = match node.presence(&handshake).await {
-        Ok(presence) => proto::Message::Presence(presence),
-        Err(refusal) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
+    let answer = match tokio::time::timeout_at(handshake_deadline, node.presence(&handshake)).await {
+        Ok(Ok(presence)) => proto::Message::Presence(presence),
+        Ok(Err(refusal)) => return refuse(&mut socket, refusal, client_ip, handshake_deadline).await,
+        Err(_) => {
+            warn!("This node's presence for peer at {client_ip} was not ready within {HANDSHAKE_TIMEOUT:?}; closing");
+            return ControlFlow::Break(());
+        }
     };
-    // Within the handshake deadline, so a peer that stops reading cannot hold the connection open.
     match tokio::time::timeout_at(handshake_deadline, socket.send(axum::extract::ws::Message::Binary(answer.encode().into()))).await {
         Ok(Ok(())) if writer.send(socket).is_ok() => ControlFlow::Continue(()),
         Ok(Ok(())) => {
@@ -252,7 +256,7 @@ where
             ControlFlow::Break(())
         }
         Err(_) => {
-            warn!("Peer at {client_ip} did not take our answer to its presence within {INITIAL_PRESENCE_TIMEOUT:?}; closing");
+            warn!("Peer at {client_ip} did not take our answer to its presence within {HANDSHAKE_TIMEOUT:?}; closing");
             ControlFlow::Break(())
         }
     }
