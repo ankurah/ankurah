@@ -78,6 +78,19 @@ pub enum NodeMessage {
     UnsubscribeQuery { from: NodeId, query_id: QueryId },
 }
 
+impl NodeMessage {
+    /// The node this message names as its sender.
+    pub fn sender(&self) -> NodeId {
+        match self {
+            NodeMessage::Request { request, .. } => request.from,
+            NodeMessage::Response(response) => response.from,
+            NodeMessage::Update(update) => update.from,
+            NodeMessage::UpdateAck(ack) => ack.from,
+            NodeMessage::UnsubscribeQuery { from, .. } => *from,
+        }
+    }
+}
+
 impl std::fmt::Display for Message {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -144,22 +157,34 @@ mod tests {
         }
     }
 
-    #[test]
-    fn node_message_variant_order_is_pinned() {
-        let (from, to) = (node(1), node(2));
+    /// One message of each kind, in declaration order, from `from` to `to`.
+    fn one_node_message_of_each_kind(from: NodeId, to: NodeId) -> [NodeMessage; 5] {
         let request = NodeRequest { id: RequestId::new(), to, from, body: CarriedBody::encode(&NodeRequestBody::Get { ids: vec![] }) };
         let response = NodeResponse { request_id: RequestId::new(), from, to, body: CarriedBody::encode(&NodeResponseBody::Success) };
         let body = CarriedBody::encode(&NodeUpdateBody::SubscriptionUpdate { items: vec![] });
         let update = NodeUpdate { id: UpdateId::new(), from, to, body };
         let ack = NodeUpdateAck { id: UpdateId::new(), from, to, body: NodeUpdateAckBody::Success };
-        for (message, index) in [
-            (NodeMessage::Request { auth: vec![], request }, [0, 0, 0, 0]),
-            (NodeMessage::Response(response), [1, 0, 0, 0]),
-            (NodeMessage::Update(update), [2, 0, 0, 0]),
-            (NodeMessage::UpdateAck(ack), [3, 0, 0, 0]),
-            (NodeMessage::UnsubscribeQuery { from, query_id: QueryId::test(1) }, [4, 0, 0, 0]),
-        ] {
+        [
+            NodeMessage::Request { auth: vec![], request },
+            NodeMessage::Response(response),
+            NodeMessage::Update(update),
+            NodeMessage::UpdateAck(ack),
+            NodeMessage::UnsubscribeQuery { from, query_id: QueryId::test(1) },
+        ]
+    }
+
+    #[test]
+    fn node_message_variant_order_is_pinned() {
+        let indices = [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0]];
+        for (message, index) in one_node_message_of_each_kind(node(1), node(2)).into_iter().zip(indices) {
             assert_eq!(encode(&message)[..4], index, "{message}");
+        }
+    }
+
+    #[test]
+    fn every_node_message_names_its_sender() {
+        for message in one_node_message_of_each_kind(node(1), node(2)) {
+            assert_eq!(message.sender(), node(1), "{message}");
         }
     }
 

@@ -21,7 +21,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     node.lifecycle.check_not_halted()?;
-    let sender_named = sender_of(&message);
+    let sender_named = message.sender();
     if sender_named != registration.peer() {
         warn!("Node({}) refusing a frame from peer {} that names {} as its sender", node.id, registration.peer(), sender_named);
         return Ok(());
@@ -136,16 +136,5 @@ where
             applier::NodeApplier::apply_updates(node, &from, items).await?;
             Ok(())
         }
-    }
-}
-
-/// The node a frame names as its sender.
-fn sender_of(message: &proto::NodeMessage) -> proto::NodeId {
-    match message {
-        proto::NodeMessage::Request { request, .. } => request.from,
-        proto::NodeMessage::Response(response) => response.from,
-        proto::NodeMessage::Update(update) => update.from,
-        proto::NodeMessage::UpdateAck(ack) => ack.from,
-        proto::NodeMessage::UnsubscribeQuery { from, .. } => *from,
     }
 }
