@@ -1,12 +1,10 @@
 //! Static model declarations and their catalog bindings.
 
 use super::catalog::register::{Registrant, RegistrantProperty};
-use super::catalog::resolver::{resolve_selection, DescriptorResolver};
 use super::catalog::{CatalogManager, SysModelRow, SysPropertyRow};
 use super::cell::PerSystemOnceCell;
 use super::registration::{RegistrationError, RegistrationError::Retrieval};
 use super::SystemEpoch;
-use ankql::ast::{Parsed, Resolved, Selection};
 use ankurah_proto::{EntityId, ModelId, PropertyId, RegisterModel, RegisterProperty, SystemModel};
 
 use crate::error::RetrievalError;
@@ -98,23 +96,6 @@ impl ModelStructDescriptor {
             catalog.resolve_local(&mut self.registrant(epoch))?;
         }
         self.model_id(epoch)
-    }
-
-    /// Resolve names and literal types against this model, restricting the selection to its members.
-    pub(crate) fn resolve_selection(
-        &'static self,
-        catalog: &CatalogManager,
-        epoch: Option<SystemEpoch>,
-        selection: Selection<Parsed>,
-    ) -> Result<Selection<Resolved>, RetrievalError> {
-        let epoch = match (self.system, epoch) {
-            (Some(_), None) => SystemEpoch::BOOTSTRAP,
-            (_, Some(epoch)) => epoch,
-            (None, None) => return Err(RetrievalError::UnboundDeclaration { label: self.label.to_string() }),
-        };
-        let model = self.bind_local(catalog, epoch)?;
-        let resolver = DescriptorResolver { schema: self, epoch, catalog };
-        Ok(resolve_selection(&model, &resolver, selection)?.and_member_of(model))
     }
 
     /// The active field whose display name is `name`, if any.

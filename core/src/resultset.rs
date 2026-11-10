@@ -1,5 +1,6 @@
 use crate::indexing::{encode_tuple_values_with_key_spec, KeySpec};
 use crate::internal::prelude::*;
+use crate::model::ComponentViews;
 use crate::reactor::AbstractEntity;
 use ankql::ast::PropertyId;
 use ankurah_proto as proto;
@@ -49,22 +50,22 @@ pub struct EntityResultSet<E: AbstractEntity = Entity>(Arc<Inner<E>>);
 
 /// View-typed ResultSet
 #[derive(Debug)]
-pub struct ResultSet<R: View>(EntityResultSet<Entity>, std::marker::PhantomData<R>);
+pub struct ResultSet<R: ComponentViews>(EntityResultSet<Entity>, std::marker::PhantomData<R>);
 
-impl<R: View> Deref for ResultSet<R> {
+impl<R: ComponentViews> Deref for ResultSet<R> {
     type Target = EntityResultSet<Entity>;
     fn deref(&self) -> &Self::Target { &self.0 }
 }
 
-impl<R: View> ResultSet<R> {
+impl<R: ComponentViews> ResultSet<R> {
     pub fn by_id(&self, id: &proto::EntityId) -> Option<R> { self.0.by_id(id).map(member_view) }
 }
 
 /// View an entity from a typed result set or its change notifications.
-pub(crate) fn member_view<R: View>(entity: Entity) -> R {
-    // Only core builds typed result sets (`map` and `wrap` are crate-private), each from a query on R's own model:
-    // resolving that query bound the model, its predicate admits only members, and memberships are never removed.
-    R::from_entity(entity).expect("typed result sets hold only members of their bound model")
+pub(crate) fn member_view<R: ComponentViews>(entity: Entity) -> R {
+    // Only core builds typed result sets (`map` and `wrap` are crate-private), each from a query on R's own components:
+    // resolving that query bound them, its predicate admits only members of each, and memberships are never removed.
+    R::view_entity(entity).expect("typed result sets hold only members of their bound components")
 }
 
 #[derive(Debug)]
@@ -813,15 +814,15 @@ fn fix_from<E: AbstractEntity>(st: &mut State<E>, start: usize) {
     }
 }
 
-impl<E: View> ResultSet<E> {
+impl<E: ComponentViews> ResultSet<E> {
     pub fn iter(&self) -> ResultSetIter<E> { ResultSetIter::new(self.clone()) }
 }
 
-impl<E: View> Clone for ResultSet<E> {
+impl<E: ComponentViews> Clone for ResultSet<E> {
     fn clone(&self) -> Self { Self(self.0.clone(), std::marker::PhantomData) }
 }
 
-impl<E: View> Default for ResultSet<E> {
+impl<E: ComponentViews> Default for ResultSet<E> {
     fn default() -> Self {
         let entity_resultset = EntityResultSet::empty();
         Self(entity_resultset, std::marker::PhantomData)
@@ -833,13 +834,13 @@ impl<E: AbstractEntity> Signal for EntityResultSet<E> {
     fn broadcast_id(&self) -> BroadcastId { self.0.broadcast.id() }
 }
 
-impl<R: View> Signal for ResultSet<R> {
+impl<R: ComponentViews> Signal for ResultSet<R> {
     fn listen(&self, listener: Listener) -> ListenerGuard { ListenerGuard::new(self.0 .0.broadcast.reference().listen(listener)) }
 
     fn broadcast_id(&self) -> BroadcastId { self.0 .0.broadcast.id() }
 }
 
-impl<E: View + Clone + 'static> Get<Vec<E>> for ResultSet<E> {
+impl<E: ComponentViews + Clone + 'static> Get<Vec<E>> for ResultSet<E> {
     fn get(&self) -> Vec<E> {
         use ankurah_signals::CurrentObserver;
         CurrentObserver::track(self);
@@ -847,11 +848,11 @@ impl<E: View + Clone + 'static> Get<Vec<E>> for ResultSet<E> {
     }
 }
 
-impl<E: View + Clone + 'static> Peek<Vec<E>> for ResultSet<E> {
+impl<E: ComponentViews + Clone + 'static> Peek<Vec<E>> for ResultSet<E> {
     fn peek(&self) -> Vec<E> { self.0 .0.state.lock().unwrap().order.iter().map(|e| member_view(e.entity.clone())).collect() }
 }
 
-impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
+impl<E: ComponentViews + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
     fn subscribe<F>(&self, listener: F) -> SubscriptionGuard
     where F: IntoSubscribeListener<Vec<E>> {
         let listener = listener.into_subscribe_listener();
@@ -865,16 +866,16 @@ impl<E: View + Clone + 'static> Subscribe<Vec<E>> for ResultSet<E> {
 }
 
 #[derive(Debug)]
-pub struct ResultSetIter<E: View> {
+pub struct ResultSetIter<E: ComponentViews> {
     resultset: ResultSet<E>,
     index: usize,
 }
 
-impl<E: View> ResultSetIter<E> {
+impl<E: ComponentViews> ResultSetIter<E> {
     fn new(resultset: ResultSet<E>) -> Self { Self { resultset, index: 0 } }
 }
 
-impl<E: View + Clone> Iterator for ResultSetIter<E> {
+impl<E: ComponentViews + Clone> Iterator for ResultSetIter<E> {
     type Item = E;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -894,14 +895,14 @@ impl<E: View + Clone> Iterator for ResultSetIter<E> {
     }
 }
 
-impl<E: View + Clone> IntoIterator for ResultSet<E> {
+impl<E: ComponentViews + Clone> IntoIterator for ResultSet<E> {
     type Item = E;
     type IntoIter = ResultSetIter<E>;
 
     fn into_iter(self) -> Self::IntoIter { ResultSetIter::new(self) }
 }
 
-impl<E: View + Clone> IntoIterator for &ResultSet<E> {
+impl<E: ComponentViews + Clone> IntoIterator for &ResultSet<E> {
     type Item = E;
     type IntoIter = ResultSetIter<E>;
 
@@ -934,5 +935,5 @@ impl Iterator for EntityResultSetKeyIterator {
 
 // Specific implementation for EntityResultSet<Entity> to provide map method
 impl EntityResultSet<Entity> {
-    pub(crate) fn wrap<R: View>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
+    pub(crate) fn wrap<R: ComponentViews>(&self) -> ResultSet<R> { ResultSet(self.clone(), std::marker::PhantomData) }
 }

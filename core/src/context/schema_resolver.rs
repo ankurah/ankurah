@@ -18,11 +18,11 @@ pub(crate) trait SchemaResolver: Send + Sync {
     /// Used by synchronous `Transaction::edit`.
     fn bind_descriptor_local(&self, schema: &'static ModelStructDescriptor, entity: &Entity) -> Result<ModelId, RetrievalError>;
 
-    /// Resolve names and literal types for `Context::fetch` after schema registration.
+    /// Resolve names and literal types against a query's components for `Context::fetch` after schema registration.
     /// Read-policy filtering is applied separately by `fetch_entities`.
-    fn resolve_selection_with_descriptor(
+    fn resolve_selection_with_descriptors(
         &self,
-        schema: &'static ModelStructDescriptor,
+        components: &[&'static ModelStructDescriptor],
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError>;
 
@@ -30,7 +30,7 @@ pub(crate) trait SchemaResolver: Send + Sync {
     /// Missing bindings/readiness return errors; the caller decides whether to resolve asynchronously.
     fn resolve_query_selection(
         &self,
-        schema: &'static ModelStructDescriptor,
+        components: &[&'static ModelStructDescriptor],
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError>;
 
@@ -38,7 +38,7 @@ pub(crate) trait SchemaResolver: Send + Sync {
     /// The returned future owns a weak context; the caller controls execution and cancellation.
     fn resolve_query_selection_when_ready(
         &self,
-        schema: &'static ModelStructDescriptor,
+        components: Vec<&'static ModelStructDescriptor>,
         selection: Selection<Parsed>,
     ) -> BoxFuture<'static, Result<Selection<Resolved>, RetrievalError>>;
 }
@@ -94,43 +94,43 @@ where
         Ok(model)
     }
 
-    /// Resolve names and literal types for `Context::fetch` after schema registration.
+    /// Resolve names and literal types against a query's components for `Context::fetch` after schema registration.
     /// Read-policy filtering is applied separately by `fetch_entities`.
-    fn resolve_selection_with_descriptor(
+    fn resolve_selection_with_descriptors(
         &self,
-        schema: &'static ModelStructDescriptor,
+        components: &[&'static ModelStructDescriptor],
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let node = self.node.upgrade()?;
-        schema.resolve_selection(&node.catalog, node.system.system_epoch(), selection)
+        crate::schema::resolver::resolve_component_selection(components, &node.catalog, node.system.system_epoch(), selection)
     }
 
     /// Resolve and policy-filter a livequery's initial or updated selection locally.
     /// Missing bindings/readiness return errors; the caller decides whether to resolve asynchronously.
     fn resolve_query_selection(
         &self,
-        schema: &'static ModelStructDescriptor,
+        components: &[&'static ModelStructDescriptor],
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let node = self.node.upgrade()?;
         node.system.check_not_halted()?;
-        crate::schema::resolver::validate_selection_names(schema, &selection)?;
+        crate::schema::resolver::validate_selection_names(components, &selection)?;
         if node.system.system_epoch().is_none() {
             return Err(RetrievalError::NodeNotReady);
         }
-        if schema.system.is_none() {
+        if components.iter().any(|schema| schema.system.is_none()) {
             if !node.catalog.is_ready() {
                 return Err(RetrievalError::NodeNotReady);
             }
         }
-        resolve_and_scope(self, schema, selection)
+        resolve_and_scope(self, components, selection)
     }
 
     /// Wait for the required catalog state, register missing declarations, and resolve with read policy.
     /// The returned future owns a weak context; the caller controls execution and cancellation.
     fn resolve_query_selection_when_ready(
         &self,
-        schema: &'static ModelStructDescriptor,
+        components: Vec<&'static ModelStructDescriptor>,
         selection: Selection<Parsed>,
     ) -> BoxFuture<'static, Result<Selection<Resolved>, RetrievalError>> {
         let sessions = match &self.auth {
@@ -151,8 +151,10 @@ where
                 system.wait_system_ready().await?;
             }
 
-            context.ensure_registered(schema).await?;
-            resolve_and_scope(&context, schema, selection)
+            for schema in &components {
+                context.ensure_registered(schema).await?;
+            }
+            resolve_and_scope(&context, &components, selection)
         })
     }
 }
@@ -160,7 +162,7 @@ where
 /// Resolve names and literal types from local schema state and enforce this context's read policy.
 fn resolve_and_scope<SE, PA>(
     context: &ContextInner<SE, PA>,
-    schema: &'static ModelStructDescriptor,
+    components: &[&'static ModelStructDescriptor],
     selection: Selection<Parsed>,
 ) -> Result<Selection<Resolved>, RetrievalError>
 where
@@ -171,7 +173,7 @@ where
     if matches!(&context.auth, ContextAuth::Privileged) {
         return Err(RetrievalError::Other("the privileged context does not query".into()));
     }
-    let mut selection = context.resolve_selection_with_descriptor(schema, selection)?;
+    let mut selection = context.resolve_selection_with_descriptors(components, selection)?;
     let policy = crate::policy::ContextPolicy::new(&node.policy_agent, context.auth.clone());
     selection.predicate = policy.filter_predicate(selection.predicate)?;
     Ok(selection)

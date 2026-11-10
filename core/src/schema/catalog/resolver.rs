@@ -7,6 +7,10 @@ use thiserror::Error;
 use crate::internal::prelude::*;
 use crate::value::ValueType;
 
+mod component_scope;
+pub use component_scope::ComponentScopeError;
+use component_scope::{locate_property, QueryComponent};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedProperty {
     pub id: PropertyId,
@@ -23,6 +27,8 @@ pub enum ModelResolutionError {
     Lookup { model: ModelId, name: String, message: String },
     #[error("unknown property '{name}' in model '{model}'")]
     UnknownProperty { model: ModelId, name: String },
+    #[error(transparent)]
+    ComponentScope(#[from] ComponentScopeError),
     #[error("unsupported subpath '{path}' in model '{model}': {reason}")]
     UnsupportedSubpath { model: ModelId, path: String, reason: String },
     #[error("comparison canonicalization in model '{model}' failed: {message}")]
@@ -35,6 +41,7 @@ impl From<ModelResolutionError> for RetrievalError {
     fn from(error: ModelResolutionError) -> Self {
         match error {
             ModelResolutionError::Catalog(error) => error,
+            ModelResolutionError::ComponentScope(error) => Self::ComponentScope(error),
             other => Self::Other(other.to_string()),
         }
     }
@@ -90,18 +97,18 @@ impl ModelResolver for CatalogManager {
     }
 }
 
-/// Resolves names through epoch-bound descriptor cells, falling back to the
-/// catalog while those bindings have not yet been populated.
+/// Resolves names through the epoch-bound descriptor cells of a query's components, falling back to
+/// the catalog for any other component and while those bindings have not yet been populated.
 pub(crate) struct DescriptorResolver<'a> {
-    pub schema: &'static ModelStructDescriptor,
+    pub schemas: &'a [&'static ModelStructDescriptor],
     pub epoch: SystemEpoch,
     pub catalog: &'a CatalogManager,
 }
 
 impl ModelResolver for DescriptorResolver<'_> {
     fn resolve_model(&self, name: &str) -> Result<Option<ModelId>, ModelResolutionError> {
-        if name == self.schema.label {
-            if let Ok(model) = self.schema.resolved.get(self.epoch) {
+        if let Some(schema) = self.schemas.iter().find(|schema| schema.label == name) {
+            if let Ok(model) = schema.resolved.get(self.epoch) {
                 return Ok(Some(model));
             }
         }
@@ -109,7 +116,10 @@ impl ModelResolver for DescriptorResolver<'_> {
     }
 
     fn resolve_property(&self, model: &ModelId, name: &str) -> Result<Option<ResolvedProperty>, ModelResolutionError> {
-        let Some(field) = self.schema.field_by_name(name) else { return Ok(None) };
+        let Some(schema) = self.schemas.iter().find(|schema| schema.resolved.get(self.epoch).ok().as_ref() == Some(model)) else {
+            return self.catalog.resolve_property(model, name);
+        };
+        let Some(field) = schema.field_by_name(name) else { return Ok(None) };
         if let Ok(id) = field.resolved.get(self.epoch) {
             let value_type = ValueType::from_property_str(field.value_type).ok_or_else(|| ModelResolutionError::ValueTypeLookup {
                 model: *model,
@@ -122,16 +132,46 @@ impl ModelResolver for DescriptorResolver<'_> {
     }
 }
 
+/// Resolve names and literal types against a query's components, restricting the selection to entities
+/// that are members of every one of them.
+pub(crate) fn resolve_component_selection(
+    schemas: &[&'static ModelStructDescriptor],
+    catalog: &CatalogManager,
+    epoch: Option<SystemEpoch>,
+    selection: Selection<Parsed>,
+) -> Result<Selection<Resolved>, RetrievalError> {
+    // Before the node has a system epoch, only system models resolve, under the bootstrap epoch.
+    let epoch = match (epoch, schemas.iter().find(|schema| schema.system.is_none())) {
+        (Some(epoch), _) => epoch,
+        (None, None) => SystemEpoch::BOOTSTRAP,
+        (None, Some(schema)) => return Err(RetrievalError::UnboundDeclaration { label: schema.label.to_string() }),
+    };
+    let components = schemas
+        .iter()
+        .map(|schema| Ok(QueryComponent { model: schema.bind_local(catalog, epoch)?, name: Some(schema.name) }))
+        .collect::<Result<Vec<_>, RetrievalError>>()?;
+    let resolver = DescriptorResolver { schemas, epoch, catalog };
+    let selection = resolve_selection_across(&components, &resolver, selection)?;
+    Ok(components.iter().rev().fold(selection, |selection, component| selection.and_member_of(component.model)))
+}
+
 /// Check declared names without requiring their durable identities.
-pub(crate) fn validate_selection_names(schema: &ModelStructDescriptor, selection: &Selection<Parsed>) -> Result<(), RetrievalError> {
+pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selection: &Selection<Parsed>) -> Result<(), RetrievalError> {
+    let declares = |schema: &&ModelStructDescriptor, name: &str| name == "id" || schema.field_by_name(name).is_some();
     let check = |path: &PathExpr| {
-        let head = usize::from(path.steps.len() > 1 && path.steps[0] == schema.label);
+        let head = usize::from(path.steps.len() > 1 && schemas.iter().any(|schema| path.steps[0] == schema.label));
         let name = path.steps.get(head).map(String::as_str).unwrap_or("");
-        if name == "id" || schema.field_by_name(name).is_some() {
-            Ok(())
-        } else {
-            Err(RetrievalError::Other(format!("unknown property '{name}' in model '{}'", schema.label)))
+        if schemas.iter().any(|schema| declares(schema, name)) {
+            return Ok(());
         }
+        Err(match schemas {
+            [only] => RetrievalError::Other(format!("unknown property '{name}' in model '{}'", only.label)),
+            _ => ComponentScopeError::Undeclared {
+                name: name.to_owned(),
+                components: schemas.iter().map(|schema| schema.name.to_owned()).collect(),
+            }
+            .into(),
+        })
     };
     check_predicate_names(&selection.predicate, &check)?;
     for item in selection.order_by.iter().flatten() {
@@ -176,59 +216,66 @@ fn check_expr_names(expr: &Expr<Parsed>, check: &impl Fn(&PathExpr) -> Result<()
     }
 }
 
-/// Resolve model labels and property paths, and canonicalize comparison literals.
+/// Resolve model labels and property paths against one model, and canonicalize comparison literals.
 pub fn resolve_selection<R: ModelResolver + ?Sized>(
     model: &ModelId,
+    resolver: &R,
+    selection: Selection<Parsed>,
+) -> Result<Selection<Resolved>, ModelResolutionError> {
+    resolve_selection_across(&[QueryComponent { model: *model, name: None }], resolver, selection)
+}
+
+/// Resolve model labels and property paths across `components`, and canonicalize comparison literals.
+fn resolve_selection_across<R: ModelResolver + ?Sized>(
+    components: &[QueryComponent<'_>],
     resolver: &R,
     selection: Selection<Parsed>,
 ) -> Result<Selection<Resolved>, ModelResolutionError> {
     let order_by = selection
         .order_by
         .as_ref()
-        .map(|items| items.iter().map(|item| resolve_order_by_item(model, resolver, item)).collect())
+        .map(|items| items.iter().map(|item| resolve_order_by_item(components, resolver, item)).collect())
         .transpose()?;
-    Ok(Selection { predicate: resolve_predicate(model, resolver, &selection.predicate)?, order_by, limit: selection.limit })
+    Ok(Selection { predicate: resolve_predicate(components, resolver, &selection.predicate)?, order_by, limit: selection.limit })
 }
 
 fn resolve_order_by_item<R: ModelResolver + ?Sized>(
-    model: &ModelId,
+    components: &[QueryComponent<'_>],
     resolver: &R,
     item: &OrderByItem<Parsed>,
 ) -> Result<OrderByItem<Resolved>, ModelResolutionError> {
     let path = &item.path;
-    let head = property_name_index(model, resolver, path)?;
-    let Some(name) = path.steps.get(head) else {
-        return Err(unknown_property(model, ""));
-    };
-    check_order_by_path(model, path, &path.steps[head + 1..])?;
-    let (property, _value_type) = resolve_path_head(model, resolver, name, vec![])?;
-    Ok(OrderByItem { path: property, direction: item.direction.clone() })
+    let found = locate_property(components, resolver, path)?;
+    check_order_by_path(&found.model, path, found.subpath)?;
+    Ok(OrderByItem { path: resolved_property_path(found.property.id, found.name, vec![]), direction: item.direction.clone() })
 }
 
 fn resolve_predicate<R: ModelResolver + ?Sized>(
-    model: &ModelId,
+    components: &[QueryComponent<'_>],
     resolver: &R,
     predicate: &Predicate<Parsed>,
 ) -> Result<Predicate<Resolved>, ModelResolutionError> {
     Ok(match predicate {
         Predicate::Comparison { left, operator, right } => {
-            let (left, left_type) = resolve_expr(model, resolver, left)?;
-            let (right, right_type) = resolve_expr(model, resolver, right)?;
+            let (left, left_type) = resolve_expr(components, resolver, left)?;
+            let (right, right_type) = resolve_expr(components, resolver, right)?;
             let (left, right) = match (left_type, right_type) {
-                (Some(target), None) => (left, cast_comparison_value(model, right, target)?),
-                (None, Some(target)) => (cast_comparison_value(model, left, target)?, right),
+                (Some((model, target)), None) => (left, cast_comparison_value(&model, right, target)?),
+                (None, Some((model, target))) => (cast_comparison_value(&model, left, target)?, right),
                 _ => (left, right),
             };
             Predicate::Comparison { left: Box::new(left), operator: operator.clone(), right: Box::new(right) }
         }
-        Predicate::And(left, right) => {
-            Predicate::And(Box::new(resolve_predicate(model, resolver, left)?), Box::new(resolve_predicate(model, resolver, right)?))
-        }
-        Predicate::Or(left, right) => {
-            Predicate::Or(Box::new(resolve_predicate(model, resolver, left)?), Box::new(resolve_predicate(model, resolver, right)?))
-        }
-        Predicate::Not(inner) => Predicate::Not(Box::new(resolve_predicate(model, resolver, inner)?)),
-        Predicate::IsNull(expr) => Predicate::IsNull(Box::new(resolve_expr(model, resolver, expr)?.0)),
+        Predicate::And(left, right) => Predicate::And(
+            Box::new(resolve_predicate(components, resolver, left)?),
+            Box::new(resolve_predicate(components, resolver, right)?),
+        ),
+        Predicate::Or(left, right) => Predicate::Or(
+            Box::new(resolve_predicate(components, resolver, left)?),
+            Box::new(resolve_predicate(components, resolver, right)?),
+        ),
+        Predicate::Not(inner) => Predicate::Not(Box::new(resolve_predicate(components, resolver, inner)?)),
+        Predicate::IsNull(expr) => Predicate::IsNull(Box::new(resolve_expr(components, resolver, expr)?.0)),
         Predicate::MemberOf(reference) => Predicate::MemberOf(match reference {
             ModelRef::Id(id) => *id,
             ModelRef::Label(label) => resolver.resolve_model(label)?.ok_or_else(|| ModelResolutionError::UnknownModel(label.clone()))?,
@@ -239,46 +286,46 @@ fn resolve_predicate<R: ModelResolver + ?Sized>(
     })
 }
 
+/// A resolved expression, and for a property path, the model it was found in and its value type.
+type ResolvedExpr = (Expr<Resolved>, Option<(ModelId, ValueType)>);
+
 fn resolve_expr<R: ModelResolver + ?Sized>(
-    model: &ModelId,
+    components: &[QueryComponent<'_>],
     resolver: &R,
     expr: &Expr<Parsed>,
-) -> Result<(Expr<Resolved>, Option<ValueType>), ModelResolutionError> {
+) -> Result<ResolvedExpr, ModelResolutionError> {
     Ok(match expr {
         Expr::Path(path) => {
-            let head = property_name_index(model, resolver, path)?;
-            let Some(name) = path.steps.get(head) else {
-                return Err(unknown_property(model, ""));
-            };
-            if name == "id" && path.steps.len() > head + 1 {
-                return Err(id_subpath_error(model, path));
-            }
-            let (resolved, value_type) = resolve_path_head(model, resolver, name, path.steps[head + 1..].to_vec())?;
-            if !resolved.subpath.is_empty() {
+            let found = locate_property(components, resolver, path)?;
+            let value_type = found.property.value_type;
+            if !found.subpath.is_empty() {
+                if found.property.id == PropertyId::Id {
+                    return Err(id_subpath_error(&found.model, path));
+                }
                 if value_type != ValueType::Json {
                     return Err(ModelResolutionError::UnsupportedSubpath {
-                        model: *model,
+                        model: found.model,
                         path: path.steps.join("."),
                         reason: "only JSON properties support subpaths".to_owned(),
                     });
                 }
             }
-            (Expr::Path(resolved), Some(value_type))
+            (Expr::Path(resolved_property_path(found.property.id, found.name, found.subpath.to_vec())), Some((found.model, value_type)))
         }
         Expr::Literal(value) => (Expr::Literal(value.clone()), None),
         Expr::Placeholder => (Expr::Placeholder, None),
         Expr::ExprList(items) => (
             Expr::ExprList(
-                items.iter().map(|item| resolve_expr(model, resolver, item).map(|(expr, _)| expr)).collect::<Result<Vec<_>, _>>()?,
+                items.iter().map(|item| resolve_expr(components, resolver, item).map(|(expr, _)| expr)).collect::<Result<Vec<_>, _>>()?,
             ),
             None,
         ),
-        Expr::Predicate(predicate) => (Expr::Predicate(resolve_predicate(model, resolver, predicate)?), None),
+        Expr::Predicate(predicate) => (Expr::Predicate(resolve_predicate(components, resolver, predicate)?), None),
         Expr::InfixExpr { left, operator, right } => (
             Expr::InfixExpr {
-                left: Box::new(resolve_expr(model, resolver, left)?.0),
+                left: Box::new(resolve_expr(components, resolver, left)?.0),
                 operator: operator.clone(),
-                right: Box::new(resolve_expr(model, resolver, right)?.0),
+                right: Box::new(resolve_expr(components, resolver, right)?.0),
             },
             None,
         ),
@@ -295,42 +342,6 @@ fn cast_comparison_value(model: &ModelId, expr: Expr<Resolved>, target: ValueTyp
         }
         other => other,
     })
-}
-
-/// Locate the property name, skipping a leading qualifier when it resolves to
-/// the model already being queried.
-fn property_name_index<R: ModelResolver + ?Sized>(model: &ModelId, resolver: &R, path: &PathExpr) -> Result<usize, ModelResolutionError> {
-    let Some(first) = path.steps.first() else { return Ok(0) };
-    if path.steps.len() > 1 && resolver.resolve_model(first)?.as_ref() == Some(model) {
-        Ok(1)
-    } else {
-        Ok(0)
-    }
-}
-
-fn resolve_path_head<R: ModelResolver + ?Sized>(
-    model: &ModelId,
-    resolver: &R,
-    name: &str,
-    subpath: Vec<String>,
-) -> Result<(PropertyPath, ValueType), ModelResolutionError> {
-    if name == "id" {
-        return Ok((PropertyPath::id(), ValueType::EntityId));
-    }
-    let resolved = match model {
-        ModelId::System(model) => resolve_system_property(*model, name)
-            .map(|system| ResolvedProperty { id: PropertyId::System(system), value_type: system_property_value_type(system) }),
-        ModelId::EntityId(_) => resolver.resolve_property(model, name)?,
-    }
-    .ok_or_else(|| unknown_property(model, name))?;
-    if resolved.id == PropertyId::Id && !subpath.is_empty() {
-        return Err(ModelResolutionError::UnsupportedSubpath {
-            model: *model,
-            path: std::iter::once(name).chain(subpath.iter().map(String::as_str)).collect::<Vec<_>>().join("."),
-            reason: "the id pseudo-property is the entity id and has no subfields".to_owned(),
-        });
-    }
-    Ok((resolved_property_path(resolved.id, name, subpath), resolved.value_type))
 }
 
 fn resolved_property_path(property: PropertyId, label: &str, subpath: Vec<String>) -> PropertyPath {

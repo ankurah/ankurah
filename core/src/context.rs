@@ -1,4 +1,5 @@
 use crate::internal::prelude::*;
+use crate::model::ComponentViews;
 use ankql::ast::Parsed;
 use std::sync::Arc;
 #[cfg(feature = "wasm")]
@@ -83,24 +84,28 @@ impl Context {
         R::from_entity(self.0.get_entity(id, true).await?)
     }
 
-    pub async fn fetch<R: View>(
+    /// Fetch the entities matching a selection, each seen through every component of `R`:
+    /// one view, or a tuple of views whose components a match must all have.
+    pub async fn fetch<R: ComponentViews>(
         &self,
         args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<Vec<R>, RetrievalError> {
         let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
-        use crate::model::Model;
-        self.0.schema_resolver().ensure_registered(R::Model::descriptor()).await?;
+        let components = R::components();
+        for schema in &components {
+            self.0.schema_resolver().ensure_registered(schema).await?;
+        }
         let args = MatchArgs {
-            selection: self.0.schema_resolver().resolve_selection_with_descriptor(R::Model::descriptor(), args.selection)?,
+            selection: self.0.schema_resolver().resolve_selection_with_descriptors(&components, args.selection)?,
             cache_policy: args.cache_policy,
         };
 
         let entities = self.0.fetch_entities(args).await?;
 
-        entities.into_iter().map(R::from_entity).collect()
+        entities.into_iter().map(R::view_entity).collect()
     }
 
-    pub async fn fetch_one<R: View + Clone + 'static>(
+    pub async fn fetch_one<R: ComponentViews + Clone + 'static>(
         &self,
         args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<Option<R>, RetrievalError> {
@@ -115,11 +120,10 @@ impl Context {
         args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<LiveQuery<R>, RetrievalError>
     where
-        R: View,
+        R: ComponentViews,
     {
         let args: MatchArgs<Parsed> = args.try_into().map_err(|e| e.into())?;
-        use crate::model::Model;
-        Ok(self.0.clone().query(R::Model::descriptor(), args)?.map::<R>())
+        Ok(self.0.clone().query(R::components(), args)?.map::<R>())
     }
 
     /// Subscribe to changes in entities matching a selection and wait for initialization
@@ -128,7 +132,7 @@ impl Context {
         args: impl TryInto<MatchArgs<Parsed>, Error = impl Into<RetrievalError>>,
     ) -> Result<LiveQuery<R>, RetrievalError>
     where
-        R: View,
+        R: ComponentViews,
     {
         let livequery = self.query::<R>(args)?;
         livequery.wait_initialized().await?;

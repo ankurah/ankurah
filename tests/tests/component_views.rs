@@ -1,11 +1,15 @@
-//! Views of one entity's several components: a cast between views, `task.cast::<AssignmentView>()`.
+//! Views of one entity's several components: a typed query over a tuple of views,
+//! `ctx.fetch::<(TaskView, AssignmentView)>(..)`, and a cast between views, `task.cast::<AssignmentView>()`.
+//! A query's matches belong to every component in its tuple, and bare names resolve across those components.
 //! Each scenario runs on sled and on in-memory SQLite.
 
+use ankurah::core::schema::resolver::ComponentScopeError;
 use ankurah::core::storage::StorageEngine;
 use ankurah::entity::{Entity, LocalTrxEntity};
 use ankurah::error::RetrievalError;
 use ankurah::policy::DEFAULT_CONTEXT;
 use ankurah::property::PropertyError;
+use ankurah::signals::Peek;
 use ankurah::{Context, EntityId, Model, ModelId, Mutable, Node, PermissiveAgent, View};
 use ankurah_storage_sled::SledStorageEngine;
 use ankurah_storage_sqlite::SqliteStorageEngine;
@@ -114,6 +118,55 @@ impl Fixture {
     }
 
     fn id(&self, name: &str) -> EntityId { self.names.iter().find(|(_, known)| *known == name).expect("a fixture name").0 }
+
+    fn name(&self, id: EntityId) -> &'static str { self.names.iter().find(|(known, _)| *known == id).expect("a fixture entity").1 }
+
+    /// Fixture names of `ids`, in the order given.
+    fn ordered(&self, ids: impl IntoIterator<Item = EntityId>) -> Vec<&'static str> { ids.into_iter().map(|id| self.name(id)).collect() }
+
+    /// Fixture names of `ids`, sorted, for results whose order is not part of the query.
+    fn names(&self, ids: impl IntoIterator<Item = EntityId>) -> Vec<&'static str> {
+        let mut names = self.ordered(ids);
+        names.sort();
+        names
+    }
+
+    async fn fetch_pairs(&self, selection: &str) -> anyhow::Result<Vec<&'static str>> {
+        let pairs = self.ctx.fetch::<(TaskView, AssignmentView)>(selection).await?;
+        Ok(self.names(pairs.iter().map(|(task, _)| task.id())))
+    }
+
+    async fn fetch_pairs_in_order(&self, selection: &str) -> anyhow::Result<Vec<&'static str>> {
+        let pairs = self.ctx.fetch::<(TaskView, AssignmentView)>(selection).await?;
+        Ok(self.ordered(pairs.iter().map(|(task, _)| task.id())))
+    }
+
+    /// The component-scope error a pair fetch refuses `selection` with.
+    async fn refusal(&self, selection: &str) -> ComponentScopeError {
+        match self.ctx.fetch::<(TaskView, AssignmentView)>(selection).await {
+            Err(RetrievalError::ComponentScope(error)) => error,
+            other => panic!("{}: `{selection}` gave {other:?}", self.engine),
+        }
+    }
+
+    /// Commit one change to a component's property on an existing entity.
+    async fn edit<M: Model>(&self, name: &str, change: impl FnOnce(&M::Mutable) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let trx = self.ctx.begin();
+        let record = trx.get::<M>(&self.id(name)).await?;
+        change(&record)?;
+        trx.commit().await?;
+        Ok(())
+    }
+
+    /// Commit a further component, with its values, on an existing entity.
+    async fn add<M: Model>(&self, name: &str, component: &M) -> anyhow::Result<()> {
+        let model = self.ctx.resolve_model_id::<M>().await?;
+        let trx = self.ctx.begin();
+        let record = trx.get::<Task>(&self.id(name)).await?;
+        stage(record.entity(), component, model)?;
+        trx.commit().await?;
+        Ok(())
+    }
 }
 
 fn stage<M: Model>(entity: &LocalTrxEntity, component: &M, model: ModelId) -> Result<(), PropertyError> {
@@ -146,4 +199,113 @@ async fn cast_between_views(f: Fixture) -> anyhow::Result<()> {
 async fn cast_sees_the_entity_through_another_component_it_has() -> anyhow::Result<()> {
     cast_between_views(on_sled().await?).await?;
     cast_between_views(on_sqlite().await?).await
+}
+
+async fn filter_across_components(f: Fixture) -> anyhow::Result<()> {
+    let engine = f.engine;
+    let pairs: Vec<(TaskView, AssignmentView)> = f.ctx.fetch::<(TaskView, AssignmentView)>("status = 'open' AND assignee = 'ada'").await?;
+    assert_eq!(f.names(pairs.iter().map(|(task, _)| task.id())), ["ada"], "{engine}");
+    let (task, assignment) = &pairs[0];
+    assert_eq!((task.title()?, assignment.assignee()?), ("ship".to_owned(), "ada".to_owned()), "{engine}");
+    assert_eq!(task.entity(), assignment.entity(), "{engine}: both views hold the same entity");
+
+    // Every component is required: the stray Assignment is no Task, and the unassigned Task has no Assignment.
+    assert_eq!(f.fetch_pairs("assignee = 'ada'").await?, ["ada", "done"], "{engine}");
+    assert_eq!(
+        f.names(f.ctx.fetch::<AssignmentView>("assignee = 'ada'").await?.iter().map(View::id)),
+        ["ada", "done", "stray"],
+        "{engine}"
+    );
+    assert_eq!(f.fetch_pairs("status = 'open'").await?, ["ada", "bob"], "{engine}");
+
+    let all_three = f.ctx.fetch::<(TaskView, AssignmentView, ClosureView)>("closed_at = 5 AND assignee = 'ada'").await?;
+    assert_eq!(f.names(all_three.iter().map(|(task, _, _)| task.id())), ["done"], "{engine}");
+    Ok(())
+}
+
+/// `status` is Task's and `assignee` is Assignment's; neither needs a qualifier in a tuple holding both.
+#[tokio::test]
+async fn bare_names_filter_across_the_components_of_a_tuple() -> anyhow::Result<()> {
+    filter_across_components(on_sled().await?).await?;
+    filter_across_components(on_sqlite().await?).await
+}
+
+async fn order_by_second_component(f: Fixture) -> anyhow::Result<()> {
+    let engine = f.engine;
+    assert_eq!(f.fetch_pairs_in_order("status = 'open' ORDER BY assignee").await?, ["ada", "bob"], "{engine}");
+    assert_eq!(f.fetch_pairs_in_order("status = 'open' ORDER BY assignee DESC").await?, ["bob", "ada"], "{engine}");
+
+    let live = f.ctx.query_wait::<(TaskView, AssignmentView)>("status = 'open' ORDER BY assignee").await?;
+    assert_eq!(f.ordered(live.peek().iter().map(|(task, _)| task.id())), ["ada", "bob"], "{engine}");
+    f.add("unassigned", &assignment("abe")).await?;
+    assert_eq!(f.ordered(live.peek().iter().map(|(task, _)| task.id())), ["unassigned", "ada", "bob"], "{engine}");
+    Ok(())
+}
+
+/// ORDER BY takes a property of the tuple's second component, in a fetch and in a live query, which places
+/// an entity that comes to match by that property.
+#[tokio::test]
+async fn order_by_a_property_of_the_second_component() -> anyhow::Result<()> {
+    order_by_second_component(on_sled().await?).await?;
+    order_by_second_component(on_sqlite().await?).await
+}
+
+async fn shared_and_colliding_names(f: Fixture) -> anyhow::Result<()> {
+    let engine = f.engine;
+    // `project` is one property, declared by both components through the same explicit id.
+    assert_eq!(f.fetch_pairs("project = 'atlas'").await?, ["ada", "bob", "done"], "{engine}");
+
+    // `note` is two properties: Task's and Assignment's.
+    let ambiguous = ComponentScopeError::Ambiguous { name: "note".into(), first: "Task".into(), second: "Assignment".into() };
+    assert_eq!(ambiguous.to_string(), "'note' names different properties in components 'Task' and 'Assignment'");
+    for selection in ["note = 'task note ship'", "status = 'open' ORDER BY note"] {
+        assert_eq!(f.refusal(selection).await, ambiguous, "{engine}: {selection}");
+    }
+    let live = f.ctx.query_wait::<(TaskView, AssignmentView)>("note = 'task note ship'").await.map(|_| ());
+    assert!(matches!(&live, Err(RetrievalError::ComponentScope(error)) if *error == ambiguous), "{engine}: {live:?}");
+
+    // One component's names are never ambiguous: a one-view query answers as it always has.
+    let tasks = f.ctx.fetch::<TaskView>("note = 'task note triage'").await?;
+    assert_eq!(f.names(tasks.iter().map(View::id)), ["unassigned"], "{engine}");
+    Ok(())
+}
+
+/// A name the two components declare as the same property resolves bare; a name they declare as different
+/// properties is refused, naming both components.
+#[tokio::test]
+async fn a_shared_property_resolves_bare_and_a_colliding_name_is_refused() -> anyhow::Result<()> {
+    shared_and_colliding_names(on_sled().await?).await?;
+    shared_and_colliding_names(on_sqlite().await?).await
+}
+
+async fn live_tuple_query(f: Fixture) -> anyhow::Result<()> {
+    let engine = f.engine;
+    let open = f.ctx.query_wait::<(TaskView, AssignmentView)>("status = 'open'").await?;
+    let open_to_ada = f.ctx.query_wait::<(TaskView, AssignmentView)>("status = 'open' AND assignee = 'ada'").await?;
+    assert_eq!((f.names(open.ids()), f.names(open_to_ada.ids())), (vec!["ada", "bob"], vec!["ada"]), "{engine}");
+
+    f.add("unassigned", &assignment("ada")).await?;
+    assert_eq!(f.names(open.ids()), ["ada", "bob", "unassigned"], "{engine}: gains a Task when Assignment is added to it");
+    assert_eq!(f.names(open_to_ada.ids()), ["ada", "unassigned"], "{engine}");
+
+    f.edit::<Task>("ada", |task| Ok(task.status()?.replace("done")?)).await?;
+    assert_eq!(f.names(open_to_ada.ids()), ["unassigned"], "{engine}: loses it when a Task value stops matching");
+
+    f.edit::<Assignment>("unassigned", |assignment| Ok(assignment.assignee()?.replace("bob")?)).await?;
+    assert!(open_to_ada.ids().is_empty(), "{engine}: loses it when an Assignment value stops matching");
+
+    f.edit::<Assignment>("unassigned", |assignment| Ok(assignment.assignee()?.replace("ada")?)).await?;
+    f.edit::<Task>("unassigned", |task| Ok(task.title()?.replace("triaged")?)).await?;
+    let pairs = open_to_ada.peek();
+    let [(task, assignment)] = pairs.as_slice() else { panic!("{engine}: expected one match, got {}", pairs.len()) };
+    assert_eq!((f.name(task.id()), task.title()?, assignment.assignee()?), ("unassigned", "triaged".into(), "ada".into()), "{engine}");
+    Ok(())
+}
+
+/// A live tuple query gains an entity when the second component is added to it, loses it when a value of
+/// either component stops matching, and its views follow changes to properties of either component.
+#[tokio::test]
+async fn a_live_tuple_query_follows_both_components() -> anyhow::Result<()> {
+    live_tuple_query(on_sled().await?).await?;
+    live_tuple_query(on_sqlite().await?).await
 }

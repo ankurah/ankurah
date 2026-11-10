@@ -103,6 +103,8 @@ pub enum RetrievalError {
     ApplyError(Arc<ApplyError>),
     #[error("model '{label}' has no complete compatible binding in the local catalog; schema synchronization or registration is required")]
     UnboundDeclaration { label: String },
+    #[error(transparent)]
+    ComponentScope(#[from] crate::schema::resolver::ComponentScopeError),
 }
 
 impl From<NodeReadinessError> for RetrievalError {
