@@ -87,7 +87,7 @@ where
                         node.policy_agent.check_request(node, &auth, &request).await
                     };
                     match cdata {
-                        Ok(cdata) => match handler::handle_request(node, &cdata, from, body).await {
+                        Ok(cdata) => match handler::handle_request(node, &cdata, &connection, body).await {
                             Ok(result) => result,
                             Err(e) => proto::NodeResponseBody::Error(e.to_string()),
                         },

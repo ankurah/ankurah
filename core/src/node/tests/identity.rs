@@ -1,11 +1,17 @@
 use super::{register_keyed_peer, register_keyed_peer_claiming, RecordingSender};
 use crate::connector::{Handshake, PeerConnectionError, PeerProvenance};
+use crate::entity::Entity;
+use crate::error::ValidationError;
 use crate::node::{Node, NodeKey};
-use crate::policy::{PeerTrust, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT};
+use crate::policy::{AccessDenied, AttestationRequest, DefaultContext, PeerTrust, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT};
+use crate::storage::StorageEngine;
 use crate::test_helpers::opened_handshakes;
 use crate::test_utils::TestStorage;
+use crate::util::Iterable;
+use ankql::ast::{Predicate, Resolved};
 use ankurah_proto as proto;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
+use tokio::sync::oneshot;
 
 type TestNode = Node<TestStorage, PermissiveAgent>;
 
@@ -317,6 +323,130 @@ async fn a_frame_on_a_connection_its_peer_has_registered_again_is_refused() {
     assert!(old_frames.try_recv().is_err() && new_frames.try_recv().is_err());
     node.handle_message(new, get_request(node.id, key.node_id())).await.unwrap();
     assert!(matches!(new_frames.try_recv(), Ok(proto::NodeMessage::Response(_))));
+}
+
+/// A permissive agent whose request check, once armed, signals that it has begun and waits until released.
+#[derive(Clone)]
+struct RequestHoldingAgent(Arc<Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>>);
+
+#[async_trait::async_trait]
+impl PolicyAgent for RequestHoldingAgent {
+    type ContextData = &'static DefaultContext;
+
+    async fn check_request<SE: StorageEngine, A: Iterable<proto::AuthData> + Send + Sync>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &A,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<Self::ContextData>, ValidationError> {
+        let hold = self.0.lock().unwrap().take();
+        if let Some((entered, release)) = hold {
+            entered.send(()).unwrap();
+            release.await.unwrap();
+        }
+        Ok(vec![DEFAULT_CONTEXT])
+    }
+
+    fn sign_request<SE: StorageEngine, C: Iterable<Self::ContextData>>(
+        &self,
+        _: &crate::node::NodeInner<SE, Self>,
+        _: &C,
+        _: &proto::NodeRequest,
+    ) -> Result<Vec<proto::AuthData>, AccessDenied> {
+        Ok(vec![])
+    }
+
+    fn check_write_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &Self::ContextData,
+        _: &Entity,
+        _: &Entity,
+        _: &proto::Event,
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
+        Ok(None)
+    }
+
+    fn query_predicate<C: Iterable<Self::ContextData>>(&self, _: &C) -> Result<Predicate<Resolved>, AccessDenied> { Ok(Predicate::True) }
+
+    fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+    fn request_state_attestation<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<AttestationRequest> {
+        None
+    }
+
+    fn validate_received_event<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &proto::NodeId,
+        _: &proto::Attested<proto::Event>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn validate_received_state<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &proto::NodeId,
+        _: &proto::Attested<proto::EntityState>,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+
+    fn validate_causal_assertion<SE: StorageEngine>(
+        &self,
+        _: &Node<SE, Self>,
+        _: &proto::NodeId,
+        _: &proto::CausalAssertion,
+    ) -> Result<(), AccessDenied> {
+        Ok(())
+    }
+}
+
+/// A subscription request runs on the connection it arrived on, even when its peer registers
+/// again while the request is being checked: its query stands on that connection, not the newer one.
+#[tokio::test]
+async fn a_subscription_whose_peer_registers_again_during_its_request_check_stands_on_the_connection_it_arrived_on() {
+    let hold = Arc::new(Mutex::new(None));
+    let node = Node::new_durable(Arc::new(TestStorage::default()), RequestHoldingAgent(hold.clone()));
+    node.wait_ready().await.unwrap();
+    let key = NodeKey::generate();
+    let (old_sent, old_frames) = mpsc::channel();
+    let old = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(old_sent))).await.unwrap();
+    let old_connection = node.peers.registered(&old).unwrap();
+
+    let (entered, entered_rx) = oneshot::channel();
+    let (release, release_rx) = oneshot::channel();
+    *hold.lock().unwrap() = Some((entered, release_rx));
+    let query_id = proto::QueryId::new();
+    let selection = ankql::ast::Selection::<Resolved> {
+        predicate: Predicate::MemberOf(proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]))),
+        order_by: None,
+        limit: None,
+    };
+    let body =
+        proto::CarriedBody::encode(&proto::NodeRequestBody::SubscribeQuery { query_id, selection, version: 1, known_matches: vec![] });
+    let request = proto::NodeRequest { id: proto::RequestId::new(), to: node.id, from: key.node_id(), body };
+    let handling = tokio::spawn({
+        let node = node.clone();
+        async move { node.handle_message(old, proto::NodeMessage::Request { auth: vec![proto::AuthData(vec![])], request }).await }
+    });
+    entered_rx.await.unwrap();
+    let (new_sent, _new_frames) = mpsc::channel();
+    let new = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(new_sent))).await.unwrap();
+    release.send(()).unwrap();
+    handling.await.unwrap().unwrap();
+
+    assert!(
+        old_frames.try_iter().any(|frame| matches!(frame, proto::NodeMessage::Response(_))),
+        "answered on the connection it arrived on"
+    );
+    let new_connection = node.peers.registered(&new).unwrap();
+    assert!(new_connection.subscription_handler.remove_predicate(query_id).await.is_err(), "the newer connection holds no such query");
+    assert!(
+        old_connection.subscription_handler.remove_predicate(query_id).await.is_ok(),
+        "the query stands on the connection it arrived on"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
