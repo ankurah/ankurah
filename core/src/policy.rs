@@ -81,7 +81,7 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// - checking access for requests. If approved, yield a ContextData
 /// - deciding which events and served states this node attests, and what each attestation says
 /// - deciding whether the attestations on a received event or state suffice
-/// - deciding what a connected peer is trusted with, and which publishers it trusts
+/// - deciding what a connected peer is trusted with
 ///
 /// Core seals an attestation only when an agent requests one, and checks none: an agent
 /// receives the attestations on an event or state exactly as they came, and unseals the ones
