@@ -1,8 +1,11 @@
 use std::{panic, sync::Arc};
 
 use ankurah::core::context::Context;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
+use ankurah::error::{NodeHaltReason, NodeReadinessError};
+use ankurah::signals::Wait;
+use ankurah::{policy::DEFAULT_CONTEXT as c, Node, NodeState, PermissiveAgent};
 pub use ankurah_storage_indexeddb_wasm::IndexedDBStorageEngine;
+use ankurah_system_reset::{OnReseed, SystemReset};
 pub use ankurah_websocket_client_wasm::WebsocketClient;
 use lazy_static::lazy_static;
 use once_cell::sync::OnceCell;
@@ -31,10 +34,19 @@ pub async fn start() -> Result<(), JsValue> {
     );
     panic::set_hook(Box::new(console_error_panic_hook::hook));
 
-    let storage_engine = IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let node = Node::new(Arc::new(storage_engine), PermissiveAgent::new());
+    let storage_engine =
+        Arc::new(IndexedDBStorageEngine::open("ankurah_example_app").await.map_err(|e| JsValue::from_str(&e.to_string()))?);
+    let node = Node::builder(storage_engine, PermissiveAgent::new())
+        .plug(SystemReset::<System, _>::new(OnReseed::Reset, c))
+        .build()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    reload_after_reset(node.clone());
     let connector = WebsocketClient::new(node.clone(), "ws://127.0.0.1:9797").map_err(|e| JsValue::from_str(&e.to_string()))?;
-    node.wait_ready().await.map_err(|e| JsValue::from_str(&e.to_string()))?;
+    match node.wait_ready().await {
+        // The server was seeded again; the page reloads once the store is wiped.
+        Err(NodeReadinessError::Halted(NodeHaltReason::Reset)) => return Ok(()),
+        ready => ready.map_err(|e| JsValue::from_str(&e.to_string()))?,
+    }
     if let Err(_) = NODE.set(node) {
         error!("Failed to set node");
     }
@@ -44,6 +56,23 @@ pub async fn start() -> Result<(), JsValue> {
     NOTIFY.notify_waiters();
 
     Ok(())
+}
+
+/// Reload the page once a reset of `node`, the plugin's when the server was seeded again, has
+/// wiped its store, so the app starts over on the new seeding, at start-up or at any time after.
+fn reload_after_reset(node: Node<IndexedDBStorageEngine, PermissiveAgent>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        node.state().wait_for(|state| matches!(state, NodeState::Halted(NodeHaltReason::Reset)).then_some(())).await;
+        if let Err(e) = node.reset().await {
+            error!("The reset did not wipe the store, so the page stays as it is: {e}");
+            return;
+        }
+        if let Some(window) = web_sys::window() {
+            if let Err(e) = window.location().reload() {
+                error!("Failed to reload the page after a reset: {e:?}");
+            }
+        }
+    });
 }
 
 pub fn get_node() -> Node<IndexedDBStorageEngine, PermissiveAgent> { NODE.get().expect("Node not initialized").clone() }

@@ -1,9 +1,10 @@
 use ankurah::signals::Get;
-use ankurah::{policy::DEFAULT_CONTEXT as c, Node, PermissiveAgent};
+use ankurah::{policy::DEFAULT_CONTEXT as c, Node, NodeKey, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
+use ankurah_system_reset::{OnReseed, SystemReset};
 use ankurah_websocket_server::WebsocketServer;
 use anyhow::Result;
-use example_model::{FlagsView, Level as LogLevel, LogEntry, Payload};
+use example_model::{FlagsView, Level as LogLevel, LogEntry, Payload, System, SystemView};
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 use tracing::Level;
@@ -13,9 +14,25 @@ async fn main() -> Result<()> {
     // initialize tracing
     tracing_subscriber::fmt().with_max_level(Level::INFO).init();
 
-    // Initialize storage engine
-    let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
-    let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
+    // The store, and beside it the node's key, so a restart is the same node.
+    let dir = std::env::home_dir().ok_or_else(|| anyhow::anyhow!("no home directory"))?.join(".ankurah_example");
+    let storage = SledStorageEngine::with_path(dir.clone())?;
+    let key = NodeKey::load_or_create(dir.join("node.key"))?;
+    // The server announces its seeding to every browser. It dials no durable peer, so the plugin
+    // never judges one here.
+    let node = Node::builder(Arc::new(storage), PermissiveAgent::new())
+        .durable()
+        .key(key)
+        .plug(SystemReset::<System, _>::new(OnReseed::Refuse, c))
+        .build()?;
+
+    // A fresh store is a new seeding, with a System entity of its own.
+    let context = node.context_async(c).await?;
+    if context.fetch::<SystemView>("true").await?.is_empty() {
+        let trx = context.begin();
+        trx.create(&System { seeded_at: chrono::Utc::now().to_rfc3339() }).await?;
+        trx.commit().await?;
+    }
 
     // Clone node for log generation task
     let log_node = node.clone();

@@ -12,9 +12,11 @@ ankurah                        = { path = "../../ankurah", features = ["derive",
 ankurah-signals                = { path = "../../signals", features = ["wasm"], version = "=0.10.0" }
 ankurah-websocket-client-wasm  = { path = "../../connectors/websocket-client-wasm", version = "=0.10.0" }
 ankurah-storage-indexeddb-wasm = { path = "../../storage/indexeddb-wasm", version = "=0.10.0" }
+ankurah-system-reset           = { path = "../../extensions/system-reset", version = "=0.10.0" }
 example-model                  = { path = "../model", features = ["wasm"], version = "=0.10.0" }
 wasm-bindgen                   = "0.2.84"
 wasm-bindgen-futures           = "0.4.42"
+web-sys                        = { version = "0.3.76", features = ["Location", "Window"] }
 wasm-logger                    = "0.2.0"
 tracing                        = "0.1.40"
 tracing-wasm                   = "0.2.1"
