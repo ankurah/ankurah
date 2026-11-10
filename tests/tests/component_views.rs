@@ -9,7 +9,7 @@ use ankurah::core::storage::StorageEngine;
 use ankurah::entity::{Entity, LocalTrxEntity};
 use ankurah::error::RetrievalError;
 use ankurah::policy::DEFAULT_CONTEXT;
-use ankurah::property::PropertyError;
+use ankurah::property::{Json, PropertyError};
 use ankurah::signals::Peek;
 use ankurah::{Context, EntityId, Model, ModelId, Mutable, Node, PermissiveAgent, View};
 use ankurah_storage_sled::SledStorageEngine;
@@ -44,6 +44,17 @@ pub struct Assignment {
 #[model(label = "records.closure")]
 pub struct Closure {
     pub closed_at: i64,
+}
+
+/// A component whose JSON property `pin` shares its name with the label of the `Pin` component.
+#[derive(Model, Debug, Clone)]
+pub struct Card {
+    pub pin: Json,
+}
+
+#[derive(Model, Debug, Clone)]
+pub struct Pin {
+    pub owner: String,
 }
 
 fn task(status: &str, title: &str) -> Task {
@@ -391,4 +402,37 @@ async fn qualified_outside_component(f: Fixture) -> anyhow::Result<()> {
 async fn a_qualified_property_of_a_component_outside_the_tuple_reads_absent_where_it_is_missing() -> anyhow::Result<()> {
     qualified_outside_component(on_sled().await?).await?;
     qualified_outside_component(on_sqlite().await?).await
+}
+
+async fn dotted_paths(f: Fixture) -> anyhow::Result<()> {
+    let engine = f.engine;
+    let trx = f.ctx.begin();
+    let card = trx.create(&Card { pin: Json::new(serde_json::json!({ "owner": "zed" })) }).await?;
+    stage(card.entity(), &Pin { owner: "amy".into() }, f.ctx.resolve_model_id::<Pin>().await?)?;
+    let id = card.id();
+    trx.commit().await?;
+    let cards = |cards: Vec<CardView>| cards.iter().map(View::id).collect::<Vec<_>>();
+    let pairs = |pairs: Vec<(CardView, PinView)>| pairs.iter().map(|(card, _)| card.id()).collect::<Vec<_>>();
+
+    // `pin.owner` is Card's JSON property `pin` and its subpath, whether the query names Pin's component or not.
+    assert_eq!(cards(f.ctx.fetch("pin.owner = 'zed'").await?), [id], "{engine}");
+    assert_eq!(pairs(f.ctx.fetch("pin.owner = 'zed'").await?), [id], "{engine}");
+    assert_eq!(pairs(f.ctx.fetch("Pin::owner = 'amy'").await?), [id], "{engine}");
+
+    // A one-view query reads a leading label of its own component as a qualifier; a tuple query does not.
+    assert_eq!(cards(f.ctx.fetch("card.pin.owner = 'zed'").await?), [id], "{engine}");
+    assert_eq!(f.names(f.ctx.fetch::<TaskView>("task.title = 'ship'").await?.iter().map(View::id)), ["ada"], "{engine}");
+    let undeclared = ComponentScopeError::Undeclared { name: "card".into(), components: vec!["Card".into(), "Pin".into()] };
+    let refused = f.ctx.fetch::<(CardView, PinView)>("card.pin.owner = 'zed'").await.map(|_| ());
+    assert!(matches!(&refused, Err(RetrievalError::ComponentScope(error)) if *error == undeclared), "{engine}: {refused:?}");
+    Ok(())
+}
+
+/// In a query over a tuple a dot only ever starts a subpath, so `pin.owner` reads Card's JSON property `pin`
+/// beside a Pin component exactly as it does in a one-view query, and `Pin::owner` reads the component.
+/// A one-view query still reads a leading label of its own component as a qualifier.
+#[tokio::test]
+async fn a_dot_in_a_tuple_query_starts_a_subpath_and_never_names_a_component() -> anyhow::Result<()> {
+    dotted_paths(on_sled().await?).await?;
+    dotted_paths(on_sqlite().await?).await
 }

@@ -169,7 +169,7 @@ pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selec
                 _ => Ok(()),
             };
         }
-        let head = usize::from(path.steps.len() > 1 && schemas.iter().any(|schema| path.steps[0] == schema.label));
+        let head = usize::from(path.steps.len() > 1 && matches!(schemas, [only] if path.steps[0] == only.label));
         let name = path.steps.get(head).map(String::as_str).unwrap_or("");
         if schemas.iter().any(|schema| declares(schema, name)) {
             return Ok(());

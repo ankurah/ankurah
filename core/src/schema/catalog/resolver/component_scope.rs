@@ -54,9 +54,10 @@ pub(super) struct LocatedProperty<'p> {
 }
 
 /// Find the property a path names. `Component::name` reads it from the component the qualifier names: one of
-/// `components` by display name, or any component by label, including one a match may lack. A leading dotted
-/// label of one of `components` (`album.name`) also qualifies the path. A bare name belongs to whichever of
-/// `components` declares it, and is refused when two of them declare it as different properties.
+/// `components` by display name, or any component by label, including one a match may lack. A selection over
+/// one component also reads a leading dotted label of that component as its qualifier (`album.name`); over
+/// several, a dot only ever starts a subpath. A bare name belongs to whichever of `components` declares it,
+/// and is refused when two of them declare it as different properties.
 pub(super) fn locate_property<'p, R: ModelResolver + ?Sized>(
     components: &[QueryComponent<'_>],
     resolver: &R,
@@ -74,10 +75,10 @@ pub(super) fn locate_property<'p, R: ModelResolver + ?Sized>(
             .ok_or_else(|| ComponentScopeError::Undeclared { name: first.clone(), components: vec![qualifier.clone()] })?;
         return Ok(LocatedProperty { model, name: first, property, subpath: rest });
     }
-    if let [name, subpath @ ..] = rest {
-        if let Some(model) = resolver.resolve_model(first)?.filter(|model| components.iter().any(|component| component.model == *model)) {
-            let property = lookup_property(&model, resolver, name)?.ok_or_else(|| unknown_property(&model, name.as_str()))?;
-            return Ok(LocatedProperty { model, name, property, subpath });
+    if let ([only], [name, subpath @ ..]) = (components, rest) {
+        if resolver.resolve_model(first)?.as_ref() == Some(&only.model) {
+            let property = lookup_property(&only.model, resolver, name)?.ok_or_else(|| unknown_property(&only.model, name.as_str()))?;
+            return Ok(LocatedProperty { model: only.model, name, property, subpath });
         }
     }
     let mut found: Option<(&QueryComponent<'_>, ResolvedProperty)> = None;
