@@ -1,7 +1,7 @@
 //! The work a node asks a durable peer to do.
 
-use super::{inbound::applier, Node};
 use crate::internal::prelude::*;
+use crate::node::{inbound::applier, Node};
 use crate::retrieval::{CachedEventGetter, LocalStateGetter};
 use ankql::ast::Resolved;
 use ankurah_proto::Attested;

@@ -238,7 +238,7 @@ async fn only_a_configured_durable_peer_receives_local_commits() {
     assert_eq!(node.granted_trust(&configured.node_id()), Some(PeerTrust { durable: true }));
     assert_eq!(node.get_durable_peers(), vec![configured.node_id()]);
 
-    let relay = crate::node::durable_peer::relay_to_required_peers(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), &[]);
+    let relay = crate::node::peers::durable_peer::relay_to_required_peers(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), &[]);
     tokio::pin!(relay);
     assert!(futures::poll!(&mut relay).is_pending(), "the relay waits for the configured durable peer");
     assert_eq!(commit_relays(&configured_messages), 1);
@@ -267,7 +267,7 @@ async fn a_durable_peer_registering_again_inbound_leaves_durable_routing() {
     assert_eq!(client.granted_trust(&server.id), Some(PeerTrust { durable: false }));
     assert!(client.get_durable_peers().is_empty());
     assert!(!relay.is_connected(&server.id));
-    let commit = crate::node::durable_peer::relay_to_required_peers(&client, &DEFAULT_CONTEXT, proto::TransactionId::new(), &[]);
+    let commit = crate::node::peers::durable_peer::relay_to_required_peers(&client, &DEFAULT_CONTEXT, proto::TransactionId::new(), &[]);
     tokio::pin!(commit);
     assert!(matches!(futures::poll!(&mut commit), std::task::Poll::Ready(Ok(()))), "no durable peer is left to relay to");
     assert_eq!(commit_relays(&relayer_messages), 0);

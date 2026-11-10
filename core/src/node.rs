@@ -27,7 +27,6 @@ use tracing::instrument;
 use tracing::{debug, info, warn};
 
 mod builder;
-pub(crate) mod durable_peer;
 mod erased;
 pub(crate) mod event_admissibility;
 pub mod handles;
@@ -35,7 +34,7 @@ pub(crate) mod identity;
 pub(crate) mod inbound;
 mod lifecycle;
 mod match_args;
-mod peers;
+pub(crate) mod peers;
 #[cfg(test)]
 mod tests;
 

@@ -1,5 +1,6 @@
 //! The peers registered with one node.
 
+pub(crate) mod durable_peer;
 pub(super) mod peer_state;
 pub(super) mod plugin;
 
