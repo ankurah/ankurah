@@ -250,6 +250,80 @@ async fn a_closing_connection_leaves_a_newer_registration_of_its_peer_in_place()
     assert!(!relay.is_connected(&server.id));
 }
 
+/// A request from `from` to `node` that any registered peer may make.
+fn get_request(node: proto::NodeId, from: proto::NodeId) -> proto::NodeMessage {
+    let body = proto::CarriedBody::encode(&proto::NodeRequestBody::Get { ids: vec![] });
+    proto::NodeMessage::Request {
+        auth: vec![proto::AuthData(vec![])],
+        request: proto::NodeRequest { id: proto::RequestId::new(), to: node, from, body },
+    }
+}
+
+/// A registered peer cannot pass a frame off as another peer's: a frame of any kind that names a
+/// sender other than its connection's peer is refused, and that connection stays up.
+#[tokio::test]
+async fn a_frame_naming_a_sender_other_than_its_connections_peer_is_refused_and_the_connection_stays_up() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let (liar, other) = (NodeKey::generate(), NodeKey::generate());
+    let (liar_sent, liar_frames) = mpsc::channel();
+    let (other_sent, other_frames) = mpsc::channel();
+    let liar_connection =
+        register_keyed_peer(&node, &liar, false, PeerProvenance::Inbound, Box::new(RecordingSender(liar.node_id(), liar_sent)))
+            .await
+            .unwrap();
+    register_keyed_peer(&node, &other, false, PeerProvenance::Inbound, Box::new(RecordingSender(other.node_id(), other_sent)))
+        .await
+        .unwrap();
+    let request = node.request(other.node_id(), &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![] });
+    tokio::pin!(request);
+    assert!(futures::poll!(&mut request).is_pending());
+    let proto::NodeMessage::Request { request: sent, .. } = other_frames.try_recv().unwrap() else { panic!("the request was not sent") };
+
+    let in_others_name = [
+        get_request(node.id, other.node_id()),
+        proto::NodeMessage::Update(proto::NodeUpdate {
+            id: proto::UpdateId::new(),
+            from: other.node_id(),
+            to: node.id,
+            body: proto::CarriedBody::encode(&proto::NodeUpdateBody::SubscriptionUpdate { items: vec![] }),
+        }),
+        proto::NodeMessage::Response(proto::NodeResponse {
+            request_id: sent.id,
+            from: other.node_id(),
+            to: node.id,
+            body: proto::CarriedBody::encode(&proto::NodeResponseBody::Get(vec![])),
+        }),
+        proto::NodeMessage::UnsubscribeQuery { from: other.node_id(), query_id: proto::QueryId::new() },
+    ];
+    for forged in in_others_name {
+        node.handle_message(liar_connection, forged).await.unwrap();
+    }
+    assert!(liar_frames.try_recv().is_err() && other_frames.try_recv().is_err(), "neither peer was answered");
+    assert!(futures::poll!(&mut request).is_pending(), "the forged response fulfilled nothing");
+
+    node.handle_message(liar_connection, get_request(node.id, liar.node_id())).await.unwrap();
+    assert!(matches!(liar_frames.try_recv(), Ok(proto::NodeMessage::Response(_))), "the liar's own frames are still served");
+}
+
+/// A frame still arriving on a connection whose peer has since registered again elsewhere is
+/// refused, not served as if it came on the newer connection.
+#[tokio::test]
+async fn a_frame_on_a_connection_its_peer_has_registered_again_is_refused() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let key = NodeKey::generate();
+    let (old_sent, old_frames) = mpsc::channel();
+    let (new_sent, new_frames) = mpsc::channel();
+    let old =
+        register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(key.node_id(), old_sent))).await.unwrap();
+    let new =
+        register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(RecordingSender(key.node_id(), new_sent))).await.unwrap();
+
+    node.handle_message(old, get_request(node.id, key.node_id())).await.unwrap();
+    assert!(old_frames.try_recv().is_err() && new_frames.try_recv().is_err());
+    node.handle_message(new, get_request(node.id, key.node_id())).await.unwrap();
+    assert!(matches!(new_frames.try_recv(), Ok(proto::NodeMessage::Response(_))));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_registrations_of_one_id_leave_durable_routing_matching_the_connection_that_won() {
     let server = Node::new_durable(Arc::new(TestStorage::default()), PermissiveAgent::new());

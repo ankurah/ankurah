@@ -13,13 +13,14 @@
 //! the simulation seed and that index.
 
 use ankurah::core::connector::PeerProvenance;
-use ankurah::core::node::NodeKey;
+use ankurah::core::node::{ConnectionRegistration, NodeKey};
 use ankurah::core::test_helpers::commit_transaction;
 use ankurah::proto::{self, Attested};
 use ankurah::storage::StorageEngine;
 use ankurah::{Node, PermissiveAgent};
 use ankurah_storage_sled::SledStorageEngine;
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use super::model::{Field, SimRecord};
 use super::transport::{Captured, SimSender};
@@ -31,6 +32,9 @@ pub struct SimNode {
     pub durable: bool,
     pub node: Node<SledStorageEngine, PermissiveAgent>,
     captured: Captured,
+    /// This node's registration of each peer it connected to, by the peer's index: the one a
+    /// frame from that peer arrives on.
+    registrations: Mutex<BTreeMap<usize, ConnectionRegistration>>,
 }
 
 impl SimNode {
@@ -46,7 +50,14 @@ impl SimNode {
         ours.receive_opening(theirs.opening()).expect("sim peers share this build's protocol versions");
         theirs.receive_opening(ours.opening()).expect("sim peers share this build's protocol versions");
         let presence = peer.node.presence(&theirs).await.expect("sim peers do not halt during setup");
-        self.node.register_peer(presence, ours, provenance, Box::new(sender)).await.expect("sim peers answer each other's handshakes");
+        let registration =
+            self.node.register_peer(presence, ours, provenance, Box::new(sender)).await.expect("sim peers answer each other's handshakes");
+        self.registrations.lock().unwrap().insert(peer.index, registration);
+    }
+
+    /// This node's registration of the peer at `index`, if it connected to that peer.
+    pub fn registration_of(&self, index: usize) -> Option<ConnectionRegistration> {
+        self.registrations.lock().unwrap().get(&index).copied()
     }
 
     /// Ingest a forged batch of events directly through the production remote
@@ -132,13 +143,13 @@ pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Res
     crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
     let durable = Node::builder(durable_engine, PermissiveAgent::new()).durable().key(sim_node_key(seed, 0)).build()?;
     durable.wait_ready().await?;
-    nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
+    nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone(), registrations: Mutex::new(BTreeMap::new()) });
 
     // Nodes 1..n: ephemeral.
     for index in 1..n {
         let node =
             Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).key(sim_node_key(seed, index)).build()?;
-        nodes.push(SimNode { index, durable: false, node, captured: captured.clone() });
+        nodes.push(SimNode { index, durable: false, node, captured: captured.clone(), registrations: Mutex::new(BTreeMap::new()) });
     }
 
     // Ephemeral descriptors are seeded after those nodes become ready.

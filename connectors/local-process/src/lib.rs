@@ -103,6 +103,16 @@ where
         Ok(Self { node1: node1.weak(), node2: node2.weak(), registration1, registration2, receiver1_task, receiver2_task })
     }
 
+    /// The registration `node`, one of the two connected nodes, holds of the other: the one a frame
+    /// from the other node arrives on.
+    pub fn registration_held_by(&self, node: proto::NodeId) -> Option<ConnectionRegistration> {
+        match node {
+            node if node == self.registration2.peer() => Some(self.registration1),
+            node if node == self.registration1.peer() => Some(self.registration2),
+            _ => None,
+        }
+    }
+
     fn setup_receiver<SE, PA>(
         node: Node<SE, PA>,
         registration: ConnectionRegistration,
@@ -124,7 +134,7 @@ where
                 };
                 let node = node.clone();
                 tokio::spawn(async move {
-                    let _ = node.handle_message(message).await;
+                    let _ = node.handle_message(registration, message).await;
                 });
             }
             node.deregister_peer(registration);

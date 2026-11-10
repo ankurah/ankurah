@@ -468,43 +468,46 @@ where
         // response_rx.await.map_err(|_| RequestError::InternalChannelClosed)??;
     }
 
-    // TODO add a node id argument to this function rather than getting it from the message
-    // (does this actually make it more secure? or just move the place they could lie to us to the handshake?)
-    // Not if its signed by a node key.
+    /// Handle a frame that arrived on the connection `registration` registered. A frame naming
+    /// another node as its sender, or arriving once a newer registration of the peer replaced
+    /// this one, is refused and logged, and the connection stays up.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(message = %message)))]
-    pub async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
+    pub async fn handle_message(&self, registration: ConnectionRegistration, message: proto::NodeMessage) -> anyhow::Result<()> {
         self.lifecycle.check_not_halted()?;
+        let sender_named = sender_of(&message);
+        if sender_named != registration.peer() {
+            warn!("Node({}) refusing a frame from peer {} that names {} as its sender", self.id, registration.peer(), sender_named);
+            return Ok(());
+        }
+        let Some(connection) = self.peers.registered(&registration) else {
+            warn!("Node({}) refusing a frame from peer {} on a connection no longer registered", self.id, registration.peer());
+            return Ok(());
+        };
         match message {
             proto::NodeMessage::Update(update) => {
                 debug!("Node({}) received update {}", self.id, update);
-
-                if let Some(sender) = { self.peers.connection(&update.from).map(|c| c.sender.cloned()) } {
-                    let _from = update.from;
-                    let _id = update.id.clone();
-                    if update.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
-                        return Ok(());
-                    }
-
-                    // take down the return address
-                    let id = update.id.clone();
-                    let to = update.from;
-                    let from = self.id;
-
-                    // TODO - validate the from node id is the one we're connected to
-                    let body = match update.body.decode() {
-                        Ok(body) => match self.handle_update(update.from, body).await {
-                            Ok(_) => proto::NodeUpdateAckBody::Success,
-                            Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
-                        },
-                        Err(unreadable) => {
-                            debug!("Node({}) cannot read update {} from {}: {}", self.id, id, update.from, unreadable);
-                            proto::NodeUpdateAckBody::Unsupported
-                        }
-                    };
-
-                    sender.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
+                if update.to != self.id {
+                    warn!("{} received message from {} but is not the intended recipient", self.id, update.from);
+                    return Ok(());
                 }
+
+                // take down the return address
+                let id = update.id.clone();
+                let to = update.from;
+                let from = self.id;
+
+                let body = match update.body.decode() {
+                    Ok(body) => match self.handle_update(update.from, body).await {
+                        Ok(_) => proto::NodeUpdateAckBody::Success,
+                        Err(e) => proto::NodeUpdateAckBody::Error(e.to_string()),
+                    },
+                    Err(unreadable) => {
+                        debug!("Node({}) cannot read update {} from {}: {}", self.id, id, update.from, unreadable);
+                        proto::NodeUpdateAckBody::Unsupported
+                    }
+                };
+
+                connection.send_message(proto::NodeMessage::UpdateAck(proto::NodeUpdateAck { id, from, to, body }))?;
             }
             proto::NodeMessage::UpdateAck(ack) => {
                 debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
@@ -520,48 +523,44 @@ where
                 // I think we want timeouts to be handled by the node, not the connector,
                 // which would lend itself to spawning a task here and making this function synchronous.
 
-                // double check to make sure we have a connection to the peer based on the node id
-                if let Some(sender) = { self.peers.connection(&request.from).map(|c| c.sender.cloned()) } {
-                    let from = request.from;
-                    let request_id = request.id.clone();
-                    if request.to != self.id {
-                        warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
-                        return Ok(());
-                    }
-
-                    let body = match request.body.decode() {
-                        Ok(body) => {
-                            // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
-                            // follow-on uses #426's node session union for catalog queries.
-                            let cdata = if crate::schema::request_bypasses_policy(&body) {
-                                Ok(Vec::new())
-                            } else {
-                                self.policy_agent.check_request(self, &auth, &request).await
-                            };
-                            match cdata {
-                                Ok(cdata) => match self.handle_request(&cdata, from, body).await {
-                                    Ok(result) => result,
-                                    Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                                },
-                                Err(e) => proto::NodeResponseBody::Error(e.to_string()),
-                            }
-                        }
-                        Err(unreadable) => {
-                            debug!("Node({}) cannot read request {} from {}: {}", self.id, request_id, from, unreadable);
-                            proto::NodeResponseBody::Unsupported
-                        }
-                    };
-                    let _result = sender.send_message(proto::NodeMessage::Response(proto::NodeResponse {
-                        request_id,
-                        from: self.id,
-                        to: from,
-                        body: proto::CarriedBody::encode(&body),
-                    }));
+                let from = request.from;
+                let request_id = request.id.clone();
+                if request.to != self.id {
+                    warn!("{} received message from {} but is not the intended recipient", self.id, request.from);
+                    return Ok(());
                 }
+
+                let body = match request.body.decode() {
+                    Ok(body) => {
+                        // Temporary credentialless catalog reads. Remove this bypass when the #425 catalog
+                        // follow-on uses #426's node session union for catalog queries.
+                        let cdata = if crate::schema::request_bypasses_policy(&body) {
+                            Ok(Vec::new())
+                        } else {
+                            self.policy_agent.check_request(self, &auth, &request).await
+                        };
+                        match cdata {
+                            Ok(cdata) => match self.handle_request(&cdata, from, body).await {
+                                Ok(result) => result,
+                                Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                            },
+                            Err(e) => proto::NodeResponseBody::Error(e.to_string()),
+                        }
+                    }
+                    Err(unreadable) => {
+                        debug!("Node({}) cannot read request {} from {}: {}", self.id, request_id, from, unreadable);
+                        proto::NodeResponseBody::Unsupported
+                    }
+                };
+                let _result = connection.send_message(proto::NodeMessage::Response(proto::NodeResponse {
+                    request_id,
+                    from: self.id,
+                    to: from,
+                    body: proto::CarriedBody::encode(&body),
+                }));
             }
             proto::NodeMessage::Response(response) => {
                 debug!("Node {} received response {}", self.id, response);
-                let connection = self.peers.connection(&response.from).ok_or(RequestError::PeerNotConnected)?;
                 if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
                     let body = match response.body.decode() {
                         Ok(proto::NodeResponseBody::Unsupported) => Err(RequestError::UnsupportedByPeer(response.from)),
@@ -571,11 +570,9 @@ where
                     tx.send(body).map_err(|e| anyhow!("Failed to send response: {:?}", e))?;
                 }
             }
-            proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
+            proto::NodeMessage::UnsubscribeQuery { query_id, .. } => {
                 // Remove predicate from the peer's subscription
-                if let Some(peer_state) = self.peers.connection(&from) {
-                    peer_state.subscription_handler.remove_predicate(query_id).await?;
-                }
+                connection.subscription_handler.remove_predicate(query_id).await?;
             }
         }
         Ok(())
@@ -663,10 +660,6 @@ where
     }
 
     async fn handle_update(&self, from: proto::NodeId, body: proto::NodeUpdateBody) -> anyhow::Result<()> {
-        let Some(_connection) = self.peers.connection(&from) else {
-            return Err(anyhow!("Rejected notification from unknown node {}", from));
-        };
-
         match body {
             proto::NodeUpdateBody::SubscriptionUpdate { items } => {
                 tracing::debug!("Node({}) received subscription update from peer {}", self.id, from);
@@ -1037,5 +1030,16 @@ where PA: PolicyAgent
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // bold blue, dimmed brackets
         write!(f, "\x1b[1;34mnode\x1b[2m[\x1b[1;34m{}\x1b[2m]\x1b[0m", self.id.to_base64_short())
+    }
+}
+
+/// The node a frame names as its sender.
+fn sender_of(message: &proto::NodeMessage) -> proto::NodeId {
+    match message {
+        proto::NodeMessage::Request { request, .. } => request.from,
+        proto::NodeMessage::Response(response) => response.from,
+        proto::NodeMessage::Update(update) => update.from,
+        proto::NodeMessage::UpdateAck(ack) => ack.from,
+        proto::NodeMessage::UnsubscribeQuery { from, .. } => *from,
     }
 }

@@ -110,13 +110,18 @@ impl<CD: ContextData> PeerRegistry<CD> {
     ) -> Option<Arc<PeerState<CD>>> {
         let peer = registration.peer;
         let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.connections.get(&peer).filter(|connection| connection.registration == registration)?;
+        self.registered(&registration)?;
         self.durable.remove(&peer);
         let connection = self.connections.remove(&peer);
         if let Some(relay) = relay {
             relay.notify_peer_disconnected(peer);
         }
         connection
+    }
+
+    /// The connection `registration` registered, while no newer registration of its peer has replaced it.
+    pub(super) fn registered(&self, registration: &ConnectionRegistration) -> Option<Arc<PeerState<CD>>> {
+        self.connections.get(&registration.peer).filter(|connection| connection.registration == *registration)
     }
 
     /// The connection registered for `peer`.

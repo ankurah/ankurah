@@ -435,13 +435,13 @@ where
                 }
             }
             Ok(proto::Message::PeerMessage(node_msg)) => {
-                if registration.is_none() {
+                let Some(registration) = *registration else {
                     // Application traffic before a compatible Presence:
                     // negotiation has not admitted this server, so nothing
                     // it says may reach the node.
                     return Err(anyhow!("server {} sent application traffic before presence negotiation completed", inner.server_url));
-                }
-                Self::handle_peer_message(inner, node_msg).await;
+                };
+                Self::handle_peer_message(inner, registration, node_msg).await;
                 Ok(MessageResult::Continue)
             }
             Err(e) => {
@@ -490,11 +490,11 @@ where
         Ok(())
     }
 
-    async fn handle_peer_message(inner: &Arc<Inner<SE, PA>>, node_msg: proto::NodeMessage) {
+    async fn handle_peer_message(inner: &Arc<Inner<SE, PA>>, registration: ConnectionRegistration, node_msg: proto::NodeMessage) {
         debug!("Received peer message");
         let node = inner.node.clone();
         tokio::spawn(async move {
-            if let Err(e) = node.handle_message(node_msg).await {
+            if let Err(e) = node.handle_message(registration, node_msg).await {
                 warn!("Error handling peer message: {}", e);
             }
         });

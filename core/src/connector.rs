@@ -88,7 +88,8 @@ pub trait NodeComms: Send + Sync {
     ) -> Result<ConnectionRegistration, PeerConnectionError>;
     fn state(&self) -> ankurah_signals::Read<NodeState>;
     fn deregister_peer(&self, registration: ConnectionRegistration);
-    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()>;
+    /// Handle a frame that arrived on the connection `registration` registered.
+    async fn handle_message(&self, registration: ConnectionRegistration, message: proto::NodeMessage) -> anyhow::Result<()>;
     fn cloned(&self) -> Box<dyn NodeComms>;
 }
 
@@ -108,9 +109,8 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     }
     fn state(&self) -> ankurah_signals::Read<NodeState> { self.state() }
     fn deregister_peer(&self, registration: ConnectionRegistration) { self.deregister_peer(registration); }
-    async fn handle_message(&self, message: proto::NodeMessage) -> anyhow::Result<()> {
-        //
-        self.handle_message(message).await
+    async fn handle_message(&self, registration: ConnectionRegistration, message: proto::NodeMessage) -> anyhow::Result<()> {
+        self.handle_message(registration, message).await
     }
     fn cloned(&self) -> Box<dyn NodeComms> { Box::new(self.clone()) }
 }

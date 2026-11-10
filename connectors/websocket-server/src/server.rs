@@ -272,9 +272,10 @@ where
                         }
                     }
                     proto::Message::PeerMessage(msg) => {
-                        if let Connection::Established { .. } = state {
+                        if let Connection::Established { registration, .. } = state {
+                            let registration = *registration;
                             tokio::spawn(async move {
-                                if let Err(e) = node.handle_message(msg).await {
+                                if let Err(e) = node.handle_message(registration, msg).await {
                                     error!("Error handling message from {}: {:?}", client_ip, e);
                                 }
                             });

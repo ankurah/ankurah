@@ -274,19 +274,19 @@ impl Connection {
                     }
                 }
                 proto::Message::PeerMessage(msg) => {
-                    if self.registration.get().is_none() {
+                    let Some(registration) = self.registration.get() else {
                         // As the native client: nothing an unregistered server says may reach the node.
                         let message = format!("Server {} sent application traffic before its presence registered; closing", self.url);
                         error!("{}", message);
                         self.disconnect();
                         self.set_state(ConnectionState::Error { message, cause: None });
                         return None;
-                    }
+                    };
                     let node = self.node.cloned();
                     // TODO: determine the performance implications of spawning a new task for each message
                     // versus using a channel to send messages to the node.
                     wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(e) = node.handle_message(msg).await {
+                        if let Err(e) = node.handle_message(registration, msg).await {
                             info!("Error handling message: {:?}", e);
                         }
                     });

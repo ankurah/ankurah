@@ -119,7 +119,8 @@ async fn an_event_fetched_from_a_peer_after_a_reset_is_not_stored() {
     let key = NodeKey::generate();
     let peer = key.node_id();
     let (sent, messages) = mpsc::channel();
-    register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(peer, sent))).await.unwrap();
+    let registration =
+        register_keyed_peer(&node, &key, true, PeerProvenance::Configured, Box::new(RecordingSender(peer, sent))).await.unwrap();
     let model = proto::ModelId::EntityId(proto::EntityId::from_bytes([7; 32]));
     let event = proto::Event::genesis(
         key.node_id().identity(),
@@ -144,7 +145,7 @@ async fn an_event_fetched_from_a_peer_after_a_reset_is_not_stored() {
         .expect("the fetch asked the peer");
     let body = proto::NodeResponseBody::GetEvents(vec![event.clone().into()]);
     let response = proto::NodeResponse { request_id, from: peer, to: node.id, body: proto::CarriedBody::encode(&body) };
-    node.handle_message(proto::NodeMessage::Response(response)).await.unwrap();
+    node.handle_message(registration, proto::NodeMessage::Response(response)).await.unwrap();
 
     node.reset().await.unwrap();
     assert!(matches!(fetch.await, Err(RetrievalError::NodeHalted(NodeHaltReason::Reset))));

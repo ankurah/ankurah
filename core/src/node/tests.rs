@@ -233,7 +233,7 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     transaction.commit().await.unwrap();
     let key = NodeKey::generate();
     let peer = key.node_id();
-    register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(ClosedSender(peer))).await.unwrap();
+    let registration = register_keyed_peer(&node, &key, false, PeerProvenance::Inbound, Box::new(ClosedSender(peer))).await.unwrap();
 
     let model = ModelId::System(proto::SystemModel::Model);
     let (entered, entered_rx) = oneshot::channel();
@@ -253,7 +253,8 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
         node.request(peer, &DEFAULT_CONTEXT, proto::NodeRequestBody::Get { ids: vec![id] }).await,
         Err(RequestError::NodeHalted(error)) if error == reason
     ));
-    assert!(node.handle_message(proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() }).await.is_err());
+    let unsubscribe = proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() };
+    assert!(node.handle_message(registration, unsubscribe).await.is_err());
 }
 
 /// Each read that asks a durable peer reports a halt as the halt, as local reads do.

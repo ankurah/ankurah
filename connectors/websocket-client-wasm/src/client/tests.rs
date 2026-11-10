@@ -96,7 +96,7 @@ impl NodeComms for HeldAdmission {
     }
     fn state(&self) -> Read<NodeState> { self.0.node_state.read() }
     fn deregister_peer(&self, _: ConnectionRegistration) { self.0.published.set(false); }
-    async fn handle_message(&self, _: proto::NodeMessage) -> anyhow::Result<()> {
+    async fn handle_message(&self, _: ConnectionRegistration, _: proto::NodeMessage) -> anyhow::Result<()> {
         self.0.handled.set(self.0.handled.value() + 1);
         Ok(())
     }

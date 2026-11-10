@@ -58,6 +58,7 @@ pub struct Record {
 // ---------------------------------------------------------------------------
 
 use ankurah::core::connector::{PeerProvenance, PeerSender, SendError};
+use ankurah::core::node::ConnectionRegistration;
 use tokio::sync::mpsc;
 
 #[derive(Clone)]
@@ -81,6 +82,8 @@ impl PeerSender for GatedSender {
 pub struct MessageGate {
     filter: Arc<dyn Fn(&proto::NodeMessage) -> bool + Send + Sync>,
     held: Arc<Mutex<Vec<proto::NodeMessage>>>,
+    /// The gated node's registration of the other, which the held messages arrive on.
+    registration: ConnectionRegistration,
 }
 
 impl MessageGate {
@@ -106,7 +109,7 @@ impl MessageGate {
             held.drain(..count).collect()
         };
         for message in drained {
-            let _ = node.handle_message(message).await;
+            let _ = node.handle_message(self.registration, message).await;
         }
     }
 
@@ -123,7 +126,7 @@ impl MessageGate {
             held.drain(start..).collect()
         };
         for message in drained {
-            let _ = node.handle_message(message).await;
+            let _ = node.handle_message(self.registration, message).await;
         }
     }
 }
@@ -134,6 +137,8 @@ impl MessageGate {
 pub struct GatedConnection {
     task_a: tokio::task::JoinHandle<()>,
     task_b: tokio::task::JoinHandle<()>,
+    /// `other`'s registration of `gated`, the one a frame from `gated` arrives on.
+    other_registration: ConnectionRegistration,
 }
 
 impl GatedConnection {
@@ -167,23 +172,23 @@ impl GatedConnection {
             other
                 .register_peer(gated_presence, other_side, other_provenance, Box::new(GatedSender { sender: gated_tx, node_id: gated.id }))
                 .await
-                .expect("each presence answers the other side's handshake");
+                .expect("each presence answers the other side's handshake")
         };
         let register_gated = async {
             gated
                 .register_peer(other_presence, gated_side, gated_provenance, Box::new(GatedSender { sender: other_tx, node_id: other.id }))
                 .await
-                .expect("each presence answers the other side's handshake");
+                .expect("each presence answers the other side's handshake")
         };
-        if gated_dials {
-            register_gated.await;
-            register_other.await;
+        let (other_registration, gated_registration) = if gated_dials {
+            let gated_registration = register_gated.await;
+            (register_other.await, gated_registration)
         } else {
-            register_other.await;
-            register_gated.await;
-        }
+            let other_registration = register_other.await;
+            (other_registration, register_gated.await)
+        };
 
-        let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())) };
+        let gate = MessageGate { filter: Arc::new(filter), held: Arc::new(Mutex::new(Vec::new())), registration: gated_registration };
 
         // Messages flowing INTO `other` are always handled immediately.
         let task_a = {
@@ -192,7 +197,7 @@ impl GatedConnection {
                 while let Some(message) = other_rx.recv().await {
                     let node = node.clone();
                     tokio::spawn(async move {
-                        let _ = node.handle_message(message).await;
+                        let _ = node.handle_message(other_registration, message).await;
                     });
                 }
             })
@@ -210,14 +215,17 @@ impl GatedConnection {
                     }
                     let node = node.clone();
                     tokio::spawn(async move {
-                        let _ = node.handle_message(message).await;
+                        let _ = node.handle_message(gated_registration, message).await;
                     });
                 }
             })
         };
 
-        (Self { task_a, task_b }, gate)
+        (Self { task_a, task_b, other_registration }, gate)
     }
+
+    /// `other`'s registration of `gated`, for a test framing a message from `gated`.
+    pub fn other_registration(&self) -> ConnectionRegistration { self.other_registration }
 }
 
 impl Drop for GatedConnection {
