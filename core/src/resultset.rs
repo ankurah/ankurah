@@ -65,7 +65,7 @@ impl<R: ComponentViews> ResultSet<R> {
 pub(crate) fn member_view<R: ComponentViews>(entity: Entity) -> R {
     // Only core builds typed result sets (`map` and `wrap` are crate-private), each from a query on R's own components:
     // resolving that query bound them, its predicate admits only members of each, and memberships are never removed.
-    R::view_entity(entity).expect("typed result sets hold only members of their bound components")
+    R::views_of(entity).expect("typed result sets hold only members of their bound components")
 }
 
 #[derive(Debug)]

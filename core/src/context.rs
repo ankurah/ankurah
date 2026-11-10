@@ -102,7 +102,7 @@ impl Context {
 
         let entities = self.0.fetch_entities(args).await?;
 
-        entities.into_iter().map(R::view_entity).collect()
+        entities.into_iter().map(R::views_of).collect()
     }
 
     pub async fn fetch_one<R: ComponentViews + Clone + 'static>(

@@ -9,23 +9,23 @@ pub trait ComponentViews: Sized {
     fn components() -> Vec<&'static ModelStructDescriptor>;
 
     /// View `entity`, a member of every one of `components()`, through each of them.
-    fn view_entity(entity: Entity) -> Result<Self, RetrievalError>;
+    fn views_of(entity: Entity) -> Result<Self, RetrievalError>;
 }
 
 impl<V: View> ComponentViews for V {
     fn components() -> Vec<&'static ModelStructDescriptor> { vec![V::Model::descriptor()] }
 
-    fn view_entity(entity: Entity) -> Result<Self, RetrievalError> { V::from_entity(entity) }
+    fn views_of(entity: Entity) -> Result<Self, RetrievalError> { V::from_entity(entity) }
 }
 
 impl<A: View, B: View> ComponentViews for (A, B) {
     fn components() -> Vec<&'static ModelStructDescriptor> { vec![A::Model::descriptor(), B::Model::descriptor()] }
 
-    fn view_entity(entity: Entity) -> Result<Self, RetrievalError> { Ok((entity.cast()?, entity.cast()?)) }
+    fn views_of(entity: Entity) -> Result<Self, RetrievalError> { Ok((entity.cast()?, entity.cast()?)) }
 }
 
 impl<A: View, B: View, C: View> ComponentViews for (A, B, C) {
     fn components() -> Vec<&'static ModelStructDescriptor> { vec![A::Model::descriptor(), B::Model::descriptor(), C::Model::descriptor()] }
 
-    fn view_entity(entity: Entity) -> Result<Self, RetrievalError> { Ok((entity.cast()?, entity.cast()?, entity.cast()?)) }
+    fn views_of(entity: Entity) -> Result<Self, RetrievalError> { Ok((entity.cast()?, entity.cast()?, entity.cast()?)) }
 }
