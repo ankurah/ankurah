@@ -318,38 +318,26 @@ where
 /// The server's own presence, its plugins' announcements included, is bound by the handshake
 /// deadline: a server whose plugin never announces closes the connection of the client it
 /// registered, and removes that registration.
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn the_server_closes_a_connection_whose_answer_is_not_ready_within_the_handshake_deadline() -> Result<()> {
     let server_node =
         Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).durable().plug(SilentAnnouncer).build()?;
     let (server_url, server_task) = serve(server_node.clone()).await?;
-    let key = NodeKey::generate();
-    let (mut socket, _) = tokio_tungstenite::connect_async(format!("{server_url}/ws")).await?;
-    let opening = proto::Opening { versions: SPOKEN, challenge: proto::HandshakeChallenge::new(key.node_id()) };
-    socket.send(frame(&proto::Message::Open(opening))).await?;
-    let server_opening = match socket.next().await {
-        Some(Ok(WsMessage::Binary(data))) => match proto::Message::decode(&data)? {
-            proto::Message::Open(opening) => opening,
-            other => panic!("the server opened with {other}"),
-        },
-        other => panic!("the server opened with {other:?}"),
-    };
-    let claims = claims_answering(&key, &server_opening, SPOKEN, false);
-    socket.send(frame(&proto::Message::Presence(key.sign_presence(claims)))).await?;
-    // Yield rather than sleep, so the paused clock stays put until the server is presenting.
-    while server_node.granted_trust(&key.node_id()).is_none() {
-        tokio::task::yield_now().await;
-    }
+    let mut client = RawClient::open(&server_url, SPOKEN).await?;
+    client.present(|_| {}).await?;
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
 
+    // The server is now waiting on its plugin's announcement. Run the clock past the deadline
+    // without waiting for it; the clock stays real until here, so no earlier deadline fires early.
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(60)).await;
     tokio::task::yield_now().await;
-    // As in the silent client's test: resume before bounding the read on the clock.
     tokio::time::resume();
-    match tokio::time::timeout(Duration::from_secs(1), socket.next()).await.expect("the server left the connection open") {
+    match tokio::time::timeout(Duration::from_secs(1), client.socket.next()).await.expect("the server left the connection open") {
         None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => {}
         Some(Ok(other)) => panic!("the server sent {other:?} instead of closing"),
     }
-    assert!(eventually(|| server_node.granted_trust(&key.node_id()).is_none()).await, "the server removes the registration");
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_none()).await, "the server removes the registration");
     server_task.abort();
     Ok(())
 }
