@@ -242,6 +242,18 @@ fn parse_qualified_steps<'i>(pairs: impl Iterator<Item = Pair<'i, grammar::Rule>
     (component, steps)
 }
 
+/// How AnkQL text writes `name` as an identifier: bare when the grammar reads it as one identifier,
+/// double-quoted otherwise.
+pub fn identifier_spelling(name: &str) -> String {
+    let plain = name.chars().next().is_some_and(|first| !first.is_ascii_digit())
+        && name.chars().all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-');
+    if plain {
+        name.to_owned()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
 fn parse_identifier(text: &str) -> String {
     match text.strip_prefix('"').and_then(|text| text.strip_suffix('"')) {
         Some(quoted) => quoted.replace("\"\"", "\""),

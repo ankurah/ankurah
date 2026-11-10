@@ -1,6 +1,7 @@
 //! Which of a query's components a property name belongs to.
 
 use ankql::ast::{Expr, Parsed, PathExpr, Predicate, Selection};
+use ankql::parser::identifier_spelling;
 use ankurah_proto::{ModelId, PropertyId};
 use thiserror::Error;
 
@@ -62,15 +63,15 @@ pub enum ComponentScopeError {
     /// A bare name two of the query's components declare as different properties.
     #[error(
         "'{name}' names different properties in components '{first}' and '{second}'; qualify it as {}::{name} or {}::{name}",
-        qualifier_spelling(.first),
-        qualifier_spelling(.second)
+        identifier_spelling(.first),
+        identifier_spelling(.second)
     )]
     Ambiguous { name: String, first: String, second: String },
     /// A display name two different components of the query share; only their labels tell them apart.
     #[error(
         "'{qualifier}' is the display name of components '{first}' and '{second}'; qualify by label, as {}:: or {}::",
-        qualifier_spelling(.first),
-        qualifier_spelling(.second)
+        identifier_spelling(.first),
+        identifier_spelling(.second)
     )]
     AmbiguousQualifier { qualifier: String, first: String, second: String },
     /// A qualifier naming neither a component of the query by display name nor any component by label.
@@ -83,17 +84,6 @@ pub enum ComponentScopeError {
     /// A name that none of these components declares.
     #[error("no property '{name}' in {}", describe_components(.components))]
     Undeclared { name: String, components: Vec<String> },
-}
-
-/// How a qualifier writes `name`: bare when the grammar reads it as one identifier, double-quoted otherwise.
-fn qualifier_spelling(name: &str) -> String {
-    let plain = name.chars().next().is_some_and(|first| !first.is_ascii_digit())
-        && name.chars().all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-');
-    if plain {
-        name.to_owned()
-    } else {
-        format!("\"{}\"", name.replace('"', "\"\""))
-    }
 }
 
 fn describe_components(components: &[String]) -> String {
