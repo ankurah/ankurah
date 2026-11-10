@@ -37,7 +37,7 @@ impl<'a> From<&'a ModelStructDescriptor> for ComponentNames<'a> {
 }
 
 /// Which of `members` a `Component::` qualifier names: the one with that display name, else the one with that
-/// label. A display name that two different components share names neither.
+/// label. A display name that two different components share is refused as `AmbiguousQualifier`.
 fn member_named<'a>(
     members: impl IntoIterator<Item = Option<ComponentNames<'a>>>,
     qualifier: &str,
@@ -162,11 +162,11 @@ pub(super) fn locate_sort_key<'p, R: ModelResolver + ?Sized>(
     path: &'p PathExpr,
 ) -> Result<LocatedProperty<'p>, ModelResolutionError> {
     if let Some(qualifier) = &path.component {
+        let Some(name) = path.steps.first() else { return Err(undeclared(components, "")) };
         let in_query = member_named(components.iter().map(|component| component.names), qualifier)?.is_some()
             || resolver.resolve_model(qualifier)?.is_some_and(|model| components.iter().any(|component| component.model == model));
         if !in_query {
-            let name = path.steps.first().cloned().unwrap_or_default();
-            return Err(ComponentScopeError::SortKeyOutsideQuery { component: qualifier.clone(), name }.into());
+            return Err(ComponentScopeError::SortKeyOutsideQuery { component: qualifier.clone(), name: name.clone() }.into());
         }
     }
     locate_property(components, resolver, path)
@@ -206,7 +206,7 @@ fn undeclared(components: &[QueryComponent<'_>], name: &str) -> ModelResolutionE
 pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selection: &Selection<Parsed>) -> Result<(), RetrievalError> {
     let members: Vec<ComponentNames> = schemas.iter().map(|schema| ComponentNames::from(*schema)).collect();
     let declares = |schema: &ModelStructDescriptor, name: &str| name == "id" || schema.field_by_name(name).is_some();
-    let check = |path: &PathExpr, sort_key: bool| -> Result<(), RetrievalError> {
+    let check = |path: &PathExpr, clause: Clause| -> Result<(), RetrievalError> {
         let Some((first, rest)) = path.steps.split_first() else { return Ok(()) };
         if let Some(qualifier) = &path.component {
             return match member_named(members.iter().copied().map(Some), qualifier)? {
@@ -214,7 +214,7 @@ pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selec
                     Err(ComponentScopeError::Undeclared { name: first.clone(), components: vec![qualifier.clone()] }.into())
                 }
                 Some(_) => Ok(()),
-                None if sort_key => {
+                None if clause == Clause::OrderBy => {
                     Err(ComponentScopeError::SortKeyOutsideQuery { component: qualifier.clone(), name: first.clone() }.into())
                 }
                 None => Ok(()),
@@ -242,11 +242,18 @@ pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selec
             .into(),
         })
     };
-    check_predicate_names(&selection.predicate, &|path| check(path, false))?;
+    check_predicate_names(&selection.predicate, &|path| check(path, Clause::Predicate))?;
     for item in selection.order_by.iter().flatten() {
-        check(&item.path, true)?;
+        check(&item.path, Clause::OrderBy)?;
     }
     Ok(())
+}
+
+/// The part of a selection a name stands in; an ORDER BY key must belong to a component of the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Clause {
+    Predicate,
+    OrderBy,
 }
 
 fn check_predicate_names(
