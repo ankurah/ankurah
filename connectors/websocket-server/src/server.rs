@@ -342,12 +342,7 @@ where
                         warn!("Received an opening from {} after its presence - ignoring", client_ip);
                     }
                 },
-                // A message of a kind this node's version does not define closes the connection,
-                // and so does a handshake frame it cannot read, since that handshake will never
-                // establish.
-                Err(unreadable)
-                    if matches!(unreadable, proto::UnreadableFrame::UnknownKind { .. }) || matches!(state, Connection::Initial { .. }) =>
-                {
+                Err(unreadable) if unreadable.closes_connection(matches!(state, Connection::Established { .. })) => {
                     error!("Closing peer at {client_ip}: it sent {unreadable}");
                     return ControlFlow::Break(());
                 }

@@ -286,11 +286,8 @@ impl Connection {
                     });
                 }
             },
-            // A message of a kind this node's version does not define closes the connection, and
-            // so does a handshake frame it cannot read, since that handshake will never establish.
             Err(unreadable)
-                if matches!(unreadable, proto::UnreadableFrame::UnknownKind { .. })
-                    || matches!(&*self.state.read().unwrap(), ConnectionState::Connecting { .. }) =>
+                if unreadable.closes_connection(!matches!(&*self.state.read().unwrap(), ConnectionState::Connecting { .. })) =>
             {
                 let message = format!("Server {} sent {unreadable}; closing", self.url);
                 error!("{}", message);

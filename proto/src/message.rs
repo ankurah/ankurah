@@ -53,6 +53,17 @@ pub enum UnreadableFrame {
     Malformed(String),
 }
 
+impl UnreadableFrame {
+    /// Whether the connection this frame arrived on closes (specs/protocol/bytes.md section 6): always for a kind this build
+    /// does not know, and for a malformed frame only during the handshake, since that handshake will never complete.
+    pub fn closes_connection(&self, handshake_complete: bool) -> bool {
+        match self {
+            UnreadableFrame::UnknownKind { .. } => true,
+            UnreadableFrame::Malformed(_) => !handshake_complete,
+        }
+    }
+}
+
 // The variant indices of `Message::Open` and `Message::NoCommonVersion`, which open their frames
 // in every protocol version, and of `Message::PeerMessage`, whose `NodeMessage` a later version
 // may extend; the tests below pin them.
@@ -295,5 +306,14 @@ mod tests {
         for frame in [&[3, 0, 0, 0, 4, 0, 0, 0][..], &[2, 0, 0, 0][..], &trailing[..], &[][..]] {
             assert!(matches!(Message::decode(frame), Err(UnreadableFrame::Malformed(_))), "{frame:?}");
         }
+    }
+
+    #[test]
+    fn an_unknown_kind_closes_the_connection_and_a_malformed_frame_closes_it_only_during_the_handshake() {
+        let unknown = UnreadableFrame::UnknownKind { indices: vec![99] };
+        assert!(unknown.closes_connection(false) && unknown.closes_connection(true));
+        let malformed = UnreadableFrame::Malformed("a frame of no kind".into());
+        assert!(malformed.closes_connection(false), "a malformed frame closes a handshake");
+        assert!(!malformed.closes_connection(true), "a malformed frame after the handshake is dropped");
     }
 }

@@ -471,9 +471,7 @@ where
                 Self::handle_peer_message(inner, registration, node_msg).await;
                 Ok(MessageResult::Continue)
             }
-            // A message of a kind this node's version does not define closes the connection, and so
-            // does a handshake frame it cannot read, since that handshake will never establish.
-            Err(unreadable) if registration.is_none() || matches!(unreadable, proto::UnreadableFrame::UnknownKind { .. }) => {
+            Err(unreadable) if unreadable.closes_connection(registration.is_some()) => {
                 error!("Closing the connection to {}: the server sent {unreadable}", inner.server_url);
                 Err(unreadable.into())
             }
