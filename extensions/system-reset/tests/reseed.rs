@@ -72,30 +72,18 @@ async fn create_system(node: &TestNode, seeding: Option<&str>) -> anyhow::Result
     Ok(Some(id))
 }
 
-/// Serve websocket clients from `node` on a free local port.
+/// Serve websocket clients from `node` on a port the system assigns. The serving task holds the
+/// listener, bound before the URL is returned, so no other listener can hold that port.
 async fn serve(node: TestNode) -> anyhow::Result<Server> {
-    for _ in 0..10 {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
-        let address = format!("127.0.0.1:{port}");
-        let mut server = WebsocketServer::new(node.clone());
-        let task = tokio::spawn({
-            let address = address.clone();
-            async move {
-                let _ = server.run(&address).await;
-            }
-        });
-        for _ in 0..200 {
-            if task.is_finished() {
-                break;
-            }
-            if tokio::net::TcpStream::connect(&address).await.is_ok() {
-                return Ok(Server { node, url: format!("ws://{address}"), task });
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let app = axum::Router::new().route("/ws", axum::routing::get(WebsocketServer::new(node.clone()).route_handler()));
+    let task = tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await {
+            tracing::warn!("Test server on {address} stopped: {error}");
         }
-        task.abort();
-    }
-    anyhow::bail!("no port to serve websocket clients on")
+    });
+    Ok(Server { node, url: format!("ws://{address}"), task })
 }
 
 /// An ephemeral node on `engine` carrying the plugin, as an application builds its client.
