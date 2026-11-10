@@ -1,7 +1,6 @@
 use crate::util::navigator_lock::NavigatorLock;
 use ankurah_core::indexing::KeySpec;
-use ankurah_core::{error::RetrievalError, notice_info, util::safeset::SafeSet};
-use ankurah_proto::PROTOCOL_VERSION;
+use ankurah_core::{error::RetrievalError, notice_info, storage::StoreFormatError, util::safeset::SafeSet};
 use anyhow::{anyhow, Result};
 use send_wrapper::SendWrapper;
 use std::sync::{
@@ -15,8 +14,12 @@ use web_sys::{window, IdbDatabase, IdbFactory, IdbOpenDbRequest, IdbVersionChang
 
 use crate::util::{cb_future::CBFuture, cb_race::CBRace, require::WBGRequire};
 
-/// Key of the storage protocol epoch record in the `_ankurah_meta` object store.
-const PROTOCOL_VERSION_KEY: &str = "protocol_version";
+/// The format of the stores this engine writes, recorded in each store and checked on every open.
+/// Bump it when this engine's stored layout, or the encoding of anything it stores, changes
+/// incompatibly.
+pub const STORE_FORMAT_VERSION: u32 = 1;
+/// Key of the store format record in the `_ankurah_meta` object store.
+const STORE_FORMAT_VERSION_KEY: &str = "store_format_version";
 
 #[derive(Debug, Clone)]
 pub struct Database(Arc<Inner>);
@@ -41,7 +44,8 @@ pub struct Connection {
 }
 
 impl Database {
-    pub async fn open(db_name: &str) -> Result<Self, RetrievalError> {
+    /// Open the database `db_name`, refusing one of another format with a [`StoreFormatError`].
+    pub async fn open(db_name: &str) -> anyhow::Result<Self> {
         let connection = Connection::open(db_name).await?;
 
         let database = Self(Arc::new(Inner {
@@ -50,32 +54,33 @@ impl Database {
             // _callbacks: SendWrapper::new(Vec::new()), // Callbacks are now stored in Connection
             index_cache: SafeSet::new(),
         }));
-        database.check_protocol_version().await?;
+        // A storage failure while checking, then the refusal of a store of another format.
+        database.check_store_format().await??;
         Ok(database)
     }
 
-    /// Check the storage protocol epoch record (`_ankurah_meta` store, key
-    /// `protocol_version`) against [`PROTOCOL_VERSION`], once per open:
+    /// Check the store format record (`_ankurah_meta` store, key
+    /// `store_format_version`) against [`STORE_FORMAT_VERSION`], once per open:
     /// - no record and no existing ankurah data: write the record and proceed
     ///   (a fresh database created by [`Connection::open`] was already recorded
     ///   inside its creation upgrade; this covers databases whose creation was
     ///   interrupted before the record landed);
     /// - record present and equal: proceed;
-    /// - record present and different: refuse;
+    /// - record present and different or unreadable: refuse;
     /// - existing ankurah data but no record: refuse (a store from before the
     ///   record existed).
     ///
     /// The refusal paths write nothing.
-    async fn check_protocol_version(&self) -> Result<(), RetrievalError> {
+    async fn check_store_format(&self) -> Result<Result<(), StoreFormatError>, RetrievalError> {
         let mut connection = self.0.connection.lock().await;
 
         // A database from before the `_ankurah_meta` store existed carries no record at
-        // all: with ankurah data present that is a pre-versioning (0.9.x or older) store (refuse before
+        // all: with ankurah data present that is a store from before format records (refuse before
         // creating anything); an empty one gets the store via a versioned
         // upgrade and falls through to be recorded below.
         if !connection.db.object_store_names().contains("_ankurah_meta") {
             if has_ankurah_data(&connection.db).await? {
-                return Err(self.protocol_version_error(None));
+                return Ok(Err(self.store_format_refusal(None)));
             }
             let current_version = connection.version();
             connection.close();
@@ -86,46 +91,47 @@ impl Database {
         SendWrapper::new(async move {
             let transaction = db.transaction_with_str("_ankurah_meta").require("create meta transaction")?;
             let store = transaction.object_store("_ankurah_meta").require("get meta store")?;
-            let request = store.get(&JsValue::from_str(PROTOCOL_VERSION_KEY)).require("get protocol_version")?;
-            CBFuture::new(&request, "success", "error").await.require("await protocol_version get")?;
-            let found = request.result().require("protocol_version result")?;
+            let request = store.get(&JsValue::from_str(STORE_FORMAT_VERSION_KEY)).require("get store_format_version")?;
+            CBFuture::new(&request, "success", "error").await.require("await store_format_version get")?;
+            let found = request.result().require("store_format_version result")?;
 
             if found.is_undefined() || found.is_null() {
-                // No record. Existing ankurah data makes this a pre-versioning (0.9.x or older) store;
+                // No record. Existing ankurah data makes this a store from before format records;
                 // an empty database is recorded here and proceeds.
                 if has_ankurah_data(&db).await? {
-                    return Err(self.protocol_version_error(None));
+                    return Ok(Err(self.store_format_refusal(None)));
                 }
-                write_protocol_version(&db).await?;
-                return Ok(());
+                write_store_format_version(&db).await?;
+                return Ok(Ok(()));
             }
 
-            match found.as_f64() {
-                Some(version) if version == f64::from(PROTOCOL_VERSION) => Ok(()),
-                _ => Err(self.protocol_version_error(Some(found))),
-            }
+            Ok(match found.as_f64() {
+                Some(version) if version == f64::from(STORE_FORMAT_VERSION) => Ok(()),
+                _ => Err(self.store_format_refusal(Some(found))),
+            })
         })
         .await
     }
 
-    /// The refusal for a protocol-version mismatch. `found` is the raw stored
+    /// The refusal of a store of another format. `found` is the raw stored
     /// record; `None` means the database carries ankurah data but no record at
-    /// all (a store from before protocol versioning).
-    fn protocol_version_error(&self, found: Option<JsValue>) -> RetrievalError {
-        let found = match found {
-            None => "no recorded protocol version (a store from before protocol versioning)".to_string(),
-            Some(value) => match value.as_f64() {
-                Some(version) => format!("protocol version {}", version),
-                None => format!("an unreadable protocol version record ({:?})", value),
+    /// all (a store from before format records).
+    fn store_format_refusal(&self, found: Option<JsValue>) -> StoreFormatError {
+        let expected = STORE_FORMAT_VERSION;
+        let refusal = match found {
+            None => StoreFormatError::Unversioned { expected },
+            Some(record) => match record.as_f64() {
+                Some(version) if version.fract() == 0.0 && (0.0..=f64::from(u32::MAX)).contains(&version) => {
+                    StoreFormatError::Mismatch { found: version as u32, expected }
+                }
+                _ => StoreFormatError::UnreadableRecord { record: format!("{record:?}"), expected },
             },
         };
-        RetrievalError::Other(
-            format!(
-                "IndexedDB database {:?} carries {}, but this build requires protocol version {}; reset your dev database (delete the IndexedDB database, e.g. via IndexedDBStorageEngine::cleanup) to proceed",
-                self.0.db_name, found, PROTOCOL_VERSION
-            )
-            .into(),
-        )
+        warn!(
+            "Refusing IndexedDB database {:?} (delete it, e.g. via IndexedDBStorageEngine::cleanup, to proceed): {refusal}",
+            self.0.db_name
+        );
+        refusal
     }
 
     /// Get a clone of the current database connection; lazily re-open if stale
@@ -217,10 +223,10 @@ async fn has_ankurah_data(db: &IdbDatabase) -> Result<bool, RetrievalError> {
     .await
 }
 
-/// Write the [`PROTOCOL_VERSION`] record into the `_ankurah_meta` store. Only ever
+/// Write the [`STORE_FORMAT_VERSION`] record into the `_ankurah_meta` store. Only ever
 /// called on a database with no record and no ankurah data; fresh databases
 /// are recorded inside their creation upgrade transaction instead.
-async fn write_protocol_version(db: &IdbDatabase) -> Result<(), RetrievalError> {
+async fn write_store_format_version(db: &IdbDatabase) -> Result<(), RetrievalError> {
     let db = SendWrapper::new(db);
     SendWrapper::new(async move {
         let transaction = db
@@ -228,9 +234,9 @@ async fn write_protocol_version(db: &IdbDatabase) -> Result<(), RetrievalError> 
             .require("create meta write transaction")?;
         let store = transaction.object_store("_ankurah_meta").require("get meta store")?;
         let request = store
-            .put_with_key(&JsValue::from(PROTOCOL_VERSION), &JsValue::from_str(PROTOCOL_VERSION_KEY))
-            .require("record protocol_version")?;
-        CBFuture::new(&request, "success", "error").await.require("await protocol_version put")?;
+            .put_with_key(&JsValue::from(STORE_FORMAT_VERSION), &JsValue::from_str(STORE_FORMAT_VERSION_KEY))
+            .require("record store_format_version")?;
+        CBFuture::new(&request, "success", "error").await.require("await store_format_version put")?;
         CBFuture::new(&transaction, "complete", "error").await.require("complete meta write transaction")?;
         Ok(())
     })
@@ -292,15 +298,15 @@ impl Connection {
                 db.create_object_store("property_columns").require("create property_columns store")?;
                 db.create_object_store("model_registrations").require("create model registrations store")?;
 
-                // Storage protocol epoch record: `_ankurah_meta` carries
-                // `protocol_version` = PROTOCOL_VERSION, written inside the
+                // Store format record: `_ankurah_meta` carries
+                // `store_format_version` = STORE_FORMAT_VERSION, written inside the
                 // creation upgrade transaction so a fresh database is recorded
                 // atomically with its stores; `Database::open` checks the record
                 // on every open.
                 let meta_store = db.create_object_store("_ankurah_meta").require("create meta store")?;
                 meta_store
-                    .put_with_key(&JsValue::from(PROTOCOL_VERSION), &JsValue::from_str(PROTOCOL_VERSION_KEY))
-                    .require("record protocol_version")?;
+                    .put_with_key(&JsValue::from(STORE_FORMAT_VERSION), &JsValue::from_str(STORE_FORMAT_VERSION_KEY))
+                    .require("record store_format_version")?;
             }
             Ok(())
         })

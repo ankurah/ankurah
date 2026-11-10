@@ -1,11 +1,11 @@
-//! Protocol-version record semantics: a fresh store is marked with
-//! `ankurah_proto::PROTOCOL_VERSION` on engine construction and checked on
-//! every open; a store carrying a different (or missing) record refuses to
-//! open, advising a development-database reset.
+//! Store format record semantics: a fresh store is marked with this engine's
+//! `STORE_FORMAT_VERSION` on engine construction and checked on every open; a
+//! store carrying a different (or missing) record refuses to open with a
+//! `StoreFormatError`.
 
-use ankurah_core::storage::StorageEngine;
-use ankurah_proto::{ModelId, SystemModel, PROTOCOL_VERSION};
-use ankurah_storage_postgres::Postgres;
+use ankurah_core::storage::{StorageEngine, StoreFormatError};
+use ankurah_proto::{ModelId, SystemModel};
+use ankurah_storage_postgres::{Postgres, STORE_FORMAT_VERSION};
 use anyhow::Result;
 use bb8_postgres::PostgresConnectionManager;
 use testcontainers::ContainerAsync;
@@ -16,6 +16,12 @@ async fn touch_catalog_materialization(engine: &Postgres) -> Result<()> {
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
     engine.fetch_states(&selection.clone().and_member_of(ModelId::System(SystemModel::Model))).await?;
     Ok(())
+}
+
+/// The refusal constructing an engine over `pool` meets, as the typed store format error.
+async fn refusal(pool: &bb8::Pool<PostgresConnectionManager<tokio_postgres::NoTls>>) -> StoreFormatError {
+    let error = Postgres::new(pool.clone()).await.err().expect("the store is refused");
+    error.downcast_ref::<StoreFormatError>().cloned().unwrap_or_else(|| panic!("not a store format refusal: {error}"))
 }
 
 /// A fresh postgres container plus a pool onto it (no engine yet: these tests
@@ -34,15 +40,16 @@ async fn fresh_pool() -> Result<(ContainerAsync<postgres::Postgres>, bb8::Pool<P
 }
 
 #[tokio::test]
-async fn fresh_store_records_version_and_reopens() -> Result<()> {
+async fn a_fresh_store_records_its_format_version_and_reopens() -> Result<()> {
     let (_container, pool) = fresh_pool().await?;
 
     // A fresh store records the version at engine construction.
     let engine = Postgres::new(pool.clone()).await?;
     {
         let client = pool.get().await?;
-        let value: String = client.query_one(r#"SELECT "value" FROM "_ankurah_meta" WHERE "key" = 'protocol_version'"#, &[]).await?.get(0);
-        assert_eq!(value, PROTOCOL_VERSION.to_string());
+        let value: String =
+            client.query_one(r#"SELECT "value" FROM "_ankurah_meta" WHERE "key" = 'store_format_version'"#, &[]).await?.get(0);
+        assert_eq!(value, STORE_FORMAT_VERSION.to_string());
     }
 
     // Reopening a store with the matching record proceeds, with or without data.
@@ -78,7 +85,7 @@ async fn unrelated_tables_do_not_block_initialization_or_get_dropped() -> Result
 }
 
 #[tokio::test]
-async fn mismatched_or_missing_version_refuses() -> Result<()> {
+async fn a_store_of_another_format_or_without_one_is_refused() -> Result<()> {
     let (_container, pool) = fresh_pool().await?;
 
     // Record the version and give the store some data.
@@ -88,13 +95,9 @@ async fn mismatched_or_missing_version_refuses() -> Result<()> {
     // Rewrite the stored version out of band.
     {
         let client = pool.get().await?;
-        client.execute(r#"UPDATE "_ankurah_meta" SET "value" = '999' WHERE "key" = 'protocol_version'"#, &[]).await?;
+        client.execute(r#"UPDATE "_ankurah_meta" SET "value" = '999' WHERE "key" = 'store_format_version'"#, &[]).await?;
     }
-    let err = match Postgres::new(pool.clone()).await {
-        Ok(_) => panic!("expected the mismatched version to refuse the open"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains("999") && err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the found and expected versions: {err}");
+    assert_eq!(refusal(&pool).await, StoreFormatError::Mismatch { found: 999, expected: STORE_FORMAT_VERSION });
 
     // Remove the record while ankurah tables remain: the store now reads as an
     // unversioned store.
@@ -102,10 +105,6 @@ async fn mismatched_or_missing_version_refuses() -> Result<()> {
         let client = pool.get().await?;
         client.execute(r#"DROP TABLE "_ankurah_meta""#, &[]).await?;
     }
-    let err = match Postgres::new(pool).await {
-        Ok(_) => panic!("expected the unversioned store with existing data to refuse the open"),
-        Err(e) => e.to_string(),
-    };
-    assert!(err.contains(&PROTOCOL_VERSION.to_string()), "refusal must name the expected version: {err}");
+    assert_eq!(refusal(&pool).await, StoreFormatError::Unversioned { expected: STORE_FORMAT_VERSION });
     Ok(())
 }

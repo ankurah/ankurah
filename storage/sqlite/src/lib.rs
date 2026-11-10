@@ -39,6 +39,6 @@ pub mod sql_builder;
 mod value;
 
 pub use connection::SqliteConnectionManager;
-pub use engine::{SqliteStorageEngine, SqliteTransaction};
+pub use engine::{SqliteStorageEngine, SqliteTransaction, STORE_FORMAT_VERSION};
 pub use error::SqliteError;
 pub use value::SqliteValue;
