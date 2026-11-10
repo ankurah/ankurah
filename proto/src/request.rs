@@ -316,13 +316,14 @@ impl std::fmt::Display for EntityDelta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::encode;
     use crate::{State, StateFragment};
 
     fn selection() -> ast::Selection<ast::Resolved> { ast::Selection { predicate: ast::Predicate::True, order_by: None, limit: None } }
 
     fn state() -> StateFragment { StateFragment { state: State::default(), attestations: Default::default() } }
 
-    fn index(value: &impl Serialize) -> [u8; 4] { bincode::serialize(value).unwrap()[..4].try_into().unwrap() }
+    fn index(value: &impl Serialize) -> [u8; 4] { encode(value)[..4].try_into().unwrap() }
 
     /// A body's first four bytes are its variant index, which names the request a peer is asked to serve.
     #[test]

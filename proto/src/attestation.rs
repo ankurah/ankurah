@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     clock::Clock,
     domain_tag::DomainTag,
-    encoding::decode_exact,
+    encoding,
     event::{Event, EventFragment},
     event_id::EventId,
     id::EntityId,
@@ -65,11 +65,9 @@ impl Statement {
     /// This statement sealed: its bytes, and `sign`'s signature over them. It opens only if `sign`
     /// signs as the statement's attester.
     pub fn seal(&self, sign: impl FnOnce(&[u8]) -> Signature) -> SealedAttestation {
-        // Cannot fail: bincode encodes every field of a statement.
-        let statement = bincode::serialize(self).expect("statements encode");
+        let statement = encoding::encode(self);
         let signature = sign(&signed_bytes(&statement));
-        // Cannot fail: bincode encodes a byte string and a signature.
-        SealedAttestation(bincode::serialize(&Sealed { statement, signature }).expect("sealed attestations encode"))
+        SealedAttestation(encoding::encode(&Sealed { statement, signature }))
     }
 }
 
@@ -95,7 +93,7 @@ fn signed_bytes(statement: &[u8]) -> Vec<u8> {
 
 /// The value `bytes` hold; bytes left over make them undecodable.
 fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, AttestationError> {
-    decode_exact(bytes).map_err(|error| AttestationError::Undecodable(error.to_string()))
+    encoding::decode_exact(bytes).map_err(|error| AttestationError::Undecodable(error.to_string()))
 }
 
 impl Subject {
@@ -114,13 +112,11 @@ impl Subject {
     pub fn names_state(&self, state: &EntityState) -> bool { *self == Self::state(state) }
 }
 
-/// SHA-256 over [`DomainTag::State`], then the bincode of `state`.
+/// SHA-256 over [`DomainTag::State`], then the encoding of `state`.
 pub fn state_digest(state: &EntityState) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(DomainTag::State.encoded());
-    // Cannot fail: bincode encodes every field of an entity state.
-    hasher.update(bincode::serialize(state).expect("entity states serialize"));
-    hasher.finalize().into()
+    let mut preimage = DomainTag::State.encoded();
+    encoding::encode_into(&mut preimage, state);
+    Sha256::digest(&preimage).into()
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
@@ -179,6 +175,7 @@ impl Attested<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::encode;
     use crate::{ModelId, OperationSet, State, StateBuffers, SystemModel};
     use ed25519_dalek::Signer;
     use std::collections::{BTreeMap, BTreeSet};
@@ -206,7 +203,7 @@ mod tests {
     /// `sealed` with its statement's bytes replaced and its signature kept.
     fn with_statement_bytes(sealed: &SealedAttestation, statement: Vec<u8>) -> SealedAttestation {
         let Sealed { signature, .. } = decode(&sealed.0).unwrap();
-        SealedAttestation(bincode::serialize(&Sealed { statement, signature }).unwrap())
+        SealedAttestation(encode(&Sealed { statement, signature }))
     }
 
     /// The attestation vectors of specs/protocol/bytes.md section 5: the bytes each statement's
@@ -287,7 +284,7 @@ mod tests {
             Statement { kind: EntityId::from_bytes([22; 32]), ..statement.clone() },
             Statement { payload: b"other payload".to_vec(), ..statement.clone() },
         ] {
-            let tampered = with_statement_bytes(&sealed, bincode::serialize(&changed).unwrap());
+            let tampered = with_statement_bytes(&sealed, encode(&changed));
             assert_eq!(tampered.open(), Err(AttestationError::InvalidSignature), "{changed:?}");
         }
     }
@@ -306,7 +303,7 @@ mod tests {
                 state_digest: [4; 32],
             },
         );
-        let canonical = bincode::serialize(&statement).unwrap();
+        let canonical = encode(&statement);
         // The head as `count || (generation, id) ..`: swap its two entries, which follow the identity,
         // the subject's variant index, its entity and the head's count.
         let head = 36 + 4 + 32 + 8;
@@ -316,9 +313,7 @@ mod tests {
             .copy_from_slice(&[&canonical[head + entry..head + 2 * entry], &canonical[head..head + entry]].concat());
         assert_ne!(carried, canonical);
 
-        let sealed = SealedAttestation(
-            bincode::serialize(&Sealed { statement: carried.clone(), signature: sign_as(&key)(&signed_bytes(&carried)) }).unwrap(),
-        );
+        let sealed = SealedAttestation(encode(&Sealed { statement: carried.clone(), signature: sign_as(&key)(&signed_bytes(&carried)) }));
         assert_eq!(sealed.open(), Ok(statement));
     }
 
@@ -329,16 +324,16 @@ mod tests {
         let sealed = statement.seal(sign_as(&key));
         let mut trailing = sealed.0.clone();
         trailing.push(0);
-        let mut statement_bytes = bincode::serialize(&statement).unwrap();
+        let mut statement_bytes = encode(&statement);
         statement_bytes.push(0);
-        let mut unknown_attester = bincode::serialize(&statement).unwrap();
+        let mut unknown_attester = encode(&statement);
         // Identity variant index 1 and Subject variant index 2, which no build defines yet.
         unknown_attester[0] = 1;
-        let mut unknown_subject = bincode::serialize(&statement).unwrap();
+        let mut unknown_subject = encode(&statement);
         unknown_subject[36] = 2;
         // Signature variant index 1, which no build defines yet: it follows the statement's length and bytes.
         let mut unknown_signature = sealed.0.clone();
-        let signature_index = 8 + bincode::serialize(&statement).unwrap().len();
+        let signature_index = 8 + encode(&statement).len();
         unknown_signature[signature_index..signature_index + 4].copy_from_slice(&1u32.to_le_bytes());
         for undecodable in [
             SealedAttestation(vec![]),
@@ -386,8 +381,8 @@ mod tests {
     #[test]
     fn subject_variant_order_is_pinned() {
         let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
-        assert_eq!(bincode::serialize(&Subject::event(&genesis)).unwrap()[..4], [0, 0, 0, 0], "Subject::Event");
-        assert_eq!(bincode::serialize(&Subject::state(&state(&genesis))).unwrap()[..4], [1, 0, 0, 0], "Subject::State");
+        assert_eq!(encode(&Subject::event(&genesis))[..4], [0, 0, 0, 0], "Subject::Event");
+        assert_eq!(encode(&Subject::state(&state(&genesis)))[..4], [1, 0, 0, 0], "Subject::State");
     }
 
     /// The state digest vector of specs/protocol/bytes.md section 5.

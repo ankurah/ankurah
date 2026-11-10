@@ -115,6 +115,7 @@ impl std::fmt::Display for Clock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
     use crate::{Identity, OperationSet};
 
     fn id(b: u8) -> EventId { EventId::from_bytes([b; 32]) }
@@ -129,16 +130,16 @@ mod tests {
         assert_eq!(head.generation_of(&id(3)), Some(2));
         assert_eq!(head.max_generation(), Some(7));
         assert_eq!(head.child_generation(), 8);
-        assert_eq!(bincode::deserialize::<Clock>(&bincode::serialize(&entries).unwrap()).unwrap(), head);
+        assert_eq!(decode_exact::<Clock>(&encode(&entries)).unwrap(), head);
         assert_eq!(serde_json::from_str::<Clock>(&serde_json::to_string(&entries).unwrap()).unwrap(), head);
-        assert_eq!(bincode::serialize(&head).unwrap(), bincode::serialize(&expected).unwrap());
+        assert_eq!(encode(&head), encode(&expected));
     }
 
     #[test]
     fn zero_or_conflicting_generations_are_rejected() {
         for entries in [vec![(0u32, id(1))], vec![(2, id(1)), (7, id(1))]] {
             assert!(Clock::new(entries.clone()).is_err());
-            assert!(bincode::deserialize::<Clock>(&bincode::serialize(&entries).unwrap()).is_err());
+            assert!(decode_exact::<Clock>(&encode(&entries)).is_err());
             assert!(serde_json::from_str::<Clock>(&serde_json::to_string(&entries).unwrap()).is_err());
         }
     }

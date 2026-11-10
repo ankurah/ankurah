@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     domain_tag::DomainTag,
-    encoding::decode_exact,
+    encoding,
     identity::{NodeId, Signature},
 };
 
@@ -105,7 +105,7 @@ impl Opening {
         let versions = ProtocolVersions { lowest, highest };
         match index {
             OPEN_INDEX if spoken.highest_shared(versions).is_some() => {
-                let challenge = decode_exact(&frame[12..]).map_err(|error| OpeningError::Undecodable(error.to_string()))?;
+                let challenge = encoding::decode_exact(&frame[12..]).map_err(|error| OpeningError::Undecodable(error.to_string()))?;
                 Ok(Self { versions, challenge })
             }
             OPEN_INDEX | NO_COMMON_VERSION_INDEX => Err(OpeningError::NoCommonVersion(versions)),
@@ -157,11 +157,10 @@ impl PresenceClaims {
         Presence { claims: self, signature }
     }
 
-    /// The bytes a presence signature covers: [`DomainTag::Presence`], then the bincode claims.
+    /// The bytes a presence signature covers: [`DomainTag::Presence`], then the encoded claims.
     fn signed_bytes(&self) -> Vec<u8> {
         let mut bytes = DomainTag::Presence.encoded();
-        // Cannot fail: bincode encodes every field of the claims.
-        bytes.extend(bincode::serialize(self).expect("presence claims serialize"));
+        encoding::encode_into(&mut bytes, self);
         bytes
     }
 }
@@ -181,6 +180,7 @@ impl std::fmt::Display for Presence {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
     use crate::{Identity, Message};
     use ed25519_dalek::Signer;
 
@@ -209,8 +209,8 @@ mod tests {
     #[test]
     fn presence_round_trip() {
         let p = claims().sign(sign_as(&key(42)));
-        let bytes = bincode::serialize(&Message::Presence(p.clone())).unwrap();
-        match bincode::deserialize::<Message>(&bytes).unwrap() {
+        let bytes = encode(&Message::Presence(p.clone()));
+        match decode_exact::<Message>(&bytes).unwrap() {
             Message::Presence(q) => assert_eq!(p, q),
             other => panic!("expected Presence, got {other}"),
         }
@@ -304,7 +304,7 @@ mod tests {
     /// The opening and refusal vectors of specs/protocol/bytes.md section 6: each frame's bytes.
     #[test]
     fn the_opening_and_refusal_frames_match_the_byte_specification_vectors() {
-        let open = bincode::serialize(&Message::Open(opening(versions(1, 3)))).unwrap();
+        let open = encode(&Message::Open(opening(versions(1, 3))));
         assert_eq!(
             hex::encode(&open),
             concat!(
@@ -318,7 +318,7 @@ mod tests {
         );
         assert_eq!(Opening::read(&open, ProtocolVersions::SPOKEN), Ok(opening(versions(1, 3))));
 
-        let refusal = bincode::serialize(&Message::NoCommonVersion(versions(1, 1))).unwrap();
+        let refusal = encode(&Message::NoCommonVersion(versions(1, 1)));
         assert_eq!(hex::encode(&refusal), "010000000100000001000000");
     }
 
@@ -326,24 +326,24 @@ mod tests {
     /// the rest of the frame was never read.
     #[test]
     fn an_opening_sharing_no_version_is_refused_before_the_rest_is_read() {
-        let mut frame = bincode::serialize(&Message::Open(opening(versions(2, 3)))).unwrap();
+        let mut frame = encode(&Message::Open(opening(versions(2, 3))));
         frame.extend_from_slice(b"bytes a version-1 reader rejects");
         assert_eq!(Opening::read(&frame, versions(1, 1)), Err(OpeningError::NoCommonVersion(versions(2, 3))));
 
-        let mut shared = bincode::serialize(&Message::Open(opening(versions(1, 3)))).unwrap();
+        let mut shared = encode(&Message::Open(opening(versions(1, 3))));
         shared.extend_from_slice(b"bytes a version-1 reader rejects");
         assert!(matches!(Opening::read(&shared, versions(1, 1)), Err(OpeningError::Undecodable(_))), "shared versions read the rest");
     }
 
     #[test]
     fn a_refusal_in_place_of_an_opening_names_the_versions_its_sender_speaks() {
-        let refusal = bincode::serialize(&Message::NoCommonVersion(versions(4, 6))).unwrap();
+        let refusal = encode(&Message::NoCommonVersion(versions(4, 6)));
         assert_eq!(Opening::read(&refusal, versions(1, 1)), Err(OpeningError::NoCommonVersion(versions(4, 6))));
     }
 
     #[test]
     fn a_frame_that_opens_with_neither_an_opening_nor_a_refusal_is_undecodable() {
-        let open = bincode::serialize(&Message::Open(opening(versions(1, 1)))).unwrap();
+        let open = encode(&Message::Open(opening(versions(1, 1))));
         let mut other_kind = open.clone();
         other_kind[0] = 2;
         for frame in [&open[..11], &open[..40], &other_kind[..], &open[..0]] {

@@ -227,6 +227,7 @@ impl From<Event> for Attested<Event> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::encode;
     use crate::operation::{BackendOperation, CarriedOperation};
     use std::collections::BTreeMap;
 
@@ -334,8 +335,8 @@ mod tests {
     fn event_body_variant_order_is_pinned() {
         let genesis = Event::genesis(minter(), operations());
         let update = Event::update(genesis.entity_id, Clock::singleton(&genesis), operations());
-        assert_eq!(bincode::serialize(&genesis.body).unwrap()[..4], [0, 0, 0, 0], "EventBody::Genesis");
-        assert_eq!(bincode::serialize(&update.body).unwrap()[..4], [1, 0, 0, 0], "EventBody::Update");
+        assert_eq!(encode(&genesis.body)[..4], [0, 0, 0, 0], "EventBody::Genesis");
+        assert_eq!(encode(&update.body)[..4], [1, 0, 0, 0], "EventBody::Update");
     }
 
     #[test]

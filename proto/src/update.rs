@@ -153,9 +153,10 @@ impl std::fmt::Display for NodeUpdateAckBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::encode;
     use crate::State;
 
-    fn index(value: &impl Serialize) -> [u8; 4] { bincode::serialize(value).unwrap()[..4].try_into().unwrap() }
+    fn index(value: &impl Serialize) -> [u8; 4] { encode(value)[..4].try_into().unwrap() }
 
     /// Each update enum's first four bytes are its variant index, which the receiving peer reads to decode it.
     #[test]

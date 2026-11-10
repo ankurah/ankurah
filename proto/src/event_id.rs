@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{clock::Clock, domain_tag::DomainTag, id::EntityId, identity::Identity, operation::CarriedOperations, DecodeError};
+use crate::{clock::Clock, domain_tag::DomainTag, encoding, id::EntityId, identity::Identity, operation::CarriedOperations, DecodeError};
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -34,11 +34,10 @@ impl EventId {
         Self::from_preimage(DomainTag::Event, &(entity_id, nonce, timestamp, operations.digests(), parent))
     }
 
-    /// SHA-256 over `tag`, then the bincode of `fields`.
+    /// SHA-256 over `tag`, then the encoding of `fields`.
     fn from_preimage(tag: DomainTag, fields: &impl Serialize) -> Self {
         let mut preimage = tag.encoded();
-        // Cannot fail: bincode encodes every id field, and writing to a vector cannot fail.
-        bincode::serialize_into(&mut preimage, fields).expect("event id fields encode");
+        encoding::encode_into(&mut preimage, fields);
         Self(Sha256::digest(&preimage).into())
     }
     pub fn to_base64(&self) -> String {
@@ -128,6 +127,7 @@ impl<'de> Deserialize<'de> for EventId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
     use crate::operation::{BackendOperation, CarriedOperation, Membership, Operation};
     use ankurah_core_types::{ModelId, SystemModel};
 
@@ -146,12 +146,12 @@ mod tests {
         let id = EventId::from_bytes([
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
         ]);
-        let bytes = bincode::serialize(&id).unwrap();
+        let bytes = encode(&id);
         assert_eq!(
             bytes,
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
-        assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+        assert_eq!(id, decode_exact(&bytes).unwrap());
     }
 
     /// The id vectors of specs/protocol/bytes.md section 5: a genesis and an update over zero, one and two

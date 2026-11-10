@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{domain_tag::DomainTag, encoding::decode_exact};
+use crate::{domain_tag::DomainTag, encoding};
 use ankurah_core_types::ModelId;
 
 /// Ordered top-level mutations that make up one event's content, decoded: what
@@ -124,10 +124,7 @@ pub enum CarriedOperation {
 
 impl CarriedOperation {
     /// `operation` as its author carries it.
-    pub fn encode(operation: &Operation) -> Self {
-        // Cannot fail: bincode encodes every field of an operation.
-        Self::Bytes(bincode::serialize(operation).expect("operations encode"))
-    }
+    pub fn encode(operation: &Operation) -> Self { Self::Bytes(encoding::encode(operation)) }
 
     /// The digest an event's id covers for this operation: SHA-256 over
     /// [`DomainTag::Operation`] and the bytes, or what erased bytes left.
@@ -141,7 +138,7 @@ impl CarriedOperation {
     /// The operation these bytes encode.
     pub fn decode(&self) -> Result<Operation, UnreadableOperation> {
         match self {
-            Self::Bytes(bytes) => decode_exact(bytes).map_err(|error| UnreadableOperation::Undecodable(error.to_string())),
+            Self::Bytes(bytes) => encoding::decode_exact(bytes).map_err(|error| UnreadableOperation::Undecodable(error.to_string())),
             Self::Erased(_) => Err(UnreadableOperation::Erased),
         }
     }
@@ -188,6 +185,7 @@ impl std::fmt::Display for CarriedOperations {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
     use ankurah_core_types::SystemModel;
 
     fn membership() -> Operation { Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))) }
@@ -252,21 +250,19 @@ mod tests {
     /// are pinned by ankurah-core-types' own golden tests.
     #[test]
     fn operation_variant_order_is_pinned() {
-        let backend =
-            bincode::serialize(&Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![7] }] })
-                .unwrap();
+        let backend = encode(&Operation::Backend { backend: "lww".to_owned(), operations: vec![BackendOperation { diff: vec![7] }] });
         assert_eq!(&backend[..4], [0, 0, 0, 0], "Operation::Backend must encode as variant 0");
 
-        let membership = bincode::serialize(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model)))).unwrap();
+        let membership = encode(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))));
         assert_eq!(&membership[..4], [1, 0, 0, 0], "Operation::Membership must encode as variant 1");
         assert_eq!(&membership[4..8], [0, 0, 0, 0], "Membership::Add must encode as variant 0");
 
         for bytes in [backend, membership] {
-            let round: Operation = bincode::deserialize(&bytes).unwrap();
-            assert_eq!(bincode::serialize(&round).unwrap(), bytes);
+            let round: Operation = decode_exact(&bytes).unwrap();
+            assert_eq!(encode(&round), bytes);
         }
 
-        assert_eq!(bincode::serialize(&CarriedOperation::Bytes(vec![])).unwrap()[..4], [0, 0, 0, 0], "CarriedOperation::Bytes");
-        assert_eq!(bincode::serialize(&CarriedOperation::Erased([0; 32])).unwrap()[..4], [1, 0, 0, 0], "CarriedOperation::Erased");
+        assert_eq!(encode(&CarriedOperation::Bytes(vec![]))[..4], [0, 0, 0, 0], "CarriedOperation::Bytes");
+        assert_eq!(encode(&CarriedOperation::Erased([0; 32]))[..4], [1, 0, 0, 0], "CarriedOperation::Erased");
     }
 }

@@ -57,6 +57,7 @@ impl std::fmt::Display for NodeMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::encode;
     use crate::{
         carried_body::CarriedBody,
         identity::{Identity, Signature},
@@ -90,7 +91,7 @@ mod tests {
             (Message::Presence(presence), [2, 0, 0, 0]),
             (Message::PeerMessage(unsubscribe), [3, 0, 0, 0]),
         ] {
-            assert_eq!(bincode::serialize(&message).unwrap()[..4], index, "{message}");
+            assert_eq!(encode(&message)[..4], index, "{message}");
         }
     }
 
@@ -109,7 +110,7 @@ mod tests {
             (NodeMessage::UpdateAck(ack), [3, 0, 0, 0]),
             (NodeMessage::UnsubscribeQuery { from, query_id: QueryId::test(1) }, [4, 0, 0, 0]),
         ] {
-            assert_eq!(bincode::serialize(&message).unwrap()[..4], index, "{message}");
+            assert_eq!(encode(&message)[..4], index, "{message}");
         }
     }
 }

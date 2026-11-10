@@ -4,7 +4,7 @@ use std::marker::PhantomData;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::encoding::decode_exact;
+use crate::encoding;
 
 /// A body of kind `T` as its sender encoded it: length-prefixed bytes, so the frame that carries
 /// it, with its ids and addresses, decodes even when this build cannot read the body.
@@ -23,13 +23,12 @@ pub struct UnreadableBody(pub String);
 
 impl<T: Serialize + DeserializeOwned> CarriedBody<T> {
     /// `body`, encoded once to be carried.
-    pub fn encode(body: &T) -> Self {
-        // Cannot fail: bincode encodes every request, response and update body.
-        Self { bytes: bincode::serialize(body).expect("bodies encode"), kind: PhantomData }
-    }
+    pub fn encode(body: &T) -> Self { Self { bytes: encoding::encode(body), kind: PhantomData } }
 
     /// The body these bytes encode; bytes left over after it make it unreadable.
-    pub fn decode(&self) -> Result<T, UnreadableBody> { decode_exact(&self.bytes).map_err(|error| UnreadableBody(error.to_string())) }
+    pub fn decode(&self) -> Result<T, UnreadableBody> {
+        encoding::decode_exact(&self.bytes).map_err(|error| UnreadableBody(error.to_string()))
+    }
 }
 
 impl<T> Clone for CarriedBody<T> {
@@ -57,25 +56,26 @@ impl<T: std::fmt::Display + Serialize + DeserializeOwned> std::fmt::Display for 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
     use crate::{identity::Identity, request::RequestId, Message, NodeMessage, NodeRequest, NodeRequestBody};
 
     /// A body that is variant 99 of its kind, which no build defines yet.
-    fn unknown_kind<T>() -> CarriedBody<T> { bincode::deserialize(&bincode::serialize(&vec![99u8, 0, 0, 0]).unwrap()).unwrap() }
+    fn unknown_kind<T>() -> CarriedBody<T> { decode_exact(&encode(&vec![99u8, 0, 0, 0])).unwrap() }
 
     #[test]
     fn a_carried_body_decodes_to_the_body_it_encodes() {
         let body = NodeRequestBody::Get { ids: vec![crate::EntityId::from_bytes([1; 32])] };
         let carried = CarriedBody::encode(&body);
-        assert_eq!(bincode::serialize(&carried.decode().unwrap()).unwrap(), bincode::serialize(&body).unwrap());
-        assert_eq!(&bincode::serialize(&carried).unwrap()[8..], &bincode::serialize(&body).unwrap()[..], "a length, then the body");
+        assert_eq!(encode(&carried.decode().unwrap()), encode(&body));
+        assert_eq!(&encode(&carried)[8..], &encode(&body)[..], "a length, then the body");
     }
 
     #[test]
     fn a_body_of_an_unknown_kind_or_with_bytes_left_over_is_unreadable() {
         assert!(unknown_kind::<NodeRequestBody>().decode().is_err());
-        let mut bytes = bincode::serialize(&NodeRequestBody::Get { ids: vec![] }).unwrap();
+        let mut bytes = encode(&NodeRequestBody::Get { ids: vec![] });
         bytes.push(0);
-        let trailing: CarriedBody<NodeRequestBody> = bincode::deserialize(&bincode::serialize(&bytes).unwrap()).unwrap();
+        let trailing: CarriedBody<NodeRequestBody> = decode_exact(&encode(&bytes)).unwrap();
         assert!(trailing.decode().is_err());
     }
 
@@ -84,8 +84,8 @@ mod tests {
     fn a_frame_whose_body_this_build_cannot_read_still_decodes() {
         let (from, to) = (Identity::Ed25519([1; 32]).into(), Identity::Ed25519([2; 32]).into());
         let request = NodeRequest { id: RequestId::new(), to, from, body: unknown_kind() };
-        let frame = bincode::serialize(&Message::PeerMessage(NodeMessage::Request { auth: vec![], request })).unwrap();
-        let Message::PeerMessage(NodeMessage::Request { request: decoded, .. }) = bincode::deserialize(&frame).unwrap() else {
+        let frame = encode(&Message::PeerMessage(NodeMessage::Request { auth: vec![], request }));
+        let Message::PeerMessage(NodeMessage::Request { request: decoded, .. }) = decode_exact(&frame).unwrap() else {
             panic!("the frame decodes as the request it carries")
         };
         assert_eq!((decoded.from, decoded.to), (from, to));
