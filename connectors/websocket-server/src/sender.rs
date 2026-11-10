@@ -20,11 +20,14 @@ struct Inner {
 /// The sending half of a websocket.
 pub type Socket = futures_util::stream::SplitSink<axum::extract::ws::WebSocket, axum::extract::ws::Message>;
 
+/// How many frames a sender holds that its socket has not yet taken; a send beyond them fails.
+const HELD_FRAMES: usize = 32;
+
 impl WebSocketClientSender {
     /// A sender of frames to `node_id`, and the slot its connection fills with the socket once it
-    /// has answered the peer's presence; frames sent before then wait, in order.
+    /// has answered the peer's presence; up to [`HELD_FRAMES`] frames sent before then wait, in order.
     pub fn new(node_id: proto::NodeId) -> (Self, oneshot::Sender<Socket>) {
-        let (tx, mut rx) = mpsc::channel(32);
+        let (tx, mut rx) = mpsc::channel(HELD_FRAMES);
         let (socket_tx, socket_rx) = oneshot::channel::<Socket>();
         use futures_util::SinkExt;
         let handle = tokio::spawn(async move {

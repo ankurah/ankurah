@@ -55,9 +55,12 @@ accepting side on that presence, and only then counts itself connected. So an
 accepting node signs nothing, and runs no plugin's announcement, for a dialer
 it has not authenticated and registered. An accepting node that will not
 register the dialer, or cannot sign its own presence, sends `Refused` with a
-reason a person can read in place of its presence, unless it has itself
-halted, and closes; a websocket client reports that as a refused connection
-state carrying the reason, and keeps backing off before it dials again.
+reason a person can read in place of its presence, and closes; it closes
+without sending it when it has itself halted, or when the websocket server's
+handshake deadline passes before the dialer is registered and this node's
+presence is signed. A websocket client reports `Refused` as a refused
+connection state carrying the reason, and keeps backing off before it dials
+again.
 
 A node ignores a feature number it does not know, and an announcement under a
 name none of its plugins has; each of its plugins receives the announcement

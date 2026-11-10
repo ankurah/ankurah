@@ -100,14 +100,14 @@ pub trait StorageEngine: Send + Sync {
     fn set_catalog_resolver(&self, resolver: Weak<dyn CatalogResolver>);
 
     async fn get_state(&self, id: EntityId)
-        -> Result<Attested<EntityState>, RetrievalError>;
+        -> Result<EntityState, RetrievalError>;
     async fn get_states(&self, ids: Vec<EntityId>)
-        -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+        -> Result<Vec<EntityState>, RetrievalError>;
 
     async fn fetch_states(
         &self,
         selection: &Selection<Resolved>,
-    ) -> Result<Vec<Attested<EntityState>>, RetrievalError>;
+    ) -> Result<Vec<EntityState>, RetrievalError>;
 
     async fn get_events(&self, ids: Vec<EventId>)
         -> Result<Vec<Attested<Event>>, RetrievalError>;
@@ -141,7 +141,7 @@ in its batch. A failed batch publishes neither its new events nor its states.
 #[async_trait]
 pub trait StorageTransaction: Send {
     async fn add_events(&mut self, events: &[Attested<Event>]) -> Result<(), MutationError>;
-    async fn set_state(&mut self, expected_head: &Clock, state: &Attested<EntityState>)
+    async fn set_state(&mut self, expected_head: &Clock, state: &EntityState)
         -> Result<(), MutationError>;
     async fn commit(self) -> Result<StorageCommitOutcome, MutationError>;
 }
@@ -150,7 +150,7 @@ pub enum StorageCommitOutcome {
     Committed(StorageCommitResult),
     Conflict {
         /// Canonical states observed while checking this attempt.
-        observed: BTreeMap<EntityId, Option<Attested<EntityState>>>,
+        observed: BTreeMap<EntityId, Option<EntityState>>,
     },
 }
 ```
