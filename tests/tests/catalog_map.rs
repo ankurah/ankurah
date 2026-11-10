@@ -1,6 +1,7 @@
 //! Catalog projection and resolution behavior.
 
 mod common;
+use ankurah::core::error::NodeReadinessError;
 use ankurah::core::storage::StorageEngine;
 use ankurah::PropertyId;
 use common::*;
@@ -202,10 +203,14 @@ async fn catalog_projection_does_not_retain_node() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An ephemeral node with no peer loads its stored catalog, then waits for a durable peer's answer
+/// that never comes; dropping it frees it and its storage.
 #[tokio::test]
-async fn a_starting_durable_node_is_not_retained_by_catalog_startup() -> anyhow::Result<()> {
+async fn a_node_waiting_for_its_first_durable_answer_is_not_retained_by_catalog_startup() -> anyhow::Result<()> {
     let engine = Arc::new(SledStorageEngine::new_test()?);
-    let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
+    let node = Node::new(engine.clone(), PermissiveAgent::new());
+    node.wait_catalog_loaded().await?;
+    assert_eq!(node.check_ready(), Err(NodeReadinessError::NotReady), "the node waits for a durable peer's answer");
     let weak = node.weak();
     drop(node);
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -214,7 +219,7 @@ async fn a_starting_durable_node_is_not_retained_by_catalog_startup() -> anyhow:
         }
     })
     .await
-    .expect("a starting durable node must not be retained by catalog startup");
+    .expect("a node waiting for its first durable answer must not be retained by catalog startup");
     tokio::time::timeout(Duration::from_secs(1), async {
         while Arc::strong_count(&engine) != 1 {
             tokio::task::yield_now().await;
