@@ -4,7 +4,8 @@ use std::fmt;
 /// A node's ed25519 signing key. Its verifying key is the node's [`proto::Identity`].
 ///
 /// A node holds its key privately and does all of its own signing; policy
-/// agents and transports never see it, and nothing serializes or prints it.
+/// agents and transports never see it. Nothing prints it, and its seed leaves
+/// it only through `to_seed` and `load_or_create`, for the holder that persists it.
 pub struct NodeKey(ed25519_dalek::SigningKey);
 
 impl NodeKey {

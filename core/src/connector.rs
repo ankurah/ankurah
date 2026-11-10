@@ -29,7 +29,7 @@ pub enum PeerConnectionError {
     SelfConnection(proto::NodeId),
     #[error("presence from node {0} does not repeat the versions offered and chosen on this connection")]
     OfferMismatch(proto::NodeId),
-    /// A second presence was registered on a handshake that has already registered its peer.
+    /// A presence offered on a handshake that has already registered its peer.
     #[error("this connection's handshake has already registered its peer")]
     RepeatedRegistration,
     /// This node was asked to present on a connection it accepted before it registered the dialer.
@@ -81,7 +81,8 @@ pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::NodeId;
     /// Begin this node's side of one new connection's handshake, reached as `provenance` says.
     fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake;
-    /// Sign this node's presence answering the peer on `handshake`'s connection; a halted node signs none.
+    /// Sign this node's presence answering the peer on `handshake`'s connection. A halted node signs none,
+    /// and a node that accepted the connection signs none before it has registered the dialer.
     async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError>;
     /// Register the peer whose presence completes `handshake`; `sender` holds the frames it is
     /// given until the connector has written this node's presence.
