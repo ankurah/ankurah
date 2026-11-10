@@ -373,8 +373,13 @@ async fn qualified_outside_component(f: Fixture) -> anyhow::Result<()> {
     let engine = f.engine;
     // Closure is outside the tuple: its label is found through the catalog, double-quoted for its dot.
     assert_eq!(three_answers(&f, "\"records.closure\"::closed_at = 5").await?, [["done"], ["done"], ["done"]], "{engine}");
-    // ada and bob lack Closure, so its property is absent from them: a comparison with it is never true,
-    // even beneath NOT. Fetch and live query agree on both engines.
+    // ada and bob lack Closure, so its property is absent from them: NULL to IS NULL, and a comparison with it
+    // is never true, even beneath NOT. Fetch and live query agree on both engines.
+    assert_eq!(
+        three_answers(&f, "\"records.closure\"::closed_at IS NULL").await?,
+        [["ada", "bob"], ["ada", "bob"], ["ada", "bob"]],
+        "{engine}"
+    );
     assert_eq!(three_answers(&f, "NOT \"records.closure\"::closed_at = 5").await?, [[""; 0], [""; 0], [""; 0]], "{engine}");
     assert_eq!(three_answers(&f, "NOT \"records.closure\"::closed_at = 6").await?, [["done"], ["done"], ["done"]], "{engine}");
     Ok(())
