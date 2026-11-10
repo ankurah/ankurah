@@ -7,7 +7,7 @@ use ankql::ast::{Predicate, Resolved};
 use ankurah::core::{connector::PeerProvenance, node::NodeInner, util::Iterable};
 use ankurah::entity::Entity;
 use ankurah::error::ValidationError;
-use ankurah::policy::{AccessDenied, DefaultContext, PeerTrust, PolicyAgent};
+use ankurah::policy::{AccessDenied, AttestationRequest, DefaultContext, PeerTrust, PolicyAgent};
 use async_trait::async_trait;
 use common::*;
 use std::sync::{Arc, Mutex};
@@ -71,7 +71,7 @@ impl PolicyAgent for TrustListedPeers {
         _: &Entity,
         _: &Entity,
         _: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
         Ok(None)
     }
 
@@ -84,7 +84,9 @@ impl PolicyAgent for TrustListedPeers {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn request_state_attestation<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<AttestationRequest> {
+        None
+    }
 
     fn validate_received_state<SE: StorageEngine>(
         &self,

@@ -1,6 +1,6 @@
 use crate::entity::RemoteTrxEntity;
 use crate::internal::prelude::*;
-use crate::node::event_admissibility::AdmittedOperations;
+use crate::node::{event_admissibility::AdmittedOperations, identity::attestation};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -76,7 +76,7 @@ impl<'a, SE: StorageEngine + 'static, PA: PolicyAgent, C: Signal + Peek<Vec<PA::
         let after = entity.read();
         entity
             .apply_events(&self.event_getter, std::slice::from_mut(&mut event), &admitted, |event| {
-                self.policy.check_write_event(self.node, before, &after, event)
+                Ok(attestation::on_event(self.node, event, self.policy.check_write_event(self.node, before, &after, event)?))
             })
             .await?;
         self.storage.add_events(std::slice::from_ref(&event)).await?;

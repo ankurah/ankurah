@@ -1,6 +1,7 @@
 #[cfg(feature = "uniffi")]
 uniffi::setup_scaffolding!();
 
+pub mod attestation;
 pub mod auth;
 pub mod carried_body;
 pub mod clock;
@@ -31,6 +32,7 @@ pub mod wasm;
 
 pub use ankurah_core_types::{ModelId, PropertyId, SystemModel, SystemProperty};
 
+pub use attestation::*;
 pub use auth::*;
 pub use carried_body::*;
 pub use clock::*;

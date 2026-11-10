@@ -7,7 +7,7 @@ use ankurah_proto::{EntityId, EntityState, Event};
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::{durable_peer, event_admissibility::AdmittedOperations};
+use crate::node::{durable_peer, event_admissibility::AdmittedOperations, identity::attestation};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -214,7 +214,7 @@ impl Transaction {
                 let mut events = events.clone();
                 entity_after
                     .apply_events(&event_getter, &mut events, &admitted, |event| {
-                        policy.check_write_event(node, &entity_before, &after, event)
+                        Ok(attestation::on_event(node, event, policy.check_write_event(node, &entity_before, &after, event)?))
                     })
                     .await?;
                 storage_trx.add_events(&events).await?;

@@ -612,7 +612,7 @@ fn event_from_row(row: tokio_postgres::Row) -> Result<Attested<Event>, Retrieval
     let body = EventBody::decode(&body_bytes).map_err(RetrievalError::storage)?;
     let parent: Clock = row.try_get("parent").map_err(RetrievalError::storage)?;
     let attestations_bytes: Vec<u8> = row.try_get("attestations").map_err(RetrievalError::storage)?;
-    let attestations: AttestationSet = bincode::deserialize(&attestations_bytes).map_err(RetrievalError::storage)?;
+    let attestations = AttestationSet::decode(&attestations_bytes).map_err(RetrievalError::storage)?;
     Ok(Attested { payload: Event { entity_id, body, parent }, attestations })
 }
 

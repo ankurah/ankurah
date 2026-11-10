@@ -14,7 +14,7 @@ use crate::{
     retrieval::{GetEvents, GetState},
     schema::CatalogEpoch,
 };
-use ankurah_proto::{Attestation, Attested, Clock, EntityId, Event, EventId, State};
+use ankurah_proto::{Attested, Clock, EntityId, Event, EventId, SealedAttestation, State};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -90,7 +90,7 @@ impl RemoteTrxEntity {
         getter: &G,
         events: &mut [Attested<Event>],
         admitted: &AdmittedOperations,
-        mut check: impl FnMut(&Event) -> Result<Option<Attestation>, MutationError>,
+        mut check: impl FnMut(&Event) -> Result<Option<SealedAttestation>, MutationError>,
     ) -> Result<(), MutationError>
     where
         G: GetEvents + Send + Sync,

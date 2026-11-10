@@ -53,6 +53,16 @@ impl From<AccessDenied> for wasm_bindgen::JsValue {
 
 impl AccessDenied {}
 
+/// A statement a policy agent asks its node to make about the event or state in hand: its kind
+/// and payload. The node names the subject and seals the statement with its own key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttestationRequest {
+    /// The entity id of the definition that says what the statement means and how to read `payload`.
+    pub kind: proto::EntityId,
+    /// The statement's content, read as `kind` says.
+    pub payload: Vec<u8>,
+}
+
 /// What this node grants a connected peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PeerTrust {
@@ -69,9 +79,13 @@ pub use crate::schema::registration::{PlannedModelPropertyMembership, PlannedUpd
 /// PolicyAgents control access to resources, by:
 /// - signing requests which are sent to other nodes - this may come in the form of a bearer token, or a signature, or some other arbitrary method of authentication as defined by the PolicyAgent
 /// - checking access for requests. If approved, yield a ContextData
-/// - attesting events for requests that were approved
-/// - validating attestations for events
+/// - deciding which events and served states this node attests, and what each attestation says
+/// - deciding whether the attestations on a received event or state suffice
 /// - deciding what a connected peer is trusted with
+///
+/// Core seals an attestation only when an agent requests one, and checks none: an agent
+/// receives the attestations on an event or state exactly as they came, and unseals the ones
+/// it cares about with [`proto::SealedAttestation::unseal`].
 ///
 /// Read checks may receive several credentials, one, or none. Implementations
 /// must decide the empty case explicitly and authorize actual entity memberships,
@@ -145,7 +159,7 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
     }
 
     /// Authorize a proposed event, seeing the transaction's original state
-    /// and its state after applying the event; optionally return an attestation.
+    /// and its state after applying the event; optionally request this node's attestation on it.
     fn check_write_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -153,10 +167,10 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         entity_before: &Entity,
         entity_after: &Entity,
         event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied>;
+    ) -> Result<Option<AttestationRequest>, AccessDenied>;
 
-    /// Validate an event attestation
-    /// This could be used to validate that the event has sufficient attestation as to be trusted
+    /// Decide whether a received event's attestations suffice. They arrive as they came:
+    /// unverified, and not necessarily naming this event.
     fn validate_received_event<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -164,9 +178,13 @@ pub trait PolicyAgent: Clone + Send + Sync + 'static {
         event: &Attested<proto::Event>,
     ) -> Result<(), AccessDenied>;
 
-    /// Attest a state which the caller asserts is valid. Implementation may return None if no attestation is required
-    fn attest_state<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState) -> Option<proto::Attestation>;
+    /// The statement this agent asks a durable node to make about `state` when it serves it; `None`
+    /// asks for none.
+    fn request_state_attestation<SE: StorageEngine>(&self, node: &Node<SE, Self>, state: &proto::EntityState)
+        -> Option<AttestationRequest>;
 
+    /// Decide whether a received state's attestations suffice. They arrive as they came:
+    /// unverified, and not necessarily naming this state.
     fn validate_received_state<SE: StorageEngine>(
         &self,
         node: &Node<SE, Self>,
@@ -280,7 +298,6 @@ impl PolicyAgent for PermissiveAgent {
         Ok(auth.iterable().map(|_| DEFAULT_CONTEXT).collect())
     }
 
-    /// Create an attestation for an event
     fn check_write_event<SE: StorageEngine>(
         &self,
         _node: &Node<SE, Self>,
@@ -288,7 +305,7 @@ impl PolicyAgent for PermissiveAgent {
         _entity_before: &Entity,
         _entity_after: &Entity,
         _event: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
         Ok(None)
     }
 
@@ -301,9 +318,11 @@ impl PolicyAgent for PermissiveAgent {
         Ok(())
     }
 
-    fn attest_state<SE: StorageEngine>(&self, _node: &Node<SE, Self>, _state: &proto::EntityState) -> Option<proto::Attestation> {
-        // This PolicyAgent does not require attestation, so we return None
-        // Client/Server policy agents may also return None and defer to the server identity to validate the received state
+    fn request_state_attestation<SE: StorageEngine>(
+        &self,
+        _node: &Node<SE, Self>,
+        _state: &proto::EntityState,
+    ) -> Option<AttestationRequest> {
         None
     }
 

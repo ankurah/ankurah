@@ -3,7 +3,7 @@ use crate::connector::PeerProvenance;
 use crate::entity::Entity;
 use crate::error::ValidationError;
 use crate::node::{Node, NodeKey};
-use crate::policy::{AccessDenied, DefaultContext, PeerTrust, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT};
+use crate::policy::{AccessDenied, AttestationRequest, DefaultContext, PeerTrust, PermissiveAgent, PolicyAgent, DEFAULT_CONTEXT};
 use crate::storage::StorageEngine;
 use crate::test_utils::TestStorage;
 use crate::util::Iterable;
@@ -208,7 +208,7 @@ impl PolicyAgent for RequestHoldingAgent {
         _: &Entity,
         _: &Entity,
         _: &proto::Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
         Ok(None)
     }
 
@@ -216,7 +216,9 @@ impl PolicyAgent for RequestHoldingAgent {
 
     fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&proto::Event>) -> Result<(), AccessDenied> { Ok(()) }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<proto::Attestation> { None }
+    fn request_state_attestation<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &proto::EntityState) -> Option<AttestationRequest> {
+        None
+    }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,

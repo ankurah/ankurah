@@ -1,6 +1,6 @@
 use crate::{
-    auth::Attested, carried_body::CarriedBody, id::EntityId, identity::NodeId, state::EntityState, subscription::QueryId, EventFragment,
-    StateFragment,
+    attestation::Attested, carried_body::CarriedBody, id::EntityId, identity::NodeId, state::EntityState, subscription::QueryId,
+    EventFragment, StateFragment,
 };
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;

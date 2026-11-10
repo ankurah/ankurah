@@ -1068,7 +1068,7 @@ async fn batch_policy_checks_intermediate_states_and_stops_at_first_failure() ->
             if value == Some(Value::String("forbidden".into())) {
                 return Err(MutationError::InvalidUpdate("policy denied intermediate state"));
             }
-            Ok(Some(proto::Attestation(vec![7])))
+            Ok(Some(proto::SealedAttestation(vec![7])))
         })
         .await
         .unwrap_err();
@@ -1077,7 +1077,7 @@ async fn batch_policy_checks_intermediate_states_and_stops_at_first_failure() ->
         checked,
         vec![(accepted.id(), Some(Value::String("allowed".into()))), (denied.id(), Some(Value::String("forbidden".into()))),]
     );
-    assert_eq!(events[0], Attested::opt(accepted.clone(), Some(proto::Attestation(vec![7]))));
+    assert_eq!(events[0], Attested::opt(accepted.clone(), Some(proto::SealedAttestation(vec![7]))));
     assert!(events[1].attestations.is_empty());
     assert!(events[2].attestations.is_empty());
     assert_eq!(getter.tip_reads.load(std::sync::atomic::Ordering::Relaxed), 1, "the batch uses one comparison");

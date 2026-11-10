@@ -4,7 +4,7 @@ use crate::{
     entity::{Entity, LocalTrxEntity, RemoteTrxEntity},
     error::{LineageError, MutationError, ValidationError},
     node::Node,
-    policy::{AccessDenied, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
+    policy::{AccessDenied, AttestationRequest, DefaultContext, PolicyAgent, DEFAULT_CONTEXT},
     property::backend::{LWWBackend, PropertyBackend},
     reactor::ChangeNotification,
     retrieval::{LocalEventGetter, SuspenseEvents},
@@ -37,7 +37,7 @@ impl PolicyAgent for OwnerOnlyAgent {
         before: &Entity,
         after: &Entity,
         event: &Event,
-    ) -> Result<Option<proto::Attestation>, AccessDenied> {
+    ) -> Result<Option<AttestationRequest>, AccessDenied> {
         assert_eq!(before.id(), event.entity_id);
         assert_eq!(after.id(), event.entity_id);
         assert!(after.head().contains(&event.id()), "the policy must see the event applied to the working fork");
@@ -71,7 +71,7 @@ impl PolicyAgent for OwnerOnlyAgent {
 
     fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&Event>) -> Result<(), AccessDenied> { Ok(()) }
 
-    fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<proto::Attestation> { None }
+    fn request_state_attestation<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<AttestationRequest> { None }
 
     fn validate_received_event<SE: StorageEngine>(
         &self,
@@ -177,16 +177,16 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), &AdmittedOperations::new(), |_| Ok(None)).await?;
     let branch_property = PropertyId::EntityId(EntityId::from_bytes([2; 32]));
     let branch = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![set(branch_property, "branch")?]));
-    let mut branch = Attested::opt(branch, Some(proto::Attestation(vec![1, 2, 3])));
+    let mut branch = Attested::opt(branch, Some(proto::SealedAttestation(vec![1, 2, 3])));
     // Divergence must find the earlier fork events without storage or explicit staging.
     fork.apply_events(&getter, std::slice::from_mut(&mut branch), &AdmittedOperations::new(), |event| {
         assert_eq!(event.entity_id, before.id());
         assert_eq!(before.value(&branch_property), None);
         assert_eq!(fork.read().value(&branch_property), Some(Value::String("branch".into())));
-        Ok(Some(proto::Attestation(vec![4, 5, 6])))
+        Ok(Some(proto::SealedAttestation(vec![4, 5, 6])))
     })
     .await?;
-    assert_eq!(*branch.attestations, vec![proto::Attestation(vec![1, 2, 3]), proto::Attestation(vec![4, 5, 6])]);
+    assert_eq!(*branch.attestations, vec![proto::SealedAttestation(vec![1, 2, 3]), proto::SealedAttestation(vec![4, 5, 6])]);
     // Redelivered events must not appear twice in the published change.
     fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), &AdmittedOperations::new(), |_| Ok(None))
         .await?;
