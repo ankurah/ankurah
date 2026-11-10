@@ -8,14 +8,6 @@ use crate::{policy::PolicyAgent, storage::StorageEngine, Node, NodeState};
 pub enum PeerConnectionError {
     #[error("{0}")]
     Protocol(#[from] proto::PresenceRejection),
-    #[error("peer belongs to a different system (current {current}, offered {offered})")]
-    SystemMismatch { current: proto::EntityId, offered: proto::EntityId },
-    #[error("durable peer did not advertise a system")]
-    MissingSystem,
-    #[error("invalid system: {0}")]
-    InvalidSystem(String),
-    #[error("failed to wipe local storage for system replacement: {0}")]
-    SystemReset(String),
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
 }
@@ -52,7 +44,7 @@ impl From<anyhow::Error> for SendError {
 #[async_trait]
 pub trait NodeComms: Send + Sync {
     fn id(&self) -> proto::NodeId;
-    /// Build our handshake identity after local system storage loads; an unadopted node has no root.
+    /// Build our handshake identity; a halted node has none.
     async fn presence(&self) -> Result<proto::Presence, crate::error::NodeHaltReason>;
     async fn register_peer(&self, presence: proto::Presence, sender: Box<dyn PeerSender>) -> Result<(), PeerConnectionError>;
     fn state(&self) -> ankurah_signals::Read<NodeState>;

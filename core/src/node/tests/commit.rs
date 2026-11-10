@@ -110,15 +110,13 @@ fn set(property: PropertyId, value: &str) -> anyhow::Result<Operation> {
 async fn local_creation_commits_after_its_events_arrive_remotely() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let context = node.context(DEFAULT_CONTEXT)?;
     let [a, b] = [1, 2].map(|byte| ModelId::EntityId(EntityId::from_bytes([byte; 32])));
 
     for echoed in [1, 2] {
         let trx = context.begin();
-        let entity =
-            trx.add_entity(LocalTrxEntity::new(node.system.root_id(), AuthorId::Unknown, node.entities.catalog_epoch(), trx.alive.clone()));
+        let entity = trx.add_entity(LocalTrxEntity::new(None, AuthorId::Unknown, node.entities.catalog_epoch(), trx.alive.clone()));
         entity.add_membership(a)?;
         let id = entity.id();
         entity.add_membership(b)?;
@@ -140,16 +138,15 @@ async fn local_creation_commits_after_its_events_arrive_remotely() -> anyhow::Re
 async fn failed_add_event_poisons_the_transaction_even_if_the_error_is_caught() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let policy = crate::policy::ContextPolicy::from_credentials(&node.policy_agent, &DEFAULT_CONTEXT);
     let valid: Attested<Event> = Event::genesis(
-        node.system.root_id(),
+        None,
         AuthorId::Unknown,
         OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))))]),
     )
     .into();
-    let invalid: Attested<Event> = Event::genesis(node.system.root_id(), AuthorId::Unknown, OperationSet::default()).into();
+    let invalid: Attested<Event> = Event::genesis(None, AuthorId::Unknown, OperationSet::default()).into();
     let mut trx = crate::transaction::remote::RemoteTransaction::new(&node, &policy);
     trx.add_event(&valid).await?;
     let id = valid.payload.entity_id;
@@ -226,7 +223,6 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     let agent = OwnerOnlyAgent { owner, checked_owners: Arc::default() };
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), agent.clone());
-    node.system.create().await?;
     node.wait_ready().await?;
     let events = LocalEventGetter::new(storage.clone(), false);
     let genesis = Event::genesis(
@@ -284,11 +280,9 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
 async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_require() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let model = ModelId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis =
-        Event::genesis(node.system.root_id(), AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into()]).await?;
     let update = |parent: &Event, claimed| {
         Event::update(
@@ -327,11 +321,9 @@ async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_requi
 async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let model = ModelId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis =
-        Event::genesis(node.system.root_id(), AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into()]).await?;
     let unheld = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
     let child = Event::update(genesis.entity_id, proto::Clock::singleton(&unheld), AuthorId::Unknown, OperationSet::default());

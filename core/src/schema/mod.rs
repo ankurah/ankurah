@@ -58,7 +58,6 @@ pub fn is_reserved_model(model: &ModelId) -> bool { matches!(model, ModelId::Sys
 
 pub fn system_model_id(label: &str) -> Option<ModelId> {
     let model = match label {
-        crate::system::SYSTEM_COLLECTION_ID => SystemModel::System,
         MODEL_COLLECTION_ID => SystemModel::Model,
         PROPERTY_COLLECTION_ID => SystemModel::Property,
         MODEL_PROPERTY_COLLECTION_ID => SystemModel::ModelProperty,
@@ -69,7 +68,6 @@ pub fn system_model_id(label: &str) -> Option<ModelId> {
 
 pub const fn system_model_label(model: SystemModel) -> &'static str {
     match model {
-        SystemModel::System => crate::system::SYSTEM_COLLECTION_ID,
         SystemModel::Model => MODEL_COLLECTION_ID,
         SystemModel::Property => PROPERTY_COLLECTION_ID,
         SystemModel::ModelProperty => MODEL_PROPERTY_COLLECTION_ID,
@@ -83,7 +81,6 @@ mod model_mapping_tests {
     #[test]
     fn every_system_model_maps_to_the_current_storage_key_and_back() {
         let pairs = [
-            (SystemModel::System, crate::system::SYSTEM_COLLECTION_ID),
             (SystemModel::Model, MODEL_COLLECTION_ID),
             (SystemModel::Property, PROPERTY_COLLECTION_ID),
             (SystemModel::ModelProperty, MODEL_PROPERTY_COLLECTION_ID),
@@ -109,7 +106,6 @@ mod request_policy_tests {
             (ModelId::System(SystemModel::Model), true),
             (ModelId::System(SystemModel::Property), true),
             (ModelId::System(SystemModel::ModelProperty), true),
-            (ModelId::System(SystemModel::System), false),
             (ModelId::EntityId(ankurah_proto::EntityId::random()), false),
         ] {
             let requests = [

@@ -127,7 +127,7 @@ impl CrashFlushable for ankurah_storage_postgres::Postgres {
 /// Shared crash state: the target point, the per-op counters, and an `armed`
 /// gate. Operations are only counted and crashes only fire once armed, so the
 /// `nth` occurrence in a [`CrashPoint`] is relative to the test workload rather
-/// than to any bootstrap writes (e.g. `system.create()`) that happen first.
+/// than to any bootstrap writes (e.g. catalog registration) that happen first.
 struct CrashState {
     crash: Option<CrashPoint>,
     armed: AtomicBool,

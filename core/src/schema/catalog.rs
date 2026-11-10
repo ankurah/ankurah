@@ -62,6 +62,8 @@ struct CatalogIndex {
 
 pub struct CatalogManager {
     index: OnceLock<Calculated<CatalogIndex>>,
+    /// The index holds the definitions this node stores; `ready` waits for a durable answer too.
+    loaded: Mut<bool>,
     ready: Mut<bool>,
     /// Hold declaration lookup through commit so concurrent registrations reuse identities
     /// rather than both seeing a missing declaration and allocating different IDs.
@@ -69,7 +71,9 @@ pub struct CatalogManager {
 }
 
 impl Default for CatalogManager {
-    fn default() -> Self { Self { index: OnceLock::new(), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) } }
+    fn default() -> Self {
+        Self { index: OnceLock::new(), loaded: Mut::new(false), ready: Mut::new(false), allocator: tokio::sync::Mutex::new(()) }
+    }
 }
 
 fn rows<R: View + Clone + 'static>(query: &LiveQuery<R>) -> Vec<(EntityId, R::Model)> {
@@ -97,6 +101,9 @@ impl CatalogManager {
     pub(crate) fn is_ready(&self) -> bool { self.ready.value() }
 
     pub(crate) async fn wait_ready(&self) { self.ready.wait_value(true).await; }
+
+    /// Wait until the index holds the definitions this node stores, which a durable answer may still extend.
+    pub(crate) async fn wait_loaded(&self) { self.loaded.wait_value(true).await; }
 
     /// Observe catalog changes without copying catalog rows into the notification.
     pub fn subscribe_changes(&self, listener: impl Fn() + Send + Sync + 'static) -> Option<SubscriptionGuard> {
@@ -163,6 +170,11 @@ impl CatalogManager {
         let models = ctx.query::<SysModelRowView>(CACHED_TRUE)?;
         let properties = ctx.query::<SysPropertyRowView>(CACHED_TRUE)?;
         let memberships = ctx.query::<SysModelPropertyRowView>(CACHED_TRUE)?;
+        let loaded = futures::future::try_join_all([
+            models.wait_initialized().boxed(),
+            properties.wait_initialized().boxed(),
+            memberships.wait_initialized().boxed(),
+        ]);
         let ready = futures::future::try_join_all([
             models.wait_durable_answered().boxed(),
             properties.wait_durable_answered().boxed(),
@@ -205,6 +217,8 @@ impl CatalogManager {
 
         self.index.set(index).map_err(|_| RetrievalError::Other("catalog already initialized".into()))?;
         drop(node);
+        loaded.await?;
+        self.loaded.set(true);
         ready.await?;
         self.ready.set(true);
         Ok(())
@@ -361,7 +375,6 @@ mod tests {
         ] {
             let storage = Arc::new(TestStorage::default());
             let mut node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-            node.system.create().await?;
             let context = node.context_async(DEFAULT_CONTEXT).await?;
             context.resolve_model_id::<PublicationModel>().await?;
             let healthy = context.resolve_model_id::<MissingPublicationModel>().await?;
@@ -373,7 +386,6 @@ mod tests {
                 SystemModel::Model => transaction.get::<SysModelRow>(&model).await?.entity().clone(),
                 SystemModel::Property => transaction.get::<SysPropertyRow>(&property).await?.entity().clone(),
                 SystemModel::ModelProperty => transaction.get::<SysModelPropertyRow>(&membership).await?.entity().clone(),
-                _ => unreachable!(),
             };
             entity.get_backend::<LWWBackend>()?.set(PropertyId::System(field), None);
             transaction.commit().await?;
@@ -389,7 +401,6 @@ mod tests {
                     SystemModel::Model => node.catalog.model_by_id(&model)?.is_none(),
                     SystemModel::Property => node.catalog.property_by_id(&property)?.is_none(),
                     SystemModel::ModelProperty => node.catalog.membership(&model, &property)?.is_none(),
-                    _ => unreachable!(),
                 };
                 assert!(missing, "{table:?}.{field:?}, restored={restored}");
                 assert_eq!(node.catalog.model_id_for(MissingPublicationModel::descriptor().label)?, Some(healthy));
@@ -410,7 +421,6 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let model = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?;
                 seed.catalog.model_by_label(PublicationModel::descriptor().label)?.unwrap().0
             };
@@ -421,7 +431,6 @@ mod tests {
             let (release, release_rx) = tokio::sync::oneshot::channel();
             storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
             let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-            node.system.wait_system_ready().await?;
             // A context built directly skips the readiness check, so this query waits on the catalog.
             let query = Context::new(node.clone(), DEFAULT_CONTEXT).query::<PublicationModelView>(CACHED_TRUE)?;
             entered_rx.await?;
@@ -443,11 +452,9 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let node = Node::new(storage, PermissiveAgent::new());
-            node.system.wait_system_ready().await?;
             while node.catalog.counts() != (1, 1, 1) {
                 tokio::task::yield_now().await;
             }
@@ -472,7 +479,6 @@ mod tests {
             let storage = Arc::new(TestStorage::default());
             let original = {
                 let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-                seed.system.create().await?;
                 seed.context_async(DEFAULT_CONTEXT).await?.resolve_model_id::<PublicationModel>().await?
             };
             let (fetch_entered, fetch_observed) = tokio::sync::oneshot::channel();

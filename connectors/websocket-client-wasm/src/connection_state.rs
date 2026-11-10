@@ -43,10 +43,6 @@ impl ConnectionStateEnum {
         Some(
             match cause {
                 Some(PeerConnectionError::Protocol(_)) => "Protocol",
-                Some(PeerConnectionError::SystemMismatch { .. }) => "SystemMismatch",
-                Some(PeerConnectionError::MissingSystem) => "MissingSystem",
-                Some(PeerConnectionError::InvalidSystem(_)) => "InvalidSystem",
-                Some(PeerConnectionError::SystemReset(_)) => "SystemReset",
                 Some(PeerConnectionError::NodeHalted(_)) => "NodeHalted",
                 None => "Transport",
             }

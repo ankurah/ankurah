@@ -41,7 +41,6 @@ async fn connect_recording_event_requests(
 async fn commits_stamp_from_the_head_including_after_multitip_rehydration() -> Result<()> {
     let storage = Arc::new(CountEventReads { inner: SledStorageEngine::new_test()?, reads: AtomicUsize::new(0) });
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let ctx = node.context_async(c).await?;
 
@@ -105,7 +104,6 @@ async fn an_ephemeral_node_stamps_an_edit_of_a_snapshot_without_fetching_its_hea
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let (_connection, _gate, requested) = connect_recording_event_requests(&client, &server).await;
-    client.system.wait_system_ready().await?;
     let server_ctx = server.context_async(c).await?;
     let client_ctx = client.context_async(c).await?;
 
@@ -133,7 +131,6 @@ async fn an_ephemeral_node_admits_an_honest_update_over_parents_it_does_not_hold
     let server = durable_sled_setup().await?;
     let client = ephemeral_sled_setup().await?;
     let (_connection, _gate, requested) = connect_recording_event_requests(&client, &server).await;
-    client.system.wait_system_ready().await?;
     let server_ctx = server.context_async(c).await?;
     let client_ctx = client.context_async(c).await?;
     // A standing query with the server lets the client accept pushed updates from it.

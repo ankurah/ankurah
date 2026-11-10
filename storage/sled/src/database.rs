@@ -33,7 +33,6 @@ pub(crate) fn model_from_tree_name(name: &[u8]) -> Option<ModelId> {
         return EntityId::from_base64(encoded).ok().map(ModelId::EntityId);
     }
     let system = match name.strip_prefix(SYSTEM_MODEL_TREE_PREFIX)? {
-        "system" => SystemModel::System,
         "model" => SystemModel::Model,
         "property" => SystemModel::Property,
         "model-property" => SystemModel::ModelProperty,

@@ -65,14 +65,13 @@ async fn start_postgres() -> Result<PgFixture> {
 type PgCrashEngine = CrashStorageEngine<Postgres>;
 
 /// Build a durable node on the postgres database named by `ENV_PG_URI`, wrapped
-/// in the crash engine, create the system, then arm the crash hook.
+/// in the crash engine, wait for it to start, then arm the crash hook.
 async fn armed_child_pg_node(crash: CrashPoint) -> Result<(Node<PgCrashEngine, PermissiveAgent>, Arc<PgCrashEngine>)> {
     let uri = std::env::var(ENV_PG_URI).map_err(|_| anyhow::anyhow!("child missing postgres uri"))?;
     let pg = Arc::new(Postgres::open(&uri).await?);
     let engine = Arc::new(CrashStorageEngine::new(pg, Some(crash)));
     let node = Node::new_durable(engine.clone(), PermissiveAgent::new());
     ankurah_tests::catalog_forge::plant(engine.as_ref(), album_forge()).await?;
-    node.system.create().await?;
     seed_album_catalog(&node)?;
     node.wait_ready().await?;
     engine.arm();

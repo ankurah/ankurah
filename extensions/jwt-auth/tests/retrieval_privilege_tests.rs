@@ -159,7 +159,6 @@ async fn guest_retrieves_named_rows_and_scans_nothing() -> anyhow::Result<()> {
     let keys = common::test_keys();
     let agent = JwtAgent::new_durable(keys.clone(), config_path())?;
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let member = node.context_async(member_ctx("member-1")).await?;

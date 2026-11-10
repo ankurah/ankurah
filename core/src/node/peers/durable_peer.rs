@@ -45,7 +45,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    node.system.require_system_ready().map_err(MutationError::from)?;
+    node.lifecycle.check_not_halted()?;
     let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
     match node.request(peer_id, cdata, proto::NodeRequestBody::Get { ids: ids.clone() }).await? {
@@ -80,7 +80,7 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    node.system.require_system_ready().map_err(MutationError::from)?;
+    node.lifecycle.check_not_halted()?;
     let peer_id = node.get_durable_peer_random().ok_or(RetrievalError::NoDurablePeers)?;
 
     let known_matched_entities = node.fetch_entities_from_local(&selection).await?;

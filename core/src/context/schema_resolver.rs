@@ -61,11 +61,10 @@ where
     /// Preflight its policy, then return the model ID and the epoch the binding belongs to.
     async fn ensure_registered(&self, schema: &'static ModelStructDescriptor) -> Result<(proto::ModelId, CatalogEpoch), RegistrationError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
+        let epoch = node.catalog_epoch()?;
         if let Some(system) = schema.system {
-            return Ok((proto::ModelId::System(system), node.entities.catalog_epoch()));
+            return Ok((proto::ModelId::System(system), epoch));
         }
-        let epoch = node.system.catalog_epoch().ok_or(RegistrationError::SystemNotReady)?;
         if schema.resolved.get(epoch).is_err() {
             let mut registrant = schema.registrant(epoch);
             let auth = match &self.auth {
@@ -110,7 +109,7 @@ where
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let node = self.node.upgrade()?;
-        crate::schema::resolver::resolve_component_selection(components, &node.catalog, node.system.catalog_epoch(), selection)
+        crate::schema::resolver::resolve_component_selection(components, &node.catalog, node.catalog_epoch()?, selection)
     }
 
     /// Resolve and policy-filter a livequery's initial or updated selection locally.
@@ -121,11 +120,8 @@ where
         selection: Selection<Parsed>,
     ) -> Result<Selection<Resolved>, RetrievalError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
+        node.lifecycle.check_not_halted()?;
         crate::schema::resolver::validate_selection_names(components, &selection)?;
-        if node.system.catalog_epoch().is_none() {
-            return Err(RetrievalError::NodeNotReady);
-        }
         if components.iter().any(|schema| schema.system.is_none()) {
             if !node.catalog.is_ready() {
                 return Err(RetrievalError::NodeNotReady);
@@ -152,11 +148,17 @@ where
             Err(error) => return Box::pin(ready(Err(error.into()))),
         };
         let context = ContextInner { node: NodeHandle::Weak(node.weak()), auth: ContextAuth::Sessions(sessions) };
-        let system = node.system.clone();
+        let lifecycle = node.lifecycle.clone();
+        let catalog = node.catalog.clone();
 
         Box::pin(async move {
-            if system.catalog_epoch().is_none() {
-                system.wait_system_ready().await?;
+            // A user model waits for the catalog without holding the node: an ephemeral node's catalog
+            // waits for a durable peer. The catalog's own queries are over system models and need no catalog.
+            if components.iter().any(|schema| schema.system.is_none()) {
+                tokio::select! {
+                    () = catalog.wait_ready() => {}
+                    reason = lifecycle.wait_halted() => return Err(reason.into()),
+                }
             }
 
             context.ensure_components_registered(&components).await?;

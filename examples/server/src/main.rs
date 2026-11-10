@@ -17,11 +17,6 @@ async fn main() -> Result<()> {
     let storage = SledStorageEngine::with_homedir_folder(".ankurah_example")?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
 
-    node.system.wait_loaded().await?;
-    if node.system.root().is_none() {
-        node.system.create().await?;
-    }
-
     // Clone node for log generation task
     let log_node = node.clone();
 

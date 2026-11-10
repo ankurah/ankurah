@@ -11,9 +11,10 @@ use bb8_postgres::PostgresConnectionManager;
 use testcontainers::ContainerAsync;
 use testcontainers_modules::{postgres, testcontainers::runners::AsyncRunner};
 
-async fn touch_system_materialization(engine: &Postgres) -> Result<()> {
+/// Create the model catalog's materialization, so the store holds Ankurah data beside its version record.
+async fn touch_catalog_materialization(engine: &Postgres) -> Result<()> {
     let selection = ankql::ast::Selection { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-    engine.fetch_states(&selection.clone().and_member_of(ModelId::System(SystemModel::System))).await?;
+    engine.fetch_states(&selection.clone().and_member_of(ModelId::System(SystemModel::Model))).await?;
     Ok(())
 }
 
@@ -45,7 +46,7 @@ async fn fresh_store_records_version_and_reopens() -> Result<()> {
     }
 
     // Reopening a store with the matching record proceeds, with or without data.
-    touch_system_materialization(&engine).await?;
+    touch_catalog_materialization(&engine).await?;
     let reopened = Postgres::new(pool.clone()).await?;
 
     // A collection wipe preserves the record: the meta table is not a
@@ -66,7 +67,7 @@ async fn unrelated_tables_do_not_block_initialization_or_get_dropped() -> Result
     }
 
     let engine = Postgres::new(pool.clone()).await?;
-    touch_system_materialization(&engine).await?;
+    touch_catalog_materialization(&engine).await?;
     assert!(engine.delete_all().await?, "Ankurah-owned storage was deleted");
     assert!(!engine.delete_all().await?, "unrelated tables do not count as Ankurah storage");
 
@@ -82,7 +83,7 @@ async fn mismatched_or_missing_version_refuses() -> Result<()> {
 
     // Record the version and give the store some data.
     let engine = Postgres::new(pool.clone()).await?;
-    touch_system_materialization(&engine).await?;
+    touch_catalog_materialization(&engine).await?;
 
     // Rewrite the stored version out of band.
     {

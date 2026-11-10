@@ -64,8 +64,7 @@ impl Transaction {
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let (model_id, epoch) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
 
-        let system = self.dyncontext.system_id().ok_or(MutationError::SystemNotReady)?;
-        let entity = LocalTrxEntity::new(Some(system), proto::AuthorId::Unknown, epoch, self.alive.clone());
+        let entity = LocalTrxEntity::new(None, proto::AuthorId::Unknown, epoch, self.alive.clone());
         model.initialize_new_entity(&entity, model_id, epoch)?;
         self.dyncontext.check_write(&entity.read())?;
 
@@ -170,7 +169,7 @@ impl Transaction {
         SE: StorageEngine + Send + Sync + 'static,
         PA: PolicyAgent + Send + Sync + 'static,
     {
-        let epoch = node.system.require_system_ready()?;
+        let epoch = node.catalog_epoch()?;
 
         if self.alive.compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire).is_err() {
             return Err(MutationError::General("Transaction already committed or rolled back".into()));
@@ -230,7 +229,7 @@ impl Transaction {
                 relayed = true;
             }
             let publication = node.commit_publication_lock.lock().await;
-            storage_trx.commit().await?.committed()?;
+            node.lifecycle.begin_storage_write()?.commit(storage_trx).await?.committed()?;
             // Tests widen the window between the storage commit and the publication, in which a read
             // may load what was committed (tests/tests/publication_window.rs).
             #[cfg(feature = "test-helpers")]

@@ -51,7 +51,6 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), scope_ops_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node1.system.create().await?;
     agent.set_policy(&node1, &agent.config()).await?;
 
     // Seed one owner-keyed and one administrator-keyed assignment as system.
@@ -65,7 +64,6 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await.unwrap();
 
     let admin_claims = make_claims("admin-1", &["Administrator"], "admin@scope.test");
     let admin_token = sign_token(&keys, &admin_claims);
@@ -123,7 +121,6 @@ async fn write_only_scope_rule_gates_writes_not_reads() -> anyhow::Result<()> {
 async fn a_scope_filter_with_a_component_qualifier_is_refused_when_the_policy_is_set() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(common::test_keys(), scope_ops_config_path())?;
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     let filter = "Other::owner = $jwt.sub";
     let config: PolicyConfig = serde_json::from_value(serde_json::json!({
         "roles": { "Owner": ["account:write"] },

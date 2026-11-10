@@ -46,7 +46,6 @@ fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.
 
 fn system_label(model: SystemModel) -> &'static str {
     match model {
-        SystemModel::System => "_ankurah_system",
         SystemModel::Model => "_ankurah_model",
         SystemModel::Property => "_ankurah_property",
         SystemModel::ModelProperty => "_ankurah_model_property",
@@ -54,7 +53,7 @@ fn system_label(model: SystemModel) -> &'static str {
 }
 
 fn reserved_system_table_names() -> Vec<String> {
-    [SystemModel::System, SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty]
+    [SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty]
         .into_iter()
         .map(|model| naming::sanitize(system_label(model)))
         .collect()
@@ -739,7 +738,7 @@ mod tests {
     async fn test_open_in_memory() {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         let all = ankql::ast::Selection::<Resolved> { predicate: ankql::ast::Predicate::True, order_by: None, limit: None };
-        assert!(engine.fetch_states(&all.clone().and_member_of(ModelId::System(SystemModel::System))).await.unwrap().is_empty());
+        assert!(engine.fetch_states(&all.clone().and_member_of(ModelId::System(SystemModel::Model))).await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -747,7 +746,7 @@ mod tests {
         let engine = SqliteStorageEngine::open_in_memory().await.unwrap();
         assert!(engine.list_materializations().await.unwrap().is_empty());
 
-        let expected = [SystemModel::System, SystemModel::Model, SystemModel::Property].map(ModelId::System);
+        let expected = [SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty].map(ModelId::System);
         for model in &expected {
             engine.materialization(model).await.unwrap();
         }

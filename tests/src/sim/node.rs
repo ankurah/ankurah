@@ -38,17 +38,12 @@ impl SimNode {
     /// Register `peer` as a connected peer of this node, installing a
     /// `SimSender` so anything this node sends *to* `peer` is captured for the
     /// scheduler. Mirrors `Node::register_peer` as `LocalProcessConnection`
-    /// would, including initial system adoption from a durable peer.
+    /// would.
     pub async fn connect_to(&self, peer: &SimNode) {
         let sender = SimSender::new(self.index, peer.id(), self.captured.clone());
         self.node
             .register_peer(
-                proto::Presence {
-                    node_id: peer.id(),
-                    durable: peer.durable,
-                    system_root: peer.node.system.root(),
-                    protocol_version: proto::PROTOCOL_VERSION,
-                },
+                proto::Presence { node_id: peer.id(), durable: peer.durable, protocol_version: proto::PROTOCOL_VERSION },
                 Box::new(sender),
             )
             .await
@@ -125,8 +120,8 @@ impl SimNode {
     }
 }
 
-/// Build `n` nodes: node 0 is durable and owns the system root; the rest are
-/// ephemeral and join node 0's system. All nodes share one capture sink, and
+/// Build `n` nodes: node 0 is durable and holds the forged catalog; the rest
+/// are ephemeral and connect to it. All nodes share one capture sink, and
 /// each node's key derives from `seed` and its index.
 /// Returns the nodes and the shared `Captured` for the scheduler.
 pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Result<Vec<SimNode>> {
@@ -137,7 +132,6 @@ pub async fn build_nodes(n: usize, seed: u64, captured: Captured) -> anyhow::Res
     let durable_engine = Arc::new(SledStorageEngine::new_test()?);
     crate::catalog_forge::plant(&*durable_engine, super::model::forged_catalog_rows()).await?;
     let durable = Node::builder(durable_engine, PermissiveAgent::new()).durable().key(sim_node_key(seed, 0)).build();
-    durable.system.create().await?;
     durable.wait_ready().await?;
     nodes.push(SimNode { index: 0, durable: true, node: durable, captured: captured.clone() });
 
@@ -164,9 +158,8 @@ fn sim_node_key(seed: u64, index: usize) -> NodeKey {
     NodeKey::from_seed(hasher.finalize().into())
 }
 
-/// Seed and bind the deterministic `SimRecord` catalog on one node. The
-/// node's system must be READY (the seeded binding resolves under its
-/// catalog epoch).
+/// Seed and bind the deterministic `SimRecord` catalog on one node that has
+/// not halted (the seeded binding resolves under its catalog epoch).
 pub fn seed_sim_schema(node: &SimNode) -> anyhow::Result<()> {
     ankurah::core::test_helpers::seed_registered_schema(&node.node, SimRecord::descriptor(), &sim_model_definition())?;
     Ok(())

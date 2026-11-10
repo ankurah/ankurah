@@ -445,7 +445,6 @@ where
         *outgoing_rx = Some(rx);
         *peer_sender = Some(sender);
 
-        // Advertise our system only after admission, so an old cached root cannot preempt adoption.
         let presence = proto::Message::Presence(inner.node.presence().await.map_err(PeerConnectionError::from)?);
         sink.send(Message::Binary(bincode::serialize(&presence)?.into())).await?;
 

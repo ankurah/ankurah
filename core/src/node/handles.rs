@@ -71,7 +71,6 @@ mod tests {
     #[tokio::test]
     async fn upgrade_borrows_strong_handles_and_retains_live_weak_handles() {
         let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
-        node.system.wait_loaded().await.unwrap();
         let weak = NodeHandle::Weak(node.weak());
         let strong = NodeHandle::Strong(node);
         let borrowed = strong.upgrade().unwrap();

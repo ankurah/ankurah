@@ -62,7 +62,6 @@ fn quote_identifier(identifier: &str) -> String { format!(r#""{}""#, identifier.
 
 fn system_label(model: SystemModel) -> &'static str {
     match model {
-        SystemModel::System => "_ankurah_system",
         SystemModel::Model => "_ankurah_model",
         SystemModel::Property => "_ankurah_property",
         SystemModel::ModelProperty => "_ankurah_model_property",
@@ -72,7 +71,7 @@ fn system_label(model: SystemModel) -> &'static str {
 /// Built-in materialization names are reserved even before their rows are
 /// inserted, so assignment order cannot let an ordinary model steal one.
 fn reserved_system_table_names() -> Vec<String> {
-    [SystemModel::System, SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty]
+    [SystemModel::Model, SystemModel::Property, SystemModel::ModelProperty]
         .into_iter()
         .map(|model| naming::sanitize(system_label(model)))
         .collect()

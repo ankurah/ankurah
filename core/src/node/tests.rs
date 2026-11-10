@@ -8,6 +8,7 @@ use ankurah_signals::Subscribe;
 
 mod commit;
 mod identity;
+mod reset;
 
 #[derive(Clone)]
 struct ClosedSender(proto::NodeId);
@@ -30,7 +31,7 @@ impl PeerSender for RecordingSender {
 }
 
 fn presence(id: proto::NodeId) -> proto::Presence {
-    proto::Presence { node_id: id, durable: false, system_root: None, protocol_version: proto::PROTOCOL_VERSION }
+    proto::Presence { node_id: id, durable: false, protocol_version: proto::PROTOCOL_VERSION }
 }
 
 #[tokio::test]
@@ -39,12 +40,9 @@ async fn presence_does_not_require_an_adopted_system_but_rejects_a_halted_node()
     let presence = tokio::time::timeout(std::time::Duration::from_secs(2), node.presence()).await.unwrap().unwrap();
     assert_eq!(presence.node_id, node.id);
     assert!(!presence.durable);
-    assert!(presence.system_root.is_none());
     assert_eq!(presence.protocol_version, proto::PROTOCOL_VERSION);
-    assert!(!node.system.is_system_ready());
-    assert_eq!(node.state().value(), NodeState::Uninitialized);
 
-    let halt_reason = node.system.halt(NodeHaltReason::SystemLoad("test failure".into()));
+    let halt_reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("test failure".into()));
     assert_eq!(node.state().value(), NodeState::Halted(halt_reason.clone()));
     assert_eq!(node.presence().await.unwrap_err(), halt_reason);
 }
@@ -60,23 +58,22 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
         let state = node.state();
         let run = node.run.clone();
         assert!(run.get());
-        assert_eq!(state.value(), NodeState::Uninitialized);
+        assert_eq!(state.value(), NodeState::Startup);
         assert_eq!(node.check_ready(), Err(NodeReadinessError::NotReady));
         let mut ready = Box::pin(node.wait_ready());
         assert!(futures::poll!(&mut ready).is_pending());
         let (changes, observed) = std::sync::mpsc::channel();
         let _subscription = state.subscribe(changes);
-        node.system.create().await.unwrap();
         entered_rx.await.unwrap();
         assert_eq!(state.value(), NodeState::Startup);
         assert!(run.get());
         assert_eq!(node.check_ready(), Err(NodeReadinessError::NotReady));
         assert!(futures::poll!(&mut ready).is_pending());
-        assert_eq!(observed.try_recv().unwrap(), NodeState::Startup);
+        assert!(observed.try_recv().is_err(), "the node stays in startup while its catalog loads");
 
-        let reason = NodeHaltReason::SystemLoad("first reason".into());
+        let reason = NodeHaltReason::PolicyAgentStartFailed("first reason".into());
         if halt_during_startup {
-            node.system.halt(reason.clone());
+            node.lifecycle.halt(reason.clone());
             assert_eq!(ready.await, Err(NodeReadinessError::Halted(reason.clone())));
             release.send(()).unwrap();
         } else {
@@ -85,11 +82,11 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
             assert_eq!(node.check_ready(), Ok(()));
             assert!(run.get());
             assert_eq!(observed.try_recv().unwrap(), NodeState::Running);
-            node.system.halt(reason.clone());
+            node.lifecycle.halt(reason.clone());
         }
         assert_eq!(observed.try_recv().unwrap(), NodeState::Halted(reason.clone()));
-        assert_eq!(node.system.halt(NodeHaltReason::CatalogLoad("later reason".into())), reason);
-        node.system.mark_running();
+        assert_eq!(node.lifecycle.halt(NodeHaltReason::CatalogLoad("later reason".into())), reason);
+        node.lifecycle.mark_running();
         assert_eq!(node.check_ready(), Err(NodeReadinessError::Halted(reason.clone())));
         assert_eq!(node.wait_ready().await, Err(NodeReadinessError::Halted(reason.clone())));
         assert_eq!(state.value(), NodeState::Halted(reason));
@@ -97,12 +94,49 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
     }
 }
 
+/// An ephemeral node's catalog is ready only once a durable peer answers, but what it stores is
+/// readable before that.
 #[tokio::test]
-async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
+async fn the_catalog_holds_the_stored_definitions_before_a_durable_peer_answers() {
+    let storage = Arc::new(TestStorage::default());
+    {
+        let durable = Node::new_durable(storage.clone(), PermissiveAgent::new());
+        durable.wait_ready().await.unwrap();
+        let transaction = durable.privileged_context().begin();
+        transaction.create(&crate::schema::catalog::SysModelRow { label: "stored".into(), name: "Stored".into() }).await.unwrap();
+        transaction.commit().await.unwrap();
+    }
+    let hold = |storage: &TestStorage| {
+        let (entered, entered_rx) = oneshot::channel();
+        let (release, release_rx) = oneshot::channel();
+        storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
+        (entered_rx, release)
+    };
+
+    let (entered, release) = hold(&storage);
+    let node = Node::new(storage.clone(), PermissiveAgent::new());
+    let loaded = node.wait_catalog_loaded();
+    tokio::pin!(loaded);
+    entered.await.unwrap();
+    assert!(futures::poll!(&mut loaded).is_pending(), "the stored definitions are still being read");
+    release.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), loaded).await.unwrap().unwrap();
+    assert!(node.catalog.model_by_label("stored").unwrap().is_some());
+    assert_eq!(node.state().value(), NodeState::Startup, "no durable peer has answered");
+
+    let (entered, _release) = hold(&storage);
+    let halting = Node::new(storage, PermissiveAgent::new());
+    entered.await.unwrap();
+    let reason = halting.lifecycle.halt(NodeHaltReason::CatalogLoad("test failure".into()));
+    let halted = tokio::time::timeout(std::time::Duration::from_secs(2), halting.wait_catalog_loaded()).await;
+    assert_eq!(halted, Ok(Err(reason)), "a node halted while its catalog loads stops the wait");
+}
+
+#[tokio::test]
+async fn dropping_a_starting_node_cancels_its_readiness_wait() {
     let storage = Arc::new(TestStorage::default());
     let weak_storage = Arc::downgrade(&storage);
     let node = Node::new(storage, PermissiveAgent::new());
-    node.system.wait_loaded().await.unwrap();
     let weak = node.weak();
     let run = node.run.clone();
     drop(node);
@@ -117,27 +151,22 @@ async fn dropping_an_uninitialized_node_cancels_its_readiness_wait() {
     .unwrap();
 }
 
+/// A node answers a peer's challenge while its catalog is still loading: startup gates no connection.
 #[tokio::test]
-async fn presence_waits_for_the_persisted_system_root() {
+async fn presence_does_not_wait_for_startup() {
     let storage = Arc::new(TestStorage::default());
-    let seed = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    seed.system.create().await.unwrap();
-    let root = seed.system.root().unwrap();
-    drop(seed);
-
     let (entered, entered_rx) = oneshot::channel();
-    let (release, release_rx) = oneshot::channel();
-    storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::System), (entered, release_rx));
+    let (_release, release_rx) = oneshot::channel();
+    storage.hold_fetch.lock().unwrap().insert(ModelId::System(proto::SystemModel::Model), (entered, release_rx));
     let node = Node::new_durable(storage, PermissiveAgent::new());
     entered_rx.await.unwrap();
+    assert_eq!(node.state().value(), NodeState::Startup);
     let presence = node.presence();
     tokio::pin!(presence);
-    assert!(futures::poll!(&mut presence).is_pending());
-    release.send(()).unwrap();
-    let presence = tokio::time::timeout(std::time::Duration::from_secs(2), presence).await.unwrap().unwrap();
+    let std::task::Poll::Ready(presence) = futures::poll!(&mut presence) else { panic!("presence waited for startup") };
+    let presence = presence.unwrap();
     assert_eq!(presence.node_id, node.id);
     assert!(presence.durable);
-    assert_eq!(presence.system_root, Some(root));
 }
 
 #[tokio::test]
@@ -158,7 +187,6 @@ async fn disconnect_releases_pending_requests() {
 async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await.unwrap();
     node.wait_ready().await.unwrap();
     let transaction = node.privileged_context().begin();
     let id = transaction.create(&crate::schema::catalog::SysModelRow { label: "test".into(), name: "Test".into() }).await.unwrap().id();
@@ -176,7 +204,7 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     assert!(futures::poll!(&mut read).is_pending());
     entered_rx.await.unwrap();
 
-    let reason = node.system.halt(NodeHaltReason::SystemLoad("fixture".into()));
+    let reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
     release.send(()).unwrap();
     assert_eq!(read.await.unwrap().iter().map(Entity::id).collect::<Vec<_>>(), vec![id]);
     assert!(matches!(node.fetch_entities_from_local(&selection).await, Err(RetrievalError::NodeHalted(error)) if error == reason));
@@ -187,18 +215,40 @@ async fn an_inflight_read_can_finish_after_halt_but_new_work_is_rejected() {
     assert!(node.handle_message(proto::NodeMessage::UnsubscribeQuery { from: peer, query_id: proto::QueryId::new() }).await.is_err());
 }
 
+/// Each read that asks a durable peer reports a halt as the halt, as local reads do.
+#[tokio::test]
+async fn a_halted_node_asked_to_read_from_a_peer_reports_its_halt() {
+    let node = Node::new(Arc::new(TestStorage::default()), PermissiveAgent::new());
+    let key = NodeKey::generate();
+    let (sent, _) = std::sync::mpsc::channel();
+    let presence = proto::Presence { node_id: key.node_id(), durable: true, protocol_version: proto::PROTOCOL_VERSION };
+    node.register_peer(presence, Box::new(RecordingSender(key.node_id(), sent))).await.unwrap();
+    let reason = node.lifecycle.halt(NodeHaltReason::CatalogLoad("fixture".into()));
+    let cdata = vec![DEFAULT_CONTEXT];
+    let selection = ankql::ast::Selection::<Resolved> {
+        predicate: ankql::ast::Predicate::MemberOf(ModelId::System(proto::SystemModel::Model)),
+        order_by: None,
+        limit: None,
+    };
+    assert!(
+        matches!(durable_peer::get_from_peer(&node, vec![proto::EntityId::random()], &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
+    );
+    assert!(
+        matches!(durable_peer::fetch_from_peer(&node, selection, &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
+    );
+}
+
 #[tokio::test]
 async fn remote_creations_are_not_registered_or_published_before_storage_succeeds() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let a = ModelId::EntityId(proto::EntityId::random());
     let b = ModelId::EntityId(proto::EntityId::random());
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
-    let genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(a));
+    let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(a));
     let update = proto::Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), proto::AuthorId::Unknown, membership(b));
-    let other_genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(b));
+    let other_genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(b));
     let other_update =
         proto::Event::update(other_genesis.entity_id, proto::Clock::singleton(&other_genesis), proto::AuthorId::Unknown, membership(a));
 
@@ -243,11 +293,10 @@ async fn remote_creations_are_not_registered_or_published_before_storage_succeed
 async fn remote_commit_waits_for_the_winners_resident_publication() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new_durable(storage.clone(), PermissiveAgent::new());
-    node.system.create().await?;
     node.wait_ready().await?;
     let [a, b, c] = [1, 2, 3].map(|byte| ModelId::EntityId(proto::EntityId::from_bytes([byte; 32])));
     let membership = |model| proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model))]);
-    let genesis = proto::Event::genesis(node.system.root_id(), proto::AuthorId::Unknown, membership(a));
+    let genesis = proto::Event::genesis(None, proto::AuthorId::Unknown, membership(a));
     let id = genesis.entity_id;
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![Attested::opt(genesis.clone(), None)]).await?;
     let getter = LocalEventGetter::new(storage.clone(), true);

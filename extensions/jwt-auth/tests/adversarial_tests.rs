@@ -28,12 +28,10 @@ async fn test_server_rejects_wrongly_signed_token() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(server_keys.clone(), blog_config_path())?;
 
     let node1 = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node1.system.create().await?;
     agent.set_policy(&node1, &agent.config()).await?;
 
     let node2 = Node::new(Arc::new(SledStorageEngine::new_test()?), agent.clone());
     let _conn = LocalProcessConnection::new(&node1, &node2).await?;
-    node2.system.wait_system_ready().await.unwrap();
 
     let claims = JwtClaims {
         sub: "attacker-1".into(),
@@ -88,7 +86,6 @@ async fn test_server_rejects_garbage_auth_data() -> anyhow::Result<()> {
     let agent = JwtAgent::new_durable(keys.clone(), blog_config_path())?;
 
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent.clone());
-    node.system.create().await?;
     agent.set_policy(&node, &agent.config()).await?;
 
     let garbage_auth = vec![ankurah_proto::AuthData(b"NOT_A_JWT_TOKEN".to_vec())];

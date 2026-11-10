@@ -13,7 +13,7 @@ use futures::future::BoxFuture;
 /// ctx.query::<AlbumView>("bogus = 1")     unknown field                   =>  Err(..) immediately
 /// ```
 ///
-/// A `Pending` future waits for the system and catalog, registers the model if the catalog lacks it,
+/// A `Pending` future waits for the catalog, registers the model if the catalog lacks it,
 /// then resolves. The livequery installs its result unless a newer selection has replaced it.
 pub(crate) enum QueryResolution {
     /// Ready to subscribe immediately.

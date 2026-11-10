@@ -233,7 +233,6 @@ impl Connection {
                                     connection.disconnect();
                                     return;
                                 }
-                                // Advertise our root only after accepting the server's system.
                                 if let Err(error) = connection.send_message(proto::Message::Presence(presence)) {
                                     connection.disconnect();
                                     connection.set_state(ConnectionState::Error {

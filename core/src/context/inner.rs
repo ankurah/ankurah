@@ -58,10 +58,6 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Return the node's identity, even if its weak handle can no longer upgrade.
     fn node_id(&self) -> proto::NodeId { self.node.node_id() }
 
-    /// This node's system root entity id, which every non-root genesis binds
-    /// into its own id. `None` before the node has created or adopted a system.
-    fn system_id(&self) -> Option<proto::EntityId> { self.node.upgrade().ok().and_then(|node| node.system.root_id()) }
-
     /// Check whether this context may write the entity.
     fn check_write(&self, entity: &Entity) -> Result<(), AccessDenied> {
         let node = self.node.upgrade()?;
@@ -71,7 +67,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Retrieve an entity and enforce this context's read policy.
     async fn get_entity(&self, id: proto::EntityId, cached: bool) -> Result<Entity, RetrievalError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
+        node.lifecycle.check_not_halted()?;
         debug!("Node({}).get_entity {:?}", node.id, id);
         let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
         let cdata = policy.credentials();
@@ -115,7 +111,7 @@ impl<SE: StorageEngine + Send + Sync + 'static, PA: PolicyAgent + Send + Sync + 
     /// Shared by `Context::fetch` and livequery gap filling.
     async fn fetch_entities(&self, mut args: MatchArgs<Resolved>) -> Result<Vec<Entity>, RetrievalError> {
         let node = self.node.upgrade()?;
-        node.system.check_not_halted()?;
+        node.lifecycle.check_not_halted()?;
         let policy = ContextPolicy::new(&node.policy_agent, self.auth.clone());
         let cdata = policy.credentials();
         args.selection.predicate = policy.filter_predicate(args.selection.predicate)?;

@@ -28,7 +28,6 @@ pub struct Message {
 async fn test_json_path_livequery_initial_results() -> Result<()> {
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     // Create messages with different task_id contexts
@@ -65,7 +64,6 @@ async fn test_json_path_livequery_initial_results() -> Result<()> {
 async fn test_json_path_livequery_with_new_entity() -> Result<()> {
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     let task_id = "task-xyz";
@@ -102,7 +100,6 @@ async fn test_json_path_livequery_with_new_entity() -> Result<()> {
 async fn test_json_path_livequery_with_nested_path() -> Result<()> {
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     // Create message with nested JSON context
@@ -138,7 +135,6 @@ async fn test_json_path_livequery_with_nested_path() -> Result<()> {
 async fn test_json_path_predicate_reevaluation() -> Result<()> {
     let storage = SledStorageEngine::new_test()?;
     let node = Node::new_durable(Arc::new(storage), PermissiveAgent::new());
-    node.system.create().await?;
     let ctx = node.context_async(c).await?;
 
     let task_id = "reevaluation-test";

@@ -107,7 +107,6 @@ async fn get_enforces_the_same_write_policy_as_edit() -> Result<()> {
         move || if allow_write.load(Ordering::SeqCst) { Ok(()) } else { Err(AccessDenied::ByPolicy("read-only test context")) }
     }));
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
-    node.system.create().await?;
     let context = node.context_async(DEFAULT_CONTEXT).await?;
     let id = seed_album(&context).await?;
     allow_write.store(false, Ordering::SeqCst);
@@ -144,7 +143,6 @@ async fn concurrent_get_and_edit_share_one_snapshot() -> Result<()> {
             }
         }));
         let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), agent);
-        node.system.create().await?;
         let context = node.context_async(DEFAULT_CONTEXT).await?;
         let id = seed_album(&context).await?;
         let view = context.get::<AlbumView>(id).await?;

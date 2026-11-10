@@ -19,7 +19,7 @@ type TestNode = Node<SledStorageEngine, PermissiveAgent>;
 
 async fn durable_node() -> Result<TestNode> {
     let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    node.system.create().await?;
+    node.wait_ready().await?;
     Ok(node)
 }
 
@@ -149,7 +149,7 @@ async fn typed_creation_includes_its_model_membership() -> Result<()> {
 #[tokio::test]
 async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
     let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    server.system.create().await?;
+    server.wait_ready().await?;
     let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
 
     // Record every event the client relays to the server. The filter returns
@@ -168,7 +168,6 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
         })
         .await
     };
-    client.system.wait_system_ready().await.unwrap();
     let client_ctx = client.context_async(c).await.unwrap();
 
     let trx = client_ctx.begin();
@@ -187,41 +186,5 @@ async fn a_relayed_genesis_is_the_one_create_minted() -> Result<()> {
     let stored_genesis = entity_events(&server, id).await?.into_iter().find(|e| e.is_entity_create()).expect("the peer stored it");
     assert_eq!(stored_genesis.id(), relayed_genesis.id(), "the peer stored the relayed genesis rather than deriving its own");
     assert_eq!(stored_genesis.nonce(), relayed_genesis.nonce(), "same nonce: the mint happened once, at create()");
-    Ok(())
-}
-
-/// The system root is the one entity whose genesis binds no system above it,
-/// and every other entity's genesis binds the root. Without that binding the
-/// same content under a different system root would derive the same id.
-#[tokio::test]
-async fn the_root_binds_no_system_and_everything_else_binds_the_root() -> Result<()> {
-    let node = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
-    node.system.create().await?;
-    let root_id = node.system.root_id().expect("the system root exists after create");
-    let ctx = node.context_async(c).await.unwrap();
-
-    let trx = ctx.begin();
-    let id = trx.create(&Album { name: "Ascension".to_owned(), year: "1966".to_owned() }).await?.id();
-    trx.commit().await?;
-
-    let genesis = entity_events(&node, id).await?.into_iter().find(|e| e.is_entity_create()).expect("genesis");
-    match &genesis.body {
-        proto::EventBody::Genesis { system, .. } => assert_eq!(system, &Some(root_id), "a non-root genesis binds the system root"),
-        proto::EventBody::Update { .. } => panic!("is_entity_create disagreed with the body"),
-    }
-
-    let root_genesis = node
-        .storage
-        .dump_entity_events(root_id)
-        .await?
-        .into_iter()
-        .map(|e| e.payload)
-        .find(|e| e.is_entity_create())
-        .expect("the root has a committed genesis");
-    assert_eq!(proto::EntityId::from(root_genesis.id()), root_id, "the root's id derives from its own genesis");
-    match &root_genesis.body {
-        proto::EventBody::Genesis { system, .. } => assert_eq!(system, &None, "the root has no system above it"),
-        proto::EventBody::Update { .. } => panic!("the root's first event is not a genesis"),
-    }
     Ok(())
 }
