@@ -308,11 +308,12 @@ operation carried as `Erased` with its digest.
 | erased membership | `9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a` | `c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8` |
 
 State digest of the entity `[0x55; 32]` whose state buffers map `"lww"` to
-`010203`, whose memberships are `{ System(Model) }`, and whose head has one
-entry, generation 1 and event id `[0x66; 32]`:
+`010203` and `"yrs"` to `0405`, whose memberships are `{ EntityId([0x77; 32]),
+System(Model) }`, and whose head has one entry, generation 1 and event id
+`[0x66; 32]`:
 
 ```text
-05e2003ec33f79b0e5b1aec10579c2c75fde70fd91971765028855fb8509221e
+ff38c3da54c1ee5405e4ef560f987e2eda6b611009a1875e3d136b0ab1fbf3da
 ```
 
 Presence signed bytes for node `Ed25519([0x99; 32])`, durable, answering the

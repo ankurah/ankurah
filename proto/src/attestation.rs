@@ -400,17 +400,19 @@ mod tests {
         assert_eq!(encode(&Subject::state(&state(&genesis)))[..4], [1, 0, 0, 0], "Subject::State");
     }
 
-    /// The state digest vector of specs/protocol/bytes.md section 5.
+    /// The state digest vector of specs/protocol/bytes.md section 5. Two buffers and two
+    /// memberships, so the digest pins the order of each: buffer names by their bytes, and an
+    /// entity id model before a system model.
     #[test]
     fn the_state_digest_matches_the_byte_specification_vector() {
         let state = EntityState {
             entity_id: EntityId::from_bytes([0x55; 32]),
             state: State {
-                state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), vec![1, 2, 3])])),
-                memberships: BTreeSet::from([ModelId::System(SystemModel::Model)]),
+                state_buffers: StateBuffers(BTreeMap::from([("lww".to_owned(), vec![1, 2, 3]), ("yrs".to_owned(), vec![4, 5])])),
+                memberships: BTreeSet::from([ModelId::System(SystemModel::Model), ModelId::EntityId(EntityId::from_bytes([0x77; 32]))]),
                 head: Clock::new(vec![(1, EventId::from_bytes([0x66; 32]))]).unwrap(),
             },
         };
-        assert_eq!(hex::encode(state_digest(&state)), "05e2003ec33f79b0e5b1aec10579c2c75fde70fd91971765028855fb8509221e");
+        assert_eq!(hex::encode(state_digest(&state)), "ff38c3da54c1ee5405e4ef560f987e2eda6b611009a1875e3d136b0ab1fbf3da");
     }
 }
