@@ -7,7 +7,7 @@ use ankurah_proto::{Attested, EntityId, EntityState, Event};
 use crate::context::{ContextAuth, DynContextInner};
 use crate::entity::{LocalTrxEntity, RemoteTrxEntity};
 use crate::model::{Model, MutableBorrow};
-use crate::node::{durable_peer, event_admissibility::check_genesis_membership};
+use crate::node::{durable_peer, event_admissibility::AdmittedOperations};
 use crate::policy::ContextPolicy;
 use crate::reactor::ChangeNotification;
 use crate::retrieval::{LocalEventGetter, LocalStateGetter};
@@ -60,11 +60,11 @@ impl Transaction {
         &self.entities[index]
     }
 
-    /// Mint an entity after registering its model in the current catalog epoch.
+    /// Mint an entity under this node's identity after registering its model in the current catalog epoch.
     pub async fn create<'rec, 'trx: 'rec, M: Model>(&'trx self, model: &M) -> Result<MutableBorrow<'rec, M::Mutable>, MutationError> {
         let (model_id, epoch) = self.dyncontext.schema_resolver().ensure_registered(M::descriptor()).await?;
 
-        let entity = LocalTrxEntity::new(None, proto::AuthorId::Unknown, epoch, self.alive.clone());
+        let entity = LocalTrxEntity::new(self.dyncontext.node_id().identity(), epoch, self.alive.clone());
         model.initialize_new_entity(&entity, model_id, epoch)?;
         self.dyncontext.check_write(&entity.read())?;
 
@@ -86,7 +86,7 @@ impl Transaction {
             let _guard = self.snapshot_creation_lock.lock().unwrap();
             match self.get_trx_entity(id) {
                 Some(entity) => entity,
-                None => self.add_entity(LocalTrxEntity::edit(&source, proto::AuthorId::Unknown, self.alive.clone())?),
+                None => self.add_entity(LocalTrxEntity::edit(&source, self.alive.clone())?),
             }
         };
         MutableBorrow::new(entity)
@@ -105,7 +105,7 @@ impl Transaction {
             let _guard = self.snapshot_creation_lock.lock().unwrap();
             match self.get_trx_entity(&resident.id()) {
                 Some(entity) => entity,
-                None => self.add_entity(LocalTrxEntity::edit(&resident, proto::AuthorId::Unknown, self.alive.clone())?),
+                None => self.add_entity(LocalTrxEntity::edit(&resident, self.alive.clone())?),
             }
         };
         MutableBorrow::new(entity)
@@ -178,6 +178,7 @@ impl Transaction {
         let policy = ContextPolicy::new(&node.policy_agent, auth.clone());
 
         let mut entity_events = Vec::new();
+        let mut admitted = AdmittedOperations::new();
         // Prepare once, outside the retry loop: every attempt re-applies and relays these exact events.
         for entity in self.entities.iter() {
             if entity.catalog_epoch() != epoch {
@@ -186,7 +187,7 @@ impl Transaction {
             let events = entity.prepare_events()?;
             for event in &events {
                 event.payload.validate_structure()?;
-                check_genesis_membership(&event.payload)?;
+                admitted.admit(&event.payload)?;
             }
             if !events.is_empty() {
                 entity_events.push((entity, events));
@@ -212,7 +213,9 @@ impl Transaction {
                 let expected_head = entity_after.head();
                 let mut events = events.clone();
                 entity_after
-                    .apply_events(&event_getter, &mut events, |event| policy.check_write_event(node, &entity_before, &after, event))
+                    .apply_events(&event_getter, &mut events, &admitted, |event| {
+                        policy.check_write_event(node, &entity_before, &after, event)
+                    })
                     .await?;
                 storage_trx.add_events(&events).await?;
                 let state = EntityState { entity_id: entity.id(), state: entity_after.to_state()? };

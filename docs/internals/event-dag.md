@@ -37,6 +37,14 @@ entity's head when the event was created) and a set of backend-specific
 operations. An event with an empty parent clock is a **creation event**
 (genesis).
 
+An event carries each operation as the exact bytes its author produced, and
+its id covers each operation's digest rather than the bytes, so a node that
+cannot read an operation still derives the event's id. A node refuses an
+event holding an operation it cannot read, of a kind its build does not know
+or one whose bytes were erased, for that entity, and never stores such an
+event unapplied. Storage engines and relays keep the bytes as they were
+carried.
+
 **Clock** -- A frontier of `(generation, event_id)` pairs, ordered by event id.
 An entity's **head** usually names one event in linear history and
 several tips when concurrent branches coexist. Event parents, state heads,

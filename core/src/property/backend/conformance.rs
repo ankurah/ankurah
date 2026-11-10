@@ -160,14 +160,15 @@ fn fixture_body(
     parent: &Clock,
     operations: OperationSet,
 ) -> (EntityId, ankurah_proto::EventBody) {
+    let operations = ankurah_proto::CarriedOperations::encode(&operations);
     let mut nonce = [0u8; 32];
     nonce[..nonce_seed.len()].copy_from_slice(nonce_seed);
-    let author = ankurah_proto::AuthorId::Unknown;
     if parent.is_empty() {
-        let entity_id = EntityId::from(ankurah_proto::EventId::from_genesis_parts(&None, &nonce, 0, &author, &operations));
-        (entity_id, ankurah_proto::EventBody::Genesis { system: None, nonce, timestamp: 0, author, operations })
+        let minter = ankurah_proto::Identity::Ed25519([0; 32]);
+        let entity_id = EntityId::from(ankurah_proto::EventId::from_genesis_parts(&minter, &nonce, 0, &operations));
+        (entity_id, ankurah_proto::EventBody::Genesis { minter, nonce, timestamp: 0, operations })
     } else {
-        (seeded_entity_id, ankurah_proto::EventBody::Update { nonce, timestamp: 0, author, operations })
+        (seeded_entity_id, ankurah_proto::EventBody::Update { nonce, timestamp: 0, operations })
     }
 }
 
@@ -322,7 +323,7 @@ pub(crate) fn law_within_layer_permutation_invariance<B: ConformanceBackend>() {
     for perm in &permutations {
         let backend = B::new_backend();
         // Seed the root as committed state (the meet the layer branches from).
-        if root.operations().backend_operations(B::backend_name()).next().is_some() {
+        if root.operations().decode().unwrap().backend_operations(B::backend_name()).next().is_some() {
             crate::test_helpers::apply_backend_event(&*backend, &root).expect("apply root");
         }
 
@@ -409,7 +410,7 @@ pub(crate) fn law_cross_order_determinism<B: ConformanceBackend>() {
 /// Apply the backend-relevant operations of `root` as committed state, so the
 /// root is the meet the subsequent layers branch from.
 fn apply_committed_root<B: ConformanceBackend>(backend: &Arc<dyn PropertyBackend>, root: &Event) {
-    if root.operations().backend_operations(B::backend_name()).next().is_some() {
+    if root.operations().decode().unwrap().backend_operations(B::backend_name()).next().is_some() {
         crate::test_helpers::apply_backend_event(&**backend, root).expect("apply committed root");
     }
 }
@@ -582,7 +583,7 @@ mod lww_conformance {
 
         // Apply earlier as committed state, then the later event via a layer.
         let backend: Arc<dyn PropertyBackend> = Arc::new(LWWBackend::new());
-        let ops: Vec<_> = earlier.operations().backend_operations(LwwAdopter::backend_name()).cloned().collect();
+        let ops: Vec<_> = earlier.operations().decode().unwrap().backend_operations(LwwAdopter::backend_name()).cloned().collect();
         if !ops.is_empty() {
             crate::test_helpers::apply_backend_event(&*backend, &earlier).unwrap();
         }

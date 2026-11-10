@@ -41,12 +41,7 @@ fn forge_title_event(f: &Fixture, entity_id: proto::EntityId, parent: proto::Clo
     let backend = LWWBackend::new();
     backend.set(common::resolved_prop(&f.server, Record::descriptor(), "title"), Some(Value::String(title.to_owned())));
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
-    proto::Event::update(
-        entity_id,
-        parent,
-        proto::AuthorId::Unknown,
-        proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-    )
+    proto::Event::update(entity_id, parent, proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])))
 }
 
 /// Forge a genesis that CLAIMS `entity_id` rather than the entity its own
@@ -58,7 +53,7 @@ fn forge_genesis_claiming(f: &Fixture, entity_id: proto::EntityId, title: &str) 
     let ops = backend.to_operations().unwrap().expect("LWW backend with a write produces operations");
     let mut operations = proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)]));
     operations.push(proto::Operation::Membership(proto::Membership::Add(f.model)));
-    let mut event = proto::Event::genesis(None, proto::AuthorId::Unknown, operations);
+    let mut event = proto::Event::genesis(proto::Identity::Ed25519([1; 32]), operations);
     event.entity_id = entity_id;
     event
 }
@@ -141,29 +136,31 @@ async fn committed_event_ids(node: &Node<SledStorageEngine, PermissiveAgent>, id
 // Malformed clocks (C4-03)
 // ===========================================================================
 
-/// Wire clocks normalize complete annotations before hashing or head maintenance.
+/// A wire clock whose entries are out of order or repeated is refused, since an update's id
+/// covers its parent clock; one in ascending order decodes to a clock that maintains heads.
 #[test]
-fn malformed_clock_deserialization_normalizes() {
+fn malformed_clock_deserialization_is_refused() {
     let id = |b: u8| proto::EventId::from_bytes([b; 32]);
     let raw = vec![(1u32, id(4)), (4, id(1)), (1, id(4)), (2, id(2)), (4, id(1))];
-    let bytes = bincode::serialize(&raw).unwrap();
-    let mut clock: proto::Clock = bincode::deserialize(&bytes).unwrap();
-    assert_eq!(clock.entries(), &[(4, id(1)), (2, id(2)), (1, id(4))]);
+    assert!(bincode::deserialize::<proto::Clock>(&bincode::serialize(&raw).unwrap()).is_err());
+    let ascending = vec![(4u32, id(1)), (2, id(2)), (1, id(4))];
+    let mut clock: proto::Clock = bincode::deserialize(&bincode::serialize(&ascending).unwrap()).unwrap();
+    assert_eq!(clock.entries(), &ascending[..]);
     assert!(clock.contains(&id(1)) && clock.contains(&id(4)));
     assert!(!clock.contains(&id(3)));
     assert!(clock.remove(&id(2)));
     assert_eq!(clock.entries(), &[(4, id(1)), (1, id(4))]);
 }
 
-/// Public construction and decoding normalize complete annotations before they are hashed.
+/// Public construction normalizes complete annotations before they are hashed, and decoding
+/// refuses annotations that are not normalized.
 #[test]
 fn no_public_non_normalizing_clock_constructor() {
     let id = |b: u8| proto::EventId::from_bytes([b; 32]);
     let unsorted = vec![(1u32, id(3)), (3, id(1)), (2, id(2)), (3, id(1))];
     let expected = [(3, id(1)), (2, id(2)), (1, id(3))];
     assert_eq!(proto::Clock::new(unsorted.clone()).unwrap().entries(), &expected);
-    let decoded: proto::Clock = bincode::deserialize(&bincode::serialize(&unsorted).unwrap()).unwrap();
-    assert_eq!(decoded.entries(), &expected);
+    assert!(bincode::deserialize::<proto::Clock>(&bincode::serialize(&unsorted).unwrap()).is_err());
 }
 
 /// C4-03 end to end: because every clock is normalized before it is hashed, a
@@ -187,12 +184,7 @@ async fn malformed_clock_identity_is_order_independent_end_to_end() -> Result<()
         let backend = LWWBackend::new();
         backend.set(common::resolved_prop(&f.server, Record::descriptor(), "artist"), Some(Value::String("c-artist".to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event::update(
-            rec_id,
-            head0.clone(),
-            proto::AuthorId::Unknown,
-            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-        )
+        proto::Event::update(rec_id, head0.clone(), proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])))
     };
     f.client.handle_message(deliver(f.server.id, f.client.id, vec![event_only_multi(rec_id, vec![ev_b.clone(), ev_c.clone()])])).await?;
 
@@ -280,7 +272,7 @@ async fn forged_extra_genesis_head_does_not_trigger_wholesale_adoption() -> Resu
         operations.push(proto::Operation::Membership(proto::Membership::Add(f.model)));
         // A genesis claiming an existing entity's id: structurally invalid
         // now that a genesis names whatever entity its own content derives.
-        let mut event = proto::Event::genesis(None, proto::AuthorId::Unknown, operations);
+        let mut event = proto::Event::genesis(proto::Identity::Ed25519([1; 32]), operations);
         event.entity_id = rec_id;
         event
     };
@@ -331,12 +323,7 @@ fn declared_cycle_is_unconstructible_content_addressing() {
         let backend = LWWBackend::new();
         backend.set(title_prop, Some(Value::String(title.to_owned())));
         let ops = backend.to_operations().unwrap().expect("ops");
-        proto::Event::update(
-            entity,
-            parent,
-            proto::AuthorId::Unknown,
-            proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])),
-        )
+        proto::Event::update(entity, parent, proto::OperationSet::from_backends(BTreeMap::from([("lww".to_owned(), ops)])))
     };
 
     // Start from two independent events and try to wire A.parent := [B.id()]

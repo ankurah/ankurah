@@ -2,7 +2,7 @@ use base64::engine::general_purpose;
 use base64::write::EncoderWriter;
 use postgres_types::{to_sql_checked, FromSql, IsNull, ToSql, Type};
 
-use crate::{Clock, DecodeError, EventBody, EventId};
+use crate::{encoding, Clock, DecodeError, EventBody, EventId};
 use bytes::{BufMut, BytesMut};
 use std::error::Error;
 use std::io::Write;
@@ -44,7 +44,7 @@ impl<'a> FromSql<'a> for EventId {
 
 impl ToSql for Clock {
     fn to_sql(&self, _: &Type, out: &mut BytesMut) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
-        out.put_slice(&bincode::serialize(self)?);
+        out.put_slice(&encoding::encode(self));
         Ok(IsNull::No)
     }
 
@@ -53,7 +53,7 @@ impl ToSql for Clock {
 }
 
 impl<'a> FromSql<'a> for Clock {
-    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> { Ok(bincode::deserialize(raw)?) }
+    fn from_sql(_: &Type, raw: &'a [u8]) -> Result<Self, Box<dyn Error + Sync + Send>> { Ok(encoding::decode_exact(raw)?) }
     fn accepts(ty: &Type) -> bool { *ty == Type::BYTEA }
 }
 
@@ -64,7 +64,7 @@ impl ToSql for EventBody {
         if ty.name() != "bytea" {
             return Err("expected bytea type".into());
         }
-        out.put_slice(&bincode::serialize(self).map_err(|_| DecodeError::InvalidFormat)?);
+        out.put_slice(&self.encode());
         Ok(IsNull::No)
     }
 
@@ -84,8 +84,7 @@ impl<'a> FromSql<'a> for EventBody {
         if ty.name() != "bytea" {
             return Err("expected bytea type".into());
         }
-        let body: EventBody = bincode::deserialize(raw).map_err(|_| DecodeError::InvalidFormat)?;
-        Ok(body)
+        Ok(EventBody::decode(raw).map_err(|_| DecodeError::InvalidFormat)?)
     }
 
     fn accepts(ty: &Type) -> bool {

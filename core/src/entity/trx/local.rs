@@ -10,7 +10,7 @@ use crate::{
     property::{backend::PropertyBackend, PropertyError},
     schema::CatalogEpoch,
 };
-use ankurah_proto::{Attested, AuthorId, Clock, EntityId, Event, Membership, ModelId, Operation, OperationSet, State};
+use ankurah_proto::{Attested, Clock, EntityId, Event, Identity, Membership, ModelId, Operation, OperationSet, State};
 use std::{
     collections::BTreeSet,
     sync::{
@@ -26,7 +26,6 @@ pub struct LocalTrxEntity(Arc<LocalTrxEntityInner>);
 #[derive(Debug)]
 pub(in crate::entity) struct LocalTrxEntityInner {
     origin: Origin,
-    author: AuthorId,
     data: TrxEntityData,
     /// Cleared when the transaction commits or rolls back; local writes check it.
     alive: Arc<AtomicBool>,
@@ -39,7 +38,8 @@ enum Origin {
     Pending {
         /// First id demand or commit preparation freezes the genesis that determines identity.
         genesis: OnceLock<Event>,
-        system: Option<EntityId>,
+        /// The identity the genesis is minted under.
+        minter: Identity,
     },
     Mut {
         upstream: Arc<EntityInner>,
@@ -47,26 +47,19 @@ enum Origin {
 }
 
 impl LocalTrxEntity {
-    pub(crate) fn new(system: Option<EntityId>, author: AuthorId, epoch: CatalogEpoch, alive: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(minter: Identity, epoch: CatalogEpoch, alive: Arc<AtomicBool>) -> Self {
         Self(Arc::new(LocalTrxEntityInner {
-            origin: Origin::Pending { genesis: OnceLock::new(), system },
-            author,
+            origin: Origin::Pending { genesis: OnceLock::new(), minter },
             data: TrxEntityData::new(EntityState::empty(), epoch),
             alive,
             staged_memberships: Mutex::default(),
         }))
     }
 
-    pub(crate) fn edit(entity: &Entity, author: AuthorId, alive: Arc<AtomicBool>) -> Result<Self, PropertyError> {
+    pub(crate) fn edit(entity: &Entity, alive: Arc<AtomicBool>) -> Result<Self, PropertyError> {
         let upstream = entity.resident()?;
         let data = TrxEntityData::new(upstream.state.fork(), upstream.catalog_epoch());
-        Ok(Self(Arc::new(LocalTrxEntityInner {
-            origin: Origin::Mut { upstream },
-            author,
-            data,
-            alive,
-            staged_memberships: Mutex::default(),
-        })))
+        Ok(Self(Arc::new(LocalTrxEntityInner { origin: Origin::Mut { upstream }, data, alive, staged_memberships: Mutex::default() })))
     }
 
     /// Freeze the genesis on first demand, including all mutations made so far.
@@ -125,7 +118,7 @@ impl LocalTrxEntity {
         if !creating {
             let operations = self.0.take_operations()?;
             if !operations.is_empty() {
-                let event = Event::update(id, data.state.head(), self.0.author.clone(), operations);
+                let event = Event::update(id, data.state.head(), operations);
                 data.state.set_head(Clock::singleton(&event));
                 events.push(event.into());
             }
@@ -152,11 +145,11 @@ impl LocalTrxEntityInner {
     pub(in crate::entity) fn id(&self) -> EntityId {
         match &self.origin {
             Origin::Mut { upstream } => upstream.id,
-            Origin::Pending { genesis, system } => {
+            Origin::Pending { genesis, minter } => {
                 genesis
                     .get_or_init(|| {
                         // Cannot fail: Yrs encoding has no error path, and LWW's bincode encoding of `Value`s cannot fail.
-                        let event = Event::genesis(*system, self.author.clone(), self.take_operations().unwrap());
+                        let event = Event::genesis(*minter, self.take_operations().unwrap());
                         self.data.state.set_head(Clock::singleton(&event));
                         self.data.events.lock().unwrap().push(event.clone().into());
                         event

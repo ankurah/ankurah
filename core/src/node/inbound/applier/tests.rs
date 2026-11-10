@@ -9,7 +9,7 @@ use crate::{
     value::Value,
 };
 use proto::{
-    AuthorId, Clock, EntityId, Event, EventId, EventStructureError, Membership, ModelId, NodeId, Operation, OperationSet, PropertyId, State,
+    Clock, EntityId, Event, EventId, EventStructureError, Identity, Membership, ModelId, NodeId, Operation, OperationSet, PropertyId, State,
 };
 use std::sync::{mpsc, Arc};
 
@@ -40,19 +40,21 @@ impl Fixture {
         let node = Node::new(storage.clone(), PermissiveAgent::new());
         let events = LocalEventGetter::new(storage.clone(), false);
         let genesis = Event::genesis(
-            Some(EntityId::from_bytes([4; 32])),
-            AuthorId::Unknown,
+            Identity::Ed25519([4; 32]),
             OperationSet(vec![Operation::Membership(Membership::Add(model_a())), value_operation("initial")?]),
         );
         events.stage_event(genesis.clone());
         let (entity, _) =
-            NodeApplier::apply_and_commit_events(&node, &[Attested::opt(genesis.clone(), None)], &events).await?.unwrap().into_parts();
+            NodeApplier::apply_and_commit_events(&node, &[Attested::opt(genesis.clone(), None)], &AdmittedOperations::new(), &events)
+                .await?
+                .unwrap()
+                .into_parts();
         Ok(Self { node, storage, events, genesis, entity })
     }
 
     async fn commit_event(&self, event: Event) -> anyhow::Result<()> {
         self.events.stage_event(event.clone());
-        NodeApplier::apply_and_commit_events(&self.node, &[Attested::opt(event, None)], &self.events).await?;
+        NodeApplier::apply_and_commit_events(&self.node, &[Attested::opt(event, None)], &AdmittedOperations::new(), &self.events).await?;
         Ok(())
     }
 
@@ -159,9 +161,9 @@ async fn first_snapshot_initializes_an_entity_without_its_events() -> anyhow::Re
 #[tokio::test]
 async fn adopted_snapshot_rejects_false_parent_generations_without_changing_the_resident() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let older = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), AuthorId::Unknown, OperationSet::default());
-    let sibling = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), AuthorId::Unknown, OperationSet::default());
-    let newer = Event::update(fixture.entity.id(), Clock::singleton(&sibling), AuthorId::Unknown, OperationSet::default());
+    let older = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), OperationSet::default());
+    let sibling = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), OperationSet::default());
+    let newer = Event::update(fixture.entity.id(), Clock::singleton(&sibling), OperationSet::default());
     fixture.commit_event(older.clone()).await?;
     fixture.commit_event(sibling).await?;
     fixture.commit_event(newer.clone()).await?;
@@ -172,7 +174,6 @@ async fn adopted_snapshot_rejects_false_parent_generations_without_changing_the_
         let forged = Event::update(
             fixture.entity.id(),
             Clock::new(vec![(claimed, older.id()), (newer.generation(), newer.id())])?,
-            AuthorId::Unknown,
             OperationSet::default(),
         );
         assert_eq!(forged.generation(), 4);
@@ -192,7 +193,7 @@ async fn adopted_snapshot_rejects_false_parent_generations_without_changing_the_
         assert!(fixture.storage.get_events(vec![forged.id()]).await?.is_empty());
     }
 
-    let honest = Event::update(fixture.entity.id(), before.head.clone(), AuthorId::Unknown, OperationSet::default());
+    let honest = Event::update(fixture.entity.id(), before.head.clone(), OperationSet::default());
     let mut snapshot = before;
     snapshot.head = Clock::singleton(&honest);
     fixture.apply_snapshot(SnapshotIngress::StateAndEvent, snapshot.clone(), honest.clone()).await?;
@@ -211,8 +212,7 @@ async fn first_snapshot_checks_cargo_against_local_or_carried_parents_but_allows
         if parent_source == "local" {
             cache(&storage, &[&source.genesis]).await?;
         }
-        let forged =
-            Event::update(source.entity.id(), Clock::new(vec![(2, source.genesis.id())])?, AuthorId::Unknown, OperationSet::default());
+        let forged = Event::update(source.entity.id(), Clock::new(vec![(2, source.genesis.id())])?, OperationSet::default());
         let mut snapshot = source.entity.to_state()?;
         snapshot.head = Clock::singleton(&forged);
         let mut cargo = vec![Attested::from(forged.clone()).into()];
@@ -251,9 +251,9 @@ async fn first_snapshot_checks_cargo_against_local_or_carried_parents_but_allows
 async fn snapshot_event_consistency_is_checked_before_persistence_and_publication() -> anyhow::Result<()> {
     let source = Fixture::new().await?;
     let initial = source.entity.to_state()?;
-    let first = Event::update(source.entity.id(), initial.head.clone(), AuthorId::Unknown, OperationSet::default());
-    let tip = Event::update(source.entity.id(), Clock::singleton(&first), AuthorId::Unknown, OperationSet(vec![value_operation("tip")?]));
-    let stray = Event::update(source.entity.id(), initial.head.clone(), AuthorId::Unknown, OperationSet(vec![value_operation("stray")?]));
+    let first = Event::update(source.entity.id(), initial.head.clone(), OperationSet::default());
+    let tip = Event::update(source.entity.id(), Clock::singleton(&first), OperationSet(vec![value_operation("tip")?]));
+    let stray = Event::update(source.entity.id(), initial.head.clone(), OperationSet(vec![value_operation("stray")?]));
     source.commit_event(first.clone()).await?;
     source.commit_event(tip.clone()).await?;
     let snapshot = source.entity.to_state()?;
@@ -335,15 +335,18 @@ async fn assert_failed_snapshot_keeps_resident(ingress: SnapshotIngress) -> anyh
     let incoming = Event::update(
         fixture.entity.id(),
         fixture.entity.head(),
-        AuthorId::Unknown,
         OperationSet(vec![value_operation("incoming")?, Operation::Membership(Membership::Add(model_b()))]),
     );
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), |_| Ok(None)).await?;
+    candidate
+        .apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), &AdmittedOperations::new(), |_| {
+            Ok(None)
+        })
+        .await?;
     let snapshot = candidate.to_state()?;
     if matches!(ingress, SnapshotIngress::DivergedStateAndEvent) {
-        let local = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
+        let local = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
         fixture.commit_event(local).await?;
     }
 
@@ -403,13 +406,12 @@ async fn divergent_state_and_event_commit_failure_keeps_retained_entity_and_list
 #[tokio::test]
 async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let first = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
-    let second = Event::update(fixture.entity.id(), Clock::singleton(&first), AuthorId::Unknown, OperationSet::default());
-    let last =
-        Event::update(fixture.entity.id(), Clock::singleton(&second), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let first = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
+    let second = Event::update(fixture.entity.id(), Clock::singleton(&first), OperationSet::default());
+    let last = Event::update(fixture.entity.id(), Clock::singleton(&second), OperationSet(vec![value_operation("incoming")?]));
     let mut events = vec![Attested::from(first), Attested::from(second), Attested::from(last.clone())];
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut events, |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut events, &AdmittedOperations::new(), |_| Ok(None)).await?;
     let update = proto::SubscriptionUpdateItem {
         entity_id: fixture.entity.id(),
         content: proto::UpdateContent::StateAndEvent(
@@ -428,12 +430,8 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
     entered_rx.await?;
 
     // Advance storage and the resident after adoption, but before its expected-head check at commit.
-    let local = Event::update(
-        fixture.entity.id(),
-        fixture.entity.head(),
-        AuthorId::Unknown,
-        OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]),
-    );
+    let local =
+        Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
     fixture.commit_event(local.clone()).await?;
     assert!(fixture.storage.get_events(events.iter().map(|event| event.payload.id()).collect()).await?.is_empty());
     let (notifications, observed) = mpsc::channel();
@@ -456,10 +454,9 @@ async fn snapshot_retry_merges_the_carried_chain_after_a_concurrent_commit() -> 
 #[tokio::test]
 async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_applied() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let incoming =
-        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], &AdmittedOperations::new(), |_| Ok(None)).await?;
     let snapshot = candidate.to_state()?;
     let update = proto::SubscriptionUpdateItem {
         entity_id: fixture.entity.id(),
@@ -493,11 +490,10 @@ async fn snapshot_retry_does_not_notify_for_events_a_concurrent_commit_already_a
 #[tokio::test]
 async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let incoming =
-        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], &AdmittedOperations::new(), |_| Ok(None)).await?;
     let delta = proto::EntityDelta {
         entity_id: fixture.entity.id(),
         content: proto::DeltaContent::StateSnapshot {
@@ -512,7 +508,7 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
     });
     assert!(futures::poll!(&mut applying).is_pending());
     entered_rx.await?;
-    let local = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
+    let local = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
     fixture.commit_event(local).await?;
     let before = fixture.entity.to_state()?;
     let (notifications, observed) = mpsc::channel();
@@ -532,13 +528,12 @@ async fn snapshot_retry_without_events_keeps_the_divergent_resident() -> anyhow:
 async fn unchanged_bare_snapshots_do_not_write_storage() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let older = fixture.entity.to_state()?;
-    let incoming =
-        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.into()], &AdmittedOperations::new(), |_| Ok(None)).await?;
     let concurrent = candidate.to_state()?;
-    let local = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("local")?]));
+    let local = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("local")?]));
     fixture.commit_event(local).await?;
     let current = fixture.entity.to_state()?;
 
@@ -563,11 +558,10 @@ async fn unchanged_bare_snapshots_do_not_write_storage() -> anyhow::Result<()> {
 #[tokio::test]
 async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let incoming =
-        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("incoming")?]));
+    let incoming = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("incoming")?]));
     fixture.events.stage_event(incoming.clone());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], |_| Ok(None)).await?;
+    candidate.apply_events(&fixture.events, &mut [incoming.clone().into()], &AdmittedOperations::new(), |_| Ok(None)).await?;
     let snapshot = candidate.to_state()?;
     fixture.apply_snapshot(SnapshotIngress::Snapshot, snapshot.clone(), incoming.clone()).await?;
     assert!(fixture.storage.get_events(vec![incoming.id()]).await?.is_empty());
@@ -586,11 +580,10 @@ async fn state_and_event_persists_payloads_for_an_already_adopted_snapshot() -> 
 async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyhow::Result<()> {
     for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
         let fixture = Fixture::new().await?;
-        let foreign = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
+        let foreign = Event::genesis(Identity::Ed25519([1; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
         cache(&fixture.storage, &[&foreign]).await?;
-        let valid =
-            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("valid")?]));
-        let disjoint = Event::update(fixture.entity.id(), Clock::singleton(&foreign), AuthorId::Unknown, OperationSet::default());
+        let valid = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("valid")?]));
+        let disjoint = Event::update(fixture.entity.id(), Clock::singleton(&foreign), OperationSet::default());
         for event in [&foreign, &valid, &disjoint] {
             event.validate_structure()?;
         }
@@ -610,7 +603,9 @@ async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyho
         for mut events in [vec![valid.clone().into(), disjoint.clone().into()], vec![disjoint.into(), valid.into()]] {
             let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
             let error = candidate
-                .apply_events(&fixture.events, &mut events, |_| panic!("disjoint batch must be rejected before policy checks"))
+                .apply_events(&fixture.events, &mut events, &AdmittedOperations::new(), |_| {
+                    panic!("disjoint batch must be rejected before policy checks")
+                })
                 .await
                 .unwrap_err();
             assert!(matches!(error, MutationError::LineageError(LineageError::Disjoint)));
@@ -623,12 +618,10 @@ async fn event_ingresses_reject_a_disjoint_input_in_a_connected_batch() -> anyho
 #[tokio::test]
 async fn event_only_discards_the_batch_without_partial_failed_operations() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let accepted =
-        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("accepted")?]));
+    let accepted = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("accepted")?]));
     let failed = Event::update(
         fixture.entity.id(),
         Clock::singleton(&accepted),
-        AuthorId::Unknown,
         OperationSet(vec![
             value_operation("failed")?,
             Operation::Membership(Membership::Add(model_b())),
@@ -636,8 +629,7 @@ async fn event_only_discards_the_batch_without_partial_failed_operations() -> an
             Operation::Backend { backend: "yrs".into(), operations: vec![proto::BackendOperation { diff: vec![0xff] }] },
         ]),
     );
-    let later =
-        Event::update(fixture.entity.id(), Clock::singleton(&failed), AuthorId::Unknown, OperationSet(vec![value_operation("later")?]));
+    let later = Event::update(fixture.entity.id(), Clock::singleton(&failed), OperationSet(vec![value_operation("later")?]));
     let before = fixture.entity.to_state()?;
     let getter = CountedHistory { inner: &fixture.events, tip: fixture.genesis.id(), tip_reads: 0.into() };
     let (notifications, observed) = mpsc::channel();
@@ -675,12 +667,10 @@ async fn state_and_event_bridges_discard_the_batch_on_operation_failure() -> any
     for ingress in [EventIngress::StateAndEvent, EventIngress::EventBridge] {
         let fixture = Fixture::new().await?;
         let before = fixture.entity.to_state()?;
-        let first =
-            Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("first")?]));
+        let first = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("first")?]));
         let failed = Event::update(
             fixture.entity.id(),
             Clock::singleton(&first),
-            AuthorId::Unknown,
             OperationSet(vec![Operation::Backend {
                 backend: "yrs".into(),
                 operations: vec![proto::BackendOperation { diff: vec![0xff] }],
@@ -706,11 +696,10 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
         for parent_in_batch in [false, true] {
             let fixture = Fixture::new().await?;
             let genesis = fixture.entity.head();
-            let honest = Event::update(fixture.entity.id(), genesis.clone(), AuthorId::Unknown, OperationSet::default());
+            let honest = Event::update(fixture.entity.id(), genesis.clone(), OperationSet::default());
             let (parent, known) = if parent_in_batch { (&honest, 2) } else { (&fixture.genesis, 1) };
             let claimed = known + 1;
-            let forged =
-                Event::update(fixture.entity.id(), Clock::new(vec![(claimed, parent.id())])?, AuthorId::Unknown, OperationSet::default());
+            let forged = Event::update(fixture.entity.id(), Clock::new(vec![(claimed, parent.id())])?, OperationSet::default());
             let events = if parent_in_batch { vec![honest.clone(), forged] } else { vec![forged] };
             let error = fixture.deliver(ingress, events.clone()).await.unwrap_err();
             assert!(
@@ -728,6 +717,57 @@ async fn event_ingress_rejects_false_annotations_for_known_parents() -> anyhow::
     Ok(())
 }
 
+/// Operations this build cannot read: one whose bytes were erased, and one of a kind no build defines yet.
+fn unreadable_operations() -> anyhow::Result<[proto::CarriedOperation; 2]> {
+    let erased = proto::CarriedOperation::Erased(proto::CarriedOperation::encode(&value_operation("erased")?).digest());
+    // Variant index 2, which no build of `Operation` defines yet.
+    Ok([erased, proto::CarriedOperation::Bytes(vec![2, 0, 0, 0])])
+}
+
+/// An update over the fixture's genesis carrying one readable operation and then `unreadable`.
+fn update_holding(fixture: &Fixture, unreadable: proto::CarriedOperation) -> anyhow::Result<Event> {
+    let mut update = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("read")?]));
+    let proto::EventBody::Update { operations, .. } = &mut update.body else { unreachable!("Event::update mints an update") };
+    operations.0.push(unreadable);
+    Ok(update)
+}
+
+/// Each event ingress refuses an event holding an operation this build cannot read before storing anything, and
+/// leaves the entity as it was.
+#[tokio::test]
+async fn event_ingress_refuses_an_event_holding_an_operation_it_cannot_read() -> anyhow::Result<()> {
+    for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
+        for unreadable in unreadable_operations()? {
+            let fixture = Fixture::new().await?;
+            let update = update_holding(&fixture, unreadable.clone())?;
+            let error = fixture.deliver(ingress, vec![update.clone()]).await.unwrap_err();
+            assert!(
+                matches!(&error, MutationError::UnreadableOperation(refused) if Err(refused.clone()) == unreadable.decode()),
+                "{ingress:?}: {error}"
+            );
+            assert!(fixture.storage.get_events(vec![update.id()]).await?.is_empty(), "{ingress:?}");
+            assert_eq!(fixture.entity.head(), Clock::singleton(&fixture.genesis), "{ingress:?}");
+        }
+    }
+    Ok(())
+}
+
+/// Adopting a snapshot applies none of the events it carries, so an event among them holding an operation this build
+/// cannot read is refused on arrival; otherwise it would be stored and never applied.
+#[tokio::test]
+async fn a_snapshot_carrying_an_event_that_holds_an_operation_it_cannot_read_is_refused() -> anyhow::Result<()> {
+    for unreadable in unreadable_operations()? {
+        let fixture = Fixture::new().await?;
+        let update = update_holding(&fixture, unreadable.clone())?;
+        let state = State { head: Clock::singleton(&update), ..fixture.entity.to_state()? };
+        let error = fixture.apply_snapshot(SnapshotIngress::StateAndEvent, state, update.clone()).await.unwrap_err();
+        assert!(matches!(&error, MutationError::UnreadableOperation(refused) if Err(refused.clone()) == unreadable.decode()), "{error}");
+        assert!(fixture.storage.get_events(vec![update.id()]).await?.is_empty());
+        assert_eq!(fixture.entity.head(), Clock::singleton(&fixture.genesis));
+    }
+    Ok(())
+}
+
 /// Comparison's missing-parent error takes precedence over a known generation mismatch.
 /// No event in the batch is applied when history preparation fails.
 #[tokio::test]
@@ -735,15 +775,11 @@ async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_
     for ingress in [EventIngress::EventOnly, EventIngress::StateAndEvent, EventIngress::EventBridge] {
         let fixture = Fixture::new().await?;
         let genesis = fixture.entity.head();
-        let honest = Event::update(fixture.entity.id(), genesis.clone(), AuthorId::Unknown, OperationSet::default());
+        let honest = Event::update(fixture.entity.id(), genesis.clone(), OperationSet::default());
         let unreadable = EventId::from_bytes([9; 32]);
         // The known parent is generation 2, but the update claims 1: a false annotation within the bound.
-        let over_both = Event::update(
-            fixture.entity.id(),
-            Clock::new(vec![(1, honest.id()), (1, unreadable.clone())])?,
-            AuthorId::Unknown,
-            OperationSet::default(),
-        );
+        let over_both =
+            Event::update(fixture.entity.id(), Clock::new(vec![(1, honest.id()), (1, unreadable.clone())])?, OperationSet::default());
 
         let error = fixture.deliver(ingress, vec![honest.clone(), over_both.clone()]).await.unwrap_err();
         assert!(
@@ -761,12 +797,8 @@ async fn an_update_naming_an_unreadable_parent_is_stopped_before_its_generation_
 async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_payload() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    let genesis = Event::genesis(
-        Some(EntityId::from_bytes([4; 32])),
-        AuthorId::Unknown,
-        OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]),
-    );
-    let over = |parent: &Event| Event::update(genesis.entity_id, Clock::singleton(parent), AuthorId::Unknown, OperationSet::default());
+    let genesis = Event::genesis(Identity::Ed25519([4; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
+    let over = |parent: &Event| Event::update(genesis.entity_id, Clock::singleton(parent), OperationSet::default());
     let mut newer = genesis.clone();
     let mut newer_history = Vec::new();
     for _ in 0..4 {
@@ -792,7 +824,7 @@ async fn an_update_over_one_tip_of_a_snapshot_head_is_checked_without_that_tips_
         events.stage_event(event.clone());
     }
     // Understate the older parent's known generation of 2.
-    let under_claimed = Event::update(genesis.entity_id, Clock::new(vec![(1, older.id())])?, AuthorId::Unknown, OperationSet::default());
+    let under_claimed = Event::update(genesis.entity_id, Clock::new(vec![(1, older.id())])?, OperationSet::default());
     let update = proto::SubscriptionUpdateItem {
         entity_id: genesis.entity_id,
         content: proto::UpdateContent::EventOnly(vec![Attested::opt(under_claimed.clone(), None).into()]),
@@ -825,19 +857,13 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
     let first = Event::update(
         fixture.entity.id(),
         Clock::singleton(&fixture.genesis),
-        AuthorId::Unknown,
         OperationSet(vec![value_operation("first")?, Operation::Membership(Membership::Add(model_b()))]),
     );
-    let intermediate = Event::update(fixture.entity.id(), Clock::singleton(&first), AuthorId::Unknown, OperationSet::default());
-    let last = Event::update(
-        fixture.entity.id(),
-        Clock::singleton(&intermediate),
-        AuthorId::Unknown,
-        OperationSet(vec![value_operation("last")?]),
-    );
+    let intermediate = Event::update(fixture.entity.id(), Clock::singleton(&first), OperationSet::default());
+    let last = Event::update(fixture.entity.id(), Clock::singleton(&intermediate), OperationSet(vec![value_operation("last")?]));
     let mut applied = vec![Attested::from(first), Attested::from(intermediate), Attested::from(last)];
     for event in &mut applied {
-        candidate.apply_events(&fixture.events, std::slice::from_mut(event), |_| Ok(None)).await?;
+        candidate.apply_events(&fixture.events, std::slice::from_mut(event), &AdmittedOperations::new(), |_| Ok(None)).await?;
     }
     let prepared = candidate.to_state()?;
     let mut transaction = fixture.storage.transaction();
@@ -862,7 +888,7 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
     assert!(matches!(received.try_recv(), Err(mpsc::TryRecvError::Empty)));
 
     // The retained view must follow the resident, not keep reading the unchanged transaction copy.
-    let next = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("next")?]));
+    let next = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("next")?]));
     fixture.commit_event(next).await?;
     assert_eq!(view.values()?, vec![(property(), Some(Value::String("next".into())))]);
     assert_eq!(view.head(), fixture.entity.head());
@@ -873,13 +899,12 @@ async fn unchanged_resident_publishes_prepared_state_and_all_applied_events_with
 async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
-    let incoming = Event::update(
-        fixture.entity.id(),
-        Clock::singleton(&fixture.genesis),
-        AuthorId::Unknown,
-        OperationSet(vec![value_operation("incoming")?]),
-    );
-    candidate.apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), |_| Ok(None)).await?;
+    let incoming = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), OperationSet(vec![value_operation("incoming")?]));
+    candidate
+        .apply_events(&fixture.events, std::slice::from_mut(&mut Attested::from(incoming.clone())), &AdmittedOperations::new(), |_| {
+            Ok(None)
+        })
+        .await?;
     let prepared = candidate.to_state()?;
     let mut transaction = fixture.storage.transaction();
     transaction
@@ -891,8 +916,7 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
     // A reader loads our committed snapshot before publication finishes, then another update advances it.
     let states = LocalStateGetter::new(fixture.storage.clone());
     fixture.node.entities.with_state(&states, &fixture.events, fixture.entity.id(), prepared).await?;
-    let later =
-        Event::update(fixture.entity.id(), Clock::singleton(&incoming), AuthorId::Unknown, OperationSet(vec![value_operation("later")?]));
+    let later = Event::update(fixture.entity.id(), Clock::singleton(&incoming), OperationSet(vec![value_operation("later")?]));
     fixture.commit_event(later).await?;
     let latest = fixture.entity.to_state()?;
     let (notifications, received) = mpsc::channel();
@@ -911,18 +935,9 @@ async fn publication_keeps_a_resident_advanced_by_a_reader() -> anyhow::Result<(
 async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked() -> anyhow::Result<()> {
     let storage = Arc::new(TestStorage::default());
     let node = Node::new(storage.clone(), PermissiveAgent::new());
-    let genesis = Event::genesis(
-        Some(EntityId::from_bytes([4; 32])),
-        AuthorId::Unknown,
-        OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]),
-    );
+    let genesis = Event::genesis(Identity::Ed25519([4; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
     let over = |parent: &Event, parent_generation| {
-        Event::update(
-            genesis.entity_id,
-            Clock::new(vec![(parent_generation, parent.id())]).unwrap(),
-            AuthorId::Unknown,
-            OperationSet::default(),
-        )
+        Event::update(genesis.entity_id, Clock::new(vec![(parent_generation, parent.id())]).unwrap(), OperationSet::default())
     };
     let parent = over(&genesis, genesis.generation());
     let tip = over(&parent, parent.generation());
@@ -942,13 +957,13 @@ async fn a_parent_arriving_before_persistence_causes_generation_to_be_rechecked(
     // An unpublished fork admits the update while its parent is unavailable.
     let candidate = RemoteTrxEntity::edit(&entity)?;
     let mut admitted = Attested::opt(update.clone(), None);
-    candidate.apply_events(&events, std::slice::from_mut(&mut admitted), |_| Ok(None)).await?;
+    candidate.apply_events(&events, std::slice::from_mut(&mut admitted), &AdmittedOperations::new(), |_| Ok(None)).await?;
     assert_eq!(candidate.head(), admitted_head);
 
     // The parent arrives before a fresh application attempt.
     cache(&storage, &[&parent]).await?;
     let before = entity.to_state()?;
-    let error = NodeApplier::apply_and_commit_events(&node, &[admitted], &events).await.unwrap_err();
+    let error = NodeApplier::apply_and_commit_events(&node, &[admitted], &AdmittedOperations::new(), &events).await.unwrap_err();
     assert!(
         matches!(error, MutationError::EventStructure(EventStructureError::GenerationMismatch { claimed: 1, known: 2, .. })),
         "{error}"
@@ -965,18 +980,9 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
     for reader_loads_snapshot in [false, true] {
         let storage = Arc::new(TestStorage::default());
         let node = Node::new(storage.clone(), PermissiveAgent::new());
-        let genesis = Event::genesis(
-            Some(EntityId::from_bytes([4; 32])),
-            AuthorId::Unknown,
-            OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]),
-        );
+        let genesis = Event::genesis(Identity::Ed25519([4; 32]), OperationSet(vec![Operation::Membership(Membership::Add(model_a()))]));
         let over = |parent: &Event, parent_generation| {
-            Event::update(
-                genesis.entity_id,
-                Clock::new(vec![(parent_generation, parent.id())]).unwrap(),
-                AuthorId::Unknown,
-                OperationSet::default(),
-            )
+            Event::update(genesis.entity_id, Clock::new(vec![(parent_generation, parent.id())]).unwrap(), OperationSet::default())
         };
         let parent = over(&genesis, genesis.generation());
         let tip = over(&parent, parent.generation());
@@ -995,7 +1001,7 @@ async fn a_parent_arriving_after_storage_commit_does_not_prevent_publication() -
 
         let candidate = RemoteTrxEntity::edit(&entity)?;
         let mut admitted = Attested::from(update.clone());
-        candidate.apply_events(&events, std::slice::from_mut(&mut admitted), |_| Ok(None)).await?;
+        candidate.apply_events(&events, std::slice::from_mut(&mut admitted), &AdmittedOperations::new(), |_| Ok(None)).await?;
         let prepared = candidate.to_state()?;
         let mut transaction = storage.transaction();
         transaction
@@ -1051,33 +1057,18 @@ impl SuspenseEvents for CountedHistory<'_> {
 #[tokio::test]
 async fn batch_policy_checks_intermediate_states_and_stops_at_first_failure() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let resident = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
+    let resident = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
     fixture.commit_event(resident.clone()).await?;
-    let accepted = Event::update(
-        fixture.entity.id(),
-        Clock::singleton(&fixture.genesis),
-        AuthorId::Unknown,
-        OperationSet(vec![value_operation("allowed")?]),
-    );
-    let denied = Event::update(
-        fixture.entity.id(),
-        Clock::singleton(&accepted),
-        AuthorId::Unknown,
-        OperationSet(vec![value_operation("forbidden")?]),
-    );
-    let later = Event::update(
-        fixture.entity.id(),
-        Clock::singleton(&denied),
-        AuthorId::Unknown,
-        OperationSet(vec![value_operation("allowed again")?]),
-    );
+    let accepted = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), OperationSet(vec![value_operation("allowed")?]));
+    let denied = Event::update(fixture.entity.id(), Clock::singleton(&accepted), OperationSet(vec![value_operation("forbidden")?]));
+    let later = Event::update(fixture.entity.id(), Clock::singleton(&denied), OperationSet(vec![value_operation("allowed again")?]));
     let getter = CountedHistory { inner: &fixture.events, tip: resident.id(), tip_reads: 0.into() };
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     let view = candidate.read();
     let mut events: Vec<_> = [&accepted, &denied, &later].into_iter().cloned().map(Attested::from).collect();
     let mut checked = Vec::new();
     let error = candidate
-        .apply_events(&getter, &mut events, |event| {
+        .apply_events(&getter, &mut events, &AdmittedOperations::new(), |event| {
             let value = view.property_value(&property()).unwrap();
             checked.push((event.id(), value.clone()));
             if value == Some(Value::String("forbidden".into())) {
@@ -1105,15 +1096,15 @@ async fn batch_policy_checks_intermediate_states_and_stops_at_first_failure() ->
 #[tokio::test]
 async fn unsorted_batch_is_rejected_before_application_or_policy_checks() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let parent =
-        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("parent")?]));
-    let child =
-        Event::update(fixture.entity.id(), Clock::singleton(&parent), AuthorId::Unknown, OperationSet(vec![value_operation("child")?]));
+    let parent = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("parent")?]));
+    let child = Event::update(fixture.entity.id(), Clock::singleton(&parent), OperationSet(vec![value_operation("child")?]));
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     let before = candidate.to_state()?;
     let mut events = vec![Attested::from(child), Attested::from(parent)];
-    let error =
-        candidate.apply_events(&NoEventReads, &mut events, |_| panic!("an unsorted batch must not reach policy checks")).await.unwrap_err();
+    let error = candidate
+        .apply_events(&NoEventReads, &mut events, &AdmittedOperations::new(), |_| panic!("an unsorted batch must not reach policy checks"))
+        .await
+        .unwrap_err();
     assert!(matches!(error, MutationError::InvalidUpdate("event batch must be in causal order")));
     assert_eq!(candidate.to_state()?, before);
     assert!(events.iter().all(|event| event.attestations.is_empty()));
@@ -1123,20 +1114,16 @@ async fn unsorted_batch_is_rejected_before_application_or_policy_checks() -> any
 #[tokio::test]
 async fn batch_preparation_failure_changes_nothing_and_runs_no_policy_checks() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let accepted =
-        Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet(vec![value_operation("first")?]));
+    let accepted = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![value_operation("first")?]));
     let missing = EventId::from_bytes([99; 32]);
-    let failed = Event::update(
-        fixture.entity.id(),
-        Clock::new(vec![(2, accepted.id()), (2, missing.clone())])?,
-        AuthorId::Unknown,
-        OperationSet::default(),
-    );
+    let failed = Event::update(fixture.entity.id(), Clock::new(vec![(2, accepted.id()), (2, missing.clone())])?, OperationSet::default());
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     let before = candidate.to_state()?;
     let mut events = vec![Attested::from(accepted), Attested::from(failed)];
-    let error =
-        candidate.apply_events(&fixture.events, &mut events, |_| panic!("preparation must finish before policy checks")).await.unwrap_err();
+    let error = candidate
+        .apply_events(&fixture.events, &mut events, &AdmittedOperations::new(), |_| panic!("preparation must finish before policy checks"))
+        .await
+        .unwrap_err();
     assert!(matches!(error, MutationError::RetrievalError(RetrievalError::EventNotFound(id)) if id == missing));
     assert_eq!(candidate.to_state()?, before);
     assert!(events.iter().all(|event| event.attestations.is_empty()));
@@ -1146,15 +1133,10 @@ async fn batch_preparation_failure_changes_nothing_and_runs_no_policy_checks() -
 #[tokio::test]
 async fn one_comparison_prepares_and_persists_a_concurrent_batch() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let resident = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
+    let resident = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
     fixture.commit_event(resident.clone()).await?;
-    let a = Event::update(
-        fixture.entity.id(),
-        Clock::singleton(&fixture.genesis),
-        AuthorId::Unknown,
-        OperationSet(vec![value_operation("first")?]),
-    );
-    let b = Event::update(fixture.entity.id(), Clock::singleton(&a), AuthorId::Unknown, OperationSet(vec![value_operation("second")?]));
+    let a = Event::update(fixture.entity.id(), Clock::singleton(&fixture.genesis), OperationSet(vec![value_operation("first")?]));
+    let b = Event::update(fixture.entity.id(), Clock::singleton(&a), OperationSet(vec![value_operation("second")?]));
     let getter = CountedHistory { inner: &fixture.events, tip: resident.id(), tip_reads: 0.into() };
     let update = proto::SubscriptionUpdateItem {
         entity_id: fixture.entity.id(),
@@ -1174,23 +1156,15 @@ async fn one_comparison_prepares_and_persists_a_concurrent_batch() -> anyhow::Re
 #[tokio::test]
 async fn batch_checks_concurrent_events_before_later_operations_in_the_same_layer() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let ancestor = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
+    let ancestor = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
     fixture.commit_event(ancestor.clone()).await?;
-    let resident = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
+    let resident = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
     fixture.commit_event(resident.clone()).await?;
     let third_model = ModelId::EntityId(EntityId::from_bytes([18; 32]));
-    let a = Event::update(
-        fixture.entity.id(),
-        fixture.entity.head(),
-        AuthorId::Unknown,
-        OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]),
-    );
-    let b = Event::update(
-        fixture.entity.id(),
-        fixture.entity.head(),
-        AuthorId::Unknown,
-        OperationSet(vec![Operation::Membership(Membership::Add(third_model))]),
-    );
+    let a =
+        Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![Operation::Membership(Membership::Add(model_b()))]));
+    let b =
+        Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet(vec![Operation::Membership(Membership::Add(third_model))]));
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     let view = candidate.read();
     // Old inputs below the loaded history and duplicates still get policy checks without shifting the next event's layers.
@@ -1204,7 +1178,7 @@ async fn batch_checks_concurrent_events_before_later_operations_in_the_same_laye
     ];
     let mut checked = Vec::new();
     candidate
-        .apply_events(&fixture.events, &mut events, |event| {
+        .apply_events(&fixture.events, &mut events, &AdmittedOperations::new(), |event| {
             checked.push((event.id(), view.memberships()));
             Ok(None)
         })
@@ -1227,13 +1201,13 @@ async fn batch_checks_concurrent_events_before_later_operations_in_the_same_laye
 #[tokio::test]
 async fn batch_extension_does_not_fetch_the_existing_head() -> anyhow::Result<()> {
     let fixture = Fixture::new().await?;
-    let first = Event::update(fixture.entity.id(), fixture.entity.head(), AuthorId::Unknown, OperationSet::default());
-    let second = Event::update(fixture.entity.id(), Clock::singleton(&first), AuthorId::Unknown, OperationSet::default());
+    let first = Event::update(fixture.entity.id(), fixture.entity.head(), OperationSet::default());
+    let second = Event::update(fixture.entity.id(), Clock::singleton(&first), OperationSet::default());
     let expected_head = Clock::singleton(&second);
     let candidate = RemoteTrxEntity::edit(&fixture.entity)?;
     let mut events = vec![Attested::from(first), Attested::from(second)];
     // An ephemeral node may have adopted this state without storing its head event.
-    candidate.apply_events(&NoEventReads, &mut events, |_| Ok(None)).await?;
+    candidate.apply_events(&NoEventReads, &mut events, &AdmittedOperations::new(), |_| Ok(None)).await?;
     assert_eq!(candidate.head(), expected_head);
     Ok(())
 }
@@ -1244,7 +1218,7 @@ async fn supplied_batch_can_exceed_the_single_event_history_budget() -> anyhow::
     let mut head = fixture.entity.head();
     let mut events = Vec::new();
     for _ in 0..crate::event_dag::DEFAULT_BUDGET * 4 + 1 {
-        let event = Event::update(fixture.entity.id(), head, AuthorId::Unknown, OperationSet::default());
+        let event = Event::update(fixture.entity.id(), head, OperationSet::default());
         head = Clock::singleton(&event);
         events.push(Attested::from(event));
     }
@@ -1252,7 +1226,7 @@ async fn supplied_batch_can_exceed_the_single_event_history_budget() -> anyhow::
     let count = events.len();
     let mut checks = 0;
     candidate
-        .apply_events(&fixture.events, &mut events, |_| {
+        .apply_events(&fixture.events, &mut events, &AdmittedOperations::new(), |_| {
             checks += 1;
             Ok(None)
         })

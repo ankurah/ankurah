@@ -100,7 +100,8 @@ it cannot use absence from a pruned DAG as evidence that a write is older.
 
 ### Why lexicographic EventId comparison is safe
 
-`EventId` is a SHA-256 hash of `(entity_id, operations, parent_clock)`. The
+`EventId` is a SHA-256 hash over the event's content, its operations entering
+through their digests. The
 ordering of hashes has no relationship to wall-clock time, but it provides a
 **deterministic total order**. Used after generation, it gives one maximum
 over all writes before saturation, regardless of their delivery order.

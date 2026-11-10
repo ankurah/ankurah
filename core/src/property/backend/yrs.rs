@@ -177,12 +177,9 @@ impl PropertyBackend for YrsBackend {
         // Just apply all operations from to_apply events.
         let changed_fields = Arc::new(Mutex::new(std::collections::HashSet::new()));
 
-        for event in &layer.to_apply {
-            // Extract Yrs operations from this event
-            {
-                for operation in event.operations().backend_operations(Self::property_backend_name()) {
-                    self.apply_update(&operation.diff, &changed_fields)?;
-                }
+        for crate::event_dag::LayerEvent { operations, .. } in &layer.to_apply {
+            for operation in operations.backend_operations(Self::property_backend_name()) {
+                self.apply_update(&operation.diff, &changed_fields)?;
             }
         }
 

@@ -1,15 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{author::AuthorId, clock::Clock, id::EntityId, operation::OperationSet, DecodeError};
-
-/// Domain tag for genesis event ids. Separates the two preimage shapes so no
-/// genesis preimage can ever equal an update preimage, and versions the
-/// derivation scheme.
-pub const GENESIS_TAG: &[u8] = b"org.ankurah.genesis.v0";
-
-/// Domain tag for update event ids. See [`GENESIS_TAG`].
-pub const EVENT_TAG: &[u8] = b"org.ankurah.event.v0";
+use crate::{clock::Clock, domain_tag::DomainTag, encoding, id::EntityId, identity::Identity, operation::CarriedOperations, DecodeError};
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq, Hash)]
 pub struct EventId([u8; 32]);
@@ -19,47 +11,29 @@ impl std::fmt::Debug for EventId {
 }
 
 impl EventId {
-    /// The id of a genesis event: `SHA-256(GENESIS_TAG || bincode(system,
-    /// nonce, timestamp, author, operations))`. Membership is carried in the
-    /// operations and therefore contributes to the entity's identity.
-    pub fn from_genesis_parts(
-        system: &Option<EntityId>,
-        nonce: &[u8; 32],
-        timestamp: u64,
-        author: &AuthorId,
-        operations: &OperationSet,
-    ) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(GENESIS_TAG);
-        hasher.update(bincode::serialize(system).unwrap());
-        hasher.update(bincode::serialize(nonce).unwrap());
-        hasher.update(bincode::serialize(&timestamp).unwrap());
-        hasher.update(bincode::serialize(author).unwrap());
-        hasher.update(bincode::serialize(operations).unwrap());
-        Self(hasher.finalize().into())
+    /// The id of a genesis event (specs/protocol/bytes.md section 4.2). The minter and the
+    /// memberships its operations carry are part of the entity's identity.
+    pub fn from_genesis_parts(minter: &Identity, nonce: &[u8; 32], timestamp: u64, operations: &CarriedOperations) -> Self {
+        Self::from_preimage(DomainTag::Genesis, &(minter, nonce, timestamp, operations.digests()))
     }
 
-    /// The id of an update event: `SHA-256(EVENT_TAG || bincode(entity_id,
-    /// author, nonce, timestamp, operations, parent))`. Model projections stay
-    /// outside the canonical event and its identity. The nonce is what makes an
-    /// event id unguessable to anyone who was not sent the event.
+    /// The id of an update event (specs/protocol/bytes.md section 4.3). Its nonce makes the id
+    /// unguessable to anyone who was not sent the event.
     pub fn from_update_parts(
         entity_id: &EntityId,
-        author: &AuthorId,
         nonce: &[u8; 32],
         timestamp: u64,
-        operations: &OperationSet,
+        operations: &CarriedOperations,
         parent: &Clock,
     ) -> Self {
-        let mut hasher = Sha256::new();
-        hasher.update(EVENT_TAG);
-        hasher.update(bincode::serialize(entity_id).unwrap());
-        hasher.update(bincode::serialize(author).unwrap());
-        hasher.update(bincode::serialize(nonce).unwrap());
-        hasher.update(bincode::serialize(&timestamp).unwrap());
-        hasher.update(bincode::serialize(operations).unwrap());
-        hasher.update(bincode::serialize(parent).unwrap());
-        Self(hasher.finalize().into())
+        Self::from_preimage(DomainTag::Update, &(entity_id, nonce, timestamp, operations.digests(), parent))
+    }
+
+    /// SHA-256 over `tag`, then the encoding of `fields`.
+    fn from_preimage(tag: DomainTag, fields: &impl Serialize) -> Self {
+        let mut preimage = tag.encoded().to_vec();
+        encoding::encode_into(&mut preimage, fields);
+        Self(Sha256::digest(&preimage).into())
     }
     pub fn to_base64(&self) -> String {
         use base64::{engine::general_purpose, Engine as _};
@@ -148,6 +122,9 @@ impl<'de> Deserialize<'de> for EventId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encoding::{decode_exact, encode};
+    use crate::operation::{BackendOperation, CarriedOperation, Membership, Operation};
+    use ankurah_core_types::{ModelId, SystemModel};
 
     #[test]
     fn test_event_id_json_serialization() {
@@ -164,11 +141,54 @@ mod tests {
         let id = EventId::from_bytes([
             1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
         ]);
-        let bytes = bincode::serialize(&id).unwrap();
+        let bytes = encode(&id);
         assert_eq!(
             bytes,
             [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32]
         );
-        assert_eq!(id, bincode::deserialize(&bytes).unwrap());
+        assert_eq!(id, decode_exact(&bytes).unwrap());
+    }
+
+    /// The id vectors of specs/protocol/bytes.md section 5: a genesis and an update over zero, one and two
+    /// operations, and over the one operation erased, which leaves each id unchanged.
+    #[test]
+    fn event_ids_match_the_byte_specification_vectors() {
+        let membership = CarriedOperation::encode(&Operation::Membership(Membership::Add(ModelId::System(SystemModel::Model))));
+        let backend = CarriedOperation::encode(&Operation::Backend {
+            backend: "lww".to_owned(),
+            operations: vec![BackendOperation { diff: vec![1, 2, 3] }],
+        });
+        let erased = CarriedOperation::Erased(membership.digest());
+        let minter = Identity::Ed25519([0x11; 32]);
+        let (nonce, timestamp) = ([0x22; 32], 1_720_000_000_000);
+        let entity_id = EntityId::from_bytes([0x33; 32]);
+        let parent = Clock::new(vec![(1, EventId::from_bytes([0x44; 32]))]).unwrap();
+
+        for (operations, genesis, update) in [
+            (
+                vec![],
+                "133fdae5349217e57d706cfb395b259cc94e718562a71779dfd1f0270d8bb649",
+                "036ff81f4ba2285f3ccd38e0ad3232855a466bb6c0b9d6f0fd254a202180364e",
+            ),
+            (
+                vec![membership.clone()],
+                "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
+                "c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8",
+            ),
+            (
+                vec![membership, backend],
+                "0395ecaf7e93f57b19cf2098a8161c6c0c72b182ff1f5dfc8a0525359cd927a3",
+                "342304016d7452fae948903da6bb928e9b69b3c460d1bdb49d69fbcead6e1b43",
+            ),
+            (
+                vec![erased],
+                "9b8f62522e532428eae37ef651a7a0f495fdbf2b1c5d153a1ee79660fbbd358a",
+                "c3f6d6bab2d1336547d778567c51962fb0fa95e04e35cd9bd45057687339c5c8",
+            ),
+        ] {
+            let operations = CarriedOperations(operations);
+            assert_eq!(hex::encode(EventId::from_genesis_parts(&minter, &nonce, timestamp, &operations).as_bytes()), genesis);
+            assert_eq!(hex::encode(EventId::from_update_parts(&entity_id, &nonce, timestamp, &operations, &parent).as_bytes()), update);
+        }
     }
 }

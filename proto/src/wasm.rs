@@ -4,7 +4,7 @@ use wasm_bindgen::JsValue;
 
 use crate::AttestationSet;
 use crate::StateBuffers;
-use crate::{Clock, DecodeError, EventBody, EventId};
+use crate::{encoding, Clock, DecodeError, EventBody, EventId};
 
 impl TryFrom<JsValue> for EventId {
     type Error = DecodeError;
@@ -26,7 +26,7 @@ impl TryFrom<JsValue> for Clock {
         let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
         let mut buffer = vec![0; array.length() as usize];
         array.copy_to(&mut buffer);
-        let set: Clock = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
+        let set: Clock = encoding::decode_exact(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
 
         Ok(set)
     }
@@ -36,7 +36,7 @@ impl TryFrom<&Clock> for JsValue {
     type Error = DecodeError;
 
     fn try_from(val: &Clock) -> Result<Self, Self::Error> {
-        let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
+        let buffer = encoding::encode(val);
         let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
         array.copy_from(&buffer);
         Ok(array.into())
@@ -74,9 +74,7 @@ impl TryFrom<JsValue> for EventBody {
         let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
         let mut buffer = vec![0; array.length() as usize];
         array.copy_to(&mut buffer);
-        let body: EventBody = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
-
-        Ok(body)
+        EventBody::decode(&buffer).map_err(|_| DecodeError::InvalidFormat)
     }
 }
 
@@ -84,7 +82,7 @@ impl TryFrom<&EventBody> for JsValue {
     type Error = DecodeError;
 
     fn try_from(val: &EventBody) -> Result<Self, Self::Error> {
-        let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
+        let buffer = val.encode();
         let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
         array.copy_from(&buffer);
         Ok(array.into())
@@ -98,7 +96,7 @@ impl TryFrom<JsValue> for StateBuffers {
         let array: js_sys::Uint8Array = value.dyn_into().map_err(|_| DecodeError::InvalidFormat)?;
         let mut buffer = vec![0; array.length() as usize];
         array.copy_to(&mut buffer);
-        let set: StateBuffers = bincode::deserialize(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
+        let set: StateBuffers = encoding::decode_exact(&buffer).map_err(|_| DecodeError::InvalidFormat)?;
 
         Ok(set)
     }
@@ -108,7 +106,7 @@ impl TryFrom<&StateBuffers> for JsValue {
     type Error = DecodeError;
 
     fn try_from(val: &StateBuffers) -> Result<Self, Self::Error> {
-        let buffer = bincode::serialize(&val).map_err(|_| DecodeError::InvalidFormat)?;
+        let buffer = encoding::encode(val);
         let array = js_sys::Uint8Array::new_with_length(buffer.len() as u32);
         array.copy_from(&buffer);
         Ok(array.into())

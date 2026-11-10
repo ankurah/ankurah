@@ -32,7 +32,7 @@ pub(super) fn encode_events(events: &[Attested<Event>]) -> Result<Vec<EventRow>,
             Ok(EventRow {
                 id: event.payload.id(),
                 entity_id: event.payload.entity_id,
-                body: bincode::serialize(&event.payload.body)?,
+                body: event.payload.body.encode(),
                 parent: event.payload.parent.clone(),
                 attestations: bincode::serialize(&event.attestations)?,
             })

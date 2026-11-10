@@ -594,6 +594,65 @@ mod tests {
     /// The durable identity of the property [`identifier_selection`] builds.
     fn identifier_selection_id() -> PropertyId { PropertyId::EntityId(EntityId::from_bytes([7u8; 32])) }
 
+    fn index(value: &impl Serialize) -> [u8; 4] { bincode::serialize(value).unwrap()[..4].try_into().unwrap() }
+
+    /// A resolved selection crosses the wire inside fetch and subscribe requests, so each of its enums keeps the
+    /// variant index its first four bytes encode.
+    #[test]
+    fn selection_variant_order_is_pinned() {
+        let literal = || Box::new(Expr::<Resolved>::Literal(Value::I32(1)));
+        let path = PropertyPath::registered(EntityId::from_bytes([7u8; 32]), "name", vec![]);
+        let expressions = [
+            Expr::<Resolved>::Literal(Value::I32(1)),
+            Expr::Path(path.clone()),
+            Expr::Predicate(Predicate::True),
+            Expr::InfixExpr { left: literal(), operator: InfixOperator::Add, right: literal() },
+            Expr::ExprList(vec![]),
+            Expr::Placeholder,
+        ];
+        assert_eq!(
+            expressions.iter().map(index).collect::<Vec<_>>(),
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0]]
+        );
+
+        let predicate = || Box::new(Predicate::<Resolved>::True);
+        let predicates = [
+            Predicate::<Resolved>::Comparison { left: literal(), operator: ComparisonOperator::Equal, right: literal() },
+            Predicate::IsNull(literal()),
+            Predicate::And(predicate(), predicate()),
+            Predicate::Or(predicate(), predicate()),
+            Predicate::Not(predicate()),
+            Predicate::True,
+            Predicate::False,
+            Predicate::Placeholder,
+            Predicate::MemberOf(ModelId::System(SystemModel::Model)),
+        ];
+        assert_eq!(
+            predicates.iter().map(index).collect::<Vec<_>>(),
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0], [6, 0, 0, 0], [7, 0, 0, 0], [8, 0, 0, 0]]
+        );
+
+        let comparisons = [
+            ComparisonOperator::Equal,
+            ComparisonOperator::NotEqual,
+            ComparisonOperator::GreaterThan,
+            ComparisonOperator::GreaterThanOrEqual,
+            ComparisonOperator::LessThan,
+            ComparisonOperator::LessThanOrEqual,
+            ComparisonOperator::In,
+            ComparisonOperator::Between,
+        ];
+        assert_eq!(
+            comparisons.iter().map(index).collect::<Vec<_>>(),
+            [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0], [4, 0, 0, 0], [5, 0, 0, 0], [6, 0, 0, 0], [7, 0, 0, 0]]
+        );
+
+        let infixes = [InfixOperator::Add, InfixOperator::Subtract, InfixOperator::Multiply, InfixOperator::Divide];
+        assert_eq!(infixes.iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0], [2, 0, 0, 0], [3, 0, 0, 0]]);
+
+        assert_eq!([OrderDirection::Asc, OrderDirection::Desc].iter().map(index).collect::<Vec<_>>(), [[0, 0, 0, 0], [1, 0, 0, 0]]);
+    }
+
     #[test]
     fn identifier_selection_bincode_roundtrip() {
         for selection in [identifier_selection("name", vec![]), identifier_selection("licensing", vec!["territory"])] {

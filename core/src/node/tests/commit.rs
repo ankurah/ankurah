@@ -1,3 +1,4 @@
+use crate::node::event_admissibility::AdmittedOperations;
 use crate::node::inbound::handler::commit_transaction;
 use crate::{
     entity::{Entity, LocalTrxEntity, RemoteTrxEntity},
@@ -15,7 +16,7 @@ use crate::{
 };
 use ankql::ast::{Predicate, Resolved};
 use ankurah_proto::{
-    self as proto, Attested, AuthorId, EntityId, EntityState, Event, Membership, ModelId, Operation, OperationSet, PropertyId,
+    self as proto, Attested, EntityId, EntityState, Event, Identity, Membership, ModelId, Operation, OperationSet, PropertyId,
 };
 use std::sync::{Arc, Mutex};
 
@@ -116,7 +117,7 @@ async fn local_creation_commits_after_its_events_arrive_remotely() -> anyhow::Re
 
     for echoed in [1, 2] {
         let trx = context.begin();
-        let entity = trx.add_entity(LocalTrxEntity::new(None, AuthorId::Unknown, node.entities.catalog_epoch(), trx.alive.clone()));
+        let entity = trx.add_entity(LocalTrxEntity::new(node.identity(), node.entities.catalog_epoch(), trx.alive.clone()));
         entity.add_membership(a)?;
         let id = entity.id();
         entity.add_membership(b)?;
@@ -141,12 +142,11 @@ async fn failed_add_event_poisons_the_transaction_even_if_the_error_is_caught() 
     node.wait_ready().await?;
     let policy = crate::policy::ContextPolicy::from_credentials(&node.policy_agent, &DEFAULT_CONTEXT);
     let valid: Attested<Event> = Event::genesis(
-        None,
-        AuthorId::Unknown,
+        node.identity(),
         OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))))]),
     )
     .into();
-    let invalid: Attested<Event> = Event::genesis(None, AuthorId::Unknown, OperationSet::default()).into();
+    let invalid: Attested<Event> = Event::genesis(node.identity(), OperationSet::default()).into();
     let mut trx = crate::transaction::remote::RemoteTransaction::new(&node, &policy);
     trx.add_event(&valid).await?;
     let id = valid.payload.entity_id;
@@ -165,26 +165,21 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     let storage = Arc::new(TestStorage::default());
     let getter = LocalEventGetter::new(storage.clone(), false);
     let property = PropertyId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![set(property, "Alice")?]));
+    let genesis = Event::genesis(Identity::Ed25519([1; 32]), OperationSet(vec![set(property, "Alice")?]));
 
     let entities = crate::entity::WeakEntitySet::new(crate::schema::CatalogEpoch::allocate());
     let fork = RemoteTrxEntity::new(&genesis, entities.catalog_epoch())?;
     let before = fork.snapshot();
-    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(None)).await?;
+    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), &AdmittedOperations::new(), |_| Ok(None))
+        .await?;
 
-    let update =
-        Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), AuthorId::Unknown, OperationSet(vec![set(property, "Bob")?]));
-    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), |_| Ok(None)).await?;
+    let update = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![set(property, "Bob")?]));
+    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), &AdmittedOperations::new(), |_| Ok(None)).await?;
     let branch_property = PropertyId::EntityId(EntityId::from_bytes([2; 32]));
-    let branch = Event::update(
-        genesis.entity_id,
-        proto::Clock::singleton(&genesis),
-        AuthorId::Unknown,
-        OperationSet(vec![set(branch_property, "branch")?]),
-    );
+    let branch = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![set(branch_property, "branch")?]));
     let mut branch = Attested::opt(branch, Some(proto::Attestation(vec![1, 2, 3])));
     // Divergence must find the earlier fork events without storage or explicit staging.
-    fork.apply_events(&getter, std::slice::from_mut(&mut branch), |event| {
+    fork.apply_events(&getter, std::slice::from_mut(&mut branch), &AdmittedOperations::new(), |event| {
         assert_eq!(event.entity_id, before.id());
         assert_eq!(before.value(&branch_property), None);
         assert_eq!(fork.read().value(&branch_property), Some(Value::String("branch".into())));
@@ -193,7 +188,8 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     .await?;
     assert_eq!(*branch.attestations, vec![proto::Attestation(vec![1, 2, 3]), proto::Attestation(vec![4, 5, 6])]);
     // Redelivered events must not appear twice in the published change.
-    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(None)).await?;
+    fork.apply_events(&getter, std::slice::from_mut(&mut Attested::from(genesis.clone())), &AdmittedOperations::new(), |_| Ok(None))
+        .await?;
     assert!(entities.get(&genesis.entity_id).is_none());
 
     let expected_events = vec![genesis.clone().into(), update.clone().into(), branch.clone()];
@@ -210,7 +206,9 @@ async fn fork_commit_publishes_to_resident_without_changing_original_snapshot() 
     assert_eq!(before.value(&property), None);
 
     let retry = RemoteTrxEntity::edit(&resident)?;
-    retry.apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), |_| Ok(None)).await?;
+    retry
+        .apply_events(&getter, std::slice::from_mut(&mut Attested::from(update.clone())), &AdmittedOperations::new(), |_| Ok(None))
+        .await?;
     assert!(retry.commit(&entities, &getter, false).await?.events().is_empty(), "already-published events do not notify again");
     assert_eq!(resident.head(), proto::Clock::from_events([&update, &branch.payload]));
     Ok(())
@@ -226,21 +224,21 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     node.wait_ready().await?;
     let events = LocalEventGetter::new(storage.clone(), false);
     let genesis = Event::genesis(
-        Some(EntityId::from_bytes([3; 32])),
-        AuthorId::Unknown,
+        Identity::Ed25519([3; 32]),
         OperationSet(vec![Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([4; 32])))), set(owner, "Alice")?]),
     );
     events.stage_event(genesis.clone());
     let candidate = RemoteTrxEntity::new(&genesis, node.entities.catalog_epoch())?;
-    candidate.apply_events(&events, std::slice::from_mut(&mut Attested::from(genesis.clone())), |_| Ok(None)).await?;
+    candidate
+        .apply_events(&events, std::slice::from_mut(&mut Attested::from(genesis.clone())), &AdmittedOperations::new(), |_| Ok(None))
+        .await?;
     let mut transaction = storage.transaction();
     transaction.set_state(&proto::Clock::default(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
     transaction.add_events(&[Attested::opt(genesis.clone(), None)]).await?;
     assert!(matches!(transaction.commit().await?, StorageCommitOutcome::Committed(_)));
     let (entity, _) = candidate.commit(&node.entities, &events, false).await?.into_parts();
 
-    let edit =
-        Event::update(entity.id(), proto::Clock::singleton(&genesis), AuthorId::Unknown, OperationSet(vec![set(title, "Alice's edit")?]));
+    let edit = Event::update(entity.id(), proto::Clock::singleton(&genesis), OperationSet(vec![set(title, "Alice's edit")?]));
     events.stage_event(edit.clone());
     let (entered, entered_rx) = tokio::sync::oneshot::channel();
     let (release, release_rx) = tokio::sync::oneshot::channel();
@@ -251,10 +249,12 @@ async fn conflict_rechecks_policy_against_the_winning_state() -> anyhow::Result<
     entered_rx.await?;
 
     // Ownership changes after Alice's check but before her storage commit.
-    let transfer = Event::update(entity.id(), proto::Clock::singleton(&genesis), AuthorId::Unknown, OperationSet(vec![set(owner, "Bob")?]));
+    let transfer = Event::update(entity.id(), proto::Clock::singleton(&genesis), OperationSet(vec![set(owner, "Bob")?]));
     events.stage_event(transfer.clone());
     let candidate = RemoteTrxEntity::edit(&entity)?;
-    candidate.apply_events(&events, std::slice::from_mut(&mut Attested::from(transfer.clone())), |_| Ok(None)).await?;
+    candidate
+        .apply_events(&events, std::slice::from_mut(&mut Attested::from(transfer.clone())), &AdmittedOperations::new(), |_| Ok(None))
+        .await?;
     let mut transaction = storage.transaction();
     transaction.set_state(&entity.head(), &Attested::opt(candidate.read().to_entity_state()?, None)).await?;
     transaction.add_events(&[Attested::opt(transfer.clone(), None)]).await?;
@@ -282,15 +282,10 @@ async fn remote_commit_admits_an_update_only_at_the_generation_its_parents_requi
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
     node.wait_ready().await?;
     let model = ModelId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+    let genesis = Event::genesis(node.identity(), OperationSet(vec![Operation::Membership(Membership::Add(model))]));
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into()]).await?;
     let update = |parent: &Event, claimed| {
-        Event::update(
-            genesis.entity_id,
-            proto::Clock::new(vec![(claimed, parent.id())]).unwrap(),
-            AuthorId::Unknown,
-            OperationSet::default(),
-        )
+        Event::update(genesis.entity_id, proto::Clock::new(vec![(claimed, parent.id())]).unwrap(), OperationSet::default())
     };
     let honest = update(&genesis, 1);
 
@@ -323,10 +318,10 @@ async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> any
     let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
     node.wait_ready().await?;
     let model = ModelId::EntityId(EntityId::from_bytes([1; 32]));
-    let genesis = Event::genesis(None, AuthorId::Unknown, OperationSet(vec![Operation::Membership(Membership::Add(model))]));
+    let genesis = Event::genesis(node.identity(), OperationSet(vec![Operation::Membership(Membership::Add(model))]));
     commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into()]).await?;
-    let unheld = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), AuthorId::Unknown, OperationSet::default());
-    let child = Event::update(genesis.entity_id, proto::Clock::singleton(&unheld), AuthorId::Unknown, OperationSet::default());
+    let unheld = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet::default());
+    let child = Event::update(genesis.entity_id, proto::Clock::singleton(&unheld), OperationSet::default());
 
     let error = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![child.clone().into()]).await.unwrap_err();
     assert!(
@@ -339,5 +334,43 @@ async fn a_durable_node_refuses_an_update_whose_parent_it_does_not_hold() -> any
     assert!(storage.get_events(vec![child.id()]).await?.is_empty());
     let stored = storage.get_state(genesis.entity_id).await?.payload.state;
     assert_eq!(stored.head, proto::Clock::singleton(&genesis));
+    Ok(())
+}
+
+/// A remote commit holding an operation this build cannot read is refused for its entity and stores nothing: an
+/// update of a kind this build does not know, and an already committed update resent with an operation erased, which
+/// keeps its id and would otherwise replace the stored bytes.
+#[tokio::test]
+async fn a_durable_node_refuses_a_remote_commit_holding_an_operation_it_cannot_read() -> anyhow::Result<()> {
+    let storage = Arc::new(TestStorage::default());
+    let node = Node::new_durable(storage.clone(), crate::policy::PermissiveAgent::new());
+    node.wait_ready().await?;
+    let membership = Operation::Membership(Membership::Add(ModelId::EntityId(EntityId::from_bytes([1; 32]))));
+    let genesis = Event::genesis(node.identity(), OperationSet(vec![membership.clone()]));
+    let committed = Event::update(genesis.entity_id, proto::Clock::singleton(&genesis), OperationSet(vec![membership]));
+    commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![genesis.clone().into(), committed.clone().into()])
+        .await?;
+
+    let mut erased = committed.clone();
+    let proto::EventBody::Update { operations, .. } = &mut erased.body else { unreachable!("Event::update mints an update") };
+    let erased_operation = proto::CarriedOperation::Erased(operations.0[0].digest());
+    operations.0[0] = erased_operation.clone();
+    let mut unknown_kind = Event::update(genesis.entity_id, proto::Clock::singleton(&committed), OperationSet::default());
+    let proto::EventBody::Update { operations, .. } = &mut unknown_kind.body else { unreachable!("Event::update mints an update") };
+    // Variant index 2, which no build of `Operation` defines yet.
+    let unknown_operation = proto::CarriedOperation::Bytes(vec![2, 0, 0, 0]);
+    operations.0.push(unknown_operation.clone());
+
+    for (event, operation) in [(erased, erased_operation), (unknown_kind.clone(), unknown_operation)] {
+        let error = commit_transaction(&node, &DEFAULT_CONTEXT, proto::TransactionId::new(), vec![event.into()]).await.unwrap_err();
+        assert!(
+            matches!(error.downcast_ref::<MutationError>(), Some(MutationError::UnreadableOperation(refused)) if Err(refused.clone()) == operation.decode()),
+            "{error}"
+        );
+    }
+    let stored: Vec<_> =
+        storage.get_events(vec![committed.id(), unknown_kind.id()]).await?.into_iter().map(|event| event.payload).collect();
+    assert_eq!(stored, vec![committed.clone()], "the committed update keeps its bytes and the unknown kind is not stored");
+    assert_eq!(storage.get_state(genesis.entity_id).await?.payload.state.head, proto::Clock::singleton(&committed));
     Ok(())
 }

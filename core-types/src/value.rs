@@ -408,6 +408,39 @@ mod wasm {
 mod tests {
     use super::*;
 
+    /// A value's first four bytes are its variant index: values travel in query literals and in property diffs.
+    #[test]
+    fn value_variant_order_is_pinned() {
+        let values = [
+            Value::I16(1),
+            Value::I32(1),
+            Value::I64(1),
+            Value::F64(1.0),
+            Value::Bool(true),
+            Value::String("s".into()),
+            Value::EntityId(crate::EntityId::from_bytes([1; 32])),
+            Value::Object(vec![]),
+            Value::Binary(vec![]),
+            Value::Json(serde_json::json!(1)),
+        ];
+        let indices: Vec<_> = values.iter().map(|value| bincode::serialize(value).unwrap()[..4].to_vec()).collect();
+        assert_eq!(
+            indices,
+            [
+                [0, 0, 0, 0],
+                [1, 0, 0, 0],
+                [2, 0, 0, 0],
+                [3, 0, 0, 0],
+                [4, 0, 0, 0],
+                [5, 0, 0, 0],
+                [6, 0, 0, 0],
+                [7, 0, 0, 0],
+                [8, 0, 0, 0],
+                [9, 0, 0, 0]
+            ]
+        );
+    }
+
     #[test]
     fn castability_and_cast_implementation_stay_aligned() {
         use ValueType::*;

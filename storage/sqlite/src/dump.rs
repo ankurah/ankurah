@@ -100,7 +100,7 @@ fn event_page(conn: &Connection, after: Option<&str>) -> Result<(Option<String>,
         let stored_id: String = row.get(0)?;
         let declared_id = EventId::from_base64(&stored_id).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let entity_id = EntityId::from_base64(row.get::<_, String>(1)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
-        let body = bincode::deserialize::<EventBody>(&row.get::<_, Vec<u8>>(2)?)?;
+        let body = EventBody::decode(&row.get::<_, Vec<u8>>(2)?).map_err(|error| SqliteError::Dump(error.to_string()))?;
         let parent = serde_json::from_str::<Clock>(&row.get::<_, String>(3)?)?;
         let attestations = bincode::deserialize::<AttestationSet>(&row.get::<_, Vec<u8>>(4)?)?;
         let event = Attested { payload: Event { entity_id, body, parent }, attestations };
@@ -160,7 +160,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use ankurah_core::storage::{StorageCommitOutcome, StorageEngine, StorageTransaction};
-    use ankurah_proto::{AuthorId, OperationSet};
+    use ankurah_proto::{Identity, OperationSet};
     use futures_util::{pin_mut, StreamExt};
 
     use super::*;
@@ -172,7 +172,7 @@ mod tests {
         let storage = SqliteStorageEngine::open_in_memory().await?;
         let mut expected = BTreeSet::new();
         for _ in 0..RECORDS {
-            let event = Event::genesis(None, AuthorId::Unknown, OperationSet::default());
+            let event = Event::genesis(Identity::Ed25519([1; 32]), OperationSet::default());
             let entity_id = event.entity_id;
             let state = Attested::opt(
                 EntityState {

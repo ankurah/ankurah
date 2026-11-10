@@ -71,31 +71,20 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
     };
     let create = |value: &str| -> anyhow::Result<proto::Event> {
         Ok(proto::Event::genesis(
-            None,
-            proto::AuthorId::Unknown,
+            node.identity(),
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(model)), set_owner(value)?]),
         ))
     };
     let genesis = create("alice")?;
     let remote_id = genesis.entity_id;
-    let completion = proto::Event::update(
-        remote_id,
-        proto::Clock::singleton(&genesis),
-        proto::AuthorId::Unknown,
-        proto::OperationSet(vec![set_owner("alice")?]),
-    );
+    let completion = proto::Event::update(remote_id, proto::Clock::singleton(&genesis), proto::OperationSet(vec![set_owner("alice")?]));
     commit_transaction(&node, &credential("alice"), proto::TransactionId::new(), vec![genesis.into(), completion.into()]).await?;
     assert_eq!(context.get::<DocumentView>(remote_id).await?.owner()?, "alice");
     assert_eq!(storage.dump_entity_events(remote_id).await?.len(), 2);
 
     let genesis = create("bob")?;
     let denied_id = genesis.entity_id;
-    let completion = proto::Event::update(
-        denied_id,
-        proto::Clock::singleton(&genesis),
-        proto::AuthorId::Unknown,
-        proto::OperationSet(vec![set_owner("alice")?]),
-    );
+    let completion = proto::Event::update(denied_id, proto::Clock::singleton(&genesis), proto::OperationSet(vec![set_owner("alice")?]));
     assert!(
         commit_transaction(&node, &credential("alice"), proto::TransactionId::new(), vec![genesis.into(), completion.into()],)
             .await
@@ -107,12 +96,8 @@ async fn event_state_checks_and_late_denial_roll_back_the_transaction() -> anyho
     let allowed = create("alice")?;
     let denied = create("alice")?;
     let ids = [allowed.entity_id, denied.entity_id];
-    let outside_scope = proto::Event::update(
-        denied.entity_id,
-        proto::Clock::singleton(&denied),
-        proto::AuthorId::Unknown,
-        proto::OperationSet(vec![set_owner("bob")?]),
-    );
+    let outside_scope =
+        proto::Event::update(denied.entity_id, proto::Clock::singleton(&denied), proto::OperationSet(vec![set_owner("bob")?]));
     assert!(commit_transaction(
         &node,
         &credential("alice"),
@@ -174,7 +159,6 @@ async fn existing_membership_authorizes_addition_but_new_membership_cannot_autho
         proto::Attested::from(proto::Event::update(
             state.payload.entity_id,
             state.payload.state.head,
-            proto::AuthorId::Unknown,
             proto::OperationSet(vec![proto::Operation::Membership(proto::Membership::Add(attachment))]),
         ))
     };
