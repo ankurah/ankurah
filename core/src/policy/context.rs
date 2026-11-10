@@ -243,3 +243,103 @@ impl<'a, PA: PolicyAgent> ContextPolicy<'a, PA, Mut<Vec<PA::ContextData>>> {
         Self::for_sessions(agent, Mut::new(credentials.iterable().cloned().collect()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ValidationError;
+    use crate::node::NodeInner;
+    use crate::policy::{DefaultContext, DEFAULT_CONTEXT};
+    use crate::session::SessionSet;
+    use crate::value::Value;
+    use ankql::ast::{ComparisonOperator, Expr, PropertyPath};
+    use ankurah_proto::{AuthData, CausalAssertion, NodeRequest};
+
+    /// Lets every context retrieve exactly the entities its predicate matches.
+    #[derive(Clone)]
+    struct Retrieves(Predicate<Resolved>);
+
+    #[async_trait::async_trait]
+    impl PolicyAgent for Retrieves {
+        type ContextData = &'static DefaultContext;
+
+        fn sign_request<SE: StorageEngine, C: Iterable<Self::ContextData>>(
+            &self,
+            _: &NodeInner<SE, Self>,
+            _: &C,
+            _: &NodeRequest,
+        ) -> Result<Vec<AuthData>, AccessDenied> {
+            Ok(vec![])
+        }
+
+        async fn check_request<SE: StorageEngine, A: Iterable<AuthData> + Send + Sync>(
+            &self,
+            _: &Node<SE, Self>,
+            _: &A,
+            _: &NodeRequest,
+        ) -> Result<Vec<Self::ContextData>, ValidationError> {
+            Ok(vec![])
+        }
+
+        fn check_write_event<SE: StorageEngine>(
+            &self,
+            _: &Node<SE, Self>,
+            _: &Self::ContextData,
+            _: &Entity,
+            _: &Entity,
+            _: &Event,
+        ) -> Result<Option<Attestation>, AccessDenied> {
+            Ok(None)
+        }
+
+        fn validate_received_event<SE: StorageEngine>(
+            &self,
+            _: &Node<SE, Self>,
+            _: &EntityId,
+            _: &Attested<Event>,
+        ) -> Result<(), AccessDenied> {
+            Ok(())
+        }
+
+        fn attest_state<SE: StorageEngine>(&self, _: &Node<SE, Self>, _: &EntityState) -> Option<Attestation> { None }
+
+        fn validate_received_state<SE: StorageEngine>(
+            &self,
+            _: &Node<SE, Self>,
+            _: &EntityId,
+            _: &Attested<EntityState>,
+        ) -> Result<(), AccessDenied> {
+            Ok(())
+        }
+
+        fn query_predicate<C: Iterable<Self::ContextData>>(&self, _: &C) -> Result<Predicate<Resolved>, AccessDenied> { Ok(self.0.clone()) }
+
+        fn check_write(&self, _: &Self::ContextData, _: &Entity, _: Option<&Event>) -> Result<(), AccessDenied> { Ok(()) }
+
+        fn validate_causal_assertion<SE: StorageEngine>(
+            &self,
+            _: &Node<SE, Self>,
+            _: &EntityId,
+            _: &CausalAssertion,
+        ) -> Result<(), AccessDenied> {
+            Ok(())
+        }
+    }
+
+    /// A missing property is NULL to a read policy as to a query: `owner IS NULL` admits an entity without an
+    /// owner, while `owner = 'Alice'` cannot hold for it.
+    #[test]
+    fn a_retrieval_predicate_that_a_property_is_null_admits_an_entity_without_it() {
+        let owner = || Box::new(Expr::Path(PropertyPath::registered(EntityId::from_bytes([7; 32]), "owner", vec![])));
+        let (id, unowned) = (EntityId::from_bytes([1; 32]), State::default());
+        let check =
+            |predicate| ContextPolicy::for_sessions(&Retrieves(predicate), SessionSet::from(DEFAULT_CONTEXT)).check_read(&id, &unowned);
+        assert!(check(Predicate::IsNull(owner())).is_ok());
+        let owned_by_alice = Predicate::Comparison {
+            left: owner(),
+            operator: ComparisonOperator::Equal,
+            right: Box::new(Expr::Literal(Value::String("Alice".into()))),
+        };
+        assert!(matches!(check(owned_by_alice), Err(AccessDenied::ByPolicy(_))));
+    }
+}
