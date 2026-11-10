@@ -85,10 +85,11 @@ pub struct NodeId(Identity);              // the peer layer's name for an identi
 For: a node signs its presence and its attestations with a key nobody else holds, and a
 durable node is the same node after a restart.
 
-- `NodeKey` (`core/src/node/identity/key.rs`) holds the signing key. The node owns it privately; nothing
-  serializes or prints it, and `Debug` prints the public identity. Policy agents, plugins and
-  transports never see it. What a holder of a `NodeKey` can do with it is build a node, read
-  its identity, and seal a statement (`NodeKey::attest`, section 7).
+- `NodeKey` (`core/src/node/identity/key.rs`) holds the signing key. The node owns it
+  privately; nothing prints it, and `Debug` prints the public identity. Policy agents, plugins
+  and transports never see it. What a holder of a `NodeKey` can do with it is build a node,
+  read its identity, take its seed to keep it (`to_seed`), seal a statement (`NodeKey::attest`,
+  section 7) and sign a presence (`sign_presence`).
 - A node built without a key draws a fresh one. A durable node built without a key logs a
   notice that its identity will not survive a restart.
 - Where the 32-byte seed is kept is the embedder's choice. `NodeKey::load_or_create(path)`
@@ -97,7 +98,7 @@ durable node is the same node after a restart.
 
 ### 3.3 Trusted publishers
 
-For: a node can later adopt the model and property definitions the Ankurah Commons publishes,
+For: a node can later adopt the component and property definitions the Ankurah Commons publishes,
 knowing whose signature to expect on them.
 
 - `core/src/policy/trusted_publishers.txt` holds one identity per line in its text form, with
@@ -105,8 +106,8 @@ knowing whose signature to expect on them.
   a test, not a running node. It ships empty until the Commons key exists.
 - `PolicyAgent::trusted_publishers` returns the shipped set by default; an application
   overrides it with its own.
-- Nothing consumes the set yet. Adopting a published definition by its id is later work
-  (section 13).
+- Nothing consumes the set yet. Adopting a published definition by its id is outside this
+  work (section 13).
 - A publisher key that is lost or compromised is replaced out of band: the publisher announces
   a new key and publishes new signatures. The protocol has no rotation of its own (section 12).
 
@@ -155,9 +156,10 @@ pub struct VersionNegotiation { pub offered: ProtocolVersions, pub peer_offered:
   accepting side on its presence, and only then reports itself connected. So an accepting
   node signs nothing, and runs no plugin's `announce`, for a dialer it has not authenticated,
   and nobody can ask a server for a presence to use elsewhere. Core keeps this order for
-  every connector: a handshake is begun as dialing or accepting (`Node::begin_handshake`),
-  `Node::presence` refuses an accepting handshake whose dialer has not registered, and one
-  handshake registers one peer, once.
+  every connector: a handshake is begun with how the peer was reached
+  (`Node::begin_handshake`), `Inbound` being the accepting side; `Node::presence` refuses an
+  accepting handshake whose dialer has not registered; and one handshake registers one peer,
+  once.
 - **What a receiver checks** (`core::connector::Handshake::authenticate`), each failure a
   typed `PeerConnectionError`: the presence answers the challenge this node issued on this
   connection; its signature verifies under the node id it names; the challenge in the peer's
@@ -171,11 +173,12 @@ pub struct VersionNegotiation { pub offered: ProtocolVersions, pub peer_offered:
   plugin's name (section 10). A node ignores a name it does not know. The keys are names and
   not definition ids: no definition exists to name yet, and a presence is never stored, so
   changing the key type later is an ordinary version step.
-- **One deadline.** Everything the accepting side does before it has answered the dialer
-  runs inside one handshake deadline: reading the dialer's opening and presence, registering
-  the dialer with every plugin's hook, and signing its own presence with every plugin's
-  announcement. A connection not established by then closes, so neither a dialer that never
-  presents nor a slow plugin holds it open.
+- **One deadline.** Everything a server does before it has answered the dialer runs inside
+  one handshake deadline: reading the dialer's opening and presence, registering the dialer
+  with every plugin's hook, and signing its own presence with every plugin's announcement. A
+  connection not established by then closes, so neither a dialer that never presents nor a
+  slow plugin holds it open. The local-process connector, which joins two nodes in one
+  process, sets no deadline.
 - **Closing without a frame.** An accepting node that has itself halted, or whose deadline
   passed, closes without `Refused`. A receiver closes a connection that sends a frame of a
   variant its chosen version does not define.
@@ -238,7 +241,7 @@ pub enum EventBody {
     Update  { nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
 }
 pub enum CarriedOperation { Bytes(Vec<u8>), Erased([u8; 32]) }
-pub enum UnreadableOperation { UnknownKind { index: u32 }, Malformed(String), Erased }
+pub enum UnreadableOperation { UnknownKind { indices: Vec<u32> }, Malformed(String), Erased }
 
 // operation digest = SHA-256( tag(operation) || bytes )       for Bytes
 //                  = the 32 bytes carried                     for Erased
@@ -435,8 +438,9 @@ server holds one `M` entity per seeding.
 - Either side holding none is no verdict, so a first connection, a peer that is behind and a
   peer of the same seeding all register normally. An announcement the plugin cannot read is
   also no verdict: it accepts and logs.
-- A node that holds none of the announced entities fetches them once the peer is registered,
-  so a first connection leaves the node holding its System entity.
+- An ephemeral node fetches the announced entities it lacks once the peer is registered, so
+  a first connection leaves it holding its System entity. A durable node reads only its own
+  storage and fetches nothing.
 
 ## 11. Versions and stores
 
