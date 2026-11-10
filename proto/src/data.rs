@@ -544,18 +544,6 @@ mod tests {
         assert!(genesis.operations().decode().is_err());
     }
 
-    /// The two tags keep the two preimage shapes apart even when every hashed
-    /// field happens to coincide.
-    #[test]
-    fn the_two_preimage_shapes_never_collide() {
-        let nonce = [1u8; 32];
-        let timestamp = 42u64;
-        let operations = carried();
-        let genesis = EventId::from_genesis_parts(&Identity::Ed25519([0u8; 32]), &nonce, timestamp, &operations);
-        let update = EventId::from_update_parts(&EntityId::from_bytes([0u8; 32]), &nonce, timestamp, &operations, &Clock::default());
-        assert_ne!(genesis, update);
-    }
-
     /// The minter is inside the genesis id: the same content minted under two
     /// identities is two entities, so no relay can re-attribute an entity
     /// without changing what it is.

@@ -230,6 +230,15 @@ mod tests {
         assert!(matches!(carried.decode(), Err(UnreadableOperation::Undecodable(_))), "one unreadable operation fails the event's");
     }
 
+    /// `Membership` index 1 is reserved for the variant that removes a membership, which no build reads yet.
+    #[test]
+    fn a_membership_of_the_reserved_removal_index_cannot_be_read() {
+        let CarriedOperation::Bytes(mut bytes) = CarriedOperation::encode(&membership()) else { unreachable!("encoding yields bytes") };
+        // The operation's variant index, then the membership's.
+        bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(CarriedOperation::Bytes(bytes).decode(), Err(UnreadableOperation::Undecodable(_))));
+    }
+
     #[test]
     fn bytes_left_over_after_the_operation_make_it_unreadable() {
         let CarriedOperation::Bytes(mut bytes) = CarriedOperation::encode(&membership()) else { unreachable!("encoding yields bytes") };

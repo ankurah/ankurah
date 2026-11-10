@@ -324,10 +324,15 @@ mod tests {
         unknown_attester[0] = 1;
         let mut unknown_subject = bincode::serialize(&statement).unwrap();
         unknown_subject[36] = 2;
+        // Signature variant index 1, which no build defines yet: it follows the statement's length and bytes.
+        let mut unknown_signature = sealed.0.clone();
+        let signature_index = 8 + bincode::serialize(&statement).unwrap().len();
+        unknown_signature[signature_index..signature_index + 4].copy_from_slice(&1u32.to_le_bytes());
         for undecodable in [
             SealedAttestation(vec![]),
             SealedAttestation(b"not an attestation".to_vec()),
             SealedAttestation(trailing),
+            SealedAttestation(unknown_signature),
             with_statement_bytes(&sealed, statement_bytes),
             with_statement_bytes(&sealed, unknown_attester),
             with_statement_bytes(&sealed, unknown_subject),

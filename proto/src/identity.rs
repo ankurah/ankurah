@@ -250,7 +250,11 @@ mod tests {
         assert_eq!(bincode::deserialize::<Identity>(&bincode::serialize(&identity).unwrap()).unwrap(), identity);
 
         let node = NodeId::from(identity);
-        assert_eq!(bincode::serialize(&node).unwrap(), bincode::serialize(&identity).unwrap(), "a node id encodes as its identity");
+        assert_eq!(
+            bincode::serialize(&node).unwrap(),
+            [0u32.to_le_bytes().as_slice(), &[7; 32]].concat(),
+            "a node id encodes as its identity"
+        );
     }
 
     /// The text form names the scheme, so a key of a later scheme can never be read as an ed25519 key.
