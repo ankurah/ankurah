@@ -411,8 +411,9 @@ pub struct PeerRefusal { pub plugin: &'static str, pub reason: String }
   handshake authenticates and `peer_trust` is decided, and before anything is inserted. The
   first refusal returns `PeerConnectionError::Refused(PeerRefusal)` and leaves nothing
   registered. No lock is held across a hook. A plugin may call `Node::reset` from the hook and
-  then refuse. A hook can be dropped at any await, when the connection closes or the
-  accepting side's handshake deadline passes, and the peer is then not registered.
+  then refuse. A hook can be dropped at any await: when its node halts or the connector shuts
+  down, when the connection closes, or when an accepting connector's handshake deadline
+  passes; the peer is then not registered.
 - **A plugin decides from what the handshake carries.** No connector reads a peer's messages
   while `register_peer` is awaited, so a plugin cannot ask the peer anything from this hook;
   what it needs to know about the peer travels in the peer's announcement. A hook that
