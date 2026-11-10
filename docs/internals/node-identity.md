@@ -50,12 +50,12 @@ each of its [plugins](node-architecture.md#node-plugins) announces under the
 plugin's name, all signed under the tag `ankurah.presence.v1`. A node ignores
 a feature number it does not know, and an announcement under a name none of
 its plugins has; each of its plugins receives the announcement under its own
-name. This build assigns no feature numbers. Connectors hold each connection's side of the handshake
-in a `Handshake`, and `register_peer` spends it: it accepts the presence only
-if it answers the single-use challenge this node issued for that connection,
-its signature verifies under the key it names, it does not name this node
-itself, and it repeats the offers this node sent and saw and the version this
-node chose. Openings carry no signature, so a party between the two nodes
+name. This build assigns no feature numbers. Connectors hold each connection's
+side of the handshake in a `Handshake`, and `register_peer` spends it: it
+accepts the presence only if it answers the single-use challenge this node
+issued for that connection, its signature verifies under the key it names, it
+does not name this node itself, and it repeats the offers this node sent and
+saw and the version this node chose. Openings carry no signature, so a party between the two nodes
 could change the offers to lower the version chosen; the peer then signs
 offers that differ from this node's, and its presence is refused. A presence
 copied from another connection answers a different challenge and is refused.
