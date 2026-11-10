@@ -471,15 +471,27 @@ async fn names_checked_before_ready<SE: StorageEngine + Send + Sync + 'static>(e
         assert!(matches!(&refused, Err(RetrievalError::ComponentScope(error)) if *error == expected), "{engine}: {selection}: {refused:?}");
     }
 
+    // Whether two components declare `note` as one property, and whether `Nobody` is a component at all, waits
+    // for their bound identities and the catalog.
     let open = ctx.query::<(TaskView, AssignmentView)>("status = 'open'")?;
+    let ambiguous = ctx.query::<(TaskView, AssignmentView)>("note = 'x'")?;
+    let unknown = ctx.query::<(TaskView, AssignmentView)>("Nobody::closed_at = 5")?;
     node.system.create().await?;
     open.wait_initialized().await?;
     assert!(open.ids().is_empty(), "{engine}");
+    let expected = ComponentScopeError::Ambiguous { name: "note".into(), first: "Task".into(), second: "Assignment".into() };
+    let refused = ambiguous.wait_initialized().await;
+    assert!(matches!(&refused, Err(RetrievalError::ComponentScope(error)) if *error == expected), "{engine}: {refused:?}");
+    let refused = unknown.wait_initialized().await;
+    assert!(
+        matches!(&refused, Err(RetrievalError::ComponentScope(ComponentScopeError::UnknownComponent(name))) if name == "Nobody"),
+        "{engine}: {refused:?}"
+    );
     Ok(())
 }
 
-/// A tuple live query made before its node is ready is refused at once when a name cannot resolve, and
-/// otherwise waits for the node and answers.
+/// A tuple live query made before its node is ready is refused at once when its components do not declare a
+/// name, and otherwise waits for the node; names that need bound identities or the catalog are refused then.
 #[tokio::test]
 async fn a_tuple_live_query_made_before_its_node_is_ready_checks_its_names_at_once() -> anyhow::Result<()> {
     names_checked_before_ready("sled", SledStorageEngine::new_test()?).await?;

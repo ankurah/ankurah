@@ -110,7 +110,9 @@ impl Context {
         let views = self.fetch::<R>(args).await?;
         Ok(views.into_iter().next())
     }
-    /// Subscribe to a typed selection, rejecting unknown fields immediately.
+    /// Subscribe to a typed selection, rejecting names its components do not declare immediately; names
+    /// that need the components' bound identities or the catalog (a bare name two components declare, a
+    /// qualifier naming no component of the query) are checked when the components are bound.
     /// When registration is needed, initialization failures appear in the query's
     /// error signal and are returned by `wait_initialized`.
     pub fn query<R>(
