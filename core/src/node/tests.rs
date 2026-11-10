@@ -8,6 +8,7 @@ use ankurah_proto::Attested;
 use ankurah_signals::Subscribe;
 
 mod commit;
+mod connections;
 mod identity;
 mod plugins;
 mod reset;
