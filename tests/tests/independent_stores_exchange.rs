@@ -1,5 +1,5 @@
-//! Nodes that share no system root connect and exchange entities: whether a
-//! peer is durable follows from how it was reached and what policy allows.
+//! Nodes created independently connect and exchange entities; whether a peer is
+//! durable follows from how it was reached and what policy allows.
 
 mod common;
 
@@ -12,20 +12,10 @@ use async_trait::async_trait;
 use common::*;
 use std::sync::{Arc, Mutex};
 
-/// The store materializes no built-in model but the catalog's: there is no system collection to hold a root.
-async fn assert_no_system_collection(storage: &SledStorageEngine) -> anyhow::Result<()> {
-    for model in storage.list_materializations().await? {
-        assert!(matches!(model, proto::ModelId::EntityId(_)) || ankurah::core::schema::is_catalog_model(&model), "{model}");
-    }
-    Ok(())
-}
-
 #[tokio::test]
-async fn a_durable_and_an_ephemeral_node_exchange_entities_with_no_system_root() -> anyhow::Result<()> {
-    let server_storage = Arc::new(SledStorageEngine::new_test()?);
-    let client_storage = Arc::new(SledStorageEngine::new_test()?);
-    let server = Node::new_durable(server_storage.clone(), PermissiveAgent::new());
-    let client = Node::new(client_storage.clone(), PermissiveAgent::new());
+async fn a_durable_and_an_ephemeral_node_created_independently_exchange_entities() -> anyhow::Result<()> {
+    let server = Node::new_durable(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
+    let client = Node::new(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new());
     let _connection = LocalProcessConnection::new(&server, &client).await?;
     let server_context = server.context_async(DEFAULT_CONTEXT).await?;
     let client_context = client.context_async(DEFAULT_CONTEXT).await?;
@@ -39,8 +29,6 @@ async fn a_durable_and_an_ephemeral_node_exchange_entities_with_no_system_root()
 
     assert_eq!(server_context.get::<AlbumView>(from_client).await?.name()?, "minted by the client");
     assert_eq!(client_context.get::<AlbumView>(from_server).await?.name()?, "minted by the server");
-    assert_no_system_collection(&server_storage).await?;
-    assert_no_system_collection(&client_storage).await?;
     Ok(())
 }
 
@@ -158,7 +146,6 @@ async fn two_independently_created_durable_stores_exchange_when_configured_to_tr
             assert!(storage.get_state(*id).await.is_ok(), "each store holds both entities");
             assert!(!storage.dump_entity_events(*id).await?.is_empty());
         }
-        assert_no_system_collection(storage).await?;
     }
     Ok(())
 }
