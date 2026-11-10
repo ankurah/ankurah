@@ -72,9 +72,9 @@ The entry count as a `u64`, then each entry in ascending order of its event id
 (compared as bytes): the generation as a `u32`, then the `EventId`. No two
 entries share an event id, and no generation is 0.
 
-A reader refuses a clock whose entries are not in strictly ascending order of
-event id, which also refuses an event id given twice, and one with a generation
-of 0. An update's id covers its parent clock (4.3), so a clock has exactly one
+A reader refuses a clock with a generation of 0, or whose entries are not in
+strictly ascending order of event id, which refuses an event id given twice as
+well. An update's id covers its parent clock (4.3), so a clock has exactly one
 encoding.
 
 ### 3.3 `ModelId` and `PropertyId`
