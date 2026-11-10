@@ -9,7 +9,7 @@ use rand::rngs::SmallRng;
 use std::{
     fmt,
     ops::Deref,
-    sync::{Arc, Mutex, Weak},
+    sync::{Arc, Weak},
 };
 use tokio::sync::oneshot;
 
@@ -22,8 +22,6 @@ use crate::policy::{ContextPolicy, PeerTrust};
 use crate::reactor::Reactor;
 use crate::retrieval::{CachedEventGetter, LocalEventGetter, LocalStateGetter};
 use crate::schema::catalog::register::RegistrationAuth;
-use crate::util::safemap::SafeMap;
-use crate::util::safeset::SafeSet;
 use crate::util::Iterable;
 use crate::{action_info, notice_info};
 use itertools::Itertools;
@@ -43,6 +41,7 @@ mod key;
 mod lifecycle;
 mod match_args;
 mod peer_state;
+mod peers;
 mod plugin;
 mod schema_registration;
 mod state;
@@ -56,6 +55,7 @@ pub use key::NodeKey;
 use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub use peer_state::PeerState;
+use peers::{PeerRegistry, RequiredTrust};
 use plugin::NodePlugins;
 pub use plugin::{AnnouncementFailure, DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};
 use schema_registration::WireRegistrant;
@@ -99,15 +99,6 @@ where PA: PolicyAgent
 
 pub use crate::session::ContextData;
 
-/// What a request needs from the trust its recipient holds when it is sent.
-#[derive(Clone, Copy)]
-enum RequiredTrust {
-    /// Any registered peer.
-    Any,
-    /// A peer this node trusts as durable.
-    Durable,
-}
-
 pub struct NodeInner<SE, PA>
 where PA: PolicyAgent
 {
@@ -123,17 +114,7 @@ where PA: PolicyAgent
     /// or update one already registered there. Otherwise a competing writer could retry
     /// from stale in-memory state after storage advances. Reactor notification follows later.
     pub(crate) commit_publication_lock: tokio::sync::Mutex<()>,
-    peer_connections: SafeMap<proto::NodeId, Arc<PeerState<PA::ContextData>>>,
-    durable_peers: SafeSet<proto::NodeId>,
-    /// Held while a registration or deregistration updates `durable_peers`, the subscription
-    /// relay and `peer_connections`, so all three describe the same registration.
-    registration: Mutex<()>,
-
-    /// Per-node source of randomness for peer selection. Seeded from entropy in production;
-    /// an explicit seed can be injected at construction so the simulation harness and tests
-    /// can reproduce an identical selection sequence. Held behind a Mutex because draws mutate
-    /// RNG state and Node is shared across tasks; the lock is only ever held for a single draw.
-    rng: Mutex<SmallRng>,
+    peers: PeerRegistry<PA::ContextData>,
 
     /// The continuous superset of every session backing a context on
     /// this node: each context attaches its credential source here at
@@ -279,10 +260,7 @@ where
             storage: engine,
             entities: entityset,
             commit_publication_lock: tokio::sync::Mutex::new(()),
-            peer_connections: SafeMap::new(),
-            durable_peers: SafeSet::new(),
-            registration: Mutex::new(()),
-            rng: Mutex::new(rng),
+            peers: PeerRegistry::new(rng),
             reactor,
             durable,
             policy_agent,
@@ -380,21 +358,7 @@ where
         // A plugin may have halted this node.
         self.lifecycle.check_not_halted()?;
         let subscription_handler = SubscriptionHandler::new(peer, self);
-        let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        // The latest registration decides trust: an id registering again without durable trust
-        // leaves durable routing before its new sender is reachable.
-        if !trust.durable && self.durable_peers.remove(&peer) {
-            if let Some(ref relay) = self.subscription_relay {
-                relay.notify_peer_disconnected(peer);
-            }
-        }
-        self.peer_connections.insert(peer, Arc::new(PeerState::new(sender, trust, subscription_handler)));
-        if trust.durable {
-            self.durable_peers.insert(peer);
-            if let Some(ref relay) = self.subscription_relay {
-                relay.notify_peer_connected(peer);
-            }
-        }
+        self.peers.register(peer, PeerState::new(sender, trust, subscription_handler), self.subscription_relay.as_ref());
         // TODO send hello message to the peer, including present head state for all relevant collections
         Ok(())
     }
@@ -402,17 +366,9 @@ where
     pub fn deregister_peer(&self, node_id: proto::NodeId) {
         notice_info!("Node({:#}) deregister_peer {:#}", self.id, node_id);
 
-        let _registration = self.registration.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.durable_peers.remove(&node_id);
-        // Get and cleanup subscriptions before removing the peer
-        if let Some(peer_state) = self.peer_connections.remove(&node_id) {
+        if let Some(peer_state) = self.peers.deregister(node_id, self.subscription_relay.as_ref()) {
             action_info!(self, "unsubscribing", "subscription {} for peer {}", peer_state.subscription_handler.subscription_id(), node_id);
             // ReactorSubscription is automatically unsubscribed on drop
-        }
-
-        // Notify subscription relay of peer disconnection (unconditional - relay handles filtering)
-        if let Some(ref relay) = self.subscription_relay {
-            relay.notify_peer_disconnected(node_id);
         }
     }
     /// Send a request to a connected peer and wait for its response.
@@ -467,21 +423,12 @@ where
 
         {
             // Checked and sent with no await between, through the connection that was checked.
-            let connection = self.trusted_connection(&node_id, required)?;
+            let connection = self.peers.trusted_connection(&node_id, required)?;
             connection.pending_requests.insert(request_id, response_tx);
             connection.send_message(proto::NodeMessage::Request { auth, request })?;
         }
 
         response_rx.await.map_err(|_| RequestError::InternalChannelClosed)?
-    }
-
-    /// The connection to `peer`, if the trust this node grants that connection now meets `required`.
-    fn trusted_connection(&self, peer: &proto::NodeId, required: RequiredTrust) -> Result<Arc<PeerState<PA::ContextData>>, RequestError> {
-        let connection = self.peer_connections.get(peer).ok_or(RequestError::PeerNotConnected)?;
-        match required {
-            RequiredTrust::Durable if !connection.trust.durable => Err(RequestError::NotTrustedAsDurable(*peer)),
-            RequiredTrust::Any | RequiredTrust::Durable => Ok(connection),
-        }
     }
 
     // TODO LATER: rework this to be retried in the background some number of times
@@ -495,7 +442,7 @@ where
         let id = proto::UpdateId::new();
 
         // Get the peer connection
-        let Some(connection) = self.peer_connections.get(&node_id) else {
+        let Some(connection) = self.peers.connection(&node_id) else {
             warn!("Failed to send update to peer {}: {}", node_id, RequestError::PeerNotConnected);
             return;
         };
@@ -526,7 +473,7 @@ where
             proto::NodeMessage::Update(update) => {
                 debug!("Node({}) received update {}", self.id, update);
 
-                if let Some(sender) = { self.peer_connections.get(&update.from).map(|c| c.sender.cloned()) } {
+                if let Some(sender) = { self.peers.connection(&update.from).map(|c| c.sender.cloned()) } {
                     let _from = update.from;
                     let _id = update.id.clone();
                     if update.to != self.id {
@@ -556,7 +503,7 @@ where
             }
             proto::NodeMessage::UpdateAck(ack) => {
                 debug!("Node({}) received ack notification {} {}", self.id, ack.id, ack.body);
-                // let connection = self.peer_connections.get(&ack.from).ok_or(RequestError::PeerNotConnected)?;
+                // let connection = self.peers.connection(&ack.from).ok_or(RequestError::PeerNotConnected)?;
                 // if let Some(tx) = connection.pending_updates.remove(&ack.id) {
                 //     tx.send(Ok(proto::NodeResponseBody::Success)).unwrap();
                 // }
@@ -569,7 +516,7 @@ where
                 // which would lend itself to spawning a task here and making this function synchronous.
 
                 // double check to make sure we have a connection to the peer based on the node id
-                if let Some(sender) = { self.peer_connections.get(&request.from).map(|c| c.sender.cloned()) } {
+                if let Some(sender) = { self.peers.connection(&request.from).map(|c| c.sender.cloned()) } {
                     let from = request.from;
                     let request_id = request.id.clone();
                     if request.to != self.id {
@@ -609,7 +556,7 @@ where
             }
             proto::NodeMessage::Response(response) => {
                 debug!("Node {} received response {}", self.id, response);
-                let connection = self.peer_connections.get(&response.from).ok_or(RequestError::PeerNotConnected)?;
+                let connection = self.peers.connection(&response.from).ok_or(RequestError::PeerNotConnected)?;
                 if let Some(tx) = connection.pending_requests.remove(&response.request_id) {
                     let body = match response.body.decode() {
                         Ok(proto::NodeResponseBody::Unsupported) => Err(RequestError::UnsupportedByPeer(response.from)),
@@ -621,7 +568,7 @@ where
             }
             proto::NodeMessage::UnsubscribeQuery { from, query_id } => {
                 // Remove predicate from the peer's subscription
-                if let Some(peer_state) = self.peer_connections.get(&from) {
+                if let Some(peer_state) = self.peers.connection(&from) {
                     peer_state.subscription_handler.remove_predicate(query_id).await?;
                 }
             }
@@ -695,7 +642,7 @@ where
             }
             proto::NodeRequestBody::GetEvents { event_ids } => Ok(handler::get_events(self, cdata, event_ids).await?),
             proto::NodeRequestBody::SubscribeQuery { query_id, selection, version, known_matches } => {
-                let peer_state = self.peer_connections.get(&from).ok_or_else(|| anyhow!("Peer {} not connected", from))?;
+                let peer_state = self.peers.connection(&from).ok_or_else(|| anyhow!("Peer {} not connected", from))?;
                 // Catalog subscriptions carry no credential; others carry exactly one.
                 let cdata = match cdata.iterable().at_most_one() {
                     Ok(cdata) => cdata,
@@ -711,7 +658,7 @@ where
     }
 
     async fn handle_update(&self, from: proto::NodeId, body: proto::NodeUpdateBody) -> anyhow::Result<()> {
-        let Some(_connection) = self.peer_connections.get(&from) else {
+        let Some(_connection) = self.peers.connection(&from) else {
             return Err(anyhow!("Rejected notification from unknown node {}", from));
         };
 
@@ -974,28 +921,14 @@ where
         }
     }
 
-    /// Get a random durable peer node ID.
-    ///
-    /// Draws from the node's seeded RNG (not `thread_rng`) so the simulation harness can reproduce
-    /// selections. The candidate slice is sorted first: `choose` indexes by position, so a stable
-    /// candidate order is required for a given seed to yield a given peer.
-    pub fn get_durable_peer_random(&self) -> Option<proto::NodeId> {
-        let peers = self.get_durable_peers();
-        let mut rng = self.rng.lock().expect("node rng mutex poisoned");
-        peers.choose(&mut *rng).copied()
-    }
+    /// A durable peer drawn from the node's seeded source of randomness.
+    pub fn get_durable_peer_random(&self) -> Option<proto::NodeId> { self.peers.random_durable() }
 
     /// The trust this node granted a connected peer.
-    pub fn granted_trust(&self, peer: &proto::NodeId) -> Option<PeerTrust> { self.peer_connections.get(peer).map(|state| state.trust) }
+    pub fn granted_trust(&self, peer: &proto::NodeId) -> Option<PeerTrust> { self.peers.granted_trust(peer) }
 
-    /// Get all durable peer node IDs, sorted by id for a stable fan-out order.
-    /// The underlying set is unordered; callers that emit per peer (relay, random selection)
-    /// depend on this stable order for the C1 determinism audit.
-    pub fn get_durable_peers(&self) -> Vec<proto::NodeId> {
-        let mut peers = self.durable_peers.to_vec();
-        peers.sort();
-        peers
-    }
+    /// The durable peers' ids, sorted by id for a stable fan-out order.
+    pub fn get_durable_peers(&self) -> Vec<proto::NodeId> { self.peers.durable_peers() }
 
     /// TEST ONLY: Create a phantom entity with a specific ID.
     ///
@@ -1018,7 +951,7 @@ where
     ///
     /// Requires the `test-helpers` feature to be enabled.
     #[cfg(feature = "test-helpers")]
-    pub fn insert_durable_peer_for_test(&self, peer_id: proto::NodeId) { self.durable_peers.insert(peer_id); }
+    pub fn insert_durable_peer_for_test(&self, peer_id: proto::NodeId) { self.peers.insert_durable_for_test(peer_id); }
 
     /// TEST ONLY: Observe the session registry — the current credential
     /// of every session backing a context on this node, in the
@@ -1040,7 +973,7 @@ where
     PA: PolicyAgent + Send + Sync + 'static,
 {
     pub async fn request_remote_unsubscribe(&self, query_id: proto::QueryId, peers: Vec<proto::NodeId>) -> anyhow::Result<()> {
-        for (peer_id, item) in self.peer_connections.get_list(peers) {
+        for (peer_id, item) in self.peers.connections(peers) {
             if let Some(connection) = item {
                 connection.send_message(proto::NodeMessage::UnsubscribeQuery { from: self.id, query_id })?;
             } else {
