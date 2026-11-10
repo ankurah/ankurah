@@ -120,8 +120,9 @@ bytes, so the message, its ids and its addresses decode even when the body is
 of a kind a later build added. A node answers a request whose body it cannot
 read with `NodeResponseBody::Unsupported`, acknowledges such an update with
 `NodeUpdateAckBody::Unsupported`, and fails a request whose response it cannot
-read with `RequestError::UnreadableResponse`. A message of a kind it does not
-know at all is dropped and the connection stays up.
+read with `RequestError::UnreadableResponse`. A request its peer answers with
+`Unsupported` fails with `RequestError::UnsupportedByPeer`. A message of a kind
+it does not know at all is dropped and the connection stays up.
 
 
 ## Subscription Propagation
