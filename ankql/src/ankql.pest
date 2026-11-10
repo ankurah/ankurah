@@ -38,7 +38,8 @@ Expr = { ExprAtomValue ~ (ExprInfixOp ~ ExprAtomValue)* }
             QuestionParameter = @{ "?" }
             PathExpr = { ComponentQualifier? ~ Identifier ~ ("." ~ Identifier)* }
                 // `Assignment::assignee` names the component a property belongs to; dots after it keep their meaning.
-                ComponentQualifier = ${ Identifier ~ "::" }
+                // `::` takes no whitespace on either side, in a predicate as in ORDER BY.
+                ComponentQualifier = ${ Identifier ~ "::" ~ !WS }
             ExpressionInParentheses = { "(" ~ Expr ~ ")" }
             Row = { "(" ~ Expr ~ ("," ~ Expr)* ~ ")" }
 

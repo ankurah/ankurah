@@ -795,6 +795,19 @@ mod tests {
     }
 
     #[test]
+    fn component_qualifier_takes_no_whitespace_around_its_colons() {
+        for source in [
+            "Assignment:: assignee = 'x'",
+            "Assignment ::assignee = 'x'",
+            "Assignment :: assignee = 'x'",
+            "true ORDER BY Assignment:: assignee",
+            "true ORDER BY Assignment ::assignee",
+        ] {
+            assert!(parse_selection(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
     fn order_by_takes_a_component_qualifier() -> anyhow::Result<()> {
         let selection = parse_selection("true ORDER BY Assignment::assignee DESC, \"records.closure\"::closed_at")?;
         assert_eq!(
