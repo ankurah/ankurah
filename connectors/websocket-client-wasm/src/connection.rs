@@ -201,7 +201,7 @@ impl Connection {
                 proto::Message::Open(_) => warn!("Ignoring repeated opening from {}", self.url),
                 proto::Message::NoCommonVersion(theirs) => {
                     let no_common_version = PeerConnectionError::NoCommonVersion { ours: proto::ProtocolVersions::SPOKEN, theirs };
-                    error!("Server {} refused connection: {}", self.url, no_common_version);
+                    error!("Server {} answered this node's opening: {}; closing", self.url, no_common_version);
                     self.disconnect();
                     self.set_state(ConnectionState::Error { message: no_common_version.to_string(), cause: Some(no_common_version) });
                 }

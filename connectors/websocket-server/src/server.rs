@@ -199,7 +199,9 @@ async fn read_opening(
     let ours = match handshake.read_opening(frame) {
         Ok(()) => return Some(ControlFlow::Continue(())),
         Err(PeerConnectionError::NoCommonVersion { ours, theirs }) => {
-            warn!("Refusing peer at {client_ip}: it speaks protocol versions {theirs} and this node speaks {ours}");
+            warn!(
+                "Peer at {client_ip} speaks protocol versions {theirs}, none of which this node speaks; answering with {ours} and closing"
+            );
             ours
         }
         Err(refusal) => {
