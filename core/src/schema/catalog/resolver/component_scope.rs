@@ -32,6 +32,10 @@ pub enum ComponentScopeError {
     /// A qualifier naming neither a component of the query by display name nor any component by label.
     #[error("unknown component '{0}': a qualifier names one of the query's components by name, or any component by its label")]
     UnknownComponent(String),
+    /// An ORDER BY key on a component outside the query. An entity without that component has no value
+    /// to sort by, and some engines take sort candidates only from entities that have one.
+    #[error("ORDER BY {component}::{name} sorts by a component outside the query; add {component} to the query's tuple")]
+    SortKeyOutsideQuery { component: String, name: String },
     /// A name that none of these components declares.
     #[error("no property '{name}' in {}", describe_components(.components))]
     Undeclared { name: String, components: Vec<String> },
@@ -99,6 +103,23 @@ pub(super) fn locate_property<'p, R: ModelResolver + ?Sized>(
     }
     let (component, property) = found.ok_or_else(|| undeclared(components, first))?;
     Ok(LocatedProperty { model: component.model, name: first, property, subpath: rest })
+}
+
+/// Find the property an ORDER BY key names, which must belong to one of `components`.
+pub(super) fn locate_sort_key<'p, R: ModelResolver + ?Sized>(
+    components: &[QueryComponent<'_>],
+    resolver: &R,
+    path: &'p PathExpr,
+) -> Result<LocatedProperty<'p>, ModelResolutionError> {
+    if let Some(qualifier) = &path.component {
+        let in_query = components.iter().any(|component| component.name == Some(qualifier.as_str()))
+            || resolver.resolve_model(qualifier)?.is_some_and(|model| components.iter().any(|component| component.model == model));
+        if !in_query {
+            let name = path.steps.first().cloned().unwrap_or_default();
+            return Err(ComponentScopeError::SortKeyOutsideQuery { component: qualifier.clone(), name }.into());
+        }
+    }
+    locate_property(components, resolver, path)
 }
 
 /// The property `name` in `model`: the entity id, a system property, or a registered one.

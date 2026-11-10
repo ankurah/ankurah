@@ -344,6 +344,16 @@ async fn qualified_names(f: Fixture) -> anyhow::Result<()> {
     assert_eq!(f.fetch_pairs_in_order("status = 'open' ORDER BY Assignment::assignee DESC").await?, ["bob", "ada"], "{engine}");
     assert_eq!(f.fetch_pairs_in_order("assignee = 'ada' ORDER BY Task::note").await?, ["done", "ada"], "{engine}");
 
+    // An ORDER BY key belongs to a component in the tuple, though a predicate may read one outside it.
+    for (selection, component) in
+        [("true ORDER BY \"records.closure\"::closed_at", "records.closure"), ("true ORDER BY Nobody::closed_at", "Nobody")]
+    {
+        let outside = ComponentScopeError::SortKeyOutsideQuery { component: component.into(), name: "closed_at".into() };
+        assert_eq!(f.refusal(selection).await, outside, "{engine}: {selection}");
+        let live = f.ctx.query_wait::<(TaskView, AssignmentView)>(selection).await.map(|_| ());
+        assert!(matches!(&live, Err(RetrievalError::ComponentScope(error)) if *error == outside), "{engine}: {live:?}");
+    }
+
     // A qualifier must name a known component, and its component must declare the property.
     assert_eq!(f.refusal("Nobody::closed_at = 5").await, ComponentScopeError::UnknownComponent("Nobody".into()), "{engine}");
     assert_eq!(f.refusal("Closure::closed_at = 5").await, ComponentScopeError::UnknownComponent("Closure".into()), "{engine}");
@@ -360,8 +370,8 @@ async fn qualified_names(f: Fixture) -> anyhow::Result<()> {
 }
 
 /// `Component::name` names the component a property belongs to, in a predicate and in ORDER BY: a component
-/// of the tuple by display name or label. A qualifier naming no such component and no label, or a property
-/// its component does not declare, is refused.
+/// of the tuple by display name or label. A qualifier naming no such component and no label, a property its
+/// component does not declare, or an ORDER BY key on a component outside the tuple, is refused.
 #[tokio::test]
 async fn a_qualifier_names_the_component_a_property_belongs_to() -> anyhow::Result<()> {
     qualified_names(on_sled().await?).await?;

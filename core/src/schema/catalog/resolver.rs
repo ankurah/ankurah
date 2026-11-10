@@ -9,7 +9,7 @@ use crate::value::ValueType;
 
 mod component_scope;
 pub use component_scope::ComponentScopeError;
-use component_scope::{locate_property, QueryComponent};
+use component_scope::{locate_property, locate_sort_key, QueryComponent};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResolvedProperty {
@@ -185,6 +185,12 @@ pub(crate) fn validate_selection_names(schemas: &[&ModelStructDescriptor], selec
     };
     check_predicate_names(&selection.predicate, &check)?;
     for item in selection.order_by.iter().flatten() {
+        if let Some(qualifier) = &item.path.component {
+            if !schemas.iter().any(|schema| schema.name == qualifier || schema.label == qualifier) {
+                let name = item.path.steps.first().cloned().unwrap_or_default();
+                return Err(ComponentScopeError::SortKeyOutsideQuery { component: qualifier.clone(), name }.into());
+            }
+        }
         check(&item.path)?;
     }
     Ok(())
@@ -255,7 +261,7 @@ fn resolve_order_by_item<R: ModelResolver + ?Sized>(
     item: &OrderByItem<Parsed>,
 ) -> Result<OrderByItem<Resolved>, ModelResolutionError> {
     let path = &item.path;
-    let found = locate_property(components, resolver, path)?;
+    let found = locate_sort_key(components, resolver, path)?;
     check_order_by_path(&found.model, path, found.subpath)?;
     Ok(OrderByItem { path: resolved_property_path(found.property.id, found.name, vec![]), direction: item.direction.clone() })
 }
