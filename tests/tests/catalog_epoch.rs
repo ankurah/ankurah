@@ -6,7 +6,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Notify;
 
 #[tokio::test]
-async fn a_reset_does_not_wait_for_an_inflight_commit() -> anyhow::Result<()> {
+async fn a_reset_does_not_wait_for_a_commit_awaiting_its_durable_peer() -> anyhow::Result<()> {
     tokio::time::timeout(Duration::from_secs(30), async {
         let server = durable_sled_setup().await?;
         let client = ephemeral_sled_setup().await?;

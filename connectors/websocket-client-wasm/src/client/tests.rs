@@ -506,7 +506,7 @@ async fn a_refusal_is_reported_with_its_reason_and_the_client_waits_longer_befor
             assert_eq!(*client.reconnect_delay.borrow(), delay, "the client waits longer before each dial");
         }
         assert_eq!(connected.load(Ordering::Relaxed), 0, "the client never counted itself connected");
-        assert!(!node.0.published.value(), "the client registered nothing");
+        assert!(!node.0.started.value(), "the client never asked its node to register the server");
         assert_eq!(handle.ready().await, Err("the server refused this node: not today".to_string()));
     };
     futures::pin_mut!(run);

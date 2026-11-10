@@ -81,8 +81,8 @@ async fn a_client_the_server_refuses_reports_why_never_connects_and_waits_longer
     assert!(matches!(client.state().value(), ConnectionState::RefusedByServer { .. }), "a refusal stays visible while the client retries");
     assert_eq!(connected.load(Ordering::Relaxed), 0, "the client never counted itself connected");
     assert!(!client.is_connected());
-    assert_eq!(node.granted_trust(&server.id), None, "the client registered nothing");
-    assert_eq!(server.granted_trust(&node.id), None, "the server left nothing registered");
+    assert_eq!(node.granted_trust(&server.id), None, "the client holds no registration of the server");
+    assert_eq!(server.granted_trust(&node.id), None, "the server holds no registration of the client");
     client.shutdown().await?;
     server_task.abort();
     Ok(())

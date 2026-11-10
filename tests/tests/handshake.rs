@@ -133,7 +133,7 @@ async fn a_wider_opening_settles_on_the_version_the_server_speaks() -> Result<()
     let server_presence = client.connect().await?;
     assert!(server_presence.signature_is_valid());
     assert_eq!(server_presence.claims.negotiation, proto::VersionNegotiation { offered: SPOKEN, peer_offered: versions(1, 3), chosen: 1 });
-    assert!(server_node.granted_trust(&client.key.node_id()).is_some(), "the server registered the client before presenting");
+    assert!(server_node.granted_trust(&client.key.node_id()).is_some(), "the server registered the client");
     server_task.abort();
     Ok(())
 }
