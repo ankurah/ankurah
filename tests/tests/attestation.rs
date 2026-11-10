@@ -15,18 +15,16 @@ use proto::{AttestationSet, Attested, SealedAttestation, Statement, Subject};
 use std::sync::{Arc, Mutex};
 
 /// Permissive in what it allows. It requests the attestations it is given, on every event it
-/// checks and on every state its node serves, records the events its validation hook receives,
-/// and trusts the publishers it lists.
+/// checks and on every state its node serves, and records the events its validation hook receives.
 #[derive(Clone)]
 struct Witness {
     event_request: Option<AttestationRequest>,
     state_request: Option<AttestationRequest>,
-    trusted: Vec<proto::Identity>,
     received: Arc<Mutex<Vec<Attested<proto::Event>>>>,
 }
 
 impl Witness {
-    fn allowing() -> Self { Self { event_request: None, state_request: None, trusted: Vec::new(), received: Arc::default() } }
+    fn allowing() -> Self { Self { event_request: None, state_request: None, received: Arc::default() } }
 
     /// The event with `id` as this agent's validation hook last received it.
     fn received(&self, id: &proto::EventId) -> Option<Attested<proto::Event>> {
@@ -111,8 +109,6 @@ impl PolicyAgent for Witness {
     ) -> Result<(), AccessDenied> {
         Ok(())
     }
-
-    fn trusted_publishers(&self) -> Vec<proto::Identity> { self.trusted.clone() }
 }
 
 fn node<SE: StorageEngine + Send + Sync + 'static>(storage: SE, durable: bool, agent: Witness) -> Node<SE, Witness> {
@@ -260,13 +256,4 @@ async fn relay_keeps_attestations<SE: StorageEngine + Send + Sync + 'static>([or
         assert_eq!(served, vec![event.clone()], "the relay serves it as it came");
     }
     Ok(())
-}
-
-/// The trait's default is the shipped list (pinned against the file by core's
-/// own test); an agent's override replaces it.
-#[test]
-fn an_overridden_trusted_publisher_list_replaces_the_shipped_one() {
-    let publisher = NodeKey::from_seed([4; 32]).identity();
-    assert!(!PermissiveAgent::new().trusted_publishers().contains(&publisher));
-    assert_eq!(Witness { trusted: vec![publisher], ..Witness::allowing() }.trusted_publishers(), vec![publisher]);
 }
