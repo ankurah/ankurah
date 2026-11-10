@@ -152,7 +152,7 @@ pub(crate) fn resolve_component_selection(
         .map(|schema| Ok(QueryComponent { model: schema.bind_local(catalog, epoch)?, names: Some(ComponentNames::from(*schema)) }))
         .collect::<Result<Vec<_>, RetrievalError>>()?;
     let resolver = DescriptorResolver { schemas, epoch, catalog };
-    let selection = resolve_selection_across(&components, &resolver, selection)?;
+    let selection = resolve_names_across(&components, &resolver, selection)?;
     Ok(components.iter().rev().fold(selection, |selection, component| selection.and_member_of(component.model)))
 }
 
@@ -162,11 +162,11 @@ pub fn resolve_selection<R: ModelResolver + ?Sized>(
     resolver: &R,
     selection: Selection<Parsed>,
 ) -> Result<Selection<Resolved>, ModelResolutionError> {
-    resolve_selection_across(&[QueryComponent { model: *model, names: None }], resolver, selection)
+    resolve_names_across(&[QueryComponent { model: *model, names: None }], resolver, selection)
 }
 
 /// Resolve model labels and property paths across `components`, and canonicalize comparison literals.
-fn resolve_selection_across<R: ModelResolver + ?Sized>(
+fn resolve_names_across<R: ModelResolver + ?Sized>(
     components: &[QueryComponent<'_>],
     resolver: &R,
     selection: Selection<Parsed>,
