@@ -1,23 +1,18 @@
-# Node identity, attestation, and the end of the system root
+# Node identity, event identity and attestation
 
-Status: design of record for the branch `feat/node-identity-attestation`, written on
-2026-11-08 from Daniel's rulings of the same day. Base: origin/main at 03349a58. The
-explainer page that records the reasoning, the verified facts and the retraction audit is
-"Node Identity and the System Root" (kept at ~/ak/ankurah-explainers, outside the
-repository); this file is the part an implementer builds from. Revised on 2026-11-09 after the
-first pass was reassessed; section 12 lists each revision and its reason.
-
-The branch is one pass with no line limit. It is reviewed whole, then re-cut into stacked
-pull requests. Factor prudently: a concern gets a module named for its job, behavior sits
-beside the state it governs, and nothing is written for the branch's own history.
+Design of record for how a node is identified, how an entity and an event get their ids, how
+two nodes open a connection and decide what to trust, how a node attests, and how behaviour
+attaches to a node from outside core. `specs/protocol/bytes.md` is the authority for every
+byte named here; where the two files differ on a byte, that file governs.
 
 ## 1. Intentions
 
 Every choice below is checked against all eight together.
 
 1. **One graph, held in parts, owned by no one.** Nothing in the data may require two nodes to
-   agree on a bounded dataset before they exchange an entity. The system root is such a
-   requirement today and keeps independently created stores apart forever.
+   agree on a bounded dataset before they exchange an entity. A root entity that every id
+   hashes and every handshake compares is such a requirement: it keeps independently created
+   stores apart for good. Core has none (section 9).
 2. **An entity means the same thing everywhere it is held.** Its identity is its own creation
    content; copying, merging or relaying it changes nothing about it.
 3. **A node proves who it is and is trusted for what it was granted, never for what it
@@ -34,35 +29,36 @@ Every choice below is checked against all eight together.
 6. **Development stays convenient without shaping production.** A node in a client role, which
    the application defines, discards stale data after a development reseed because the
    application decides so from its own data. Core offers the reset primitive and the place to
-   attach such a decision (a node plugin, section 7); it holds no application concept itself.
-7. **The id derivation changes once.** Entity and event ids are recomputed under the new
-   derivation; existing development stores are discarded. Migration tooling is not part of
-   this branch.
+   attach such a decision (a node plugin, section 10); it holds no application concept itself.
+7. **Ids are derived one way from 0.10 on.** The derivation in section 6 is the one that
+   freezes. Stores from before it are discarded; converting one is a tool's job outside core.
 8. **A toolkit that enables sharing and does not insist on it.** Ankurah is what an
    application is built from. Core offers abilities; what an application adopts, attests,
    checks or shares with other applications is its own choice. The Ankurah Commons is what
    makes sharing possible, for the applications that want it.
 
-## 2. The change in one view
+## 2. What goes into the frozen protocol, and two rules
 
-- Node identity is an ed25519 key held by core. Presence is a signed answer to a
-  per-connection challenge. Durable trust comes from provenance through a default method on
-  the `PolicyAgent`.
-- The minter of a genesis is a cryptographic `Identity`, a node's key by default. `system`
-  and `author` leave both id preimages. `AuthorId` leaves the crate.
-- The system root, its creation, adoption, handshake comparison and halt-on-mismatch leave
-  core, and so does the built-in `_ankurah_system` model, which held nothing but the root.
-  `create()` needs nothing but the node's key. `Node::reset` remains as the public reset
-  primitive.
-- A node carries plugins, attached at construction. A plugin announces bytes inside the
-  node's signed presence and is asked about every peer registration before the peer is
-  registered; it can refuse the peer. Resetting a client after a development reseed is built
-  on it, outside core.
-- Attestations become structured, signed envelopes. Every node attests the events it
-  commits; when policy says so, a durable node attests the states it serves and the events it
-  admits. Core verifies and strips envelopes before any policy hook sees them.
-- Ankurah ships the Commons publisher's public key as the default trusted publisher, through a
-  build-time included file and an overridable `PolicyAgent` method.
+The wire and stored formats freeze at 0.10. After the freeze a 0.10 node is the older peer in
+every compatibility question, so most of what follows is about what it can hold or refuse
+cleanly without understanding it.
+
+Something belongs in the protocol before the freeze when it lands in bytes that a 0.10 node
+hashes, signs, stores or exchanges, and leaving it for later would force a second break.
+Everything else waits (section 12). Every extension point that 0.10 leaves unused is written
+to by a test.
+
+Two rules steer the rest:
+
+- **A node refuses an event holding an operation it cannot read**, whether the operation is of
+  a kind the node does not know or its bytes were erased. It refuses with a typed error for
+  that entity and does not store the event unapplied, because a stored but unapplied event
+  would leave the node's state stale without anyone knowing. A sender withholds what a peer
+  has not announced it understands. An attestation the node cannot read is different: it
+  changes no state, so the node keeps and relays it untouched.
+- **Bytes that an id or a signature covers are carried, stored and relayed exactly as their
+  author produced them.** No engine, backend or relay re-encodes an operation's bytes or an
+  attestation's bytes.
 
 ## 3. Identity and keys
 
@@ -75,92 +71,130 @@ pub enum Signature { Ed25519([u8; 64]) }
 pub struct NodeId(Identity);              // the peer layer's name for an identity that is a node
 ```
 
-- Verification is strict (`verify_strict`); a weak key and a non-canonical key encoding
-  verify as false. Re-encode the decoded point and compare to refuse non-canonical bytes.
-- Display and human-readable serde use unpadded URL-safe base64 of the 32 bytes, as
-  `EntityId` does; binary serde writes the variant index then the bytes. The variant index is
-  part of every genesis id, so variants append and never reorder; pin the encoded form of each
-  variant by test, as `author.rs` did for `AuthorId`.
-- `NodeId` derefs or converts to `Identity`; the peer maps, `Presence`, request and response
-  `from` and `to`, updates, `UnsubscribeQuery.from`, `PeerSender::recipient_node_id` and the
-  `PolicyAgent` hooks' `received_from_node` all take `NodeId`. `EntityId::random()` keeps only
-  its test use; its TODO is updated.
-- wasm and uniffi bindings expose `Identity` and `NodeId` as base64 strings where `EntityId`
-  is exposed today.
+- The variant index of an `Identity` is part of every genesis id, so variants append and never
+  reorder. A test pins the encoded form of each variant.
+- Verification is strict. `specs/protocol/bytes.md` states the exact acceptance rule (canonical
+  encodings only, a small-order key or `R` refused, the equation without the cofactor) with
+  vectors of signatures a reader must refuse.
+- In text an identity or a signature names its scheme: `ed25519:` followed by unpadded
+  URL-safe base64. `Display`, `FromStr`, human-readable serde, the trusted publishers file and
+  the wasm and uniffi surfaces all use that form.
 
-### 3.2 Node key custody (core)
+### 3.2 The node's key (core)
 
-```rust
-// core/src/node/key.rs
-pub struct NodeKey(ed25519_dalek::SigningKey);
-impl NodeKey {
-    pub fn generate() -> Self;
-    pub fn from_seed(seed: [u8; 32]) -> Self;
-    pub fn to_seed(&self) -> [u8; 32];
-    pub fn identity(&self) -> proto::Identity;
-    pub fn node_id(&self) -> proto::NodeId;
-    pub fn sign(&self, message: &[u8]) -> proto::Signature;
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn load_or_create(path) -> io::Result<Self>;   // exactly 32 seed bytes; staged file, exclusive create, 0600, link into place
-}
-```
+For: a node signs its presence and its attestations with a key nobody else holds, and a
+durable node is the same node after a restart.
 
-- The node owns its key privately; nothing serializes or prints it; `Debug` prints the public
-  identity. Policy agents and transports never see it.
-- Construction takes an optional key. Absent, a fresh key is drawn. A durable node built
-  without a key logs a notice that its identity will not survive a restart.
-- Where the seed is stored is the embedder's choice; the helper writes and reads a seed file.
-  Daniel's answer on this point (8 November) is taken as applying to the Commons publisher
-  key in 3.3; if he meant node seeds, this section changes and nothing else does.
+- `NodeKey` (`core/src/node/identity/key.rs`) holds the signing key. The node owns it privately; nothing
+  serializes or prints it, and `Debug` prints the public identity. Policy agents, plugins and
+  transports never see it. What a holder of a `NodeKey` can do with it is build a node, read
+  its identity, and seal a statement (`NodeKey::attest`, section 7).
+- A node built without a key draws a fresh one. A durable node built without a key logs a
+  notice that its identity will not survive a restart.
+- Where the 32-byte seed is kept is the embedder's choice. `NodeKey::load_or_create(path)`
+  reads or creates a seed file (owner-only permissions, created exclusively and linked into
+  place) for embedders that want a file.
 
 ### 3.3 Trusted publishers
 
-The Commons publisher's public key ships with Ankurah as the default trusted publisher, so a
-node can later adopt the component and property definitions the Commons publishes.
+For: a node can later adopt the model and property definitions the Ankurah Commons publishes,
+knowing whose signature to expect on them.
 
-- A file `core/src/policy/trusted_publishers.txt`, one base64 `Identity` per line, comments
-  with `#`, included at build time with `include_str!` and parsed once. It ships empty until
-  the Commons key exists; parsing failures are a build-time test failure, not a runtime one.
-- `PolicyAgent::trusted_publishers(&self) -> Vec<proto::Identity>` returns the shipped set by
-  default; an application overrides it with its own.
-- Nothing in this branch consumes the set beyond a test that the default reads the file and an
-  override replaces it. Adoption of published definitions is a later branch.
+- `core/src/policy/trusted_publishers.txt` holds one identity per line in its text form, with
+  `#` comments. It is included at build time and parsed once; a line that does not parse fails
+  a test, not a running node. It ships empty until the Commons key exists.
+- `PolicyAgent::trusted_publishers` returns the shipped set by default; an application
+  overrides it with its own.
+- Nothing consumes the set yet. Adopting a published definition by its id is later work
+  (section 13).
+- A publisher key that is lost or compromised is replaced out of band: the publisher announces
+  a new key and publishes new signatures. The protocol has no rotation of its own (section 12).
 
-## 4. The handshake and peer trust
+## 4. Opening a connection
 
-Port this from the `feat/node-identity` working tree (its diff and four new files are
-exported beside the brief that dispatched this work), minus everything about the system root.
+For: each side learns which node it is talking to, on this connection and no other, and the
+two find out cleanly which protocol version they share and what each understands.
 
 ```rust
+// proto/src/message.rs
+pub enum Message {
+    Open(Opening),                       // 0: the first frame each side sends
+    NoCommonVersion(ProtocolVersions),   // 1: the answer to an opening that shares no version
+    Presence(Presence),                  // 2
+    PeerMessage(NodeMessage),            // 3
+    Refused(String),                     // 4: the accepting side will not register this peer
+}
+
 // proto/src/peering.rs
-pub const PRESENCE_TAG: &[u8] = b"ankurah.presence.v1";
+pub struct ProtocolVersions { pub lowest: u32, pub highest: u32 }
+pub struct Opening { pub versions: ProtocolVersions, pub challenge: HandshakeChallenge }
 pub struct HandshakeChallenge { issuer: NodeId, nonce: [u8; 32] }
-pub struct Presence {
+pub struct Presence { pub claims: PresenceClaims, pub signature: Signature }
+pub struct PresenceClaims {
     pub node_id: NodeId,
     pub durable: bool,
-    pub challenge: HandshakeChallenge,   // the receiver's challenge this presence answers
-    pub timestamp: u64,                  // advisory; nothing checks it
-    pub signature: Signature,            // node_id's signature over PRESENCE_TAG || bincode(PresenceClaims)
-    pub protocol_version: u32,
+    pub challenge: HandshakeChallenge,        // the receiver's challenge this presence answers
+    pub timestamp: u64,                       // advisory; nothing checks it
+    pub negotiation: VersionNegotiation,
+    pub features: Vec<u32>,
+    pub announcements: BTreeMap<String, Vec<u8>>,
 }
-pub struct PresenceClaims { node_id, durable, challenge, timestamp, protocol_version }
-
-// proto/src/message.rs
-pub enum Message { Presence(Presence), PeerMessage(NodeMessage), PresenceRejected(PresenceRejection), Challenge(HandshakeChallenge) }
+pub struct VersionNegotiation { pub offered: ProtocolVersions, pub peer_offered: ProtocolVersions, pub chosen: u32 }
 ```
 
-- Each side sends a fresh challenge first. `register_peer` consumes a core-issued, single-use
-  challenge capability, checks the challenge's issuer and value, the signature and the
-  declared sender, refuses a presence replayed from another connection and a reflected
-  self-connection, then registers. The protocol-version check stays first.
-- Connectors gain the challenge round trip: websocket client, wasm client, websocket server,
-  local-process, and the test harnesses. The server's opening challenge send, its presence
-  send and its rejection send all run under the handshake deadline. The wasm client
-  dispatches no peer frame before the server is authenticated.
-- Trust by provenance, Daniel's ruling of 5 October 2026:
+- **The opening.** Each side's first frame is `Message::Open`. Its first twelve bytes are the
+  variant index, then the lowest and the highest protocol version the sender speaks. Those
+  twelve bytes keep their position and meaning in every later version, so any two builds can
+  read each other's range. A fresh challenge follows them. The two sides use the highest
+  version both speak; with none in common the receiver answers with its own range
+  (`NoCommonVersion`) and closes. In 0.10 both ends of the range are 1.
+- **The order.** The side that dialed sends its presence first, answering the challenge in the
+  accepting side's opening. The accepting side registers the dialer, which authenticates it,
+  and only then builds and sends its own presence; if it will not register the dialer it
+  sends `Message::Refused` with a short reason and closes. The dialing side registers the
+  accepting side on its presence, and only then reports itself connected. So an accepting
+  node signs nothing, and runs no plugin's `announce`, for a dialer it has not authenticated,
+  and nobody can ask a server for a presence to use elsewhere. Core keeps this order for
+  every connector: a handshake is begun as dialing or accepting (`Node::begin_handshake`),
+  `Node::presence` refuses an accepting handshake whose dialer has not registered, and one
+  handshake registers one peer, once.
+- **What a receiver checks** (`core::connector::Handshake::authenticate`), each failure a
+  typed `PeerConnectionError`: the presence answers the challenge this node issued on this
+  connection; its signature verifies under the node id it names; the challenge in the peer's
+  own opening was issued by that same node; the peer is not this node; and the claims repeat
+  the range each side offered and the version chosen, so a party between the two cannot lower
+  the choice unnoticed. A handshake that has registered its peer refuses another presence.
+  The signature covers the claims as `specs/protocol/bytes.md` writes them out.
+- **Features.** `features` holds numbers that core assigns to things a later build may add. A
+  node ignores a number it does not know. 0.10 assigns none.
+- **Announcements.** `announcements` holds bytes that node plugins contribute, each under its
+  plugin's name (section 10). A node ignores a name it does not know. The keys are names and
+  not definition ids: no definition exists to name yet, and a presence is never stored, so
+  changing the key type later is an ordinary version step.
+- **One deadline.** Everything the accepting side does before it has answered the dialer
+  runs inside one handshake deadline: reading the dialer's opening and presence, registering
+  the dialer with every plugin's hook, and signing its own presence with every plugin's
+  announcement. A connection not established by then closes, so neither a dialer that never
+  presents nor a slow plugin holds it open.
+- **Closing without a frame.** An accepting node that has itself halted, or whose deadline
+  passed, closes without `Refused`. A receiver closes a connection that sends a frame of a
+  variant its chosen version does not define.
+
+What the handshake does not give. A node that dials an address sends its presence before it
+knows which node answers there. Whoever answers can pass that presence to one other accepting
+node and be registered there under the dialer's id, and can sit between the two and alter
+frames, because frames after the handshake are not signed. A dialer chooses its addresses and
+the transport protects them; letting a dialer name the node it expects at an address needs
+nothing on the wire and is later work (section 12). An agent that grants standing to a node
+id on an inbound connection relies on that node dialing only addresses it trusts.
+
+## 5. Peer trust and registrations
+
+For: durable standing is granted by the node that relies on it, a connection speaks only for
+the node that authenticated on it, and an old connection closing cannot disturb a newer one.
 
 ```rust
-pub enum PeerProvenance { Configured, Inbound }     // Introduced and Discovered arrive with the transports that produce them
+pub enum PeerProvenance { Configured, Inbound }
 pub struct PeerTrust { pub durable: bool }
 // PolicyAgent, default method
 fn peer_trust(&self, peer: &NodeId, provenance: PeerProvenance, claimed_durable: bool) -> PeerTrust {
@@ -168,401 +202,97 @@ fn peer_trust(&self, peer: &NodeId, provenance: PeerProvenance, claimed_durable:
 }
 ```
 
-  Every `register_peer` call site states the provenance: dialing connectors say `Configured`,
-  the server says `Inbound`, local-process says `Configured` for the dialing side and
-  `Inbound` for the accepting side. The relay and durable routing read the trust, never the
-  claim; an inbound `durable: true` is logged at info level and otherwise ignored. Every
-  request to a durable-selected peer re-checks trust at send time with no await between
-  lookup, check and send; registration and deregistration of one `NodeId` are serialized.
-- Frames after the handshake stay unsigned; the docs say so plainly: an authenticated peer can
-  spoof another peer's `from` on a request until a later cut.
+- **Trust by provenance.** Every handshake states, when it begins, how the peer was reached,
+  and the registration takes it from the handshake. A connector that dialed an address the
+  embedder configured says `Configured`; a server says `Inbound`;
+  the local-process connector says `Configured` for the dialing side and `Inbound` for the
+  accepting side. The relay of commits and the choice of a durable peer to fetch from read the
+  trust and never the claim. An inbound peer that claims to be durable is logged and otherwise
+  treated as ephemeral. A verified presence proves which key the peer holds and nothing about
+  what that key should be trusted for; that is the agent's decision.
+- **A registration belongs to one connection.** `Node::register_peer` returns a
+  `ConnectionRegistration`. Removing it removes that registration only, so a connection that
+  closes late cannot remove a newer registration of the same node id. Connectors hold the
+  registration, not a node id.
+- **A frame is accepted only from the connection it claims.** A connector passes its
+  registration with each frame, and the node refuses a frame whose `from` is not that
+  registration's node. The refusal is logged and the connection stays up. This is why frames
+  need no signature for a node to know which peer sent one; it does not let a third party
+  check a frame later, which is what attestations are for (section 7).
+- **A request runs on the connection it arrived on.** Its answer goes out on that connection,
+  and a subscription it installs is held by that connection, also when the same node
+  registers again on a newer connection while the request is being checked.
+- Every request to a peer chosen as durable checks its trust again at send time, with no
+  await between the lookup, the check and the send.
 
-## 5. Events and identity derivation
+## 6. Events and their ids
+
+For: an entity's id is its creation content and nothing else, a node can recompute an event's
+id without being able to read its operations, an operation's content can later be erased
+without changing any id, and no id depends on what a serializer crate happens to emit.
 
 ```rust
-// proto/src/data.rs
-pub const GENESIS_TAG: &[u8] = b"org.ankurah.genesis.v1";
-pub const EVENT_TAG: &[u8]   = b"org.ankurah.event.v1";
+// proto/src/event.rs, proto/src/operation.rs
 pub enum EventBody {
-    Genesis { minter: Identity, nonce: [u8; 32], timestamp: u64, operations: OperationSet },
-    Update  { nonce: [u8; 32], timestamp: u64, operations: OperationSet },
+    Genesis { minter: Identity, nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
+    Update  { nonce: [u8; 32], timestamp: u64, operations: CarriedOperations },
 }
-genesis id = SHA-256( GENESIS_TAG || bincode(minter) || bincode(nonce) || bincode(timestamp) || bincode(operations) )
-update id  = SHA-256( EVENT_TAG || bincode(entity_id) || bincode(nonce) || bincode(timestamp) || bincode(operations) || bincode(parent) )
-entity id  = genesis id
-impl Event {
-    pub fn genesis(minter: Identity, operations: OperationSet) -> Self;
-    pub fn update(entity_id: EntityId, parent: Clock, operations: OperationSet) -> Self;
-    pub fn minter(&self) -> Option<Identity>;   // Some for a genesis
-}
-```
-
-- `system` and `author` leave; `proto/src/author.rs` is deleted; the root's special case of
-  `system: None` no longer exists because no root is minted. `validate_structure` keeps its
-  two rules: parent empty if and only if genesis, and a genesis's id equals its entity id.
-  The preimage tests are rewritten for v1: recipes against an independently serialized tuple,
-  the two shapes never colliding, tag bytes pinned, the minter inside the id.
-- `Transaction::create` mints under the node's identity (`Event::genesis(node.identity(),
-  ..)`); `LocalTrxEntity::new` takes the minter instead of the system and the author. Nothing
-  gates creation on readiness beyond catalog registration of the model. Minting under another
-  identity the process holds is done with `Event::genesis` and `Attestation::sign` directly
-  (a publishing tool); a `Context` opened under another identity is not part of this branch.
-- The minter appears in the genesis only. An update's authorship rides the committing node's
-  attestation (section 8).
-- Core does not check that a genesis carries a signature by its minter. Whether a minter's
-  claim must be proven is the application's choice (section 12).
-- The simulation harness (`tests/src/sim`) seeds one deterministic `Identity` per simulated
-  node from the simulation seed and mints under it; `sim_system_id` and its comment go.
-- The LWW tie-break, generations, clocks and the comparison are untouched.
-
-## 6. The system leaves core
-
-What leaves, by symbol:
-
-- proto: `sys::Item::SysRoot` (the item is JSON-encoded in a property, so the variant can go);
-  `Presence.system_root`.
-- core/src/system.rs: `root`, `root()`, `root_id()`, `create()`, `adopt_system()`,
-  `store_root`, the root arm of `load_system_catalog`, `allow_system_replacement`,
-  `set_allow_system_replacement`.
-- The built-in model that held the root. The root was the only `_ankurah_system` item main
-  ever created, so nothing is left in it: `SystemModel::System`, `SystemProperty::Item`,
-  `proto::sys`, `SYSTEM_COLLECTION_ID`, `PROTECTED_COLLECTIONS`, `SystemManager::items` and
-  its load step, and the `_ankurah_system` table or tree in every storage engine all go.
-  `ModelId::System(..)` and `PropertyId::System(..)` remain as core's variants for its catalog
-  models and their properties.
-- The readiness gate that load fed. With nothing to load, the system-ready flag,
-  `wait_system_ready`, `is_system_ready`, `require_system_ready`'s readiness half and
-  `NodeState::Uninitialized` have no job. Each goes unless the code shows a job this section
-  missed; a caller that needs a running node uses `Node::wait_ready`, and a caller that only
-  waited for the system load waits for nothing.
-- The name `SystemManager`. What remains is the node's run state: the `NodeState` signal,
-  halt, and reset. It becomes `NodeLifecycle` in `core/src/node/lifecycle.rs`, reached through
-  `Node`'s own methods (`state`, `check_ready`, `wait_ready`, `reset`, and an accessor for the
-  epoch) instead of a public `system` field. `SystemEpoch` keeps its name and meaning.
-- core/src/error.rs: `NodeHaltReason::SystemReplacement`, `MutationError::SystemNotReady`,
-  `RequestError::SystemNotReady`, `RegistrationError::SystemNotReady`; `ForeignEntity` and
-  `SystemEpoch` stay (the epoch is per node and unrelated to the root).
-- core/src/connector.rs: `PeerConnectionError::{SystemMismatch, MissingSystem, InvalidSystem,
-  SystemReset}`.
-- core/src/node.rs: the root comparison and adoption in `register_peer`; `system_root` in
-  `presence()`; `set_allow_system_replacement`.
-- core/src/context/inner.rs `system_id()`; core/src/transaction/local.rs reading it.
-- README, GETTING_STARTED, examples and tests: `node.system.create().await` calls go; readiness
-  waits use `Node::wait_ready` or the context constructors.
-
-What is added:
-
-- `Node::reset(&self) -> Result<(), MutationError>`: halts the node with
-  `NodeHaltReason::Reset`, then
-  wipes storage through `StorageEngine::delete_all`,
-  finishing even if the caller drops the future (today's `hard_reset`, made public and freed
-  from the replacement path). Issue #477's contract stands: the host discards the halted node
-  and its contexts and live queries, and builds a fresh node on the wiped store.
-- A book section (docs/internals) on node identity, peer trust and the reset primitive, and
-  the note that resetting a client after a development reseed is the application's decision
-  over its own data.
-- specs/concurrency/threat-model.md: the self-asserted peer class gap closes (identity by
-  signed presence, durable standing by provenance); the authorship claim is updated for
-  committed attestations; the system-root rows are retired.
-
-## 7. Node plugins
-
-For: behaviour that only some applications want attaches to a node from outside core, several
-to one node, and sees every peer registration before anything is exchanged with that peer.
-Resetting a client after a development reseed is the first such behaviour. The policy agent
-cannot carry it: a node has one agent, and the agent's subject is access.
-
-Built in the pass after the fixes of 2026-11-09; this section is its contract.
-
-```rust
-// core/src/node/plugin.rs
-#[async_trait]
-pub trait NodePlugin<SE, PA>: Send + Sync + 'static {
-    /// Names this plugin's entry in a presence.
-    fn name(&self) -> &'static str;
-    /// Bytes this node announces to every peer under `name`, inside its signed presence.
-    async fn announce(&self, node: &Node<SE, PA>) -> Option<Vec<u8>> { None }
-    /// Asked once per registration, after the presence verifies and trust is decided and
-    /// before the peer is registered. `Err` refuses the peer.
-    async fn register_peer(&self, node: &Node<SE, PA>, peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> { Ok(()) }
-}
-/// One peer's registration as a plugin sees it: its id, provenance and trust, and the bytes it
-/// announced under the asking plugin's name.
-pub struct PeerRegistration<'a> { .. }
-pub struct PeerRefusal { pub plugin: &'static str, pub reason: String }
-
-// proto/src/peering.rs: in Presence and in PresenceClaims, so the presence signature covers it
-pub announcements: BTreeMap<String, Vec<u8>>
-```
-
-- A plugin decides from what the handshake carries. No connector reads a peer's messages
-  while `register_peer` is awaited (the websocket server awaits it inside its receive loop,
-  the websocket client sends its own presence only after it returns, the local-process
-  connector starts its receivers after both registrations), so a plugin cannot ask the peer
-  anything from this hook. A hook that converses with a peer needs a registered but
-  unconfirmed peer state in the node and every connector; it is out of scope until a plugin
-  needs it.
-- Plugins attach at construction, so a plugin sees every registration of its node:
-  `Node::builder(engine, agent)` with `durable()`, `key(..)`, `plug(..)` and `build()`. The
-  builder absorbs `new_with_key` and `new_durable_with_key`, which this branch added; `new`
-  and `new_durable` stay as the shorthands for a node with no plugin. Two plugins under one
-  name fail `build()` with a typed error.
-- `Node::presence` gathers each plugin's announcement, in the order plugged, under its name.
-- `register_peer` asks each plugin, in the order plugged, after the protocol check, the
-  challenge authentication and `peer_trust`, and before anything is inserted. The first
-  refusal returns `PeerConnectionError::Refused(PeerRefusal)` and leaves nothing registered.
-  No lock is held across a hook. A plugin may call `Node::reset` from the hook and then
-  refuse.
-- Each hook on the trait has a consumer in the tree. A further hook arrives with the plugin
-  that needs it.
-
-### 7.1 The first plugin: reset after a reseed
-
-Outside core, in `extensions/`. The application declares a System component (later adopted
-from the Commons) and its server holds one entity of it per seeding. The plugin announces the
-ids of the System entities its node holds. A node the application treats as a client resets
-when a peer trusted as durable announces System entities and the node holds System entities
-and the two sets share none; it then refuses the peer, and the host builds a fresh node on
-the wiped store. Either side holding none is no verdict, so a first connection, a peer that
-is behind, and a peer of the same application all register normally. Whether a mismatch
-resets the node or only refuses the peer is the application's choice when it plugs the
-plugin. The exact types are settled before this plugin is built.
-
-## 8. Attestation
-
-```rust
-// proto/src/auth.rs
-pub const ATTESTATION_TAG: &[u8]  = b"ankurah.attestation.v1";
-pub const STATE_DIGEST_TAG: &[u8] = b"ankurah.state.v1";
-pub struct Attestation { pub attester: Identity, pub body: AttestationBody, pub signature: Signature }
-pub enum AttestationBody {
-    Event { event: EventId, role: AttesterRole, claims: Vec<u8> },
-    State { entity: EntityId, head: Clock, state_digest: [u8; 32], claims: Vec<u8> },
-}
-pub enum AttesterRole { Committed, Admitted }
-// signature over ATTESTATION_TAG || bincode(body)
-// state_digest = SHA-256( STATE_DIGEST_TAG || bincode(EntityState) )
-impl Attestation {
-    pub fn sign(key: &NodeKey, body: AttestationBody) -> Self;     // core-side constructor; proto exposes the verify half
-    pub fn verify(&self) -> bool;                                    // signature under attester
-    pub fn covers_event(&self, event: &Event) -> bool;               // subject match
-    pub fn covers_state(&self, state: &EntityState) -> bool;
-}
-```
-
-`Attested<T>` and `AttestationSet` keep their shape; `Attestation(Vec<u8>)` is gone.
-
-Production:
-
-- Every node attaches a `Committed` attestation, signed with its own key, to every event it
-  commits, in the local commit path and in `commit_remote_transaction` for the events the
-  committing node minted. The claims of a committed attestation are empty in this branch.
-- `PolicyAgent::attest_state` is `fn attest_state(&self, node, state) -> Option<Vec<u8>>`.
-  When it returns claims, a durable node attaches a `State` attestation carrying them, signed
-  with its own key, to the state it is serving (fetch responses, subscription deltas, direct
-  gets). `None` attaches nothing: no signature is made and none is verified, because nothing
-  in the tree consumes a state attestation yet. `PermissiveAgent` and `JwtAgent` return
-  `None`. Ephemeral nodes attach no state attestation.
-- `PolicyAgent::check_write_event` returns `Result<Admission, AccessDenied>` with
-  `pub enum Admission { Attest { claims: Vec<u8> }, Allow }`. On `Attest`, core signs an
-  `Admitted` attestation for the event. `PermissiveAgent` answers `Allow`; `JwtAgent` answers
-  `Allow` in this branch.
-
-Verification, at every ingress (the applier's event and state arms, `commit_remote_transaction`,
-the peer event fetch in retrieval):
-
-- For each attestation: signature valid under `attester`; subject matches the carried payload
-  (the event's recomputed id, or the state's entity, head and digest). An attestation that
-  fails either is stripped and counted under a tracing warning. The payload then reaches
-  `validate_received_event` or `validate_received_state` with its verified set, and the agent
-  decides sufficiency. `PermissiveAgent` accepts anything, including an empty set.
-- Recognition of an attester as a trusted durable peer or a trusted publisher is the agent's
-  decision inside those hooks, reading the node's peer trust and `trusted_publishers`.
-- Storage keeps attestations beside events and states as today; every stored set is empty on
-  main, so the encoding change carries no data.
-
-## 9. Protocol version and stored formats
-
-`PROTOCOL_VERSION` stays 1; the one bump happens at the 0.10.0 release. Every change above
-breaks peers and stores from before the branch; existing development stores are discarded,
-as with every pre-freeze change. No migration code is built here.
-
-## 10. Out of scope
-
-Signed post-handshake frames; key rotation; the durable membership protocol; adoption of
-published definitions and anything else Commons-side; catalog convergence for components
-registered independently; a `Context` opened under a non-node identity; migration tooling in
-ak-cli; iroh. Each is named in the explainer page with its owner.
-
-Membership removal. The first pass built `Membership::Remove` with the rule that a removal
-loses to any addition outside its ancestry. Two replicas that each add a membership and then
-remove it merge to "member" under that rule, although every addition was removed by an event
-that saw it. The sound rule is an observed-remove set, which changes the shape of `State`;
-it is designed on its own. `Membership` keeps `Add` alone, and everything the first pass
-added for removal comes out.
-
-A plugin hook that converses with a peer (section 7).
-
-## 11. Acceptance
-
-Beyond the suites staying green, these tests exist and state their scenario:
-
-- Encoded forms of `Identity` and `Signature` variants pinned; a weak key and a non-canonical
-  key refused; a forged presence signature, a presence replayed on a second connection and a
-  reflected self-connection refused; an inbound peer claiming durable receives no relayed
-  commit and is no fetch source while a dialed durable peer is both; a durable node keeps its
-  `NodeId` across a restart with its seed and an ephemeral node gets a fresh one.
-- The v1 preimages against independently serialized tuples; the two shapes never collide; the
-  minter is inside the genesis id; a genesis under one minter and the same content under
-  another are different entities; `create()` succeeds on a node that has never connected.
-- No root: a durable node and an ephemeral node connect and exchange entities with no root
-  anywhere; two independently created durable stores connect and exchange when configured to
-  trust each other; `Node::reset` halts and wipes and a fresh node starts clean; no store
-  holds an `_ankurah_system` table or tree.
-- Plugins (their pass): an announcement travels in the signed presence and a changed one
-  fails the presence signature; a refusing plugin makes `register_peer` return `Refused` with
-  nothing registered, on every connector; plugins are asked in the order plugged; a client
-  holding one seeding's System entity resets and refuses a server announcing another's, and
-  registers normally with a server announcing the same one or none.
-- Attestations: a committed attestation on every locally committed event, verified by the
-  receiving peer; a state attestation on a served state exactly when the agent's
-  `attest_state` returns claims; a tampered
-  attestation and a transplanted attestation are stripped and counted; `Admission::Attest`
-  yields an admitted attestation and `Allow` yields none; the trusted-publishers default reads
-  the shipped file and an override replaces it.
-
-## 12. Assumptions, and the revisions of 2026-11-09
-
-- Daniel's "in a file that gets included at build time" (8 November) means the Commons
-  publisher's public key (3.3); he confirmed it on 9 November at 20:02Z. Node seeds keep the
-  embedder-chosen file of the October cut (3.2), which is this file's own choice.
-- The shipped trusted-publishers file is empty until the Commons key exists.
-- Committed attestations are unconditional on every node; state attestations and admitted
-  attestations follow the agent.
-
-Revisions of 2026-11-09, each with its reason:
-
-- `Node::reset`, from Daniel at 19:43Z: "presumably this should be called fn reset, not
-  reset_local_storage?" What is reset is the node, and "local" told a reader nothing.
-- Node plugins (section 7), from Daniel at 19:43Z: "PeerRegistration seems to be a good enough
-  reason to me to have a NodePlugin", and the hook "should indeed be able to refuse the peer".
-  That the hook decides from the signed presence follows from the connectors, as section 7
-  says; Daniel has not yet seen that consequence.
-- Decided by the lead from the intentions in section 1, open to Daniel's review: state
-  attestations are made only when the agent returns claims (no consumer exists; section 8);
-  the built-in `_ankurah_system` model, the readiness gate it fed and the name
-  `SystemManager` go (section 6), correcting this file's earlier claim that items other than
-  the root remained.
-- Membership removal leaves the branch (section 10). Daniel at 20:02Z: "I don't think
-  ::Remove is required for this branch, but I do want it soon."
-- The fix pass built these revisions as four commits ending at 762b2dc3. A check that a
-  genesis carries its minter's signature was specified here for a few hours and withdrawn
-  before it was built, for the reason given below.
-
-Rulings of 2026-11-09 that are not built yet. They change sections 1, 7 and 8, and they are
-specified in full, together with the findings of the protocol comparison Daniel asked for,
-before the pass that builds them:
-
-- Ankurah is a toolkit (intention 8). Daniel at 20:18Z: "the goal is for Ankara [Ankurah] to
-  be a sort of toolkit to build your application and enable but not insist upon the sharing
-  of data between applications. That's what Ankara Commons is for, is that enablement."
-- Core offers the ability to attest and no more: an envelope, signing with the node key on
-  request, verifying on request. Daniel at 20:02Z: "I wasn't intending for us to actually
-  check attestations just yet (just to have the ability to author them)"; at 20:15Z: "we
-  could later ship a default attester/verifier plugin which would be used by most
-  applications". So the committed attestation that core signs on every commit becomes the
-  policy agent's choice, and the verify-and-strip at every ingress leaves core. Section 8
-  describes the code as it stands today, not this.
-- The envelope is open. On main an attestation is opaque bytes that the policy agent writes
-  and checks; the closed set of bodies in section 8 took that freedom away. The kind of an
-  attestation becomes a type id shaped like `ModelId`: core's kinds as enum variants, any
-  other kind the entity id of a published definition, carried by core untouched. Daniel at
-  20:14Z: "having an attestation type ID could be valuable. Which would probably be best
-  recorded as an entity ID in and of itself."
-- A type is admitted by whoever consumes it: model and property definitions by the catalog
-  under access control, a plugin's types by the plugin.
-- The plugin hook is `NodePlugin::register_peer`. Daniel at 20:02Z: "there's nothing wrong
-  with having the same fn name on NodePlugin as exists on Node".
-- The Commons key is a temporary single key until its custody is formalized before the
-  crates.io release. A lost or compromised key is replaced out of band, by publishing new
-  keys and new signatures (Daniel at 20:02Z and 20:09Z).
-- Signing one tree root in place of each served state is a later enhancement, not 0.10.
-
-## 13. The protocol-shape work
-
-Built after the fix pass, in four passes, one implementer at a time, each its own commits.
-It follows Daniel's rulings in section 12 and the comparison he asked for (the report
-"Ankurah protocol future proofing", kept outside the repository). Where this section and
-sections 4, 7 or 8 disagree, this section governs.
-
-The test for every item here: it lands in bytes that a 0.10 node hashes, signs, stores or
-exchanges, and leaving it for later would force a second break. After the freeze the 0.10 node
-is the older peer in every compatibility question, so most items are about what it can hold
-or refuse cleanly without understanding. Every extension point that 0.10 leaves unused is
-written to by a test.
-
-Two calls that steer the rest:
-
-- A node refuses an event holding an operation it cannot read (one of a kind it does not
-  know, or one whose bytes were erased), with a typed error for that entity, and does not
-  store it unapplied; a stored but unapplied event would leave the node's state silently
-  stale. A sender withholds what a peer has not announced it understands. An attestation the
-  node cannot read is different: it changes no state, so it is kept and relayed untouched.
-- Bytes that an id or a signature covers are carried, stored and relayed exactly as their
-  author produced them. No engine, backend or relay re-encodes an operation's bytes or an
-  attestation's bytes.
-
-### 13.1 Pass A: the bytes of an event
-
-For: an event's id can be recomputed by a node that cannot read its operations, an
-operation's content can later be erased without changing any id, and the ids stop depending
-on what a serializer crate happens to emit.
-
-- Domain tags. One family, `ankurah.<name>.v1`, declared together in one module of proto:
-  `genesis`, `event`, `operation`, `presence`, `attestation`, `state`. A tag enters a
-  preimage as one length byte followed by its bytes. A test pins each tag's bytes and that no
-  tag's encoded form is a prefix of another's. A new derivation is a new variant with a new
-  tag, never a new meaning for an existing one.
-- Carried operations. An event body carries each operation as the bytes its author produced,
-  or as only their digest once the bytes have been erased:
-
-```rust
 pub enum CarriedOperation { Bytes(Vec<u8>), Erased([u8; 32]) }
-// operation digest = SHA-256( tag(operation) || bytes )        for Bytes
-//                  = the 32 bytes carried                      for Erased
+pub enum UnreadableOperation { UnknownKind { index: u32 }, Malformed(String), Erased }
+
+// operation digest = SHA-256( tag(operation) || bytes )       for Bytes
+//                  = the 32 bytes carried                     for Erased
 // genesis id = SHA-256( tag(genesis) || minter || nonce || timestamp || count || digest_1 .. digest_n )
-// update id  = SHA-256( tag(event) || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent )
+// update id  = SHA-256( tag(update)  || entity_id || nonce || timestamp || count || digest_1 .. digest_n || parent )
+// entity id  = genesis id
 ```
 
-  The bytes of one operation are the encoding of today's `Operation`. Building an event
-  encodes each operation once; reading one decodes it and yields a typed error for bytes of a
-  kind this build does not know and for an erased operation. Applying an event with either
-  is refused with that error, as the first call above says. Nothing in 0.10 erases; a test
-  builds an event with an erased operation and shows its id unchanged. Whether erased content
-  needs a salt is left to the operation kinds that want one: the digest covers whatever bytes
-  the operation carries.
-- The byte specification. `specs/protocol/bytes.md` writes out, byte by byte, every string
-  that is hashed or signed (both event ids, the operation digest, the state digest, the
-  presence claims, an attestation's signed bytes) and the encoding of each type inside them.
-  The encoding stays what bincode 1.3.3's default produces today (fixed-width little-endian
-  integers, four-byte variant indices, eight-byte lengths); the document is the authority and
-  the crate is an implementation of it. Tests compare each string against literal hex whose
-  expected side never calls a serializer. `bincode` is pinned to exactly 1.3.3.
-- Variant order. Tests pin the index of every variant of every enum on the wire or in a
-  hashed string that is not pinned today (`Message`, `NodeMessage`, the request, response and
-  update bodies, `Value`, `EventBody`, `Operation`, `Membership`).
-- Text forms. `Identity` and `Signature` print and parse with their scheme named
-  (`ed25519:` then the base64), in `Display`, `FromStr`, human-readable serde, the trusted
-  publishers file, and the wasm and uniffi surfaces.
+- **Domain tags.** One family, `ankurah.<name>.v1`, declared together in
+  `proto/src/domain_tag.rs`: `genesis`, `update`, `operation`, `presence`, `attestation`,
+  `state`. A tag enters a hashed or signed string as one length byte followed by its bytes.
+  Tests pin each tag's bytes and that no tag's encoded form is a prefix of another's. A new
+  derivation is a new tag, never a new meaning for an existing one.
+- **The minter.** A genesis names its minter as an `Identity`: the creating node's key by
+  default, a publisher's key for a published definition. The minter is inside the id, so the
+  same content under another minter is another entity. An update carries no minter. Core does
+  not check that a genesis carries a signature by its minter; whether the claim must be proven
+  is the application's choice, made with attestations.
+- **Carried operations.** An event carries each operation as the bytes its author produced, or
+  as only their digest once the bytes have been erased. Building an event encodes each
+  operation once. Reading one yields a typed `UnreadableOperation` for bytes of a kind this
+  build does not know, for bytes that do not parse, and for an erased operation; a node that
+  meets any of the three while taking in an event refuses that event (section 2). Nothing in
+  0.10 erases. A test builds an event with an erased operation and shows its id unchanged.
+  Whether erased content needs a salt is left to the operation kinds that want one: the digest
+  covers whatever bytes the operation carries.
+- **The parent clock** of an update is inside its id, so a `Clock` decodes strictly from the
+  wire and from a store: entries out of order, repeated, or with a zero generation are refused
+  with a typed error.
+- **Chosen parts.** `Event::genesis` and `Event::update` draw a nonce and read the clock for the
+  timestamp. `Event::genesis_from_parts` and `Event::update_from_parts` take every part from
+  the caller, for a migration tool or a publisher that must arrive at the same id twice.
+- **The encoding.** Every hashed or signed string, and the encoding of each type inside it, is
+  written out byte by byte in `specs/protocol/bytes.md`, with literal hex vectors. The encoding
+  is what bincode 1.3.3's default produces (fixed-width little-endian integers, four-byte
+  variant indices, eight-byte lengths); the document is the authority and the crate, pinned to
+  exactly that version, is one implementation of it. `proto/src/encoding.rs` is the only place
+  in proto that calls the serializer. Tests compare each string against hex whose expected
+  side never calls a serializer.
+- **Variant order.** Tests pin the index of every variant of every enum on the wire or in a
+  hashed string (`Message`, `NodeMessage`, the request, response and update bodies, `Value`,
+  `EventBody`, `Operation`, `Membership`, `Identity`, `Signature`). `Membership` has `Add`
+  alone; index 1 is left free and a test shows that an operation using it is refused as
+  unreadable.
 
-### 13.2 Pass B: attestation as an ability
+## 7. Attestation
 
 For: a node can sign a statement about an event or a state when its application asks, and
-anyone holding the statement can check it later. Core makes no statement on its own and
-checks none; an application chooses both through its policy agent now and through a plugin
-later. Replaces section 8.
+anyone holding the statement can check it later, on any node, without the connection that
+carried it. Core makes no statement on its own and checks none. An application chooses both
+through its policy agent, and later through a plugin most applications would share.
 
 ```rust
+// proto/src/attestation.rs
 /// One attestation as it travels and is stored. A node keeps and relays these bytes whether
 /// or not it can read them.
 pub struct SealedAttestation(pub Vec<u8>);
@@ -576,88 +306,220 @@ pub enum Subject { Event(EventId), State { entity: EntityId, head: Clock, state_
 // signature over: tag(attestation) || statement bytes, exactly as carried
 ```
 
-- `kind` is the entity id of the definition that says what the statement means and how to
-  read `payload`. Core defines no kinds, because core makes no statements. Tests use ids of
-  their own.
-- The attester, the subject, the kind and the payload are all inside the signed bytes, and a
-  signature is checked against the carried bytes, never against a re-encoding.
-- `PolicyAgent::check_write_event` returns `Result<Option<AttestationRequest>, AccessDenied>`
-  and `attest_state` returns `Option<AttestationRequest>`, where
+- **The kind** is the entity id of the definition that says what the statement means and how
+  to read `payload`. Core defines no kinds, because core makes no statements. A type is
+  admitted by whoever consumes it: an application or a plugin that reads a kind is what gives
+  it meaning on that node.
+- **What the signature covers.** The attester, the subject, the kind and the payload are all
+  inside the signed bytes. A signature is checked against the carried bytes, never against a
+  re-encoding.
+- **Making one.** `PolicyAgent::check_write_event` returns
+  `Result<Option<AttestationRequest>, AccessDenied>`, and the agent's hook for a served state
+  (`request_state_attestation`) returns `Option<AttestationRequest>`, where
   `AttestationRequest { kind: EntityId, payload: Vec<u8> }`. When an agent returns one, the
   node that ran the hook signs a statement about that event or state with its own key and
-  attaches it. `Admission` and `AttesterRole` go. Core attaches nothing otherwise: the
-  attestation core signs on every commit today goes.
-- Core no longer verifies or strips on arrival. `validate_received_event` and
-  `validate_received_state` receive the set as it came. An agent opens the attestations it
-  cares about (`SealedAttestation::open` yields the statement only if the bytes parse and the
-  signature verifies under the attester) and checks that the subject is the payload in hand.
-- Storage keeps a set as its elements, so one unreadable attestation never makes an event or
-  a state unreadable. Merging an attestation that arrives after its event was stored is
-  behaviour for a later release.
-- An event's attestations are kept with the event and relayed with it. A state's are not
-  kept: a statement about a state names one head, so a durable node attaches its own agent's
-  statement when it serves a state and stores states without any. Keeping a received one
-  would mean deciding when it stops naming the stored state, and nothing reads them yet.
-- Tests: an attestation of a kind nobody knows, and one whose bytes do not parse, are stored
-  and relayed unchanged by a node between two others; a statement moved to another event
-  fails its subject check; a changed payload fails its signature.
+  attaches it. Core attaches nothing otherwise. An event that core commits on its own
+  authority never reaches the agent's hook: the catalog definitions that registration writes
+  are such events, so they carry no attestation, and a definition is tied to its minter only
+  through its id.
+- **Reading one.** Core does not verify or strip on arrival. `validate_received_event` and
+  `validate_received_state` receive the set as it came. An agent unseals the attestations it
+  cares about (`SealedAttestation::unseal` yields the statement only if the bytes parse and
+  the signature verifies under the attester) and checks that the subject names the event or
+  state in hand (`Subject::names_event`, `Subject::names_state`).
+- **Keeping them.** An event's attestations are stored with the event, as separate elements so
+  one unreadable attestation never makes an event unreadable, and relayed with it. A state's
+  attestations are not stored: a statement about a state names one head, so a durable node
+  attaches its own agent's statement when it serves a state, and every engine stores a state
+  without any. Keeping a received one would mean deciding when it stops naming the stored
+  state.
 
-### 13.3 Pass C: the handshake, requests and stores
+## 8. Requests, responses and updates
 
-For: two builds that differ can find out cleanly whether they can talk and what each
-understands, and a 0.10 node answers what it cannot read instead of going silent.
+For: a 0.10 node answers what it cannot read instead of going silent, so a later build can
+add a request or an update without breaking a connection to an older peer.
 
-- The opening frame. The first frame each side sends is `Message::Open`, variant 0, whose
-  first twelve bytes are its variant index, then the lowest and the highest protocol version
-  the sender speaks. Those twelve bytes keep their position and meaning in every later
-  version. The challenge follows them. The two sides use the highest version both speak; with
-  none in common the receiver answers with its own range and closes.
-- Signed offers. `PresenceClaims` gains the sender's own range, the range it saw the peer
-  offer, and the version chosen, so a party in the middle cannot lower the choice unnoticed:
-  each side checks that the peer's claims repeat the offer it actually sent. In 0.10 both
-  ends of the range are 1.
-- What a node understands. After the version fields, `Presence` and its claims carry
-  `features: Vec<u32>` (numbers core assigns to things a later build may add; a number a node
-  does not know is ignored; 0.10 assigns none) and
-  `announcements: BTreeMap<String, Vec<u8>>` for plugins (section 13.4), where a name a node
-  does not know is ignored. The keys are names and not definition ids: no definition exists
-  to name yet, and a presence is never stored, so changing the key type later is an ordinary
-  version step.
-- Bodies as carried bytes. A request, a response and an update each carry their body as
-  length-prefixed bytes, so the frame, its ids and its addresses always decode. A request
-  whose body this build cannot read is answered with `NodeResponseBody::Unsupported`; an
-  update likewise in its acknowledgement; a response body the requester cannot read fails
-  that request with a typed error.
-- Stores. Each engine records a store format version of its own, separate from the protocol
-  version, and refuses a store of another format with a typed error naming both.
-- Tests: an opening frame offering a wider range settles on 1; one with no version in common
-  is refused with the receiver's range; a presence whose repeated offer was altered is
-  refused; unknown feature numbers and announcement names are ignored; a request with an
-  unknown body kind receives `Unsupported`.
+- A request, a response and an update each carry their body as length-prefixed bytes
+  (`proto::CarriedBody<T>`), so the frame, its ids and its addresses always decode.
+- A request whose body this build cannot read is answered with
+  `NodeResponseBody::Unsupported`; an update likewise in its acknowledgement
+  (`NodeUpdateAckBody::Unsupported`).
+- A requester that receives `Unsupported` gets `RequestError::UnsupportedByPeer`; a response
+  body the requester cannot read fails that request with `RequestError::UnreadableResponse`.
 
-### 13.4 Pass D: node plugins and reset after a reseed
+## 9. The node's run state, and reset
 
-Section 7 stands, with the hook named `register_peer` and announcements as 13.3 defines them.
+Core has no system root, no built-in model for one, and no readiness that waits on one. A
+node is ready to create an entity as soon as its model is registered in the catalog;
+`Transaction::create` mints under the node's identity and needs nothing from any peer.
 
-- `extensions/system-reset`: a plugin over the application's own System model `M` (any
-  model the application designates; the Commons will publish one later). It announces the
-  ids of the `M` entities its node holds. In `register_peer`, for a peer trusted as durable:
-  when the peer announced some, the node holds some, and the two share none, it refuses the
-  peer, after resetting the node if the application chose reset. Otherwise it accepts, and a
-  node that holds none of the announced entities fetches them once the peer is registered,
+`NodeLifecycle` (`core/src/node/lifecycle.rs`) owns what is left: the node's run state, halt,
+and reset. `Node` exposes it through its own methods (`state`, `check_ready`, `wait_ready`,
+`reset`).
+
+`Node::reset` is the reset primitive. Its contract:
+
+- It halts the node with `NodeHaltReason::Reset`, then wipes storage through
+  `StorageEngine::delete_all`.
+- The wipe is started before anything is awaited, so a caller that stops waiting cannot leave
+  a halted node with an unwiped store.
+- Every storage commit is counted from when it begins until it returns or its caller drops
+  it, and none begins once the node has halted. The wipe waits until none is counted, so no
+  commit still awaited lands in a wiped store. A commit that an engine keeps running after
+  its caller dropped it is the engine's to keep out of a store wiped since
+  (`StorageTransaction::commit`).
+- A call made while or after another reset waits for that one and does not wipe again. A
+  failed wipe is retried by the next call, and a failure nobody is waiting for is logged.
+- The host then discards the halted node with its contexts and live queries, and builds a
+  fresh node on the wiped store.
+
+When to reset is never core's decision. Section 10.1 is the one case that ships.
+
+## 10. Node plugins
+
+For: behaviour that only some applications want attaches to a node from outside core, several
+to one node, and sees every peer registration before anything is exchanged with that peer.
+The policy agent cannot carry such behaviour: a node has one agent, and the agent's subject is
+access.
+
+```rust
+// core/src/node/peers/plugin.rs
+#[async_trait]
+pub trait NodePlugin<SE, PA>: Send + Sync + 'static {
+    /// Names this plugin's entry in a presence.
+    fn name(&self) -> &'static str;
+    /// Bytes this node announces to every peer under `name`, inside its signed presence.
+    async fn announce(&self, node: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> { Ok(None) }
+    /// Asked once per registration, after the presence verifies and trust is decided and
+    /// before the peer is registered. `Err` refuses the peer.
+    async fn register_peer(&self, node: &Node<SE, PA>, peer: &PeerRegistration<'_>) -> Result<(), PeerRefusal> { Ok(()) }
+}
+pub struct PeerRefusal { pub plugin: &'static str, pub reason: String }
+```
+
+- **Attached at construction**, so a plugin sees every registration of its node:
+  `Node::builder(engine, agent)` with `durable()`, `key(..)`, `plug(..)` and `build()`.
+  `Node::new` and `Node::new_durable` are the shorthands for a node with no plugin. Two plugins
+  under one name fail `build()` with a typed error.
+- **Announcing.** `Node::presence` gathers each plugin's announcement, in the order plugged,
+  under its name, inside the signed claims. A plugin that cannot make its announcement fails
+  the presence with a typed `PeerConnectionError`; nothing is swallowed.
+- **Deciding.** `Node::register_peer` asks each plugin, in the order plugged, after the
+  handshake authenticates and `peer_trust` is decided, and before anything is inserted. The
+  first refusal returns `PeerConnectionError::Refused(PeerRefusal)` and leaves nothing
+  registered. No lock is held across a hook. A plugin may call `Node::reset` from the hook and
+  then refuse. A hook can be dropped at any await, when the connection closes or the
+  accepting side's handshake deadline passes, and the peer is then not registered.
+- **A plugin decides from what the handshake carries.** No connector reads a peer's messages
+  while `register_peer` is awaited, so a plugin cannot ask the peer anything from this hook;
+  what it needs to know about the peer travels in the peer's announcement. A hook that
+  converses with a peer would need a registered but unconfirmed peer state in the node and in
+  every connector, and waits for a plugin that needs it.
+- **Each hook on the trait has a consumer in the tree.** A further hook arrives with the plugin
+  that needs it.
+
+### 10.1 Reset after a reseed
+
+For: during development a server's store is thrown away and seeded again, and a client still
+holding the old seeding's data must not go on mixing it with the new.
+
+`extensions/system-reset` is a plugin over a model `M` that the application designates as its
+System model (any model of its own; the Commons will publish one later). The application's
+server holds one `M` entity per seeding.
+
+- The plugin announces the ids of the `M` entities its node holds.
+- In `register_peer`, for a peer trusted as durable: when the peer announced some, the node
+  holds some, and the two sets share none, the plugin refuses the peer, after resetting the
+  node if the application chose `OnReseed::Reset` and without resetting under
+  `OnReseed::Refuse`.
+- Either side holding none is no verdict, so a first connection, a peer that is behind and a
+  peer of the same seeding all register normally. An announcement the plugin cannot read is
+  also no verdict: it accepts and logs.
+- A node that holds none of the announced entities fetches them once the peer is registered,
   so a first connection leaves the node holding its System entity.
-- Tests, through the websocket connectors and the local-process connector: a client that
-  held one seeding's System entity meets a server seeded again, resets, and the host's fresh
-  node on the wiped store connects and holds the new entity; the same client against the same
-  seeding, against a server announcing nothing, and on its first connection registers
-  normally; a durable node configured to refuse does so without resetting.
 
-### 13.5 Left for later, each with what keeps it possible
+## 11. Versions and stores
 
-Erasing an operation (the digest); new operation kinds and membership removal (carried
-operations, and the removal task, which must settle the shape of `State` before the freeze);
-a signed tree root, key rotation, delegation, thresholds (new statement kinds, and identity
-or signature variants announced as features); signed frames after the handshake and new
-requests (features and carried bodies); replacing the serializer crate (the byte
-specification); merging later attestations into stored rows; a version byte per stored
-record, which the store format version makes unnecessary for now.
+- `PROTOCOL_VERSION` is 1 and is the only version 0.10 offers or accepts.
+- Each storage engine records a store format version of its own (`STORE_FORMAT_VERSION`, 1 in
+  each), separate from the protocol version, and refuses a store of another format with
+  `StoreFormatError`, which names both versions. That makes a version byte per stored record
+  unnecessary for now.
+- No engine converts a store. A store from before 0.10 is discarded.
+
+## 12. Left for later, each with what keeps it possible
+
+| Later work | What 0.10 fixes so it needs no break |
+| --- | --- |
+| Erasing an operation's content | The per-operation digest in every event id |
+| New operation kinds | Carried operations and the refusal rule of section 2 |
+| Membership removal | A free `Membership` index. Its design must settle the shape of stored state before the freeze |
+| A signed tree root in place of a signature per served state | A new statement kind |
+| Key rotation, delegation, threshold identities | New statement kinds, and `Identity` or `Signature` variants announced as features |
+| Signed frames after the handshake; new requests | Features and carried bodies |
+| Replacing the serializer crate | The byte specification |
+| Merging an attestation that arrives after its event was stored | Attestations stored as separate elements |
+| A plugin hook that converses with a peer | Nothing on the wire; a node and connector change |
+| Naming the node a dialer expects at an address | Nothing on the wire; a connector option |
+
+## 13. Out of scope
+
+The durable membership protocol; adopting a definition minted elsewhere by its id, and the
+rest of the Commons; catalog convergence for models registered independently; a `Context`
+opened under an identity other than the node's; store conversion and migration tooling; a
+shipped attester and verifier plugin.
+
+## 14. Required tests
+
+Beyond the suites staying green, these exist and each states its scenario:
+
+- **Identity.** The encoded and text forms of each `Identity` and `Signature` variant; the
+  refusal vectors of `specs/protocol/bytes.md`; a second `Signature` variant refused as
+  unreadable; a durable node keeps its `NodeId` across a restart with its seed and a node
+  without one gets a fresh id.
+- **Opening a connection.** An opening offering a wider range settles on 1; one sharing no
+  version is answered with `NoCommonVersion`, and its error names both ranges; a forged
+  presence signature, a presence replayed on a second connection, a reflected self-connection,
+  a relayed challenge and an altered offer are each refused with their own error; a stranger
+  that presents another node's challenge to an accepting node receives no presence from it; an
+  accepting node presents only once it has registered the dialer, and a second registration on
+  one handshake is refused; a registration not decided within the handshake deadline closes the
+  connection; unknown feature numbers and announcement names are ignored, and a frame of an
+  unknown kind closes the connection; a refused dialer reports the refusal and its reason,
+  never reports itself connected, and keeps backing off.
+- **Trust and registrations.** An inbound peer claiming durable receives no relayed commit and
+  is no fetch source, while a dialed durable peer is both; an old connection's registration,
+  removed late, leaves a newer one in place; a frame whose `from` is another node is refused
+  and the connection stays up; a subscription whose peer registers again while its request is
+  checked stands on the connection it arrived on.
+- **Events.** Each hashed string against literal hex; the tags' bytes and that none prefixes
+  another; the minter inside the genesis id; the same parts give the same id; an erased
+  operation leaves the id unchanged and makes the event refused on arrival; an operation of an
+  unknown kind is refused with its typed error and nothing is stored; a clock out of order is
+  refused at decode.
+- **Attestation.** An agent that requests one gets a statement signed by the node, on an event
+  and on a served state, and an agent that requests none gets none; an attestation of a kind
+  nobody knows, and one whose bytes do not parse, are stored and relayed unchanged by a node
+  between two others; a statement moved to another event fails its subject check; a changed
+  payload fails its signature; every engine returns an event's attestations as stored and
+  stores a state without any.
+- **Requests.** A request with an unknown body kind receives `Unsupported`, and its requester
+  gets the typed error.
+- **Reset.** `Node::reset` halts and wipes, and a fresh node starts clean; a commit in flight
+  when a reset starts does not write into the wiped store; a second reset waits for the first
+  and does not wipe again; a reset whose caller stopped waiting still wipes; a failed wipe is
+  retried.
+- **No root.** A durable node and an ephemeral node connect and exchange entities; two
+  independently created durable stores connect and exchange when configured to trust each
+  other; `create()` succeeds on a node that has never connected.
+- **Plugins.** An announcement travels in the signed presence and a changed one fails the
+  signature; a refusing plugin makes `register_peer` return `Refused` with nothing registered,
+  on every connector; plugins are asked in the order plugged; a plugin that cannot announce
+  fails the presence.
+- **Reset after a reseed**, through the websocket connectors and the local-process connector:
+  a client that held one seeding's System entity meets a server seeded again, resets by the
+  plugin's own decision, and the host's fresh node connects and holds the new entity; the same
+  client against the same seeding, against a server announcing nothing, against an
+  announcement it cannot read, and on its first connection registers normally; a node
+  configured to refuse does so without resetting.
+- **Stores.** Each engine refuses a store of another format with `StoreFormatError`.
