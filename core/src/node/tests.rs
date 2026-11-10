@@ -10,6 +10,7 @@ use ankurah_signals::Subscribe;
 mod commit;
 mod connections;
 mod identity;
+mod plugins;
 mod reset;
 mod unreadable_bodies;
 
@@ -131,7 +132,7 @@ async fn lifecycle_waits_for_the_catalog_and_never_revives_after_halting() {
 }
 
 /// An ephemeral node's catalog is ready only once a durable peer answers, but what it stores is
-/// readable before that.
+/// readable before that: a plugin reads it while the node's first peer registers.
 #[tokio::test]
 async fn the_catalog_holds_the_stored_definitions_before_a_durable_peer_answers() {
     let storage = Arc::new(TestStorage::default());

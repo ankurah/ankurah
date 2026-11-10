@@ -123,8 +123,9 @@ where
     let opening = proto::Message::Open(handshake.opening());
     let mut conn = Connection::Initial { socket: Some(socket), handshake: Some(handshake) };
     // Bounds the whole accepting handshake: sending this node's opening, reading the dialer's
-    // opening and presence, registering the dialer, signing this node's presence and sending it,
-    // or sending the frame that refuses the dialer.
+    // opening and presence, registering the dialer with every plugin's hook, signing this node's
+    // presence with every plugin's announcement and sending it, or sending the frame that refuses
+    // the dialer, so neither a dialer that never presents nor a slow plugin holds it open.
     let handshake_deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
 
     // The dialer's presence must answer our challenge, and ours answers the dialer's.

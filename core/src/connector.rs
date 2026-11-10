@@ -44,6 +44,10 @@ pub enum PeerConnectionError {
     /// This node was asked to present on a connection it accepted before it registered the dialer.
     #[error("this node accepted the connection and presents only once it has registered the dialer")]
     PresenceBeforeRegistration,
+    #[error("{0}")]
+    Refused(crate::node::PeerRefusal),
+    #[error("{0}")]
+    AnnouncementFailed(crate::node::AnnouncementFailure),
     #[error("node halted: {0}")]
     NodeHalted(#[from] crate::error::NodeHaltReason),
 }

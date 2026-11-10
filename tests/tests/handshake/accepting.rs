@@ -1,9 +1,16 @@
 //! The accepting side: a real server driven from a raw socket.
 
-use super::common::{proto, start_test_server};
+use super::common::{proto, serve, start_test_server};
 use super::*;
 use ankurah::core::connector::{PeerConnectionError, HANDSHAKE_FRAME_LIMIT};
+use ankurah::core::node::{AnnouncementFailure, NodePlugin, PeerRefusal, PeerRegistration};
+use ankurah::core::storage::StorageEngine;
+use ankurah::policy::PolicyAgent;
+use ankurah::{Node, PermissiveAgent};
+use ankurah_storage_sled::SledStorageEngine;
 use anyhow::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_tungstenite::MaybeTlsStream;
 
@@ -250,6 +257,104 @@ async fn the_server_closes_a_connection_whose_presence_exceeds_the_handshake_fra
         .await?;
     assert!(receive(&mut client.socket).await.is_none(), "the server closes without presenting");
     assert_eq!(server_node.granted_trust(&client.key.node_id()), None);
+    server_task.abort();
+    Ok(())
+}
+
+/// A plugin whose announcement never comes.
+struct SilentAnnouncer;
+
+#[async_trait::async_trait]
+impl<SE, PA> NodePlugin<SE, PA> for SilentAnnouncer
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn name(&self) -> &'static str { "silent-announcer" }
+
+    async fn announce(&self, _: &Node<SE, PA>) -> Result<Option<Vec<u8>>, AnnouncementFailure> { std::future::pending().await }
+}
+
+/// The server's own presence, its plugins' announcements included, is bound by the handshake
+/// deadline: a server whose plugin never announces closes the connection of the client it
+/// registered, and removes that registration.
+#[tokio::test]
+async fn the_server_closes_a_connection_whose_answer_is_not_ready_within_the_handshake_deadline() -> Result<()> {
+    let server_node =
+        Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).durable().plug(SilentAnnouncer).build()?;
+    let (server_url, server_task) = serve(server_node.clone()).await?;
+    let mut client = RawClient::open(&server_url, SPOKEN).await?;
+    client.present(|_| {}).await?;
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_some()).await, "the server registers the client");
+
+    // The server is now waiting on its plugin's announcement. Run the clock past the deadline
+    // without waiting for it; the clock stays real until here, so no earlier deadline fires early.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    match tokio::time::timeout(Duration::from_secs(1), client.socket.next()).await.expect("the server left the connection open") {
+        None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => {}
+        Some(Ok(other)) => panic!("the server sent {other:?} instead of closing"),
+    }
+    assert!(eventually(|| server_node.granted_trust(&client.key.node_id()).is_none()).await, "the server removes the registration");
+    server_task.abort();
+    Ok(())
+}
+
+/// A plugin that never decides on a peer's registration, and records that its hook began and
+/// that it was dropped.
+struct UndecidedRegistrar {
+    began: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
+}
+
+/// Sets its flag when dropped.
+struct SetOnDrop(Arc<AtomicBool>);
+
+impl Drop for SetOnDrop {
+    fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+}
+
+#[async_trait::async_trait]
+impl<SE, PA> NodePlugin<SE, PA> for UndecidedRegistrar
+where
+    SE: StorageEngine + Send + Sync + 'static,
+    PA: PolicyAgent + Send + Sync + 'static,
+{
+    fn name(&self) -> &'static str { "undecided-registrar" }
+
+    async fn register_peer(&self, _: &Node<SE, PA>, _: &PeerRegistration<'_>) -> Result<(), PeerRefusal> {
+        let _dropped = SetOnDrop(self.dropped.clone());
+        self.began.store(true, Ordering::SeqCst);
+        std::future::pending().await
+    }
+}
+
+/// Registering the dialer, every plugin's hook included, is bound by the handshake deadline: a
+/// server whose plugin never decides on the client drops the hook, registers nothing and closes
+/// the connection.
+#[tokio::test]
+async fn the_server_closes_a_connection_whose_registration_is_not_decided_within_the_handshake_deadline() -> Result<()> {
+    let (began, dropped) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+    let registrar = UndecidedRegistrar { began: began.clone(), dropped: dropped.clone() };
+    let server_node = Node::builder(Arc::new(SledStorageEngine::new_test()?), PermissiveAgent::new()).durable().plug(registrar).build()?;
+    let (server_url, server_task) = serve(server_node.clone()).await?;
+    let mut client = RawClient::open(&server_url, SPOKEN).await?;
+    client.present(|_| {}).await?;
+    assert!(eventually(|| began.load(Ordering::SeqCst)).await, "the server asks its plugin about the client");
+
+    // The clock stays real until the hook has begun, so no earlier deadline fires early.
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    tokio::time::resume();
+    match tokio::time::timeout(Duration::from_secs(1), client.socket.next()).await.expect("the server left the connection open") {
+        None | Some(Ok(WsMessage::Close(_))) | Some(Err(_)) => {}
+        Some(Ok(other)) => panic!("the server sent {other:?} instead of closing"),
+    }
+    assert!(dropped.load(Ordering::SeqCst), "the server dropped the plugin's hook");
+    assert_eq!(server_node.granted_trust(&client.key.node_id()), None, "the server registered nothing");
     server_task.abort();
     Ok(())
 }

@@ -47,6 +47,8 @@ use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
 pub(crate) use peers::durable_peer;
 pub use peers::peer_state::PeerState;
+use peers::plugin::NodePlugins;
+pub use peers::plugin::{AnnouncementFailure, DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};
 pub use peers::ConnectionRegistration;
 use peers::{PeerRegistry, RequiredTrust};
 
@@ -96,6 +98,7 @@ where PA: PolicyAgent
     pub storage: Arc<SE>,
     /// Signs this node's presence; never handed to the policy agent.
     key: NodeKey,
+    plugins: NodePlugins<SE, PA>,
 
     pub(crate) entities: WeakEntitySet,
     /// Hold across storage commit and WeakEntitySet publication: register a new resident entity
@@ -148,14 +151,16 @@ where
     SE: StorageEngine + Send + Sync + 'static,
     PA: PolicyAgent + Send + Sync + 'static,
 {
-    /// Construct an ephemeral node with a fresh identity.
-    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self { Self::start(engine, policy_agent, false, SmallRng::from_entropy(), None) }
-    /// Construct a durable node with a fresh identity, which does not survive a restart;
-    /// [`Node::builder`] gives a node a key.
-    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
-        Self::start(engine, policy_agent, true, SmallRng::from_entropy(), None)
+    /// Construct an ephemeral node with a fresh identity and no plugins.
+    pub fn new(engine: Arc<SE>, policy_agent: PA) -> Self {
+        Self::start(engine, policy_agent, false, SmallRng::from_entropy(), None, NodePlugins::none())
     }
-    /// Configure a node's role and key before it starts.
+    /// Construct a durable node with a fresh identity, which does not survive a restart, and no
+    /// plugins; [`Node::builder`] gives a node a key.
+    pub fn new_durable(engine: Arc<SE>, policy_agent: PA) -> Self {
+        Self::start(engine, policy_agent, true, SmallRng::from_entropy(), None, NodePlugins::none())
+    }
+    /// Configure a node's role, key and plugins before it starts.
     pub fn builder(engine: Arc<SE>, policy_agent: PA) -> NodeBuilder<SE, PA> { NodeBuilder::new(engine, policy_agent) }
 
     /// Halt this node with [`NodeHaltReason::Reset`] (a node already halted keeps its reason) and wipe
@@ -192,7 +197,7 @@ where
 
     /// Wait until the catalog holds the definitions this node stores, without waiting for a durable
     /// peer as [`Node::wait_ready`] does; return the halt reason if the node halts first. Lets a
-    /// caller read stored entities of a model before the node's first durable answer.
+    /// plugin read stored entities of a model before the node's first durable answer.
     pub async fn wait_catalog_loaded(&self) -> Result<(), NodeHaltReason> {
         tokio::select! {
             biased;
@@ -204,16 +209,16 @@ where
     /// Construct an ephemeral node whose peer-selection RNG is seeded explicitly.
     /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new`].
     pub fn new_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
-        Self::start(engine, policy_agent, false, SmallRng::seed_from_u64(rng_seed), None)
+        Self::start(engine, policy_agent, false, SmallRng::seed_from_u64(rng_seed), None, NodePlugins::none())
     }
 
     /// Construct a durable node whose peer-selection RNG is seeded explicitly.
     /// Intended for the simulation harness and deterministic tests; production paths use [`Node::new_durable`].
     pub fn new_durable_with_seed(engine: Arc<SE>, policy_agent: PA, rng_seed: u64) -> Self {
-        Self::start(engine, policy_agent, true, SmallRng::seed_from_u64(rng_seed), None)
+        Self::start(engine, policy_agent, true, SmallRng::seed_from_u64(rng_seed), None, NodePlugins::none())
     }
 
-    fn start(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng, key: Option<NodeKey>) -> Self {
+    fn start(engine: Arc<SE>, policy_agent: PA, durable: bool, rng: SmallRng, key: Option<NodeKey>, plugins: NodePlugins<SE, PA>) -> Self {
         let entityset = WeakEntitySet::new(CatalogEpoch::allocate());
         let key = key.unwrap_or_else(|| {
             let key = NodeKey::generate();
@@ -242,6 +247,7 @@ where
         let node = Node(Arc::new(NodeInner {
             id,
             key,
+            plugins,
             storage: engine,
             entities: entityset,
             commit_publication_lock: tokio::sync::Mutex::new(()),
@@ -298,19 +304,22 @@ where
     /// Begin this node's side of one new connection's handshake, reached as `provenance` says.
     pub fn begin_handshake(&self, provenance: PeerProvenance) -> Handshake { Handshake::new(self.id, provenance) }
 
-    /// Sign this node's presence answering the peer on `handshake`'s connection; a halted node
-    /// signs none, and none answers before the peer's opening arrives, or on a connection this
-    /// node accepted before it registered the dialer.
+    /// Sign this node's presence answering the peer on `handshake`'s connection, carrying each
+    /// plugin's announcement; a halted node signs none, nor one whose plugin cannot announce, and
+    /// none answers before the peer's opening arrives, or on a connection this node accepted
+    /// before it registered the dialer.
     pub async fn presence(&self, handshake: &Handshake) -> Result<proto::Presence, PeerConnectionError> {
         self.lifecycle.check_not_halted()?;
         handshake.check_may_present()?;
-        let claims = handshake.presence_claims(self.id, self.durable)?;
+        let mut claims = handshake.presence_claims(self.id, self.durable)?;
+        claims.announcements = self.plugins.announcements(self).await.map_err(PeerConnectionError::AnnouncementFailed)?;
         Ok(self.key.sign_presence(claims))
     }
 
     /// Register a peer connection whose presence completes `handshake`, this node's side of it,
     /// once per handshake. How the connection was reached decides, through the policy agent's
-    /// [`PolicyAgent::peer_trust`], whether the peer is durable. The connector holds the
+    /// [`PolicyAgent::peer_trust`], whether the peer is durable. Then each plugin is asked, in the
+    /// order plugged, and the first refusal leaves the peer unregistered. The connector holds the
     /// registration returned while the connection is open. `sender` holds the frames it is given
     /// until the connector has written this node's presence.
     #[cfg_attr(feature = "instrument", instrument(level = "debug", skip_all, fields(node_id = %presence.claims.node_id.to_base64_short(), durable = %presence.claims.durable)))]
@@ -334,6 +343,12 @@ where
             info!("Node({}) serves {:?} peer {} as not durable despite its durable claim", self.id, provenance, peer);
         }
 
+        self.lifecycle.check_not_halted()?;
+        if let Err(refusal) = self.plugins.register_peer(self, claims, provenance, trust).await {
+            warn!("Node({}) refusing peer {}: {}", self.id, peer, refusal);
+            return Err(PeerConnectionError::Refused(refusal));
+        }
+        // A plugin may have halted this node.
         self.lifecycle.check_not_halted()?;
         let subscription_handler = |registration| SubscriptionHandler::new(registration, self);
         let registration = self.peers.register(peer, sender, trust, subscription_handler, self.subscription_relay.as_ref());
