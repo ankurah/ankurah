@@ -34,7 +34,7 @@ pub(crate) mod identity;
 pub(crate) mod inbound;
 mod lifecycle;
 mod match_args;
-pub(crate) mod peers;
+mod peers;
 #[cfg(test)]
 mod tests;
 
@@ -45,6 +45,7 @@ pub use identity::key::NodeKey;
 pub use lifecycle::state::NodeState;
 use lifecycle::NodeLifecycle;
 pub use match_args::{nocache, CachePolicy, MatchArgs};
+pub(crate) use peers::durable_peer;
 pub use peers::peer_state::PeerState;
 use peers::plugin::NodePlugins;
 pub use peers::plugin::{AnnouncementFailure, DuplicatePluginName, NodePlugin, PeerRefusal, PeerRegistration};

@@ -271,10 +271,10 @@ async fn a_halted_node_asked_to_read_from_a_peer_reports_its_halt() {
         limit: None,
     };
     assert!(
-        matches!(peers::durable_peer::get_from_peer(&node, vec![proto::EntityId::random()], &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
+        matches!(durable_peer::get_from_peer(&node, vec![proto::EntityId::random()], &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
     );
     assert!(
-        matches!(peers::durable_peer::fetch_from_peer(&node, selection, &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
+        matches!(durable_peer::fetch_from_peer(&node, selection, &cdata).await, Err(RetrievalError::NodeHalted(error)) if error == reason)
     );
 }
 
